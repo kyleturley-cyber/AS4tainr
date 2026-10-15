@@ -1,8 +1,8 @@
 # Known fidelity gaps
 
-These are places where OpenEye knowingly behaves differently from IBM i. Each one should eventually turn into a fix with a test, or into a documented decision.
+These are places where ibmish knowingly behaves differently from IBM i. Each one should eventually turn into a fix with a test, or into a documented decision.
 
-| Area | IBM i behavior | OpenEye today | Impact |
+| Area | IBM i behavior | ibmish today | Impact |
 | --- | --- | --- | --- |
 | Key collating sequence | Character keys are ordered by EBCDIC: lowercase before uppercase, and letters before digits | Byte order of UTF-8 text (`COLLATE "C"`): digits before uppercase before lowercase | Mixed letter/digit or mixed-case keys read in a different order. Planned fix: an EBCDIC sort key per character key field |
 | Record locking | Input/update files lock the record read for update until UPDATE, the next read, or UNLOCK | No locks | Concurrent update jobs can overwrite each other. Planned: `SELECT ... FOR UPDATE` within the job's commitment scope |

@@ -1,13 +1,13 @@
 [package]
-name = "openeye-core"
-description = "OpenEye core: object catalog, DDS, record-level access and the JVM bridge"
+name = "ibmish-core"
+description = "ibmish core: object catalog, DDS, record-level access and the JVM bridge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "openeye"
+name = "ibmish"
 path = "src/main.rs"
 
 [lib]

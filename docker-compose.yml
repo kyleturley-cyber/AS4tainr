@@ -1,29 +1,29 @@
-# Spike 01: PostgreSQL plus the OpenEye image running the sample programs.
+# Spike 01: PostgreSQL plus the ibmish image running the sample programs.
 #   docker compose up --build --abort-on-container-exit
 services:
   db:
     image: postgres:16
     environment:
-      POSTGRES_USER: openeye
-      POSTGRES_PASSWORD: openeye
-      POSTGRES_DB: openeye
+      POSTGRES_USER: ibmish
+      POSTGRES_PASSWORD: ibmish
+      POSTGRES_DB: ibmish
     volumes: ["pgdata:/var/lib/postgresql/data"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U openeye"]
+      test: ["CMD-SHELL", "pg_isready -U ibmish"]
       interval: 2s
       retries: 30
 
-  openeye:
+  ibmish:
     build:
       context: .
       dockerfile: docker/Dockerfile
-    image: ghcr.io/openeye/openeye:dev
+    image: ghcr.io/ibmish/ibmish:dev
     depends_on:
       db:
         condition: service_healthy
     environment:
-      OPENEYE_DATABASE_URL: postgres://openeye:openeye@db/openeye
-    entrypoint: ["/opt/openeye/demo.sh"]
+      IBMISH_DATABASE_URL: postgres://ibmish:ibmish@db/ibmish
+    entrypoint: ["/opt/ibmish/demo.sh"]
 
 volumes:
   pgdata: {}

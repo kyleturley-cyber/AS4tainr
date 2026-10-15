@@ -61,7 +61,7 @@ impl Session {
     async fn dispatch(&mut self, req: Request) -> Result<Value> {
         let keys = req.keys.clone().unwrap_or_default();
         match req.op.as_str() {
-            "hello" => Ok(json!({ "server": "openeye-core", "version": PROTOCOL_VERSION })),
+            "hello" => Ok(json!({ "server": "ibmish-core", "version": PROTOCOL_VERSION })),
             "metadata" => {
                 let name = req.file.ok_or_else(|| anyhow!("missing 'file'"))?;
                 let f =
@@ -164,7 +164,7 @@ pub async fn connect_db(url: &str) -> Result<Client> {
     let (client, conn) = tokio_postgres::connect(url, NoTls).await?;
     tokio::spawn(async move {
         if let Err(e) = conn.await {
-            eprintln!("openeye: database connection error: {e}");
+            eprintln!("ibmish: database connection error: {e}");
         }
     });
     Ok(client)
@@ -219,7 +219,7 @@ pub async fn serve(listener: TcpListener, config: BridgeConfig) -> Result<()> {
         let cfg = config.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_conn(stream, cfg).await {
-                eprintln!("openeye: bridge session ended with error: {e:#}");
+                eprintln!("ibmish: bridge session ended with error: {e:#}");
             }
         });
     }

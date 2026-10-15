@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# OpenEye spike demo: create the sample files, load data, run the sample
+# ibmish spike demo: create the sample files, load data, run the sample
 # programs and compare their output with the golden files.
 #
 # Env:
-#   OPENEYE_DATABASE_URL  PostgreSQL URL (default: local openeye database)
-#   OPENEYE_RUNNER        runner command (default: the Jariko jar)
-#   OPENEYE_PGM_PATH      directory holding the .rpgle sources
-#   OPENEYE_BIN           path to the openeye binary (default: openeye on PATH)
+#   IBMISH_DATABASE_URL  PostgreSQL URL (default: local ibmish database)
+#   IBMISH_RUNNER        runner command (default: the Jariko jar)
+#   IBMISH_PGM_PATH      directory holding the .rpgle sources
+#   IBMISH_BIN           path to the ibmish binary (default: ibmish on PATH)
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
-samples="${OPENEYE_SAMPLES:-$here/samples}"
-bin="${OPENEYE_BIN:-openeye}"
-export OPENEYE_PGM_PATH="${OPENEYE_PGM_PATH:-$samples/qrpglesrc}"
+samples="${IBMISH_SAMPLES:-$here/samples}"
+bin="${IBMISH_BIN:-ibmish}"
+export IBMISH_PGM_PATH="${IBMISH_PGM_PATH:-$samples/qrpglesrc}"
 
 "$bin" init
 

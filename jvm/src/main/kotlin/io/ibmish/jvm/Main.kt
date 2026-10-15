@@ -1,4 +1,4 @@
-package io.openeye.jvm
+package io.ibmish.jvm
 
 import com.smeup.dbnative.ConnectionConfig
 import com.smeup.dbnative.DBNativeAccessConfig
@@ -10,23 +10,23 @@ import com.smeup.rpgparser.interpreter.NumberType
 import com.smeup.rpgparser.interpreter.StringType
 import com.smeup.rpgparser.parsing.parsetreetoast.RpgType
 import com.smeup.rpgparser.rpginterop.DirRpgProgramFinder
-import io.openeye.bridge.BridgeClient
+import io.ibmish.bridge.BridgeClient
 import java.io.File
 import kotlin.system.exitProcess
 import com.smeup.rpgparser.interpreter.FileMetadata as JarikoFileMetadata
 
 /**
- * The OpenEye RPG runner. OpenEye core launches it as:
+ * The ibmish RPG runner. ibmish core launches it as:
  *
- *     java -jar openeye-jvm.jar --bridge HOST:PORT PGM [parm...]
+ *     java -jar ibmish-jvm.jar --bridge HOST:PORT PGM [parm...]
  *
  * Programs are looked up as PGM.rpgle in the directories listed in
- * OPENEYE_PGM_PATH (path-separator separated; default ./qrpglesrc).
- * All file I/O goes back to OpenEye core through the bridge.
+ * IBMISH_PGM_PATH (path-separator separated; default ./qrpglesrc).
+ * All file I/O goes back to ibmish core through the bridge.
  */
 fun main(args: Array<String>) {
     if (args.size < 3 || args[0] != "--bridge") {
-        System.err.println("usage: openeye-jvm --bridge HOST:PORT PGM [parm...]")
+        System.err.println("usage: ibmish-jvm --bridge HOST:PORT PGM [parm...]")
         exitProcess(2)
     }
     val hostPort = args[1]
@@ -34,12 +34,12 @@ fun main(args: Array<String>) {
     val parms = args.drop(3)
 
     val dirs =
-        (System.getenv("OPENEYE_PGM_PATH") ?: "qrpglesrc")
+        (System.getenv("IBMISH_PGM_PATH") ?: "qrpglesrc")
             .split(File.pathSeparator)
             .map(::File)
             .filter { it.isDirectory }
     if (dirs.isEmpty()) {
-        System.err.println("CPF4101: no program directory found (set OPENEYE_PGM_PATH)")
+        System.err.println("CPF4101: no program directory found (set IBMISH_PGM_PATH)")
         exitProcess(1)
     }
 
@@ -54,11 +54,11 @@ fun main(args: Array<String>) {
                     listOf(
                         ConnectionConfig(
                             fileName = "*",
-                            url = OpenEyeDBMManager.URL_PREFIX + hostPort,
+                            url = IbmishDBMManager.URL_PREFIX + hostPort,
                             user = "",
                             password = "",
                             driver = null,
-                            impl = OpenEyeDBMManager::class.java.name,
+                            impl = IbmishDBMManager::class.java.name,
                         ),
                     ),
                 ),
@@ -80,7 +80,7 @@ fun main(args: Array<String>) {
     }
 }
 
-/** Map an OpenEye file description to Jariko's typed FileMetadata. */
+/** Map an ibmish file description to Jariko's typed FileMetadata. */
 @Suppress("UNCHECKED_CAST")
 fun jarikoMetadata(md: Map<String, Any?>): JarikoFileMetadata {
     val fields =

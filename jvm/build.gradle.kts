@@ -1,10 +1,10 @@
-// OpenEye JVM side: runs RPG on Jariko, with file I/O routed to OpenEye core.
+// ibmish JVM side: runs RPG on Jariko, with file I/O routed to ibmish core.
 plugins {
     kotlin("jvm") version "2.1.0"
     application
 }
 
-group = "io.openeye"
+group = "io.ibmish"
 version = "0.1.0"
 
 val jarikoVersion: String by project
@@ -41,17 +41,17 @@ tasks.withType<JavaCompile>().configureEach {
 }
 
 application {
-    mainClass.set("io.openeye.jvm.MainKt")
-    applicationName = "openeye-jvm"
+    mainClass.set("io.ibmish.jvm.MainKt")
+    applicationName = "ibmish-jvm"
 }
 
-// Self-contained jar for the container image: java -jar openeye-jvm.jar
+// Self-contained jar for the container image: java -jar ibmish-jvm.jar
 tasks.register<Jar>("fatJar") {
     group = "build"
-    description = "Builds openeye-jvm.jar with all dependencies."
-    archiveFileName.set("openeye-jvm.jar")
+    description = "Builds ibmish-jvm.jar with all dependencies."
+    archiveFileName.set("ibmish-jvm.jar")
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-    manifest { attributes["Main-Class"] = "io.openeye.jvm.MainKt" }
+    manifest { attributes["Main-Class"] = "io.ibmish.jvm.MainKt" }
     from(sourceSets.main.get().output)
     dependsOn(configurations.runtimeClasspath)
     from({ configurations.runtimeClasspath.get().filter { it.name.endsWith("jar") }.map { zipTree(it) } }) {

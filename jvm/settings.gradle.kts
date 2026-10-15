@@ -1,1 +1,1 @@
-rootProject.name = "openeye-jvm"
+rootProject.name = "ibmish-jvm"

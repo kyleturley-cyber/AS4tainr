@@ -2,7 +2,7 @@
 
 Guidance for AI coding sessions working in this repository.
 
-## What OpenEye is
+## What ibmish is
 
 An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (objects and libraries, DDS files, record-level access, later 5250, CL and jobs) on Linux and PostgreSQL. RPG runs on Jariko (JVM). It is NOT a hardware emulator.
 
@@ -19,13 +19,13 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | Path | What |
 | --- | --- |
 | `core/src/dds.rs` | DDS parser (physical files: R, K lines, fields, `UNIQUE`, `TEXT`) |
-| `core/src/catalog.rs` | Libraries = PostgreSQL schemas; file descriptions in schema `openeye`; library list resolution |
+| `core/src/catalog.rs` | Libraries = PostgreSQL schemas; file descriptions in schema `ibmish`; library list resolution |
 | `core/src/rla.rs` | Record-level access: cursor position per open file, keyset queries ordered by (keys, rrn) |
 | `core/src/bridge.rs` | JSON-lines TCP server the JVM calls for every file operation |
-| `core/src/main.rs` | `openeye` CLI |
-| `core/tests/rla_test.rs` | Integration tests (need `OPENEYE_TEST_DATABASE_URL`) |
-| `jvm/src/main/java/io/openeye/bridge` | Dependency-free Java bridge client (keep it dependency-free) |
-| `jvm/src/main/kotlin/io/openeye/jvm` | Jariko integration: reload `DBMManager`/`DBFile` adapter and runner `main` |
+| `core/src/main.rs` | `ibmish` CLI |
+| `core/tests/rla_test.rs` | Integration tests (need `IBMISH_TEST_DATABASE_URL`) |
+| `jvm/src/main/java/io/ibmish/bridge` | Dependency-free Java bridge client (keep it dependency-free) |
+| `jvm/src/main/kotlin/io/ibmish/jvm` | Jariko integration: reload `DBMManager`/`DBFile` adapter and runner `main` |
 | `jvm/src/test/java/.../BridgeConformance.java` | JDK-only stand-in runner used for end-to-end tests without Maven |
 | `samples/` | DDS, CSV data, RPG programs, golden outputs in `expected/` |
 | `docs/bridge-protocol.md` | Protocol spec. Update it in the same change as the protocol |
@@ -34,9 +34,9 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 
 ```sh
 cargo fmt && cargo clippy --all-targets -- -D warnings
-OPENEYE_TEST_DATABASE_URL=postgres://openeye:openeye@127.0.0.1/openeye cargo test
-javac -d target/conformance-classes jvm/src/main/java/io/openeye/bridge/*.java jvm/src/test/java/io/openeye/bridge/*.java
-OPENEYE_BIN=target/debug/openeye OPENEYE_RUNNER="java -cp target/conformance-classes io.openeye.bridge.BridgeConformance" scripts/demo.sh
+IBMISH_TEST_DATABASE_URL=postgres://ibmish:ibmish@127.0.0.1/ibmish cargo test
+javac -d target/conformance-classes jvm/src/main/java/io/ibmish/bridge/*.java jvm/src/test/java/io/ibmish/bridge/*.java
+IBMISH_BIN=target/debug/ibmish IBMISH_RUNNER="java -cp target/conformance-classes io.ibmish.bridge.BridgeConformance" scripts/demo.sh
 cd jvm && ./gradlew fatJar   # needs Maven Central
 ```
 

@@ -2,7 +2,7 @@
 
 **Question:** can RPG programs running on Jariko do their file I/O through a Rust core that stores the data in PostgreSQL, with IBM i record-level-access semantics?
 
-**Answer so far: yes for the Rust core, the protocol and the Java client. These were built and tested end to end on 2026-10-14. The Jariko adapter is written but has not been compiled yet, because the build environment could not reach Maven Central. The `jariko` CI job is the first place it will build and run.**
+**Answer so far: yes for the Rust core, the protocol and the Java client. These were built and tested end to end on 2026-10-14. On 2026-10-15 the Jariko adapter compiled against Jariko v2.2.0. Running the sample programs on Jariko against PostgreSQL (CI job `jariko`) is the remaining check.**
 
 ## What was built
 
@@ -13,8 +13,8 @@
 | Record-level access: SETLL, SETGT, CHAIN, READ, READP, READE, READPE, WRITE, UPDATE, DELETE | Done | 12 integration tests on PostgreSQL 16 |
 | Bridge server (JSON lines over loopback TCP) | Done | Protocol round-trip test |
 | Java bridge client, no dependencies | Done | `SELFTEST`: 11 checks pass |
-| `openeye call`: starts the bridge, launches the JVM runner, returns its exit code | Done | `scripts/demo.sh` matches the golden outputs |
-| Jariko adapter (reload `DBMManager` + `DBFile`) and runner | **Written, not yet compiled** | CI job `jariko` |
+| `ibmish call`: starts the bridge, launches the JVM runner, returns its exit code | Done | `scripts/demo.sh` matches the golden outputs |
+| Jariko adapter (reload `DBMManager` + `DBFile`) and runner | Compiles (Windows, JDK 21, Jariko v2.2.0); end-to-end run on Jariko still pending | CI job `jariko` |
 | Docker image + compose | Written, not yet built | CI job `docker` |
 
 ## Measurements
@@ -37,7 +37,7 @@ This is exactly the "plausible but wrong" failure that AI-assisted development r
 
 ## Open items before calling the spike done
 
-1. Run CI (or build `jvm/` on a machine with Maven access) and confirm that `openeye-jvm.jar` builds against the pinned Jariko release (`jvm/gradle.properties`) and that both sample programs match their golden output.
+1. ~~Build `ibmish-jvm.jar` against the pinned Jariko release~~ (done 2026-10-15). Still to do: run both sample programs on Jariko and match their golden output (CI job `jariko`).
 2. Confirm the number format Jariko sends on WRITE/UPDATE (`asString()` of packed values) parses as a plain decimal.
 3. Confirm how Jariko renders `DSPLY` on standard output, and adjust the golden-file comparison if it adds a prefix.
 4. Decide on the EBCDIC collating sequence fix (see fidelity-gaps.md).

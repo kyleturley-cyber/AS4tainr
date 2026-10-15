@@ -1,4 +1,4 @@
-package io.openeye.jvm
+package io.ibmish.jvm
 
 import com.smeup.dbnative.file.DBFile
 import com.smeup.dbnative.file.Record
@@ -6,14 +6,14 @@ import com.smeup.dbnative.file.RecordField
 import com.smeup.dbnative.file.Result
 import com.smeup.dbnative.log.Logger
 import com.smeup.dbnative.model.FileMetadata
-import io.openeye.bridge.BridgeClient
-import io.openeye.bridge.ReadResult
+import io.ibmish.bridge.BridgeClient
+import io.ibmish.bridge.ReadResult
 
 /**
  * One open file (one F-spec) in a Jariko program. Each operation is one
  * bridge round trip; %EOF and %EQUAL are cached from the last response.
  */
-class OpenEyeDBFile(
+class IbmishDBFile(
     override var name: String,
     override var fileMetadata: FileMetadata,
     private val client: BridgeClient,

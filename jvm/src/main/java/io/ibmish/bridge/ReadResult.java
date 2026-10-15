@@ -1,4 +1,4 @@
-package io.openeye.bridge;
+package io.ibmish.bridge;
 
 import java.util.Collections;
 import java.util.Map;

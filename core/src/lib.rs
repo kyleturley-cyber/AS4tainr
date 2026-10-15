@@ -1,4 +1,4 @@
-//! OpenEye core library: an IBM i-compatible runtime for containers.
+//! ibmish core library: an IBM i-compatible runtime for containers.
 //!
 //! Modules:
 //! - [`dds`]: parse DDS source for physical files

@@ -1,14 +1,14 @@
 //! Object catalog. Libraries map to PostgreSQL schemas; a physical file's
 //! data lives in a table of that schema, and its description (fields, keys)
-//! lives in the `openeye` catalog schema.
+//! lives in the `ibmish` catalog schema.
 
 use crate::dds::{DataType, FieldDef, PhysicalFile};
 use anyhow::{bail, Context, Result};
 use tokio_postgres::Client;
 
 const CATALOG_DDL: &str = r#"
-CREATE SCHEMA IF NOT EXISTS openeye;
-CREATE TABLE IF NOT EXISTS openeye.objects (
+CREATE SCHEMA IF NOT EXISTS ibmish;
+CREATE TABLE IF NOT EXISTS ibmish.objects (
     library   text NOT NULL,
     name      text NOT NULL,
     objtype   text NOT NULL,
@@ -17,14 +17,14 @@ CREATE TABLE IF NOT EXISTS openeye.objects (
     created   timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (library, name, objtype)
 );
-CREATE TABLE IF NOT EXISTS openeye.files (
+CREATE TABLE IF NOT EXISTS ibmish.files (
     library   text NOT NULL,
     name      text NOT NULL,
     format    text NOT NULL,
     is_unique boolean NOT NULL DEFAULT false,
     PRIMARY KEY (library, name)
 );
-CREATE TABLE IF NOT EXISTS openeye.file_fields (
+CREATE TABLE IF NOT EXISTS ibmish.file_fields (
     library   text NOT NULL,
     file      text NOT NULL,
     seq       int  NOT NULL,
@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS openeye.file_fields (
     text      text NOT NULL DEFAULT '',
     PRIMARY KEY (library, file, seq)
 );
-CREATE TABLE IF NOT EXISTS openeye.file_keys (
+CREATE TABLE IF NOT EXISTS ibmish.file_keys (
     library text NOT NULL,
     file    text NOT NULL,
     seq     int  NOT NULL,
@@ -76,15 +76,32 @@ impl FileRef {
     }
 }
 
+/// Advisory lock key that serializes catalog creation ("IBMISH" in ASCII).
+const INIT_LOCK_KEY: i64 = 0x49424D495348;
+
 pub async fn init(client: &Client) -> Result<()> {
+    // `CREATE SCHEMA IF NOT EXISTS` is not safe against concurrent callers:
+    // two sessions can both see "missing" and one fails on a duplicate key.
+    // Several processes may initialize at once (containers starting
+    // together, parallel tests), so take a session-wide advisory lock.
     client
-        .batch_execute(CATALOG_DDL)
-        .await
-        .context("creating catalog")?;
-    for lib in ["QSYS", "QGPL", "QTEMP"] {
-        create_library(client, lib, "System library").await?;
+        .execute("SELECT pg_advisory_lock($1)", &[&INIT_LOCK_KEY])
+        .await?;
+    let result = async {
+        client
+            .batch_execute(CATALOG_DDL)
+            .await
+            .context("creating catalog")?;
+        for lib in ["QSYS", "QGPL", "QTEMP"] {
+            create_library(client, lib, "System library").await?;
+        }
+        Ok::<(), anyhow::Error>(())
     }
-    Ok(())
+    .await;
+    client
+        .execute("SELECT pg_advisory_unlock($1)", &[&INIT_LOCK_KEY])
+        .await?;
+    result
 }
 
 pub async fn create_library(client: &Client, library: &str, text: &str) -> Result<()> {
@@ -94,7 +111,7 @@ pub async fn create_library(client: &Client, library: &str, text: &str) -> Resul
         .await?;
     client
         .execute(
-            "INSERT INTO openeye.objects (library, name, objtype, text) VALUES ('QSYS', $1, '*LIB', $2)
+            "INSERT INTO ibmish.objects (library, name, objtype, text) VALUES ('QSYS', $1, '*LIB', $2)
              ON CONFLICT DO NOTHING",
             &[&lib, &text],
         )
@@ -116,7 +133,7 @@ pub async fn create_physical_file(
     let tx = client.transaction().await?;
     let exists = tx
         .query_opt(
-            "SELECT 1 FROM openeye.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+            "SELECT 1 FROM ibmish.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
             &[&lib, &name],
         )
         .await?;
@@ -125,7 +142,7 @@ pub async fn create_physical_file(
     }
     let lib_exists = tx
         .query_opt(
-            "SELECT 1 FROM openeye.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
+            "SELECT 1 FROM ibmish.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
             &[&lib],
         )
         .await?;
@@ -134,12 +151,12 @@ pub async fn create_physical_file(
     }
 
     tx.execute(
-        "INSERT INTO openeye.objects (library, name, objtype, attribute, text) VALUES ($1,$2,'*FILE','PF',$3)",
+        "INSERT INTO ibmish.objects (library, name, objtype, attribute, text) VALUES ($1,$2,'*FILE','PF',$3)",
         &[&lib, &name, &pf.text],
     )
     .await?;
     tx.execute(
-        "INSERT INTO openeye.files (library, name, format, is_unique) VALUES ($1,$2,$3,$4)",
+        "INSERT INTO ibmish.files (library, name, format, is_unique) VALUES ($1,$2,$3,$4)",
         &[&lib, &name, &pf.format, &pf.unique],
     )
     .await?;
@@ -148,7 +165,7 @@ pub async fn create_physical_file(
         let len = f.length as i32;
         let dec = f.decimals as i32;
         tx.execute(
-            "INSERT INTO openeye.file_fields VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            "INSERT INTO ibmish.file_fields VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
             &[
                 &lib,
                 &name,
@@ -165,7 +182,7 @@ pub async fn create_physical_file(
     for (i, k) in pf.keys.iter().enumerate() {
         let seq = i as i32;
         tx.execute(
-            "INSERT INTO openeye.file_keys VALUES ($1,$2,$3,$4)",
+            "INSERT INTO ibmish.file_keys VALUES ($1,$2,$3,$4)",
             &[&lib, &name, &seq, k],
         )
         .await?;
@@ -234,16 +251,16 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
     for lib in &search {
         let row = client
             .query_opt(
-                "SELECT format, is_unique, (SELECT text FROM openeye.objects o
+                "SELECT format, is_unique, (SELECT text FROM ibmish.objects o
                     WHERE o.library=f.library AND o.name=f.name AND o.objtype='*FILE')
-                 FROM openeye.files f WHERE library=$1 AND name=$2",
+                 FROM ibmish.files f WHERE library=$1 AND name=$2",
                 &[lib, &name],
             )
             .await?;
         let Some(row) = row else { continue };
         let fields = client
             .query(
-                "SELECT name, data_type, length, decimals, text FROM openeye.file_fields
+                "SELECT name, data_type, length, decimals, text FROM ibmish.file_fields
                  WHERE library=$1 AND file=$2 ORDER BY seq",
                 &[lib, &name],
             )
@@ -261,7 +278,7 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
             .collect::<Result<Vec<_>>>()?;
         let keys = client
             .query(
-                "SELECT field FROM openeye.file_keys WHERE library=$1 AND file=$2 ORDER BY seq",
+                "SELECT field FROM ibmish.file_keys WHERE library=$1 AND file=$2 ORDER BY seq",
                 &[lib, &name],
             )
             .await?

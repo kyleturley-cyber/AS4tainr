@@ -1,31 +1,31 @@
-package io.openeye.jvm
+package io.ibmish.jvm
 
 import com.smeup.dbnative.ConnectionConfig
 import com.smeup.dbnative.DBManagerBaseImpl
 import com.smeup.dbnative.file.DBFile
 import com.smeup.dbnative.model.Field
 import com.smeup.dbnative.model.FileMetadata
-import io.openeye.bridge.BridgeClient
+import io.ibmish.bridge.BridgeClient
 
 /**
- * A reload DBMManager that sends every file operation to OpenEye core over
+ * A reload DBMManager that sends every file operation to ibmish core over
  * the bridge, instead of talking to a database over JDBC.
  *
- * Configure it with `impl = io.openeye.jvm.OpenEyeDBMManager` and
- * `url = openeye://HOST:PORT`. reload instantiates it reflectively with a
+ * Configure it with `impl = io.ibmish.jvm.IbmishDBMManager` and
+ * `url = ibmish://HOST:PORT`. reload instantiates it reflectively with a
  * single ConnectionConfig argument.
  */
-class OpenEyeDBMManager(
+class IbmishDBMManager(
     override val connectionConfig: ConnectionConfig,
 ) : DBManagerBaseImpl<String, Any>() {
     private val client: BridgeClient by lazy { BridgeClient.connect(hostPort()) }
-    private val openFiles = mutableMapOf<String, OpenEyeDBFile>()
+    private val openFiles = mutableMapOf<String, IbmishDBFile>()
 
     private fun hostPort(): String = connectionConfig.url.removePrefix(URL_PREFIX)
 
     override fun validateConfig() {
         require(connectionConfig.url.startsWith(URL_PREFIX)) {
-            "OpenEye connection URLs look like ${URL_PREFIX}HOST:PORT, got ${connectionConfig.url}"
+            "ibmish connection URLs look like ${URL_PREFIX}HOST:PORT, got ${connectionConfig.url}"
         }
     }
 
@@ -35,13 +35,13 @@ class OpenEyeDBMManager(
         try {
             client.metadata(name)
             true
-        } catch (e: io.openeye.bridge.BridgeException) {
+        } catch (e: io.ibmish.bridge.BridgeException) {
             false
         }
 
     override fun openFile(name: String): DBFile =
         openFiles.getOrPut(name.uppercase()) {
-            OpenEyeDBFile(name.uppercase(), metadataOf(name), client)
+            IbmishDBFile(name.uppercase(), metadataOf(name), client)
         }
 
     override fun closeFile(name: String) {
@@ -55,7 +55,7 @@ class OpenEyeDBMManager(
     }
 
     companion object {
-        const val URL_PREFIX = "openeye://"
+        const val URL_PREFIX = "ibmish://"
 
         @Suppress("UNCHECKED_CAST")
         fun reloadMetadata(md: Map<String, Any?>): FileMetadata {

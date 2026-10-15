@@ -1,4 +1,4 @@
-package io.openeye.bridge;
+package io.ibmish.bridge;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -12,7 +12,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Client for the OpenEye core bridge: one JSON object per line over a loopback
+ * Client for the ibmish core bridge: one JSON object per line over a loopback
  * TCP socket. One client is one job's database session. Thread-safe (calls are
  * serialized), but a job normally uses it from one thread.
  *
@@ -34,7 +34,7 @@ public final class BridgeClient implements AutoCloseable {
         Map<String, Object> hello = call(req("hello"));
         long v = ((Number) hello.get("version")).longValue();
         if (v != PROTOCOL_VERSION) {
-            throw new BridgeException("OpenEye core speaks bridge protocol " + v + ", this client speaks " + PROTOCOL_VERSION);
+            throw new BridgeException("ibmish core speaks bridge protocol " + v + ", this client speaks " + PROTOCOL_VERSION);
         }
     }
 
@@ -68,7 +68,7 @@ public final class BridgeClient implements AutoCloseable {
             out.write('\n');
             out.flush();
             String line = in.readLine();
-            if (line == null) throw new BridgeException("OpenEye core closed the bridge connection");
+            if (line == null) throw new BridgeException("ibmish core closed the bridge connection");
             Map<String, Object> resp = (Map<String, Object>) Json.parse(line);
             if (!Boolean.TRUE.equals(resp.get("ok"))) {
                 throw new BridgeException(String.valueOf(resp.get("error")));

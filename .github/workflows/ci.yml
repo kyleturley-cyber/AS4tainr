@@ -13,15 +13,15 @@ jobs:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_USER: openeye
-          POSTGRES_PASSWORD: openeye
-          POSTGRES_DB: openeye
+          POSTGRES_USER: ibmish
+          POSTGRES_PASSWORD: ibmish
+          POSTGRES_DB: ibmish
         ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U openeye" --health-interval 2s --health-retries 30
+          --health-cmd "pg_isready -U ibmish" --health-interval 2s --health-retries 30
     env:
-      OPENEYE_TEST_DATABASE_URL: postgres://openeye:openeye@127.0.0.1/openeye
-      OPENEYE_DATABASE_URL: postgres://openeye:openeye@127.0.0.1/openeye
+      IBMISH_TEST_DATABASE_URL: postgres://ibmish:ibmish@127.0.0.1/ibmish
+      IBMISH_DATABASE_URL: postgres://ibmish:ibmish@127.0.0.1/ibmish
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -35,14 +35,14 @@ jobs:
           distribution: temurin
           java-version: "17"
       - name: Compile the dependency-free bridge client and conformance runner
-        run: javac -d target/conformance-classes jvm/src/main/java/io/openeye/bridge/*.java jvm/src/test/java/io/openeye/bridge/*.java
+        run: javac -d target/conformance-classes jvm/src/main/java/io/ibmish/bridge/*.java jvm/src/test/java/io/ibmish/bridge/*.java
       - name: End-to-end with the conformance runner
         env:
-          OPENEYE_BIN: target/debug/openeye
-          OPENEYE_RUNNER: java -cp target/conformance-classes io.openeye.bridge.BridgeConformance
+          IBMISH_BIN: target/debug/ibmish
+          IBMISH_RUNNER: java -cp target/conformance-classes io.ibmish.bridge.BridgeConformance
         run: |
           scripts/demo.sh
-          target/debug/openeye call SELFTEST
+          target/debug/ibmish call SELFTEST
 
   jariko:
     name: Jariko runner end to end
@@ -52,14 +52,14 @@ jobs:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_USER: openeye
-          POSTGRES_PASSWORD: openeye
-          POSTGRES_DB: openeye
+          POSTGRES_USER: ibmish
+          POSTGRES_PASSWORD: ibmish
+          POSTGRES_DB: ibmish
         ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U openeye" --health-interval 2s --health-retries 30
+          --health-cmd "pg_isready -U ibmish" --health-interval 2s --health-retries 30
     env:
-      OPENEYE_DATABASE_URL: postgres://openeye:openeye@127.0.0.1/openeye
+      IBMISH_DATABASE_URL: postgres://ibmish:ibmish@127.0.0.1/ibmish
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -68,13 +68,13 @@ jobs:
           distribution: temurin
           java-version: "17"
       - run: cargo build --locked
-      - name: Build openeye-jvm.jar (Jariko + bridge adapter)
+      - name: Build ibmish-jvm.jar (Jariko + bridge adapter)
         working-directory: jvm
         run: ./gradlew --no-daemon fatJar
       - name: Run the sample RPG programs on Jariko against PostgreSQL
         env:
-          OPENEYE_BIN: target/debug/openeye
-          OPENEYE_RUNNER: java -jar jvm/build/libs/openeye-jvm.jar
+          IBMISH_BIN: target/debug/ibmish
+          IBMISH_RUNNER: java -jar jvm/build/libs/ibmish-jvm.jar
         run: scripts/demo.sh
 
   docker:
@@ -83,4 +83,4 @@ jobs:
     needs: jariko
     steps:
       - uses: actions/checkout@v4
-      - run: docker compose up --build --abort-on-container-exit --exit-code-from openeye
+      - run: docker compose up --build --abort-on-container-exit --exit-code-from ibmish

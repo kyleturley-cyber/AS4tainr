@@ -1,10 +1,10 @@
 //! Integration tests for the catalog, record-level access and the bridge.
 //!
-//! Needs a PostgreSQL database. Set OPENEYE_TEST_DATABASE_URL, e.g.
-//! `postgres://openeye:openeye@127.0.0.1/openeye`. Without it, tests are skipped.
+//! Needs a PostgreSQL database. Set IBMISH_TEST_DATABASE_URL, e.g.
+//! `postgres://ibmish:ibmish@127.0.0.1/ibmish`. Without it, tests are skipped.
 //! Each test creates its own library, so tests can run in parallel.
 
-use openeye_core::{bridge, catalog, dds, rla};
+use ibmish_core::{bridge, catalog, dds, rla};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -16,7 +16,7 @@ const ORDLIN: &str = include_str!("../../samples/qddssrc/ORDLIN.pf");
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
 fn db_url() -> Option<String> {
-    std::env::var("OPENEYE_TEST_DATABASE_URL").ok()
+    std::env::var("IBMISH_TEST_DATABASE_URL").ok()
 }
 
 macro_rules! require_db {
@@ -24,7 +24,7 @@ macro_rules! require_db {
         match db_url() {
             Some(u) => u,
             None => {
-                eprintln!("skipped: OPENEYE_TEST_DATABASE_URL not set");
+                eprintln!("skipped: IBMISH_TEST_DATABASE_URL not set");
                 return;
             }
         }
@@ -42,9 +42,9 @@ async fn setup(url: &str) -> (Client, String) {
     );
     client
         .batch_execute(&format!(
-            "DROP SCHEMA IF EXISTS {} CASCADE; DELETE FROM openeye.objects WHERE library='{lib}' OR name='{lib}';
-             DELETE FROM openeye.files WHERE library='{lib}'; DELETE FROM openeye.file_fields WHERE library='{lib}';
-             DELETE FROM openeye.file_keys WHERE library='{lib}';",
+            "DROP SCHEMA IF EXISTS {} CASCADE; DELETE FROM ibmish.objects WHERE library='{lib}' OR name='{lib}';
+             DELETE FROM ibmish.files WHERE library='{lib}'; DELETE FROM ibmish.file_fields WHERE library='{lib}';
+             DELETE FROM ibmish.file_keys WHERE library='{lib}';",
             catalog::ident(&lib)
         ))
         .await

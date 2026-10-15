@@ -1,5 +1,5 @@
-# OpenEye all-in-one image: the Rust core plus a JRE running Jariko.
-# Build from the repository root:  docker build -f docker/Dockerfile -t openeye .
+# ibmish all-in-one image: the Rust core plus a JRE running Jariko.
+# Build from the repository root:  docker build -f docker/Dockerfile -t ibmish .
 
 FROM rust:1-bookworm AS core
 WORKDIR /src
@@ -15,12 +15,12 @@ RUN gradle --no-daemon fatJar
 
 FROM eclipse-temurin:17-jre
 RUN apt-get update && apt-get install -y --no-install-recommends bash diffutils && rm -rf /var/lib/apt/lists/*
-COPY --from=core /src/target/release/openeye /usr/local/bin/openeye
-COPY --from=jvm /src/jvm/build/libs/openeye-jvm.jar /opt/openeye/openeye-jvm.jar
-COPY samples /opt/openeye/samples
-COPY scripts/demo.sh /opt/openeye/demo.sh
-ENV OPENEYE_RUNNER="java -jar /opt/openeye/openeye-jvm.jar" \
-    OPENEYE_PGM_PATH=/opt/openeye/samples/qrpglesrc \
-    OPENEYE_SAMPLES=/opt/openeye/samples
-ENTRYPOINT ["openeye"]
+COPY --from=core /src/target/release/ibmish /usr/local/bin/ibmish
+COPY --from=jvm /src/jvm/build/libs/ibmish-jvm.jar /opt/ibmish/ibmish-jvm.jar
+COPY samples /opt/ibmish/samples
+COPY scripts/demo.sh /opt/ibmish/demo.sh
+ENV IBMISH_RUNNER="java -jar /opt/ibmish/ibmish-jvm.jar" \
+    IBMISH_PGM_PATH=/opt/ibmish/samples/qrpglesrc \
+    IBMISH_SAMPLES=/opt/ibmish/samples
+ENTRYPOINT ["ibmish"]
 CMD ["--help"]

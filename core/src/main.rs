@@ -1,21 +1,21 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use openeye_core::{bridge, catalog, dds, rla};
+use ibmish_core::{bridge, catalog, dds, rla};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "openeye",
+    name = "ibmish",
     version,
-    about = "OpenEye: an IBM i-compatible runtime"
+    about = "ibmish: an IBM i-compatible runtime"
 )]
 struct Cli {
     /// PostgreSQL connection URL.
     #[arg(
         long,
         global = true,
-        env = "OPENEYE_DATABASE_URL",
-        default_value = "postgres://openeye:openeye@127.0.0.1/openeye"
+        env = "IBMISH_DATABASE_URL",
+        default_value = "postgres://ibmish:ibmish@127.0.0.1/ibmish"
     )]
     database_url: String,
 
@@ -23,7 +23,7 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        env = "OPENEYE_LIBL",
+        env = "IBMISH_LIBL",
         default_value = "QGPL",
         value_delimiter = ','
     )]
@@ -71,8 +71,8 @@ enum Cmd {
         /// Command that runs RPG programs.
         #[arg(
             long,
-            env = "OPENEYE_RUNNER",
-            default_value = "java -jar /opt/openeye/openeye-jvm.jar"
+            env = "IBMISH_RUNNER",
+            default_value = "java -jar /opt/ibmish/ibmish-jvm.jar"
         )]
         runner: String,
     },
@@ -112,7 +112,7 @@ async fn main() -> std::process::ExitCode {
     match run(Cli::parse()).await {
         Ok(code) => std::process::ExitCode::from(code),
         Err(e) => {
-            eprintln!("openeye: {e:#}");
+            eprintln!("ibmish: {e:#}");
             std::process::ExitCode::from(1)
         }
     }
@@ -130,7 +130,7 @@ async fn run(cli: Cli) -> Result<u8> {
         Cmd::Init => {
             let client = bridge::connect_db(&cli.database_url).await?;
             catalog::init(&client).await?;
-            println!("OpenEye catalog ready.");
+            println!("ibmish catalog ready.");
         }
         Cmd::Crtlib { library, text } => {
             let client = bridge::connect_db(&cli.database_url).await?;
@@ -181,7 +181,7 @@ async fn run(cli: Cli) -> Result<u8> {
         }
         Cmd::Serve { port } => {
             let listener = bridge::bind(port).await?;
-            println!("OpenEye bridge listening on {}", listener.local_addr()?);
+            println!("ibmish bridge listening on {}", listener.local_addr()?);
             bridge::serve(
                 listener,
                 bridge::BridgeConfig {
@@ -218,7 +218,7 @@ async fn run(cli: Cli) -> Result<u8> {
             server.abort();
             if !status.success() {
                 eprintln!(
-                    "openeye: program {} ended abnormally ({status})",
+                    "ibmish: program {} ended abnormally ({status})",
                     program.to_ascii_uppercase()
                 );
                 return Ok(status.code().map(|c| c.clamp(1, 255) as u8).unwrap_or(1));

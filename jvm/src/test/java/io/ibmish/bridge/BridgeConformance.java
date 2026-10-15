@@ -1,4 +1,4 @@
-package io.openeye.bridge;
+package io.ibmish.bridge;
 
 import java.math.BigDecimal;
 import java.util.Arrays;
@@ -7,7 +7,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * A stand-in runner for `openeye call`, with no dependencies beyond the JDK.
+ * A stand-in runner for `ibmish call`, with no dependencies beyond the JDK.
  *
  * It is launched exactly like the Jariko runner (`--bridge HOST:PORT PGM args...`)
  * and replays, in Java, the file operations of the sample RPG programs in

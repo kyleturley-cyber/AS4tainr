@@ -1,6 +1,6 @@
-package io.openeye.bridge;
+package io.ibmish.bridge;
 
-/** An error reported by OpenEye core, e.g. "CPF5026: duplicate key on a UNIQUE file". */
+/** An error reported by ibmish core, e.g. "CPF5026: duplicate key on a UNIQUE file". */
 public class BridgeException extends RuntimeException {
     public BridgeException(String message) {
         super(message);

@@ -1,6 +1,6 @@
 # Bridge protocol (version 1)
 
-The bridge connects the JVM (Jariko running RPG) to OpenEye core, which carries out every file operation. It uses TCP on loopback only, with one UTF-8 JSON object per line in each direction, strictly request then response.
+The bridge connects the JVM (Jariko running RPG) to ibmish core, which carries out every file operation. It uses TCP on loopback only, with one UTF-8 JSON object per line in each direction, strictly request then response.
 
 One connection is one job's database session. The handles it opens belong to that connection and disappear when it closes.
 

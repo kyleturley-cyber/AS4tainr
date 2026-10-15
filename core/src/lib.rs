@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod cl;
 pub mod commands;
 pub mod dds;
+pub mod dspf;
 pub mod rla;
 pub mod tn5250;
 pub mod users;

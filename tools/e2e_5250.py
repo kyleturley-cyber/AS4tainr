@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """End-to-end test of the ibmish 5250 server with the real tn5250 client.
 
-Expects a fresh database (QSECOFR with its initial, expired password) and
-the sample files CUSTMAST/ORDLIN in QGPL. Usage:
+Expects a fresh database (QSECOFR with its initial, expired password), the
+sample file CUSTMAST and the display file CUSTINQD in QGPL. Usage:
 
     TN5250=/path/to/tn5250 python3 tools/e2e_5250.py 127.0.0.1:2323
 """
@@ -95,6 +95,30 @@ with Tn5250(HOST) as t:
     t.pump(0.5)
     check("call custlist" in t.line(20), "F9 retrieves the previous command", t)
     t.fkey(12)
+
+    # Interactive RPG: EXFMT with the CUSTINQD display file.
+    FIELD_EXIT = "\x0b"  # tn5250: Ctrl-K
+    command(t, "call custinq", "Customer Inquiry", timeout=90)
+    check("Customer number" in t.line(5) and "F3=Exit" in t.line(23), "EXFMT shows the PROMPT record from DDS", t)
+    t.type("42"); t.enter()
+    t.wait_for("Customer not found.")
+    check("Customer not found." in t.line(24), "ERRMSG on *IN30 shows for an unknown customer", t)
+    t.type("5"); t.send(FIELD_EXIT); t.enter()
+    t.wait_for("Lake, Pine & Co")
+    check("Duluth" in t.line(7), "DETAIL shows the record read with CHAIN", t)
+    check("75.25-" in t.line(8), "EDTCDE(J) edits a negative balance", t)
+    t.fkey(5)
+    t.wait_for("not valid")
+    check("F5" in t.line(24), "an undefined function key is rejected on the display", t)
+    t.fkey(12)
+    t.wait_for("Type a customer number")
+    check(True, "F12 (CA12) returns to PROMPT", t)
+    t.type("1"); t.send(FIELD_EXIT); t.enter()
+    t.wait_for("Acme Tooling")
+    check("1,250.50" in t.line(8), "EDTCDE(J) inserts thousands separators", t)
+    t.fkey(3)
+    t.wait_for("Command Entry")
+    check("ended abnormally" not in t.text(), "F3 (CA03) ends the program normally", t)
 
     command(t, "signoff", "Sign On")
     check("signed off" in t.line(24), "SIGNOFF returns to the sign-on screen", t)

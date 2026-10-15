@@ -22,6 +22,6 @@ public final class Launcher {
         } finally {
             System.setOut(out);
         }
-        MainKt.main(args);
+        Runner.main(args);
     }
 }

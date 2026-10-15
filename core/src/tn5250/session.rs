@@ -12,6 +12,7 @@ use super::ds::{self, attr, Aid, FieldKind, Screen};
 use super::telnet::{opcode, Connection};
 use crate::bridge;
 use crate::commands::{Environment, Job, ListDisplay, Outcome};
+use crate::dspf;
 use crate::users;
 
 #[derive(Debug, Clone)]
@@ -161,14 +162,17 @@ pub async fn run(stream: tokio::net::TcpStream, cfg: &ServerConfig, device: &str
             "" => profile.curlib.clone(),
             c => c.to_string(),
         };
+        // Programs called from this session show their display files here.
+        let (display_tx, mut display_rx) = tokio::sync::mpsc::channel::<bridge::DisplayRequest>(1);
         let mut job = Job {
             client: &client,
             env: &cfg.env,
             user: profile.name.clone(),
             curlib,
             libl: cfg.libl.clone(),
+            display: Some(display_tx),
         };
-        command_entry(&mut term, &mut job, cfg).await?;
+        command_entry(&mut term, &mut job, cfg, &mut display_rx).await?;
         message = format!("User {} signed off.", profile.name);
     }
 }
@@ -239,7 +243,12 @@ async fn change_password(
 const LOG_TOP: u8 = 3;
 const LOG_ROWS: usize = 16; // rows 3..=18
 
-async fn command_entry(term: &mut Term, job: &mut Job<'_>, cfg: &ServerConfig) -> Result<()> {
+async fn command_entry(
+    term: &mut Term,
+    job: &mut Job<'_>,
+    cfg: &ServerConfig,
+    display_rx: &mut tokio::sync::mpsc::Receiver<bridge::DisplayRequest>,
+) -> Result<()> {
     let mut log: Vec<String> = vec![format!("Signed on to {} as {}.", cfg.system_name, job.user)];
     let mut message = String::new();
     let mut retrieve: Vec<String> = Vec::new();
@@ -296,7 +305,25 @@ async fn command_entry(term: &mut Term, job: &mut Job<'_>, cfg: &ServerConfig) -
         retrieve.push(line.clone());
         retrieve_pos = 0;
         log.push(format!("> {line}"));
-        match job.run(&line).await {
+        // Run the command; while it runs, show any display file records
+        // its program writes (EXFMT) on this terminal.
+        let user = job.user.clone();
+        let run = job.run(&line);
+        tokio::pin!(run);
+        let result = loop {
+            tokio::select! {
+                r = &mut run => break r,
+                Some(req) = display_rx.recv() => {
+                    let resp = exfmt(term, &req, &user, &cfg.system_name).await;
+                    let failed = resp.is_err();
+                    let _ = req.reply.send(resp.map_err(|e| format!("{e:#}")));
+                    if failed {
+                        anyhow::bail!("the display stopped responding");
+                    }
+                }
+            }
+        };
+        match result {
             Ok(Outcome::Messages(msgs)) => {
                 if let Some(last) = msgs.last() {
                     message = last.clone();
@@ -312,10 +339,81 @@ async fn command_entry(term: &mut Term, job: &mut Job<'_>, cfg: &ServerConfig) -
                 let lines: Vec<&str> = text.lines().collect();
                 message = lines.last().copied().unwrap_or("").to_string();
                 log.extend(lines.iter().map(|m| format!("  {m}")));
-                prefill = line;
+                prefill = line.clone();
             }
         }
     }
+}
+
+/// Show one record format until the operator enters valid input.
+async fn exfmt(
+    term: &mut Term,
+    req: &bridge::DisplayRequest,
+    user: &str,
+    system: &str,
+) -> Result<dspf::Response> {
+    let record = req
+        .file
+        .records
+        .iter()
+        .find(|r| r.name == req.format)
+        .ok_or_else(|| anyhow::anyhow!("record format {} not found", req.format))?;
+    let (date, time) = clock();
+    let ctx = dspf::Context {
+        user,
+        system,
+        date,
+        time,
+    };
+    let mut values = req.values.clone();
+    let mut message: Option<String> = None;
+    let mut error_field: Option<String> = None;
+    loop {
+        let r = dspf::render(
+            &req.file,
+            record,
+            &values,
+            &req.indicators,
+            &ctx,
+            message.as_deref(),
+            error_field.as_deref(),
+        );
+        let inp = term.show(&r.screen).await?;
+        match dspf::handle_input(&req.file, record, &req.indicators, &inp) {
+            dspf::Outcome::Done(resp) => return Ok(resp),
+            dspf::Outcome::Retry { message: m, field } => {
+                // Keep what the operator typed, show the error.
+                for (n, v) in inp.values {
+                    values.insert(n, v);
+                }
+                message = Some(m);
+                error_field = field;
+            }
+        }
+    }
+}
+
+/// Job date (MM/DD/YY) and time (HH:MM:SS) in UTC.
+fn clock() -> (String, String) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    (
+        format!("{m:02}/{d:02}/{:02}", y % 100),
+        format!("{:02}:{:02}:{:02}", rem / 3600, rem % 3600 / 60, rem % 60),
+    )
 }
 
 const LIST_ROWS: usize = 12;

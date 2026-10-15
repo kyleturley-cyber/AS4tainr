@@ -22,6 +22,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/catalog.rs` | Libraries = PostgreSQL schemas; file descriptions in schema `ibmish`; library list resolution |
 | `core/src/rla.rs` | Record-level access: cursor position per open file, keyset queries ordered by (keys, rrn) |
 | `core/src/bridge.rs` | JSON-lines TCP server the JVM calls for every file operation |
+| `core/src/dspf.rs` | DDS display files: parser, drawing a record on a 5250 screen, input validation, response indicators |
 | `core/src/tn5250/` | 5250 display server: telnet + records (`telnet.rs`), data stream (`ds.rs`), EBCDIC (`ebcdic.rs`), screens (`session.rs`) |
 | `core/src/cl.rs` | CL parser and the command definition table (add new commands here first) |
 | `core/src/commands.rs` | CL command implementations for a job |
@@ -29,7 +30,8 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/main.rs` | `ibmish` CLI |
 | `core/tests/rla_test.rs` | Integration tests (need `IBMISH_TEST_DATABASE_URL`) |
 | `jvm/src/main/java/io/ibmish/bridge` | Dependency-free Java bridge client (keep it dependency-free) |
-| `jvm/src/main/kotlin/io/ibmish/jvm` | Jariko integration: reload `DBMManager`/`DBFile` adapter and runner `main` |
+| `jvm/src/main/java/io/ibmish/jvm` | Runner (`Launcher`, `Runner`): Jariko configuration, display files, EXFMT. Java, so it compiles with plain javac against the jar |
+| `jvm/src/main/kotlin/io/ibmish/jvm` | reload `DBMManager`/`DBFile` adapter (database I/O through the bridge) |
 | `jvm/src/test/java/.../BridgeConformance.java` | JDK-only stand-in runner used for end-to-end tests without Maven |
 | `tools/tn5250_driver.py`, `tools/e2e_5250.py` | Drive the real tn5250 client for end-to-end tests |
 | `samples/` | DDS, CSV data, RPG programs, golden outputs in `expected/` |

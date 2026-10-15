@@ -17,7 +17,10 @@ These are places where ibmish knowingly behaves differently from IBM i. Each one
 | 5250 sessions | Many session and device options | 24x80 only; no TLS (992), no NEW-ENVIRON auto sign-on or device naming | Use only on trusted networks for now; telnet sends passwords in clear text |
 | Sign-on security | QMAXSIGN / QMAXSGNACN can disable the profile or the device | The connection closes after 3 failures; profiles are never disabled | Repeated guessing is slowed but not blocked across connections |
 | Command entry | F4 prompting, help, job log, message queues | Commands typed in full; messages shown in the session log only | |
-| Interactive programs | DDS display files (`*DSPF`) driven from RPG | Not yet: CALL shows DSPLY output only | Interactive RPG apps cannot run yet |
+| Display files | Full DDS for display files | Common subset (see display-files.md): no subfiles (`SFL`/`SFLCTL`), `OVERLAY`/`PUTOVR` (every EXFMT clears the screen), `WINDOW`, `REF`/`REFFLD`, `VALUES`/`RANGE`/`COMP`, `EDTWRD`, help, `INDARA` | Programs using subfiles or windows cannot run yet; validity checking keywords are not enforced |
+| Display I/O operations | EXFMT, WRITE + READ, READC on subfiles | EXFMT only (through Jariko's callback) | Separate WRITE/READ to a display file are not supported yet |
+| Numeric display fields | Unedited output shows the field's digits; input positions follow the data type | Unedited output shows digits, a decimal point and a sign position | Screen layouts with unedited numeric fields can be wider by one or two positions |
+| DATE / TIME constants | Job date in the job's date format; local time | MM/DD/YY and HH:MM:SS in UTC | |
 
 ## Gaps in Jariko (the RPG runtime)
 
@@ -26,4 +29,6 @@ These are RPG features Jariko does not support yet. They are worth contributing 
 | Feature | Jariko v2.2.0 | Workaround |
 | --- | --- | --- |
 | `%FOUND(filename)` | Fails with "%FOUND expression with file names is not implemented yet" | Use `%FOUND` with no argument right after the file operation |
+| `ITER` inside `DOW` | `DOW` catches `LEAVE` but not `ITER` (`DO`/`DOU` handle both); the program ends with IterException | Restructure with `IF`/`ELSE`; a one-line upstream fix |
+| Same field in two files with different numeric types | "Incongruous definitions" when a name is packed in one file and zoned in another | ibmish declares display-file numbers as packed, like most database files |
 | Startup output | Prints a version banner and feature flags on standard output | The ibmish launcher redirects it to standard error |

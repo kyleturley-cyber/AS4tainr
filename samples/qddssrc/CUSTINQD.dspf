@@ -1,0 +1,32 @@
+     A* CUSTINQD: customer inquiry display file (sample)
+     A                                      DSPSIZ(24 80 *DS3)
+     A                                      CA03(03 'Exit')
+     A          R PROMPT
+     A                                  1  2SYSNAME
+     A                                  1 31'Customer Inquiry'
+     A                                      DSPATR(HI)
+     A                                  1 72DATE
+     A                                  3  2'Type a customer number, -
+     A                                      press Enter.'
+     A                                  5  4'Customer number . . . .'
+     A            CUSNUM         5Y 0B  5 29
+     A  30                                  ERRMSG('Customer not found.' 30)
+     A                                 23  2'F3=Exit'
+     A                                      COLOR(BLU)
+     A          R DETAIL
+     A                                      CA12(12 'Cancel')
+     A                                  1  2SYSNAME
+     A                                  1 31'Customer Inquiry'
+     A                                      DSPATR(HI)
+     A                                  1 72DATE
+     A                                  5  4'Customer number . . . .'
+     A            CUSNUM         5Y 0O  5 29EDTCDE(Z)
+     A                                  6  4'Name  . . . . . . . . .'
+     A            CUSNAM        30   O  6 29
+     A                                  7  4'City  . . . . . . . . .'
+     A            CUSCTY        20   O  7 29
+     A                                  8  4'Balance due . . . . . .'
+     A            CUSBAL         9Y 2O  8 29EDTCDE(J)
+     A  40                                  COLOR(RED)
+     A                                 23  2'F3=Exit   F12=Cancel'
+     A                                      COLOR(BLU)

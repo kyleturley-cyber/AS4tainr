@@ -37,6 +37,8 @@ Records are objects that map field names to strings:
 | `update` | `handle`, `record` | | Acts on the last record read; fields left out are unchanged |
 | `delete` | `handle` | | Acts on the last record read |
 | `eof`, `equal` | `handle` | `eof` / `equal` | The flags from the last operation |
+| `dspf` | `file` | `library`, `name`, `source`, `formats` | A display file's DDS source, found through the library list |
+| `exfmt` | `file`, `format`, `fields`, `indicators` | `aid`, `fields`, `indicators` | Shows a record format on the job's display and waits for input. Request `indicators` is 99 characters of `0`/`1` for `*IN01`-`*IN99`. The response has the new values of input fields, and the response indicators to set, as `{"03": true, "30": false}`. Fails when the job has no display. |
 
 A **read result** is `{"found": bool, "eof": bool, "record": {...} | null, "rrn": n | null}`.
 

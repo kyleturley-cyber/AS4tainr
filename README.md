@@ -6,7 +6,7 @@ ibmish is an open, IBM i-compatible runtime that runs in a container.
 
 It runs IBM i business applications (RPG, CL, DDS files) on ordinary Linux and cloud hosts. It does not emulate POWER hardware or boot IBM's operating system. It reimplements the interfaces that programs and people use, the same way Wine runs Windows programs: libraries and objects, database files with record-level access, 5250 green screens, and CL commands. RPG runs on [Jariko](https://github.com/smeup/jariko), an open-source RPG interpreter for the JVM.
 
-> Status: **early prototype**. Phase 0's gate is met: sign on with a real 5250 emulator, run `CRTLIB` and `DSPLIB`, and `CALL` an RPG program, all against PostgreSQL. See [docs/5250-server.md](docs/5250-server.md).
+> Status: **early prototype**. Sign on with a real 5250 emulator, run CL commands, and `CALL` RPG programs. That includes **interactive programs that use DDS display files** (`EXFMT`), all against PostgreSQL. See [docs/5250-server.md](docs/5250-server.md) and [docs/display-files.md](docs/display-files.md).
 >
 > Spike 01: ibmish can create DDS physical files, load them, and run RPG programs whose file I/O (`SETLL`, `CHAIN`, `READ`, `READE`, `READP`, `READPE`, `WRITE`, `UPDATE`, `DELETE`) goes through the Rust core into PostgreSQL. There are no 5250 screens, CL, or jobs yet. See the roadmap below.
 
@@ -24,7 +24,7 @@ It runs IBM i business applications (RPG, CL, DDS files) on ordinary Linux and c
 - **`core/`**: the Rust core (`ibmish` binary). It holds the object catalog, the DDS parser, record-level access over PostgreSQL, and the bridge server.
 - **`jvm/`**: the JVM side. `io.ibmish.bridge` is a dependency-free Java bridge client. `io.ibmish.jvm` plugs that client into Jariko as a reload `DBMManager` and provides the runner (`ibmish-jvm.jar`).
 - **`samples/`**: DDS sources, CSV data, RPG programs and their expected (golden) output.
-- **`docs/`**: [5250 server](docs/5250-server.md), [bridge protocol](docs/bridge-protocol.md), [known fidelity gaps](docs/fidelity-gaps.md), [spike 01 report](docs/spike-01.md).
+- **`docs/`**: [5250 server](docs/5250-server.md), [display files](docs/display-files.md), [bridge protocol](docs/bridge-protocol.md), [known fidelity gaps](docs/fidelity-gaps.md), [spike 01 report](docs/spike-01.md).
 
 ## Quick start (Docker)
 
@@ -38,6 +38,7 @@ This starts PostgreSQL and the ibmish 5250 server, with the sample files `QGPL/C
 CRTLIB MYLIB TEXT('My first library')
 DSPLIB QSYS
 CALL CUSTLIST PARM('3')
+CALL CUSTINQ
 SIGNOFF
 ```
 
@@ -82,6 +83,7 @@ target/debug/ibmish call SELFTEST --runner "java -cp target/conformance-classes 
 | `ibmish init` | | Creates the catalog and the `QSYS`, `QGPL` and `QTEMP` libraries |
 | `ibmish crtlib LIB` | `CRTLIB` | Creates a library (a PostgreSQL schema) |
 | `ibmish crtpf LIB/FILE --src x.pf` | `CRTPF` | Creates a physical file from DDS |
+| `ibmish crtdspf LIB/FILE --src x.dspf` | `CRTDSPF` | Creates a display file from DDS |
 | `ibmish load FILE --csv x.csv` | `CPYFRMIMPF` (roughly) | Writes CSV rows with `WRITE` |
 | `ibmish call PGM [parms]` | `CALL` | Runs an RPG program through the runner |
 | `ibmish serve --port 7250` | | Runs a standalone bridge server |

@@ -51,6 +51,14 @@ enum Cmd {
         #[arg(long)]
         src: PathBuf,
     },
+    /// CRTDSPF: create a display file from DDS source.
+    Crtdspf {
+        /// Qualified name, LIB/FILE.
+        file: String,
+        /// DDS source file.
+        #[arg(long)]
+        src: PathBuf,
+    },
     /// Load records from a CSV file (header row = field names) with WRITE.
     Load {
         /// File name, optionally qualified LIB/FILE.
@@ -172,6 +180,23 @@ async fn run(cli: Cli) -> Result<u8> {
                 }
             );
         }
+        Cmd::Crtdspf { file, src } => {
+            let (lib, name) = split_lib_file(&file)?;
+            let source = std::fs::read_to_string(&src)
+                .with_context(|| format!("reading {}", src.display()))?;
+            let mut client = bridge::connect_db(&cli.database_url).await?;
+            let f = catalog::create_display_file(&mut client, &lib, &name, &source).await?;
+            println!(
+                "Display file {} created in library {} (record formats: {}).",
+                f.name,
+                lib.to_ascii_uppercase(),
+                f.records
+                    .iter()
+                    .map(|r| r.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         Cmd::Load { file, csv } => {
             let client = bridge::connect_db(&cli.database_url).await?;
             let f = catalog::resolve_file(&client, &libl, &file).await?;
@@ -203,6 +228,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 bridge::BridgeConfig {
                     database_url: cli.database_url,
                     library_list: libl,
+                    display: None,
                 },
             )
             .await?;
@@ -245,6 +271,7 @@ async fn run(cli: Cli) -> Result<u8> {
             let cfg = bridge::BridgeConfig {
                 database_url: cli.database_url,
                 library_list: libl,
+                display: None,
             };
             let server = tokio::spawn(bridge::serve(listener, cfg));
 

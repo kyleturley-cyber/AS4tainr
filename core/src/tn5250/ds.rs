@@ -24,8 +24,24 @@ pub mod attr {
     pub const HIGH: u8 = 0x22; // white / high intensity
     pub const UNDERLINE: u8 = 0x24; // green, underlined (input fields)
     pub const NONDISPLAY: u8 = 0x27; // hidden (passwords)
-    pub const BLUE: u8 = 0x3A;
     pub const RED: u8 = 0x28;
+    pub const TURQUOISE: u8 = 0x30;
+    pub const YELLOW: u8 = 0x32;
+    pub const PINK: u8 = 0x38;
+    pub const BLUE: u8 = 0x3A;
+    /// Bits added to a base attribute.
+    pub const REVERSE_BIT: u8 = 0x01;
+    pub const UNDERLINE_BIT: u8 = 0x04;
+}
+
+/// Field format word (FFW). Byte 1 always has 0x40 added.
+pub mod ffw {
+    pub const BYPASS: u8 = 0x20; // output only
+    pub const ALPHA: u8 = 0x00; // alphanumeric shift
+    pub const NUMERIC_ONLY: u8 = 0x03;
+    pub const SIGNED_NUMERIC: u8 = 0x07;
+    /// Byte 2: fold input to upper case.
+    pub const MONOCASE: u8 = 0x20;
 }
 
 /// Attention identifier: which key ended the input.
@@ -53,6 +69,18 @@ impl Aid {
             other => Aid::Other(other),
         }
     }
+
+    pub fn name(self) -> String {
+        match self {
+            Aid::Enter => "ENTER".into(),
+            Aid::F(n) => format!("F{n}"),
+            Aid::RollUp => "ROLLUP".into(),
+            Aid::RollDown => "ROLLDOWN".into(),
+            Aid::Help => "HELP".into(),
+            Aid::Clear => "CLEAR".into(),
+            Aid::Other(b) => format!("AID{b:02X}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +95,7 @@ pub enum FieldKind {
 
 #[derive(Debug, Clone)]
 pub struct Field {
-    pub name: &'static str,
+    pub name: String,
     pub row: u8,
     pub col: u8,
     pub len: u16,
@@ -84,6 +112,15 @@ pub struct Screen {
     cursor: Option<(u8, u8)>,
 }
 
+/// 0-based linear screen offset of (row, col).
+fn linear(row: u8, col: u8) -> u16 {
+    (row as u16 - 1) * COLS as u16 + col as u16 - 1
+}
+
+fn from_linear(p: u16) -> (u8, u8) {
+    ((p / COLS as u16) as u8 + 1, (p % COLS as u16) as u8 + 1)
+}
+
 impl Screen {
     pub fn new() -> Self {
         Self::default()
@@ -93,18 +130,41 @@ impl Screen {
         self.orders.extend_from_slice(&[ORDER_SBA, row, col]);
     }
 
-    /// Text starting at (row, col) with a display attribute in col - 1.
-    /// The attribute is reset to normal after the text. `col` must be >= 2.
+    /// Position the address on the attribute byte of an item starting at
+    /// (row, col): the position before it, or the item itself at 1,1.
+    fn sba_attribute(&mut self, row: u8, col: u8) -> bool {
+        let lin = linear(row, col);
+        if lin == 0 {
+            self.sba(row, col);
+            false
+        } else {
+            let (r, c) = from_linear(lin - 1);
+            self.sba(r, c);
+            true
+        }
+    }
+
+    /// Normal attribute right after an item, so its attribute stops there.
+    fn end_attribute(&mut self, row: u8, col: u8, len: u16) {
+        let end = linear(row, col) + len;
+        if end < ROWS as u16 * COLS as u16 {
+            let (r, c) = from_linear(end);
+            self.sba(r, c);
+            self.orders.push(attr::NORMAL);
+        }
+    }
+
+    /// Text at (row, col) with a display attribute in the position before it.
     pub fn text(&mut self, row: u8, col: u8, attribute: u8, s: &str) -> &mut Self {
-        debug_assert!(col >= 2 && (1..=ROWS).contains(&row));
+        debug_assert!((1..=COLS).contains(&col) && (1..=ROWS).contains(&row));
         let max = (COLS - col + 1) as usize;
         let s: String = s.chars().take(max).collect();
-        self.sba(row, col - 1);
-        self.orders.push(attribute);
+        if self.sba_attribute(row, col) {
+            self.orders.push(attribute);
+        }
         self.orders.extend(ebcdic::encode(&s));
-        let end = col as usize + s.chars().count();
-        if attribute != attr::NORMAL && end <= COLS as usize {
-            self.orders.push(attr::NORMAL);
+        if attribute != attr::NORMAL {
+            self.end_attribute(row, col, s.chars().count() as u16);
         }
         self
     }
@@ -114,29 +174,46 @@ impl Screen {
         self.text(row, col, attr::NORMAL, s)
     }
 
-    /// An input field. Its attribute byte occupies col - 1; the position after
-    /// the field gets a normal attribute so the underline stops there.
+    /// An input field: underlined, or hidden for passwords.
     pub fn field(
         &mut self,
-        name: &'static str,
+        name: &str,
         row: u8,
         col: u8,
         len: u16,
         kind: FieldKind,
         value: &str,
     ) -> &mut Self {
-        debug_assert!(col >= 2 && (col as u16 + len - 1) <= COLS as u16 * (ROWS - row + 1) as u16);
-        let ffw1 = 0x40; // field format word: input, alphanumeric shift
-        let ffw2 = if kind == FieldKind::Upper { 0x20 } else { 0x00 }; // monocase
+        let ffw2 = if kind == FieldKind::Upper {
+            ffw::MONOCASE
+        } else {
+            0
+        };
         let attribute = if kind == FieldKind::Hidden {
             attr::NONDISPLAY
         } else {
             attr::UNDERLINE
         };
-        self.sba(row, col - 1);
+        self.input_field(name, row, col, len, ffw::ALPHA, ffw2, attribute, value)
+    }
+
+    /// An input field with an explicit field format word and attribute.
+    #[allow(clippy::too_many_arguments)]
+    pub fn input_field(
+        &mut self,
+        name: &str,
+        row: u8,
+        col: u8,
+        len: u16,
+        ffw1: u8,
+        ffw2: u8,
+        attribute: u8,
+        value: &str,
+    ) -> &mut Self {
+        self.sba_attribute(row, col);
         self.orders.extend_from_slice(&[
             ORDER_SF,
-            ffw1,
+            0x40 | ffw1,
             ffw2,
             attribute,
             (len >> 8) as u8,
@@ -146,18 +223,19 @@ impl Screen {
         if !value.is_empty() {
             self.orders.extend(ebcdic::encode(&value));
         }
-        // End-of-field attribute.
-        let end = (row as u16 - 1) * COLS as u16 + col as u16 - 1 + len; // 0-based linear position after the field
-        if end < ROWS as u16 * COLS as u16 {
-            let (r, c) = ((end / COLS as u16) as u8 + 1, (end % COLS as u16) as u8 + 1);
-            self.sba(r, c);
-            self.orders.push(attr::NORMAL);
-        }
+        self.end_attribute(row, col, len);
         if self.cursor.is_none() {
             self.cursor = Some((row, col));
         }
+        let kind = if attribute == attr::NONDISPLAY {
+            FieldKind::Hidden
+        } else if ffw2 & ffw::MONOCASE != 0 {
+            FieldKind::Upper
+        } else {
+            FieldKind::Text
+        };
         self.fields.push(Field {
-            name,
+            name: name.to_string(),
             row,
             col,
             len,
@@ -167,7 +245,7 @@ impl Screen {
         self
     }
 
-    /// Put the cursor in a specific field (default: the first field).
+    /// Put the cursor at a position (default: the first input field).
     pub fn cursor_at(&mut self, row: u8, col: u8) -> &mut Self {
         self.cursor = Some((row, col));
         self
@@ -203,14 +281,16 @@ pub struct Input {
     pub aid: Aid,
     pub cursor: (u8, u8),
     /// Field values by name: modified fields as typed, others as written.
-    pub values: Vec<(&'static str, String)>,
+    pub values: Vec<(String, String)>,
+    /// Names of the fields the user changed.
+    pub modified: Vec<String>,
 }
 
 impl Input {
     pub fn get(&self, name: &str) -> &str {
         self.values
             .iter()
-            .find(|(n, _)| *n == name)
+            .find(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
             .unwrap_or("")
     }
@@ -223,11 +303,12 @@ pub fn parse_input(data: &[u8], screen: &Screen) -> Input {
         data.get(1).copied().unwrap_or(1),
     );
     let aid = Aid::from_byte(data.get(2).copied().unwrap_or(0xF1));
-    let mut values: Vec<(&'static str, String)> = screen
+    let mut values: Vec<(String, String)> = screen
         .fields
         .iter()
-        .map(|f| (f.name, f.value.clone()))
+        .map(|f| (f.name.clone(), f.value.clone()))
         .collect();
+    let mut modified = Vec::new();
     let mut i = 3;
     while i + 2 < data.len() && data[i] == ORDER_SBA {
         let (row, col) = (data[i + 1], data[i + 2]);
@@ -236,14 +317,14 @@ pub fn parse_input(data: &[u8], screen: &Screen) -> Input {
         while end < data.len() && data[end] != ORDER_SBA {
             end += 1;
         }
-        let text = ebcdic::decode(&data[start..end]);
-        let text = text.trim_end().to_string();
+        let text = ebcdic::decode(&data[start..end]).trim_end().to_string();
         if let Some(pos) = screen
             .fields
             .iter()
             .position(|f| f.row == row && f.col == col)
         {
             values[pos].1 = text;
+            modified.push(screen.fields[pos].name.clone());
         }
         i = end;
     }
@@ -251,6 +332,7 @@ pub fn parse_input(data: &[u8], screen: &Screen) -> Input {
         aid,
         cursor,
         values,
+        modified,
     }
 }
 
@@ -266,17 +348,28 @@ mod tests {
         let st = s.to_stream();
         // Clear unit, WTD with keyboard unlock.
         assert_eq!(&st[..6], &[0x04, 0x40, 0x04, 0x11, 0x00, 0x08]);
-        // SBA 1,32 + high attribute + "Hi" (EBCDIC) + normal attribute.
-        assert_eq!(&st[6..13], &[0x11, 1, 32, 0x22, 0xC8, 0x89, 0x20]);
+        // SBA 1,32 + high attribute + "Hi" (EBCDIC), then normal attribute at 1,35.
+        assert_eq!(
+            &st[6..16],
+            &[0x11, 1, 32, 0x22, 0xC8, 0x89, 0x11, 1, 35, 0x20]
+        );
         // SBA 6,52 + SF: FFW 40 20 (monocase), underline attribute, length 10.
         assert_eq!(
-            &st[13..22],
+            &st[16..25],
             &[0x11, 6, 52, 0x1D, 0x40, 0x20, 0x24, 0x00, 0x0A]
         );
         // End attribute after the field at 6,63.
-        assert_eq!(&st[22..26], &[0x11, 6, 63, 0x20]);
+        assert_eq!(&st[25..29], &[0x11, 6, 63, 0x20]);
         // Insert cursor in the field, then Read MDT Fields.
-        assert_eq!(&st[26..], &[0x13, 6, 53, 0x04, 0x52, 0x00, 0x00]);
+        assert_eq!(&st[29..], &[0x13, 6, 53, 0x04, 0x52, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn column_one_puts_the_attribute_at_the_end_of_the_previous_row() {
+        let mut s = Screen::new();
+        s.text(3, 1, attr::HIGH, "X");
+        let st = s.to_stream();
+        assert_eq!(&st[6..10], &[0x11, 2, 80, 0x22]);
     }
 
     #[test]
@@ -297,6 +390,7 @@ mod tests {
         assert_eq!(inp.get("USER"), "QSECOFR");
         assert_eq!(inp.get("PASSWORD"), "secret");
         assert_eq!(inp.get("LIB"), "QGPL", "unmodified fields keep their value");
+        assert_eq!(inp.modified, vec!["USER", "PASSWORD"]);
     }
 
     #[test]
@@ -305,5 +399,6 @@ mod tests {
         assert_eq!(Aid::from_byte(0x3C), Aid::F(12));
         assert_eq!(Aid::from_byte(0xB1), Aid::F(13));
         assert_eq!(Aid::from_byte(0xF5), Aid::RollUp);
+        assert_eq!(Aid::F(3).name(), "F3");
     }
 }

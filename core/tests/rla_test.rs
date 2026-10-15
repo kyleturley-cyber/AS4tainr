@@ -343,6 +343,7 @@ async fn bridge_protocol_round_trip() {
         bridge::BridgeConfig {
             database_url: url.clone(),
             library_list: vec![lib.clone()],
+            display: None,
         },
     ));
 
@@ -428,4 +429,112 @@ async fn numeric_keys_of_different_widths_sort_numerically() {
     }
     seen.reverse();
     assert_eq!(back, seen);
+}
+
+/// EXFMT over the bridge: values and indicators go to the job's display,
+/// the operator's input and response indicators come back.
+#[tokio::test]
+async fn bridge_exfmt_round_trip_with_a_display() {
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    catalog::create_display_file(
+        &mut client,
+        &lib,
+        "CUSTINQD",
+        include_str!("../../samples/qddssrc/CUSTINQD.dspf"),
+    )
+    .await
+    .unwrap();
+
+    // A fake display: checks the request, then "presses F3".
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<bridge::DisplayRequest>(1);
+    let display = tokio::spawn(async move {
+        let req = rx.recv().await.unwrap();
+        assert_eq!(req.format, "PROMPT");
+        assert_eq!(req.values.get("CUSNUM").map(String::as_str), Some("42"));
+        assert!(req.indicators[30], "*IN30 is passed to the display");
+        assert!(!req.indicators[3]);
+        let mut indicators = std::collections::BTreeMap::new();
+        indicators.insert(3u8, true);
+        indicators.insert(30u8, false);
+        req.reply
+            .send(Ok(ibmish_core::dspf::Response {
+                aid: "F3".into(),
+                values: Default::default(),
+                indicators,
+            }))
+            .unwrap();
+    });
+
+    let listener = bridge::bind(0).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(bridge::serve(
+        listener,
+        bridge::BridgeConfig {
+            database_url: url.clone(),
+            library_list: vec![lib.clone()],
+            display: Some(tx),
+        },
+    ));
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (rd, mut wr) = stream.into_split();
+    let mut lines = BufReader::new(rd).lines();
+    let mut ind = "0".repeat(99);
+    ind.replace_range(29..30, "1"); // *IN30
+    for req in [
+        json!({"id": 1, "op": "dspf", "file": "CUSTINQD"}),
+        json!({"id": 2, "op": "exfmt", "file": "CUSTINQD", "format": "PROMPT", "fields": {"CUSNUM": "42"}, "indicators": ind}),
+        json!({"id": 3, "op": "exfmt", "file": "CUSTINQD", "format": "NOSUCH", "fields": {}, "indicators": ""}),
+    ] {
+        wr.write_all(format!("{req}\n").as_bytes()).await.unwrap();
+    }
+    let mut resp = Vec::new();
+    for _ in 0..3 {
+        let r: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        resp.push(r);
+    }
+    display.await.unwrap();
+    server.abort();
+
+    assert_eq!(resp[0]["formats"], json!(["PROMPT", "DETAIL"]));
+    assert!(resp[0]["source"].as_str().unwrap().contains("ERRMSG"));
+    assert_eq!(resp[1]["aid"], "F3");
+    assert_eq!(resp[1]["indicators"]["03"], true);
+    assert_eq!(resp[1]["indicators"]["30"], false);
+    assert_eq!(resp[2]["ok"], false);
+}
+
+/// Without a display (batch), EXFMT fails with a clear message.
+#[tokio::test]
+async fn exfmt_without_a_display_fails_clearly() {
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    catalog::create_display_file(
+        &mut client,
+        &lib,
+        "CUSTINQD",
+        include_str!("../../samples/qddssrc/CUSTINQD.dspf"),
+    )
+    .await
+    .unwrap();
+    let listener = bridge::bind(0).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(bridge::serve(
+        listener,
+        bridge::BridgeConfig {
+            database_url: url.clone(),
+            library_list: vec![lib.clone()],
+            display: None,
+        },
+    ));
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (rd, mut wr) = stream.into_split();
+    let mut lines = BufReader::new(rd).lines();
+    wr.write_all(b"{\"id\":1,\"op\":\"exfmt\",\"file\":\"CUSTINQD\",\"format\":\"PROMPT\"}\n")
+        .await
+        .unwrap();
+    let r: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    server.abort();
+    assert_eq!(r["ok"], false);
+    assert!(r["error"].as_str().unwrap().contains("no display"), "{r}");
 }

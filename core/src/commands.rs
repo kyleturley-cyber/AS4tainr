@@ -26,6 +26,8 @@ pub struct Job<'a> {
     pub curlib: String,
     /// User part of the library list (system libraries are not modelled yet).
     pub libl: Vec<String>,
+    /// The job's display, for programs that use display files.
+    pub display: Option<bridge::DisplayHandle>,
 }
 
 /// A list shown on its own screen (DSPLIB, DSPLIBL, ...).
@@ -157,6 +159,7 @@ impl Job<'_> {
             bridge::BridgeConfig {
                 database_url: self.env.database_url.clone(),
                 library_list: self.library_list(),
+                display: self.display.clone(),
             },
         ));
         let mut parts = self.env.runner.split_whitespace();

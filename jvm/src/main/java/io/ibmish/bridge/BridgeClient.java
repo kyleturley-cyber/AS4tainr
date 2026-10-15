@@ -168,6 +168,30 @@ public final class BridgeClient implements AutoCloseable {
         call(req("delete", handle));
     }
 
+    /** A display file's DDS source: library, name, source, formats. */
+    public Map<String, Object> displayFile(String file) {
+        Map<String, Object> m = req("dspf");
+        m.put("file", file);
+        return call(m);
+    }
+
+    /**
+     * EXFMT: show a record format on the job's display and wait for input.
+     *
+     * @param fields     current values of the record's fields
+     * @param indicators indicators 01-99 as 99 characters '0'/'1'
+     * @return aid (e.g. "ENTER", "F3"), fields (new values of input fields),
+     *         indicators (response indicators to set, "03" -> true/false)
+     */
+    public Map<String, Object> exfmt(String file, String format, Map<String, String> fields, String indicators) {
+        Map<String, Object> m = req("exfmt");
+        m.put("file", file);
+        m.put("format", format);
+        m.put("fields", fields);
+        m.put("indicators", indicators);
+        return call(m);
+    }
+
     @Override
     public void close() throws IOException {
         socket.close();

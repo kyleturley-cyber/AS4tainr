@@ -35,6 +35,12 @@ CREATE TABLE IF NOT EXISTS ibmish.file_fields (
     text      text NOT NULL DEFAULT '',
     PRIMARY KEY (library, file, seq)
 );
+CREATE TABLE IF NOT EXISTS ibmish.display_files (
+    library text NOT NULL,
+    name    text NOT NULL,
+    source  text NOT NULL,
+    PRIMARY KEY (library, name)
+);
 CREATE TABLE IF NOT EXISTS ibmish.file_keys (
     library text NOT NULL,
     file    text NOT NULL,
@@ -298,6 +304,82 @@ pub async fn create_physical_file(
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// CRTDSPF: store a display file's DDS source after checking that it parses.
+pub async fn create_display_file(
+    client: &mut Client,
+    library: &str,
+    name: &str,
+    source: &str,
+) -> Result<crate::dspf::DisplayFile> {
+    let lib = validate_name("library", library)?;
+    let name = validate_name("file", name)?;
+    let parsed = crate::dspf::parse(&name, source)?;
+    let tx = client.transaction().await?;
+    if tx
+        .query_opt(
+            "SELECT 1 FROM ibmish.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
+            &[&lib],
+        )
+        .await?
+        .is_none()
+    {
+        bail!("CPF2110: Library {lib} not found.");
+    }
+    if tx
+        .query_opt(
+            "SELECT 1 FROM ibmish.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+            &[&lib, &name],
+        )
+        .await?
+        .is_some()
+    {
+        bail!("CPF7302: File {name} already exists in library {lib}.");
+    }
+    tx.execute(
+        "INSERT INTO ibmish.objects (library, name, objtype, attribute, text) VALUES ($1,$2,'*FILE','DSPF','')",
+        &[&lib, &name],
+    )
+    .await?;
+    tx.execute(
+        "INSERT INTO ibmish.display_files VALUES ($1,$2,$3)",
+        &[&lib, &name, &source],
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(parsed)
+}
+
+/// Find a display file through the library list; returns (library, source).
+pub async fn resolve_display_file(
+    client: &Client,
+    libl: &[String],
+    name: &str,
+) -> Result<(String, String)> {
+    let (lib_q, name) = match name.split_once('/') {
+        Some((l, n)) => (
+            Some(validate_name("library", l)?),
+            validate_name("file", n)?,
+        ),
+        None => (None, validate_name("file", name)?),
+    };
+    let search: Vec<String> = lib_q.map(|l| vec![l]).unwrap_or_else(|| libl.to_vec());
+    for lib in &search {
+        if let Some(row) = client
+            .query_opt(
+                "SELECT source FROM ibmish.display_files WHERE library=$1 AND name=$2",
+                &[lib, &name],
+            )
+            .await?
+        {
+            return Ok((lib.clone(), row.get(0)));
+        }
+    }
+    bail!(
+        "CPF9812: File {name} not found in library list {}",
+        search.join(" ")
+    )
 }
 
 /// Resolve a file name through the library list (first match wins).

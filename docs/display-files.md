@@ -1,6 +1,6 @@
 # Display files (interactive RPG)
 
-RPG programs that use DDS display files run on ibmish. When a program does `EXFMT`, ibmish draws the record format on the user's 5250 session, waits for input, and hands the field values and response indicators back to the program.
+RPG programs that use DDS display files run on ibmish. When a program does `EXFMT`, ibmish draws the record format on the user's 5250 session, waits for input, and hands the field values and response indicators back to the program. Subfiles (the scrolling lists of "Work with..." screens) work too; see [Subfiles](#subfiles).
 
 ## How it works
 
@@ -154,9 +154,72 @@ Customer 5. `EDTCDE(J)` edits the negative balance, and `*IN40` shows it in red:
 | Keywords | `CAnn`/`CFnn` (file or record level, with response indicator), `DSPATR(HI RI UL ND PR PC)`, `COLOR(WHT RED BLU TRQ YLW PNK GRN)`, `EDTCDE(1 2 3 4 J K L M Z)`, `ERRMSG('text' nn)`, `CHECK(LC)` |
 | Input | Numeric fields are validated (digits, decimals, sign) and re-shown with a message if wrong. Character input is folded to upper case unless `CHECK(LC)`. |
 | Response indicators | On input, the record's `CA`/`CF` indicators and `ERRMSG` indicators are set off, and the pressed key's indicator is set on. `CA` keys return no data; `CF` keys and Enter do. |
+| Screen | `OVERLAY`: without it a record clears the screen; with it, only records sharing a line with it are removed. `WRITE` puts a record on the screen for the next `EXFMT`. |
+| Subfiles | `SFL`, `SFLCTL`, `SFLSIZ`, `SFLPAG`, `SFLDSP`, `SFLDSPCTL`, `SFLCLR`, `SFLDLT`, `SFLEND(*MORE *PLUS)`, `SFLNXTCHG`, `SFLMSG`, `PAGEDOWN`/`ROLLUP`, `PAGEUP`/`ROLLDOWN` |
 
-Keywords not in this list are accepted and ignored. Fidelity gaps (subfiles, `OVERLAY`, `PUTOVR`, `WINDOW`, `REF`/`REFFLD`, `VALUES`/`RANGE`/`COMP`, `EDTWRD`, 27x132 screens, job date formats) are listed in [fidelity-gaps.md](fidelity-gaps.md).
+Keywords not in this list are accepted and ignored. Fidelity gaps (`SFLRCDNBR`, `PUTOVR`, `WINDOW`, `REF`/`REFFLD`, `VALUES`/`RANGE`/`COMP`, `EDTWRD`, 27x132 screens, job date formats) are listed in [fidelity-gaps.md](fidelity-gaps.md).
+
+## Subfiles
+
+A subfile is a list of records, numbered 1 to 9999 (relative record numbers), that the program fills with `WRITE` and the system shows a page at a time under a control record. The program names the subfile record format and the variable holding the record number on the F spec:
+
+```
+     FCUSTWRKD  CF   E             WORKSTN
+     F                                     SFILE(CUSTSFL:RRN)
+```
+
+| Program does | ibmish does |
+| --- | --- |
+| `WRITE ctl` with `SFLCLR` (or `SFLDLT`) on | Empties the subfile |
+| `WRITE sfl` | Adds the record at number `RRN`, with the current indicators (for option indicators and `SFLNXTCHG`). A number already used, or outside 1-9999, is an error |
+| `WRITE other` | Puts the record on the screen; it shows with the next `EXFMT` |
+| `EXFMT ctl` | Shows the control record and, if `SFLDSP` is on, the first page of the subfile (`SFLPAG` records) with `More...`/`Bottom` for `SFLEND(*MORE)`. Page Down and Page Up move through the records without the program. Past the last page, `PAGEDOWN`/`ROLLUP` hands the key to the program (load-a-page-at-a-time subfiles); without it, the operator gets a message |
+| `READC sfl` | Returns the next record the operator typed into, in record number order, and sets `RRN`. Records written or updated with `SFLNXTCHG` on count as typed into. `%EOF` when none is left |
+| `CHAIN n sfl` / `UPDATE sfl` | Reads record `n` / rewrites the record last read |
+
+The DDS rules are checked by `crtdspf`: the control record comes right after its subfile record and names it in `SFLCTL`, it has `SFLSIZ` and `SFLPAG`, and a page fits on the display. With `SFLSIZ` equal to `SFLPAG` the subfile cannot grow past one page; with `SFLSIZ` larger it grows as needed, as on IBM i.
+
+### How the runner does it
+
+Jariko v2.2.0 handles `EXFMT` through a callback, but nothing else on a WORKSTN file: `WRITE` and `UPDATE` look for a database file, and `READC` does nothing. So when the runner loads a program it rewrites the source first (`Workstation.java`):
+
+1. Each record format of each WORKSTN file becomes an extra F spec, `Fformat UF A E K DISK`. These "files" are served by `DisplayDBMManager`, which sends their operations to ibmish core (`dspwrite`, `sflwrite`, `sflchain`, `sflreadc`, `sflupdate`; see [bridge-protocol.md](bridge-protocol.md)).
+2. The `SFILE` keywords are taken off the F specs; the runner remembers which variable holds each subfile's record number.
+3. `READC sfl` becomes `READ sfl`, which the subfile "file" answers with the next changed record.
+
+The subfile, the records on the screen, and paging all live in ibmish core (`core/src/workstn.rs`), where they are unit tested.
+
+### Example
+
+`samples/qrpglesrc/WRKCUST.rpgle` with `samples/qddssrc/CUSTWRKD.dspf` loads every customer into a subfile of 4 lines a page. Option 5 shows the customer; a wrong option is shown in reverse image with an `SFLMSG` message, and stays selected through `SFLNXTCHG`:
+
+```
+ IBMISH                    Work with Customers                         10/15/26
+
+ Type options, press Enter.
+   5=Display
+
+ Opt  Cust   Name                            City
+          1  Acme Tooling                    Des Moines
+  Z       2  Midwest Fasteners               Chicago
+          3  Bluebird Supply                 Omaha
+          4  Prairie Freight                 Lincoln
+                                                                        More...
+
+
+
+
+
+
+
+
+
+
+
+ F3=Exit   F12=Cancel
+ Type option 5 or leave the option blank.
+```
 
 ## Testing
 
-`dspf.rs` has unit tests for parsing, indicator conditions, edit codes (expected values from IBM's published edit code table), numeric input, and response indicators. The bridge `exfmt` op has integration tests. `tools/e2e_5250.py` runs `CUSTINQ` through the real tn5250 client: the error message, DETAIL, edited numbers, F5 rejected, F12, and F3.
+`dspf.rs` has unit tests for parsing, indicator conditions, edit codes (expected values from IBM's published edit code table), numeric input, and response indicators. `workstn.rs` tests the subfile DDS rules, record numbers, `SFLCLR`, `OVERLAY`, paging and `SFLEND`, `READC` order and `SFLNXTCHG`, `CA` keys and `SFLMSG`. The bridge `exfmt` and subfile ops have integration tests. `tools/e2e_5250.py` runs `CUSTINQ` and `WRKCUST` through the real tn5250 client: error messages, edited numbers, function keys, Page Down/Up, `More...`/`Bottom`, option 5, a wrong option.

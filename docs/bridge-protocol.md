@@ -1,4 +1,6 @@
-# Bridge protocol (version 1)
+# Bridge protocol (version 2)
+
+Version 2 added the display file operations `dspwrite`, `sflwrite`, `sflchain`, `sflreadc` and `sflupdate`.
 
 The bridge connects the JVM (Jariko running RPG) to ibmish core, which carries out every file operation. It uses TCP on loopback only, with one UTF-8 JSON object per line in each direction, strictly request then response.
 
@@ -38,7 +40,14 @@ Records are objects that map field names to strings:
 | `delete` | `handle` | | Acts on the last record read |
 | `eof`, `equal` | `handle` | `eof` / `equal` | The flags from the last operation |
 | `dspf` | `file` | `library`, `name`, `source`, `formats` | A display file's DDS source, found through the library list |
-| `exfmt` | `file`, `format`, `fields`, `indicators` | `aid`, `fields`, `indicators` | Shows a record format on the job's display and waits for input. Request `indicators` is 99 characters of `0`/`1` for `*IN01`-`*IN99`. The response has the new values of input fields, and the response indicators to set, as `{"03": true, "30": false}`. Fails when the job has no display. |
+| `exfmt` | `file`, `format`, `fields`, `indicators` | `aid`, `fields`, `indicators` | Shows a record format on the job's display and waits for input. Request `indicators` is 99 characters of `0`/`1` for `*IN01`-`*IN99`. The response has the new values of input fields, and the response indicators to set, as `{"03": true, "30": false}`. Fails when the job has no display. For a subfile control record, the subfile is shown below it and the operator can page through it; the records the operator typed into are kept for `sflreadc`. |
+| `dspwrite` | `file`, `format`, `fields`, `indicators` | | WRITE of a record format: it is put on the screen (OVERLAY rules) and shown with the next EXFMT. For a subfile control record, `SFLCLR`/`SFLDLT` (if on) empty the subfile first |
+| `sflwrite` | `file`, `format`, `rrn`, `fields`, `indicators` | | WRITE of a subfile record with relative record number `rrn` (1-9999). The indicators are kept with the record (option indicators, `SFLNXTCHG`) |
+| `sflchain` | `file`, `format`, `rrn` | read result | CHAIN to a subfile record by number |
+| `sflreadc` | `file`, `format` | read result | READC: the next subfile record changed by the operator in the last EXFMT (or written/updated with `SFLNXTCHG` on), in number order; `eof` when there are no more. `rrn` is the record's number |
+| `sflupdate` | `file`, `format`, `fields`, `indicators` | | UPDATE of the subfile record last read by `sflreadc` or `sflchain` |
+
+All connections of one bridge (one program call) share the display state: the records on the screen and the subfiles.
 
 A **read result** is `{"found": bool, "eof": bool, "record": {...} | null, "rrn": n | null}`.
 

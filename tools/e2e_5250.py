@@ -2,7 +2,8 @@
 """End-to-end test of the ibmish 5250 server with the real tn5250 client.
 
 Expects a fresh database (QSECOFR with its initial, expired password), the
-sample file CUSTMAST and the display file CUSTINQD in QGPL. Usage:
+sample file CUSTMAST and the display files CUSTINQD and CUSTWRKD in QGPL.
+Usage:
 
     TN5250=/path/to/tn5250 python3 tools/e2e_5250.py 127.0.0.1:2323
 """
@@ -119,6 +120,38 @@ with Tn5250(HOST) as t:
     t.fkey(3)
     t.wait_for("Command Entry")
     check("ended abnormally" not in t.text(), "F3 (CA03) ends the program normally", t)
+
+    # Subfile: WRKCUST lists the customers in key order, 4 to a page.
+    command(t, "call wrkcust", "Work with Customers", timeout=90)
+    check("Acme Tooling" in t.line(7) and "Prairie Freight" in t.line(10),
+          "the subfile shows its first page (SFLPAG 4) in key order", t)
+    check("More..." in t.line(11) and "F3=Exit" in t.line(23),
+          "SFLEND(*MORE) says More...; the FOOTER record stays (OVERLAY)", t)
+    t.page_down()
+    t.wait_for("Lake, Pine")
+    check("Lake, Pine & Co" in t.line(7) and "Bottom" in t.line(11),
+          "Page Down shows the next page, the last one says Bottom", t)
+    t.page_down()
+    t.wait_for("bottom of the list")
+    check(True, "Page Down on the last page is refused", t)
+    t.page_up()
+    t.wait_for("Acme Tooling")
+    check("Prairie Freight" in t.line(10), "Page Up returns to the first page", t)
+    t.tab(); t.tab(); t.type("5"); t.enter()  # option 5 on the third line
+    t.wait_for("Display Customer")
+    check("Bluebird Supply" in t.line(6) and "Omaha" in t.line(7),
+          "READC returns the line with an option; option 5 shows that customer", t)
+    t.fkey(12)
+    t.wait_for("Work with Customers")
+    check(t.line(9)[2:3].strip() == "", "UPDATE of the subfile record cleared the option", t)
+    t.type("x"); t.enter()  # a wrong option on the first line
+    t.wait_for("Type option 5")
+    check("Type option 5 or leave the option blank." in t.line(24),
+          "a wrong option shows SFLMSG", t)
+    check("X" == t.line(7)[2:3], "the wrong option stays on the line (SFLNXTCHG)", t)
+    t.fkey(3)
+    t.wait_for("Command Entry")
+    check("ended abnormally" not in t.text(), "F3 ends WRKCUST normally", t)
 
     command(t, "signoff", "Sign On")
     check("signed off" in t.line(24), "SIGNOFF returns to the sign-on screen", t)

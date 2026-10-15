@@ -106,6 +106,16 @@ class Tn5250:
         self.send("\x1b" + FKEYS[n])
         self.pump(0.4)
 
+    def page_down(self):
+        # tn5250 curses: Ctrl-D is Roll Up (Page Down).
+        self.send("\x04")
+        self.pump(0.4)
+
+    def page_up(self):
+        # Ctrl-U is Roll Down (Page Up).
+        self.send("\x15")
+        self.pump(0.4)
+
 
 if __name__ == "__main__":
     import sys

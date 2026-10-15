@@ -19,7 +19,7 @@ import java.util.Map;
  * See docs/bridge-protocol.md.
  */
 public final class BridgeClient implements AutoCloseable {
-    public static final int PROTOCOL_VERSION = 1;
+    public static final int PROTOCOL_VERSION = 2;
 
     private final Socket socket;
     private final BufferedReader in;
@@ -190,6 +190,54 @@ public final class BridgeClient implements AutoCloseable {
         m.put("fields", fields);
         m.put("indicators", indicators);
         return call(m);
+    }
+
+    /** WRITE of a display record format (not a subfile record): shown with the next EXFMT. */
+    public void displayWrite(String file, String format, Map<String, String> fields, String indicators) {
+        Map<String, Object> m = req("dspwrite");
+        m.put("file", file);
+        m.put("format", format);
+        m.put("fields", fields);
+        m.put("indicators", indicators);
+        call(m);
+    }
+
+    /** WRITE of a subfile record at relative record number {@code rrn}. */
+    public void subfileWrite(String file, String format, long rrn, Map<String, String> fields, String indicators) {
+        Map<String, Object> m = req("sflwrite");
+        m.put("file", file);
+        m.put("format", format);
+        m.put("rrn", rrn);
+        m.put("fields", fields);
+        m.put("indicators", indicators);
+        call(m);
+    }
+
+    /** CHAIN to a subfile record by relative record number. */
+    public ReadResult subfileChain(String file, String format, long rrn) {
+        Map<String, Object> m = req("sflchain");
+        m.put("file", file);
+        m.put("format", format);
+        m.put("rrn", rrn);
+        return toRead(call(m));
+    }
+
+    /** READC: the next subfile record the operator changed (eof when none is left). */
+    public ReadResult subfileReadChanged(String file, String format) {
+        Map<String, Object> m = req("sflreadc");
+        m.put("file", file);
+        m.put("format", format);
+        return toRead(call(m));
+    }
+
+    /** UPDATE the subfile record last read with READC or CHAIN. */
+    public void subfileUpdate(String file, String format, Map<String, String> fields, String indicators) {
+        Map<String, Object> m = req("sflupdate");
+        m.put("file", file);
+        m.put("format", format);
+        m.put("fields", fields);
+        m.put("indicators", indicators);
+        call(m);
     }
 
     @Override

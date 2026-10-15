@@ -6,7 +6,7 @@ ibmish is an open, IBM i-compatible runtime that runs in a container.
 
 It runs IBM i business applications (RPG, CL, DDS files) on ordinary Linux and cloud hosts. It does not emulate POWER hardware or boot IBM's operating system. It reimplements the interfaces that programs and people use, the same way Wine runs Windows programs: libraries and objects, database files with record-level access, 5250 green screens, and CL commands. RPG runs on [Jariko](https://github.com/smeup/jariko), an open-source RPG interpreter for the JVM.
 
-> Status: **early prototype**. Sign on with a real 5250 emulator, run CL commands, and `CALL` RPG programs. That includes **interactive programs that use DDS display files** (`EXFMT`), all against PostgreSQL. See [docs/5250-server.md](docs/5250-server.md) and [docs/display-files.md](docs/display-files.md).
+> Status: **early prototype**. Sign on with a real 5250 emulator, run CL commands, and `CALL` RPG programs. That includes **interactive programs that use DDS display files** (`EXFMT`, and subfiles: the scrolling lists behind "Work with..." screens), all against PostgreSQL. See [docs/5250-server.md](docs/5250-server.md) and [docs/display-files.md](docs/display-files.md).
 >
 > Spike 01: ibmish can create DDS physical files, load them, and run RPG programs whose file I/O (`SETLL`, `CHAIN`, `READ`, `READE`, `READP`, `READPE`, `WRITE`, `UPDATE`, `DELETE`) goes through the Rust core into PostgreSQL. There are no 5250 screens, CL, or jobs yet. See the roadmap below.
 
@@ -39,6 +39,7 @@ CRTLIB MYLIB TEXT('My first library')
 DSPLIB QSYS
 CALL CUSTLIST PARM('3')
 CALL CUSTINQ
+CALL WRKCUST
 SIGNOFF
 ```
 

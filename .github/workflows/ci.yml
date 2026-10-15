@@ -117,10 +117,11 @@ jobs:
           target/debug/ibmish crtpf QGPL/CUSTMAST --src samples/qddssrc/CUSTMAST.pf
           target/debug/ibmish load CUSTMAST --csv samples/data/CUSTMAST.csv
           target/debug/ibmish crtdspf QGPL/CUSTINQD --src samples/qddssrc/CUSTINQD.dspf
+          target/debug/ibmish crtdspf QGPL/CUSTWRKD --src samples/qddssrc/CUSTWRKD.dspf
           IBMISH_PGM_PATH=$PWD/samples/qrpglesrc nohup target/debug/ibmish tn5250 \
             --listen 127.0.0.1:2323 --runner "java -jar jvm/build/libs/ibmish-jvm.jar" > tn5250-server.log 2>&1 &
           sleep 2
-      - name: Sign on, CL commands, CALL and an interactive RPG program through tn5250
+      - name: Sign on, CL commands, CALL and interactive RPG programs (subfiles too) through tn5250
         env:
           TN5250: /tmp/tn5250/build/curses/tn5250
         run: python3 tools/e2e_5250.py 127.0.0.1:2323

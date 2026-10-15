@@ -23,14 +23,25 @@ import com.smeup.rpgparser.interpreter.StringType;
 import com.smeup.rpgparser.interpreter.StringValue;
 import com.smeup.rpgparser.interpreter.Type;
 import com.smeup.rpgparser.interpreter.Value;
+import com.smeup.rpgparser.interpreter.RpgProgram;
+import com.smeup.rpgparser.parsing.ast.Api;
+import com.smeup.rpgparser.parsing.ast.ApiDescriptor;
+import com.smeup.rpgparser.parsing.ast.ApiId;
+import com.smeup.rpgparser.parsing.ast.SourceProgram;
+import com.smeup.rpgparser.parsing.facade.Copy;
+import com.smeup.rpgparser.parsing.facade.CopyId;
 import com.smeup.rpgparser.parsing.parsetreetoast.RpgType;
 import com.smeup.rpgparser.rpginterop.DirRpgProgramFinder;
 import com.smeup.rpgparser.rpginterop.RpgProgramFinder;
 import io.ibmish.bridge.BridgeClient;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
 import java.io.File;
+import java.io.IOException;
 import java.io.StringReader;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -61,16 +72,6 @@ public final class Runner {
         String program = args[2].toUpperCase();
         List<String> parms = Arrays.asList(args).subList(3, args.length);
 
-        List<RpgProgramFinder> finders = new ArrayList<>();
-        String path = System.getenv().getOrDefault("IBMISH_PGM_PATH", "qrpglesrc");
-        for (String dir : path.split(File.pathSeparator)) {
-            if (new File(dir).isDirectory()) finders.add(new DirRpgProgramFinder(new File(dir)));
-        }
-        if (finders.isEmpty()) {
-            System.err.println("CPF4101: no program directory found (set IBMISH_PGM_PATH)");
-            System.exit(1);
-        }
-
         BridgeClient bridge;
         try {
             bridge = BridgeClient.connect(hostPort);
@@ -79,13 +80,33 @@ public final class Runner {
             System.exit(1);
             return;
         }
+        Displays displays = new Displays(bridge);
+        Displays.current = displays;
+
+        // Database files go to IbmishDBMManager. Display record formats used as
+        // files (see Workstation) get one entry each, added as programs load.
+        List<ConnectionConfig> connections = new ArrayList<>();
+        connections.add(new ConnectionConfig(
+                "*", IbmishDBMManager.URL_PREFIX + hostPort, "", "", null, IbmishDBMManager.class.getName()));
+
+        List<RpgProgramFinder> finders = new ArrayList<>();
+        String path = System.getenv().getOrDefault("IBMISH_PGM_PATH", "qrpglesrc");
+        for (String dir : path.split(File.pathSeparator)) {
+            if (new File(dir).isDirectory()) {
+                finders.add(new PreprocessingFinder(new File(dir), displays, connections, hostPort));
+            }
+        }
+        if (finders.isEmpty()) {
+            System.err.println("CPF4101: no program directory found (set IBMISH_PGM_PATH)");
+            System.exit(1);
+        }
 
         Configuration configuration = new Configuration();
         configuration.setReloadConfig(new ReloadConfig(
-                new DBNativeAccessConfig(List.of(new ConnectionConfig(
-                        "*", IbmishDBMManager.URL_PREFIX + hostPort, "", "", null, IbmishDBMManager.class.getName()))),
-                dbFile -> fileMetadata(bridge.metadata(dbFile))));
-        Displays displays = new Displays(bridge);
+                new DBNativeAccessConfig(connections),
+                dbFile -> Workstation.format(dbFile) != null
+                        ? displays.formatMetadata(dbFile)
+                        : fileMetadata(bridge.metadata(dbFile))));
         configuration.setDspfConfig(new DspfConfig(displays::metadata, displays::dspf));
         configuration.getJarikoCallback().setOnExfmt(displays::exfmt);
 
@@ -132,6 +153,9 @@ public final class Runner {
 
     /** Display files: their definitions for Jariko, and EXFMT through the bridge. */
     static final class Displays {
+        /** The running program's displays (one runner process runs one call). */
+        static Displays current;
+
         private final BridgeClient bridge;
         private final Map<String, DSPF> parsed = new HashMap<>();
         private final Map<String, String> fileOfFormat = new HashMap<>();
@@ -154,22 +178,57 @@ public final class Runner {
             Map<String, DbField> fields = new LinkedHashMap<>();
             for (DSPFRecord r : dspf(file).getRecords()) {
                 for (MutableField f : r.getMutables()) {
-                    int length = f.getLength() == null ? 10 : f.getLength();
-                    Type type;
-                    if (f.isNumeric()) {
-                        int decimals = f.getPrecision() == null ? 0 : f.getPrecision();
-                        // Packed, like most database files: RPG programs often share a
-                        // field name between a display file and a database file, and
-                        // Jariko rejects one name with two numeric types. Display I/O
-                        // always goes through decimal text, so the choice is safe.
-                        type = new NumberType(length - decimals, decimals, RpgType.PACKED);
-                    } else {
-                        type = new StringType(length, false);
-                    }
-                    fields.putIfAbsent(f.getName(), new DbField(f.getName(), type));
+                    fields.putIfAbsent(f.getName(), new DbField(f.getName(), type(f)));
                 }
             }
             return new FileMetadata(file.toUpperCase(), "", "", new ArrayList<>(fields.values()), List.of());
+        }
+
+        /** Jariko's type for a display field. */
+        private static Type type(MutableField f) {
+            int length = f.getLength() == null ? 10 : f.getLength();
+            if (!f.isNumeric()) return new StringType(length, false);
+            int decimals = f.getPrecision() == null ? 0 : f.getPrecision();
+            // Packed, like most database files: RPG programs often share a
+            // field name between a display file and a database file, and
+            // Jariko rejects one name with two numeric types. Display I/O
+            // always goes through decimal text, so the choice is safe.
+            return new NumberType(length - decimals, decimals, RpgType.PACKED);
+        }
+
+        DSPFRecord record(String format) {
+            Workstation.Format f = Workstation.format(format);
+            if (f == null) throw new IllegalArgumentException(format + " is not a display record format");
+            for (DSPFRecord r : dspf(f.file).getRecords()) {
+                if (r.getName().equalsIgnoreCase(format)) return r;
+            }
+            throw new IllegalArgumentException("record format " + format + " not found in display file " + f.file);
+        }
+
+        /** One record format as a file (for WRITE/UPDATE/CHAIN/READC). */
+        FileMetadata formatMetadata(String format) {
+            String name = format.toUpperCase();
+            List<DbField> fields = new ArrayList<>();
+            for (MutableField f : record(name).getMutables()) {
+                fields.add(new DbField(f.getName(), type(f)));
+            }
+            return new FileMetadata(name, name, name, fields, List.of());
+        }
+
+        /** The same, in reload's terms. */
+        static com.smeup.dbnative.model.FileMetadata reloadMetadata(String format) {
+            String name = format.toUpperCase();
+            List<com.smeup.dbnative.model.Field> fields = new ArrayList<>();
+            for (MutableField f : current.record(name).getMutables()) {
+                fields.add(new com.smeup.dbnative.model.Field(f.getName(), "", f.isNumeric()));
+            }
+            return new com.smeup.dbnative.model.FileMetadata(name, name, fields, List.of());
+        }
+
+        List<String> formats(String file) {
+            List<String> out = new ArrayList<>();
+            for (DSPFRecord r : dspf(file).getRecords()) out.add(r.getName().toUpperCase());
+            return out;
         }
 
         @SuppressWarnings("unchecked")
@@ -183,13 +242,7 @@ public final class Runner {
 
             Map<Integer, BooleanValue> indicators = MainExecutionContext.INSTANCE.getProgramStack().peek()
                     .getIntepreterCore().getIndicators();
-            StringBuilder ind = new StringBuilder(99);
-            for (int i = 1; i <= 99; i++) {
-                BooleanValue b = indicators.get(i);
-                ind.append(b != null && b.getValue() ? '1' : '0');
-            }
-
-            Map<String, Object> resp = bridge.exfmt(file, format, values, ind.toString());
+            Map<String, Object> resp = bridge.exfmt(file, format, values, Workstation.indicators());
 
             Map<String, Value> newValues = new HashMap<>();
             Map<String, Object> fields = (Map<String, Object>) resp.get("fields");
@@ -212,6 +265,69 @@ public final class Runner {
             if (v instanceof NumberValue) return ((NumberValue) v).getBigDecimal().toPlainString();
             if (v instanceof Value) return ((Value) v).asString().getValue();
             return String.valueOf(v);
+        }
+    }
+
+    /**
+     * Finds PGM.rpgle in a directory, like Jariko's DirRpgProgramFinder, and
+     * runs the source through {@link Workstation#preprocess} first.
+     */
+    static final class PreprocessingFinder implements RpgProgramFinder {
+        private final File dir;
+        private final DirRpgProgramFinder plain;
+        private final Displays displays;
+        private final List<ConnectionConfig> connections;
+        private final String hostPort;
+
+        PreprocessingFinder(File dir, Displays displays, List<ConnectionConfig> connections, String hostPort) {
+            this.dir = dir;
+            this.plain = new DirRpgProgramFinder(dir);
+            this.displays = displays;
+            this.connections = connections;
+            this.hostPort = hostPort;
+        }
+
+        @Override
+        public RpgProgram findRpgProgram(String nameOrSource) {
+            File f = new File(dir, nameOrSource + ".rpgle");
+            if (!f.isFile()) f = new File(dir, nameOrSource.toUpperCase() + ".rpgle");
+            if (!f.isFile()) f = new File(dir, nameOrSource.toLowerCase() + ".rpgle");
+            if (!f.isFile()) return null;
+            String source;
+            try {
+                source = new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                throw new IllegalStateException("cannot read " + f + ": " + e.getMessage(), e);
+            }
+            String rewritten = Workstation.preprocess(source, displays::formats);
+            synchronized (connections) {
+                for (Workstation.Format fmt : Workstation.formats()) {
+                    boolean known = connections.stream().anyMatch(c -> c.getFileName().equalsIgnoreCase(fmt.name));
+                    if (!known) {
+                        // Before the "*" entry, so the format is not looked up as a database file.
+                        connections.add(0, new ConnectionConfig(fmt.name, DisplayDBMManager.URL_PREFIX + hostPort,
+                                "", "", null, DisplayDBMManager.class.getName()));
+                    }
+                }
+            }
+            return RpgProgram.Companion.fromInputStream(
+                    new ByteArrayInputStream(rewritten.getBytes(StandardCharsets.UTF_8)),
+                    nameOrSource.toUpperCase(), SourceProgram.RPGLE);
+        }
+
+        @Override
+        public Copy findCopy(CopyId copyId) {
+            return plain.findCopy(copyId);
+        }
+
+        @Override
+        public ApiDescriptor findApiDescriptor(ApiId apiId) {
+            return plain.findApiDescriptor(apiId);
+        }
+
+        @Override
+        public Api findApi(ApiId apiId) {
+            return plain.findApi(apiId);
         }
     }
 }

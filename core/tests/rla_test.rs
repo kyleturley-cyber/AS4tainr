@@ -368,7 +368,7 @@ async fn bridge_protocol_round_trip() {
     }
     server.abort();
 
-    assert_eq!(resp[0]["version"], 1);
+    assert_eq!(resp[0]["version"], 2);
     assert_eq!(resp[1]["format"], "ORDLINR");
     assert_eq!(resp[1]["keys"], json!(["ORDNO", "LINNO"]));
     assert_eq!(resp[1]["fields"][4]["decimals"], 2);
@@ -450,10 +450,11 @@ async fn bridge_exfmt_round_trip_with_a_display() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<bridge::DisplayRequest>(1);
     let display = tokio::spawn(async move {
         let req = rx.recv().await.unwrap();
-        assert_eq!(req.format, "PROMPT");
-        assert_eq!(req.values.get("CUSNUM").map(String::as_str), Some("42"));
-        assert!(req.indicators[30], "*IN30 is passed to the display");
-        assert!(!req.indicators[3]);
+        let shown = req.frame.layers.last().unwrap();
+        assert_eq!(shown.format, "PROMPT");
+        assert_eq!(shown.values.get("CUSNUM").map(String::as_str), Some("42"));
+        assert!(shown.ind[30], "*IN30 is passed to the display");
+        assert!(!shown.ind[3]);
         let mut indicators = std::collections::BTreeMap::new();
         indicators.insert(3u8, true);
         indicators.insert(30u8, false);
@@ -462,6 +463,7 @@ async fn bridge_exfmt_round_trip_with_a_display() {
                 aid: "F3".into(),
                 values: Default::default(),
                 indicators,
+                changed: Default::default(),
             }))
             .unwrap();
     });
@@ -502,6 +504,129 @@ async fn bridge_exfmt_round_trip_with_a_display() {
     assert_eq!(resp[1]["indicators"]["03"], true);
     assert_eq!(resp[1]["indicators"]["30"], false);
     assert_eq!(resp[2]["ok"], false);
+}
+
+/// A subfile over the bridge, as the JVM uses it: the records are written
+/// on one connection and the control record is shown on another (the
+/// runner has one connection for EXFMT, one per display record format).
+/// The operator types an option on record 2; READC returns it, then eof.
+#[tokio::test]
+async fn bridge_subfile_write_exfmt_readc() {
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    catalog::create_display_file(
+        &mut client,
+        &lib,
+        "CUSTWRKD",
+        include_str!("../../samples/qddssrc/CUSTWRKD.dspf"),
+    )
+    .await
+    .unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<bridge::DisplayRequest>(1);
+    let display = tokio::spawn(async move {
+        let req = rx.recv().await.unwrap();
+        let names: Vec<&str> = req.frame.layers.iter().map(|l| l.format.as_str()).collect();
+        assert_eq!(
+            names,
+            ["FOOTER", "CUSTCTL"],
+            "FOOTER stays: CUSTCTL has OVERLAY"
+        );
+        let sf = req.frame.subfile.as_ref().unwrap();
+        assert!(sf.show);
+        assert_eq!(sf.rows.iter().map(|r| r.rrn).collect::<Vec<_>>(), [1, 2, 3]);
+        let mut changed = std::collections::BTreeMap::new();
+        changed.insert(2u16, [("OPT".to_string(), "5".to_string())].into());
+        req.reply
+            .send(Ok(ibmish_core::dspf::Response {
+                aid: "ENTER".into(),
+                values: Default::default(),
+                indicators: Default::default(),
+                changed,
+            }))
+            .unwrap();
+    });
+
+    let listener = bridge::bind(0).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(bridge::serve(
+        listener,
+        bridge::BridgeConfig {
+            database_url: url.clone(),
+            library_list: vec![lib.clone()],
+            display: Some(tx),
+        },
+    ));
+    async fn conn(
+        addr: std::net::SocketAddr,
+    ) -> (
+        tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+        tokio::net::tcp::OwnedWriteHalf,
+    ) {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (rd, wr) = stream.into_split();
+        (BufReader::new(rd).lines(), wr)
+    }
+    async fn call(
+        c: &mut (
+            tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+            tokio::net::tcp::OwnedWriteHalf,
+        ),
+        req: Value,
+    ) -> Value {
+        c.1.write_all(format!("{req}\n").as_bytes()).await.unwrap();
+        serde_json::from_str(&c.0.next_line().await.unwrap().unwrap()).unwrap()
+    }
+    let mut writer = conn(addr).await;
+    let mut runner = conn(addr).await;
+    let ind = |on: &[usize]| {
+        let mut s = vec![b'0'; 99];
+        for &i in on {
+            s[i - 1] = b'1';
+        }
+        String::from_utf8(s).unwrap()
+    };
+    let r = call(&mut writer, json!({"op": "dspwrite", "file": "CUSTWRKD", "format": "CUSTCTL", "fields": {}, "indicators": ind(&[32])})).await;
+    assert_eq!(r["ok"], true, "{r}");
+    for n in 1..=3 {
+        let r = call(&mut writer, json!({"op": "sflwrite", "file": "CUSTWRKD", "format": "CUSTSFL", "rrn": n,
+            "fields": {"OPT": "", "CUSNO": n.to_string(), "CUSNAM": format!("Customer {n}"), "CUSCTY": ""}, "indicators": ind(&[])})).await;
+        assert_eq!(r["ok"], true, "{r}");
+    }
+    let r = call(&mut writer, json!({"op": "sflwrite", "file": "CUSTWRKD", "format": "CUSTSFL", "rrn": 2, "fields": {}, "indicators": ind(&[])})).await;
+    assert_eq!(r["ok"], false, "record 2 exists already");
+    call(&mut writer, json!({"op": "dspwrite", "file": "CUSTWRKD", "format": "FOOTER", "fields": {}, "indicators": ind(&[])})).await;
+    let r = call(&mut runner, json!({"op": "exfmt", "file": "CUSTWRKD", "format": "CUSTCTL", "fields": {}, "indicators": ind(&[31, 33])})).await;
+    assert_eq!(r["aid"], "ENTER", "{r}");
+    display.await.unwrap();
+    let r = call(
+        &mut writer,
+        json!({"op": "sflreadc", "file": "CUSTWRKD", "format": "CUSTSFL"}),
+    )
+    .await;
+    assert_eq!(
+        (r["found"].clone(), r["rrn"].clone()),
+        (json!(true), json!(2)),
+        "{r}"
+    );
+    assert_eq!(r["record"]["OPT"], "5");
+    assert_eq!(r["record"]["CUSNAM"], "Customer 2");
+    let r = call(&mut writer, json!({"op": "sflupdate", "file": "CUSTWRKD", "format": "CUSTSFL",
+        "fields": {"OPT": "", "CUSNO": "2", "CUSNAM": "Customer 2", "CUSCTY": ""}, "indicators": ind(&[])})).await;
+    assert_eq!(r["ok"], true, "{r}");
+    let r = call(
+        &mut writer,
+        json!({"op": "sflreadc", "file": "CUSTWRKD", "format": "CUSTSFL"}),
+    )
+    .await;
+    assert_eq!(r["eof"], true, "{r}");
+    let r = call(
+        &mut writer,
+        json!({"op": "sflchain", "file": "CUSTWRKD", "format": "CUSTSFL", "rrn": 3}),
+    )
+    .await;
+    assert_eq!(r["record"]["CUSNAM"], "Customer 3");
+    server.abort();
 }
 
 /// Without a display (batch), EXFMT fails with a clear message.

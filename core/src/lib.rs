@@ -5,6 +5,7 @@
 //! - [`catalog`]: libraries and file descriptions stored in PostgreSQL
 //! - [`rla`]: record-level access (SETLL, CHAIN, READ, ...) over PostgreSQL
 //! - [`bridge`]: the JSON-lines protocol the JVM (Jariko) uses for file I/O
+//! - [`dspf`], [`workstn`]: display files, subfiles and the screen
 
 pub mod bridge;
 pub mod catalog;
@@ -15,3 +16,4 @@ pub mod dspf;
 pub mod rla;
 pub mod tn5250;
 pub mod users;
+pub mod workstn;

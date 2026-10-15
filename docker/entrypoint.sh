@@ -11,7 +11,9 @@ if [ "${IBMISH_LOAD_SAMPLES:-1}" = "1" ]; then
       ibmish load "$f" --csv "${IBMISH_SAMPLES:-/opt/ibmish/samples}/data/$f.csv"
     fi
   done
-  ibmish crtdspf QGPL/CUSTINQD --src "${IBMISH_SAMPLES:-/opt/ibmish/samples}/qddssrc/CUSTINQD.dspf" >/dev/null 2>&1 || true
+  for d in CUSTINQD CUSTWRKD; do
+    ibmish crtdspf "QGPL/$d" --src "${IBMISH_SAMPLES:-/opt/ibmish/samples}/qddssrc/$d.dspf" >/dev/null 2>&1 || true
+  done
 fi
 
 exec ibmish tn5250 --listen "${IBMISH_TN5250_LISTEN:-0.0.0.0:23}"

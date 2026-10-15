@@ -8,6 +8,7 @@
 use crate::catalog;
 use crate::dspf;
 use crate::rla::{OpenFile, ReadResult, Record};
+use crate::workstn::{Frame, Workstation};
 use anyhow::{anyhow, bail, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -17,7 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_postgres::{Client, NoTls};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Debug)]
 pub struct BridgeConfig {
@@ -31,10 +32,8 @@ pub struct BridgeConfig {
 /// One EXFMT, sent to whatever owns the job's display.
 #[derive(Debug)]
 pub struct DisplayRequest {
-    pub file: Arc<dspf::DisplayFile>,
-    pub format: String,
-    pub values: BTreeMap<String, String>,
-    pub indicators: [bool; 100],
+    /// What to show: the records on the screen, the one being read last.
+    pub frame: Frame,
     pub reply: tokio::sync::oneshot::Sender<std::result::Result<dspf::Response, String>>,
 }
 
@@ -62,14 +61,28 @@ struct Request {
     /// EXFMT: indicators 01-99 as a string of 99 '0'/'1' characters.
     #[serde(default)]
     indicators: Option<String>,
+    /// Subfile operations: relative record number.
+    #[serde(default)]
+    rrn: Option<i64>,
 }
 
 struct Session {
     client: Client,
     config: Arc<BridgeConfig>,
+    /// Display files and subfiles: shared by all connections of one bridge
+    /// (one program call).
+    workstation: Arc<tokio::sync::Mutex<Workstation>>,
     displays: HashMap<String, Arc<dspf::DisplayFile>>,
     files: HashMap<u32, OpenFile>,
     next_handle: u32,
+}
+
+fn indicators(s: Option<String>) -> [bool; 100] {
+    let mut ind = [false; 100];
+    for (i, c) in s.unwrap_or_default().chars().take(99).enumerate() {
+        ind[i + 1] = c == '1';
+    }
+    ind
 }
 
 fn read_json(r: ReadResult) -> Value {
@@ -77,6 +90,18 @@ fn read_json(r: ReadResult) -> Value {
 }
 
 impl Session {
+    async fn display_file(&mut self, name: &str) -> Result<Arc<dspf::DisplayFile>> {
+        let key = name.to_ascii_uppercase();
+        if let Some(f) = self.displays.get(&key) {
+            return Ok(f.clone());
+        }
+        let (_, source) =
+            catalog::resolve_display_file(&self.client, &self.config.library_list, name).await?;
+        let f = Arc::new(dspf::parse(name, &source)?);
+        self.displays.insert(key, f.clone());
+        Ok(f)
+    }
+
     fn file(&mut self, handle: Option<u32>) -> Result<&mut OpenFile> {
         let h = handle.ok_or_else(|| anyhow!("missing 'handle'"))?;
         self.files
@@ -196,60 +221,72 @@ impl Session {
             }
             "exfmt" => {
                 let name = req.file.ok_or_else(|| anyhow!("missing 'file'"))?;
-                let format = req
-                    .format
-                    .ok_or_else(|| anyhow!("missing 'format'"))?
-                    .to_ascii_uppercase();
+                let format = req.format.ok_or_else(|| anyhow!("missing 'format'"))?;
                 let Some(display) = self.config.display.clone() else {
                     bail!("Display file {name} cannot be used here: this job has no display (it is not interactive).");
                 };
-                let file = match self.displays.get(&name.to_ascii_uppercase()) {
-                    Some(f) => f.clone(),
-                    None => {
-                        let (_, source) = catalog::resolve_display_file(
-                            &self.client,
-                            &self.config.library_list,
-                            &name,
-                        )
-                        .await?;
-                        let f = Arc::new(dspf::parse(&name, &source)?);
-                        self.displays.insert(name.to_ascii_uppercase(), f.clone());
-                        f
-                    }
-                };
-                if !file.records.iter().any(|r| r.name == format) {
-                    bail!("Record format {format} not found in display file {name}.");
-                }
-                let mut indicators = [false; 100];
-                for (i, c) in req
-                    .indicators
-                    .unwrap_or_default()
-                    .chars()
-                    .take(99)
-                    .enumerate()
-                {
-                    indicators[i + 1] = c == '1';
-                }
+                let file = self.display_file(&name).await?;
+                let frame = self.workstation.lock().await.frame(
+                    &file,
+                    &format,
+                    req.fields.unwrap_or_default(),
+                    indicators(req.indicators),
+                )?;
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 display
-                    .send(DisplayRequest {
-                        file,
-                        format,
-                        values: req.fields.unwrap_or_default(),
-                        indicators,
-                        reply: tx,
-                    })
+                    .send(DisplayRequest { frame, reply: tx })
                     .await
                     .map_err(|_| anyhow!("the job's display is gone"))?;
                 let resp = rx
                     .await
                     .map_err(|_| anyhow!("the job's display is gone"))?
                     .map_err(|e| anyhow!(e))?;
+                self.workstation.lock().await.apply(&file, &format, &resp);
                 Ok(json!({
                     "aid": resp.aid,
                     "fields": resp.values,
                     "indicators": resp.indicators.iter().map(|(k, v)| (format!("{k:02}"), *v)).collect::<BTreeMap<_, _>>(),
                 }))
+            }
+            "dspwrite" | "sflwrite" | "sflchain" | "sflreadc" | "sflupdate" => {
+                let name = req.file.ok_or_else(|| anyhow!("missing 'file'"))?;
+                let format = req.format.ok_or_else(|| anyhow!("missing 'format'"))?;
+                let file = self.display_file(&name).await?;
+                let mut ws = self.workstation.lock().await;
+                let fields = req.fields.unwrap_or_default();
+                let ind = indicators(req.indicators);
+                let rrn = || req.rrn.ok_or_else(|| anyhow!("missing 'rrn'"));
+                match req.op.as_str() {
+                    "dspwrite" => {
+                        ws.write(&file, &format, fields, ind)?;
+                        Ok(json!({}))
+                    }
+                    "sflwrite" => {
+                        ws.sfl_write(&file, &format, rrn()?, fields, ind)?;
+                        Ok(json!({}))
+                    }
+                    "sflupdate" => {
+                        ws.sfl_update(&file, &format, fields, ind)?;
+                        Ok(json!({}))
+                    }
+                    "sflchain" => {
+                        let n = rrn()?;
+                        Ok(match ws.sfl_chain(&file, &format, n)? {
+                            Some(r) => {
+                                json!({ "found": true, "eof": false, "record": r, "rrn": n })
+                            }
+                            None => {
+                                json!({ "found": false, "eof": false, "record": {}, "rrn": null })
+                            }
+                        })
+                    }
+                    _ => Ok(match ws.sfl_readc(&file, &format)? {
+                        Some((n, r)) => {
+                            json!({ "found": true, "eof": false, "record": r, "rrn": n })
+                        }
+                        None => json!({ "found": false, "eof": true, "record": {}, "rrn": null }),
+                    }),
+                }
             }
             other => Err(anyhow!("unknown op '{other}'")),
         }
@@ -266,11 +303,16 @@ pub async fn connect_db(url: &str) -> Result<Client> {
     Ok(client)
 }
 
-async fn handle_conn(stream: TcpStream, config: Arc<BridgeConfig>) -> Result<()> {
+async fn handle_conn(
+    stream: TcpStream,
+    config: Arc<BridgeConfig>,
+    workstation: Arc<tokio::sync::Mutex<Workstation>>,
+) -> Result<()> {
     let client = connect_db(&config.database_url).await?;
     let mut session = Session {
         client,
         config,
+        workstation,
         displays: HashMap::new(),
         files: HashMap::new(),
         next_handle: 1,
@@ -311,11 +353,13 @@ pub async fn bind(port: u16) -> Result<TcpListener> {
 /// Serve connections until the listener task is dropped.
 pub async fn serve(listener: TcpListener, config: BridgeConfig) -> Result<()> {
     let config = Arc::new(config);
+    let workstation = Arc::new(tokio::sync::Mutex::new(Workstation::new()));
     loop {
         let (stream, _) = listener.accept().await?;
         let cfg = config.clone();
+        let ws = workstation.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, cfg).await {
+            if let Err(e) = handle_conn(stream, cfg, ws).await {
                 eprintln!("ibmish: bridge session ended with error: {e:#}");
             }
         });

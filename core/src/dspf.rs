@@ -10,7 +10,10 @@
 //! - option indicators (positions 7-16, up to three per line, `N` for not,
 //!   and `O` lines for OR)
 //! - keywords: CA/CF (file or record level), DSPATR (HI RI UL ND PR PC BL),
-//!   COLOR, EDTCDE (1 2 3 4 J K L M Z), ERRMSG, CHECK(LC), TEXT
+//!   COLOR, EDTCDE (1 2 3 4 J K L M Z), ERRMSG, CHECK(LC), TEXT, OVERLAY
+//! - subfiles: SFL, SFLCTL, SFLSIZ, SFLPAG, SFLDSP, SFLDSPCTL, SFLCLR,
+//!   SFLDLT, SFLEND (*MORE, *PLUS), SFLNXTCHG, SFLMSG, PAGEUP/PAGEDOWN
+//!   (ROLLDOWN/ROLLUP). Subfile state and paging live in `crate::workstn`.
 //!
 //! Anything else is parsed and ignored; see docs/fidelity-gaps.md.
 
@@ -47,6 +50,29 @@ pub enum Keyword {
         indicator: Option<u8>,
     },
     CheckLc,
+    Overlay,
+    /// SFL: this record format is a subfile record.
+    Sfl,
+    /// SFLCTL(subfile): this record format controls the named subfile.
+    SflCtl(String),
+    SflSiz(u16),
+    SflPag(u16),
+    SflDsp,
+    SflDspCtl,
+    SflClr,
+    SflDlt,
+    SflInz,
+    SflNxtChg,
+    /// SFLEND: *MORE, *PLUS or *SCRBAR.
+    SflEnd(String),
+    SflMsg {
+        text: String,
+        indicator: Option<u8>,
+    },
+    /// PAGEDOWN/ROLLUP: return to the program when paging past the last record.
+    PageDown(Option<u8>),
+    /// PAGEUP/ROLLDOWN: return to the program when paging before the first record.
+    PageUp(Option<u8>),
     Other(String),
 }
 
@@ -113,6 +139,74 @@ pub struct DisplayFile {
     pub name: String,
     pub keywords: Vec<Kw>,
     pub records: Vec<Record>,
+}
+
+impl DisplayFile {
+    pub fn record(&self, name: &str) -> Option<&Record> {
+        self.records
+            .iter()
+            .find(|r| r.name.eq_ignore_ascii_case(name))
+    }
+}
+
+impl Record {
+    /// Is a keyword present (whatever its condition)?
+    pub fn has(&self, pred: impl Fn(&Keyword) -> bool) -> bool {
+        self.keywords.iter().any(|k| pred(&k.kw))
+    }
+
+    /// Is a keyword present and its condition true?
+    pub fn active(&self, ind: &[bool; 100], pred: impl Fn(&Keyword) -> bool) -> bool {
+        self.keywords
+            .iter()
+            .any(|k| pred(&k.kw) && cond_true(&k.cond, ind))
+    }
+
+    pub fn is_subfile(&self) -> bool {
+        self.has(|k| *k == Keyword::Sfl)
+    }
+
+    /// For a subfile control record, the subfile record format it controls.
+    pub fn subfile_control(&self) -> Option<&str> {
+        self.keywords.iter().find_map(|k| match &k.kw {
+            Keyword::SflCtl(s) => Some(s.as_str()),
+            _ => None,
+        })
+    }
+
+    pub fn sflsiz(&self) -> u16 {
+        self.keywords
+            .iter()
+            .find_map(|k| match k.kw {
+                Keyword::SflSiz(n) => Some(n),
+                _ => None,
+            })
+            .unwrap_or(1)
+    }
+
+    pub fn sflpag(&self) -> u16 {
+        self.keywords
+            .iter()
+            .find_map(|k| match k.kw {
+                Keyword::SflPag(n) => Some(n),
+                _ => None,
+            })
+            .unwrap_or(1)
+    }
+
+    /// Screen rows used by the record's fields and constants (hidden
+    /// fields have no row), lowest first.
+    pub fn rows(&self) -> Vec<u8> {
+        let mut rows: Vec<u8> = self
+            .fields
+            .iter()
+            .filter_map(|f| f.pos.map(|p| p.0))
+            .chain(self.constants.iter().map(|c| c.pos.0))
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
 }
 
 // ---------------------------------------------------------------- parsing
@@ -257,6 +351,44 @@ fn to_keyword(name: &str, args: &[String]) -> Result<Keyword> {
             indicator: ind(args.get(1)),
         },
         "CHECK" if args.iter().any(|a| a.eq_ignore_ascii_case("LC")) => Keyword::CheckLc,
+        "OVERLAY" => Keyword::Overlay,
+        "SFL" => Keyword::Sfl,
+        "SFLCTL" => Keyword::SflCtl(
+            args.first()
+                .map(|a| a.to_ascii_uppercase())
+                .ok_or_else(|| anyhow::anyhow!("SFLCTL needs the subfile record format name"))?,
+        ),
+        "SFLSIZ" | "SFLPAG" => {
+            let n: u16 = args
+                .first()
+                .and_then(|a| a.trim().parse().ok())
+                .filter(|n| (1..=9999).contains(n))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("{name} needs a number of records from 1 to 9999")
+                })?;
+            if name == "SFLSIZ" {
+                Keyword::SflSiz(n)
+            } else {
+                Keyword::SflPag(n)
+            }
+        }
+        "SFLDSP" => Keyword::SflDsp,
+        "SFLDSPCTL" => Keyword::SflDspCtl,
+        "SFLCLR" => Keyword::SflClr,
+        "SFLDLT" => Keyword::SflDlt,
+        "SFLINZ" => Keyword::SflInz,
+        "SFLNXTCHG" => Keyword::SflNxtChg,
+        "SFLEND" => Keyword::SflEnd(
+            args.first()
+                .map(|a| a.to_ascii_uppercase())
+                .unwrap_or_else(|| "*PLUS".into()),
+        ),
+        "SFLMSG" => Keyword::SflMsg {
+            text: args.first().cloned().unwrap_or_default(),
+            indicator: ind(args.get(1)),
+        },
+        "PAGEDOWN" | "ROLLUP" => Keyword::PageDown(ind(args.first())),
+        "PAGEUP" | "ROLLDOWN" => Keyword::PageUp(ind(args.first())),
         other => Keyword::Other(other.to_string()),
     })
 }
@@ -494,7 +626,56 @@ pub fn parse(name: &str, source: &str) -> Result<DisplayFile> {
     if f.records.is_empty() {
         bail!("no record formats (R) found");
     }
+    check_subfiles(&f)?;
     Ok(f)
+}
+
+/// The DDS rules for subfiles that the rest of ibmish relies on: a control
+/// record comes right after its subfile record and names it, and has
+/// SFLSIZ and SFLPAG; one page of subfile records fits on the display.
+fn check_subfiles(f: &DisplayFile) -> Result<()> {
+    for (i, r) in f.records.iter().enumerate() {
+        if r.is_subfile() {
+            let ctl = f.records.get(i + 1);
+            if ctl.and_then(|c| c.subfile_control()) != Some(r.name.as_str()) {
+                bail!(
+                    "subfile record {} must be followed by its control record (SFLCTL({}))",
+                    r.name,
+                    r.name
+                );
+            }
+            if r.rows().is_empty() {
+                bail!("subfile record {} has nothing to display", r.name);
+            }
+        }
+        if let Some(sfl) = r.subfile_control() {
+            let prev = if i > 0 { f.records.get(i - 1) } else { None };
+            let Some(sflrec) = prev.filter(|p| p.name == sfl && p.is_subfile()) else {
+                bail!(
+                    "SFLCTL({sfl}) on {}: the subfile record {sfl} must come just before it",
+                    r.name
+                );
+            };
+            if !r.has(|k| matches!(k, Keyword::SflSiz(_)))
+                || !r.has(|k| matches!(k, Keyword::SflPag(_)))
+            {
+                bail!("subfile control record {} needs SFLSIZ and SFLPAG", r.name);
+            }
+            let rows = sflrec.rows();
+            let height = (rows[rows.len() - 1] - rows[0] + 1) as u32;
+            if rows[0] as u32 + height * r.sflpag() as u32 - 1 > 24 {
+                bail!(
+                    "SFLPAG({}) on {}: {} lines of {} starting at line {} do not fit on the display",
+                    r.sflpag(),
+                    r.name,
+                    r.sflpag(),
+                    sfl,
+                    rows[0]
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 // --------------------------------------------------------------- editing
@@ -736,20 +917,53 @@ pub struct Rendered {
     pub inputs: Vec<String>,
 }
 
-/// Draw a record format with the program's field values and indicators.
-pub fn render(
-    file: &DisplayFile,
+/// How to draw one record format.
+#[derive(Default)]
+pub struct DrawOpts<'a> {
+    /// The record being read: input-capable fields take input, and its
+    /// ERRMSG and SFLMSG messages show. Other records on the screen are
+    /// output only.
+    pub input: bool,
+    /// Added to every line number (subfile records below the first).
+    pub row_offset: u8,
+    /// Prefix for input field names on the screen (subfile records).
+    pub prefix: &'a str,
+    /// Field (unprefixed name) to show in error: reverse image, cursor.
+    pub error_field: Option<&'a str>,
+}
+
+/// What [`draw`] put on the screen.
+#[derive(Default)]
+pub struct Drawn {
+    /// Input fields drawn, with their prefixed names.
+    pub inputs: Vec<String>,
+    /// Where DSPATR(PC) or an error wants the cursor.
+    pub cursor: Option<(u8, u8)>,
+    /// ERRMSG or SFLMSG text to show on the message line.
+    pub message: Option<String>,
+}
+
+/// Draw a record format onto a screen with the program's field values and
+/// indicators.
+pub fn draw(
+    s: &mut Screen,
     record: &Record,
     values: &BTreeMap<String, String>,
     ind: &[bool; 100],
     ctx: &Context,
-    message: Option<&str>,
-    error_field: Option<&str>,
-) -> Rendered {
-    let mut s = Screen::new();
-    let mut inputs = Vec::new();
-    let mut cursor: Option<(u8, u8)> = None;
-    let mut msg = message.map(|m| m.to_string());
+    o: &DrawOpts,
+) -> Drawn {
+    let mut out = Drawn::default();
+    let off = o.row_offset;
+    if o.input {
+        for k in &record.keywords {
+            if let Keyword::SflMsg { text, .. } = &k.kw {
+                if cond_true(&k.cond, ind) && out.message.is_none() {
+                    out.message = Some(text.clone());
+                }
+            }
+        }
+    }
 
     for c in record.constants.iter().filter(|c| cond_true(&c.cond, ind)) {
         let text = match &c.text {
@@ -761,7 +975,7 @@ pub fn render(
         };
         let (a, _, _, nd) = attribute_for(&c.keywords, ind, false);
         if !nd {
-            s.text(c.pos.0, c.pos.1, a, &text);
+            s.text(c.pos.0 + off, c.pos.1, a, &text);
         }
     }
 
@@ -771,40 +985,41 @@ pub fn render(
         .filter(|f| f.usage != Usage::Hidden && cond_true(&f.cond, ind))
     {
         let (row, col) = f.pos.unwrap();
+        let row = row + off;
         let value = values.get(&f.name).cloned().unwrap_or_default();
         let mut kws = f.keywords.clone();
         // ERRMSG: show the message, highlight the field, put the cursor there.
-        for k in &f.keywords {
-            if let Keyword::ErrMsg { text, .. } = &k.kw {
-                if cond_true(&k.cond, ind) && msg.is_none() {
-                    msg = Some(text.clone());
-                    kws.push(Kw {
-                        cond: None,
-                        kw: Keyword::DspAtr(vec!["RI".into(), "PC".into()]),
-                    });
+        if o.input {
+            for k in &f.keywords {
+                if let Keyword::ErrMsg { text, .. } = &k.kw {
+                    if cond_true(&k.cond, ind) && out.message.is_none() {
+                        out.message = Some(text.clone());
+                        kws.push(Kw {
+                            cond: None,
+                            kw: Keyword::DspAtr(vec!["RI".into(), "PC".into()]),
+                        });
+                    }
                 }
             }
         }
-        if error_field == Some(f.name.as_str()) {
+        if o.error_field == Some(f.name.as_str()) {
             kws.push(Kw {
                 cond: None,
                 kw: Keyword::DspAtr(vec!["RI".into(), "PC".into()]),
             });
         }
-        let input_capable = matches!(f.usage, Usage::Input | Usage::Both);
+        let input_capable = o.input && matches!(f.usage, Usage::Input | Usage::Both);
         let (a, protect, pc, _) = attribute_for(&kws, ind, input_capable);
-        let shown = if f.is_numeric() {
+        let shown = if f.usage == Usage::Input {
+            String::new()
+        } else if f.is_numeric() {
             let dec = f.decimals.unwrap_or(0);
-            if f.usage == Usage::Input {
-                String::new()
-            } else if input_capable {
+            if input_capable {
                 // Show what was typed if it is not a valid number (retry).
                 parse_numeric_input(&value, f.length, dec).unwrap_or(value)
             } else {
                 edit(&value, f.length, dec, edit_code(f))
             }
-        } else if f.usage == Usage::Input {
-            String::new()
         } else {
             value
         };
@@ -831,8 +1046,9 @@ pub fn render(
             } else {
                 ffw::MONOCASE
             };
-            s.input_field(&f.name, row, col, width, shift, ffw2, a, &shown);
-            inputs.push(f.name.clone());
+            let name = format!("{}{}", o.prefix, f.name);
+            s.input_field(&name, row, col, width, shift, ffw2, a, &shown);
+            out.inputs.push(name);
         } else {
             let shown: String = format!("{shown:<w$}", w = width as usize)
                 .chars()
@@ -840,18 +1056,48 @@ pub fn render(
                 .collect();
             s.text(row, col, a, &shown);
         }
-        if pc && cursor.is_none() {
-            cursor = Some((row, col));
+        if pc && out.cursor.is_none() {
+            out.cursor = Some((row, col));
         }
     }
-    if let Some(c) = cursor {
+    out
+}
+
+/// Draw one record format on its own screen, as EXFMT of a record without
+/// OVERLAY or subfile shows it.
+pub fn render(
+    file: &DisplayFile,
+    record: &Record,
+    values: &BTreeMap<String, String>,
+    ind: &[bool; 100],
+    ctx: &Context,
+    message: Option<&str>,
+    error_field: Option<&str>,
+) -> Rendered {
+    let _ = file;
+    let mut s = Screen::new();
+    let d = draw(
+        &mut s,
+        record,
+        values,
+        ind,
+        ctx,
+        &DrawOpts {
+            input: true,
+            error_field,
+            ..Default::default()
+        },
+    );
+    if let Some(c) = d.cursor {
         s.cursor_at(c.0, c.1);
     }
-    if let Some(m) = msg {
+    if let Some(m) = message.map(str::to_string).or(d.message) {
         s.message(&m);
     }
-    let _ = file;
-    Rendered { screen: s, inputs }
+    Rendered {
+        screen: s,
+        inputs: d.inputs,
+    }
 }
 
 // --------------------------------------------------------------- input
@@ -864,6 +1110,9 @@ pub struct Response {
     pub values: BTreeMap<String, String>,
     /// Response indicators to set (true) or reset (false).
     pub indicators: BTreeMap<u8, bool>,
+    /// Subfile records the operator typed into: new values of their input
+    /// fields, by relative record number.
+    pub changed: BTreeMap<u16, BTreeMap<String, String>>,
 }
 
 /// What to do with the operator's input.
@@ -895,6 +1144,18 @@ fn function_keys(
             _ => None,
         })
         .collect()
+}
+
+/// Does this key return the record's input fields to the program? Enter
+/// and CF keys do, CA keys do not.
+pub fn returns_data(file: &DisplayFile, record: &Record, ind: &[bool; 100], aid: Aid) -> bool {
+    match aid {
+        Aid::Enter => true,
+        Aid::F(n) => function_keys(file, record, ind)
+            .iter()
+            .any(|(k, data, _)| *k == n && *data),
+        _ => false,
+    }
 }
 
 pub fn handle_input(
@@ -939,6 +1200,18 @@ pub fn handle_input(
             }
         }
     }
+    for k in &record.keywords {
+        match k.kw {
+            Keyword::SflMsg {
+                indicator: Some(i), ..
+            }
+            | Keyword::PageDown(Some(i))
+            | Keyword::PageUp(Some(i)) => {
+                indicators.insert(i, false);
+            }
+            _ => {}
+        }
+    }
     if let Some(i) = pressed {
         indicators.insert(i, true);
     }
@@ -977,6 +1250,7 @@ pub fn handle_input(
         aid: input.aid.name(),
         values,
         indicators,
+        changed: BTreeMap::new(),
     })
 }
 

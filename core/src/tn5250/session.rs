@@ -14,6 +14,7 @@ use crate::bridge;
 use crate::commands::{Environment, Job, ListDisplay, Outcome};
 use crate::dspf;
 use crate::users;
+use crate::workstn;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -345,19 +346,14 @@ async fn command_entry(
     }
 }
 
-/// Show one record format until the operator enters valid input.
+/// Show an EXFMT frame until the operator enters valid input. Paging
+/// through a subfile happens here, without the program.
 async fn exfmt(
     term: &mut Term,
     req: &bridge::DisplayRequest,
     user: &str,
     system: &str,
 ) -> Result<dspf::Response> {
-    let record = req
-        .file
-        .records
-        .iter()
-        .find(|r| r.name == req.format)
-        .ok_or_else(|| anyhow::anyhow!("record format {} not found", req.format))?;
     let (date, time) = clock();
     let ctx = dspf::Context {
         user,
@@ -365,30 +361,12 @@ async fn exfmt(
         date,
         time,
     };
-    let mut values = req.values.clone();
-    let mut message: Option<String> = None;
-    let mut error_field: Option<String> = None;
+    let mut it = workstn::Interaction::new(&req.frame);
     loop {
-        let r = dspf::render(
-            &req.file,
-            record,
-            &values,
-            &req.indicators,
-            &ctx,
-            message.as_deref(),
-            error_field.as_deref(),
-        );
-        let inp = term.show(&r.screen).await?;
-        match dspf::handle_input(&req.file, record, &req.indicators, &inp) {
-            dspf::Outcome::Done(resp) => return Ok(resp),
-            dspf::Outcome::Retry { message: m, field } => {
-                // Keep what the operator typed, show the error.
-                for (n, v) in inp.values {
-                    values.insert(n, v);
-                }
-                message = Some(m);
-                error_field = field;
-            }
+        let screen = it.screen(&ctx);
+        let inp = term.show(&screen).await?;
+        if let workstn::Step::Done(resp) = it.input(&inp) {
+            return Ok(resp);
         }
     }
 }

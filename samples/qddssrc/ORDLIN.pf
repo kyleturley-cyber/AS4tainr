@@ -1,0 +1,9 @@
+     A* Order lines, keyed by order number then line number
+     A          R ORDLINR                   TEXT('Order line')
+     A            ORDNO          7P 0       TEXT('Order number')
+     A            LINNO          3P 0       TEXT('Line number')
+     A            ITEM          15A         TEXT('Item')
+     A            QTY            5P 0       TEXT('Quantity')
+     A            PRICE          7P 2       TEXT('Unit price')
+     A          K ORDNO
+     A          K LINNO

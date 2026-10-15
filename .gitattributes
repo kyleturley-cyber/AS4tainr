@@ -1,0 +1,7 @@
+# Keep Unix line endings for files that run inside Linux containers,
+# even when the repo is checked out on Windows.
+*.sh       text eol=lf
+gradlew    text eol=lf
+*.rpgle    text eol=lf
+*.pf       text eol=lf
+*.bat      text eol=crlf

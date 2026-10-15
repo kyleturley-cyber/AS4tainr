@@ -1,0 +1,8 @@
+/target/
+jvm/build/
+jvm/.gradle/
+.gradle/
+.idea/
+*.iml
+.vscode/
+.DS_Store

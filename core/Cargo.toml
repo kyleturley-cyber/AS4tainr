@@ -1,0 +1,23 @@
+[package]
+name = "openeye-core"
+description = "OpenEye core: object catalog, DDS, record-level access and the JVM bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "openeye"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "sync", "signal"] }
+tokio-postgres = "0.7"
+thiserror = "1"

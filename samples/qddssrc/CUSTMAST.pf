@@ -1,0 +1,8 @@
+     A* Customer master file
+     A                                      UNIQUE
+     A          R CUSTREC                   TEXT('Customer master')
+     A            CUSNO          5P 0       TEXT('Customer number')
+     A            CUSNAM        30A         TEXT('Customer name')
+     A            CUSCTY        20A         TEXT('City')
+     A            CUSBAL         9P 2       TEXT('Balance due')
+     A          K CUSNO

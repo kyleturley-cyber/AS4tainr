@@ -19,8 +19,10 @@ COPY --from=core /src/target/release/ibmish /usr/local/bin/ibmish
 COPY --from=jvm /src/jvm/build/libs/ibmish-jvm.jar /opt/ibmish/ibmish-jvm.jar
 COPY samples /opt/ibmish/samples
 COPY scripts/demo.sh /opt/ibmish/demo.sh
+COPY docker/entrypoint.sh /opt/ibmish/entrypoint.sh
 ENV IBMISH_RUNNER="java -jar /opt/ibmish/ibmish-jvm.jar" \
     IBMISH_PGM_PATH=/opt/ibmish/samples/qrpglesrc \
     IBMISH_SAMPLES=/opt/ibmish/samples
-ENTRYPOINT ["ibmish"]
-CMD ["--help"]
+# 5250 display sessions (telnet). Map it to a free host port, e.g. 2323.
+EXPOSE 23
+ENTRYPOINT ["/opt/ibmish/entrypoint.sh"]

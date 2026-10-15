@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use ibmish_core::{bridge, catalog, dds, rla};
+use ibmish_core::{bridge, catalog, commands, dds, rla, tn5250};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -62,6 +62,22 @@ enum Cmd {
     Serve {
         #[arg(long, default_value_t = 7250)]
         port: u16,
+    },
+    /// Run the TN5250 display server (5250 green-screen sessions).
+    Tn5250 {
+        /// Address to listen on.
+        #[arg(long, env = "IBMISH_TN5250_LISTEN", default_value = "0.0.0.0:23")]
+        listen: String,
+        /// System name shown on the sign-on screen.
+        #[arg(long, env = "IBMISH_SYSTEM_NAME", default_value = "IBMISH")]
+        system_name: String,
+        /// Command that runs RPG programs for CALL.
+        #[arg(
+            long,
+            env = "IBMISH_RUNNER",
+            default_value = "java -jar /opt/ibmish/ibmish-jvm.jar"
+        )]
+        runner: String,
     },
     /// CALL: run a program. Starts a bridge on a free port and launches the
     /// runner (the JVM with Jariko), passing `--bridge HOST:PORT` first.
@@ -190,6 +206,34 @@ async fn run(cli: Cli) -> Result<u8> {
                 },
             )
             .await?;
+        }
+        Cmd::Tn5250 {
+            listen,
+            system_name,
+            runner,
+        } => {
+            // Make sure the catalog and QSECOFR exist before anyone signs on.
+            let client = bridge::connect_db(&cli.database_url).await?;
+            catalog::init(&client).await?;
+            drop(client);
+            let listener = tokio::net::TcpListener::bind(&listen)
+                .await
+                .with_context(|| format!("listening on {listen}"))?;
+            println!(
+                "ibmish 5250 server listening on {} (system {system_name})",
+                listener.local_addr()?
+            );
+            let cfg = tn5250::ServerConfig {
+                env: commands::Environment {
+                    database_url: cli.database_url,
+                    runner,
+                    call_timeout: std::time::Duration::from_secs(120),
+                },
+                system_name: system_name.to_ascii_uppercase(),
+                libl: libl.clone(),
+                max_signon_attempts: 3,
+            };
+            tn5250::serve(listener, cfg).await?;
         }
         Cmd::Call {
             program,

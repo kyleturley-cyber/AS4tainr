@@ -16,10 +16,12 @@ export IBMISH_PGM_PATH="${IBMISH_PGM_PATH:-$samples/qrpglesrc}"
 
 "$bin" init
 
+fresh=0
 for f in CUSTMAST ORDLIN; do
   if out=$("$bin" crtpf "QGPL/$f" --src "$samples/qddssrc/$f.pf" 2>&1); then
     echo "$out"
     "$bin" load "$f" --csv "$samples/data/$f.csv"
+    fresh=1
   elif grep -q CPF7302 <<<"$out"; then
     echo "File $f already exists; keeping its data."
   else
@@ -46,4 +48,10 @@ run() {
 }
 run CUSTLIST 3
 run ORDTOTAL 1002
+# CUSTUPD changes data, so it only runs right after the sample files were created.
+if [ "$fresh" = 1 ]; then
+  run CUSTUPD 5
+else
+  echo "--- skipping CUSTUPD (sample files already existed; drop them for a full run)"
+fi
 exit $status

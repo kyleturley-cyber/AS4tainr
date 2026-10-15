@@ -14,3 +14,16 @@ These are places where ibmish knowingly behaves differently from IBM i. Each one
 | Null-capable fields | `ALWNULL` | Not supported | |
 | Character data | EBCDIC CCSIDs (37, 500, ...) | UTF-8 in PostgreSQL | Hex constants and byte-level tricks (`%BITAND` on text) differ |
 | Jariko DSPLY output | DSPLY writes to the job's external message queue | Jariko prints the message on standard output | Fine for tests; operator messages come later |
+| 5250 sessions | Many session and device options | 24x80 only; no TLS (992), no NEW-ENVIRON auto sign-on or device naming | Use only on trusted networks for now; telnet sends passwords in clear text |
+| Sign-on security | QMAXSIGN / QMAXSGNACN can disable the profile or the device | The connection closes after 3 failures; profiles are never disabled | Repeated guessing is slowed but not blocked across connections |
+| Command entry | F4 prompting, help, job log, message queues | Commands typed in full; messages shown in the session log only | |
+| Interactive programs | DDS display files (`*DSPF`) driven from RPG | Not yet: CALL shows DSPLY output only | Interactive RPG apps cannot run yet |
+
+## Gaps in Jariko (the RPG runtime)
+
+These are RPG features Jariko does not support yet. They are worth contributing upstream to [smeup/jariko](https://github.com/smeup/jariko).
+
+| Feature | Jariko v2.2.0 | Workaround |
+| --- | --- | --- |
+| `%FOUND(filename)` | Fails with "%FOUND expression with file names is not implemented yet" | Use `%FOUND` with no argument right after the file operation |
+| Startup output | Prints a version banner and feature flags on standard output | The ibmish launcher redirects it to standard error |

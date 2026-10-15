@@ -41,7 +41,7 @@ tasks.withType<JavaCompile>().configureEach {
 }
 
 application {
-    mainClass.set("io.ibmish.jvm.MainKt")
+    mainClass.set("io.ibmish.jvm.Launcher")
     applicationName = "ibmish-jvm"
 }
 
@@ -51,7 +51,7 @@ tasks.register<Jar>("fatJar") {
     description = "Builds ibmish-jvm.jar with all dependencies."
     archiveFileName.set("ibmish-jvm.jar")
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-    manifest { attributes["Main-Class"] = "io.ibmish.jvm.MainKt" }
+    manifest { attributes["Main-Class"] = "io.ibmish.jvm.Launcher" }
     from(sourceSets.main.get().output)
     dependsOn(configurations.runtimeClasspath)
     from({ configurations.runtimeClasspath.get().filter { it.name.endsWith("jar") }.map { zipTree(it) } }) {

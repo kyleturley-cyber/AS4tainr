@@ -95,6 +95,7 @@ pub async fn init(client: &Client) -> Result<()> {
         for lib in ["QSYS", "QGPL", "QTEMP"] {
             create_library(client, lib, "System library").await?;
         }
+        crate::users::init(client).await?;
         Ok::<(), anyhow::Error>(())
     }
     .await;
@@ -102,6 +103,70 @@ pub async fn init(client: &Client) -> Result<()> {
         .execute("SELECT pg_advisory_unlock($1)", &[&INIT_LOCK_KEY])
         .await?;
     result
+}
+
+/// CRTLIB: like `create_library`, but fails with CPF2111 when the library exists.
+pub async fn create_library_new(client: &Client, library: &str, text: &str) -> Result<String> {
+    let lib = validate_name("library", library)?;
+    let exists = client
+        .query_opt(
+            "SELECT 1 FROM ibmish.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
+            &[&lib],
+        )
+        .await?;
+    if exists.is_some() {
+        bail!("CPF2111: Library {lib} already exists.");
+    }
+    create_library(client, &lib, text).await?;
+    Ok(lib)
+}
+
+/// One object in a library, for DSPLIB.
+#[derive(Debug, Clone)]
+pub struct ObjectEntry {
+    pub name: String,
+    pub objtype: String,
+    pub attribute: String,
+    pub text: String,
+}
+
+pub async fn library_exists(client: &Client, library: &str) -> Result<bool> {
+    let lib = validate_name("library", library)?;
+    Ok(client
+        .query_opt(
+            "SELECT 1 FROM ibmish.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
+            &[&lib],
+        )
+        .await?
+        .is_some())
+}
+
+pub async fn library_text(client: &Client, library: &str) -> Result<String> {
+    Ok(client
+        .query_opt(
+            "SELECT text FROM ibmish.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
+            &[&library],
+        )
+        .await?
+        .map(|r| r.get(0))
+        .unwrap_or_default())
+}
+
+/// Objects in a library, sorted by name then type.
+pub async fn list_objects(client: &Client, library: &str) -> Result<Vec<ObjectEntry>> {
+    let lib = validate_name("library", library)?;
+    if !library_exists(client, &lib).await? {
+        bail!("CPF2110: Library {lib} not found.");
+    }
+    Ok(client
+        .query(
+            "SELECT name, objtype, attribute, text FROM ibmish.objects WHERE library=$1 ORDER BY name, objtype",
+            &[&lib],
+        )
+        .await?
+        .into_iter()
+        .map(|r| ObjectEntry { name: r.get(0), objtype: r.get(1), attribute: r.get(2), text: r.get(3) })
+        .collect())
 }
 
 pub async fn create_library(client: &Client, library: &str, text: &str) -> Result<()> {

@@ -31,6 +31,7 @@ public final class BridgeConformance {
             switch (pgm) {
                 case "CUSTLIST": custlist(c, parms); break;
                 case "ORDTOTAL": ordtotal(c, parms); break;
+                case "CUSTUPD": custupd(c, parms); break;
                 case "SELFTEST": selftest(c); break;
                 default:
                     System.err.println("CPF4101: program " + pgm + " not found");
@@ -80,6 +81,28 @@ public final class BridgeConformance {
             r = c.readEqual(f, key);
         }
         dsply("Order " + new BigDecimal(ord).toPlainString() + ": " + lines + " lines, total " + total.toPlainString());
+        c.closeFile(f);
+    }
+
+    /** Mirrors samples/qrpglesrc/CUSTUPD.rpgle. */
+    static void custupd(BridgeClient c, List<String> parms) {
+        List<String> key = Collections.singletonList(parms.isEmpty() ? "0" : parms.get(0));
+        int f = c.open("CUSTMAST");
+        ReadResult r = c.chain(f, key);
+        if (r.found) {
+            BigDecimal bal = new BigDecimal(r.record.get("CUSBAL")).add(new BigDecimal("10.25"));
+            c.update(f, Collections.singletonMap("CUSBAL", bal.toPlainString()));
+        }
+        java.util.Map<String, String> rec = new java.util.LinkedHashMap<>();
+        rec.put("CUSNO", "6");
+        rec.put("CUSNAM", "Northwind Parts");
+        rec.put("CUSCTY", "Fargo");
+        rec.put("CUSBAL", "-1234.56");
+        c.write(f, rec);
+        for (List<String> k : Arrays.asList(key, Collections.singletonList("6"))) {
+            r = c.chain(f, k);
+            dsply(r.record.get("CUSNAM").trim() + " " + r.record.get("CUSBAL"));
+        }
         c.closeFile(f);
     }
 

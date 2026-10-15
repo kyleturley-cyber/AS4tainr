@@ -77,10 +77,60 @@ jobs:
           IBMISH_RUNNER: java -jar jvm/build/libs/ibmish-jvm.jar
         run: scripts/demo.sh
 
+  tn5250:
+    name: 5250 server with the real tn5250 client
+    runs-on: ubuntu-latest
+    needs: jariko
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ibmish
+          POSTGRES_PASSWORD: ibmish
+          POSTGRES_DB: ibmish
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ibmish" --health-interval 2s --health-retries 30
+    env:
+      IBMISH_DATABASE_URL: postgres://ibmish:ibmish@127.0.0.1/ibmish
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Build tn5250 (test client only; not shipped)
+        run: |
+          sudo apt-get update && sudo apt-get install -y cmake libncurses-dev libssl-dev
+          git clone --depth 1 https://github.com/tn5250/tn5250.git /tmp/tn5250
+          cmake -S /tmp/tn5250 -B /tmp/tn5250/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/tn5250/build -j 2
+          pip install pyte
+      - run: cargo build --locked
+      - name: Build ibmish-jvm.jar
+        working-directory: jvm
+        run: ./gradlew --no-daemon fatJar
+      - name: Start the 5250 server with the sample files
+        run: |
+          target/debug/ibmish init
+          target/debug/ibmish crtpf QGPL/CUSTMAST --src samples/qddssrc/CUSTMAST.pf
+          target/debug/ibmish load CUSTMAST --csv samples/data/CUSTMAST.csv
+          IBMISH_PGM_PATH=$PWD/samples/qrpglesrc nohup target/debug/ibmish tn5250 \
+            --listen 127.0.0.1:2323 --runner "java -jar jvm/build/libs/ibmish-jvm.jar" > tn5250-server.log 2>&1 &
+          sleep 2
+      - name: Sign on, CRTLIB, DSPLIB, CALL, SIGNOFF through tn5250
+        env:
+          TN5250: /tmp/tn5250/build/curses/tn5250
+        run: python3 tools/e2e_5250.py 127.0.0.1:2323
+      - if: failure()
+        run: cat tn5250-server.log
+
   docker:
     name: Container image
     runs-on: ubuntu-latest
     needs: jariko
     steps:
       - uses: actions/checkout@v4
-      - run: docker compose up --build --abort-on-container-exit --exit-code-from ibmish
+      - run: docker compose build
+      - run: docker compose run --rm demo

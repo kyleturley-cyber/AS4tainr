@@ -2,7 +2,7 @@
 
 **Question:** can RPG programs running on Jariko do their file I/O through a Rust core that stores the data in PostgreSQL, with IBM i record-level-access semantics?
 
-**Answer so far: yes for the Rust core, the protocol and the Java client. These were built and tested end to end on 2026-10-14. On 2026-10-15 the Jariko adapter compiled against Jariko v2.2.0. Running the sample programs on Jariko against PostgreSQL (CI job `jariko`) is the remaining check.**
+**Answer: yes.** On 2026-10-15 the real Jariko v2.2.0 runner (built on Windows) ran all three sample RPG programs, CUSTLIST, ORDTOTAL and CUSTUPD, against PostgreSQL through the Rust core. Their output matched the golden files, including READ, READE, CHAIN, UPDATE and WRITE with negative and fractional packed values.
 
 ## What was built
 
@@ -14,7 +14,7 @@
 | Bridge server (JSON lines over loopback TCP) | Done | Protocol round-trip test |
 | Java bridge client, no dependencies | Done | `SELFTEST`: 11 checks pass |
 | `ibmish call`: starts the bridge, launches the JVM runner, returns its exit code | Done | `scripts/demo.sh` matches the golden outputs |
-| Jariko adapter (reload `DBMManager` + `DBFile`) and runner | Compiles (Windows, JDK 21, Jariko v2.2.0); end-to-end run on Jariko still pending | CI job `jariko` |
+| Jariko adapter (reload `DBMManager` + `DBFile`) and runner | Done | Built on Windows (JDK 21); 3 sample programs match golden output on Jariko |
 | Docker image + compose | Written, not yet built | CI job `docker` |
 
 ## Measurements
@@ -35,9 +35,14 @@ Sequential READ stopped after 4,000 of 20,000 records. The cause: `ORDER BY ordn
 
 This is exactly the "plausible but wrong" failure that AI-assisted development risks. The lesson: test data must include awkward values (different widths, negatives, blanks, duplicate keys) on purpose.
 
-## Open items before calling the spike done
+## Findings from the first Jariko run
 
-1. ~~Build `ibmish-jvm.jar` against the pinned Jariko release~~ (done 2026-10-15). Still to do: run both sample programs on Jariko and match their golden output (CI job `jariko`).
-2. Confirm the number format Jariko sends on WRITE/UPDATE (`asString()` of packed values) parses as a plain decimal.
-3. Confirm how Jariko renders `DSPLY` on standard output, and adjust the golden-file comparison if it adds a prefix.
-4. Decide on the EBCDIC collating sequence fix (see fidelity-gaps.md).
+1. **Jariko prints a banner on standard output.** `io.ibmish.jvm.Launcher` now initializes Jariko with standard output pointed at standard error.
+2. **`%FOUND(filename)` is not implemented in Jariko v2.2.0.** The sample uses `%FOUND` with no argument instead. This is a good first upstream contribution (see fidelity-gaps.md).
+3. **Numbers on WRITE/UPDATE work.** Jariko sends plain decimal strings; -75.25 + 10.25 stored as -65.00, and -1234.56 round-trips.
+4. **DSPLY output is padded** to the message field's length; the golden comparison ignores trailing blanks.
+5. **Jariko's `ChainCacheFlag` is on by default.** Cached CHAIN results could go stale when another job updates the same record. To review when record locking and multi-job work begin.
+
+## Open items
+
+- Decide on the EBCDIC collating sequence fix (see fidelity-gaps.md).

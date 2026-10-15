@@ -4,6 +4,11 @@
 //! clear text. The first `init` creates QSECOFR. If IBMISH_QSECOFR_PASSWORD
 //! is set, that is its password; otherwise the password is QSECOFR and is
 //! marked expired, so the first sign-on must change it.
+//!
+//! Password case follows the IBM i system value QPWDLVL, set here with
+//! IBMISH_QPWDLVL. IBM ships QPWDLVL 0, where passwords are not case
+//! sensitive: the system changes them to upper case. At levels 2 and 3
+//! they are case sensitive.
 
 use anyhow::{anyhow, bail, Result};
 use argon2::password_hash::{
@@ -37,6 +42,33 @@ pub struct Profile {
     pub special_auth: Vec<String>,
     pub curlib: String,
     pub text: String,
+}
+
+/// The password level (QPWDLVL 0-3) from IBMISH_QPWDLVL; 0 when unset,
+/// like a new IBM i.
+pub fn password_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("IBMISH_QPWDLVL")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|l| *l <= 3)
+            .unwrap_or(0)
+    })
+}
+
+/// A password as the system checks it at a password level: upper case at
+/// levels 0 and 1, as typed at 2 and 3.
+pub fn normalize_password(level: u8, pw: &str) -> String {
+    if level <= 1 {
+        pw.to_uppercase()
+    } else {
+        pw.to_string()
+    }
+}
+
+fn normalized(pw: &str) -> String {
+    normalize_password(password_level(), pw)
 }
 
 pub fn hash_password(pw: &str) -> Result<String> {
@@ -96,7 +128,7 @@ pub async fn create(
         .execute(
             "INSERT INTO ibmish.user_profiles (name, password_hash, pwd_expired, special_auth, text)
              VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
-            &[&name, &hash_password(password)?, &expired, &special, &text],
+            &[&name, &hash_password(&normalized(password))?, &expired, &special, &text],
         )
         .await?;
     if n == 0 {
@@ -108,6 +140,9 @@ pub async fn create(
 pub fn check_password_rules(user: &str, pw: &str) -> Result<()> {
     if pw.is_empty() {
         bail!("The password cannot be blank.");
+    }
+    if pw.starts_with(' ') || pw.ends_with(' ') {
+        bail!("The password cannot start or end with a blank.");
     }
     if pw.chars().count() > MAX_PASSWORD {
         bail!("The password can be at most {MAX_PASSWORD} characters.");
@@ -138,7 +173,7 @@ pub async fn authenticate(client: &Client, user: &str, password: &str) -> Result
         let _ = verify_hash(password, dummy);
         bail!(BAD);
     };
-    if !verify_hash(password, row.get(0)) {
+    if !verify_hash(&normalized(password), row.get(0)) {
         bail!(BAD);
     }
     let status: String = row.get(5);
@@ -165,13 +200,13 @@ pub async fn change_password(client: &Client, user: &str, current: &str, new: &s
         .await
         .map_err(|_| anyhow!("Current password not correct."))?;
     check_password_rules(user, new)?;
-    if new == current {
+    if normalized(new) == normalized(current) {
         bail!("The new password must be different from the current password.");
     }
     client
         .execute(
             "UPDATE ibmish.user_profiles SET password_hash = $2, pwd_expired = false WHERE name = $1",
-            &[&user, &hash_password(new)?],
+            &[&user, &hash_password(&normalized(new))?],
         )
         .await?;
     Ok(())
@@ -189,6 +224,19 @@ mod tests {
         assert!(a.starts_with("$argon2id$"));
         assert!(verify_hash("Secret1", &a));
         assert!(!verify_hash("secret1", &a));
+    }
+
+    // IBM i Security reference, QPWDLVL: at levels 0 and 1 passwords are
+    // changed to upper case (so not case sensitive); at 2 and 3 they are
+    // case sensitive.
+    #[test]
+    fn password_level_decides_case() {
+        let h = hash_password(&normalize_password(0, "QSECOFR")).unwrap();
+        assert!(verify_hash(&normalize_password(0, "qsecofr"), &h));
+        assert!(verify_hash(&normalize_password(1, "QsEcOfR"), &h));
+        let h = hash_password(&normalize_password(2, "Secret1")).unwrap();
+        assert!(!verify_hash(&normalize_password(2, "secret1"), &h));
+        assert!(verify_hash(&normalize_password(3, "Secret1"), &h));
     }
 
     #[test]

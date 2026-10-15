@@ -57,9 +57,13 @@ with Tn5250(HOST) as t:
     t.wait_for("CPF1107")
     check(True, "the old password no longer works", t)
 
-    t.type("qsecofr"); t.tab(); t.type(NEWPW); t.enter()
+    # Blanks in front of the password (tn5250j sends them when the cursor
+    # was put in the middle of the field) are not part of it. At QPWDLVL 0
+    # (IBM's shipped value, ibmish's default) passwords are not case
+    # sensitive.
+    t.type("qsecofr"); t.tab(); t.type("   " + NEWPW.lower()); t.enter()
     t.wait_for("Command Entry")
-    check("QSECOFR" in t.line(2), "signed on: command entry shows the user", t)
+    check("QSECOFR" in t.line(2), "signed on (blanks ignored, password not case sensitive): command entry shows the user", t)
 
     command(t, "crtlib mylib text('My first library')", "Library MYLIB created.")
     check("Library MYLIB created." in t.line(24), "CRTLIB creates a library", t)

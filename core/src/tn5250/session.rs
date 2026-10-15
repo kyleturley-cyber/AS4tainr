@@ -58,6 +58,34 @@ impl Term {
     }
 }
 
+/// A password as typed into a nondisplay field, without the blanks around
+/// it. Positions the operator did not type into come back as blanks (or
+/// nulls) depending on the emulator: tn5250j sends blanks in front of the
+/// password when the cursor was put in the middle of the field. Passwords
+/// cannot start or end with a blank, so the blanks are not part of it.
+fn password<'a>(inp: &'a ds::Input, field: &str) -> &'a str {
+    inp.get(field).trim_matches(|c: char| c == ' ' || c == '\0')
+}
+
+/// What a typed secret looked like, without revealing it: its length and
+/// the kinds of characters in it. For the server log when sign-on fails.
+fn describe_secret(raw: &str) -> String {
+    let (mut upper, mut lower, mut digit, mut blank, mut other) = (0, 0, 0, 0, 0);
+    for c in raw.chars() {
+        match c {
+            'A'..='Z' => upper += 1,
+            'a'..='z' => lower += 1,
+            '0'..='9' => digit += 1,
+            ' ' | '\0' => blank += 1,
+            _ => other += 1,
+        }
+    }
+    format!(
+        "{} characters ({upper} upper case, {lower} lower case, {digit} digits, {blank} blanks, {other} other)",
+        raw.chars().count()
+    )
+}
+
 fn centered(s: &mut Screen, row: u8, text: &str) {
     let col = ((80 - text.chars().count() as u8) / 2).max(2);
     s.text(row, col, attr::HIGH, text);
@@ -82,6 +110,7 @@ fn label(text: &str, width: usize) -> String {
 pub async fn run(stream: tokio::net::TcpStream, cfg: &ServerConfig, device: &str) -> Result<()> {
     let mut conn = Connection::new(stream);
     conn.negotiate().await?;
+    eprintln!("ibmish: {device}: terminal type {}", conn.terminal_type);
     let mut term = Term { conn };
     let client = bridge::connect_db(&cfg.env.database_url).await?;
     let mut message = String::new();
@@ -128,10 +157,17 @@ pub async fn run(stream: tokio::net::TcpStream, cfg: &ServerConfig, device: &str
             message = "Type your user profile name and password.".into();
             continue;
         }
-        let profile = match users::authenticate(&client, &user, inp.get("PASSWORD")).await {
+        let profile = match users::authenticate(&client, &user, password(&inp, "PASSWORD")).await {
             Ok(p) => p,
             Err(e) => {
                 attempts += 1;
+                eprintln!(
+                    "ibmish: {device}: sign-on failed for user '{user}' ({}); password received: {}; fields modified: {:?}; cursor {:?}",
+                    e,
+                    describe_secret(inp.get("PASSWORD")),
+                    inp.modified,
+                    inp.cursor,
+                );
                 tokio::time::sleep(Duration::from_millis(800)).await;
                 if attempts >= cfg.max_signon_attempts {
                     let mut s = Screen::new();
@@ -230,11 +266,21 @@ async fn change_password(
             Aid::Enter => {}
             _ => continue,
         }
-        if inp.get("NEW") != inp.get("VERIFY") {
+        let level = users::password_level();
+        if users::normalize_password(level, password(&inp, "NEW"))
+            != users::normalize_password(level, password(&inp, "VERIFY"))
+        {
             message = "New password and verify password do not match.".into();
             continue;
         }
-        match users::change_password(client, user, inp.get("CURRENT"), inp.get("NEW")).await {
+        match users::change_password(
+            client,
+            user,
+            password(&inp, "CURRENT"),
+            password(&inp, "NEW"),
+        )
+        .await
+        {
             Ok(()) => return Ok(true),
             Err(e) => message = e.to_string(),
         }

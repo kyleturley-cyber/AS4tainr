@@ -25,6 +25,9 @@ pub enum Kind {
     Qualified,
     /// A password: prompted in a nondisplay field.
     Password,
+    /// A whole command as a value (SBMJOB CMD): taken as written, nested
+    /// parentheses and all.
+    Command,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -248,6 +251,68 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "SBMJOB",
+        description: "Submit Job",
+        params: &[
+            p("CMD", Kind::Command, true, None, "Command to run"),
+            p("JOB", Kind::Name, false, Some("*JOBD"), "Job name").ch("Name, *JOBD"),
+            p("JOBQ", Kind::Name, false, Some("*JOBD"), "Job queue").ch("QBATCH, *JOBD"),
+            p(
+                "CURLIB",
+                Kind::Name,
+                false,
+                Some("*CURRENT"),
+                "Current library",
+            )
+            .ch("Name, *CURRENT, *CRTDFT")
+            .keyword_only(),
+            p(
+                "INLLIBL",
+                Kind::List,
+                false,
+                Some("*CURRENT"),
+                "Initial library list",
+            )
+            .ch("Name, *CURRENT")
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "WRKACTJOB",
+        description: "Work with Active Jobs",
+        params: &[],
+    },
+    CommandDef {
+        name: "WRKSBMJOB",
+        description: "Work with Submitted Jobs",
+        params: &[],
+    },
+    CommandDef {
+        name: "DSPJOBLOG",
+        description: "Display Job Log",
+        params: &[p("JOB", Kind::Text, false, Some("*"), "Job name").ch("*, number/user/name")],
+    },
+    CommandDef {
+        name: "ENDJOB",
+        description: "End Job",
+        params: &[p("JOB", Kind::Text, true, None, "Job name").ch("number/user/name")],
+    },
+    CommandDef {
+        name: "SNDMSG",
+        description: "Send Message",
+        params: &[
+            p("MSG", Kind::Text, true, None, "Message text"),
+            p("TOUSR", Kind::Name, true, None, "To user profile").ch("Name"),
+        ],
+    },
+    CommandDef {
+        name: "DSPMSG",
+        description: "Display Messages",
+        params: &[
+            p("MSGQ", Kind::Name, false, Some("*USRPRF"), "Message queue").ch("*USRPRF, user name"),
+        ],
+    },
+    CommandDef {
         name: "CRTDTAARA",
         description: "Create Data Area",
         params: &[
@@ -331,6 +396,19 @@ pub static GROUPS: &[Group] = &[
         item: "Program commands",
         title: "Program Commands",
         commands: &["CALL"],
+    },
+    Group {
+        item: "Job and message commands",
+        title: "Job and Message Commands",
+        commands: &[
+            "SBMJOB",
+            "WRKACTJOB",
+            "WRKSBMJOB",
+            "DSPJOBLOG",
+            "ENDJOB",
+            "SNDMSG",
+            "DSPMSG",
+        ],
     },
     Group {
         item: "Session commands",
@@ -448,6 +526,81 @@ fn tokenize(s: &str) -> Result<Vec<Tok>> {
     Ok(out)
 }
 
+/// A value that is itself a command (`SBMJOB CMD(CALL PGM(X) PARM('a'))`)
+/// is turned into one quoted string before tokenizing, so its own
+/// parentheses and keywords stay as written.
+fn quote_command_values(line: &str) -> Result<String> {
+    let name = line
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("");
+    let Some(def) = find(name) else {
+        return Ok(line.to_string());
+    };
+    let mut out = line.to_string();
+    for pd in def.params.iter().filter(|p| p.kind == Kind::Command) {
+        let cs: Vec<char> = out.chars().collect();
+        let kw: Vec<char> = pd.keyword.chars().collect();
+        let mut i = 0;
+        let mut in_q = false;
+        let mut found = None;
+        while i < cs.len() {
+            if cs[i] == '\'' {
+                in_q = !in_q;
+            } else if !in_q
+                && (i == 0 || cs[i - 1].is_whitespace())
+                && cs.len() >= i + kw.len()
+                && cs[i..i + kw.len()]
+                    .iter()
+                    .zip(&kw)
+                    .all(|(a, b)| a.eq_ignore_ascii_case(b))
+            {
+                let mut j = i + kw.len();
+                while j < cs.len() && cs[j] == ' ' {
+                    j += 1;
+                }
+                if cs.get(j) == Some(&'(') {
+                    found = Some((i, j));
+                    break;
+                }
+            }
+            i += 1;
+        }
+        let Some((start, open)) = found else { continue };
+        // The matching close parenthesis, outside quotes.
+        let (mut depth, mut q, mut close) = (0i32, false, None);
+        for (k, &c) in cs.iter().enumerate().skip(open) {
+            match c {
+                '\'' => q = !q,
+                '(' if !q => depth += 1,
+                ')' if !q => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(k);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            return Err(err(format!(
+                "A closing parenthesis is missing after {}.",
+                pd.keyword
+            )));
+        };
+        let inner: String = cs[open + 1..close].iter().collect();
+        let quoted = format!("{}('{}')", pd.keyword, inner.trim().replace('\'', "''"));
+        out = format!(
+            "{}{}{}",
+            cs[..start].iter().collect::<String>(),
+            quoted,
+            cs[close + 1..].iter().collect::<String>()
+        );
+    }
+    Ok(out)
+}
+
 fn err(msg: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("CPF0006: Errors occurred in command. {msg}")
 }
@@ -457,7 +610,8 @@ fn err(msg: impl std::fmt::Display) -> anyhow::Error {
 pub fn parse_partial(
     line: &str,
 ) -> Result<(&'static CommandDef, BTreeMap<&'static str, Vec<Value>>)> {
-    let toks = tokenize(line.trim())?;
+    let line = quote_command_values(line.trim())?;
+    let toks = tokenize(&line)?;
     let mut it = toks.into_iter().peekable();
     let name = match it.next() {
         Some(Tok::Word(w)) => w,
@@ -605,7 +759,7 @@ fn cl_value(kind: Kind, v: &str) -> String {
         && v.chars()
             .all(|c| c.is_ascii_alphanumeric() || "*$#@_./".contains(c));
     match kind {
-        Kind::List => v.to_string(),
+        Kind::List | Kind::Command => v.to_string(),
         Kind::Text | Kind::Password if !(plain && v.starts_with('*')) => {
             format!("'{}'", v.replace('\'', "''"))
         }
@@ -714,6 +868,17 @@ mod tests {
         let c = parse("crtdtaara nxt *dec len(7 0) value(1004)").unwrap();
         assert_eq!(c.list("LEN"), ["7", "0"]);
         assert!(parse("CHGDTAARA DTAARA(CO (1 (2))) VALUE(X)").is_err());
+    }
+
+    #[test]
+    fn command_values_keep_their_parentheses() {
+        // SBMJOB CMD takes a whole command, nested lists and quotes included.
+        let c = parse("SBMJOB CMD(CHGDTAARA DTAARA(X (1 2)) VALUE('it''s')) JOB(nightly)").unwrap();
+        assert_eq!(c.get("CMD"), "CHGDTAARA DTAARA(X (1 2)) VALUE('it''s')");
+        assert_eq!(c.get("JOB"), "NIGHTLY");
+        let c = parse("sbmjob cmd(call pgm(custrpt) parm('L'))").unwrap();
+        assert_eq!(c.get("CMD"), "call pgm(custrpt) parm('L')");
+        assert!(parse("SBMJOB CMD(CALL PGM(X)").is_err());
     }
 
     #[test]

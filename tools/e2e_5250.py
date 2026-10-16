@@ -316,6 +316,59 @@ with Tn5250(HOST) as t:
     command(t, "dspusrprf bob", "Display User Profile")
     check("*PGMR" in t.text() and "Bob the builder" in t.text(), "DSPUSRPRF shows the class and text", t)
     t.fkey(3); t.wait_for("Command Entry")
+
+    # Phase 3: two users signed on at once, and a batch job.
+    with Tn5250(HOST) as t2:
+        t2.wait_for("Sign On")
+        t2.type("bob"); t2.tab(); t2.type("secret42"); t2.enter()
+        t2.wait_for("Command Entry")
+        check("BOB" in t2.line(2), "a second session signs on as BOB while QSECOFR is signed on", t2)
+        command(t2, "sbmjob cmd(call pgm(custrpt) parm(L)) job(rpt)", "submitted to job queue QBATCH")
+        check("CPC1221" in t2.line(24) and "/BOB/RPT" in t2.line(24),
+              "SBMJOB puts job RPT on job queue QBATCH (CPC1221)", t2)
+        command(t, "wrkactjob", "Work with Active Jobs")
+        screen = t.text()
+        check("QINTER" in screen and "QBATCH" in screen and "BOB" in screen and "CMD-WRKACTJOB" in screen,
+              "WRKACTJOB in QSECOFR's session lists BOB's interactive job under QINTER", t)
+        t.fkey(3); t.wait_for("Command Entry")
+        command(t2, "wrksbmjob", "Work with Submitted Jobs")
+        for _ in range(60):
+            if "OUTQ" in t2.text():
+                break
+            t2.fkey(5)
+            t2.pump(1.5)
+        check("RPT" in t2.text() and "OUTQ" in t2.text() and "abnormally" not in t2.text(),
+              "QBATCH runs the job: WRKSBMJOB shows it ended (OUTQ); F5 refreshes", t2)
+        t2.type("5"); t2.enter()
+        t2.wait_for("Display Job Log")
+        screen = t2.text()
+        check("> call pgm(custrpt) parm(L)" in screen and "started in subsystem QBATCH" in screen,
+              "option 5 shows the batch job's log: the command it ran", t2)
+        for _ in range(5):
+            if "CPF1241" in t2.text():
+                break
+            t2.page_down(); t2.pump(0.5)
+        check("Report done for BOB" in t2.text() and "CPF1241" in t2.text(),
+              "the job log has the CL program's messages and the completion message", t2)
+        t2.fkey(3); t2.wait_for("Command Entry")
+        command(t2, "dspmsg", "Display Messages")
+        check("CPF1241" in t2.text() and "/BOB/RPT completed normally" in t2.text(),
+              "BOB gets CPF1241 on his message queue when the job ends", t2)
+        t2.fkey(3); t2.wait_for("Command Entry")
+        command(t2, "sndmsg msg('Report is ready') tousr(qsecofr)", "Message sent to QSECOFR.")
+        check(True, "SNDMSG sends a message to another user", t2)
+        command(t, "dsplibl", "Display Library List")
+        t.fkey(3)
+        t.wait_for("new message")
+        check("DSPMSG" in t.line(24), "QSECOFR's session says a new message is waiting", t)
+        command(t, "dspmsg", "Display Messages")
+        check("Report is ready" in t.text() and "From BOB" in t.text(), "DSPMSG shows BOB's message", t)
+        t.fkey(3); t.wait_for("Command Entry")
+        command(t2, "signoff", "Sign On")
+    command(t, "dspjoblog", "Display Job Log")
+    check("> crtlib mylib text('My first library')" in t.text() and "QINTER" in t.text(),
+          "DSPJOBLOG shows this session's own job log, oldest first", t)
+    t.fkey(3); t.wait_for("Command Entry")
     command(t, "wrkobj qgpl/cust*", "Work with Objects")
     screen = t.text()
     check("CUSTMAST" in screen and "CUSTWRKD" in screen and "ORDLIN" not in screen,

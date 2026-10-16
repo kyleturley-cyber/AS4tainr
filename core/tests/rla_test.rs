@@ -815,6 +815,7 @@ async fn job_library_list_commands() {
         curlib: None,
         libl: vec!["QGPL".into(), "QTEMP".into()],
         display: None,
+        id: None,
     };
     let types = |job: &Job| -> Vec<String> {
         job.library_list_entries()
@@ -1270,6 +1271,7 @@ async fn cl_job_run(
         curlib: None,
         libl: vec![lib.to_string()],
         display: None,
+        id: None,
     };
     match job.run(call).await? {
         Outcome::Messages(m) => Ok(m),
@@ -1451,6 +1453,7 @@ async fn job_run(
         curlib: Some(lib.to_string()),
         libl: vec![lib.to_string()],
         display: None,
+        id: None,
     };
     job.run(line).await
 }
@@ -1619,4 +1622,173 @@ async fn bridge_data_area_in_lock_out() {
     let r = ask(json!({"id": 5, "op": "dtaara_in", "name": "NOSUCH"})).await;
     assert!(r["error"].as_str().unwrap().starts_with("CPF1015"), "{r}");
     server.abort();
+}
+
+/// Work management: SBMJOB puts a job on QBATCH; the subsystem runs it in
+/// a new job with the submitter's library list and keeps its job log;
+/// the submitter gets CPF1241 (completed normally) or CPF1240 (ended
+/// abnormally) on their message queue, as IBM's work management
+/// documentation describes. Also WRKSBMJOB, WRKACTJOB, ENDJOB of a job
+/// still on the queue, SNDMSG and DSPMSG.
+#[tokio::test]
+async fn submitted_jobs_run_in_qbatch() {
+    use ibmish_core::commands::{Environment, Job, Outcome};
+    use ibmish_core::jobs;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+        runner: "false".into(),
+        call_timeout: std::time::Duration::from_secs(5),
+    };
+    let device = format!("D{lib}");
+    let id = jobs::start_interactive(
+        &client,
+        &device,
+        "QSECOFR",
+        Some(&lib),
+        std::slice::from_ref(&lib),
+    )
+    .await
+    .unwrap();
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: Some(id.clone()),
+    };
+    let msg = |o: Outcome| match o {
+        Outcome::Messages(m) => m.join("\n"),
+        other => panic!("unexpected {other:?}"),
+    };
+    // Runs one submitted job, whether this test or a running server's
+    // QBATCH subsystem picks it up.
+    let run = |number: i64| {
+        let env = env.clone();
+        let client = &client;
+        async move {
+            if let Some(info) = jobs::claim(client, number).await.unwrap() {
+                jobs::run_batch_job(&env, &info).await.unwrap();
+            }
+            for _ in 0..100 {
+                if jobs::get(client, number).await.unwrap().status == "OUTQ" {
+                    return jobs::get(client, number).await.unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            panic!("job {number} did not end");
+        }
+    };
+    let number_in = |m: &str| -> i64 { m.split_whitespace().nth(2).unwrap()[..6].parse().unwrap() };
+
+    // A job that works: unqualified names resolve through the library
+    // list the job inherited (INLLIBL(*CURRENT)).
+    let m = msg(job
+        .run("SBMJOB CMD(CRTDTAARA DTAARA(D1) TYPE(*CHAR) LEN(5) VALUE('ok')) JOB(MAKEDTA)")
+        .await
+        .unwrap());
+    assert!(m.starts_with("CPC1221: Job "), "{m}");
+    assert!(
+        m.contains("/QSECOFR/MAKEDTA submitted to job queue QBATCH"),
+        "{m}"
+    );
+    let n1 = number_in(&m);
+    let done = run(n1).await;
+    assert_eq!(done.end_code, "NORMAL");
+    let d = ibmish_core::dtaara::resolve(&client, "D1", std::slice::from_ref(&lib), &lib)
+        .await
+        .unwrap();
+    assert_eq!(d.value, "ok   ");
+    let log = jobs::job_log(&client, n1).await.unwrap();
+    assert!(log
+        .iter()
+        .any(|e| e.kind == "*RQS" && e.text.starts_with("CRTDTAARA")));
+    assert!(log
+        .iter()
+        .any(|e| e.text == format!("Data area D1 created in library {lib}.")));
+    assert!(log.last().unwrap().text.starts_with("CPF1241"));
+
+    // A job that fails ends abnormally.
+    let m = msg(job
+        .run("SBMJOB CMD(DLTDTAARA NOPE) JOB(FAILS)")
+        .await
+        .unwrap());
+    let n2 = number_in(&m);
+    let done = run(n2).await;
+    assert_eq!(done.end_code, "ABNORMAL");
+    let log = jobs::job_log(&client, n2).await.unwrap();
+    assert!(log.iter().any(|e| e.msgid == "CPF1015"), "{log:?}");
+
+    // The completion messages are on QSECOFR's message queue.
+    let msgs = jobs::messages(&client, "QSECOFR", false).await.unwrap();
+    let job1 = format!("{n1:06}/QSECOFR/MAKEDTA");
+    let job2 = format!("{n2:06}/QSECOFR/FAILS");
+    assert!(msgs.iter().any(
+        |x| x.text == format!("CPF1241: Job {job1} completed normally.") && x.from_user == "QSYS"
+    ));
+    assert!(msgs
+        .iter()
+        .any(|x| x.text == format!("CPF1240: Job {job2} ended abnormally.")));
+
+    // A command that does not parse is never submitted.
+    assert!(job.run("SBMJOB CMD(NOSUCHCMD X)").await.is_err());
+
+    // WRKSBMJOB and the job log of a submitted job.
+    let Outcome::Display(d) = job.run("WRKSBMJOB").await.unwrap() else {
+        panic!()
+    };
+    assert!(d.keys.contains(&job1) && d.keys.contains(&job2));
+    let Outcome::Display(d) = job.run(&format!("DSPJOBLOG JOB({job1})")).await.unwrap() else {
+        panic!()
+    };
+    assert!(
+        d.rows.iter().any(|r| r.contains("> CRTDTAARA")),
+        "{:?}",
+        d.rows
+    );
+
+    // WRKACTJOB shows this interactive job under QINTER.
+    let Outcome::Display(d) = job.run("WRKACTJOB").await.unwrap() else {
+        panic!()
+    };
+    assert!(d.keys.contains(&id.to_string()));
+
+    // ENDJOB of a job that has not started takes it off the queue.
+    let m = msg(job.run("SBMJOB CMD(DSPLIBL) JOB(NEVER)").await.unwrap());
+    let n3 = number_in(&m);
+    let ended = job.run(&format!("ENDJOB JOB({n3:06}/QSECOFR/NEVER)")).await;
+    match ended {
+        Ok(o) => assert!(msg(o).contains("taken off job queue QBATCH")),
+        // A running server's QBATCH may have started it already.
+        Err(e) => assert!(
+            e.to_string().contains("active") || e.to_string().contains("ended"),
+            "{e}"
+        ),
+    }
+
+    // SNDMSG / DSPMSG.
+    msg(job
+        .run(&format!(
+            "SNDMSG MSG('Lunch at noon, {lib}') TOUSR(QSECOFR)"
+        ))
+        .await
+        .unwrap());
+    let Outcome::Display(d) = job.run("DSPMSG").await.unwrap() else {
+        panic!()
+    };
+    assert!(d
+        .rows
+        .iter()
+        .any(|r| r.ends_with(&format!("Lunch at noon, {lib}"))));
+    let after = jobs::messages(&client, "QSECOFR", false).await.unwrap();
+    assert!(after
+        .iter()
+        .all(|x| !x.is_new || x.id > after.last().unwrap().id));
+    assert!(job.run("SNDMSG MSG(hi) TOUSR(NOBODY99)").await.is_err());
+
+    jobs::end(&client, &id, true).await.unwrap();
+    assert_eq!(jobs::get(&client, id.number).await.unwrap().status, "OUTQ");
 }

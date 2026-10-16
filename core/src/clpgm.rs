@@ -17,7 +17,7 @@
 //! - `MONMSG MSGID EXEC` after a command, or program-level (right after
 //!   the declarations); generic IDs like `CPF0000` and `CPF9800`
 //! - `SNDPGMMSG` (MSG, MSGID/MSGDTA, MSGTYPE *INFO *COMP *DIAG *ESCAPE),
-//!   `CHKOBJ`, `RTVJOBA` (USER, CURLIB, TYPE), `RTVDTAARA`
+//!   `CHKOBJ`, `RTVJOBA` (JOB, USER, NBR, CURLIB, TYPE), `RTVDTAARA`
 //! - `CALL PGM PARM` (CL programs here, others through the RPG runner)
 //! - any other command the job knows, with `&variables` replaced by
 //!   their values
@@ -1704,6 +1704,15 @@ async fn command(
                     "USER" | "CURUSER" => Value::Char(job.user.clone()),
                     "CURLIB" => Value::Char(job.curlib.clone().unwrap_or_else(|| "*CRTDFT".into())),
                     "TYPE" => Value::Char(if job.display.is_some() { "1" } else { "0" }.into()),
+                    "JOB" => {
+                        Value::Char(job.id.as_ref().map(|i| i.name.clone()).unwrap_or_default())
+                    }
+                    "NBR" => Value::Char(
+                        job.id
+                            .as_ref()
+                            .map(|i| format!("{:06}", i.number))
+                            .unwrap_or_default(),
+                    ),
                     other => bail!("line {}: RTVJOBA {other} is not supported yet", st.line),
                 };
                 let name = target.trim().to_ascii_uppercase();

@@ -357,6 +357,11 @@ async fn run(cli: Cli) -> Result<u8> {
             // Make sure the catalog and QSECOFR exist before anyone signs on.
             let client = bridge::connect_db(&cli.database_url).await?;
             catalog::init(&client).await?;
+            // Jobs left active by a server that stopped are not running.
+            let stale = ibmish_core::jobs::recover(&client).await?;
+            if stale > 0 {
+                println!("ibmish: {stale} jobs from before the restart marked as ended");
+            }
             drop(client);
             let listener = tokio::net::TcpListener::bind(&listen)
                 .await
@@ -375,7 +380,14 @@ async fn run(cli: Cli) -> Result<u8> {
                 libl: libl.clone(),
                 max_signon_attempts: 3,
             };
-            tn5250::serve(listener, cfg).await?;
+            // The QBATCH subsystem runs submitted jobs in this process.
+            let maxact = ibmish_core::jobs::batch_max_active();
+            println!("ibmish: subsystem QBATCH started (MAXACT {maxact})");
+            let qbatch = tokio::spawn(ibmish_core::jobs::run_subsystem(cfg.env.clone(), maxact));
+            tokio::select! {
+                r = tn5250::serve(listener, cfg) => r?,
+                r = qbatch => r??,
+            }
         }
         Cmd::Call {
             program,
@@ -407,6 +419,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 curlib: None,
                 libl: libl.clone(),
                 display: None,
+                id: None,
             };
             match job.call_program(&program, args).await {
                 Ok(commands::Outcome::Messages(m)) => {

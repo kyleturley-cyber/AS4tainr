@@ -22,7 +22,7 @@ Written from IBM's public CL reference.
 | Control | `IF COND THEN` / `ELSE CMD`, `DO` / `ENDDO`, `DOWHILE`, `DOUNTIL`, `DOFOR VAR FROM TO BY`, `LEAVE`, `ITERATE`, `SELECT` / `WHEN` / `OTHERWISE` / `ENDSELECT`, `GOTO CMDLBL`, `RETURN` |
 | Errors | `MONMSG MSGID EXEC` after a command, or program-level right after the declarations (tried after the command-level ones; when its EXEC is not a GOTO or RETURN, the program goes on after the command that failed). Generic IDs: `CPF0000` all CPF messages, `CPF9800` all CPF98xx. An unmonitored error ends the program and names the line. |
 | Messages | `SNDPGMMSG MSG(...)` or `MSGID(...) MSGDTA(...)`, `MSGTYPE(*INFO \| *COMP \| *DIAG \| *ESCAPE)`: *ESCAPE ends the program with that message (CPF9898 when MSG is given), which a calling CL program can monitor for. Other messages go to the job log (the command entry screen, or standard output for `ibmish call`). |
-| Commands | `CALL PGM PARM` (CL or RPG), `CHKOBJ OBJ OBJTYPE` (`CPF9801` when missing), `RTVJOBA USER CURLIB TYPE`, `RTVDTAARA DTAARA RTNVAR` (see [data-areas.md](data-areas.md)), and every other command the job knows (CRTLIB, ADDLIBLE, CHGCURLIB, RUNSQL, CRTUSRPRF, ...) with `&variables` replaced by their values |
+| Commands | `CALL PGM PARM` (CL or RPG), `CHKOBJ OBJ OBJTYPE` (`CPF9801` when missing), `RTVJOBA JOB USER NBR CURLIB TYPE`, `SBMJOB` (see [work-management.md](work-management.md)), `RTVDTAARA DTAARA RTNVAR` (see [data-areas.md](data-areas.md)), and every other command the job knows (CRTLIB, ADDLIBLE, CHGCURLIB, RUNSQL, CRTUSRPRF, ...) with `&variables` replaced by their values |
 
 A program that runs more than ten million steps is ended, so a loop that never ends cannot hang a job.
 

@@ -216,6 +216,22 @@ pub async fn run(stream: tokio::net::TcpStream, cfg: &ServerConfig, device: &str
         };
         // Programs called from this session show their display files here.
         let (display_tx, mut display_rx) = tokio::sync::mpsc::channel::<bridge::DisplayRequest>(1);
+        // The session is an interactive job in QINTER.
+        let id = crate::jobs::start_interactive(
+            &client,
+            device,
+            &profile.name,
+            curlib.as_deref(),
+            &cfg.libl,
+        )
+        .await?;
+        crate::jobs::log(
+            &client,
+            &id,
+            "*INFO",
+            &format!("Job {id} started in subsystem QINTER."),
+        )
+        .await;
         let mut job = Job {
             client: &client,
             env: &cfg.env,
@@ -223,8 +239,14 @@ pub async fn run(stream: tokio::net::TcpStream, cfg: &ServerConfig, device: &str
             curlib,
             libl: cfg.libl.clone(),
             display: Some(display_tx),
+            id: Some(id.clone()),
         };
-        command_entry(&mut term, &mut job, cfg, &mut display_rx).await?;
+        let ended = command_entry(&mut term, &mut job, cfg, &mut display_rx).await;
+        // The job ends however the session ends (sign-off, F3, the
+        // emulator closing).
+        crate::jobs::log(&client, &id, "*INFO", &format!("Job {id} ended.")).await;
+        crate::jobs::end(&client, &id, ended.is_ok()).await?;
+        ended?;
         message = format!("User {} signed off.", profile.name);
     }
 }
@@ -384,6 +406,20 @@ async fn command_entry(
         retrieve.push(line.clone());
         retrieve_pos = 0;
         log.push(format!("> {line}"));
+        if let Some(id) = &job.id {
+            crate::jobs::log(job.client, id, "*RQS", &line).await;
+            let first = line
+                .split(|c: char| c.is_whitespace() || c == '(')
+                .next()
+                .unwrap_or("");
+            crate::jobs::set_function(
+                job.client,
+                id,
+                &format!("CMD-{}", first.to_ascii_uppercase()),
+                "RUN",
+            )
+            .await;
+        }
         // Run the command; while it runs, show any display file records
         // its program writes (EXFMT) on this terminal.
         let user = job.user.clone();
@@ -404,6 +440,21 @@ async fn command_entry(
                 }
             }
         };
+        if let Some(id) = &job.id {
+            match &result {
+                Ok(Outcome::Messages(msgs)) => {
+                    for m in msgs {
+                        crate::jobs::log(job.client, id, "*INFO", m).await;
+                    }
+                }
+                Err(e) => {
+                    for m in e.to_string().lines() {
+                        crate::jobs::log(job.client, id, "*ESCAPE", m).await;
+                    }
+                }
+                _ => {}
+            }
+        }
         match result {
             Ok(Outcome::Messages(msgs)) => {
                 if let Some(last) = msgs.last() {
@@ -433,6 +484,23 @@ async fn command_entry(
                 log.extend(lines.iter().map(|m| format!("  {m}")));
                 prefill = line.clone();
             }
+        }
+        if let Some(id) = &job.id {
+            crate::jobs::set_function(job.client, id, "", "DSPW").await;
+        }
+        // New messages on the user's message queue (a submitted job
+        // ended, SNDMSG from another user): say so when nothing else is.
+        let waiting = crate::jobs::new_messages(job.client, &job.user)
+            .await
+            .unwrap_or(0);
+        if waiting > 0 && message.is_empty() {
+            message = if waiting == 1 {
+                "A new message is on your message queue. Type DSPMSG to see it.".into()
+            } else {
+                format!(
+                    "{waiting} new messages are on your message queue. Type DSPMSG to see them."
+                )
+            };
         }
     }
 }
@@ -629,6 +697,7 @@ fn prompt_width(kind: cl::Kind) -> u16 {
         cl::Kind::Name | cl::Kind::Qualified => 10,
         cl::Kind::Password => users::MAX_PASSWORD as u16,
         cl::Kind::Text | cl::Kind::List => 42,
+        cl::Kind::Command => 60,
     }
 }
 
@@ -674,7 +743,7 @@ async fn prompt(
             let w = prompt_width(pd.kind);
             let kind = match pd.kind {
                 cl::Kind::Password => FieldKind::Hidden,
-                cl::Kind::Text | cl::Kind::List => FieldKind::Text,
+                cl::Kind::Text | cl::Kind::List | cl::Kind::Command => FieldKind::Text,
                 _ => FieldKind::Upper,
             };
             let v = values.get(pd.keyword).cloned().unwrap_or_default();
@@ -860,6 +929,8 @@ enum ListResult {
     Exit,
     /// Options were typed: run these commands, then show the list again.
     Run(Vec<String>),
+    /// F5: show the list again with fresh data.
+    Refresh,
 }
 
 /// Show a list, then run the commands of the options typed on it and come
@@ -876,7 +947,10 @@ async fn show_list(term: &mut Term, job: &mut Job<'_>, d: ListDisplay) -> Result
             ListResult::Back => {
                 stack.pop();
             }
+            ListResult::Refresh => refresh_top(job, &mut stack, &mut message).await,
             ListResult::Run(cmds) => {
+                // Options change what the list shows (ENDJOB, ...).
+                refresh_top(job, &mut stack, &mut message).await;
                 let mut shown = Vec::new();
                 for c in cmds {
                     match job.run(&c).await {
@@ -892,6 +966,22 @@ async fn show_list(term: &mut Term, job: &mut Job<'_>, d: ListDisplay) -> Result
         }
     }
     Ok(())
+}
+
+/// Run the top list's refresh command and show its new data.
+async fn refresh_top(job: &mut Job<'_>, stack: &mut [ListDisplay], message: &mut String) {
+    let Some(cmd) = stack.last().and_then(|d| d.refresh.clone()) else {
+        return;
+    };
+    match job.run(&cmd).await {
+        Ok(Outcome::Display(d)) => {
+            if let Some(top) = stack.last_mut() {
+                *top = d;
+            }
+        }
+        Ok(_) => {}
+        Err(e) => *message = e.to_string().lines().last().unwrap_or("").to_string(),
+    }
 }
 
 async fn list_display(term: &mut Term, d: &ListDisplay, first_message: &str) -> Result<ListResult> {
@@ -953,7 +1043,7 @@ async fn list_display(term: &mut Term, d: &ListDisplay, first_message: &str) -> 
         }
         for (i, idx) in (top.min(d.rows.len())..end).enumerate() {
             let r = first + i as u8;
-            if has_options {
+            if has_options && d.keys.get(idx).is_some_and(|k| !k.is_empty()) {
                 let v = typed.get(&idx).cloned().unwrap_or_default();
                 s.field(&format!("OPT{idx}"), r, 3, opt_width, FieldKind::Text, &v);
             }
@@ -968,10 +1058,11 @@ async fn list_display(term: &mut Term, d: &ListDisplay, first_message: &str) -> 
         keys(
             &mut s,
             23,
-            if wide {
-                "F3=Exit   F12=Cancel   F19=Left   F20=Right"
-            } else {
-                "F3=Exit   F12=Cancel"
+            match (d.refresh.is_some(), wide) {
+                (true, true) => "F3=Exit   F5=Refresh   F12=Cancel   F19=Left   F20=Right",
+                (true, false) => "F3=Exit   F5=Refresh   F12=Cancel",
+                (false, true) => "F3=Exit   F12=Cancel   F19=Left   F20=Right",
+                (false, false) => "F3=Exit   F12=Cancel",
             },
         );
         s.message(&message);
@@ -993,6 +1084,7 @@ async fn list_display(term: &mut Term, d: &ListDisplay, first_message: &str) -> 
         match inp.aid {
             Aid::F(3) => return Ok(ListResult::Exit),
             Aid::F(12) => return Ok(ListResult::Back),
+            Aid::F(5) if d.refresh.is_some() => return Ok(ListResult::Refresh),
             Aid::Enter => {
                 if typed.is_empty() {
                     return Ok(ListResult::Back);

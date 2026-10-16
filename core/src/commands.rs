@@ -9,6 +9,7 @@ use crate::bridge;
 use crate::catalog;
 use crate::cl::{self, Command};
 use crate::dtaara;
+use crate::jobs;
 use crate::users;
 
 /// Settings that come from the server, not from the job.
@@ -31,6 +32,9 @@ pub struct Job<'a> {
     pub libl: Vec<String>,
     /// The job's display, for programs that use display files.
     pub display: Option<bridge::DisplayHandle>,
+    /// The job's qualified name, for jobs the system knows about
+    /// (interactive sessions, submitted jobs). None for `ibmish call`.
+    pub id: Option<jobs::JobId>,
 }
 
 /// A list shown on its own screen (DSPLIB, DSPLIBL, ...).
@@ -43,8 +47,12 @@ pub struct ListDisplay {
     /// Options the operator can type next to a row: (number, text,
     /// command with `{}` for the row's key). Empty: a plain list.
     pub options: Vec<(u8, String, String)>,
-    /// One key per row, for the options' commands.
+    /// One key per row, for the options' commands. A row with an empty
+    /// key takes no option.
     pub keys: Vec<String>,
+    /// The command that shows this list again with fresh data (F5), if
+    /// the list can change while it is shown.
+    pub refresh: Option<String>,
 }
 
 /// The system part of the library list (system value QSYSLIBL as shipped).
@@ -130,6 +138,13 @@ impl Job<'_> {
             "CHGDTAARA" => self.chgdtaara(&cmd).await,
             "DSPDTAARA" => self.dspdtaara(&cmd).await,
             "DLTDTAARA" => self.dltdtaara(&cmd).await,
+            "SBMJOB" => self.sbmjob(&cmd).await,
+            "WRKACTJOB" => self.wrkactjob().await,
+            "WRKSBMJOB" => self.wrksbmjob().await,
+            "DSPJOBLOG" => self.dspjoblog(&cmd).await,
+            "ENDJOB" => self.endjob(&cmd).await,
+            "SNDMSG" => self.sndmsg(&cmd).await,
+            "DSPMSG" => self.dspmsg(&cmd).await,
             "SIGNOFF" => Ok(Outcome::SignOff),
             other => bail!("CPD0030: Command {other} is not implemented yet."),
         }
@@ -198,6 +213,7 @@ impl Job<'_> {
                 "DSPLIB LIB({})".into(),
             )],
             keys,
+            refresh: None,
         }))
     }
 
@@ -535,6 +551,262 @@ impl Job<'_> {
         }))
     }
 
+    /// SBMJOB: put the command on job queue QBATCH, to run in a new batch
+    /// job with this job's user, current library and library list.
+    async fn sbmjob(&mut self, cmd: &Command) -> Result<Outcome> {
+        let command = cmd.get("CMD").trim().to_string();
+        // Check it now, as SBMJOB does: a command that does not parse is
+        // never submitted.
+        cl::parse(&command)?;
+        let name = match cmd.get("JOB") {
+            "*JOBD" => jobs::DEFAULT_BATCH_JOB_NAME.to_string(),
+            n => n.to_string(),
+        };
+        let jobq = match cmd.get("JOBQ") {
+            "*JOBD" | "QBATCH" | "*LIBL/QBATCH" | "QGPL/QBATCH" | "QSYS/QBATCH" => {
+                jobs::BATCH_QUEUE
+            }
+            other => bail!("Job queue {other} not found. The job queue is QBATCH (JOBQ(*JOBD))."),
+        };
+        let curlib = match cmd.get("CURLIB") {
+            "*CURRENT" => self.curlib.clone(),
+            "*CRTDFT" => None,
+            l => {
+                if !catalog::library_exists(self.client, l).await? {
+                    bail!("CPF2110: Library {l} not found.");
+                }
+                Some(l.to_string())
+            }
+        };
+        let inllibl = cmd.list("INLLIBL");
+        let libl = if inllibl.is_empty() || inllibl == ["*CURRENT"] {
+            self.libl.clone()
+        } else {
+            inllibl
+        };
+        let id = jobs::submit(
+            self.client,
+            &jobs::Submit {
+                name,
+                user: self.user.clone(),
+                command,
+                jobq: jobq.to_string(),
+                curlib,
+                libl,
+                submitted_by: self.user.clone(),
+                submitter: self.id.as_ref().map(|i| i.number),
+            },
+        )
+        .await?;
+        Ok(Outcome::Messages(vec![format!(
+            "CPC1221: Job {id} submitted to job queue {jobq} in library QGPL."
+        )]))
+    }
+
+    async fn wrkactjob(&mut self) -> Result<Outcome> {
+        let active = jobs::active(self.client).await?;
+        let mut rows = Vec::new();
+        let mut keys = Vec::new();
+        let fmt = |job: &str, user: &str, ty: &str, func: &str, status: &str| {
+            format!("{job:<12}  {user:<10}  {ty:<4}  {func:<16}  {status}")
+        };
+        for sbs in [jobs::BATCH_QUEUE, jobs::INTERACTIVE_SUBSYSTEM] {
+            rows.push(fmt(sbs, "QSYS", "SBS", "", "DEQW"));
+            keys.push(String::new());
+            for j in active.iter().filter(|j| j.subsystem == sbs) {
+                rows.push(fmt(
+                    &format!("  {}", j.id.name),
+                    &j.id.user,
+                    &j.job_type,
+                    &j.function,
+                    &j.activity,
+                ));
+                keys.push(j.id.to_string());
+            }
+        }
+        Ok(Outcome::Display(ListDisplay {
+            title: "Work with Active Jobs".into(),
+            info: vec![("Active jobs".into(), active.len().to_string())],
+            heading: fmt("Subsystem/Job", "User", "Type", "Function", "Status"),
+            rows,
+            options: vec![(5, "Display job log".into(), "DSPJOBLOG JOB({})".into())],
+            keys,
+            refresh: Some("WRKACTJOB".into()),
+        }))
+    }
+
+    async fn wrksbmjob(&mut self) -> Result<Outcome> {
+        let list = jobs::submitted_by(self.client, &self.user).await?;
+        let fmt = |job: &str, user: &str, number: &str, status: &str, func: &str| {
+            format!("{job:<10}  {user:<10}  {number:<6}  {status:<6}  {func}")
+        };
+        let rows = list
+            .iter()
+            .map(|j| {
+                let status = if j.status == "OUTQ" && j.end_code == "ABNORMAL" {
+                    "OUTQ  (ended abnormally)".to_string()
+                } else {
+                    j.status.clone()
+                };
+                fmt(
+                    &j.id.name,
+                    &j.id.user,
+                    &format!("{:06}", j.id.number),
+                    &status,
+                    &j.function,
+                )
+            })
+            .collect();
+        Ok(Outcome::Display(ListDisplay {
+            title: "Work with Submitted Jobs".into(),
+            info: vec![("Submitted from".into(), format!("*USER ({})", self.user))],
+            heading: fmt("Job", "User", "Number", "Status", "Function"),
+            rows,
+            options: vec![
+                (4, "End".into(), "ENDJOB JOB({})".into()),
+                (5, "Display job log".into(), "DSPJOBLOG JOB({})".into()),
+            ],
+            keys: list.iter().map(|j| j.id.to_string()).collect(),
+            refresh: Some("WRKSBMJOB".into()),
+        }))
+    }
+
+    /// The job a JOB parameter names; `*` is this job.
+    async fn job_named(&self, spec: &str) -> Result<jobs::JobInfo> {
+        if spec.trim() == "*" || spec.trim().is_empty() {
+            let id = self
+                .id
+                .as_ref()
+                .ok_or_else(|| anyhow!("This job has no job log (it is not a system job)."))?;
+            return jobs::get(self.client, id.number).await;
+        }
+        jobs::find(self.client, &jobs::parse_spec(spec)?).await
+    }
+
+    async fn dspjoblog(&mut self, cmd: &Command) -> Result<Outcome> {
+        let job = self.job_named(cmd.get("JOB")).await?;
+        let entries = jobs::job_log(self.client, job.id.number).await?;
+        let rows = entries
+            .iter()
+            .flat_map(|e| {
+                let first = if e.kind == "*RQS" {
+                    format!("{}  > {}", e.sent, e.text)
+                } else {
+                    format!("{}    {}", e.sent, e.text)
+                };
+                let mut out = Vec::new();
+                // Long messages continue on the next lines.
+                let mut rest = first.as_str();
+                while rest.chars().count() > 76 {
+                    let cut = rest
+                        .char_indices()
+                        .nth(76)
+                        .map(|(i, _)| i)
+                        .unwrap_or(rest.len());
+                    let at = rest[..cut].rfind(' ').filter(|&i| i > 20).unwrap_or(cut);
+                    out.push(rest[..at].to_string());
+                    rest = rest[at..].trim_start();
+                    let indent = "              ";
+                    if rest.chars().count() <= 76 - indent.len() {
+                        out.push(format!("{indent}{rest}"));
+                        rest = "";
+                        break;
+                    }
+                }
+                if !rest.is_empty() {
+                    out.push(rest.to_string());
+                }
+                out
+            })
+            .collect();
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display Job Log".into(),
+            info: vec![
+                ("Job".into(), job.id.name.clone()),
+                ("User".into(), job.id.user.clone()),
+                ("Number".into(), format!("{:06}", job.id.number)),
+            ],
+            heading: "Time      Message".into(),
+            rows,
+            ..Default::default()
+        }))
+    }
+
+    async fn endjob(&mut self, cmd: &Command) -> Result<Outcome> {
+        let job = self.job_named(cmd.get("JOB")).await?;
+        if job.status == "JOBQ" {
+            if job.id.user != self.user {
+                self.require_secadm("end other users' jobs").await?;
+            }
+            jobs::end_queued(self.client, &job.id).await?;
+            return Ok(Outcome::Messages(vec![format!(
+                "Job {} ended; it was taken off job queue {}.",
+                job.id, job.jobq
+            )]));
+        }
+        if job.status == "OUTQ" {
+            bail!("Job {} has already ended.", job.id);
+        }
+        bail!(
+            "Job {} is active. Ending active jobs is not supported yet.",
+            job.id
+        )
+    }
+
+    async fn sndmsg(&mut self, cmd: &Command) -> Result<Outcome> {
+        let to = cmd.get("TOUSR").to_string();
+        let to = if to == "*SYSOPR" {
+            "QSYSOPR".to_string()
+        } else {
+            to
+        };
+        if to != "QSYSOPR" && users::get(self.client, &to).await?.is_none() {
+            bail!("CPF2204: User profile {to} not found.");
+        }
+        let from_job = self.id.as_ref().map(|i| i.to_string()).unwrap_or_default();
+        jobs::send_message(
+            self.client,
+            &to,
+            &self.user,
+            &from_job,
+            "*INFO",
+            cmd.get("MSG"),
+        )
+        .await?;
+        Ok(Outcome::Messages(vec![format!("Message sent to {to}.")]))
+    }
+
+    async fn dspmsg(&mut self, cmd: &Command) -> Result<Outcome> {
+        let q = match cmd.get("MSGQ") {
+            "*USRPRF" => self.user.clone(),
+            q => {
+                if q != self.user {
+                    self.require_secadm("display other users' messages").await?;
+                }
+                q.to_string()
+            }
+        };
+        let msgs = jobs::messages(self.client, &q, q == self.user).await?;
+        let mut rows = Vec::new();
+        for m in msgs.iter().rev() {
+            rows.push(format!("{}{}", if m.is_new { "* " } else { "  " }, m.text));
+            rows.push(format!("    From {} at {}", m.from_user, m.sent));
+        }
+        if rows.is_empty() {
+            rows.push("(no messages)".into());
+        }
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display Messages".into(),
+            info: vec![
+                ("Queue".into(), q.clone()),
+                ("Messages".into(), msgs.len().to_string()),
+            ],
+            heading: "Newest first; * = new".into(),
+            rows,
+            ..Default::default()
+        }))
+    }
+
     async fn crtdtaara(&mut self, cmd: &Command) -> Result<Outcome> {
         let (lib, name) = match cmd.get("DTAARA").split_once('/') {
             Some(("*CURLIB", n)) => (self.current_library(), n.to_string()),
@@ -680,6 +952,9 @@ impl Job<'_> {
             Some((l, n)) => (vec![l.to_string()], n.to_string()),
             None => (self.library_list(), pgm.clone()),
         };
+        if let Some(id) = &self.id {
+            jobs::set_function(self.client, id, &format!("PGM-{name}"), "RUN").await;
+        }
         if let Some((_, source)) = catalog::find_cl_program(self.client, &libs, &name).await? {
             let program = crate::clpgm::compile(&name, &source)?;
             return crate::clpgm::run(self, &program, &args).await;

@@ -4,7 +4,7 @@ Guidance for AI coding sessions working in this repository.
 
 ## What ibmish is
 
-An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (objects and libraries, DDS files, record-level access, later 5250, CL and jobs) on Linux and PostgreSQL. RPG runs on Jariko (JVM). It is NOT a hardware emulator.
+An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (objects and libraries, DDS files, record-level access, 5250, CL, jobs) on Linux and PostgreSQL. RPG runs on Jariko (JVM). It is NOT a hardware emulator.
 
 ## Non-negotiable rules
 
@@ -30,6 +30,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/commands.rs` | CL command implementations for a job |
 | `core/src/clpgm.rs` | CL programs: parse/check (CRTBNDCL), expressions (exact decimals), run in the calling job with MONMSG |
 | `core/src/dtaara.rs` | Data areas: CRTDTAARA/CHGDTAARA/RTVDTAARA values, RPG `IN *LOCK`/`OUT` (PostgreSQL advisory locks) |
+| `core/src/jobs.rs` | Work management: jobs (`ibmish.jobs`), job logs, job queue QBATCH and its subsystem loop, user message queues |
 | `core/src/users.rs` | User profiles, Argon2id password hashes |
 | `core/src/main.rs` | `ibmish` CLI |
 | `core/tests/rla_test.rs` | Integration tests (need `IBMISH_TEST_DATABASE_URL`) |

@@ -421,6 +421,23 @@ with Tn5250(HOST) as t:
         t.fkey(12); t.wait_for("Type a customer number")
         t.fkey(3); t.wait_for("Command Entry")
         t2.fkey(3); t2.wait_for("Command Entry")
+        # Object authority: with *PUBLIC *USE, BOB cannot open CUSTMAST
+        # for update; a private *CHANGE lets him.
+        command(t, "grtobjaut obj(custmast) objtype(*file) user(*public) aut(*use)", "*PUBLIC has authority *USE")
+        command(t2, "call custmnt", "CPF9802", timeout=90)
+        check("CPF9802: Not authorized" in t2.text(),
+              "with *PUBLIC *USE, BOB's program cannot open CUSTMAST for update (CPF9802)", t2)
+        command(t, "grtobjaut custmast *file user(bob) aut(*change)", "BOB has authority *CHANGE")
+        command(t, "dspobjaut custmast *file", "Display Object Authority")
+        check("BOB" in t.text() and "*CHANGE" in t.text() and "*USE" in t.text(),
+              "DSPOBJAUT shows the owner, BOB's private authority and *PUBLIC", t)
+        t.fkey(3); t.wait_for("Command Entry")
+        t2.fkey(12)
+        command(t2, "call custmnt", "Change Customer", timeout=90)
+        check(True, "a private *CHANGE authority beats *PUBLIC *USE: BOB's program runs", t2)
+        t2.fkey(3); t2.wait_for("Command Entry")
+        command(t, "grtobjaut custmast *file user(*public) aut(*change)", "*PUBLIC has authority *CHANGE")
+        command(t, "rvkobjaut custmast *file user(bob)", "revoked")
         command(t2, "signoff", "Sign On")
     command(t, "dspjoblog", "Display Job Log")
     check("> crtlib mylib text('My first library')" in t.text() and "QINTER" in t.text(),

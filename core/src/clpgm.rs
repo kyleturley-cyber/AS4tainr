@@ -1738,6 +1738,15 @@ async fn command(
                 &job.current_library(),
             )
             .await?;
+            crate::authority::check(
+                job.client,
+                &job.user,
+                &d.library,
+                &d.name,
+                "*DTAARA",
+                crate::authority::Aut::Use,
+            )
+            .await?;
             let target = p
                 .get("RTNVAR")
                 .ok_or_else(|| anyhow!("line {}: RTVDTAARA needs RTNVAR", st.line))?

@@ -1,7 +1,6 @@
 /* ORDENTC: start order entry (sample CL program).                    */
-/* Checks the files, creates the next-order-number data area the     */
-/* first time, calls the RPG program ORDENT and says what the next   */
-/* order number will be.                                             */
+/* Checks the files and the next-order-number data area, calls the   */
+/* RPG program ORDENT and says what the next order number will be.   */
 PGM
   DCL VAR(&NEXT) TYPE(*DEC) LEN(7 0)
   DCL VAR(&FILE) TYPE(*CHAR) LEN(10)
@@ -19,10 +18,9 @@ PGM
   CHKOBJ OBJ(ORDLIN) OBJTYPE(*FILE)
   MONMSG MSGID(CPF9801) EXEC(GOTO CMDLBL(MISSING))
 
-  /* The first order number after the sample orders is 1004. */
+  CHGVAR VAR(&FILE) VALUE('ORDNXT')
   CHKOBJ OBJ(ORDNXT) OBJTYPE(*DTAARA)
-  MONMSG MSGID(CPF9801) EXEC(CRTDTAARA DTAARA(*CURLIB/ORDNXT) +
-           TYPE(*DEC) LEN(7 0) VALUE(1004) TEXT('Next order number'))
+  MONMSG MSGID(CPF9801) EXEC(GOTO CMDLBL(MISSING))
 
   CALL PGM(ORDENT)
 
@@ -32,6 +30,6 @@ PGM
   RETURN
 
 MISSING:
-  SNDPGMMSG MSG('Order entry cannot start: file' *BCAT &FILE *BCAT +
+  SNDPGMMSG MSG('Order entry cannot start:' *BCAT &FILE *BCAT +
                 'is missing.') MSGTYPE(*ESCAPE)
 ENDPGM

@@ -6,7 +6,7 @@ ibmish is an open, IBM i-compatible runtime that runs in a container.
 
 It runs IBM i business applications (RPG, CL, DDS files) on ordinary Linux and cloud hosts. It does not emulate POWER hardware or boot IBM's operating system. It reimplements the interfaces that programs and people use, the same way Wine runs Windows programs: libraries and objects, database files with record-level access, 5250 green screens, and CL commands. RPG runs on [Jariko](https://github.com/smeup/jariko), an open-source RPG interpreter for the JVM.
 
-> Status: **early prototype**. Sign on with a real 5250 emulator, run CL commands, and `CALL` CL and RPG programs, all against PostgreSQL. That includes **interactive programs that use DDS display files** (`EXFMT`, and subfiles: the scrolling lists behind "Work with..." screens), DDS physical and logical files, SQL, and data areas. The Phase 2 gate is met: a sample **order entry application** (CL driver, RPG with an input subfile, five files, a data area) runs unmodified. See [docs/order-entry.md](docs/order-entry.md), [docs/5250-server.md](docs/5250-server.md) and [docs/display-files.md](docs/display-files.md). Phase 3 has started: jobs, `SBMJOB` with a QBATCH subsystem, job logs and message queues ([docs/work-management.md](docs/work-management.md)). Two users changing the same record are kept apart with IBM i-style record locks ([docs/record-locks.md](docs/record-locks.md)). Printed reports become spooled files (`WRKSPLF`, [docs/spooled-files.md](docs/spooled-files.md)). Object authority comes next.
+> Status: **early prototype**. Sign on with a real 5250 emulator, run CL commands, and `CALL` CL and RPG programs, all against PostgreSQL. That includes **interactive programs that use DDS display files** (`EXFMT`, and subfiles: the scrolling lists behind "Work with..." screens), DDS physical and logical files, SQL, and data areas. The Phase 2 gate is met: a sample **order entry application** (CL driver, RPG with an input subfile, five files, a data area) runs unmodified. See [docs/order-entry.md](docs/order-entry.md), [docs/5250-server.md](docs/5250-server.md) and [docs/display-files.md](docs/display-files.md). Phase 3 has started: jobs, `SBMJOB` with a QBATCH subsystem, job logs and message queues ([docs/work-management.md](docs/work-management.md)). Two users changing the same record are kept apart with IBM i-style record locks ([docs/record-locks.md](docs/record-locks.md)). Printed reports become spooled files (`WRKSPLF`, [docs/spooled-files.md](docs/spooled-files.md)), and objects have owners and authorities ([docs/object-authority.md](docs/object-authority.md)). The Phase 3 gate is met: three clerks enter orders at once while batch jobs print, and the files add up (`tools/gate3_5250.py`).
 
 ## How it fits together
 
@@ -22,7 +22,7 @@ It runs IBM i business applications (RPG, CL, DDS files) on ordinary Linux and c
 - **`core/`**: the Rust core (`ibmish` binary). It holds the object catalog, the DDS parser, record-level access over PostgreSQL, and the bridge server.
 - **`jvm/`**: the JVM side. `io.ibmish.bridge` is a dependency-free Java bridge client. `io.ibmish.jvm` plugs that client into Jariko as a reload `DBMManager` and provides the runner (`ibmish-jvm.jar`).
 - **`samples/`**: DDS sources, CSV data, RPG programs and their expected (golden) output.
-- **`docs/`**: [5250 server](docs/5250-server.md), [browser terminal](docs/web-terminal.md), [display files](docs/display-files.md), [logical files](docs/logical-files.md), [SQL](docs/sql.md), [CL programs](docs/cl-programs.md), [data areas](docs/data-areas.md), [work management](docs/work-management.md), [record locks](docs/record-locks.md), [spooled files](docs/spooled-files.md), [order entry sample](docs/order-entry.md), [bridge protocol](docs/bridge-protocol.md), [known fidelity gaps](docs/fidelity-gaps.md), [spike 01 report](docs/spike-01.md).
+- **`docs/`**: [5250 server](docs/5250-server.md), [browser terminal](docs/web-terminal.md), [display files](docs/display-files.md), [logical files](docs/logical-files.md), [SQL](docs/sql.md), [CL programs](docs/cl-programs.md), [data areas](docs/data-areas.md), [work management](docs/work-management.md), [record locks](docs/record-locks.md), [spooled files](docs/spooled-files.md), [object authority](docs/object-authority.md), [order entry sample](docs/order-entry.md), [bridge protocol](docs/bridge-protocol.md), [known fidelity gaps](docs/fidelity-gaps.md), [spike 01 report](docs/spike-01.md).
 
 ## Quick start (Docker)
 
@@ -95,6 +95,7 @@ target/debug/ibmish call SELFTEST --runner "java -cp target/conformance-classes 
 | --- | --- | --- |
 | `ibmish init` | | Creates the catalog and the `QSYS`, `QGPL` and `QTEMP` libraries |
 | `ibmish crtlib LIB` | `CRTLIB` | Creates a library (a PostgreSQL schema) |
+| `ibmish system "COMMAND"` | `system` (QSH) | Runs one CL command as QSECOFR, e.g. `ibmish system "CRTDTAARA DTAARA(QGPL/X) TYPE(*DEC)"` |
 | `ibmish crtpf LIB/FILE --src x.pf` | `CRTPF` | Creates a physical file from DDS |
 | `ibmish crtbndcl LIB/PGM --src x.clle` | `CRTBNDCL` | Creates a CL program ([docs/cl-programs.md](docs/cl-programs.md)); `CALL` runs it |
 | `ibmish sql "SELECT ..."` | `RUNSQL` / `STRSQL` | Runs one SQL statement in the DB2 for i dialect ([docs/sql.md](docs/sql.md)) |
@@ -114,7 +115,7 @@ Settings: `IBMISH_DATABASE_URL`, `IBMISH_QSECOFR_PASSWORD` (initial QSECOFR pass
 | 0 · Foundations | Object store, EBCDIC/decimal library, TN5250 sign-on, CL shell | Sign on with tn5250, run `CRTLIB` and `DSPLIB` |
 | 1 · Data | DDS physical and logical files, record-level access, SQL | `CRTPF` from DDS, read it with RLA and SQL |
 | 2 · Programs (v1) | CL compiler, RPG IV on Jariko, display files | A sample order-entry app runs unmodified (met: [docs/order-entry.md](docs/order-entry.md)) |
-| 3 · Operations | Jobs, subsystems, spool, security | Multi-user interactive and batch workload |
+| 3 · Operations | Jobs, subsystems, spool, security | Multi-user interactive and batch workload (met: `tools/gate3_5250.py`) |
 | 4 · Ecosystem | RPG/400, COBOL, host servers, migration tools | ACS and ODBC tools connect |
 
 Spike 01 brings forward part of phase 1 (record-level access) and phase 2 (Jariko integration), because these were the riskiest assumptions.

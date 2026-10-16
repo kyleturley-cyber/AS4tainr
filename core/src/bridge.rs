@@ -5,6 +5,7 @@
 //! job's view of the database: it owns a PostgreSQL session and the open
 //! files (handles) created on it. See docs/bridge-protocol.md.
 
+use crate::authority::Aut;
 use crate::catalog;
 use crate::dspf;
 use crate::dtaara;
@@ -133,6 +134,8 @@ struct Session {
     /// (page, line) printed per spooled file.
     stdout_spool: HashMap<i64, (i32, i32)>,
     next_stdout_spool: i64,
+    /// Open files the job may change (*CHANGE checked).
+    change_ok: std::collections::HashSet<u32>,
 }
 
 fn indicators(s: Option<String>) -> [bool; 100] {
@@ -158,13 +161,44 @@ impl Session {
         })
     }
 
+    /// Object authority for the job's user (no job: `ibmish call`, which
+    /// runs as QSECOFR, is not checked).
+    async fn require(&self, library: &str, name: &str, objtype: &str, need: Aut) -> Result<()> {
+        match self.job_id() {
+            Some(job) => {
+                crate::authority::check(&self.client, &job.user, library, name, objtype, need).await
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// WRITE, UPDATE and DELETE change the file: *CHANGE (checked once
+    /// per open file).
+    async fn require_change(&mut self, handle: Option<u32>) -> Result<()> {
+        let h = handle.ok_or_else(|| anyhow!("missing 'handle'"))?;
+        if self.change_ok.contains(&h) {
+            return Ok(());
+        }
+        let (lib, name) = {
+            let f = self
+                .files
+                .get(&h)
+                .ok_or_else(|| anyhow!("unknown handle {h}"))?;
+            (f.file.library.clone(), f.file.file.name.clone())
+        };
+        self.require(&lib, &name, "*FILE", Aut::Change).await?;
+        self.change_ok.insert(h);
+        Ok(())
+    }
+
     async fn display_file(&mut self, name: &str) -> Result<Arc<dspf::DisplayFile>> {
         let key = name.to_ascii_uppercase();
         if let Some(f) = self.displays.get(&key) {
             return Ok(f.clone());
         }
-        let (_, source) =
+        let (library, source) =
             catalog::resolve_display_file(&self.client, &self.config.library_list, name).await?;
+        self.require(&library, &key, "*FILE", Aut::Use).await?;
         let f = Arc::new(dspf::parse(name, &source)?);
         self.displays.insert(key, f.clone());
         Ok(f)
@@ -206,8 +240,16 @@ impl Session {
                 let name = req.file.ok_or_else(|| anyhow!("missing 'file'"))?;
                 let f =
                     catalog::resolve_file(&self.client, &self.config.library_list, &name).await?;
+                let update = req.update.unwrap_or(false);
+                self.require(
+                    &f.library,
+                    &f.file.name,
+                    "*FILE",
+                    if update { Aut::Change } else { Aut::Use },
+                )
+                .await?;
                 let mut open = OpenFile::new(f.clone());
-                if req.update.unwrap_or(false) {
+                if update {
                     let (lib, pf) =
                         catalog::physical_file_of(&self.client, &f.library, &f.file.name).await?;
                     open = open.for_update(format!("{lib}/{pf}"));
@@ -272,6 +314,7 @@ impl Session {
                 Ok(read_json(r))
             }
             "write" | "update" => {
+                self.require_change(req.handle).await?;
                 let client = &self.client;
                 let f = self
                     .files
@@ -288,6 +331,7 @@ impl Session {
                 }
             }
             "delete" => {
+                self.require_change(req.handle).await?;
                 let client = &self.client;
                 let f = self
                     .files
@@ -302,6 +346,8 @@ impl Session {
                 let (library, source) =
                     catalog::resolve_display_file(&self.client, &self.config.library_list, &name)
                         .await?;
+                self.require(&library, &name.to_ascii_uppercase(), "*FILE", Aut::Use)
+                    .await?;
                 let parsed = dspf::parse(&name, &source)?;
                 Ok(json!({
                     "library": library,
@@ -391,6 +437,8 @@ impl Session {
                         let key_of = |d: &dtaara::DataArea| (d.library.clone(), d.name.clone());
                         let held = {
                             let d = dtaara::resolve(&self.client, &name, libl, cur).await?;
+                            self.require(&d.library, &d.name, "*DTAARA", Aut::Use)
+                                .await?;
                             self.locked.contains(&key_of(&d))
                         };
                         // A lock this session already holds is not taken again.
@@ -410,6 +458,8 @@ impl Session {
                     "dtaara_out" => {
                         let value = req.value.ok_or_else(|| anyhow!("missing 'value'"))?;
                         let d = dtaara::resolve(&self.client, &name, libl, cur).await?;
+                        self.require(&d.library, &d.name, "*DTAARA", Aut::Change)
+                            .await?;
                         let key = (d.library.clone(), d.name.clone());
                         let held = self.locked.contains(&key);
                         dtaara::write(&self.client, &d, &value, held).await?;
@@ -527,6 +577,7 @@ async fn handle_conn(
         job_number,
         stdout_spool: HashMap::new(),
         next_stdout_spool: -1,
+        change_ok: std::collections::HashSet::new(),
     };
     let (rd, mut wr) = stream.into_split();
     let mut lines = BufReader::new(rd).lines();

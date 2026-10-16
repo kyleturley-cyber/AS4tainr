@@ -101,6 +101,20 @@ enum Cmd {
         #[arg(long)]
         csv: PathBuf,
     },
+    /// Run one CL command as QSECOFR, as the IBM i `system` utility does
+    /// (e.g. `ibmish system "CRTDTAARA DTAARA(QGPL/X) TYPE(*DEC)"`).
+    /// Messages go to standard output; a failure exits with status 1.
+    System {
+        /// The command, as typed on a command line.
+        command: String,
+        /// Command that runs RPG programs (for CALL).
+        #[arg(
+            long,
+            env = "IBMISH_RUNNER",
+            default_value = "java -jar /opt/ibmish/ibmish-jvm.jar"
+        )]
+        runner: String,
+    },
     /// Run the JVM bridge server.
     Serve {
         #[arg(long, default_value_t = 7250)]
@@ -339,6 +353,46 @@ async fn run(cli: Cli) -> Result<u8> {
                 "{n} records written to {}/{}.",
                 of.file.library, of.file.file.name
             );
+        }
+        Cmd::System { command, runner } => {
+            let client = bridge::connect_db(&cli.database_url).await?;
+            catalog::init(&client).await?;
+            let env = commands::Environment {
+                database_url: cli.database_url.clone(),
+                runner,
+                call_timeout: std::time::Duration::from_secs(120),
+            };
+            let mut job = commands::Job {
+                client: &client,
+                env: &env,
+                user: "QSECOFR".into(),
+                curlib: None,
+                libl: libl.clone(),
+                display: None,
+                id: None,
+            };
+            match job.run(&command).await {
+                Ok(commands::Outcome::Messages(m)) => {
+                    for l in m {
+                        println!("{l}");
+                    }
+                }
+                Ok(commands::Outcome::Display(d)) => {
+                    println!("{}", d.title);
+                    for (k, v) in &d.info {
+                        println!("{k}: {v}");
+                    }
+                    println!("{}", d.heading);
+                    for r in &d.rows {
+                        println!("{r}");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("ibmish: {e:#}");
+                    return Ok(1);
+                }
+            }
         }
         Cmd::Serve { port } => {
             let listener = bridge::bind(port).await?;

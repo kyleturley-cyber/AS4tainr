@@ -2141,3 +2141,191 @@ async fn spooled_files() {
         .any(|k| k.contains("QPJOBLOG") && k.contains("/SPLTEST)")));
     jobs::end(&client, &id, true).await.unwrap();
 }
+
+/// Object authority (IBM i security reference): the creator owns an
+/// object; *PUBLIC gets *CHANGE (QCRTAUT as shipped); a user's authority
+/// is *ALLOBJ, else owner (*ALL), else a private authority, else *PUBLIC.
+/// *USE reads, *CHANGE changes, *ALL deletes and manages authority;
+/// anything less fails with CPF9802.
+#[tokio::test]
+async fn object_authority() {
+    use ibmish_core::commands::{Environment, Job, Outcome};
+    use ibmish_core::{jobs, users};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let bob = format!("B{}", &lib[1..]);
+    let _ = users::delete(&client, &bob).await;
+    users::create(
+        &client,
+        users::NewProfile {
+            name: bob.clone(),
+            password: users::NewPassword::None,
+            expired: false,
+            enabled: true,
+            usrcls: "*USER".into(),
+            special: vec![],
+            curlib: "*CRTDFT".into(),
+            text: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let env = Environment {
+        database_url: url.clone(),
+        runner: "false".into(),
+        call_timeout: std::time::Duration::from_secs(5),
+    };
+    let job_for = |user: &str| Job {
+        client: &client,
+        env: &env,
+        user: user.to_string(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+    };
+    let mut sec = job_for("QSECOFR");
+    let mut b = job_for(&bob);
+    let denied = |r: anyhow::Result<Outcome>| match r {
+        Err(e) => e.to_string().starts_with("CPF9802"),
+        Ok(_) => false,
+    };
+
+    sec.run("CRTDTAARA AREA *CHAR LEN(10)").await.unwrap();
+    let Outcome::Display(d) = sec
+        .run(&format!("DSPOBJAUT {lib}/AREA *DTAARA"))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(d.info.contains(&("Owner".into(), "QSECOFR".into())));
+    assert!(
+        d.rows
+            .iter()
+            .any(|r| r.starts_with("*PUBLIC") && r.ends_with("*CHANGE")),
+        "{:?}",
+        d.rows
+    );
+    b.run("CHGDTAARA AREA 'by bob'").await.unwrap();
+
+    // *PUBLIC *USE: BOB can read but not change.
+    sec.run(&format!(
+        "GRTOBJAUT OBJ({lib}/AREA) OBJTYPE(*DTAARA) USER(*PUBLIC) AUT(*USE)"
+    ))
+    .await
+    .unwrap();
+    assert!(denied(b.run("CHGDTAARA AREA 'again'").await));
+    b.run("DSPDTAARA AREA").await.unwrap();
+    // A private authority beats *PUBLIC, both ways.
+    sec.run(&format!("GRTOBJAUT AREA *DTAARA USER({bob}) AUT(*CHANGE)"))
+        .await
+        .unwrap();
+    b.run("CHGDTAARA AREA 'again'").await.unwrap();
+    sec.run(&format!(
+        "GRTOBJAUT AREA *DTAARA USER({bob} *PUBLIC) AUT(*EXCLUDE)"
+    ))
+    .await
+    .unwrap();
+    sec.run("GRTOBJAUT AREA *DTAARA USER(*PUBLIC) AUT(*CHANGE)")
+        .await
+        .unwrap();
+    assert!(denied(b.run("DSPDTAARA AREA").await));
+    // Only the owner (or *ALL, or *ALLOBJ) manages authority.
+    assert!(denied(
+        b.run(&format!("GRTOBJAUT AREA *DTAARA USER({bob}) AUT(*ALL)"))
+            .await
+    ));
+    // RVKOBJAUT: the private authority goes; *PUBLIC becomes *EXCLUDE.
+    sec.run(&format!("RVKOBJAUT AREA *DTAARA USER({bob})"))
+        .await
+        .unwrap();
+    b.run("DSPDTAARA AREA").await.unwrap();
+    sec.run("RVKOBJAUT AREA *DTAARA USER(*PUBLIC) AUT(*ALL)")
+        .await
+        .unwrap();
+    assert!(denied(b.run("DSPDTAARA AREA").await));
+    assert!(denied(b.run("DLTDTAARA AREA").await));
+    // The creator owns: BOB's own data area is his to manage and delete.
+    b.run("CRTDTAARA BOBS *DEC").await.unwrap();
+    b.run("GRTOBJAUT BOBS *DTAARA USER(*PUBLIC) AUT(*EXCLUDE)")
+        .await
+        .unwrap();
+    sec.run("DSPDTAARA BOBS").await.unwrap(); // *ALLOBJ
+    b.run("DLTDTAARA BOBS").await.unwrap();
+    // CHGOBJOWN hands AREA to BOB.
+    sec.run(&format!("CHGOBJOWN AREA *DTAARA NEWOWN({bob})"))
+        .await
+        .unwrap();
+    b.run("DLTDTAARA AREA").await.unwrap();
+
+    // Files through the bridge: open for update needs *CHANGE, input *USE.
+    let id = jobs::start_interactive(
+        &client,
+        "AUTDEV",
+        &bob,
+        Some(&lib),
+        std::slice::from_ref(&lib),
+    )
+    .await
+    .unwrap();
+    let listener = bridge::bind(0).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(bridge::serve(
+        listener,
+        bridge::BridgeConfig {
+            database_url: url.clone(),
+            library_list: vec![lib.clone()],
+            display: None,
+            job: Some(id.to_string()),
+            record_wait: None,
+        },
+    ));
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (rd, mut wr) = stream.into_split();
+    let mut lines = BufReader::new(rd).lines();
+    let mut ask = async |req: Value| -> Value {
+        wr.write_all(format!("{req}\n").as_bytes()).await.unwrap();
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap()
+    };
+    sec.run(&format!(
+        "GRTOBJAUT {lib}/CUSTMAST *FILE USER(*PUBLIC) AUT(*USE)"
+    ))
+    .await
+    .unwrap();
+    let r = ask(json!({"op": "open", "file": "CUSTMAST", "update": true})).await;
+    assert!(
+        r["error"].as_str().unwrap_or("").starts_with("CPF9802"),
+        "{r}"
+    );
+    let h = ask(json!({"op": "open", "file": "CUSTMAST"})).await["handle"].clone();
+    assert_eq!(
+        ask(json!({"op": "chain", "handle": h, "keys": ["1"]})).await["found"],
+        true
+    );
+    let r = ask(json!({"op": "write", "handle": h, "record": {"CUSNO": "77"}})).await;
+    assert!(
+        r["error"].as_str().unwrap_or("").starts_with("CPF9802"),
+        "{r}"
+    );
+    sec.run(&format!(
+        "GRTOBJAUT {lib}/CUSTMAST *FILE USER({bob}) AUT(*CHANGE)"
+    ))
+    .await
+    .unwrap();
+    let r = ask(json!({"op": "open", "file": "CUSTMAST", "update": true})).await;
+    assert!(r["handle"].is_number(), "{r}");
+    sec.run(&format!(
+        "GRTOBJAUT {lib}/CUSTMAST *FILE USER({bob}) AUT(*EXCLUDE)"
+    ))
+    .await
+    .unwrap();
+    let r = ask(json!({"op": "open", "file": "CUSTMAST"})).await;
+    assert!(
+        r["error"].as_str().unwrap_or("").starts_with("CPF9802"),
+        "{r}"
+    );
+    server.abort();
+    jobs::end(&client, &id, true).await.unwrap();
+    users::delete(&client, &bob).await.unwrap();
+}

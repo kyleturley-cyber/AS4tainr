@@ -33,6 +33,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/dtaara.rs` | Data areas: CRTDTAARA/CHGDTAARA/RTVDTAARA values, RPG `IN *LOCK`/`OUT` (PostgreSQL advisory locks) |
 | `core/src/jobs.rs` | Work management: jobs (`ibmish.jobs`), job logs, job queue QBATCH and its subsystem loop, user message queues |
 | `core/src/spool.rs` | Spooled files (`ibmish.spooled_files`, `ibmish.spool_lines`): printer output, QSYSPRT listings of batch display commands, QPJOBLOG |
+| `core/src/authority.rs` | Object owners, *PUBLIC and private authorities; `check` before every object use (CPF9802) |
 | `core/src/users.rs` | User profiles, Argon2id password hashes |
 | `core/src/main.rs` | `ibmish` CLI |
 | `core/tests/rla_test.rs` | Integration tests (need `IBMISH_TEST_DATABASE_URL`) |
@@ -42,6 +43,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `jvm/src/test/java/.../BridgeConformance.java` | JDK-only stand-in runner used for end-to-end tests without Maven |
 | `tools/tn5250_driver.py`, `tools/e2e_5250.py` | Drive the real tn5250 client for end-to-end tests |
 | `tools/e2e_web.py` | Drives the browser terminal in Chromium (Playwright) |
+| `tools/gate3_5250.py` | Phase 3 gate: three clerks enter orders at once with batch jobs running; the files must add up. Run after e2e_5250.py |
 | `samples/` | DDS, CSV data, RPG and CL programs, golden outputs in `expected/`. The order entry app (Phase 2 gate) is described in `docs/order-entry.md` |
 | `scripts/samples.sh` | Creates every sample object in QGPL (used by demo.sh, the Docker entrypoint and CI). Add new sample objects here |
 | `docs/bridge-protocol.md` | Protocol spec. Update it in the same change as the protocol |
@@ -56,6 +58,7 @@ IBMISH_BIN=target/debug/ibmish IBMISH_RUNNER="java -cp target/conformance-classe
 cd jvm && ./gradlew fatJar   # needs Maven Central
 TN5250=/path/to/tn5250 python3 tools/e2e_5250.py 127.0.0.1:2323   # against a running `ibmish tn5250`
 python3 tools/e2e_web.py http://127.0.0.1:5250   # browser terminal in Chromium (pip install playwright), with --web-listen 127.0.0.1:5250
+TN5250=/path/to/tn5250 IBMISH_BIN=target/debug/ibmish python3 tools/gate3_5250.py 127.0.0.1:2323   # then the Phase 3 gate
 ```
 
 ## Conventions

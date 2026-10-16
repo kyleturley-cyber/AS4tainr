@@ -40,6 +40,13 @@ done
 for d in CUSTINQD CUSTWRKD ORDENTD CUSTMNTD; do
   create crtdspf "QGPL/$d" --src "$samples/qddssrc/$d.dspf" || true
 done
+# The order entry application's next order number (after the sample
+# orders 1001-1003).
+if ! out=$("$bin" system "CRTDTAARA DTAARA(QGPL/ORDNXT) TYPE(*DEC) LEN(7 0) VALUE(1004) TEXT('Next order number')" 2>&1) \
+   && ! grep -q CPF1023 <<<"$out"; then
+  echo "$out" >&2
+  exit 1
+fi
 "$bin" crtbndcl QGPL/CUSTRPT --src "$samples/qclsrc/CUSTRPT.clle" --text 'Customer report driver' >/dev/null
 "$bin" crtbndcl QGPL/ORDENTC --src "$samples/qclsrc/ORDENTC.clle" --text 'Order entry' >/dev/null
 echo "Sample objects ready in QGPL."

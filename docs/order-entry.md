@@ -8,14 +8,14 @@ The end-to-end test (`tools/e2e_5250.py`, run in CI with Jariko and the real tn5
 
 | Object | Type | Source | What |
 | --- | --- | --- | --- |
-| `ORDENTC` | `*PGM` (CLLE) | `samples/qclsrc/ORDENTC.clle` | Checks the files with `CHKOBJ`, creates the data area `ORDNXT` the first time (`MONMSG CPF9801`), calls `ORDENT`, then reports the next order number with `RTVDTAARA` |
+| `ORDENTC` | `*PGM` (CLLE) | `samples/qclsrc/ORDENTC.clle` | Checks the files and the data area `ORDNXT` with `CHKOBJ` (`MONMSG CPF9801`), calls `ORDENT`, then reports the next order number with `RTVDTAARA` |
 | `ORDENT` | RPG | `samples/qrpglesrc/ORDENT.rpgle` | The order entry program |
 | `ORDENTD` | `*FILE` (DSPF) | `samples/qddssrc/ORDENTD.dspf` | Customer prompt, order lines subfile (20 lines, 10 a page), footer |
 | `CUSTMAST` | `*FILE` (PF) | `samples/qddssrc/CUSTMAST.pf` | Customers; the order total is added to `CUSBAL` |
 | `ITEMMAST` | `*FILE` (PF) | `samples/qddssrc/ITEMMAST.pf` | Items with price and quantity on hand |
 | `ORDHDR` | `*FILE` (PF) | `samples/qddssrc/ORDHDR.pf` | Order headers |
 | `ORDLIN` | `*FILE` (PF) | `samples/qddssrc/ORDLIN.pf` | Order lines |
-| `ORDNXT` | `*DTAARA` (`*DEC 7 0`) | created by `ORDENTC` | The next order number, 1004 after the sample orders |
+| `ORDNXT` | `*DTAARA` (`*DEC 7 0`) | `scripts/samples.sh` (`ibmish system "CRTDTAARA ..."`) | The next order number, 1004 after the sample orders |
 
 `scripts/samples.sh` creates them in `QGPL`, and the Docker image runs it at start-up.
 
@@ -52,9 +52,21 @@ Then look at what changed: `DSPPFM ORDHDR`, `DSPPFM ORDLIN`, `DSPPFM ITEMMAST`, 
 
 ## What it exercises
 
-- **CL:** `CHKOBJ`, `MONMSG` with `GOTO` and with a command in `EXEC`, `CRTDTAARA`, `CALL`, `RTVDTAARA`, `SNDPGMMSG` (`*COMP`, `*ESCAPE`).
+- **CL:** `CHKOBJ`, `MONMSG` with `GOTO`, `CALL`, `RTVDTAARA`, `SNDPGMMSG` (`*COMP`, `*ESCAPE`).
 - **RPG:** `EXFMT`, `WRITE`/`CHAIN`/`UPDATE` of subfile records, `CHAIN(N)` (read without lock), `CHAIN`/`UPDATE` and `WRITE` on database files, `*DTAARA DEFINE` with `IN *LOCK`/`OUT`, subroutines, named constants, `Z-ADD` of `UYEAR`/`UMONTH`/`UDAY`, and field names shared between the display file and database files (`ITEM`, `QTY`, `PRICE`, `ITMDSC`, `ORDTOT`).
 - **DDS:** `SFL`/`SFLCTL` with `SFLSIZ` larger than `SFLPAG`, `SFLEND(*MORE)`, `SFLMSG`, `CF06` (returns data) and `CA12` (does not), option indicators on fields and constants, `DSPATR(RI PC)`, `ERRMSG`, `EDTCDE(Z)` on an input field, `EDTCDE(2)` and `(J)`, `OVERLAY`.
+
+## Many users at once (the Phase 3 gate)
+
+`tools/gate3_5250.py` has three clerks enter orders with this application at the same time, on the same customers and items, while batch jobs print reports. It then checks that the files add up:
+
+- every order has its own number, with no gaps;
+- each item's quantity on hand went down by exactly what was ordered;
+- each customer's balance went up by exactly their order totals.
+
+What makes them add up is `IN *LOCK` on the data area and the record locks on CUSTMAST and ITEMMAST (see [record-locks.md](record-locks.md)).
+
+The first run of the gate found a race in an earlier version of `ORDENTC`: it created `ORDNXT` the first time it ran. Two clerks starting at the same moment both tried to create it, and the one that lost failed with `CPF1023`. A data area created in the wrong library also restarted the numbering. `ORDNXT` is now created with the sample files.
 
 ## Found while building it
 

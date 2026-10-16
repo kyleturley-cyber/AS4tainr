@@ -126,6 +126,10 @@ pub async fn init(client: &Client) -> Result<()> {
             .await
             .context("creating catalog")?;
         client
+            .batch_execute(crate::authority::DDL)
+            .await
+            .context("creating catalog")?;
+        client
             .batch_execute(crate::dtaara::DDL)
             .await
             .context("creating catalog")?;

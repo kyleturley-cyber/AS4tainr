@@ -355,6 +355,44 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "GRTOBJAUT",
+        description: "Grant Object Authority",
+        params: &[
+            p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
+            p("OBJTYPE", Kind::Name, true, None, "Object type").ch("*FILE, *PGM, *DTAARA, *LIB"),
+            p("USER", Kind::List, true, None, "Users").ch("Name, *PUBLIC"),
+            p("AUT", Kind::Name, false, Some("*CHANGE"), "Authority")
+                .ch("*CHANGE, *ALL, *USE, *EXCLUDE"),
+        ],
+    },
+    CommandDef {
+        name: "RVKOBJAUT",
+        description: "Revoke Object Authority",
+        params: &[
+            p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
+            p("OBJTYPE", Kind::Name, true, None, "Object type").ch("*FILE, *PGM, *DTAARA, *LIB"),
+            p("USER", Kind::List, true, None, "Users").ch("Name, *PUBLIC"),
+            p("AUT", Kind::Name, false, Some("*CHANGE"), "Authority").ch("*CHANGE, *ALL, *USE"),
+        ],
+    },
+    CommandDef {
+        name: "DSPOBJAUT",
+        description: "Display Object Authority",
+        params: &[
+            p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
+            p("OBJTYPE", Kind::Name, true, None, "Object type").ch("*FILE, *PGM, *DTAARA, *LIB"),
+        ],
+    },
+    CommandDef {
+        name: "CHGOBJOWN",
+        description: "Change Object Owner",
+        params: &[
+            p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
+            p("OBJTYPE", Kind::Name, true, None, "Object type").ch("*FILE, *PGM, *DTAARA, *LIB"),
+            p("NEWOWN", Kind::Name, true, None, "New owner").ch("Name"),
+        ],
+    },
+    CommandDef {
         name: "CRTDTAARA",
         description: "Create Data Area",
         params: &[
@@ -428,6 +466,11 @@ pub static GROUPS: &[Group] = &[
         item: "User profile commands",
         title: "User Profile Commands",
         commands: &["CRTUSRPRF", "DSPUSRPRF", "DLTUSRPRF", "CHGPWD"],
+    },
+    Group {
+        item: "Security commands",
+        title: "Security Commands",
+        commands: &["GRTOBJAUT", "RVKOBJAUT", "DSPOBJAUT", "CHGOBJOWN"],
     },
     Group {
         item: "SQL commands",

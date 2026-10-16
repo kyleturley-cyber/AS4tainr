@@ -5,6 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::time::Duration;
 use tokio_postgres::Client;
 
+use crate::authority::{self, Aut};
 use crate::bridge;
 use crate::catalog;
 use crate::cl::{self, Command};
@@ -156,6 +157,9 @@ impl Job<'_> {
                 }
                 Ok(Outcome::SignOff)
             }
+            "GRTOBJAUT" | "RVKOBJAUT" => self.objaut(&cmd).await,
+            "DSPOBJAUT" => self.dspobjaut(&cmd).await,
+            "CHGOBJOWN" => self.chgobjown(&cmd).await,
             "WRKSPLF" => self.wrksplf(&cmd).await,
             "DSPSPLF" => self.dspsplf(&cmd).await,
             "DLTSPLF" => self.dltsplf(&cmd).await,
@@ -165,6 +169,7 @@ impl Job<'_> {
 
     async fn crtlib(&mut self, cmd: &Command) -> Result<Outcome> {
         let lib = catalog::create_library_new(self.client, cmd.get("LIB"), cmd.get("TEXT")).await?;
+        authority::set_owner(self.client, "QSYS", &lib, "*LIB", &self.user).await?;
         Ok(Outcome::Messages(vec![format!("Library {lib} created.")]))
     }
 
@@ -505,6 +510,15 @@ impl Job<'_> {
             _ => cmd.get("FILE").to_string(),
         };
         let f = catalog::resolve_file(self.client, &self.library_list(), &name).await?;
+        authority::check(
+            self.client,
+            &self.user,
+            &f.library,
+            &f.file.name,
+            "*FILE",
+            Aut::Use,
+        )
+        .await?;
         let recs = catalog::member_records(self.client, &f, DSPPFM_MAX_RECORDS + 1).await?;
         let widths: Vec<usize> = f
             .file
@@ -832,6 +846,100 @@ impl Job<'_> {
         }))
     }
 
+    /// The library and name of an existing object (OBJ and OBJTYPE).
+    async fn object_named(&self, cmd: &Command) -> Result<(String, String, String)> {
+        let objtype = cmd.get("OBJTYPE").to_string();
+        if !["*FILE", "*PGM", "*DTAARA", "*LIB"].contains(&objtype.as_str()) {
+            bail!("Object type {objtype} is not supported; use *FILE, *PGM, *DTAARA or *LIB.");
+        }
+        let (lib, name) = match cmd.get("OBJ").split_once('/') {
+            Some(("*CURLIB", n)) => (self.current_library(), n.to_string()),
+            Some(("*LIBL", n)) => ("*LIBL".to_string(), n.to_string()),
+            Some((l, n)) => (l.to_string(), n.to_string()),
+            None => ("*LIBL".to_string(), cmd.get("OBJ").to_string()),
+        };
+        let libs = if objtype == "*LIB" {
+            vec!["QSYS".to_string()]
+        } else if lib == "*LIBL" {
+            self.library_list()
+        } else {
+            vec![lib.clone()]
+        };
+        for l in &libs {
+            if catalog::object_exists(self.client, std::slice::from_ref(l), &name, &objtype).await?
+            {
+                return Ok((l.clone(), name, objtype));
+            }
+        }
+        bail!("CPF9801: Object {name} in library {lib} type {objtype} not found.")
+    }
+
+    /// GRTOBJAUT and RVKOBJAUT.
+    async fn objaut(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name, objtype) = self.object_named(cmd).await?;
+        authority::check_manage(self.client, &self.user, &lib, &name, &objtype).await?;
+        let grant = cmd.def.name == "GRTOBJAUT";
+        let aut = Aut::parse(cmd.get("AUT"))?;
+        let mut done = Vec::new();
+        for user in cmd.list("USER") {
+            if user != "*PUBLIC" && users::get(self.client, &user).await?.is_none() {
+                bail!("CPF2204: User profile {user} not found.");
+            }
+            if grant {
+                authority::grant(self.client, &lib, &name, &objtype, &user, aut).await?;
+                done.push(format!(
+                    "{user} has authority {} to {lib}/{name} {objtype}.",
+                    aut.code()
+                ));
+            } else {
+                authority::revoke(self.client, &lib, &name, &objtype, &user).await?;
+                done.push(if user == "*PUBLIC" {
+                    format!("*PUBLIC authority to {lib}/{name} {objtype} is now *EXCLUDE.")
+                } else {
+                    format!("Private authority of {user} to {lib}/{name} {objtype} revoked.")
+                });
+            }
+        }
+        Ok(Outcome::Messages(done))
+    }
+
+    async fn dspobjaut(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name, objtype) = self.object_named(cmd).await?;
+        let a = authority::get(self.client, &lib, &name, &objtype)
+            .await?
+            .ok_or_else(|| anyhow!("CPF9801: Object {name} in library {lib} not found."))?;
+        let mut rows = vec![format!("{:<10}  {}", a.owner, "*ALL (owner)")];
+        for (u, aut) in &a.private {
+            rows.push(format!("{u:<10}  {}", aut.code()));
+        }
+        rows.push(format!("{:<10}  {}", "*PUBLIC", a.public.code()));
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display Object Authority".into(),
+            info: vec![
+                ("Object".into(), name.clone()),
+                ("Library".into(), lib.clone()),
+                ("Object type".into(), objtype.clone()),
+                ("Owner".into(), a.owner.clone()),
+            ],
+            heading: format!("{:<10}  {}", "User", "Authority"),
+            rows,
+            ..Default::default()
+        }))
+    }
+
+    async fn chgobjown(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name, objtype) = self.object_named(cmd).await?;
+        authority::check_manage(self.client, &self.user, &lib, &name, &objtype).await?;
+        let new = cmd.get("NEWOWN").to_string();
+        if users::get(self.client, &new).await?.is_none() {
+            bail!("CPF2204: User profile {new} not found.");
+        }
+        authority::set_owner(self.client, &lib, &name, &objtype, &new).await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Owner of {lib}/{name} {objtype} changed to {new}."
+        )]))
+    }
+
     async fn wrksplf(&mut self, cmd: &Command) -> Result<Outcome> {
         let user = match cmd.get("SELECT") {
             "*CURRENT" => self.user.clone(),
@@ -965,6 +1073,7 @@ impl Job<'_> {
             cmd.get("TEXT"),
         )
         .await?;
+        authority::set_owner(self.client, &d.library, &d.name, "*DTAARA", &self.user).await?;
         Ok(Outcome::Messages(vec![format!(
             "Data area {} created in library {}.",
             d.name, d.library
@@ -981,6 +1090,22 @@ impl Job<'_> {
             }
             _ => bail!("DTAARA takes a data area name and, optionally, (start length)."),
         };
+        let found = dtaara::resolve(
+            self.client,
+            &name,
+            &self.library_list(),
+            &self.current_library(),
+        )
+        .await?;
+        authority::check(
+            self.client,
+            &self.user,
+            &found.library,
+            &found.name,
+            "*DTAARA",
+            Aut::Change,
+        )
+        .await?;
         let d = dtaara::change(
             self.client,
             &name,
@@ -1002,6 +1127,15 @@ impl Job<'_> {
             cmd.get("DTAARA"),
             &self.library_list(),
             &self.current_library(),
+        )
+        .await?;
+        authority::check(
+            self.client,
+            &self.user,
+            &d.library,
+            &d.name,
+            "*DTAARA",
+            Aut::Use,
         )
         .await?;
         // Character values a line of 50 at a time, with their offsets.
@@ -1032,6 +1166,23 @@ impl Job<'_> {
     }
 
     async fn dltdtaara(&mut self, cmd: &Command) -> Result<Outcome> {
+        let found = dtaara::resolve(
+            self.client,
+            cmd.get("DTAARA"),
+            &self.library_list(),
+            &self.current_library(),
+        )
+        .await?;
+        authority::check(
+            self.client,
+            &self.user,
+            &found.library,
+            &found.name,
+            "*DTAARA",
+            Aut::All,
+        )
+        .await?;
+        authority::forget(self.client, &found.library, &found.name, "*DTAARA").await?;
         let d = dtaara::delete(
             self.client,
             cmd.get("DTAARA"),
@@ -1084,7 +1235,8 @@ impl Job<'_> {
         if let Some(id) = &self.id {
             jobs::set_function(self.client, id, &format!("PGM-{name}"), "RUN").await;
         }
-        if let Some((_, source)) = catalog::find_cl_program(self.client, &libs, &name).await? {
+        if let Some((lib, source)) = catalog::find_cl_program(self.client, &libs, &name).await? {
+            authority::check(self.client, &self.user, &lib, &name, "*PGM", Aut::Use).await?;
             let program = crate::clpgm::compile(&name, &source)?;
             return crate::clpgm::run(self, &program, &args).await;
         }

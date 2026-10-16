@@ -121,6 +121,11 @@ jobs:
         env:
           TN5250: /tmp/tn5250/build/curses/tn5250
         run: python3 tools/e2e_5250.py 127.0.0.1:2323
+      - name: Phase 3 gate - three clerks enter orders at once while batch jobs print
+        env:
+          TN5250: /tmp/tn5250/build/curses/tn5250
+          IBMISH_BIN: target/debug/ibmish
+        run: python3 tools/gate3_5250.py 127.0.0.1:2323
       - name: Browser 5250 terminal in Chromium
         run: |
           pip install playwright

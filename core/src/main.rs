@@ -19,12 +19,13 @@ struct Cli {
     )]
     database_url: String,
 
-    /// Library list, comma-separated, searched in order.
+    /// User part of the library list, comma-separated, searched in order
+    /// (after the system libraries and the current library in a 5250 job).
     #[arg(
         long,
         global = true,
         env = "IBMISH_LIBL",
-        default_value = "QGPL",
+        default_value = "QGPL,QTEMP",
         value_delimiter = ','
     )]
     libl: Vec<String>,
@@ -57,6 +58,21 @@ enum Cmd {
         /// DDS source file.
         #[arg(long)]
         src: PathBuf,
+    },
+    /// CRTLF: create a logical file over a physical file from DDS source.
+    /// The physical file named in PFILE is found through the library list
+    /// unless it is qualified.
+    Crtlf {
+        /// Qualified name, LIB/FILE.
+        file: String,
+        /// DDS source file.
+        #[arg(long)]
+        src: PathBuf,
+    },
+    /// Run one SQL statement (DB2 for i dialect) with the library list.
+    Sql {
+        /// The statement, e.g. "SELECT * FROM CUSTMAST".
+        statement: String,
     },
     /// CRTDSPF: create a display file from DDS source.
     Crtdspf {
@@ -178,6 +194,61 @@ async fn run(cli: Cli) -> Result<u8> {
             let client = bridge::connect_db(&cli.database_url).await?;
             catalog::create_library(&client, &library, &text).await?;
             println!("Library {} created.", library.to_ascii_uppercase());
+        }
+        Cmd::Sql { statement } => {
+            let client = bridge::connect_db(&cli.database_url).await?;
+            match ibmish_core::sql::run(&client, &cli.database_url, &libl, &statement).await? {
+                ibmish_core::sql::Outcome::Rows {
+                    columns,
+                    numeric,
+                    rows,
+                } => {
+                    let (head, lines) = ibmish_core::sql::format_rows(&columns, &numeric, &rows);
+                    println!("{head}");
+                    for l in lines {
+                        println!("{l}");
+                    }
+                    println!("{} rows selected.", rows.len());
+                }
+                ibmish_core::sql::Outcome::Count(kind, n) => {
+                    println!("{}", ibmish_core::sql::count_message(kind, n))
+                }
+            }
+        }
+        Cmd::Crtlf { file, src } => {
+            let (lib, name) = split_lib_file(&file)?;
+            let source = std::fs::read_to_string(&src)
+                .with_context(|| format!("reading {}", src.display()))?;
+            let lf = dds::parse_lf(&name, &source)?;
+            let mut client = bridge::connect_db(&cli.database_url).await?;
+            catalog::create_logical_file(&mut client, &libl, &lib, &lf).await?;
+            let keys: Vec<String> = lf
+                .keys
+                .iter()
+                .map(|k| {
+                    if lf.descending.contains(k) {
+                        format!("{k} (descending)")
+                    } else {
+                        k.clone()
+                    }
+                })
+                .collect();
+            println!(
+                "Logical file {} created in library {} over {} (key: {}{}).",
+                lf.name,
+                lib.to_ascii_uppercase(),
+                lf.based_on,
+                if keys.is_empty() {
+                    "none".to_string()
+                } else {
+                    keys.join(", ")
+                },
+                if lf.select_omit.is_empty() {
+                    ""
+                } else {
+                    "; with select/omit"
+                }
+            );
         }
         Cmd::Crtpf { file, src } => {
             let (lib, name) = split_lib_file(&file)?;

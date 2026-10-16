@@ -30,6 +30,18 @@ for f in CUSTMAST ORDLIN; do
   fi
 done
 
+# Logical files over CUSTMAST (created once, like the physical files).
+for l in CUSTNAME CUSTOWE; do
+  if out=$("$bin" crtlf "QGPL/$l" --src "$samples/qddssrc/$l.lf" 2>&1); then
+    echo "$out"
+  elif grep -q CPF7302 <<<"$out"; then
+    echo "File $l already exists."
+  else
+    echo "$out" >&2
+    exit 1
+  fi
+done
+
 status=0
 run() {
   local pgm="$1" parm="$2" expected="$samples/expected/${1}_${2}.txt"
@@ -48,6 +60,7 @@ run() {
 }
 run CUSTLIST 3
 run ORDTOTAL 1002
+run OWING L
 # CUSTUPD changes data, so it only runs right after the sample files were created.
 if [ "$fresh" = 1 ]; then
   run CUSTUPD 5

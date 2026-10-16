@@ -85,6 +85,47 @@ with Tn5250(HOST) as t:
     t.fkey(3)
     t.wait_for("Command Entry")
 
+    # DSPLIBL: system part, no current library (QSECOFR has *CRTDFT), user part.
+    command(t, "dsplibl", "Display Library List")
+    check(t.line(8).split()[:2] == ["QSYS", "SYS"] and t.line(11).split()[:2] == ["QUSRSYS", "SYS"],
+          "DSPLIBL starts with the system part of the library list", t)
+    check(t.line(12).split()[:2] == ["QGPL", "USR"] and t.line(13).split()[:2] == ["QTEMP", "USR"] and " CUR " not in t.text(),
+          "the user part is QGPL and QTEMP, with no current library", t)
+    t.tab(); t.tab(); t.tab(); t.tab(); t.type("5"); t.enter()
+    t.wait_for("Display Library")
+    check("CUSTMAST" in t.text() and "QGPL" in t.text(), "option 5 on QGPL shows its objects (DSPLIB)", t)
+    t.fkey(12)
+    t.wait_for("Display Library List")
+    check(True, "F12 from DSPLIB returns to the library list", t)
+    t.fkey(3)
+    t.wait_for("Command Entry")
+    command(t, "chgcurlib mylib", "Current library changed to MYLIB.")
+    command(t, "dsplibl", "Display Library List")
+    check(t.line(12).split()[:2] == ["MYLIB", "CUR"], "CHGCURLIB puts the current library between the system and user parts", t)
+    t.fkey(3); t.wait_for("Command Entry")
+    command(t, "rmvlible qtemp", "Library QTEMP removed from library list.")
+    check(True, "RMVLIBLE removes a library from the user part", t)
+
+    # SQL: STRSQL shows rows, RUNSQL changes them.
+    command(t, "strsql", "Enter SQL Statements")
+    t.type("select cusno, cusnam, cusbal from qgpl/custmast where cusbal > 0 order by cusbal desc"); t.enter()
+    t.wait_for("Display Data")
+    check(t.line(4).split() == ["CUSNO", "CUSNAM", "CUSBAL"] and "Prairie Freight" in t.line(5) and "9999999.99" in t.line(5),
+          "STRSQL: SELECT shows the rows under their column names, without the record number", t)
+    t.fkey(3)
+    t.wait_for("3 rows selected.")
+    check(True, "back on the SQL screen, the row count is shown", t)
+    t.type("select * from nosuch"); t.enter()
+    t.wait_for("SQL0204")
+    check(True, "an unknown table gives SQL0204", t)
+    t.fkey(3)
+    t.wait_for("Command Entry")
+    command(t, "runsql sql('update custmast set cusctY = ''Des Moines'' where cusno = 1')", "1 rows updated.")
+    check(True, "RUNSQL runs an UPDATE and reports the rows changed", t)
+    command(t, "runsql sql('select * from custmast')", "SQL0084")
+    check(True, "RUNSQL does not run SELECT", t)
+    t.fkey(12)
+
     command(t, "dsplib nosuch", "CPF2110")
     check("CPF2110" in t.line(24), "DSPLIB of a missing library fails with CPF2110", t)
     t.fkey(12)

@@ -24,21 +24,37 @@ pub struct Job<'a> {
     pub client: &'a Client,
     pub env: &'a Environment,
     pub user: String,
-    pub curlib: String,
-    /// User part of the library list (system libraries are not modelled yet).
+    /// The current library, or None (*CRTDFT: objects are created in QGPL).
+    pub curlib: Option<String>,
+    /// User part of the library list.
     pub libl: Vec<String>,
     /// The job's display, for programs that use display files.
     pub display: Option<bridge::DisplayHandle>,
 }
 
 /// A list shown on its own screen (DSPLIB, DSPLIBL, ...).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ListDisplay {
     pub title: String,
     pub info: Vec<(String, String)>,
     pub heading: String,
     pub rows: Vec<String>,
+    /// Options the operator can type next to a row: (number, text,
+    /// command with `{}` for the row's key). Empty: a plain list.
+    pub options: Vec<(u8, String, String)>,
+    /// One key per row, for the options' commands.
+    pub keys: Vec<String>,
 }
+
+/// The system part of the library list (system value QSYSLIBL as shipped).
+pub const SYSTEM_LIBRARY_LIST: &[&str] = &["QSYS", "QSYS2", "QHLPSYS", "QUSRSYS"];
+
+/// The user part of a new job's library list (system value QUSRLIBL as
+/// shipped).
+pub const USER_LIBRARY_LIST: &[&str] = &["QGPL", "QTEMP"];
+
+/// The library objects are created in when there is no current library.
+pub const DEFAULT_CURRENT_LIBRARY: &str = "QGPL";
 
 #[derive(Debug)]
 pub enum Outcome {
@@ -47,6 +63,8 @@ pub enum Outcome {
     Display(ListDisplay),
     /// CHGPWD: show the Change Password screen.
     ChangePassword,
+    /// STRSQL: the interactive SQL screen.
+    StartSql,
     SignOff,
 }
 
@@ -54,15 +72,38 @@ pub enum Outcome {
 pub const DSPPFM_MAX_RECORDS: i64 = 9999;
 
 impl Job<'_> {
-    /// The full library list, current library first, without duplicates.
+    /// The library list as searched: system part, current library, user
+    /// part.
     pub fn library_list(&self) -> Vec<String> {
-        let mut out = vec![self.curlib.clone()];
+        self.library_list_entries()
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect()
+    }
+
+    /// The library list with each library's type (SYS, CUR, USR), as
+    /// DSPLIBL shows it.
+    pub fn library_list_entries(&self) -> Vec<(String, &'static str)> {
+        let mut out: Vec<(String, &'static str)> = SYSTEM_LIBRARY_LIST
+            .iter()
+            .map(|l| (l.to_string(), "SYS"))
+            .collect();
+        if let Some(c) = &self.curlib {
+            out.push((c.clone(), "CUR"));
+        }
         for l in &self.libl {
-            if !out.contains(l) {
-                out.push(l.clone());
+            if !out.iter().any(|(x, _)| x == l) {
+                out.push((l.clone(), "USR"));
             }
         }
         out
+    }
+
+    /// *CURLIB: the current library, or QGPL when there is none.
+    pub fn current_library(&self) -> String {
+        self.curlib
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CURRENT_LIBRARY.to_string())
     }
 
     pub async fn run(&mut self, line: &str) -> Result<Outcome> {
@@ -72,11 +113,16 @@ impl Job<'_> {
             "DSPLIB" => self.dsplib(&cmd).await,
             "DSPLIBL" => self.dsplibl().await,
             "ADDLIBLE" => self.addlible(&cmd).await,
+            "RMVLIBLE" => self.rmvlible(&cmd).await,
+            "CHGCURLIB" => self.chgcurlib(&cmd).await,
+            "CHGLIBL" => self.chglibl(&cmd).await,
             "CALL" => self.call(&cmd).await,
             "CRTUSRPRF" => self.crtusrprf(&cmd).await,
             "DSPUSRPRF" => self.dspusrprf(&cmd).await,
             "DLTUSRPRF" => self.dltusrprf(&cmd).await,
             "CHGPWD" => Ok(Outcome::ChangePassword),
+            "STRSQL" => Ok(Outcome::StartSql),
+            "RUNSQL" => self.runsql(&cmd).await,
             "WRKOBJ" => self.wrkobj(&cmd).await,
             "DSPPFM" => self.dsppfm(&cmd).await,
             "SIGNOFF" => Ok(Outcome::SignOff),
@@ -95,7 +141,7 @@ impl Job<'_> {
             return self.dsplibl().await;
         }
         let lib = if lib == "*CURLIB" {
-            self.curlib.clone()
+            self.current_library()
         } else {
             lib.to_string()
         };
@@ -122,24 +168,105 @@ impl Job<'_> {
                 "Object", "Type", "Attribute", "Text"
             ),
             rows,
+            ..Default::default()
         }))
     }
 
     async fn dsplibl(&mut self) -> Result<Outcome> {
         let mut rows = Vec::new();
-        for (i, lib) in self.library_list().iter().enumerate() {
-            let kind = if i == 0 { "CUR" } else { "USR" };
-            let text = catalog::library_text(self.client, lib)
+        let mut keys = Vec::new();
+        for (lib, kind) in self.library_list_entries() {
+            let text = catalog::library_text(self.client, &lib)
                 .await
                 .unwrap_or_default();
             rows.push(format!("{lib:<10}  {kind:<4}  {text}"));
+            keys.push(lib);
         }
         Ok(Outcome::Display(ListDisplay {
             title: "Display Library List".into(),
             info: vec![],
             heading: format!("{:<10}  {:<4}  {}", "Library", "Type", "Text"),
             rows,
+            options: vec![(
+                5,
+                "Display objects in library".into(),
+                "DSPLIB LIB({})".into(),
+            )],
+            keys,
         }))
+    }
+
+    async fn rmvlible(&mut self, cmd: &Command) -> Result<Outcome> {
+        let lib = cmd.get("LIB").to_string();
+        let before = self.libl.len();
+        self.libl.retain(|l| *l != lib);
+        if self.libl.len() == before {
+            if self.curlib.as_deref() == Some(lib.as_str())
+                || SYSTEM_LIBRARY_LIST.contains(&lib.as_str())
+            {
+                bail!("Library {lib} is not in the user part of the library list and was not removed.");
+            }
+            bail!("Library {lib} is not in the library list.");
+        }
+        Ok(Outcome::Messages(vec![format!(
+            "Library {lib} removed from library list."
+        )]))
+    }
+
+    async fn chgcurlib(&mut self, cmd: &Command) -> Result<Outcome> {
+        match cmd.get("CURLIB") {
+            "*CRTDFT" => {
+                self.curlib = None;
+                Ok(Outcome::Messages(vec![
+                    "Current library removed; objects are created in QGPL.".into(),
+                ]))
+            }
+            lib => {
+                if !catalog::library_exists(self.client, lib).await? {
+                    bail!("CPF2110: Library {lib} not found.");
+                }
+                self.curlib = Some(lib.to_string());
+                Ok(Outcome::Messages(vec![format!(
+                    "Current library changed to {lib}."
+                )]))
+            }
+        }
+    }
+
+    async fn chglibl(&mut self, cmd: &Command) -> Result<Outcome> {
+        let list = cmd.list("LIBL");
+        let new_libl: Option<Vec<String>> = match list.as_slice() {
+            [one] if one == "*SAME" => None,
+            [one] if one == "*NONE" => Some(vec![]),
+            libs => {
+                let mut v: Vec<String> = Vec::new();
+                for l in libs {
+                    let l = catalog::validate_name("library", l)?;
+                    if !catalog::library_exists(self.client, &l).await? {
+                        bail!("CPF2110: Library {l} not found.");
+                    }
+                    if v.contains(&l) {
+                        bail!("Library {l} is in the list more than once.");
+                    }
+                    v.push(l);
+                }
+                Some(v)
+            }
+        };
+        match cmd.get("CURLIB") {
+            "*SAME" => {}
+            "*CRTDFT" => self.curlib = None,
+            lib => {
+                if !catalog::library_exists(self.client, lib).await? {
+                    bail!("CPF2110: Library {lib} not found.");
+                }
+                self.curlib = Some(lib.to_string());
+            }
+        }
+        if let Some(v) = new_libl {
+            self.libl = v;
+        }
+        Ok(Outcome::Messages(vec!["Library list changed.".into()]))
     }
 
     async fn addlible(&mut self, cmd: &Command) -> Result<Outcome> {
@@ -150,6 +277,7 @@ impl Job<'_> {
         if self.library_list().contains(&lib) {
             bail!("CPF2103: Library {lib} already exists in library list.");
         }
+        // Only the user part of the library list can be changed.
         match cmd.get("POSITION") {
             "*LAST" => self.libl.push(lib.clone()),
             _ => self.libl.insert(0, lib.clone()),
@@ -157,6 +285,28 @@ impl Job<'_> {
         Ok(Outcome::Messages(vec![format!(
             "Library {lib} added to library list."
         )]))
+    }
+
+    /// RUNSQL: one SQL statement that does not return rows.
+    async fn runsql(&mut self, cmd: &Command) -> Result<Outcome> {
+        let stmt = cmd.get("SQL");
+        let t = crate::sql::translate(stmt, &|_| false)?;
+        if t.kind == crate::sql::Kind::Query {
+            bail!("SQL0084: RUNSQL cannot run a SELECT; use STRSQL to see rows.");
+        }
+        match crate::sql::run(
+            self.client,
+            &self.env.database_url,
+            &self.library_list(),
+            stmt,
+        )
+        .await?
+        {
+            crate::sql::Outcome::Count(kind, n) => {
+                Ok(Outcome::Messages(vec![crate::sql::count_message(kind, n)]))
+            }
+            crate::sql::Outcome::Rows { .. } => Ok(Outcome::Messages(vec![])),
+        }
     }
 
     async fn require_secadm(&self, what: &str) -> Result<()> {
@@ -181,7 +331,7 @@ impl Job<'_> {
             list => list.to_vec(),
         };
         let curlib = match cmd.get("CURLIB") {
-            "*CRTDFT" => "QGPL".to_string(),
+            "*CRTDFT" => "*CRTDFT".to_string(),
             lib => {
                 if !catalog::library_exists(self.client, lib).await? {
                     bail!("CPF2110: Library {lib} not found.");
@@ -239,6 +389,7 @@ impl Job<'_> {
             } else {
                 p.special_auth
             },
+            ..Default::default()
         }))
     }
 
@@ -267,7 +418,7 @@ impl Job<'_> {
         let objtype = cmd.get("OBJTYPE").to_string();
         let libs: Vec<String> = match lib.as_str() {
             "*LIBL" => self.library_list(),
-            "*CURLIB" => vec![self.curlib.clone()],
+            "*CURLIB" => vec![self.current_library()],
             "*USRLIBL" => self.libl.clone(),
             "*ALL" => catalog::list_libraries(self.client).await?,
             "*ALLUSR" => catalog::list_libraries(self.client)
@@ -309,13 +460,14 @@ impl Job<'_> {
                 "Object", "Type", "Library", "Attribute", "Text"
             ),
             rows,
+            ..Default::default()
         }))
     }
 
     async fn dsppfm(&mut self, cmd: &Command) -> Result<Outcome> {
         let name = match cmd.get("FILE").split_once('/') {
             Some(("*LIBL", n)) => n.to_string(),
-            Some(("*CURLIB", n)) => format!("{}/{n}", self.curlib),
+            Some(("*CURLIB", n)) => format!("{}/{n}", self.current_library()),
             _ => cmd.get("FILE").to_string(),
         };
         let f = catalog::resolve_file(self.client, &self.library_list(), &name).await?;
@@ -374,6 +526,7 @@ impl Job<'_> {
             info,
             heading: line(&names, true),
             rows,
+            ..Default::default()
         }))
     }
 

@@ -11,6 +11,9 @@ if [ "${IBMISH_LOAD_SAMPLES:-1}" = "1" ]; then
       ibmish load "$f" --csv "${IBMISH_SAMPLES:-/opt/ibmish/samples}/data/$f.csv"
     fi
   done
+  for l in CUSTNAME CUSTOWE; do
+    ibmish crtlf "QGPL/$l" --src "${IBMISH_SAMPLES:-/opt/ibmish/samples}/qddssrc/$l.lf" >/dev/null 2>&1 || true
+  done
   for d in CUSTINQD CUSTWRKD; do
     ibmish crtdspf "QGPL/$d" --src "${IBMISH_SAMPLES:-/opt/ibmish/samples}/qddssrc/$d.dspf" >/dev/null 2>&1 || true
   done

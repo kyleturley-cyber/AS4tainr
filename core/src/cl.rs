@@ -113,6 +113,55 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "RMVLIBLE",
+        description: "Remove Library List Entry",
+        params: &[p("LIB", Kind::Name, true, None, "Library").ch("Name")],
+    },
+    CommandDef {
+        name: "CHGCURLIB",
+        description: "Change Current Library",
+        params: &[p("CURLIB", Kind::Name, true, None, "Current library").ch("Name, *CRTDFT")],
+    },
+    CommandDef {
+        name: "CHGLIBL",
+        description: "Change Library List",
+        params: &[
+            p("LIBL", Kind::List, true, None, "Libraries for current job").ch("Name, *SAME, *NONE"),
+            p(
+                "CURLIB",
+                Kind::Name,
+                false,
+                Some("*SAME"),
+                "Current library",
+            )
+            .ch("Name, *SAME, *CRTDFT"),
+        ],
+    },
+    CommandDef {
+        name: "RUNSQL",
+        description: "Run SQL Statement",
+        params: &[
+            p("SQL", Kind::Text, true, None, "SQL statement"),
+            p(
+                "COMMIT",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "Commitment control",
+            )
+            .ch("*NONE")
+            .keyword_only(),
+            p("NAMING", Kind::Name, false, Some("*SYS"), "Naming")
+                .ch("*SYS, *SQL")
+                .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "STRSQL",
+        description: "Start SQL Interactive Session",
+        params: &[],
+    },
+    CommandDef {
         name: "CALL",
         description: "Call Program",
         params: &[
@@ -218,7 +267,15 @@ pub static GROUPS: &[Group] = &[
     Group {
         item: "Library commands",
         title: "Library Commands",
-        commands: &["CRTLIB", "DSPLIB", "DSPLIBL", "ADDLIBLE"],
+        commands: &[
+            "CRTLIB",
+            "DSPLIB",
+            "DSPLIBL",
+            "ADDLIBLE",
+            "RMVLIBLE",
+            "CHGCURLIB",
+            "CHGLIBL",
+        ],
     },
     Group {
         item: "Object commands",
@@ -234,6 +291,11 @@ pub static GROUPS: &[Group] = &[
         item: "User profile commands",
         title: "User Profile Commands",
         commands: &["CRTUSRPRF", "DSPUSRPRF", "DLTUSRPRF", "CHGPWD"],
+    },
+    Group {
+        item: "SQL commands",
+        title: "SQL Commands",
+        commands: &["STRSQL", "RUNSQL"],
     },
     Group {
         item: "Program commands",

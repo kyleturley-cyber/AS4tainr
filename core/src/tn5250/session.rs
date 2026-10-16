@@ -196,9 +196,23 @@ pub async fn run(stream: tokio::net::TcpStream, cfg: &ServerConfig, device: &str
             continue;
         }
 
+        // Current library: from the sign-on screen, else the profile's.
+        // *CRTDFT means none.
         let curlib = match inp.get("CURLIB").trim() {
             "" => profile.curlib.clone(),
-            c => c.to_string(),
+            c => c.to_ascii_uppercase(),
+        };
+        let curlib = if curlib == "*CRTDFT" {
+            None
+        } else {
+            if !crate::catalog::library_exists(&client, &curlib)
+                .await
+                .unwrap_or(false)
+            {
+                message = format!("CPF2110: Library {curlib} not found.");
+                continue;
+            }
+            Some(curlib)
         };
         // Programs called from this session show their display files here.
         let (display_tx, mut display_rx) = tokio::sync::mpsc::channel::<bridge::DisplayRequest>(1);
@@ -398,7 +412,7 @@ async fn command_entry(
                 log.extend(msgs.into_iter().map(|m| format!("  {m}")));
             }
             Ok(Outcome::Display(d)) => {
-                list_display(term, &d).await?;
+                show_list(term, job, d).await?;
             }
             Ok(Outcome::ChangePassword) => {
                 if change_password(term, job.client, &job.user, false).await? {
@@ -407,6 +421,9 @@ async fn command_entry(
                     message = "Password not changed.".into();
                 }
                 log.push(format!("  {message}"));
+            }
+            Ok(Outcome::StartSql) => {
+                sql_session(term, job).await?;
             }
             Ok(Outcome::SignOff) => return Ok(()),
             Err(e) => {
@@ -731,12 +748,165 @@ async fn prompt(
 /// or Bottom. How many lines it has depends on the info lines above it.
 const LIST_LAST_ROW: usize = 20;
 
+/// STRSQL: type SQL statements; SELECT results are shown as a list,
+/// other statements report how many rows they changed. F9 retrieves the
+/// previous statement, F3 ends the session.
+async fn sql_session(term: &mut Term, job: &mut Job<'_>) -> Result<()> {
+    let mut log: Vec<String> = Vec::new();
+    let mut message = String::new();
+    let mut retrieve: Vec<String> = Vec::new();
+    let mut retrieve_pos = 0usize;
+    let mut prefill = String::new();
+    loop {
+        let mut s = Screen::new();
+        centered(&mut s, 1, "Enter SQL Statements");
+        s.put(3, 2, "Type SQL statement, press Enter.");
+        let start = log.len().saturating_sub(14);
+        for (i, line) in log[start..].iter().enumerate() {
+            let line: String = line.chars().take(78).collect();
+            s.put(5 + i as u8, 2, &line);
+        }
+        s.text(20, 2, attr::HIGH, "===>");
+        // Two lines for the statement: the field wraps to line 21.
+        s.field("STMT", 20, 7, 74 + 80, FieldKind::Text, &prefill);
+        keys(&mut s, 23, "F3=Exit   F9=Retrieve   F12=Cancel");
+        s.message(&message);
+        message.clear();
+        prefill.clear();
+        let inp = term.show(&s).await?;
+        match inp.aid {
+            Aid::F(3) => return Ok(()),
+            Aid::F(12) => continue,
+            Aid::F(9) => {
+                if retrieve.is_empty() {
+                    message = "There are no statements to retrieve.".into();
+                } else {
+                    retrieve_pos = if retrieve_pos == 0 {
+                        retrieve.len()
+                    } else {
+                        retrieve_pos
+                    };
+                    retrieve_pos -= 1;
+                    prefill = retrieve[retrieve_pos].clone();
+                }
+                continue;
+            }
+            Aid::Enter => {}
+            _ => {
+                message = "That key is not valid on this display.".into();
+                continue;
+            }
+        }
+        let stmt = inp.get("STMT").trim().to_string();
+        if stmt.is_empty() {
+            continue;
+        }
+        retrieve.push(stmt.clone());
+        retrieve_pos = 0;
+        log.push(format!("> {stmt}"));
+        match crate::sql::run(
+            job.client,
+            &job.env.database_url,
+            &job.library_list(),
+            &stmt,
+        )
+        .await
+        {
+            Ok(crate::sql::Outcome::Rows {
+                columns,
+                numeric,
+                rows,
+            }) => {
+                let (heading, lines) = crate::sql::format_rows(&columns, &numeric, &rows);
+                let n = rows.len();
+                list_display(
+                    term,
+                    &ListDisplay {
+                        title: "Display Data".into(),
+                        info: vec![],
+                        heading,
+                        rows: lines,
+                        ..Default::default()
+                    },
+                    "",
+                )
+                .await?;
+                message = if n >= crate::sql::MAX_ROWS {
+                    format!("{n} rows selected (no more are shown).")
+                } else {
+                    format!("{n} rows selected.")
+                };
+            }
+            Ok(crate::sql::Outcome::Count(kind, n)) => {
+                message = crate::sql::count_message(kind, n);
+            }
+            Err(e) => {
+                message = e.to_string();
+                prefill = stmt;
+            }
+        }
+        log.push(format!("  {message}"));
+    }
+}
+
 /// Columns moved by F19 (Left) and F20 (Right) on wide lists.
 const SHIFT: usize = 40;
 
-async fn list_display(term: &mut Term, d: &ListDisplay) -> Result<()> {
+/// How a list screen was left.
+enum ListResult {
+    /// Enter or F12: back to the screen before.
+    Back,
+    /// F3: all the way back to the command line.
+    Exit,
+    /// Options were typed: run these commands, then show the list again.
+    Run(Vec<String>),
+}
+
+/// Show a list, then run the commands of the options typed on it and come
+/// back to it, as IBM i list screens do. F12 goes back one screen, F3
+/// returns to the command line.
+async fn show_list(term: &mut Term, job: &mut Job<'_>, d: ListDisplay) -> Result<()> {
+    let mut stack = vec![d];
+    let mut message = String::new();
+    while let Some(top) = stack.last() {
+        let result = list_display(term, top, &message).await?;
+        message.clear();
+        match result {
+            ListResult::Exit => return Ok(()),
+            ListResult::Back => {
+                stack.pop();
+            }
+            ListResult::Run(cmds) => {
+                let mut shown = Vec::new();
+                for c in cmds {
+                    match job.run(&c).await {
+                        Ok(Outcome::Display(d)) => shown.push(d),
+                        Ok(Outcome::Messages(m)) => message = m.last().cloned().unwrap_or_default(),
+                        Ok(_) => {}
+                        Err(e) => message = e.to_string().lines().last().unwrap_or("").to_string(),
+                    }
+                }
+                // Shown in the order the options were typed.
+                stack.extend(shown.into_iter().rev());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn list_display(term: &mut Term, d: &ListDisplay, first_message: &str) -> Result<ListResult> {
     let mut top = 0usize;
     let mut left = 0usize;
+    let has_options = !d.options.is_empty();
+    // The Opt column is as wide as the longest option number.
+    let opt_width = d
+        .options
+        .iter()
+        .map(|(n, _, _)| n.to_string().len())
+        .max()
+        .unwrap_or(0) as u16;
+    let text_col: u8 = if has_options { 7 } else { 2 };
+    let text_width = 80 - text_col as usize - 1;
     let width = d
         .rows
         .iter()
@@ -744,31 +914,52 @@ async fn list_display(term: &mut Term, d: &ListDisplay) -> Result<()> {
         .map(|r| r.chars().count())
         .max()
         .unwrap_or(0);
-    let wide = width > 78;
-    let cut = |line: &str, left: usize| -> String { line.chars().skip(left).take(78).collect() };
-    let mut message = String::new();
-    // Title, blank, info lines, blank, heading: the list starts after them.
-    let first_row = 3 + d.info.len() + 2;
+    let wide = width > text_width;
+    let cut =
+        |line: &str, left: usize| -> String { line.chars().skip(left).take(text_width).collect() };
+    let mut message = first_message.to_string();
+    // Options typed so far, by row, kept while paging.
+    let mut typed: std::collections::BTreeMap<usize, String> = Default::default();
+    // Title, blank, [options: 2 lines + blank], info lines, blank, heading.
+    let info_row = if has_options { 6 } else { 3 };
+    let first_row = info_row + d.info.len() + 2;
     let page_rows = (LIST_LAST_ROW + 1).saturating_sub(first_row).max(1);
     loop {
         let mut s = Screen::new();
         centered(&mut s, 1, &d.title);
-        let mut row = 3u8;
+        if has_options {
+            s.put(3, 2, "Type options, press Enter.");
+            let opts: Vec<String> = d
+                .options
+                .iter()
+                .map(|(n, t, _)| format!("{n}={t}"))
+                .collect();
+            s.text(4, 4, attr::BLUE, &opts.join("   "));
+        }
+        let mut row = info_row as u8;
         for (k, v) in &d.info {
             s.put(row, 2, &format!("{}:   {v}", label(k, 26)));
             row += 1;
         }
         row += 1;
-        s.text(row, 2, attr::HIGH, &cut(&d.heading, left));
+        if has_options {
+            s.text(row, 2, attr::HIGH, "Opt");
+        }
+        s.text(row, text_col, attr::HIGH, &cut(&d.heading, left));
         let first = row + 1;
-        let page = &d.rows[top.min(d.rows.len())..(top + page_rows).min(d.rows.len())];
+        let end = (top + page_rows).min(d.rows.len());
         if d.rows.is_empty() {
             s.put(first, 4, "(No entries)");
         }
-        for (i, line) in page.iter().enumerate() {
-            s.put(first + i as u8, 2, &cut(line, left));
+        for (i, idx) in (top.min(d.rows.len())..end).enumerate() {
+            let r = first + i as u8;
+            if has_options {
+                let v = typed.get(&idx).cloned().unwrap_or_default();
+                s.field(&format!("OPT{idx}"), r, 3, opt_width, FieldKind::Text, &v);
+            }
+            s.put(r, text_col, &cut(&d.rows[idx], left));
         }
-        let more = if top + page_rows < d.rows.len() {
+        let more = if end < d.rows.len() {
             "More..."
         } else {
             "Bottom"
@@ -786,11 +977,51 @@ async fn list_display(term: &mut Term, d: &ListDisplay) -> Result<()> {
         s.message(&message);
         message.clear();
         let inp = term.show(&s).await?;
+        for (name, v) in &inp.values {
+            if let Some(idx) = name
+                .strip_prefix("OPT")
+                .and_then(|n| n.parse::<usize>().ok())
+            {
+                let v = v.trim();
+                if v.is_empty() {
+                    typed.remove(&idx);
+                } else {
+                    typed.insert(idx, v.to_string());
+                }
+            }
+        }
         match inp.aid {
-            Aid::F(3) | Aid::F(12) | Aid::Enter => return Ok(()),
+            Aid::F(3) => return Ok(ListResult::Exit),
+            Aid::F(12) => return Ok(ListResult::Back),
+            Aid::Enter => {
+                if typed.is_empty() {
+                    return Ok(ListResult::Back);
+                }
+                let mut cmds = Vec::new();
+                let mut bad = None;
+                for (idx, v) in &typed {
+                    match d.options.iter().find(|(n, _, _)| n.to_string() == *v) {
+                        Some((_, _, cmd)) => cmds.push(
+                            cmd.replace("{}", d.keys.get(*idx).map(String::as_str).unwrap_or("")),
+                        ),
+                        None => {
+                            bad = Some((*idx, v.clone()));
+                            break;
+                        }
+                    }
+                }
+                match bad {
+                    None => return Ok(ListResult::Run(cmds)),
+                    Some((idx, v)) => {
+                        message = format!("Option {v} is not valid.");
+                        // Show the page with the wrong option.
+                        top = idx / page_rows * page_rows;
+                    }
+                }
+            }
             Aid::F(19) if wide => left = left.saturating_sub(SHIFT),
             Aid::F(20) if wide => {
-                if left + 78 < width {
+                if left + text_width < width {
                     left += SHIFT;
                 } else {
                     message = "Already at the right edge.".into();

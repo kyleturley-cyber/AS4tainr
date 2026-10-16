@@ -1,0 +1,6 @@
+     A* CUSTOWE: customers with a balance due, largest balance first
+     A* (logical file over CUSTMAST with select/omit)
+     A          R CUSTREC                   PFILE(CUSTMAST)
+     A                                      TEXT('Customers who owe')
+     A          K CUSBAL                    DESCEND
+     A          S CUSBAL                    COMP(GT 0)

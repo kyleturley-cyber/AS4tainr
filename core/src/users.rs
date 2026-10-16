@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS ibmish.user_profiles (
     password_hash text NOT NULL,
     pwd_expired   boolean NOT NULL DEFAULT false,
     special_auth  text[] NOT NULL DEFAULT '{}',
-    curlib        text NOT NULL DEFAULT 'QGPL',
+    curlib        text NOT NULL DEFAULT '*CRTDFT',
     text          text NOT NULL DEFAULT '',
     status        text NOT NULL DEFAULT '*ENABLED',
     last_signon   timestamptz,
@@ -33,6 +33,10 @@ CREATE TABLE IF NOT EXISTS ibmish.user_profiles (
 );
 ALTER TABLE ibmish.user_profiles ADD COLUMN IF NOT EXISTS usrcls text NOT NULL DEFAULT '*USER';
 UPDATE ibmish.user_profiles SET usrcls = '*SECOFR' WHERE name = 'QSECOFR' AND usrcls = '*USER';
+-- QSECOFR is shipped without a current library (*CRTDFT); profiles made
+-- before ibmish modelled that had QGPL.
+UPDATE ibmish.user_profiles SET curlib = '*CRTDFT'
+    WHERE name = 'QSECOFR' AND curlib = 'QGPL';
 "#;
 
 /// User classes (CRTUSRPRF USRCLS).
@@ -178,7 +182,7 @@ pub async fn init(client: &Client) -> Result<()> {
                 enabled: true,
                 usrcls: "*SECOFR".into(),
                 special: class_special_authorities("*SECOFR"),
-                curlib: "QGPL".into(),
+                curlib: "*CRTDFT".into(),
                 text: "Security officer".into(),
             },
         )

@@ -5,3 +5,5 @@ gradlew    text eol=lf
 *.rpgle    text eol=lf
 *.pf       text eol=lf
 *.bat      text eol=crlf
+*.lf       text eol=lf
+*.dspf     text eol=lf

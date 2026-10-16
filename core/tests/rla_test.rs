@@ -792,3 +792,452 @@ async fn passwords_from_before_qpwdlvl_still_work() {
     assert!(!users::reset_password(&client, "NOSUCHUSR").await.unwrap());
     users::delete(&client, &name).await.unwrap();
 }
+
+/// The library list of a job, as IBM documents it: the system part
+/// (QSYS, QSYS2, QHLPSYS, QUSRSYS), then the current library if there is
+/// one, then the user part (QGPL, QTEMP as shipped). Only the user part
+/// and the current library can be changed.
+#[tokio::test]
+async fn job_library_list_commands() {
+    use ibmish_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+        runner: String::new(),
+        call_timeout: std::time::Duration::from_secs(5),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: None,
+        libl: vec!["QGPL".into(), "QTEMP".into()],
+        display: None,
+    };
+    let types = |job: &Job| -> Vec<String> {
+        job.library_list_entries()
+            .iter()
+            .map(|(l, t)| format!("{l} {t}"))
+            .collect()
+    };
+    assert_eq!(
+        types(&job),
+        [
+            "QSYS SYS",
+            "QSYS2 SYS",
+            "QHLPSYS SYS",
+            "QUSRSYS SYS",
+            "QGPL USR",
+            "QTEMP USR"
+        ]
+    );
+    assert_eq!(job.current_library(), "QGPL", "*CRTDFT creates in QGPL");
+
+    // DSPLIBL: one row per library, option 5 runs DSPLIB on it.
+    let Ok(Outcome::Display(d)) = job.run("dsplibl").await else {
+        panic!()
+    };
+    assert_eq!(d.rows.len(), 6);
+    assert_eq!(d.keys[4], "QGPL");
+    assert_eq!(d.options[0].0, 5);
+    assert_eq!(d.options[0].2.replace("{}", &d.keys[4]), "DSPLIB LIB(QGPL)");
+    assert!(
+        d.rows[4].contains("General purpose library"),
+        "{}",
+        d.rows[4]
+    );
+
+    job.run(&format!("chgcurlib {lib}")).await.unwrap();
+    assert_eq!(types(&job)[4], format!("{lib} CUR"));
+    assert!(job
+        .run(&format!("addlible {lib}"))
+        .await
+        .unwrap_err()
+        .to_string()
+        .starts_with("CPF2103"));
+    assert!(job
+        .run("chgcurlib nosuchlib")
+        .await
+        .unwrap_err()
+        .to_string()
+        .starts_with("CPF2110"));
+    job.run("chgcurlib *crtdft").await.unwrap();
+    assert!(!types(&job).iter().any(|t| t.ends_with("CUR")));
+
+    job.run(&format!("addlible {lib} *last")).await.unwrap();
+    assert_eq!(types(&job).last().unwrap(), &format!("{lib} USR"));
+    job.run("rmvlible qtemp").await.unwrap();
+    assert!(!job.library_list().contains(&"QTEMP".to_string()));
+    assert!(
+        job.run("rmvlible qsys").await.is_err(),
+        "the system part cannot be changed"
+    );
+    assert!(
+        job.run("rmvlible qtemp").await.is_err(),
+        "not in the list any more"
+    );
+
+    job.run(&format!("chglibl libl(qtemp {lib}) curlib(qgpl)"))
+        .await
+        .unwrap();
+    assert_eq!(
+        types(&job)[4..],
+        [
+            "QGPL CUR".to_string(),
+            "QTEMP USR".into(),
+            format!("{lib} USR")
+        ]
+    );
+    job.run("chglibl libl(*none) curlib(*crtdft)")
+        .await
+        .unwrap();
+    assert_eq!(job.library_list().len(), 4, "only the system part is left");
+}
+
+async fn crtlf(client: &mut Client, lib: &str, name: &str, src: &str) -> rla::OpenFile {
+    let lf = dds::parse_lf(name, src).unwrap();
+    catalog::create_logical_file(client, &[lib.to_string()], lib, &lf)
+        .await
+        .unwrap();
+    let f = catalog::resolve_file(client, &[lib.to_string()], name)
+        .await
+        .unwrap();
+    rla::OpenFile::new(f)
+}
+
+async fn names(client: &Client, f: &mut rla::OpenFile) -> Vec<String> {
+    let mut out = Vec::new();
+    loop {
+        let r = f.read(client).await.unwrap();
+        if r.eof {
+            break;
+        }
+        out.push(field(&r, "CUSNAM").trim().to_string());
+    }
+    out
+}
+
+/// Logical files (IBM DDS reference): a keyed view of a physical file's
+/// records in another order, with only the records select/omit lets
+/// through; DESCEND keys read high to low.
+#[tokio::test]
+async fn logical_files_order_and_select() {
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    let mut by_name = crtlf(
+        &mut client,
+        &lib,
+        "CUSTNAME",
+        include_str!("../../samples/qddssrc/CUSTNAME.lf"),
+    )
+    .await;
+    assert_eq!(
+        names(&client, &mut by_name).await,
+        [
+            "Acme Tooling",
+            "Bluebird Supply",
+            "Lake, Pine & Co",
+            "Midwest Fasteners",
+            "Prairie Freight"
+        ]
+    );
+    // SETLL on a partial name, then READ.
+    by_name.setll(&client, &["L".into()]).await.unwrap();
+    assert_eq!(
+        field(&by_name.read(&client).await.unwrap(), "CUSNAM").trim(),
+        "Lake, Pine & Co"
+    );
+
+    let mut owe = crtlf(
+        &mut client,
+        &lib,
+        "CUSTOWE",
+        include_str!("../../samples/qddssrc/CUSTOWE.lf"),
+    )
+    .await;
+    // Balances: 4: 9999999.99, 1: 1250.50, 2: 310.00; 3 (0) and 5 (-75.25)
+    // are omitted by COMP(GT 0).
+    assert_eq!(
+        names(&client, &mut owe).await,
+        ["Prairie Freight", "Acme Tooling", "Midwest Fasteners"]
+    );
+    // Descending key: SETLL 1250.50 positions at the first record whose key
+    // is at or after it in access path order, i.e. <= 1250.50.
+    owe.setll(&client, &["1250.50".into()]).await.unwrap();
+    assert!(owe.equal());
+    assert_eq!(
+        field(&owe.read(&client).await.unwrap(), "CUSNAM").trim(),
+        "Acme Tooling"
+    );
+    assert_eq!(
+        field(&owe.read(&client).await.unwrap(), "CUSNAM").trim(),
+        "Midwest Fasteners"
+    );
+    assert!(owe.read(&client).await.unwrap().eof);
+    // And backwards: READP from the end gives the smallest balance first.
+    owe.setgt(&client, &[]).await.unwrap();
+    assert_eq!(
+        field(&owe.read_previous(&client).await.unwrap(), "CUSNAM").trim(),
+        "Midwest Fasteners"
+    );
+    assert_eq!(
+        field(&owe.read_previous(&client).await.unwrap(), "CUSNAM").trim(),
+        "Acme Tooling"
+    );
+    // SETGT 1250.50 (descending): after it come the smaller balances.
+    owe.setgt(&client, &["1250.50".into()]).await.unwrap();
+    assert_eq!(
+        field(&owe.read(&client).await.unwrap(), "CUSNAM").trim(),
+        "Midwest Fasteners"
+    );
+    // CHAIN works on the logical file's key.
+    let r = owe.chain(&client, &["310".into()]).await.unwrap();
+    assert!(r.found);
+    assert!(
+        !owe.chain(&client, &["0".into()]).await.unwrap().found,
+        "omitted record"
+    );
+
+    // A record changed through the physical file moves in and out of the
+    // logical file: no copy, the same data.
+    let mut pf = rla::OpenFile::new(
+        catalog::resolve_file(&client, std::slice::from_ref(&lib), "CUSTMAST")
+            .await
+            .unwrap(),
+    );
+    let r = pf.chain(&client, &["3".into()]).await.unwrap();
+    let mut rec = r.record.unwrap();
+    rec.insert("CUSBAL".into(), "500".into());
+    pf.update(&client, &rec).await.unwrap();
+    owe.setll(&client, &[]).await.unwrap();
+    assert_eq!(
+        names(&client, &mut owe).await,
+        [
+            "Prairie Freight",
+            "Acme Tooling",
+            "Bluebird Supply",
+            "Midwest Fasteners"
+        ]
+    );
+}
+
+/// Select/omit rules are tried in order and the first that holds decides;
+/// with none holding, the record is omitted after a last select and
+/// selected after a last omit (IBM DDS reference). Character constants are
+/// quoted; apostrophes and periods in them are data.
+#[tokio::test]
+async fn logical_file_select_omit_rules_and_unique() {
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    // Omit Omaha and Lincoln, then select the rest (ALL).
+    let mut f = crtlf(
+        &mut client,
+        &lib,
+        "NOTNEB",
+        "     A          R CUSTREC                   PFILE(CUSTMAST)\n     A          K CUSNO\n     A          O CUSCTY                    VALUES('Omaha' 'Lincoln')\n     A          S                           ALL\n",
+    )
+    .await;
+    assert_eq!(
+        names(&client, &mut f).await,
+        ["Acme Tooling", "Midwest Fasteners", "Lake, Pine & Co"]
+    );
+    // Only an omit rule: everything else is selected.
+    let mut f = crtlf(
+        &mut client,
+        &lib,
+        "NOTLOW",
+        "     A          R CUSTREC                   PFILE(CUSTMAST)\n     A          K CUSNO\n     A          O CUSBAL                    RANGE(-100 500)\n",
+    )
+    .await;
+    assert_eq!(
+        names(&client, &mut f).await,
+        ["Acme Tooling", "Prairie Freight"]
+    );
+    // AND within a rule, and a constant with an apostrophe and a period.
+    let mut f = crtlf(
+        &mut client,
+        &lib,
+        "STPAUL",
+        "     A          R CUSTREC                   PFILE(CUSTMAST)\n     A          K CUSNO\n     A          S CUSCTY                    COMP(EQ 'St. Paul''s')\n     A            CUSBAL                    COMP(GE 0)\n",
+    )
+    .await;
+    assert!(names(&client, &mut f).await.is_empty());
+    let mut pf = rla::OpenFile::new(
+        catalog::resolve_file(&client, std::slice::from_ref(&lib), "CUSTMAST")
+            .await
+            .unwrap(),
+    );
+    let mut rec = rla::Record::new();
+    rec.insert("CUSNO".into(), "9".into());
+    rec.insert("CUSNAM".into(), "Saints Supply".into());
+    rec.insert("CUSCTY".into(), "St. Paul's".into());
+    rec.insert("CUSBAL".into(), "1".into());
+    pf.write(&client, &rec).await.unwrap();
+    f.setll(&client, &[]).await.unwrap();
+    assert_eq!(names(&client, &mut f).await, ["Saints Supply"]);
+
+    // A UNIQUE logical file rejects a second record with the same key
+    // among the records it selects; omitted records do not count.
+    let mut u = crtlf(
+        &mut client,
+        &lib,
+        "UNAME",
+        "     A                                      UNIQUE\n     A          R CUSTREC                   PFILE(CUSTMAST)\n     A          K CUSNAM\n     A          S CUSBAL                    COMP(GT 0)\n",
+    )
+    .await;
+    let mut dup = rla::Record::new();
+    dup.insert("CUSNO".into(), "10".into());
+    dup.insert("CUSNAM".into(), "Acme Tooling".into());
+    dup.insert("CUSBAL".into(), "5".into());
+    assert!(
+        u.write(&client, &dup).await.is_err(),
+        "duplicate key among selected records"
+    );
+    dup.insert("CUSBAL".into(), "0".into());
+    pf.write(&client, &dup).await.unwrap();
+    // Writing through a logical file puts the record in the physical file.
+    let mut through = rla::Record::new();
+    through.insert("CUSNO".into(), "11".into());
+    through.insert("CUSNAM".into(), "Zephyr Co".into());
+    through.insert("CUSBAL".into(), "7".into());
+    u.write(&client, &through).await.unwrap();
+    assert!(pf.chain(&client, &["11".into()]).await.unwrap().found);
+
+    // A logical file over a logical file is refused; so are unknown fields.
+    let lf = dds::parse_lf(
+        "BAD",
+        "     A          R CUSTREC                   PFILE(UNAME)\n",
+    )
+    .unwrap();
+    assert!(
+        catalog::create_logical_file(&mut client, std::slice::from_ref(&lib), &lib, &lf)
+            .await
+            .is_err()
+    );
+    let lf = dds::parse_lf(
+        "BAD",
+        "     A          R R1                        PFILE(CUSTMAST)\n     A            NOSUCH\n",
+    )
+    .unwrap();
+    assert!(
+        catalog::create_logical_file(&mut client, std::slice::from_ref(&lib), &lib, &lf)
+            .await
+            .is_err()
+    );
+}
+
+/// Phase 1 gate: a file created from DDS is read with record-level access
+/// (the other tests) and with SQL. DB2 for i SQL reference: system naming
+/// LIB/FILE, SQL naming LIB.FILE, unqualified names through the library
+/// list; the relative record number is not a column unless asked for with
+/// RRN(); INSERT without a column list fills the file's fields in order.
+#[tokio::test]
+async fn sql_reads_and_writes_dds_files() {
+    use ibmish_core::sql::{self, Outcome};
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    crtlf(
+        &mut client,
+        &lib,
+        "CUSTOWE",
+        include_str!("../../samples/qddssrc/CUSTOWE.lf"),
+    )
+    .await;
+    let libl = vec![lib.clone()];
+    let rows = |o: Outcome| match o {
+        Outcome::Rows { columns, rows, .. } => (columns, rows),
+        other => panic!("expected rows, got {other:?}"),
+    };
+
+    let (cols, r) = rows(
+        sql::run(
+            &client,
+            &url,
+            &libl,
+            &format!("select * from {lib}/custmast order by cusno"),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        cols,
+        ["CUSNO", "CUSNAM", "CUSCTY", "CUSBAL"],
+        "no RRN column"
+    );
+    assert_eq!(r.len(), 5);
+    assert_eq!(r[0][3], "1250.50", "decimals keep their scale");
+    let (_, r) = rows(
+        sql::run(
+            &client,
+            &url,
+            &libl,
+            &format!("select cusnam from {lib}.custowe where cusbal > 1000 order by cusbal desc"),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        r.iter().map(|x| x[0].trim()).collect::<Vec<_>>(),
+        ["Prairie Freight", "Acme Tooling"]
+    );
+    let (cols, r) = rows(
+        sql::run(
+            &client,
+            &url,
+            &libl,
+            "select rrn(c), cusno from custmast c where cusno = 3",
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(cols, ["RRN", "CUSNO"]);
+    assert_eq!(r[0][0], "1", "customer 3 was the first record loaded");
+
+    let n = sql::run(
+        &client,
+        &url,
+        &libl,
+        "insert into custmast values (8, 'Eighth Co', 'Fargo', 5)",
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, Outcome::Count(sql::Kind::Insert, 1));
+    // Seen by record-level access too: one database.
+    let mut f = rla::OpenFile::new(
+        catalog::resolve_file(&client, &libl, "CUSTMAST")
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        field(&f.chain(&client, &["8".into()]).await.unwrap(), "CUSNAM").trim(),
+        "Eighth Co"
+    );
+    let n = sql::run(
+        &client,
+        &url,
+        &libl,
+        "update custmast set cusbal = cusbal * 2 where cusno = 8",
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, Outcome::Count(sql::Kind::Update, 1));
+    assert_eq!(
+        field(&f.chain(&client, &["8".into()]).await.unwrap(), "CUSBAL"),
+        "10.00"
+    );
+
+    // Errors carry DB2-style SQL message IDs; the catalog is out of reach.
+    let err = |s: &'static str| {
+        let (c, u, l) = (&client, &url, &libl);
+        async move { sql::run(c, u, l, s).await.unwrap_err().to_string() }
+    };
+    assert!(err("select * from nosuch").await.starts_with("SQL0204"));
+    assert!(err("insert into custmast values (8, 'Dup', 'X', 0)")
+        .await
+        .starts_with("SQL0803"));
+    assert!(err("select * from \"IBMISH\".user_profiles")
+        .await
+        .starts_with("SQL0551"));
+    assert!(err("create table x (a int)").await.starts_with("SQL0084"));
+}

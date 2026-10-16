@@ -18,9 +18,10 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 
 | Path | What |
 | --- | --- |
-| `core/src/dds.rs` | DDS parser (physical files: R, K lines, fields, `UNIQUE`, `TEXT`) |
+| `core/src/dds.rs` | DDS parser: physical files (R, K lines with `DESCEND`, fields, `UNIQUE`, `TEXT`) and logical files (`PFILE`, field subsets, keys, select/omit) |
 | `core/src/catalog.rs` | Libraries = PostgreSQL schemas; file descriptions in schema `ibmish`; library list resolution |
 | `core/src/rla.rs` | Record-level access: cursor position per open file, keyset queries ordered by (keys, rrn) |
+| `core/src/sql.rs` | SQL in the DB2 for i dialect: translation to PostgreSQL, run on a separate connection as the restricted `ibmish_sql` login |
 | `core/src/bridge.rs` | JSON-lines TCP server the JVM calls for every file operation |
 | `core/src/dspf.rs` | DDS display files: parser, drawing a record on a 5250 screen, input validation, response indicators |
 | `core/src/workstn.rs` | A program's display state: records on the screen (OVERLAY), subfiles (WRITE/READC/CHAIN/UPDATE), one EXFMT's interaction and paging |
@@ -52,6 +53,6 @@ TN5250=/path/to/tn5250 python3 tools/e2e_5250.py 127.0.0.1:2323   # against a ru
 ## Conventions
 
 - Errors that a program could monitor for start with the IBM-style message ID, e.g. `CPF5026: ...`.
-- SQL is built dynamically only with `catalog::ident()` for identifiers. Values are always bound parameters (as text, then `CAST`).
+- SQL is built dynamically only with `catalog::ident()` for identifiers. Values are always bound parameters (as text, then `CAST`). The exception is user SQL (`sql.rs`), which only ever runs as the `ibmish_sql` login: never run user-supplied SQL on the main connection.
 - Bridge protocol changes are versioned: bump `PROTOCOL_VERSION` in both `bridge.rs` and `BridgeClient.java`.
 - Commits are signed off (`git commit -s`). Commit messages describe the IBM i behavior implemented.

@@ -181,32 +181,64 @@ impl OpenFile {
         }
         let mut lhs = Vec::new();
         let mut rhs = Vec::new();
+        let mut desc = Vec::new();
         for (f, v) in kf.iter().zip(prefix) {
             params.push(Self::normalize(f, v));
             lhs.push(format!("t.{}", ident(&f.name)));
             rhs.push(format!("CAST(${}::text AS {})", params.len(), f.sql_type()));
+            desc.push(self.file.file.is_descending(&f.name));
         }
         if let Some(rrn) = with_rrn {
             params.push(rrn.to_string());
             lhs.push("t.rrn".into());
             rhs.push(format!("CAST(${}::text AS bigint)", params.len()));
+            desc.push(false);
         }
-        Ok(format!("({}) {op} ({})", lhs.join(", "), rhs.join(", ")))
+        if op == "=" {
+            let eq: Vec<String> = lhs
+                .iter()
+                .zip(&rhs)
+                .map(|(l, r)| format!("{l} = {r}"))
+                .collect();
+            return Ok(format!("({})", eq.join(" AND ")));
+        }
+        if !desc.contains(&true) {
+            return Ok(format!("({}) {op} ({})", lhs.join(", "), rhs.join(", ")));
+        }
+        // A descending key: compare in access path order field by field.
+        // "after" (> or >=) means greater for ascending keys and smaller
+        // for descending ones.
+        let after = op.starts_with('>');
+        let strict = op.len() == 1;
+        let mut terms = Vec::new();
+        for i in 0..lhs.len() {
+            let mut t: Vec<String> = (0..i).map(|j| format!("{} = {}", lhs[j], rhs[j])).collect();
+            let cmp = if after != desc[i] { ">" } else { "<" };
+            t.push(format!("{} {cmp} {}", lhs[i], rhs[i]));
+            terms.push(format!("({})", t.join(" AND ")));
+        }
+        if !strict {
+            let eq: Vec<String> = lhs
+                .iter()
+                .zip(&rhs)
+                .map(|(l, r)| format!("{l} = {r}"))
+                .collect();
+            terms.push(format!("({})", eq.join(" AND ")));
+        }
+        Ok(format!("({})", terms.join(" OR ")))
     }
 
     fn order_by(&self, dir: &Dir) -> String {
-        let d = match dir {
-            Dir::Forward => "ASC",
-            Dir::Backward => "DESC",
-        };
+        let forward = matches!(dir, Dir::Forward);
+        let d = |descending: bool| if forward != descending { "ASC" } else { "DESC" };
         let mut cols: Vec<String> = self
             .file
             .file
             .keys
             .iter()
-            .map(|k| format!("t.{} {d}", ident(k)))
+            .map(|k| format!("t.{} {}", ident(k), d(self.file.file.is_descending(k))))
             .collect();
-        cols.push(format!("t.rrn {d}"));
+        cols.push(format!("t.rrn {}", d(false)));
         cols.join(", ")
     }
 

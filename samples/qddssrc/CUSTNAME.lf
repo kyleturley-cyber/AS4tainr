@@ -1,0 +1,4 @@
+     A* CUSTNAME: customers by name (logical file over CUSTMAST)
+     A          R CUSTREC                   PFILE(CUSTMAST)
+     A                                      TEXT('Customers by name')
+     A          K CUSNAM

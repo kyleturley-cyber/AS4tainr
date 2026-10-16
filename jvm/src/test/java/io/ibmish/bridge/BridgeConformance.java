@@ -32,6 +32,7 @@ public final class BridgeConformance {
                 case "CUSTLIST": custlist(c, parms); break;
                 case "ORDTOTAL": ordtotal(c, parms); break;
                 case "CUSTUPD": custupd(c, parms); break;
+                case "OWING": owing(c, parms); break;
                 case "SELFTEST": selftest(c); break;
                 default:
                     System.err.println("CPF4101: program " + pgm + " not found");
@@ -82,6 +83,25 @@ public final class BridgeConformance {
         }
         dsply("Order " + new BigDecimal(ord).toPlainString() + ": " + lines + " lines, total " + total.toPlainString());
         c.closeFile(f);
+    }
+
+    /** Mirrors samples/qrpglesrc/OWING.rpgle: two logical files over CUSTMAST. */
+    static void owing(BridgeClient c, List<String> parms) {
+        int owe = c.open("CUSTOWE");
+        ReadResult r = c.read(owe);
+        while (!r.eof) {
+            dsply(r.record.get("CUSNAM").trim() + " " + new BigDecimal(r.record.get("CUSBAL")).toPlainString());
+            r = c.read(owe);
+        }
+        c.closeFile(owe);
+        int byName = c.open("CUSTNAME");
+        c.setll(byName, Collections.singletonList(parms.isEmpty() ? "" : parms.get(0)));
+        r = c.read(byName);
+        for (int n = 0; !r.eof && n < 2; n++) {
+            dsply(r.record.get("CUSNAM").trim());
+            r = c.read(byName);
+        }
+        c.closeFile(byName);
     }
 
     /** Mirrors samples/qrpglesrc/CUSTUPD.rpgle. */

@@ -144,8 +144,11 @@ DSPLIB:
 | --- | --- |
 | `CRTLIB LIB(name) TYPE(*PROD) TEXT('...')` | Creates a library (a PostgreSQL schema). `CPF2111` if it exists. |
 | `DSPLIB LIB(name\|*LIBL\|*CURLIB)` | Lists the objects in a library. `DSPLIB QSYS` lists the libraries. |
-| `DSPLIBL` | Shows the job's library list. |
-| `ADDLIBLE LIB(name) POSITION(*FIRST\|*LAST)` | Adds a library to the job's library list. |
+| `DSPLIBL` | Shows the job's library list: the system part (QSYS, QSYS2, QHLPSYS, QUSRSYS, type `SYS`), the current library if there is one (`CUR`), and the user part (`USR`, QGPL and QTEMP for a new job). Option 5 shows a library's objects. |
+| `ADDLIBLE LIB(name) POSITION(*FIRST\|*LAST)` | Adds a library to the user part of the library list. `CPF2103` if it is already in the list. |
+| `RMVLIBLE LIB(name)` | Removes a library from the user part of the library list. |
+| `CHGCURLIB CURLIB(name\|*CRTDFT)` | Sets the current library; `*CRTDFT` means none (objects are then created in QGPL). |
+| `CHGLIBL LIBL(names\|*SAME\|*NONE) CURLIB(*SAME\|*CRTDFT\|name)` | Replaces the user part of the library list, and optionally the current library. |
 | `CALL PGM(name) PARM('a' 'b')` | Runs an RPG program on Jariko with the job's library list. DSPLY output appears in the log. |
 | `SIGNOFF` | Ends the session and returns to the sign-on screen. |
 | `CRTUSRPRF USRPRF(name) PASSWORD(*USRPRF\|*NONE\|pw) PWDEXP STATUS USRCLS CURLIB TEXT SPCAUT` | Creates a user profile. Needs `*SECADM`. `SPCAUT(*USRCLS)` gives the class's special authorities (`*SECOFR`: all eight; `*SECADM`: `*SECADM`; `*SYSOPR`: `*JOBCTL *SAVSYS`; `*PGMR`, `*USER`: none). |
@@ -153,6 +156,8 @@ DSPLIB:
 | `DLTUSRPRF USRPRF(name)` | Deletes a profile. Needs `*SECADM`; not QSECOFR or yourself. |
 | `CHGPWD` | Shows the Change Password screen. |
 | `WRKOBJ OBJ(lib/name) OBJTYPE(*ALL\|*LIB\|*FILE)` | Lists objects. The name can be generic (`CUST*`) or `*ALL`; the library `*LIBL`, `*CURLIB`, `*USRLIBL`, `*ALL`, `*ALLUSR` or a name. List only for now: no options. |
+| `STRSQL` | Interactive SQL: type a statement, see the rows (see [sql.md](sql.md)). |
+| `RUNSQL SQL('...')` | Runs one INSERT, UPDATE or DELETE (not SELECT) and reports the rows changed. |
 | `DSPPFM FILE(lib/name)` | Shows a physical file's records in arrival order, one line each with the field names above. F19/F20 shift left/right on wide files. |
 
 Keyword and positional forms both work (`CRTLIB MYLIB` = `CRTLIB LIB(MYLIB)`). Unquoted values are folded to upper case; quoted values keep their case, with `''` for an apostrophe.
@@ -171,7 +176,9 @@ Keys on the command entry screen:
 
 **Prompting (F4).** The prompt has one line per parameter with its current value or default and the allowed values; required parameters are highlighted, qualified names get a separate Library line. Enter builds the command (parameters left at their default are left out), checks it, and runs it; the command as built appears in the log, so F9 retrieves it. F5 resets the values, F12 returns to the command line with what was typed, F3 returns to an empty command line. The prompt comes from the same command table (`cl::COMMANDS`) as parsing.
 
-On list screens, Page Down / Page Up (Roll Up / Roll Down) page through the list, and F3 or F12 return.
+On list screens, Page Down / Page Up (Roll Up / Roll Down) page through the list. Lists with options (DSPLIBL) have an Opt column: type an option number next to one or more entries and press Enter to run it on each, then you come back to the list. F12 goes back one screen, F3 goes back to the command line.
+
+**Library list.** A job's library list is searched in order: the system part, the current library, the user part. The system part is fixed. The user part of a new job comes from `IBMISH_LIBL` (default `QGPL,QTEMP`); the current library comes from the sign-on screen, else the user profile (`*CRTDFT` = none, as QSECOFR is shipped).
 
 ## How it is built
 

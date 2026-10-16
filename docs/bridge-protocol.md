@@ -1,6 +1,6 @@
-# Bridge protocol (version 2)
+# Bridge protocol (version 3)
 
-Version 2 added the display file operations `dspwrite`, `sflwrite`, `sflchain`, `sflreadc` and `sflupdate`.
+Version 3 added the data area operations `dtaara_in`, `dtaara_out` and `dtaara_unlock`. Version 2 added the display file operations `dspwrite`, `sflwrite`, `sflchain`, `sflreadc` and `sflupdate`.
 
 The bridge connects the JVM (Jariko running RPG) to ibmish core, which carries out every file operation. It uses TCP on loopback only, with one UTF-8 JSON object per line in each direction, strictly request then response.
 
@@ -46,6 +46,9 @@ Records are objects that map field names to strings:
 | `sflchain` | `file`, `format`, `rrn` | read result | CHAIN to a subfile record by number |
 | `sflreadc` | `file`, `format` | read result | READC: the next subfile record changed by the operator in the last EXFMT (or written/updated with `SFLNXTCHG` on), in number order; `eof` when there are no more. `rrn` is the record's number |
 | `sflupdate` | `file`, `format`, `fields`, `indicators` | | UPDATE of the subfile record last read by `sflreadc` or `sflchain` |
+| `dtaara_in` | `name`, `lock`? | `library`, `name`, `type`, `length`, `decimals`, `value` | RPG `IN`: reads a data area found through the library list. `type` is `*CHAR`, `*DEC` or `*LGL`; `value` is the padded text, decimal text with `decimals` places, or `0`/`1`. With `lock: true` (`IN *LOCK`) this connection holds the data area until `dtaara_out`, `dtaara_unlock` or the connection closes; others wait |
+| `dtaara_out` | `name`, `value` | | RPG `OUT`: writes the whole value (decimal text for `*DEC`); a value that does not fit fails. Releases this connection's lock |
+| `dtaara_unlock` | `name` | | Releases this connection's lock without writing |
 
 All connections of one bridge (one program call) share the display state: the records on the screen and the subfiles.
 
@@ -65,6 +68,7 @@ These match IBM i record-level access for keyed physical files:
 
 | ID | When |
 | --- | --- |
+| `CPF1015` | Data area not found |
 | `CPF2110` | Library not found |
 | `CPF5013` | UPDATE/DELETE with no current record, or the record is gone |
 | `CPF5026` | Duplicate key on a UNIQUE file |

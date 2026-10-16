@@ -243,8 +243,38 @@ pub static COMMANDS: &[CommandDef] = &[
         description: "Work with Objects",
         params: &[
             p("OBJ", Kind::Qualified, true, None, "Object").ch("Name, generic*, *ALL"),
-            p("OBJTYPE", Kind::Name, false, Some("*ALL"), "Object type").ch("*ALL, *LIB, *FILE"),
+            p("OBJTYPE", Kind::Name, false, Some("*ALL"), "Object type")
+                .ch("*ALL, *LIB, *FILE, *PGM, *DTAARA"),
         ],
+    },
+    CommandDef {
+        name: "CRTDTAARA",
+        description: "Create Data Area",
+        params: &[
+            p("DTAARA", Kind::Qualified, true, None, "Data area").ch("Name"),
+            p("TYPE", Kind::Name, true, None, "Type").ch("*DEC, *CHAR, *LGL"),
+            p("LEN", Kind::List, false, Some("*DFT"), "Length").ch("1-2000, digits decimals"),
+            p("VALUE", Kind::Text, false, Some("*DFT"), "Initial value"),
+            p("TEXT", Kind::Text, false, Some(""), "Text 'description'"),
+        ],
+    },
+    CommandDef {
+        name: "CHGDTAARA",
+        description: "Change Data Area",
+        params: &[
+            p("DTAARA", Kind::List, true, None, "Data area").ch("Name, (start length)"),
+            p("VALUE", Kind::Text, true, None, "New value"),
+        ],
+    },
+    CommandDef {
+        name: "DSPDTAARA",
+        description: "Display Data Area",
+        params: &[p("DTAARA", Kind::Qualified, true, None, "Data area").ch("Name")],
+    },
+    CommandDef {
+        name: "DLTDTAARA",
+        description: "Delete Data Area",
+        params: &[p("DTAARA", Kind::Qualified, true, None, "Data area").ch("Name")],
     },
     CommandDef {
         name: "DSPPFM",
@@ -280,7 +310,7 @@ pub static GROUPS: &[Group] = &[
     Group {
         item: "Object commands",
         title: "Object Commands",
-        commands: &["WRKOBJ"],
+        commands: &["WRKOBJ", "CRTDTAARA", "CHGDTAARA", "DSPDTAARA", "DLTDTAARA"],
     },
     Group {
         item: "File commands",
@@ -455,7 +485,32 @@ pub fn parse_partial(
                         Some(Tok::Close) => break,
                         Some(Tok::Word(v)) => vals.push(Value::Word(v)),
                         Some(Tok::Quoted(v)) => vals.push(Value::Quoted(v)),
-                        Some(Tok::Open) => return Err(err("Nested lists are not supported yet.")),
+                        // An element list inside a value, e.g. the
+                        // substring in DTAARA(NAME (1 10)): kept as one
+                        // value "(1 10)" for the command to take apart.
+                        Some(Tok::Open) => {
+                            let mut inner = Vec::new();
+                            loop {
+                                match it.next() {
+                                    Some(Tok::Close) => break,
+                                    Some(Tok::Word(v)) => inner.push(v),
+                                    Some(Tok::Quoted(v)) => {
+                                        inner.push(format!("'{}'", v.replace('\'', "''")))
+                                    }
+                                    Some(Tok::Open) => {
+                                        return Err(err(
+                                            "Lists nested more than two deep are not supported.",
+                                        ))
+                                    }
+                                    None => {
+                                        return Err(err(format!(
+                                            "A closing parenthesis is missing after {w}."
+                                        )))
+                                    }
+                                }
+                            }
+                            vals.push(Value::Word(format!("({})", inner.join(" "))));
+                        }
                         None => {
                             return Err(err(format!("A closing parenthesis is missing after {w}.")))
                         }
@@ -648,6 +703,17 @@ mod tests {
         v.insert("PGM".to_string(), "CUSTLIST".to_string());
         v.insert("PARM".to_string(), parm);
         assert_eq!(parse(&build(def, &v)).unwrap().list("PARM"), vec!["3", "X"]);
+    }
+
+    #[test]
+    fn element_lists_inside_a_value() {
+        // DTAARA(name (start length)), as in CHGDTAARA's syntax diagram.
+        let c = parse("CHGDTAARA DTAARA(QGPL/CO (6 5)) VALUE('Ltd')").unwrap();
+        assert_eq!(c.list("DTAARA"), ["QGPL/CO", "(6 5)"]);
+        assert_eq!(c.get("VALUE"), "Ltd");
+        let c = parse("crtdtaara nxt *dec len(7 0) value(1004)").unwrap();
+        assert_eq!(c.list("LEN"), ["7", "0"]);
+        assert!(parse("CHGDTAARA DTAARA(CO (1 (2))) VALUE(X)").is_err());
     }
 
     #[test]

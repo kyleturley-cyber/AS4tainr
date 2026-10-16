@@ -44,7 +44,8 @@ async fn setup(url: &str) -> (Client, String) {
         .batch_execute(&format!(
             "DROP SCHEMA IF EXISTS {} CASCADE; DELETE FROM ibmish.objects WHERE library='{lib}' OR name='{lib}';
              DELETE FROM ibmish.files WHERE library='{lib}'; DELETE FROM ibmish.file_fields WHERE library='{lib}';
-             DELETE FROM ibmish.file_keys WHERE library='{lib}';",
+             DELETE FROM ibmish.file_keys WHERE library='{lib}';
+             DELETE FROM ibmish.data_areas WHERE library='{lib}';",
             catalog::ident(&lib)
         ))
         .await
@@ -368,7 +369,7 @@ async fn bridge_protocol_round_trip() {
     }
     server.abort();
 
-    assert_eq!(resp[0]["version"], 2);
+    assert_eq!(resp[0]["version"], 3);
     assert_eq!(resp[1]["format"], "ORDLINR");
     assert_eq!(resp[1]["keys"], json!(["ORDNO", "LINNO"]));
     assert_eq!(resp[1]["fields"][4]["decimals"], 2);
@@ -1429,4 +1430,193 @@ ENDPGM";
     assert!(cl_job_run(&client, &url, &lib, &[], "CALL CLOVF PARM(1 2)")
         .await
         .is_err());
+}
+
+/// Run commands in a job whose library list is just `lib`.
+async fn job_run(
+    client: &Client,
+    lib: &str,
+    line: &str,
+) -> anyhow::Result<ibmish_core::commands::Outcome> {
+    use ibmish_core::commands::{Environment, Job};
+    let env = Environment {
+        database_url: String::new(),
+        runner: "false".into(),
+        call_timeout: std::time::Duration::from_secs(5),
+    };
+    let mut job = Job {
+        client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.to_string()),
+        libl: vec![lib.to_string()],
+        display: None,
+    };
+    job.run(line).await
+}
+
+/// Data areas: CRTDTAARA, CHGDTAARA (all or a substring), DSPDTAARA,
+/// DLTDTAARA and RTVDTAARA in a CL program. Expected values follow IBM's
+/// command descriptions: a *CHAR value is padded with blanks to its length,
+/// a substring change replaces only those positions, *DEC values must fit
+/// the length and decimal positions, LEN(*DFT) for *DEC is (15 5).
+#[tokio::test]
+async fn data_areas_commands_and_rtvdtaara() {
+    use ibmish_core::commands::Outcome;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let run = |line: String| {
+        let client = &client;
+        let lib = lib.clone();
+        async move { job_run(client, &lib, &line).await }
+    };
+    let msgs = |o: Outcome| match o {
+        Outcome::Messages(m) => m,
+        other => panic!("unexpected {other:?}"),
+    };
+    let m = msgs(
+        run(format!(
+            "CRTDTAARA DTAARA({lib}/NEXTNO) TYPE(*DEC) LEN(7 0) VALUE(1004) TEXT('Next number')"
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(m, [format!("Data area NEXTNO created in library {lib}.")]);
+    let e = run(format!("CRTDTAARA {lib}/NEXTNO *DEC"))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().starts_with("CPF1023"), "{e}");
+    // Unqualified: created in the current library.
+    run("CRTDTAARA CO *CHAR LEN(10) VALUE('Acme')".into())
+        .await
+        .unwrap();
+    run("CHGDTAARA DTAARA(CO (6 5)) VALUE('Ltd')".into())
+        .await
+        .unwrap();
+    let Outcome::Display(d) = run("DSPDTAARA CO".into()).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(d.rows, ["     0   'Acme Ltd  '"]);
+    assert!(d.info.contains(&("Type".into(), "*CHAR".into())));
+    run(format!("CRTDTAARA {lib}/DFT TYPE(*DEC)"))
+        .await
+        .unwrap();
+    let Outcome::Display(d) = run("DSPDTAARA DFT".into()).await.unwrap() else {
+        panic!()
+    };
+    assert!(d.info.contains(&("Length".into(), "15 5".into())));
+    assert_eq!(d.rows, ["     0   0.00000"]);
+    run("CRTDTAARA FLAG *LGL".into()).await.unwrap();
+    // Values that do not fit, and substrings of a *DEC data area.
+    assert!(run("CHGDTAARA NEXTNO VALUE(12345678)".into())
+        .await
+        .is_err());
+    assert!(run("CHGDTAARA DTAARA(NEXTNO (1 2)) VALUE(1)".into())
+        .await
+        .is_err());
+    assert!(run("CHGDTAARA DTAARA(CO (8 5)) VALUE(X)".into())
+        .await
+        .is_err());
+    assert!(run("CHGDTAARA FLAG VALUE('2')".into()).await.is_err());
+
+    let pgm = r#"
+PGM
+  DCL &N *DEC (7 0)
+  DCL &C *CHAR 4
+  DCL &F *LGL
+  RTVDTAARA NEXTNO &N
+  CHGVAR &N (&N + 1)
+  CHGDTAARA DTAARA(NEXTNO) VALUE(&N)
+  RTVDTAARA DTAARA(CO (1 4)) RTNVAR(&C)
+  CHGDTAARA FLAG '1'
+  RTVDTAARA FLAG &F
+  IF &F THEN(SNDPGMMSG MSG(%CHAR(&N) *BCAT &C))
+  RTVDTAARA NOSUCH &C
+  MONMSG CPF1015 EXEC(SNDPGMMSG MSG('NOSUCH is missing'))
+ENDPGM
+"#;
+    let m = cl_job_run(&client, &url, &lib, &[("DTAPGM", pgm)], "CALL DTAPGM")
+        .await
+        .unwrap();
+    assert!(m.contains(&"1005 Acme".to_string()), "{m:?}");
+    assert!(m.contains(&"NOSUCH is missing".to_string()), "{m:?}");
+    // A *DEC data area needs a *DEC variable.
+    let bad = "PGM\n DCL &C *CHAR 10\n RTVDTAARA NEXTNO &C\nENDPGM\n";
+    let e = cl_job_run(&client, &url, &lib, &[("BADPGM", bad)], "CALL BADPGM")
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("must be a *DEC variable"), "{e}");
+
+    let m = msgs(run("DLTDTAARA CO".into()).await.unwrap());
+    assert_eq!(m, [format!("Data area CO deleted from library {lib}.")]);
+    let e = run("DSPDTAARA CO".into()).await.unwrap_err();
+    assert!(e.to_string().starts_with("CPF1015"), "{e}");
+}
+
+/// RPG IN *LOCK / OUT through the bridge: while one program holds the
+/// data area, CHGDTAARA from another job waits, so a counter is never
+/// changed between a program's IN and its OUT (IBM i: IN *LOCK keeps an
+/// exclusive lock until OUT, UNLOCK or the end of the program).
+#[tokio::test]
+async fn bridge_data_area_in_lock_out() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    ibmish_core::dtaara::create(
+        &client,
+        &lib,
+        "ORDNXT",
+        ibmish_core::dtaara::Type::Dec,
+        7,
+        0,
+        "1004",
+        "",
+    )
+    .await
+    .unwrap();
+    let listener = bridge::bind(0).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(bridge::serve(
+        listener,
+        bridge::BridgeConfig {
+            database_url: url.clone(),
+            library_list: vec![lib.clone()],
+            display: None,
+        },
+    ));
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (rd, mut wr) = stream.into_split();
+    let mut lines = BufReader::new(rd).lines();
+    let mut ask = async |req: Value| -> Value {
+        wr.write_all(format!("{req}\n").as_bytes()).await.unwrap();
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap()
+    };
+    let r = ask(json!({"id": 1, "op": "dtaara_in", "name": "ORDNXT", "lock": true})).await;
+    assert_eq!(r["value"], "1004");
+    assert_eq!(r["type"], "*DEC");
+
+    // Another job changes the data area: it must wait for OUT.
+    let other = bridge::connect_db(&url).await.unwrap();
+    let libl = vec![lib.clone()];
+    let lib2 = lib.clone();
+    let change = tokio::spawn(async move {
+        ibmish_core::dtaara::change(&other, "ORDNXT", &libl, &lib2, None, "5000")
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!change.is_finished(), "CHGDTAARA did not wait for the lock");
+
+    let r = ask(json!({"id": 2, "op": "dtaara_out", "name": "ORDNXT", "value": "1005"})).await;
+    assert_eq!(r["ok"], true, "{r}");
+    let after = change.await.unwrap();
+    assert_eq!(after.value, "5000");
+
+    // Without a lock, IN just reads; a value that does not fit is refused.
+    let r = ask(json!({"id": 3, "op": "dtaara_in", "name": "ORDNXT"})).await;
+    assert_eq!(r["value"], "5000");
+    let r = ask(json!({"id": 4, "op": "dtaara_out", "name": "ORDNXT", "value": "123456789"})).await;
+    assert_eq!(r["ok"], false);
+    let r = ask(json!({"id": 5, "op": "dtaara_in", "name": "NOSUCH"})).await;
+    assert!(r["error"].as_str().unwrap().starts_with("CPF1015"), "{r}");
+    server.abort();
 }

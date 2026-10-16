@@ -152,7 +152,7 @@ Customer 5. `EDTCDE(J)` edits the negative balance, and `*IN40` shows it in red:
 | Constants | `'text'` (with `-`/`+` continuation), `DATE` (MM/DD/YY), `TIME`, `USER`, `SYSNAME` |
 | Option indicators | Up to three per line in positions 8-16, `N` for not, `O` lines for OR, condition-only lines that carry to the next line |
 | Keywords | `CAnn`/`CFnn` (file or record level, with response indicator), `DSPATR(HI RI UL ND PR PC)`, `COLOR(WHT RED BLU TRQ YLW PNK GRN)`, `EDTCDE(1 2 3 4 J K L M Z)`, `ERRMSG('text' nn)`, `CHECK(LC)` |
-| Input | Numeric fields are validated (digits, decimals, sign) and re-shown with a message if wrong. Character input is folded to upper case unless `CHECK(LC)`. |
+| Input | Numeric fields are validated (digits, decimals, sign) and re-shown with a message if wrong. An input-capable numeric field with `EDTCDE` is shown edited (with `EDTCDE(Z)` a zero is blank); blanks and commas are taken out again on input. Character input is folded to upper case unless `CHECK(LC)`. |
 | Response indicators | On input, the record's `CA`/`CF` indicators and `ERRMSG` indicators are set off, and the pressed key's indicator is set on. `CA` keys return no data; `CF` keys and Enter do. |
 | Screen | `OVERLAY`: without it a record clears the screen; with it, only records sharing a line with it are removed. `WRITE` puts a record on the screen for the next `EXFMT`. |
 | Subfiles | `SFL`, `SFLCTL`, `SFLSIZ`, `SFLPAG`, `SFLDSP`, `SFLDSPCTL`, `SFLCLR`, `SFLDLT`, `SFLEND(*MORE *PLUS)`, `SFLNXTCHG`, `SFLMSG`, `PAGEDOWN`/`ROLLUP`, `PAGEUP`/`ROLLDOWN` |

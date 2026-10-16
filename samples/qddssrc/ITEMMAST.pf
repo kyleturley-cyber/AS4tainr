@@ -1,0 +1,8 @@
+     A* Item master, keyed by item number
+     A                                      UNIQUE
+     A          R ITEMREC                   TEXT('Item master')
+     A            ITEM          15A         TEXT('Item number')
+     A            ITMDSC        30A         TEXT('Description')
+     A            ITMPRC         7P 2       TEXT('Unit price')
+     A            ITMQOH         7P 0       TEXT('Quantity on hand')
+     A          K ITEM

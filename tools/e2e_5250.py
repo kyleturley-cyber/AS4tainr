@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """End-to-end test of the ibmish 5250 server with the real tn5250 client.
 
-Expects a fresh database (QSECOFR with its initial, expired password), the
-sample file CUSTMAST and the display files CUSTINQD and CUSTWRKD in QGPL.
+Expects a fresh database (QSECOFR with its initial, expired password) and
+the sample objects in QGPL (scripts/samples.sh).
 Usage:
 
     TN5250=/path/to/tn5250 python3 tools/e2e_5250.py 127.0.0.1:2323
@@ -202,6 +202,64 @@ with Tn5250(HOST) as t:
     t.fkey(3)
     t.wait_for("Command Entry")
     check("ended abnormally" not in t.text(), "F3 ends WRKCUST normally", t)
+
+    # The order entry application (Phase 2 gate): a CL driver, an RPG
+    # program with an input subfile, five files and a data area.
+    command(t, "call ordentc", "Order Entry", timeout=90)
+    check("Customer number" in t.line(5), "ORDENTC calls ORDENT, which asks for a customer", t)
+    t.enter()
+    t.wait_for("Type a customer number.")
+    check(True, "Enter with no customer number is refused (ERRMSG)", t)
+    t.type("42"); t.send(FIELD_EXIT); t.enter()
+    t.wait_for("Customer not found.")
+    check(True, "an unknown customer is refused", t)
+    t.type("2"); t.send(FIELD_EXIT); t.enter()
+    t.wait_for("Midwest Fasteners")
+    check("Chicago" in t.line(4) and "Description" in t.line(8) and "More..." in t.line(19),
+          "the order screen shows the customer and an empty input subfile", t)
+    check(t.line(9)[18:23].strip() == "", "a zero quantity shows as blanks (EDTCDE(Z) on an input field)", t)
+    t.fkey(6)
+    t.wait_for("Type at least one item")
+    check(True, "F6 with no lines is refused (SFLMSG)", t)
+    t.type("bolt-m8"); t.tab(); t.type("40"); t.send(FIELD_EXIT)
+    t.type("nosuch"); t.tab(); t.type("1"); t.send(FIELD_EXIT)
+    t.enter()
+    t.wait_for("Item not found.")
+    check("Hex bolt M8 x 30" in t.line(9) and "6.00" in t.line(9) and "NOSUCH" in t.line(10),
+          "Enter prices the good line from ITEMMAST and flags the unknown item", t)
+    check("6.00" in t.line(21), "the order total so far is shown", t)
+    t.type("pump-200"); t.send(FIELD_EXIT)  # the cursor is on the wrong item
+    t.tab()
+    t.type("nut-m8"); t.send(FIELD_EXIT)
+    t.enter()
+    t.wait_for("Quantity must be more than zero.")
+    check("Transfer pump" in t.line(10) and "189.00" in t.line(10),
+          "the corrected item is priced; a line without a quantity is refused", t)
+    t.type("100"); t.send(FIELD_EXIT)  # the cursor is on the missing quantity
+    t.enter()
+    t.wait_for("200.00")
+    check("5.00" in t.line(11) and "200.00" in t.line(21),
+          "all three lines priced: 6.00 + 189.00 + 5.00 = 200.00", t)
+    t.fkey(6)
+    t.wait_for("created")
+    check("Order    1004 created, total       200.00" in t.line(21),
+          "F6 creates order 1004 (number from data area ORDNXT) and returns to the prompt", t)
+    t.fkey(3)
+    t.wait_for("next order number")
+    check("The next order number is 1005." in t.text(),
+          "F3 ends ORDENT; ORDENTC reads the data area with RTVDTAARA", t)
+    command(t, "dsppfm ordlin", "Display Physical File Member")
+    screen = t.text()
+    check("PUMP-200" in screen and "189.00" in screen and "NUT-M8" in screen,
+          "the order lines are in ORDLIN", t)
+    t.fkey(3); t.wait_for("Command Entry")
+    command(t, "dsppfm itemmast", "Display Physical File Member")
+    check("4960" in t.text() and "7900" in t.text(), "the quantities were taken off ITMQOH", t)
+    t.fkey(3); t.wait_for("Command Entry")
+    command(t, "dspdtaara ordnxt", "Display Data Area")
+    check("*DEC" in t.text() and "1005" in t.text() and "Next order number" in t.text(),
+          "DSPDTAARA shows the data area", t)
+    t.fkey(3); t.wait_for("Command Entry")
 
     # F4 prompting, from the command definitions.
     t.type("crtlib"); t.fkey(4)

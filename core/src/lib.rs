@@ -7,6 +7,7 @@
 //! - [`bridge`]: the JSON-lines protocol the JVM (Jariko) uses for file I/O
 //! - [`sql`]: SQL in the DB2 for i dialect
 //! - [`dspf`], [`workstn`]: display files, subfiles and the screen
+//! - [`dtaara`]: data areas
 
 pub mod bridge;
 pub mod catalog;
@@ -15,6 +16,7 @@ pub mod clpgm;
 pub mod commands;
 pub mod dds;
 pub mod dspf;
+pub mod dtaara;
 pub mod rla;
 pub mod sql;
 pub mod tn5250;

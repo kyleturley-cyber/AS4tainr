@@ -1016,7 +1016,14 @@ pub fn draw(
             let dec = f.decimals.unwrap_or(0);
             if input_capable {
                 // Show what was typed if it is not a valid number (retry).
-                parse_numeric_input(&value, f.length, dec).unwrap_or(value)
+                // A valid one is shown edited when the field has an edit
+                // code (EDTCDE(Z): zero shows as blanks); the edit
+                // characters are taken out again on input.
+                match (parse_numeric_input(&value, f.length, dec), edit_code(f)) {
+                    (Ok(v), Some(code)) => edit(&v, f.length, dec, Some(code)),
+                    (Ok(v), None) => v,
+                    (Err(_), _) => value,
+                }
             } else {
                 edit(&value, f.length, dec, edit_code(f))
             }

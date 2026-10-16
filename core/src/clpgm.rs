@@ -17,7 +17,7 @@
 //! - `MONMSG MSGID EXEC` after a command, or program-level (right after
 //!   the declarations); generic IDs like `CPF0000` and `CPF9800`
 //! - `SNDPGMMSG` (MSG, MSGID/MSGDTA, MSGTYPE *INFO *COMP *DIAG *ESCAPE),
-//!   `CHKOBJ`, `RTVJOBA` (USER, CURLIB, TYPE)
+//!   `CHKOBJ`, `RTVJOBA` (USER, CURLIB, TYPE), `RTVDTAARA`
 //! - `CALL PGM PARM` (CL programs here, others through the RPG runner)
 //! - any other command the job knows, with `&variables` replaced by
 //!   their values
@@ -1712,6 +1712,51 @@ async fn command(
                     .ok_or_else(|| anyhow!("CPD0727: Variable {name} is not declared."))?;
                 assign(&name, var, v)?;
             }
+            Ok(None)
+        }
+        "RTVDTAARA" => {
+            let p = named(st, &["DTAARA", "RTNVAR"])?;
+            let raw = substitute_text(
+                p.get("DTAARA")
+                    .ok_or_else(|| anyhow!("line {}: RTVDTAARA needs DTAARA", st.line))?,
+                vars,
+            )?;
+            let (qualified, part) = crate::dtaara::split_dtaara_param(&raw)?;
+            let d = crate::dtaara::resolve(
+                job.client,
+                &qualified,
+                &job.library_list(),
+                &job.current_library(),
+            )
+            .await?;
+            let target = p
+                .get("RTNVAR")
+                .ok_or_else(|| anyhow!("line {}: RTVDTAARA needs RTNVAR", st.line))?
+                .trim()
+                .to_ascii_uppercase();
+            let var = vars
+                .get_mut(&target)
+                .ok_or_else(|| anyhow!("CPD0727: Variable {target} is not declared."))?;
+            // The variable's type must suit the data area's: a *DEC data
+            // area goes to a *DEC variable, *CHAR and *LGL to *CHAR or *LGL.
+            let v = match (d.ty, var.ty) {
+                (crate::dtaara::Type::Dec, VarType::Dec) => {
+                    Value::Dec(Decimal::from_str(&d.value).map_err(|e| anyhow!("{e}"))?)
+                }
+                (crate::dtaara::Type::Dec, _) => bail!(
+                    "Data area {} is *DEC; RTNVAR({target}) must be a *DEC variable.",
+                    d.name
+                ),
+                (_, VarType::Char) | (crate::dtaara::Type::Lgl, VarType::Lgl) => {
+                    Value::Char(d.substring(part)?)
+                }
+                _ => bail!(
+                    "Data area {} is {}; RTNVAR({target}) must be a *CHAR variable.",
+                    d.name,
+                    d.ty.code()
+                ),
+            };
+            assign(&target, var, v)?;
             Ok(None)
         }
         "CALL" => {

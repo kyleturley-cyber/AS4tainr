@@ -1,0 +1,37 @@
+/* ORDENTC: start order entry (sample CL program).                    */
+/* Checks the files, creates the next-order-number data area the     */
+/* first time, calls the RPG program ORDENT and says what the next   */
+/* order number will be.                                             */
+PGM
+  DCL VAR(&NEXT) TYPE(*DEC) LEN(7 0)
+  DCL VAR(&FILE) TYPE(*CHAR) LEN(10)
+
+  CHGVAR VAR(&FILE) VALUE('CUSTMAST')
+  CHKOBJ OBJ(CUSTMAST) OBJTYPE(*FILE)
+  MONMSG MSGID(CPF9801) EXEC(GOTO CMDLBL(MISSING))
+  CHGVAR VAR(&FILE) VALUE('ITEMMAST')
+  CHKOBJ OBJ(ITEMMAST) OBJTYPE(*FILE)
+  MONMSG MSGID(CPF9801) EXEC(GOTO CMDLBL(MISSING))
+  CHGVAR VAR(&FILE) VALUE('ORDHDR')
+  CHKOBJ OBJ(ORDHDR) OBJTYPE(*FILE)
+  MONMSG MSGID(CPF9801) EXEC(GOTO CMDLBL(MISSING))
+  CHGVAR VAR(&FILE) VALUE('ORDLIN')
+  CHKOBJ OBJ(ORDLIN) OBJTYPE(*FILE)
+  MONMSG MSGID(CPF9801) EXEC(GOTO CMDLBL(MISSING))
+
+  /* The first order number after the sample orders is 1004. */
+  CHKOBJ OBJ(ORDNXT) OBJTYPE(*DTAARA)
+  MONMSG MSGID(CPF9801) EXEC(CRTDTAARA DTAARA(*CURLIB/ORDNXT) +
+           TYPE(*DEC) LEN(7 0) VALUE(1004) TEXT('Next order number'))
+
+  CALL PGM(ORDENT)
+
+  RTVDTAARA DTAARA(ORDNXT) RTNVAR(&NEXT)
+  SNDPGMMSG MSG('Order entry ended. The next order number is' +
+                *BCAT %CHAR(&NEXT) *TCAT '.') MSGTYPE(*COMP)
+  RETURN
+
+MISSING:
+  SNDPGMMSG MSG('Order entry cannot start: file' *BCAT &FILE *BCAT +
+                'is missing.') MSGTYPE(*ESCAPE)
+ENDPGM

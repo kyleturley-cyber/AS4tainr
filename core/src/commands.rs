@@ -8,6 +8,7 @@ use tokio_postgres::Client;
 use crate::bridge;
 use crate::catalog;
 use crate::cl::{self, Command};
+use crate::dtaara;
 use crate::users;
 
 /// Settings that come from the server, not from the job.
@@ -125,6 +126,10 @@ impl Job<'_> {
             "RUNSQL" => self.runsql(&cmd).await,
             "WRKOBJ" => self.wrkobj(&cmd).await,
             "DSPPFM" => self.dsppfm(&cmd).await,
+            "CRTDTAARA" => self.crtdtaara(&cmd).await,
+            "CHGDTAARA" => self.chgdtaara(&cmd).await,
+            "DSPDTAARA" => self.dspdtaara(&cmd).await,
+            "DLTDTAARA" => self.dltdtaara(&cmd).await,
             "SIGNOFF" => Ok(Outcome::SignOff),
             other => bail!("CPD0030: Command {other} is not implemented yet."),
         }
@@ -530,6 +535,115 @@ impl Job<'_> {
         }))
     }
 
+    async fn crtdtaara(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = match cmd.get("DTAARA").split_once('/') {
+            Some(("*CURLIB", n)) => (self.current_library(), n.to_string()),
+            Some((l, n)) => (l.to_string(), n.to_string()),
+            None => (self.current_library(), cmd.get("DTAARA").to_string()),
+        };
+        let ty = dtaara::Type::parse(cmd.get("TYPE"))?;
+        let len = cmd.list("LEN");
+        let (length, decimals) = match len.as_slice() {
+            [d] if d == "*DFT" => ty.default_length(),
+            [l] => (number(l, "LEN")?, 0),
+            [l, d] => (number(l, "LEN")?, number(d, "LEN")?),
+            _ => bail!("LEN takes a length, and for *DEC a number of decimal positions."),
+        };
+        let value = match cmd.get("VALUE") {
+            "*DFT" => "",
+            v => v,
+        };
+        let d = dtaara::create(
+            self.client,
+            &lib,
+            &name,
+            ty,
+            length,
+            decimals,
+            value,
+            cmd.get("TEXT"),
+        )
+        .await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Data area {} created in library {}.",
+            d.name, d.library
+        )]))
+    }
+
+    async fn chgdtaara(&mut self, cmd: &Command) -> Result<Outcome> {
+        let vals = cmd.list("DTAARA");
+        let (name, part) = match vals.as_slice() {
+            [n] => (n.clone(), None),
+            [n, p] => {
+                let inner = p.trim_start_matches('(').trim_end_matches(')');
+                (n.clone(), dtaara::parse_substring(inner)?)
+            }
+            _ => bail!("DTAARA takes a data area name and, optionally, (start length)."),
+        };
+        let d = dtaara::change(
+            self.client,
+            &name,
+            &self.library_list(),
+            &self.current_library(),
+            part,
+            cmd.get("VALUE"),
+        )
+        .await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Data area {} in {} changed.",
+            d.name, d.library
+        )]))
+    }
+
+    async fn dspdtaara(&mut self, cmd: &Command) -> Result<Outcome> {
+        let d = dtaara::resolve(
+            self.client,
+            cmd.get("DTAARA"),
+            &self.library_list(),
+            &self.current_library(),
+        )
+        .await?;
+        // Character values a line of 50 at a time, with their offsets.
+        let rows: Vec<String> = match d.ty {
+            dtaara::Type::Char => d
+                .value
+                .chars()
+                .collect::<Vec<_>>()
+                .chunks(50)
+                .enumerate()
+                .map(|(i, c)| format!("{:>6}   '{}'", i * 50, c.iter().collect::<String>()))
+                .collect(),
+            _ => vec![format!("{:>6}   {}", 0, d.value)],
+        };
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display Data Area".into(),
+            info: vec![
+                ("Data area".into(), d.name.clone()),
+                ("Library".into(), d.library.clone()),
+                ("Type".into(), d.ty.code().into()),
+                ("Length".into(), d.length_text()),
+                ("Text".into(), d.text.clone()),
+            ],
+            heading: format!("{:>6}   {}", "Offset", "Value"),
+            rows,
+            ..Default::default()
+        }))
+    }
+
+    async fn dltdtaara(&mut self, cmd: &Command) -> Result<Outcome> {
+        let d = dtaara::delete(
+            self.client,
+            cmd.get("DTAARA"),
+            &self.library_list(),
+            &self.current_library(),
+        )
+        .await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Data area {} deleted from library {}.",
+            d.name, d.library
+        )]))
+    }
+
     /// CALL: run an RPG program on the runner, with file I/O through a
     /// bridge that uses this job's library list. DSPLY lines come back as
     /// messages.
@@ -638,4 +752,11 @@ impl Job<'_> {
         }
         Ok(Outcome::Messages(msgs))
     }
+}
+
+/// A whole number in a command parameter.
+fn number(s: &str, keyword: &str) -> Result<u32> {
+    s.trim().parse().map_err(|_| {
+        anyhow!("CPF0006: Errors occurred in command. {keyword} value '{s}' is not a number.")
+    })
 }

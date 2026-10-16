@@ -7,6 +7,7 @@
 
 use crate::catalog;
 use crate::dspf;
+use crate::dtaara;
 use crate::rla::{OpenFile, ReadResult, Record};
 use crate::workstn::{Frame, Workstation};
 use anyhow::{anyhow, bail, Result};
@@ -18,7 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_postgres::{Client, NoTls};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Clone, Debug)]
 pub struct BridgeConfig {
@@ -64,6 +65,15 @@ struct Request {
     /// Subfile operations: relative record number.
     #[serde(default)]
     rrn: Option<i64>,
+    /// Data areas: the name (from `*DTAARA DEFINE`).
+    #[serde(default)]
+    name: Option<String>,
+    /// Data areas: the value to write.
+    #[serde(default)]
+    value: Option<String>,
+    /// Data areas: `IN *LOCK`.
+    #[serde(default)]
+    lock: Option<bool>,
 }
 
 struct Session {
@@ -75,6 +85,8 @@ struct Session {
     displays: HashMap<String, Arc<dspf::DisplayFile>>,
     files: HashMap<u32, OpenFile>,
     next_handle: u32,
+    /// Data areas this session holds under `*LOCK` (library/name).
+    locked: Vec<(String, String)>,
 }
 
 fn indicators(s: Option<String>) -> [bool; 100] {
@@ -288,6 +300,54 @@ impl Session {
                     }),
                 }
             }
+            "dtaara_in" | "dtaara_out" | "dtaara_unlock" => {
+                let name = req.name.ok_or_else(|| anyhow!("missing 'name'"))?;
+                // RPG names a data area without a library (factor 2 of
+                // DEFINE), so only the library list matters here.
+                let libl = &self.config.library_list;
+                let cur = crate::commands::DEFAULT_CURRENT_LIBRARY;
+                match req.op.as_str() {
+                    "dtaara_in" => {
+                        let lock = req.lock.unwrap_or(false);
+                        let key_of = |d: &dtaara::DataArea| (d.library.clone(), d.name.clone());
+                        let held = {
+                            let d = dtaara::resolve(&self.client, &name, libl, cur).await?;
+                            self.locked.contains(&key_of(&d))
+                        };
+                        // A lock this session already holds is not taken again.
+                        let d = dtaara::read(&self.client, &name, libl, cur, lock && !held).await?;
+                        if lock && !held {
+                            self.locked.push(key_of(&d));
+                        }
+                        Ok(json!({
+                            "library": d.library,
+                            "name": d.name,
+                            "type": d.ty.code(),
+                            "length": d.length,
+                            "decimals": d.decimals,
+                            "value": d.value,
+                        }))
+                    }
+                    "dtaara_out" => {
+                        let value = req.value.ok_or_else(|| anyhow!("missing 'value'"))?;
+                        let d = dtaara::resolve(&self.client, &name, libl, cur).await?;
+                        let key = (d.library.clone(), d.name.clone());
+                        let held = self.locked.contains(&key);
+                        dtaara::write(&self.client, &d, &value, held).await?;
+                        self.locked.retain(|k| *k != key);
+                        Ok(json!({}))
+                    }
+                    _ => {
+                        let d = dtaara::resolve(&self.client, &name, libl, cur).await?;
+                        let key = (d.library.clone(), d.name.clone());
+                        if self.locked.contains(&key) {
+                            dtaara::unlock(&self.client, &d).await?;
+                            self.locked.retain(|k| *k != key);
+                        }
+                        Ok(json!({}))
+                    }
+                }
+            }
             other => Err(anyhow!("unknown op '{other}'")),
         }
     }
@@ -316,6 +376,7 @@ async fn handle_conn(
         displays: HashMap::new(),
         files: HashMap::new(),
         next_handle: 1,
+        locked: Vec::new(),
     };
     let (rd, mut wr) = stream.into_split();
     let mut lines = BufReader::new(rd).lines();

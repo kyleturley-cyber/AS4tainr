@@ -29,6 +29,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/cl.rs` | CL parser and the command definition table (add new commands here first) |
 | `core/src/commands.rs` | CL command implementations for a job |
 | `core/src/clpgm.rs` | CL programs: parse/check (CRTBNDCL), expressions (exact decimals), run in the calling job with MONMSG |
+| `core/src/dtaara.rs` | Data areas: CRTDTAARA/CHGDTAARA/RTVDTAARA values, RPG `IN *LOCK`/`OUT` (PostgreSQL advisory locks) |
 | `core/src/users.rs` | User profiles, Argon2id password hashes |
 | `core/src/main.rs` | `ibmish` CLI |
 | `core/tests/rla_test.rs` | Integration tests (need `IBMISH_TEST_DATABASE_URL`) |
@@ -37,7 +38,8 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `jvm/src/main/kotlin/io/ibmish/jvm` | reload `DBMManager`/`DBFile` adapter (database I/O through the bridge) |
 | `jvm/src/test/java/.../BridgeConformance.java` | JDK-only stand-in runner used for end-to-end tests without Maven |
 | `tools/tn5250_driver.py`, `tools/e2e_5250.py` | Drive the real tn5250 client for end-to-end tests |
-| `samples/` | DDS, CSV data, RPG programs, golden outputs in `expected/` |
+| `samples/` | DDS, CSV data, RPG and CL programs, golden outputs in `expected/`. The order entry app (Phase 2 gate) is described in `docs/order-entry.md` |
+| `scripts/samples.sh` | Creates every sample object in QGPL (used by demo.sh, the Docker entrypoint and CI). Add new sample objects here |
 | `docs/bridge-protocol.md` | Protocol spec. Update it in the same change as the protocol |
 
 ## Commands

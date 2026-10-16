@@ -14,36 +14,15 @@ samples="${IBMISH_SAMPLES:-$here/samples}"
 bin="${IBMISH_BIN:-ibmish}"
 export IBMISH_PGM_PATH="${IBMISH_PGM_PATH:-$samples/qrpglesrc}"
 
-"$bin" init
-
+# The sample files, display files and CL programs (scripts/samples.sh).
+setup=$(IBMISH_BIN="$bin" IBMISH_SAMPLES="$samples" "$(dirname "$0")/samples.sh")
+echo "$setup"
 fresh=0
-for f in CUSTMAST ORDLIN; do
-  if out=$("$bin" crtpf "QGPL/$f" --src "$samples/qddssrc/$f.pf" 2>&1); then
-    echo "$out"
-    "$bin" load "$f" --csv "$samples/data/$f.csv"
-    fresh=1
-  elif grep -q CPF7302 <<<"$out"; then
-    echo "File $f already exists; keeping its data."
-  else
-    echo "$out" >&2
-    exit 1
-  fi
-done
-
-# Logical files over CUSTMAST (created once, like the physical files).
-for l in CUSTNAME CUSTOWE; do
-  if out=$("$bin" crtlf "QGPL/$l" --src "$samples/qddssrc/$l.lf" 2>&1); then
-    echo "$out"
-  elif grep -q CPF7302 <<<"$out"; then
-    echo "File $l already exists."
-  else
-    echo "$out" >&2
-    exit 1
-  fi
-done
-
-# The sample CL program (CRTBNDCL replaces it each time).
-"$bin" crtbndcl QGPL/CUSTRPT --src "$samples/qclsrc/CUSTRPT.clle" --text 'Customer report driver'
+if grep -qx "Loaded CUSTMAST" <<<"$setup"; then
+  fresh=1
+else
+  echo "File CUSTMAST already existed; keeping its data."
+fi
 
 status=0
 run() {

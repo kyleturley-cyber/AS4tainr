@@ -19,7 +19,7 @@ import java.util.Map;
  * See docs/bridge-protocol.md.
  */
 public final class BridgeClient implements AutoCloseable {
-    public static final int PROTOCOL_VERSION = 2;
+    public static final int PROTOCOL_VERSION = 3;
 
     private final Socket socket;
     private final BufferedReader in;
@@ -237,6 +237,35 @@ public final class BridgeClient implements AutoCloseable {
         m.put("format", format);
         m.put("fields", fields);
         m.put("indicators", indicators);
+        call(m);
+    }
+
+    /**
+     * IN: read a data area found through the library list. With {@code lock}
+     * (IN *LOCK) this session holds the data area until {@link #dataAreaOut}
+     * or {@link #dataAreaUnlock}, or until the connection closes.
+     *
+     * @return library, name, type (*CHAR, *DEC, *LGL), length, decimals, value
+     */
+    public Map<String, Object> dataAreaIn(String name, boolean lock) {
+        Map<String, Object> m = req("dtaara_in");
+        m.put("name", name);
+        m.put("lock", lock);
+        return call(m);
+    }
+
+    /** OUT: write a data area's whole value (decimal text for *DEC); releases this session's lock. */
+    public void dataAreaOut(String name, String value) {
+        Map<String, Object> m = req("dtaara_out");
+        m.put("name", name);
+        m.put("value", value);
+        call(m);
+    }
+
+    /** UNLOCK: release a lock taken with IN *LOCK, without writing. */
+    public void dataAreaUnlock(String name) {
+        Map<String, Object> m = req("dtaara_unlock");
+        m.put("name", name);
         call(m);
     }
 

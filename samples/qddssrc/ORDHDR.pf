@@ -1,0 +1,10 @@
+     A* Order header, keyed by order number (lines are in ORDLIN)
+     A                                      UNIQUE
+     A          R ORDHDRR                   TEXT('Order header')
+     A            ORDNO          7P 0       TEXT('Order number')
+     A            CUSNO          5P 0       TEXT('Customer number')
+     A            ORDDAT         8S 0       TEXT('Order date YYYYMMDD')
+     A            ORDLNS         3P 0       TEXT('Number of lines')
+     A            ORDTOT         9P 2       TEXT('Order total')
+     A            ORDSTS         1A         TEXT('Status: O=open')
+     A          K ORDNO

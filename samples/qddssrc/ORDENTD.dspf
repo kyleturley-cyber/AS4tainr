@@ -1,0 +1,69 @@
+     A* ORDENTD: order entry (sample). CUSPRMT asks for a customer;
+     A* ORDCTL/ORDSFL take the order lines (an input subfile of 20
+     A* lines, 10 a page); ORDFTR shows the total and the keys.
+     A                                      DSPSIZ(24 80 *DS3)
+     A                                      CA03(03 'Exit')
+     A          R CUSPRMT
+     A                                  1  2SYSNAME
+     A                                  1 35'Order Entry'
+     A                                      DSPATR(HI)
+     A                                  1 72DATE
+     A                                  3  2'Type a customer number, press Enter.'
+     A                                  5  4'Customer number . . . .'
+     A            CUSNUM         5Y 0B  5 29EDTCDE(Z)
+     A  30                                  ERRMSG('Customer not found.' 30)
+     A  35                                  ERRMSG('Type a customer number.' 35)
+     A  60                             21  2'Order'
+     A  60        LSTORD         7Y 0O 21  8EDTCDE(Z)
+     A  60                             21 16'created, total'
+     A  60        LSTTOT         9Y 2O 21 31EDTCDE(J)
+     A                                 23  2'F3=Exit'
+     A                                      COLOR(BLU)
+     A          R ORDSFL                    SFL
+     A            ITEM          15A  B  9  2
+     A  51                                  DSPATR(RI PC)
+     A            QTY            5Y 0B  9 19EDTCDE(Z)
+     A  52                                  DSPATR(RI PC)
+     A            ITMDSC        30A  O  9 26
+     A            PRICE          7Y 2O  9 57EDTCDE(2)
+     A            AMOUNT         9Y 2O  9 67EDTCDE(2)
+     A          R ORDCTL                    SFLCTL(ORDSFL)
+     A                                      SFLSIZ(0020)
+     A                                      SFLPAG(0010)
+     A                                      CF06(06 'Create order')
+     A                                      CA12(12 'Cancel')
+     A                                      OVERLAY
+     A  31                                  SFLDSP
+     A                                      SFLDSPCTL
+     A  32                                  SFLCLR
+     A  33                                  SFLEND(*MORE)
+     A  40                                  SFLMSG('Item not found.' 40)
+     A  41                                  SFLMSG('Quantity must be more than zero.' 41)
+     A  42                                  SFLMSG('Type at least one item and quantity.' 42)
+     A                                  1  2SYSNAME
+     A                                  1 35'Order Entry'
+     A                                      DSPATR(HI)
+     A                                  1 72DATE
+     A                                  3  2'Customer  . . :'
+     A            CUSNUM         5Y 0O  3 18EDTCDE(Z)
+     A            CUSNAM        30A  O  3 25
+     A                                  4  2'City  . . . . :'
+     A            CUSCTY        20A  O  4 18
+     A                                  6  2'Type items and quantities, press Enter to check them.'
+     A                                      COLOR(BLU)
+     A                                  8  2'Item'
+     A                                      DSPATR(HI)
+     A                                  8 21'Qty'
+     A                                      DSPATR(HI)
+     A                                  8 26'Description'
+     A                                      DSPATR(HI)
+     A                                  8 61'Price'
+     A                                      DSPATR(HI)
+     A                                  8 73'Amount'
+     A                                      DSPATR(HI)
+     A          R ORDFTR
+     A                                      OVERLAY
+     A                                 21 46'Order total . . :'
+     A            ORDTOT         9Y 2O 21 66EDTCDE(J)
+     A                                 23  2'F3=Exit   F6=Create order   F12=Cancel'
+     A                                      COLOR(BLU)

@@ -14,6 +14,7 @@ import com.smeup.rpgparser.execution.RunnerKt;
 import com.smeup.rpgparser.interpreter.BooleanValue;
 import com.smeup.rpgparser.interpreter.DbField;
 import com.smeup.rpgparser.interpreter.DecimalValue;
+import com.smeup.rpgparser.interpreter.FeatureFlag;
 import com.smeup.rpgparser.interpreter.FileMetadata;
 import com.smeup.rpgparser.interpreter.NumberType;
 import com.smeup.rpgparser.interpreter.NumberValue;
@@ -109,6 +110,18 @@ public final class Runner {
                         : fileMetadata(bridge.metadata(dbFile))));
         configuration.setDspfConfig(new DspfConfig(displays::metadata, displays::dspf));
         configuration.getJarikoCallback().setOnExfmt(displays::exfmt);
+        // Jariko's CHAIN cache answers a repeated CHAIN from memory. On IBM i
+        // every CHAIN reads the file: it sees other jobs' changes and makes
+        // the record found the one UPDATE and DELETE work on. With the cache,
+        // CHAIN A, CHAIN B, CHAIN A, UPDATE updates B. So it is off.
+        configuration.getJarikoCallback().setFeatureFlagIsOn(
+                flag -> flag != FeatureFlag.ChainCacheFlag && flag.getOn());
+        DataAreas dataAreas = new DataAreas(bridge);
+        configuration.getJarikoCallback().setReadDataArea(dataAreas::in);
+        configuration.getJarikoCallback().setWriteDataArea((name, value) -> {
+            dataAreas.out(name);
+            return kotlin.Unit.INSTANCE;
+        });
 
         try {
             RunnerKt.executePgmWithStringArgs(program, parms, null, finders, configuration);
@@ -149,6 +162,63 @@ public final class Runner {
                 (String) md.get("format"),
                 fields,
                 (List<String>) md.get("keys"));
+    }
+
+    /**
+     * Data areas (*DTAARA DEFINE, IN, OUT) through the bridge. Jariko hands
+     * over only the data area's name and expects text back; ibmish sets the
+     * program's field itself instead, so a numeric field gets the *DEC value
+     * as a number (not as a byte image), and OUT sends a number as decimal
+     * text.
+     */
+    static final class DataAreas {
+        private final BridgeClient bridge;
+
+        DataAreas(BridgeClient bridge) {
+            this.bridge = bridge;
+        }
+
+        private static com.smeup.rpgparser.interpreter.InterpreterCore core() {
+            return MainExecutionContext.INSTANCE.getProgramStack().peek().getIntepreterCore();
+        }
+
+        /** The program fields DEFINEd for this data area. */
+        private static List<com.smeup.rpgparser.interpreter.AbstractDataDefinition> fields(String name) {
+            com.smeup.rpgparser.interpreter.InterpreterCore core = core();
+            List<com.smeup.rpgparser.interpreter.AbstractDataDefinition> out = new ArrayList<>();
+            for (Map.Entry<String, String> e : core.getStatus().getDataAreas().entrySet()) {
+                if (e.getValue().equalsIgnoreCase(name)) {
+                    com.smeup.rpgparser.interpreter.AbstractDataDefinition d =
+                            core.getGlobalSymbolTable().dataDefinitionByName(e.getKey());
+                    if (d != null) out.add(d);
+                }
+            }
+            if (out.isEmpty()) throw new IllegalStateException("no field is defined for data area " + name);
+            return out;
+        }
+
+        String in(String name, Boolean lock) {
+            Map<String, Object> d = bridge.dataAreaIn(name, Boolean.TRUE.equals(lock));
+            String value = (String) d.get("value");
+            com.smeup.rpgparser.interpreter.InterpreterCore core = core();
+            for (com.smeup.rpgparser.interpreter.AbstractDataDefinition def : fields(name)) {
+                Value v = def.getType() instanceof NumberType
+                        ? new DecimalValue(new BigDecimal("*DEC".equals(d.get("type")) ? value : value.trim()))
+                        : new StringValue(value, false);
+                core.assign(def, v);
+            }
+            return null; // already assigned
+        }
+
+        void out(String name) {
+            com.smeup.rpgparser.interpreter.InterpreterCore core = core();
+            com.smeup.rpgparser.interpreter.AbstractDataDefinition def = fields(name).get(0);
+            Value v = core.get(def);
+            String text = v instanceof NumberValue
+                    ? ((NumberValue) v).getBigDecimal().toPlainString()
+                    : v.asString().getValue();
+            bridge.dataAreaOut(name, text);
+        }
     }
 
     /** Display files: their definitions for Jariko, and EXFMT through the bridge. */

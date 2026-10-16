@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends bash diffutils 
 COPY --from=core /src/target/release/ibmish /usr/local/bin/ibmish
 COPY --from=jvm /src/jvm/build/libs/ibmish-jvm.jar /opt/ibmish/ibmish-jvm.jar
 COPY samples /opt/ibmish/samples
-COPY scripts/demo.sh /opt/ibmish/demo.sh
+COPY scripts/demo.sh scripts/samples.sh /opt/ibmish/
 COPY docker/entrypoint.sh /opt/ibmish/entrypoint.sh
 ENV IBMISH_RUNNER="java -jar /opt/ibmish/ibmish-jvm.jar" \
     IBMISH_PGM_PATH=/opt/ibmish/samples/qrpglesrc \

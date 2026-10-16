@@ -84,14 +84,15 @@ def sign_on(t):
     t.wait_for("Sign On")
     t.type("qsecofr"); t.key("Tab"); t.type(PW); t.key("Enter")
     t.ready()  # the screen after this sign-on, not the one before it
-    if "Command Entry" not in t.text():
+    if "Main Menu" not in t.text():
         # Fresh database: the initial password, which has expired.
         t.type("qsecofr"); t.key("Tab"); t.type("QSECOFR"); t.key("Enter")
         t.wait_for("Change Password")
         t.type("QSECOFR"); t.key("Tab"); t.type(PW); t.key("Tab"); t.type(PW); t.key("Enter")
         t.wait_for("Password changed")
         t.type("qsecofr"); t.key("Tab"); t.type(PW); t.key("Enter")
-    t.wait_for("Command Entry")
+    t.wait_for("Main Menu")  # the initial menu
+    t.command("call qcmd", "Command Entry")
 
 
 def fkey_label(page, aid):

@@ -22,7 +22,7 @@ It runs IBM i business applications (RPG, CL, DDS files) on ordinary Linux and c
 - **`core/`**: the Rust core (`ibmish` binary). It holds the object catalog, the DDS parser, record-level access over PostgreSQL, and the bridge server.
 - **`jvm/`**: the JVM side. `io.ibmish.bridge` is a dependency-free Java bridge client. `io.ibmish.jvm` plugs that client into Jariko as a reload `DBMManager` and provides the runner (`ibmish-jvm.jar`).
 - **`samples/`**: DDS sources, CSV data, RPG programs and their expected (golden) output.
-- **`docs/`**: [5250 server](docs/5250-server.md), [browser terminal](docs/web-terminal.md), [display files](docs/display-files.md), [logical files](docs/logical-files.md), [SQL](docs/sql.md), [CL programs](docs/cl-programs.md), [data areas](docs/data-areas.md), [work management](docs/work-management.md), [record locks](docs/record-locks.md), [spooled files](docs/spooled-files.md), [object authority](docs/object-authority.md), [order entry sample](docs/order-entry.md), [bridge protocol](docs/bridge-protocol.md), [known fidelity gaps](docs/fidelity-gaps.md), [spike 01 report](docs/spike-01.md).
+- **`docs/`**: [5250 server](docs/5250-server.md), [browser terminal](docs/web-terminal.md), [display files](docs/display-files.md), [logical files](docs/logical-files.md), [SQL](docs/sql.md), [CL programs](docs/cl-programs.md), [data areas](docs/data-areas.md), [work management](docs/work-management.md), [record locks](docs/record-locks.md), [spooled files](docs/spooled-files.md), [object authority](docs/object-authority.md), [menus](docs/menus.md), [order entry sample](docs/order-entry.md), [bridge protocol](docs/bridge-protocol.md), [known fidelity gaps](docs/fidelity-gaps.md), [spike 01 report](docs/spike-01.md).
 
 ## Quick start (Docker)
 
@@ -30,7 +30,7 @@ It runs IBM i business applications (RPG, CL, DDS files) on ordinary Linux and c
 docker compose up --build
 ```
 
-This starts PostgreSQL and the ibmish 5250 server, with the sample files (`CUSTMAST`, `ITEMMAST`, `ORDHDR`, `ORDLIN`), display files and CL programs in `QGPL` (`scripts/samples.sh`). Open **http://localhost:5250** for a 5250 terminal in your browser, with clickable function keys ([docs/web-terminal.md](docs/web-terminal.md)), or connect a 5250 emulator to **localhost:2323** (tn5250, [tn5250j](https://github.com/tn5250j/tn5250j), or IBM ACS). Sign on as `QSECOFR` with password `QSECOFR`. You will be asked to choose a new password. Then try:
+This starts PostgreSQL and the ibmish 5250 server, with the sample files (`CUSTMAST`, `ITEMMAST`, `ORDHDR`, `ORDLIN`), display files and CL programs in `QGPL` (`scripts/samples.sh`). Open **http://localhost:5250** for a 5250 terminal in your browser, with clickable function keys ([docs/web-terminal.md](docs/web-terminal.md)), or connect a 5250 emulator to **localhost:2323** (tn5250, [tn5250j](https://github.com/tn5250j/tn5250j), or IBM ACS). Sign on as `QSECOFR` with password `QSECOFR`. You will be asked to choose a new password. You land on the main menu ([docs/menus.md](docs/menus.md)): pick an option, or type commands on its command line (option 7 or `CALL QCMD` opens Command Entry). Then try:
 
 ```
 CRTLIB MYLIB TEXT('My first library')
@@ -104,7 +104,7 @@ target/debug/ibmish call SELFTEST --runner "java -cp target/conformance-classes 
 | `ibmish load FILE --csv x.csv` | `CPYFRMIMPF` (roughly) | Writes CSV rows with `WRITE` |
 | `ibmish call PGM [parms]` | `CALL` | Runs an RPG program through the runner |
 | `ibmish serve --port 7250` | | Runs a standalone bridge server |
-| `ibmish tn5250 --listen 0.0.0.0:23` | | Runs the 5250 display server (sign-on, command entry) and the QBATCH subsystem for submitted jobs. `--web-listen 0.0.0.0:8080` also serves the browser 5250 terminal |
+| `ibmish tn5250 --listen 0.0.0.0:23` | | Runs the 5250 display server (sign-on, menus, command entry) and the QBATCH subsystem for submitted jobs. `--web-listen 0.0.0.0:8080` also serves the browser 5250 terminal |
 
 Settings: `IBMISH_DATABASE_URL`, `IBMISH_QSECOFR_PASSWORD` (initial QSECOFR password), `IBMISH_SYSTEM_NAME`, `IBMISH_LIBL` (library list, comma-separated, default `QGPL`), `IBMISH_RUNNER`, `IBMISH_PGM_PATH`.
 

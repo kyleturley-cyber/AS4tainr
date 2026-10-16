@@ -34,6 +34,12 @@ def command(t, cmd, expect, timeout=20):
     return t.wait_for(expect, timeout)
 
 
+def qcmd(t):
+    """From the initial menu (MAIN) to Command Entry, as CALL QCMD does."""
+    t.wait_for("ibmish Main Menu", 30)
+    command(t, "call qcmd", "Command Entry")
+
+
 with Tn5250(HOST) as t:
     t.wait_for("Sign On")
     check("IBMISH" in t.line(2) and "QPADEV" in t.line(4), "sign-on screen shows system and display names", t)
@@ -63,8 +69,14 @@ with Tn5250(HOST) as t:
     # (IBM's shipped value, ibmish's default) passwords are not case
     # sensitive.
     t.type("qsecofr"); t.tab(); t.type("   " + NEWPW.lower()); t.enter()
-    t.wait_for("Command Entry")
-    check("QSECOFR" in t.line(2), "signed on (blanks ignored, password not case sensitive): command entry shows the user", t)
+    # The initial menu: CRTUSRPRF INLMNU is MAIN unless changed (IBM i CL
+    # reference), and QSECOFR is shipped with INLMNU(MAIN).
+    t.wait_for("ibmish Main Menu")
+    check("MAIN" in t.line(1) and "QSECOFR" in t.line(2) and "Selection or command" in t.text()
+          and "90. Sign off" in t.text(),
+          "signed on (blanks ignored, password not case sensitive): the initial menu MAIN is shown", t)
+    command(t, "call qcmd", "Command Entry")
+    check("QSECOFR" in t.line(2), "CALL QCMD from the menu's command line shows Command Entry", t)
 
     command(t, "crtlib mylib text('My first library')", "Library MYLIB created.")
     check("Library MYLIB created." in t.line(24), "CRTLIB creates a library", t)
@@ -351,7 +363,7 @@ with Tn5250(HOST) as t:
     with Tn5250(HOST) as t2:
         t2.wait_for("Sign On")
         t2.type("bob"); t2.tab(); t2.type("secret42"); t2.enter()
-        t2.wait_for("Command Entry")
+        qcmd(t2)
         check("BOB" in t2.line(2), "a second session signs on as BOB while QSECOFR is signed on", t2)
         command(t2, "sbmjob cmd(call pgm(custrpt) parm(L)) job(rpt)", "submitted to job queue QBATCH")
         check("CPC1221" in t2.line(24) and "/BOB/RPT" in t2.line(24),
@@ -458,7 +470,7 @@ with Tn5250(HOST) as t:
 
     # The new user: no *SECADM, so no CRTUSRPRF; CHGPWD shows the screen.
     t.type("bob"); t.tab(); t.type("secret42"); t.enter()
-    t.wait_for("Command Entry")
+    qcmd(t)
     check("BOB" in t.line(2), "the new profile signs on", t)
     command(t, "crtusrprf eve", "Not authorized")
     check("*SECADM" in t.line(24), "CRTUSRPRF needs *SECADM special authority", t)
@@ -469,9 +481,80 @@ with Tn5250(HOST) as t:
     check(True, "CHGPWD shows Change Password; F12 leaves the password as it was", t)
     command(t, "signoff", "Sign On")
     t.type("qsecofr"); t.tab(); t.type(NEWPW); t.enter()
-    t.wait_for("Command Entry")
+    qcmd(t)
     command(t, "dltusrprf bob", "User profile BOB deleted.")
     check(True, "DLTUSRPRF deletes the profile", t)
+
+    # Menus. Expected behavior from IBM's CL reference (GO, CRTMNU,
+    # CRTUSRPRF INLPGM/INLMNU): a menu takes an option number or a command
+    # on its "Selection or command" line; F12 goes back one display, F3
+    # leaves the menus; option 90 signs off; INLPGM runs at sign-on, and
+    # INLMNU(*SIGNOFF) signs off when it ends; ending the initial menu
+    # signs off.
+    command(t, "go main", "ibmish Main Menu")
+    check("Select one of the following:" in t.text() and " 1. User tasks" in t.text(),
+          "GO MAIN shows the main menu from Command Entry", t)
+    command(t, "1", "User Tasks")
+    check("USER" in t.line(1) and "90. Sign off" in t.text(), "option 1 goes to the User Tasks menu (GO USER)", t)
+    command(t, "5", "Display Job Log")
+    t.fkey(3); t.wait_for("User Tasks")
+    check(True, "a menu option runs its command; leaving the display returns to the menu", t)
+    t.fkey(12); t.wait_for("ibmish Main Menu")
+    check(True, "F12 goes back one menu", t)
+    command(t, "99", "not one of the options")
+    check("99" in t.line(24), "a number that is not an option is rejected on the message line", t)
+    command(t, "crtlib menulib", "Library MENULIB created.")
+    check("ibmish Main Menu" in t.text(), "a command typed on a menu's command line runs there, the menu stays", t)
+    command(t, "6", "Go to Menu (GO)")
+    check(True, "option 6 prompts GO (a ? in front of the command prompts it)", t)
+    t.type("security"); t.enter()
+    t.wait_for("Change object owner")
+    check("SECURITY" in t.line(1), "the prompted GO shows the Security menu", t)
+    t.fkey(3); t.wait_for("Command Entry")
+    check(True, "F3 leaves the menus and returns to Command Entry", t)
+
+    # A user menu: CRTMNU TYPE(*PGM), the program shows the menu.
+    command(t, "crtmnu menulib/orders type(*pgm) pgm(qgpl/ordentc) text('Order entry')",
+            "Menu ORDERS created in library MENULIB.")
+    check(True, "CRTMNU TYPE(*PGM) creates a menu", t)
+    command(t, "go menulib/orders", "Customer number", timeout=90)
+    check(True, "GO of a *PGM menu calls its program", t)
+    t.fkey(3); t.wait_for("next order number", 60)
+    check("Command Entry" in t.text(), "when the menu program ends, the display the GO came from returns", t)
+    command(t, "crtmnu menulib/plain", "not supported yet")
+    t.fkey(12)
+
+    # Initial program and initial menu.
+    command(t, "crtusrprf carl password(Menus123) inlpgm(qgpl/ordentc) inlmnu(*signoff)",
+            "User profile CARL created.")
+    command(t, "dspusrprf carl", "Display User Profile")
+    check("QGPL/ORDENTC" in t.text() and "*SIGNOFF" in t.text(),
+          "DSPUSRPRF shows the initial program and the initial menu", t)
+    t.fkey(3); t.wait_for("Command Entry")
+    with Tn5250(HOST) as t2:
+        t2.wait_for("Sign On")
+        t2.type("carl"); t2.tab(); t2.type("menus123"); t2.enter()
+        t2.wait_for("Customer number", 90)
+        check(True, "sign-on runs the initial program (INLPGM)", t2)
+        t2.fkey(3)
+        t2.wait_for("Sign On", 60)
+        check("CARL signed off" in t2.line(24), "INLMNU(*SIGNOFF): the user is signed off when the initial program ends", t2)
+        command(t, "chgusrprf carl inlpgm(*none) inlmnu(security)", "User profile CARL changed.")
+        t2.type("carl"); t2.tab(); t2.type("menus123"); t2.enter()
+        t2.wait_for("Change object owner")
+        check("SECURITY" in t2.line(1), "CHGUSRPRF INLMNU: the next sign-on shows that menu", t2)
+        t2.fkey(3)
+        t2.wait_for("Sign On")
+        check(True, "F3 on the initial menu signs off", t2)
+        t2.type("carl"); t2.tab(); t2.type("menus123"); t2.enter()
+        t2.wait_for("Change object owner")
+        command(t2, "90", "Sign On")
+        check(True, "option 90 signs off", t2)
+    command(t, "dltmnu menulib/orders", "Menu ORDERS deleted from library MENULIB.")
+    command(t, "go menulib/orders", "not found")
+    check(True, "DLTMNU deletes the menu; GO then says it is not found", t)
+    t.fkey(12)
+    command(t, "dltusrprf carl", "User profile CARL deleted.")
     command(t, "signoff", "Sign On")
 
 print(f"\nAll {passed} checks passed.")

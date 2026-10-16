@@ -68,7 +68,8 @@ def sql(stmt):
 def sign_on(t, user, password):
     t.wait_for("Sign On")
     t.type(user); t.tab(); t.type(password); t.enter()
-    t.wait_for("Command Entry", 30)
+    t.wait_for("ibmish Main Menu", 30)  # the initial menu
+    command(t, "call qcmd", "Command Entry")
 
 
 def command(t, cmd, expect, timeout=30):

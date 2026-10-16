@@ -37,7 +37,15 @@ UPDATE ibmish.user_profiles SET usrcls = '*SECOFR' WHERE name = 'QSECOFR' AND us
 -- before ibmish modelled that had QGPL.
 UPDATE ibmish.user_profiles SET curlib = '*CRTDFT'
     WHERE name = 'QSECOFR' AND curlib = 'QGPL';
+-- Initial program and initial menu (CRTUSRPRF INLPGM, INLMNU): what runs
+-- after sign-on. IBM's defaults are *NONE and MAIN.
+ALTER TABLE ibmish.user_profiles ADD COLUMN IF NOT EXISTS inlpgm text NOT NULL DEFAULT '*NONE';
+ALTER TABLE ibmish.user_profiles ADD COLUMN IF NOT EXISTS inlmnu text NOT NULL DEFAULT 'MAIN';
 "#;
+
+/// CRTUSRPRF INLPGM and INLMNU defaults (IBM i CL reference).
+pub const DEFAULT_INLPGM: &str = "*NONE";
+pub const DEFAULT_INLMNU: &str = "MAIN";
 
 /// User classes (CRTUSRPRF USRCLS).
 pub const USER_CLASSES: &[&str] = &["*USER", "*SYSOPR", "*PGMR", "*SECADM", "*SECOFR"];
@@ -86,6 +94,10 @@ pub struct NewProfile {
     pub special: Vec<String>,
     pub curlib: String,
     pub text: String,
+    /// Initial program: *NONE or LIB/NAME (*LIBL/NAME).
+    pub inlpgm: String,
+    /// Initial menu: MAIN, *SIGNOFF or LIB/NAME.
+    pub inlmnu: String,
 }
 
 /// A user profile as DSPUSRPRF shows it.
@@ -99,6 +111,8 @@ pub struct ProfileInfo {
     pub special_auth: Vec<String>,
     pub curlib: String,
     pub text: String,
+    pub inlpgm: String,
+    pub inlmnu: String,
     pub last_signon: Option<String>,
     pub created: String,
 }
@@ -115,6 +129,8 @@ pub struct Profile {
     pub special_auth: Vec<String>,
     pub curlib: String,
     pub text: String,
+    pub inlpgm: String,
+    pub inlmnu: String,
 }
 
 /// The password level (QPWDLVL 0-3) from IBMISH_QPWDLVL; 0 when unset,
@@ -184,6 +200,8 @@ pub async fn init(client: &Client) -> Result<()> {
                 special: class_special_authorities("*SECOFR"),
                 curlib: "*CRTDFT".into(),
                 text: "Security officer".into(),
+                inlpgm: DEFAULT_INLPGM.into(),
+                inlmnu: DEFAULT_INLMNU.into(),
             },
         )
         .await?;
@@ -217,10 +235,12 @@ pub async fn create(client: &Client, p: NewProfile) -> Result<()> {
     let n = client
         .execute(
             "INSERT INTO ibmish.user_profiles
-                (name, password_hash, pwd_expired, special_auth, curlib, text, status, usrcls)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING",
+                (name, password_hash, pwd_expired, special_auth, curlib, text, status, usrcls,
+                 inlpgm, inlmnu)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT DO NOTHING",
             &[
                 &name, &hash, &p.expired, &p.special, &p.curlib, &p.text, &status, &p.usrcls,
+                &p.inlpgm, &p.inlmnu,
             ],
         )
         .await?;
@@ -237,7 +257,8 @@ pub async fn get(client: &Client, name: &str) -> Result<Option<ProfileInfo>> {
         .query_opt(
             "SELECT name, usrcls, status, pwd_expired, password_hash = $2, special_auth, curlib, text,
                     to_char(last_signon AT TIME ZONE 'UTC', 'MM/DD/YY HH24:MI:SS'),
-                    to_char(created AT TIME ZONE 'UTC', 'MM/DD/YY HH24:MI:SS')
+                    to_char(created AT TIME ZONE 'UTC', 'MM/DD/YY HH24:MI:SS'),
+                    inlpgm, inlmnu
              FROM ibmish.user_profiles WHERE name = $1",
             &[&name, &NO_PASSWORD],
         )
@@ -253,6 +274,8 @@ pub async fn get(client: &Client, name: &str) -> Result<Option<ProfileInfo>> {
         text: r.get(7),
         last_signon: r.get(8),
         created: r.get(9),
+        inlpgm: r.get(10),
+        inlmnu: r.get(11),
     }))
 }
 
@@ -267,6 +290,41 @@ pub async fn reset_password(client: &Client, name: &str) -> Result<bool> {
              SET password_hash = $2, pwd_expired = true, status = '*ENABLED'
              WHERE name = $1",
             &[&name, &hash_password(&normalized(&name))?],
+        )
+        .await?
+        > 0)
+}
+
+/// CHGUSRPRF: the attributes to change (None = leave as is).
+#[derive(Debug, Default)]
+pub struct ProfileChanges {
+    pub expired: Option<bool>,
+    pub enabled: Option<bool>,
+    pub curlib: Option<String>,
+    pub text: Option<String>,
+    pub inlpgm: Option<String>,
+    pub inlmnu: Option<String>,
+}
+
+/// CHGUSRPRF. Returns false if the profile does not exist.
+pub async fn change(client: &Client, name: &str, c: &ProfileChanges) -> Result<bool> {
+    let name = name.trim().to_ascii_uppercase();
+    let status = c
+        .enabled
+        .map(|e| if e { "*ENABLED" } else { "*DISABLED" }.to_string());
+    Ok(client
+        .execute(
+            "UPDATE ibmish.user_profiles SET
+                pwd_expired = COALESCE($2, pwd_expired),
+                status = COALESCE($3, status),
+                curlib = COALESCE($4, curlib),
+                text = COALESCE($5, text),
+                inlpgm = COALESCE($6, inlpgm),
+                inlmnu = COALESCE($7, inlmnu)
+             WHERE name = $1",
+            &[
+                &name, &c.expired, &status, &c.curlib, &c.text, &c.inlpgm, &c.inlmnu,
+            ],
         )
         .await?
         > 0)
@@ -312,7 +370,7 @@ pub async fn authenticate(client: &Client, user: &str, password: &str) -> Result
     let user = user.trim().to_ascii_uppercase();
     let row = client
         .query_opt(
-            "SELECT password_hash, pwd_expired, special_auth, curlib, text, status
+            "SELECT password_hash, pwd_expired, special_auth, curlib, text, status, inlpgm, inlmnu
              FROM ibmish.user_profiles WHERE name = $1",
             &[&user],
         )
@@ -356,6 +414,8 @@ pub async fn authenticate(client: &Client, user: &str, password: &str) -> Result
         special_auth: row.get(2),
         curlib: row.get(3),
         text: row.get(4),
+        inlpgm: row.get(6),
+        inlmnu: row.get(7),
     })
 }
 

@@ -711,6 +711,8 @@ async fn user_profiles_create_get_delete() {
         special: users::class_special_authorities("*PGMR"),
         curlib: "QGPL".into(),
         text: "Test profile".into(),
+        inlpgm: users::DEFAULT_INLPGM.into(),
+        inlmnu: users::DEFAULT_INLMNU.into(),
     };
     users::create(&client, new(users::NewPassword::SameAsProfile))
         .await
@@ -767,6 +769,8 @@ async fn passwords_from_before_qpwdlvl_still_work() {
             special: vec![],
             curlib: "QGPL".into(),
             text: String::new(),
+            inlpgm: users::DEFAULT_INLPGM.into(),
+            inlmnu: users::DEFAULT_INLMNU.into(),
         },
     )
     .await
@@ -2166,6 +2170,8 @@ async fn object_authority() {
             special: vec![],
             curlib: "*CRTDFT".into(),
             text: String::new(),
+            inlpgm: users::DEFAULT_INLPGM.into(),
+            inlmnu: users::DEFAULT_INLMNU.into(),
         },
     )
     .await
@@ -2328,4 +2334,103 @@ async fn object_authority() {
     server.abort();
     jobs::end(&client, &id, true).await.unwrap();
     users::delete(&client, &bob).await.unwrap();
+}
+
+/// Menus and the user profile's initial program and menu. Expected values
+/// from IBM's CL reference: CRTUSRPRF INLPGM defaults to *NONE and INLMNU
+/// to MAIN; GO needs *USE authority to the menu; CRTMNU PGM(*MENU) is a
+/// program with the menu's name; CALL QCMD is the command entry display.
+#[tokio::test]
+async fn menus_and_initial_menu() {
+    use ibmish_core::commands::{Environment, Job, Outcome};
+    use ibmish_core::{menus, users};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let user = format!("M{}", &lib[1..]);
+    let _ = users::delete(&client, &user).await;
+    let env = Environment {
+        database_url: url.clone(),
+        runner: "false".into(),
+        call_timeout: std::time::Duration::from_secs(5),
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let mut sec = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: Some(tx.clone()),
+        id: None,
+    };
+
+    sec.run(&format!("CRTUSRPRF {user} PASSWORD(*NONE)"))
+        .await
+        .unwrap();
+    let p = users::get(&client, &user).await.unwrap().unwrap();
+    assert_eq!((p.inlpgm.as_str(), p.inlmnu.as_str()), ("*NONE", "MAIN"));
+    sec.run(&format!(
+        "CHGUSRPRF {user} INLPGM({lib}/START) INLMNU(*SIGNOFF)"
+    ))
+    .await
+    .unwrap();
+    let p = users::get(&client, &user).await.unwrap().unwrap();
+    assert_eq!(p.inlpgm, format!("{lib}/START"));
+    assert_eq!(p.inlmnu, "*SIGNOFF");
+    assert_eq!(p.curlib, "*CRTDFT", "*SAME leaves the rest as it was");
+
+    // GO MAIN: a system menu, from any library list.
+    match sec.run("GO MAIN").await.unwrap() {
+        Outcome::Menu(menus::Menu::Builtin(m)) => assert_eq!(m.name, "MAIN"),
+        _ => panic!("GO MAIN should show the main menu"),
+    }
+    assert!(matches!(
+        sec.run("CALL QCMD").await.unwrap(),
+        Outcome::CommandEntry
+    ));
+
+    // A *PGM menu.
+    let e = sec.run("CRTMNU ORDERS").await.unwrap_err().to_string();
+    assert!(e.contains("not supported"), "{e}");
+    sec.run("CRTMNU ORDERS TYPE(*PGM)").await.unwrap();
+    match sec.run("GO ORDERS").await.unwrap() {
+        Outcome::Menu(menus::Menu::Program { program, .. }) => {
+            assert_eq!(program, format!("{lib}/ORDERS"))
+        }
+        _ => panic!("GO of a *PGM menu"),
+    }
+    // GO needs *USE to the menu.
+    sec.run(&format!(
+        "GRTOBJAUT ORDERS *MENU USER({user}) AUT(*EXCLUDE)"
+    ))
+    .await
+    .unwrap();
+    let mut u = Job {
+        client: &client,
+        env: &env,
+        user: user.clone(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: Some(tx.clone()),
+        id: None,
+    };
+    let e = u.run("GO ORDERS").await.unwrap_err().to_string();
+    assert!(e.starts_with("CPF9802"), "{e}");
+    // A batch job cannot show a menu.
+    let mut batch = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+    };
+    assert!(batch.run("GO MAIN").await.is_err());
+    assert!(batch.run("CALL QCMD").await.is_err());
+
+    sec.run("DLTMNU ORDERS").await.unwrap();
+    let e = sec.run("GO ORDERS").await.unwrap_err().to_string();
+    assert!(e.contains("not found"), "{e}");
+    users::delete(&client, &user).await.unwrap();
 }

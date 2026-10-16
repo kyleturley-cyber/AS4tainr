@@ -168,7 +168,7 @@ pub static COMMANDS: &[CommandDef] = &[
         name: "CALL",
         description: "Call Program",
         params: &[
-            p("PGM", Kind::Name, true, None, "Program").ch("Name"),
+            p("PGM", Kind::Qualified, true, None, "Program").ch("Name"),
             p("PARM", Kind::List, false, None, "Parameters"),
         ],
     },
@@ -224,7 +224,99 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*USRCLS, *NONE...")
             .keyword_only(),
+            p(
+                "INLPGM",
+                Kind::Qualified,
+                false,
+                Some("*NONE"),
+                "Initial program to call",
+            )
+            .ch("Name, *NONE")
+            .keyword_only(),
+            p(
+                "INLMNU",
+                Kind::Qualified,
+                false,
+                Some("MAIN"),
+                "Initial menu",
+            )
+            .ch("Name, MAIN, *SIGNOFF")
+            .keyword_only(),
         ],
+    },
+    CommandDef {
+        name: "CHGUSRPRF",
+        description: "Change User Profile",
+        params: &[
+            p("USRPRF", Kind::Name, true, None, "User profile").ch("Name"),
+            p(
+                "PWDEXP",
+                Kind::Name,
+                false,
+                Some("*SAME"),
+                "Set password to expired",
+            )
+            .ch("*SAME, *NO, *YES")
+            .keyword_only(),
+            p("STATUS", Kind::Name, false, Some("*SAME"), "Status")
+                .ch("*SAME, *ENABLED, *DISABLED")
+                .keyword_only(),
+            p(
+                "CURLIB",
+                Kind::Name,
+                false,
+                Some("*SAME"),
+                "Current library",
+            )
+            .ch("Name, *SAME, *CRTDFT")
+            .keyword_only(),
+            p(
+                "INLPGM",
+                Kind::Qualified,
+                false,
+                Some("*SAME"),
+                "Initial program to call",
+            )
+            .ch("Name, *SAME, *NONE")
+            .keyword_only(),
+            p(
+                "INLMNU",
+                Kind::Qualified,
+                false,
+                Some("*SAME"),
+                "Initial menu",
+            )
+            .ch("Name, *SAME, MAIN, *SIGNOFF")
+            .keyword_only(),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*SAME"),
+                "Text 'description'",
+            )
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "GO",
+        description: "Go to Menu",
+        params: &[p("MENU", Kind::Qualified, true, None, "Menu").ch("Name, MAIN")],
+    },
+    CommandDef {
+        name: "CRTMNU",
+        description: "Create Menu",
+        params: &[
+            p("MENU", Kind::Qualified, true, None, "Menu").ch("Name"),
+            p("TYPE", Kind::Name, false, Some("*DSPF"), "Menu type").ch("*DSPF, *PGM, *UIM"),
+            p("PGM", Kind::Qualified, false, Some("*MENU"), "Program").ch("Name, *MENU"),
+            p("TEXT", Kind::Text, false, Some(""), "Text 'description'").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "DLTMNU",
+        description: "Delete Menu",
+        params: &[p("MENU", Kind::Qualified, true, None, "Menu").ch("Name")],
     },
     CommandDef {
         name: "DSPUSRPRF",
@@ -247,7 +339,7 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[
             p("OBJ", Kind::Qualified, true, None, "Object").ch("Name, generic*, *ALL"),
             p("OBJTYPE", Kind::Name, false, Some("*ALL"), "Object type")
-                .ch("*ALL, *LIB, *FILE, *PGM, *DTAARA"),
+                .ch("*ALL, *LIB, *FILE, *PGM, *DTAARA, *MENU"),
         ],
     },
     CommandDef {
@@ -359,7 +451,8 @@ pub static COMMANDS: &[CommandDef] = &[
         description: "Grant Object Authority",
         params: &[
             p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
-            p("OBJTYPE", Kind::Name, true, None, "Object type").ch("*FILE, *PGM, *DTAARA, *LIB"),
+            p("OBJTYPE", Kind::Name, true, None, "Object type")
+                .ch("*FILE, *PGM, *DTAARA, *MENU, *LIB"),
             p("USER", Kind::List, true, None, "Users").ch("Name, *PUBLIC"),
             p("AUT", Kind::Name, false, Some("*CHANGE"), "Authority")
                 .ch("*CHANGE, *ALL, *USE, *EXCLUDE"),
@@ -370,7 +463,8 @@ pub static COMMANDS: &[CommandDef] = &[
         description: "Revoke Object Authority",
         params: &[
             p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
-            p("OBJTYPE", Kind::Name, true, None, "Object type").ch("*FILE, *PGM, *DTAARA, *LIB"),
+            p("OBJTYPE", Kind::Name, true, None, "Object type")
+                .ch("*FILE, *PGM, *DTAARA, *MENU, *LIB"),
             p("USER", Kind::List, true, None, "Users").ch("Name, *PUBLIC"),
             p("AUT", Kind::Name, false, Some("*CHANGE"), "Authority").ch("*CHANGE, *ALL, *USE"),
         ],
@@ -380,7 +474,8 @@ pub static COMMANDS: &[CommandDef] = &[
         description: "Display Object Authority",
         params: &[
             p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
-            p("OBJTYPE", Kind::Name, true, None, "Object type").ch("*FILE, *PGM, *DTAARA, *LIB"),
+            p("OBJTYPE", Kind::Name, true, None, "Object type")
+                .ch("*FILE, *PGM, *DTAARA, *MENU, *LIB"),
         ],
     },
     CommandDef {
@@ -388,7 +483,8 @@ pub static COMMANDS: &[CommandDef] = &[
         description: "Change Object Owner",
         params: &[
             p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
-            p("OBJTYPE", Kind::Name, true, None, "Object type").ch("*FILE, *PGM, *DTAARA, *LIB"),
+            p("OBJTYPE", Kind::Name, true, None, "Object type")
+                .ch("*FILE, *PGM, *DTAARA, *MENU, *LIB"),
             p("NEWOWN", Kind::Name, true, None, "New owner").ch("Name"),
         ],
     },
@@ -465,7 +561,7 @@ pub static GROUPS: &[Group] = &[
     Group {
         item: "User profile commands",
         title: "User Profile Commands",
-        commands: &["CRTUSRPRF", "DSPUSRPRF", "DLTUSRPRF", "CHGPWD"],
+        commands: &["CRTUSRPRF", "DSPUSRPRF", "DLTUSRPRF", "CHGPWD", "CHGUSRPRF"],
     },
     Group {
         item: "Security commands",
@@ -499,6 +595,11 @@ pub static GROUPS: &[Group] = &[
         item: "Spooled file commands",
         title: "Spooled File Commands",
         commands: &["WRKSPLF", "DSPSPLF", "DLTSPLF"],
+    },
+    Group {
+        item: "Menu commands",
+        title: "Menu Commands",
+        commands: &["GO", "CRTMNU", "DLTMNU"],
     },
     Group {
         item: "Session commands",
@@ -795,7 +896,13 @@ fn check_qualified(pd: &ParamDef, v: &str) -> Result<()> {
         }
     }
     let what = pd.prompt.to_ascii_lowercase();
-    if obj == "*ALL" && pd.choices.contains("*ALL") {
+    // Special values the parameter allows (*ALL, *NONE, *SAME...).
+    if obj.starts_with('*')
+        && pd
+            .choices
+            .split(", ")
+            .any(|c| c.trim_end_matches("...") == obj)
+    {
         return Ok(());
     }
     // Generic names: a valid name prefix followed by '*'.

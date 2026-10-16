@@ -1822,7 +1822,11 @@ async fn command(
             match job.run_boxed(&line).await? {
                 Outcome::Messages(m) => msgs.extend(m),
                 Outcome::SignOff => return Ok(Some(Outcome::SignOff)),
-                Outcome::Display(_) | Outcome::ChangePassword | Outcome::StartSql => {
+                Outcome::Display(_)
+                | Outcome::ChangePassword
+                | Outcome::StartSql
+                | Outcome::Menu(_)
+                | Outcome::CommandEntry => {
                     bail!(
                         "{} shows a display; display commands cannot run in a CL program yet.",
                         st.name

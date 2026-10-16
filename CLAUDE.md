@@ -33,6 +33,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/dtaara.rs` | Data areas: CRTDTAARA/CHGDTAARA/RTVDTAARA values, RPG `IN *LOCK`/`OUT` (PostgreSQL advisory locks) |
 | `core/src/jobs.rs` | Work management: jobs (`ibmish.jobs`), job logs, job queue QBATCH and its subsystem loop, user message queues |
 | `core/src/spool.rs` | Spooled files (`ibmish.spooled_files`, `ibmish.spool_lines`): printer output, QSYSPRT listings of batch display commands, QPJOBLOG |
+| `core/src/menus.rs` | Menus: the system menus (MAIN...) as data, GO/CRTMNU TYPE(*PGM)/DLTMNU; the session shows them (`tn5250/session.rs`: initial program, initial menu, menu stack) |
 | `core/src/authority.rs` | Object owners, *PUBLIC and private authorities; `check` before every object use (CPF9802) |
 | `core/src/users.rs` | User profiles, Argon2id password hashes |
 | `core/src/main.rs` | `ibmish` CLI |

@@ -33,7 +33,7 @@ Without the authority needed, the operation fails with `CPF9802`. In an RPG prog
 | `DSPOBJAUT OBJ(...) OBJTYPE(...)` | Shows the owner, private authorities and *PUBLIC |
 | `CHGOBJOWN OBJ(...) OBJTYPE(...) NEWOWN(name)` | Gives the object to another user |
 
-Object types are `*FILE`, `*PGM`, `*DTAARA` and `*LIB`. These commands are on the F4 menu under "Security commands".
+Object types are `*FILE`, `*PGM`, `*DTAARA`, `*MENU` and `*LIB`. These commands are on the F4 menu under "Security commands".
 
 ## Example
 

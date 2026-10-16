@@ -10,6 +10,7 @@
 //! - [`dtaara`]: data areas
 //! - [`authority`]: object owners and authorities (*ALL, *CHANGE, *USE, *EXCLUDE)
 //! - [`spool`]: spooled files (printed output)
+//! - [`menus`]: menus (GO, CRTMNU) and the system menus
 //! - [`jobs`]: jobs, job queues, job logs, message queues, the QBATCH subsystem
 //! - [`web`]: the browser 5250 terminal
 
@@ -23,6 +24,7 @@ pub mod dds;
 pub mod dspf;
 pub mod dtaara;
 pub mod jobs;
+pub mod menus;
 pub mod rla;
 pub mod spool;
 pub mod sql;

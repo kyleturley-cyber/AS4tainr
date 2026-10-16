@@ -162,12 +162,14 @@ DSPLIB:
 
 Keyword and positional forms both work (`CRTLIB MYLIB` = `CRTLIB LIB(MYLIB)`). Unquoted values are folded to upper case; quoted values keep their case, with `''` for an apostrophe.
 
+After sign-on the user's initial program runs (if the profile has one) and the initial menu is shown, MAIN for new profiles: see [menus.md](menus.md). Option 7 on MAIN, or `CALL QCMD`, opens Command Entry.
+
 Keys on the command entry screen:
 
 | Key | Action |
 | --- | --- |
 | Enter | Run the command |
-| F3 | Sign off |
+| F3 | Back to the menu (sign off when Command Entry is the first display, e.g. the initial menu was not found) |
 | F9 | Retrieve the previous command (repeat to go further back) |
 | F12 | Clear the command line |
 | F4 | Prompt the command typed (what was typed so far fills the prompt); on an empty line, show the command menu |
@@ -187,7 +189,8 @@ On list screens, Page Down / Page Up (Roll Up / Roll Down) page through the list
 | `core/src/tn5250/telnet.rs` | Telnet negotiation (TERMINAL-TYPE, END-OF-RECORD, BINARY) and 5250 record framing (10-byte header, FF doubling, IAC EOR) |
 | `core/src/tn5250/ds.rs` | 5250 data stream: Clear Unit, Write To Display, SBA/SF/IC orders, Read MDT Fields; parsing the input record (cursor, AID, modified fields) |
 | `core/src/tn5250/ebcdic.rs` | CCSID 37 conversion tables, generated from the standard code page 037 mapping |
-| `core/src/tn5250/session.rs` | Sign-on, Change Password, Command Entry and list screens |
+| `core/src/tn5250/session.rs` | Sign-on, Change Password, initial program and menu, menus, Command Entry and list screens |
+| `core/src/menus.rs` | GO, CRTMNU, the system menus (MAIN, USER, JOBS, FILES, PROGRAM, SECURITY) |
 | `core/src/cl.rs` | CL parser and the command definition table |
 | `core/src/commands.rs` | Command implementations, shared with future batch jobs |
 | `core/src/users.rs` | User profiles and password hashing |

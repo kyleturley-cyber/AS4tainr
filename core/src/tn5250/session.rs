@@ -1,5 +1,5 @@
-//! One interactive 5250 session: sign-on, password change, command entry,
-//! and list displays. The screen texts are ibmish's own; the layout follows
+//! One interactive 5250 session: sign-on, password change, the initial
+//! program and menu, menus, command entry, and list displays. The screen texts are ibmish's own; the layout follows
 //! common 5250 conventions (title on line 1, function keys on line 22 or
 //! 23, messages on line 24).
 
@@ -14,6 +14,7 @@ use crate::bridge;
 use crate::cl;
 use crate::commands::{Environment, Job, ListDisplay, Outcome};
 use crate::dspf;
+use crate::menus;
 use crate::users;
 use crate::workstn;
 
@@ -241,7 +242,7 @@ pub async fn run(stream: tokio::net::TcpStream, cfg: &ServerConfig, device: &str
             display: Some(display_tx),
             id: Some(id.clone()),
         };
-        let ended = command_entry(&mut term, &mut job, cfg, &mut display_rx).await;
+        let ended = workstation(&mut term, &mut job, cfg, &mut display_rx, &profile).await;
         // The job ends however the session ends (sign-off, F3, the
         // emulator closing).
         crate::jobs::log(&client, &id, "*INFO", &format!("Job {id} ended.")).await;
@@ -327,24 +328,182 @@ async fn change_password(
 const LOG_TOP: u8 = 3;
 const LOG_ROWS: usize = 16; // rows 3..=18
 
-async fn command_entry(
+/// A display the operator can come back to: a menu, or Command Entry
+/// (CALL QCMD). The session keeps a stack of them.
+enum Place {
+    Menu(&'static menus::BuiltinMenu),
+    CommandEntry,
+}
+
+/// What the operator asked for on a menu or on Command Entry.
+enum Action {
+    /// Run a request (a command line; `?` first: prompt it).
+    Run(String),
+    /// F3.
+    Exit,
+    /// F12.
+    Cancel,
+}
+
+/// The interactive job's requests: the Command Entry log and the commands
+/// F9 retrieves.
+#[derive(Default)]
+struct Requests {
+    log: Vec<String>,
+    retrieve: Vec<String>,
+    retrieve_pos: usize,
+}
+
+impl Requests {
+    /// F9: the previous request, going back one more each time.
+    fn previous(&mut self) -> Option<String> {
+        if self.retrieve.is_empty() {
+            return None;
+        }
+        if self.retrieve_pos == 0 {
+            self.retrieve_pos = self.retrieve.len();
+        }
+        self.retrieve_pos -= 1;
+        Some(self.retrieve[self.retrieve_pos].clone())
+    }
+}
+
+/// How a request ended, for the display that runs it.
+struct Done {
+    /// For the message line.
+    message: String,
+    /// For the command line (the request, when it failed).
+    prefill: String,
+    next: Next,
+}
+
+enum Next {
+    Stay,
+    Show(Place),
+    SignOff,
+}
+
+/// After sign-on: the user profile's initial program, then its initial
+/// menu (IBM i: INLPGM, then INLMNU; INLMNU(*SIGNOFF) signs off when the
+/// initial program ends). F3 on the initial menu signs off.
+async fn workstation(
     term: &mut Term,
     job: &mut Job<'_>,
     cfg: &ServerConfig,
     display_rx: &mut tokio::sync::mpsc::Receiver<bridge::DisplayRequest>,
+    profile: &users::Profile,
 ) -> Result<()> {
-    let mut log: Vec<String> = vec![format!("Signed on to {} as {}.", cfg.system_name, job.user)];
+    let mut rq = Requests {
+        log: vec![format!("Signed on to {} as {}.", cfg.system_name, job.user)],
+        ..Default::default()
+    };
+    let mut stack: Vec<Place> = Vec::new();
     let mut message = String::new();
-    let mut retrieve: Vec<String> = Vec::new();
-    let mut retrieve_pos = 0usize;
     let mut prefill = String::new();
+    if profile.inlmnu != "*SIGNOFF" {
+        match menus::find(job.client, &profile.inlmnu, &job.library_list()).await {
+            Ok(menus::Menu::Builtin(m)) => stack.push(Place::Menu(m)),
+            Ok(menus::Menu::Program { program, .. }) => {
+                // The menu program runs after the initial program; when it
+                // returns, Command Entry.
+                stack.push(Place::CommandEntry);
+                prefill = format!("CALL PGM({program})");
+            }
+            Err(e) => {
+                message = format!("{e} Initial menu {} not shown.", profile.inlmnu);
+                stack.push(Place::CommandEntry);
+            }
+        }
+    }
+    if profile.inlpgm != "*NONE" {
+        let line = format!("CALL PGM({})", profile.inlpgm);
+        let done = request(term, job, cfg, display_rx, &mut rq, &line).await?;
+        match done.next {
+            Next::SignOff => return Ok(()),
+            Next::Show(p) => stack.push(p),
+            Next::Stay => {}
+        }
+        if !done.message.is_empty() {
+            message = done.message;
+        }
+    }
+    // A *PGM initial menu: call it now.
+    if !prefill.is_empty() {
+        let line = std::mem::take(&mut prefill);
+        let done = request(term, job, cfg, display_rx, &mut rq, &line).await?;
+        match done.next {
+            Next::SignOff => return Ok(()),
+            Next::Show(p) => stack.push(p),
+            Next::Stay => {}
+        }
+        message = done.message;
+    }
+    while let Some(top) = stack.last() {
+        let bottom = stack.len() == 1;
+        let action = match top {
+            Place::Menu(m) => menu_display(term, m, cfg, job, &mut rq, &message, &prefill).await?,
+            Place::CommandEntry => {
+                command_entry(term, job, cfg, &mut rq, &message, &prefill).await?
+            }
+        };
+        message.clear();
+        prefill.clear();
+        match action {
+            Action::Exit => {
+                // F3: leave this chain of menus (back to Command Entry or
+                // the initial menu); on the initial menu, sign off.
+                if bottom {
+                    return Ok(());
+                }
+                match stack.last() {
+                    Some(Place::CommandEntry) => {
+                        stack.pop();
+                    }
+                    _ => {
+                        while stack.len() > 1 && matches!(stack.last(), Some(Place::Menu(_))) {
+                            stack.pop();
+                        }
+                    }
+                }
+            }
+            Action::Cancel => {
+                if !bottom && matches!(top, Place::Menu(_)) {
+                    stack.pop();
+                }
+            }
+            Action::Run(line) => {
+                let done = request(term, job, cfg, display_rx, &mut rq, &line).await?;
+                message = done.message;
+                prefill = done.prefill;
+                match done.next {
+                    Next::SignOff => return Ok(()),
+                    Next::Show(p) => stack.push(p),
+                    Next::Stay => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The Command Entry display (CALL QCMD).
+async fn command_entry(
+    term: &mut Term,
+    job: &mut Job<'_>,
+    cfg: &ServerConfig,
+    rq: &mut Requests,
+    first_message: &str,
+    first_prefill: &str,
+) -> Result<Action> {
+    let mut message = first_message.to_string();
+    let mut prefill = first_prefill.to_string();
     loop {
         let mut s = Screen::new();
         centered(&mut s, 1, "Command Entry");
         s.put(1, 66, &format!("{:>14}", cfg.system_name));
         s.put(2, 66, &format!("{:>14}", job.user));
-        let start = log.len().saturating_sub(LOG_ROWS);
-        for (i, line) in log[start..].iter().enumerate() {
+        let start = rq.log.len().saturating_sub(LOG_ROWS);
+        for (i, line) in rq.log[start..].iter().enumerate() {
             s.put(LOG_TOP + i as u8, 2, line);
         }
         s.put(19, 2, "Type command, press Enter.");
@@ -355,154 +514,273 @@ async fn command_entry(
         prefill.clear();
         message.clear();
         let inp = term.show(&s).await?;
-        let line = match inp.aid {
-            Aid::F(3) => return Ok(()),
+        let typed = inp.get("CMD").trim().to_string();
+        match inp.aid {
+            Aid::F(3) => return Ok(Action::Exit),
             Aid::F(12) => continue,
-            Aid::F(4) => {
-                let typed = inp.get("CMD").trim().to_string();
-                if typed.is_empty() {
-                    match command_menu(term).await? {
-                        Some(line) => line,
-                        None => continue,
-                    }
-                } else {
-                    match cl::parse_partial(&typed) {
-                        Err(e) => {
-                            message = e.to_string();
-                            prefill = typed;
-                            continue;
-                        }
-                        Ok((def, vals)) => match prompt(term, def, &vals).await? {
-                            PromptResult::Run(line) => line,
-                            PromptResult::Exit => continue,
-                            PromptResult::Cancel => {
-                                prefill = typed;
-                                continue;
-                            }
-                        },
-                    }
-                }
-            }
+            Aid::F(4) => return Ok(Action::Run(format!("?{typed}"))),
             Aid::F(9) => {
-                if retrieve.is_empty() {
-                    message = "There are no commands to retrieve.".into();
-                } else {
-                    retrieve_pos = if retrieve_pos == 0 {
-                        retrieve.len()
-                    } else {
-                        retrieve_pos
-                    };
-                    retrieve_pos -= 1;
-                    prefill = retrieve[retrieve_pos].clone();
+                match rq.previous() {
+                    Some(l) => prefill = l,
+                    None => message = "There are no commands to retrieve.".into(),
                 }
                 continue;
             }
-            Aid::Enter => inp.get("CMD").trim().to_string(),
+            Aid::Enter if !typed.is_empty() => return Ok(Action::Run(typed)),
             _ => continue,
-        };
-        if line.is_empty() {
-            continue;
-        }
-        retrieve.push(line.clone());
-        retrieve_pos = 0;
-        log.push(format!("> {line}"));
-        if let Some(id) = &job.id {
-            crate::jobs::log(job.client, id, "*RQS", &line).await;
-            let first = line
-                .split(|c: char| c.is_whitespace() || c == '(')
-                .next()
-                .unwrap_or("");
-            crate::jobs::set_function(
-                job.client,
-                id,
-                &format!("CMD-{}", first.to_ascii_uppercase()),
-                "RUN",
-            )
-            .await;
-        }
-        // Run the command; while it runs, show any display file records
-        // its program writes (EXFMT) on this terminal.
-        let user = job.user.clone();
-        let result = {
-            let run = job.run(&line);
-            tokio::pin!(run);
-            loop {
-                tokio::select! {
-                    r = &mut run => break r,
-                    Some(req) = display_rx.recv() => {
-                        let resp = exfmt(term, &req, &user, &cfg.system_name).await;
-                        let failed = resp.is_err();
-                        let _ = req.reply.send(resp.map_err(|e| format!("{e:#}")));
-                        if failed {
-                            anyhow::bail!("the display stopped responding");
-                        }
-                    }
-                }
-            }
-        };
-        if let Some(id) = &job.id {
-            match &result {
-                Ok(Outcome::Messages(msgs)) => {
-                    for m in msgs {
-                        crate::jobs::log(job.client, id, "*INFO", m).await;
-                    }
-                }
-                Err(e) => {
-                    for m in e.to_string().lines() {
-                        crate::jobs::log(job.client, id, "*ESCAPE", m).await;
-                    }
-                }
-                _ => {}
-            }
-        }
-        match result {
-            Ok(Outcome::Messages(msgs)) => {
-                if let Some(last) = msgs.last() {
-                    message = last.clone();
-                }
-                log.extend(msgs.into_iter().map(|m| format!("  {m}")));
-            }
-            Ok(Outcome::Display(d)) => {
-                show_list(term, job, d).await?;
-            }
-            Ok(Outcome::ChangePassword) => {
-                if change_password(term, job.client, &job.user, false).await? {
-                    message = "Password changed successfully.".into();
-                } else {
-                    message = "Password not changed.".into();
-                }
-                log.push(format!("  {message}"));
-            }
-            Ok(Outcome::StartSql) => {
-                sql_session(term, job).await?;
-            }
-            Ok(Outcome::SignOff) => return Ok(()),
-            Err(e) => {
-                let text = e.to_string();
-                let lines: Vec<&str> = text.lines().collect();
-                message = lines.last().copied().unwrap_or("").to_string();
-                log.extend(lines.iter().map(|m| format!("  {m}")));
-                prefill = line.clone();
-            }
-        }
-        if let Some(id) = &job.id {
-            crate::jobs::set_function(job.client, id, "", "DSPW").await;
-        }
-        // New messages on the user's message queue (a submitted job
-        // ended, SNDMSG from another user): say so when nothing else is.
-        let waiting = crate::jobs::new_messages(job.client, &job.user)
-            .await
-            .unwrap_or(0);
-        if waiting > 0 && message.is_empty() {
-            message = if waiting == 1 {
-                "A new message is on your message queue. Type DSPMSG to see it.".into()
-            } else {
-                format!(
-                    "{waiting} new messages are on your message queue. Type DSPMSG to see them."
-                )
-            };
         }
     }
+}
+
+/// A system menu: its options, and a "Selection or command" line that
+/// takes an option number or any command.
+async fn menu_display(
+    term: &mut Term,
+    m: &menus::BuiltinMenu,
+    cfg: &ServerConfig,
+    job: &Job<'_>,
+    rq: &mut Requests,
+    first_message: &str,
+    first_prefill: &str,
+) -> Result<Action> {
+    let mut message = first_message.to_string();
+    let mut prefill = first_prefill.to_string();
+    loop {
+        let mut s = Screen::new();
+        s.put(1, 2, m.name);
+        centered(&mut s, 1, m.title);
+        s.put(
+            1,
+            55,
+            &format!("{}:   {}", label("System", 12), cfg.system_name),
+        );
+        s.put(2, 55, &format!("{}:   {}", label("User", 12), job.user));
+        s.put(3, 2, "Select one of the following:");
+        let mut row = 5u8;
+        let mut last = 0u8;
+        for o in m.options {
+            // A blank line before the jump to option 90.
+            if o.number > last + 1 && last > 0 {
+                row += 1;
+            }
+            s.put(row, 6, &format!("{:>2}. {}", o.number, o.text));
+            row += 1;
+            last = o.number;
+        }
+        s.put(19, 2, "Selection or command");
+        s.text(20, 2, attr::HIGH, "===>");
+        s.field("SEL", 20, 7, 74, FieldKind::Text, &prefill);
+        keys(&mut s, 22, "F3=Exit   F4=Prompt   F9=Retrieve   F12=Cancel");
+        s.message(&message);
+        message.clear();
+        prefill.clear();
+        let inp = term.show(&s).await?;
+        let typed = inp.get("SEL").trim().to_string();
+        match inp.aid {
+            Aid::F(3) => return Ok(Action::Exit),
+            Aid::F(12) => return Ok(Action::Cancel),
+            Aid::F(9) => {
+                match rq.previous() {
+                    Some(l) => prefill = l,
+                    None => message = "There are no commands to retrieve.".into(),
+                }
+                continue;
+            }
+            Aid::Enter | Aid::F(4) => {}
+            _ => {
+                message = "That key is not valid on this display.".into();
+                continue;
+            }
+        }
+        if typed.is_empty() {
+            if inp.aid == Aid::F(4) {
+                return Ok(Action::Run("?".into()));
+            }
+            continue;
+        }
+        if typed.chars().all(|c| c.is_ascii_digit()) {
+            let chosen = typed
+                .parse::<u8>()
+                .ok()
+                .and_then(|n| m.options.iter().find(|o| o.number == n));
+            match chosen {
+                Some(o) if inp.aid == Aid::Enter => return Ok(Action::Run(o.command.to_string())),
+                _ => {
+                    message = format!("Selection {typed} is not one of the options on this menu.");
+                    continue;
+                }
+            }
+        }
+        return Ok(Action::Run(if inp.aid == Aid::F(4) {
+            format!("?{typed}")
+        } else {
+            typed
+        }));
+    }
+}
+
+/// Run one request in the interactive job, from a menu or Command Entry:
+/// `?` in front prompts the command first (F4 with nothing typed shows the
+/// command groups). Displays the command shows (lists, programs' display
+/// files, the SQL session) are shown here.
+async fn request(
+    term: &mut Term,
+    job: &mut Job<'_>,
+    cfg: &ServerConfig,
+    display_rx: &mut tokio::sync::mpsc::Receiver<bridge::DisplayRequest>,
+    rq: &mut Requests,
+    line: &str,
+) -> Result<Done> {
+    let mut done = Done {
+        message: String::new(),
+        prefill: String::new(),
+        next: Next::Stay,
+    };
+    let line = match line.strip_prefix('?') {
+        None => line.trim().to_string(),
+        Some(typed) => {
+            let typed = typed.trim();
+            let chosen = if typed.is_empty() {
+                command_menu(term).await?
+            } else {
+                match cl::parse_partial(typed) {
+                    Err(e) => {
+                        done.message = e.to_string();
+                        done.prefill = typed.to_string();
+                        return Ok(done);
+                    }
+                    Ok((def, vals)) => match prompt(term, def, &vals).await? {
+                        PromptResult::Run(line) => Some(line),
+                        PromptResult::Exit => None,
+                        PromptResult::Cancel => {
+                            done.prefill = typed.to_string();
+                            return Ok(done);
+                        }
+                    },
+                }
+            };
+            match chosen {
+                Some(l) => l,
+                None => return Ok(done),
+            }
+        }
+    };
+    if line.is_empty() {
+        return Ok(done);
+    }
+    rq.log.push(format!("> {line}"));
+    rq.retrieve.push(line.clone());
+    rq.retrieve_pos = 0;
+    if let Some(id) = &job.id {
+        crate::jobs::log(job.client, id, "*RQS", &line).await;
+        let first = line
+            .split(|c: char| c.is_whitespace() || c == '(')
+            .next()
+            .unwrap_or("");
+        crate::jobs::set_function(
+            job.client,
+            id,
+            &format!("CMD-{}", first.to_ascii_uppercase()),
+            "RUN",
+        )
+        .await;
+    }
+    // Run the command; while it runs, show any display file records its
+    // program writes (EXFMT) on this terminal.
+    let user = job.user.clone();
+    let result = {
+        let run = job.run(&line);
+        tokio::pin!(run);
+        loop {
+            tokio::select! {
+                r = &mut run => break r,
+                Some(req) = display_rx.recv() => {
+                    let resp = exfmt(term, &req, &user, &cfg.system_name).await;
+                    let failed = resp.is_err();
+                    let _ = req.reply.send(resp.map_err(|e| format!("{e:#}")));
+                    if failed {
+                        anyhow::bail!("the display stopped responding");
+                    }
+                }
+            }
+        }
+    };
+    if let Some(id) = &job.id {
+        match &result {
+            Ok(Outcome::Messages(msgs)) => {
+                for m in msgs {
+                    crate::jobs::log(job.client, id, "*INFO", m).await;
+                }
+            }
+            Err(e) => {
+                for m in e.to_string().lines() {
+                    crate::jobs::log(job.client, id, "*ESCAPE", m).await;
+                }
+            }
+            _ => {}
+        }
+    }
+    match result {
+        Ok(Outcome::Messages(msgs)) => {
+            if let Some(last) = msgs.last() {
+                done.message = last.clone();
+            }
+            rq.log.extend(msgs.into_iter().map(|m| format!("  {m}")));
+        }
+        Ok(Outcome::Display(d)) => {
+            show_list(term, job, d).await?;
+        }
+        Ok(Outcome::ChangePassword) => {
+            done.message = if change_password(term, job.client, &job.user, false).await? {
+                "Password changed successfully.".into()
+            } else {
+                "Password not changed.".into()
+            };
+            rq.log.push(format!("  {}", done.message));
+        }
+        Ok(Outcome::StartSql) => {
+            sql_session(term, job).await?;
+        }
+        Ok(Outcome::SignOff) => done.next = Next::SignOff,
+        Ok(Outcome::CommandEntry) => done.next = Next::Show(Place::CommandEntry),
+        Ok(Outcome::Menu(menus::Menu::Builtin(m))) => done.next = Next::Show(Place::Menu(m)),
+        Ok(Outcome::Menu(menus::Menu::Program { program, .. })) => {
+            // A *PGM menu: the program shows the menu; when it returns,
+            // the menu is done.
+            return Box::pin(request(
+                term,
+                job,
+                cfg,
+                display_rx,
+                rq,
+                &format!("CALL PGM({program})"),
+            ))
+            .await;
+        }
+        Err(e) => {
+            let text = e.to_string();
+            let lines: Vec<&str> = text.lines().collect();
+            done.message = lines.last().copied().unwrap_or("").to_string();
+            rq.log.extend(lines.iter().map(|m| format!("  {m}")));
+            done.prefill = line.clone();
+        }
+    }
+    if let Some(id) = &job.id {
+        crate::jobs::set_function(job.client, id, "", "DSPW").await;
+    }
+    // New messages on the user's message queue (a submitted job ended,
+    // SNDMSG from another user): say so when nothing else is.
+    let waiting = crate::jobs::new_messages(job.client, &job.user)
+        .await
+        .unwrap_or(0);
+    if waiting > 0 && done.message.is_empty() {
+        done.message = if waiting == 1 {
+            "A new message is on your message queue. Type DSPMSG to see it.".into()
+        } else {
+            format!("{waiting} new messages are on your message queue. Type DSPMSG to see them.")
+        };
+    }
+    Ok(done)
 }
 
 /// Show an EXFMT frame until the operator enters valid input. Paging

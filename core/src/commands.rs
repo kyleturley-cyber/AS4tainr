@@ -76,6 +76,10 @@ pub enum Outcome {
     /// STRSQL: the interactive SQL screen.
     StartSql,
     SignOff,
+    /// GO: show a menu.
+    Menu(crate::menus::Menu),
+    /// CALL QCMD: show the Command Entry display.
+    CommandEntry,
 }
 
 /// DSPPFM shows at most this many records.
@@ -129,6 +133,10 @@ impl Job<'_> {
             "CALL" => self.call(&cmd).await,
             "CRTUSRPRF" => self.crtusrprf(&cmd).await,
             "DSPUSRPRF" => self.dspusrprf(&cmd).await,
+            "CHGUSRPRF" => self.chgusrprf(&cmd).await,
+            "GO" => self.go(&cmd).await,
+            "CRTMNU" => self.crtmnu(&cmd).await,
+            "DLTMNU" => self.dltmnu(&cmd).await,
             "DLTUSRPRF" => self.dltusrprf(&cmd).await,
             "CHGPWD" => Ok(Outcome::ChangePassword),
             "STRSQL" => Ok(Outcome::StartSql),
@@ -389,6 +397,8 @@ impl Job<'_> {
                 special,
                 curlib,
                 text: cmd.get("TEXT").to_string(),
+                inlpgm: cmd.get("INLPGM").to_string(),
+                inlmnu: cmd.get("INLMNU").to_string(),
             },
         )
         .await?;
@@ -415,6 +425,8 @@ impl Job<'_> {
                 ("Password is *NONE".into(), yes_no(p.no_password)),
                 ("Set password to expired".into(), yes_no(p.pwd_expired)),
                 ("Current library".into(), p.curlib),
+                ("Initial program to call".into(), p.inlpgm),
+                ("Initial menu".into(), p.inlmnu),
                 ("Text".into(), p.text),
                 (
                     "Previous sign-on".into(),
@@ -430,6 +442,105 @@ impl Job<'_> {
             },
             ..Default::default()
         }))
+    }
+
+    async fn chgusrprf(&mut self, cmd: &Command) -> Result<Outcome> {
+        self.require_secadm("change user profiles").await?;
+        let name = cmd.get("USRPRF").to_string();
+        let same = |k: &str| match cmd.get(k) {
+            "*SAME" => None,
+            v => Some(v.to_string()),
+        };
+        let curlib = match same("CURLIB") {
+            Some(lib) if lib != "*CRTDFT" => {
+                if !catalog::library_exists(self.client, &lib).await? {
+                    bail!("CPF2110: Library {lib} not found.");
+                }
+                Some(lib)
+            }
+            other => other,
+        };
+        let changes = users::ProfileChanges {
+            expired: same("PWDEXP").map(|v| v == "*YES"),
+            enabled: same("STATUS").map(|v| v != "*DISABLED"),
+            curlib,
+            text: same("TEXT"),
+            inlpgm: same("INLPGM"),
+            inlmnu: same("INLMNU"),
+        };
+        if !users::change(self.client, &name, &changes).await? {
+            bail!("CPF2204: User profile {name} not found.");
+        }
+        Ok(Outcome::Messages(vec![format!(
+            "User profile {name} changed."
+        )]))
+    }
+
+    /// GO: find the menu; the display shows it.
+    async fn go(&mut self, cmd: &Command) -> Result<Outcome> {
+        let menu = crate::menus::find(self.client, cmd.get("MENU"), &self.library_list()).await?;
+        if let crate::menus::Menu::Program { library, name, .. } = &menu {
+            authority::check(self.client, &self.user, library, name, "*MENU", Aut::Use).await?;
+        }
+        if self.display.is_none() {
+            bail!("Menus can only be shown in an interactive job.");
+        }
+        Ok(Outcome::Menu(menu))
+    }
+
+    /// CRTMNU: only TYPE(*PGM) for now.
+    async fn crtmnu(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = match cmd.get("MENU").split_once('/') {
+            Some(("*CURLIB", n)) => (self.current_library(), n.to_string()),
+            Some((l, n)) => (l.to_string(), n.to_string()),
+            None => (self.current_library(), cmd.get("MENU").to_string()),
+        };
+        match cmd.get("TYPE") {
+            "*PGM" => {}
+            "*DSPF" | "*UIM" => bail!(
+                "Menu type {} is not supported yet; use TYPE(*PGM) with a program that shows the menu.",
+                cmd.get("TYPE")
+            ),
+            other => bail!("Menu type {other} is not valid; use *DSPF, *PGM or *UIM."),
+        }
+        // PGM(*MENU): the program has the menu's name, in the menu's library.
+        let program = match cmd.get("PGM") {
+            "*MENU" => format!("{lib}/{name}"),
+            p if p.contains('/') => p.to_string(),
+            p => format!("*LIBL/{p}"),
+        };
+        crate::menus::create(self.client, &lib, &name, &program, cmd.get("TEXT")).await?;
+        let name = name.to_ascii_uppercase();
+        authority::set_owner(self.client, &lib, &name, "*MENU", &self.user).await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Menu {name} created in library {lib}."
+        )]))
+    }
+
+    async fn dltmnu(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = match cmd.get("MENU").split_once('/') {
+            Some(("*CURLIB", n)) => (Some(self.current_library()), n.to_string()),
+            Some(("*LIBL", n)) => (None, n.to_string()),
+            Some((l, n)) => (Some(l.to_string()), n.to_string()),
+            None => (None, cmd.get("MENU").to_string()),
+        };
+        let lib = match lib {
+            Some(l) => l,
+            None => crate::menus::library_of(self.client, &name, &self.library_list())
+                .await?
+                .ok_or_else(|| anyhow!("Menu {name} in library *LIBL not found."))?,
+        };
+        if lib == "QSYS" {
+            bail!("Menu {name} is supplied with the system and cannot be deleted.");
+        }
+        authority::check(self.client, &self.user, &lib, &name, "*MENU", Aut::All).await?;
+        if !crate::menus::delete(self.client, &lib, &name).await? {
+            bail!("Menu {name} in library {lib} not found.");
+        }
+        authority::forget(self.client, &lib, &name, "*MENU").await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Menu {name} deleted from library {lib}."
+        )]))
     }
 
     async fn dltusrprf(&mut self, cmd: &Command) -> Result<Outcome> {
@@ -849,8 +960,10 @@ impl Job<'_> {
     /// The library and name of an existing object (OBJ and OBJTYPE).
     async fn object_named(&self, cmd: &Command) -> Result<(String, String, String)> {
         let objtype = cmd.get("OBJTYPE").to_string();
-        if !["*FILE", "*PGM", "*DTAARA", "*LIB"].contains(&objtype.as_str()) {
-            bail!("Object type {objtype} is not supported; use *FILE, *PGM, *DTAARA or *LIB.");
+        if !["*FILE", "*PGM", "*DTAARA", "*LIB", "*MENU"].contains(&objtype.as_str()) {
+            bail!(
+                "Object type {objtype} is not supported; use *FILE, *PGM, *DTAARA, *MENU or *LIB."
+            );
         }
         let (lib, name) = match cmd.get("OBJ").split_once('/') {
             Some(("*CURLIB", n)) => (self.current_library(), n.to_string()),
@@ -1232,6 +1345,14 @@ impl Job<'_> {
             Some((l, n)) => (vec![l.to_string()], n.to_string()),
             None => (self.library_list(), pgm.clone()),
         };
+        // QCMD, the command processor: interactively, the Command Entry
+        // display.
+        if name == "QCMD" {
+            if self.display.is_some() {
+                return Ok(Outcome::CommandEntry);
+            }
+            bail!("QCMD shows the Command Entry display; it can only be called in an interactive job.");
+        }
         if let Some(id) = &self.id {
             jobs::set_function(self.client, id, &format!("PGM-{name}"), "RUN").await;
         }

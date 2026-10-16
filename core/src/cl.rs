@@ -290,7 +290,49 @@ pub static COMMANDS: &[CommandDef] = &[
     CommandDef {
         name: "DSPJOBLOG",
         description: "Display Job Log",
-        params: &[p("JOB", Kind::Text, false, Some("*"), "Job name").ch("*, number/user/name")],
+        params: &[
+            p("JOB", Kind::Text, false, Some("*"), "Job name").ch("*, number/user/name"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
+    },
+    CommandDef {
+        name: "WRKSPLF",
+        description: "Work with Spooled Files",
+        params: &[
+            p("SELECT", Kind::Name, false, Some("*CURRENT"), "User").ch("*CURRENT, user name")
+        ],
+    },
+    CommandDef {
+        name: "DSPSPLF",
+        description: "Display Spooled File",
+        params: &[
+            p("FILE", Kind::Name, true, None, "Spooled file").ch("Name"),
+            p("JOB", Kind::Text, false, Some("*"), "Job name").ch("*, number/user/name"),
+            p(
+                "SPLNBR",
+                Kind::Text,
+                false,
+                Some("*LAST"),
+                "Spooled file number",
+            )
+            .ch("1-999999, *LAST"),
+        ],
+    },
+    CommandDef {
+        name: "DLTSPLF",
+        description: "Delete Spooled File",
+        params: &[
+            p("FILE", Kind::Name, true, None, "Spooled file").ch("Name"),
+            p("JOB", Kind::Text, false, Some("*"), "Job name").ch("*, number/user/name"),
+            p(
+                "SPLNBR",
+                Kind::Text,
+                false,
+                Some("*LAST"),
+                "Spooled file number",
+            )
+            .ch("1-999999, *LAST"),
+        ],
     },
     CommandDef {
         name: "ENDJOB",
@@ -409,6 +451,11 @@ pub static GROUPS: &[Group] = &[
             "SNDMSG",
             "DSPMSG",
         ],
+    },
+    Group {
+        item: "Spooled file commands",
+        title: "Spooled File Commands",
+        commands: &["WRKSPLF", "DSPSPLF", "DLTSPLF"],
     },
     Group {
         item: "Session commands",

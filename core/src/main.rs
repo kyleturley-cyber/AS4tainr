@@ -121,6 +121,10 @@ enum Cmd {
             default_value = "java -jar /opt/ibmish/ibmish-jvm.jar"
         )]
         runner: String,
+        /// Also serve the browser 5250 terminal on this address (HTTP), for
+        /// example 0.0.0.0:8080. Off unless set.
+        #[arg(long, env = "IBMISH_WEB_LISTEN")]
+        web_listen: Option<String>,
     },
     /// CALL: run a program. Starts a bridge on a free port and launches the
     /// runner (the JVM with Jariko), passing `--bridge HOST:PORT` first.
@@ -355,6 +359,7 @@ async fn run(cli: Cli) -> Result<u8> {
             listen,
             system_name,
             runner,
+            web_listen,
         } => {
             // Make sure the catalog and QSECOFR exist before anyone signs on.
             let client = bridge::connect_db(&cli.database_url).await?;
@@ -372,6 +377,27 @@ async fn run(cli: Cli) -> Result<u8> {
                 "ibmish 5250 server listening on {} (system {system_name})",
                 listener.local_addr()?
             );
+            // The browser terminal connects to this listener, in this process.
+            let web = match web_listen.filter(|w| !w.is_empty()) {
+                Some(w) => {
+                    let web = tokio::net::TcpListener::bind(&w)
+                        .await
+                        .with_context(|| format!("listening on {w}"))?;
+                    println!(
+                        "ibmish web terminal listening on http://{}",
+                        web.local_addr()?
+                    );
+                    let backend = ibmish_core::web::loopback_for(listener.local_addr()?);
+                    Some(tokio::spawn(ibmish_core::web::serve(web, backend)))
+                }
+                None => None,
+            };
+            let web = async move {
+                match web {
+                    Some(t) => t.await?,
+                    None => std::future::pending().await,
+                }
+            };
             let cfg = tn5250::ServerConfig {
                 env: commands::Environment {
                     database_url: cli.database_url,
@@ -389,6 +415,7 @@ async fn run(cli: Cli) -> Result<u8> {
             tokio::select! {
                 r = tn5250::serve(listener, cfg) => r?,
                 r = qbatch => r??,
+                r = web => r?,
             }
         }
         Cmd::Call {

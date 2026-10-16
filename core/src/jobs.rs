@@ -615,15 +615,23 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
             true
         }
         Ok(crate::commands::Outcome::Display(d)) => {
-            // A display command in batch: what it would show goes to the
-            // job log (IBM i would print it).
-            log(&client, &id, "*INFO", &d.title).await;
-            for (k, v) in &d.info {
-                log(&client, &id, "*INFO", &format!("{k}: {v}")).await;
+            // A display command in batch prints what it would show, as on
+            // IBM i (spooled file QSYSPRT).
+            let mut lines = vec![d.title.clone(), String::new()];
+            lines.extend(d.info.iter().map(|(k, v)| format!("{k}: {v}")));
+            if !d.info.is_empty() {
+                lines.push(String::new());
             }
-            for r in &d.rows {
-                log(&client, &id, "*INFO", r).await;
-            }
+            lines.push(d.heading.clone());
+            lines.extend(d.rows.iter().cloned());
+            crate::spool::print_lines(&client, &id, "QSYSPRT", first.as_str(), &lines).await?;
+            log(
+                &client,
+                &id,
+                "*INFO",
+                &format!("{} printed to spooled file QSYSPRT.", d.title),
+            )
+            .await;
             true
         }
         Ok(_) => {
@@ -649,6 +657,12 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
         (format!("CPF1240: Job {id} ended abnormally."), "*ESCAPE")
     };
     log(&client, &id, kind, &msg).await;
+    if !normal {
+        // QDFTJOBD's LOG(4 0 *NOLIST): the job log is kept as a spooled
+        // file only when the job ends abnormally.
+        let lines = crate::spool::job_log_lines(&client, &id).await?;
+        crate::spool::print_lines(&client, &id, "QPJOBLOG", &id.name, &lines).await?;
+    }
     end(&client, &id, normal).await?;
     if !info.submitted_by.is_empty() {
         send_message(

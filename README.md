@@ -6,7 +6,7 @@ ibmish is an open, IBM i-compatible runtime that runs in a container.
 
 It runs IBM i business applications (RPG, CL, DDS files) on ordinary Linux and cloud hosts. It does not emulate POWER hardware or boot IBM's operating system. It reimplements the interfaces that programs and people use, the same way Wine runs Windows programs: libraries and objects, database files with record-level access, 5250 green screens, and CL commands. RPG runs on [Jariko](https://github.com/smeup/jariko), an open-source RPG interpreter for the JVM.
 
-> Status: **early prototype**. Sign on with a real 5250 emulator, run CL commands, and `CALL` CL and RPG programs, all against PostgreSQL. That includes **interactive programs that use DDS display files** (`EXFMT`, and subfiles: the scrolling lists behind "Work with..." screens), DDS physical and logical files, SQL, and data areas. The Phase 2 gate is met: a sample **order entry application** (CL driver, RPG with an input subfile, five files, a data area) runs unmodified. See [docs/order-entry.md](docs/order-entry.md), [docs/5250-server.md](docs/5250-server.md) and [docs/display-files.md](docs/display-files.md). Phase 3 has started: jobs, `SBMJOB` with a QBATCH subsystem, job logs and message queues ([docs/work-management.md](docs/work-management.md)). Two users changing the same record are kept apart with IBM i-style record locks ([docs/record-locks.md](docs/record-locks.md)). Spooled files and object authority come next.
+> Status: **early prototype**. Sign on with a real 5250 emulator, run CL commands, and `CALL` CL and RPG programs, all against PostgreSQL. That includes **interactive programs that use DDS display files** (`EXFMT`, and subfiles: the scrolling lists behind "Work with..." screens), DDS physical and logical files, SQL, and data areas. The Phase 2 gate is met: a sample **order entry application** (CL driver, RPG with an input subfile, five files, a data area) runs unmodified. See [docs/order-entry.md](docs/order-entry.md), [docs/5250-server.md](docs/5250-server.md) and [docs/display-files.md](docs/display-files.md). Phase 3 has started: jobs, `SBMJOB` with a QBATCH subsystem, job logs and message queues ([docs/work-management.md](docs/work-management.md)). Two users changing the same record are kept apart with IBM i-style record locks ([docs/record-locks.md](docs/record-locks.md)). Printed reports become spooled files (`WRKSPLF`, [docs/spooled-files.md](docs/spooled-files.md)). Object authority comes next.
 
 ## How it fits together
 
@@ -22,7 +22,7 @@ It runs IBM i business applications (RPG, CL, DDS files) on ordinary Linux and c
 - **`core/`**: the Rust core (`ibmish` binary). It holds the object catalog, the DDS parser, record-level access over PostgreSQL, and the bridge server.
 - **`jvm/`**: the JVM side. `io.ibmish.bridge` is a dependency-free Java bridge client. `io.ibmish.jvm` plugs that client into Jariko as a reload `DBMManager` and provides the runner (`ibmish-jvm.jar`).
 - **`samples/`**: DDS sources, CSV data, RPG programs and their expected (golden) output.
-- **`docs/`**: [5250 server](docs/5250-server.md), [display files](docs/display-files.md), [logical files](docs/logical-files.md), [SQL](docs/sql.md), [CL programs](docs/cl-programs.md), [data areas](docs/data-areas.md), [work management](docs/work-management.md), [record locks](docs/record-locks.md), [order entry sample](docs/order-entry.md), [bridge protocol](docs/bridge-protocol.md), [known fidelity gaps](docs/fidelity-gaps.md), [spike 01 report](docs/spike-01.md).
+- **`docs/`**: [5250 server](docs/5250-server.md), [browser terminal](docs/web-terminal.md), [display files](docs/display-files.md), [logical files](docs/logical-files.md), [SQL](docs/sql.md), [CL programs](docs/cl-programs.md), [data areas](docs/data-areas.md), [work management](docs/work-management.md), [record locks](docs/record-locks.md), [spooled files](docs/spooled-files.md), [order entry sample](docs/order-entry.md), [bridge protocol](docs/bridge-protocol.md), [known fidelity gaps](docs/fidelity-gaps.md), [spike 01 report](docs/spike-01.md).
 
 ## Quick start (Docker)
 
@@ -30,7 +30,7 @@ It runs IBM i business applications (RPG, CL, DDS files) on ordinary Linux and c
 docker compose up --build
 ```
 
-This starts PostgreSQL and the ibmish 5250 server, with the sample files (`CUSTMAST`, `ITEMMAST`, `ORDHDR`, `ORDLIN`), display files and CL programs in `QGPL` (`scripts/samples.sh`). Connect a 5250 emulator to **localhost:2323** (tn5250, [tn5250j](https://github.com/tn5250j/tn5250j), or IBM ACS) and sign on as `QSECOFR` with password `QSECOFR`. You will be asked to choose a new password. Then try:
+This starts PostgreSQL and the ibmish 5250 server, with the sample files (`CUSTMAST`, `ITEMMAST`, `ORDHDR`, `ORDLIN`), display files and CL programs in `QGPL` (`scripts/samples.sh`). Open **http://localhost:5250** for a 5250 terminal in your browser, with clickable function keys ([docs/web-terminal.md](docs/web-terminal.md)), or connect a 5250 emulator to **localhost:2323** (tn5250, [tn5250j](https://github.com/tn5250j/tn5250j), or IBM ACS). Sign on as `QSECOFR` with password `QSECOFR`. You will be asked to choose a new password. Then try:
 
 ```
 CRTLIB MYLIB TEXT('My first library')
@@ -43,6 +43,8 @@ CALL ORDENTC
 DSPDTAARA ORDNXT
 CALL CUSTMNT
 SBMJOB CMD(CALL PGM(CUSTRPT) PARM(L)) JOB(RPT)
+SBMJOB CMD(CALL CUSTPRT)
+WRKSPLF
 WRKSBMJOB
 WRKACTJOB
 WRKOBJ QGPL/*ALL
@@ -101,7 +103,7 @@ target/debug/ibmish call SELFTEST --runner "java -cp target/conformance-classes 
 | `ibmish load FILE --csv x.csv` | `CPYFRMIMPF` (roughly) | Writes CSV rows with `WRITE` |
 | `ibmish call PGM [parms]` | `CALL` | Runs an RPG program through the runner |
 | `ibmish serve --port 7250` | | Runs a standalone bridge server |
-| `ibmish tn5250 --listen 0.0.0.0:23` | | Runs the 5250 display server (sign-on, command entry) and the QBATCH subsystem for submitted jobs |
+| `ibmish tn5250 --listen 0.0.0.0:23` | | Runs the 5250 display server (sign-on, command entry) and the QBATCH subsystem for submitted jobs. `--web-listen 0.0.0.0:8080` also serves the browser 5250 terminal |
 
 Settings: `IBMISH_DATABASE_URL`, `IBMISH_QSECOFR_PASSWORD` (initial QSECOFR password), `IBMISH_SYSTEM_NAME`, `IBMISH_LIBL` (library list, comma-separated, default `QGPL`), `IBMISH_RUNNER`, `IBMISH_PGM_PATH`.
 

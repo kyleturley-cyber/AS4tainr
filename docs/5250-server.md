@@ -6,7 +6,7 @@
 ibmish tn5250 --listen 0.0.0.0:23 --system-name IBMISH
 ```
 
-In Docker, `docker compose up` publishes it on `localhost:2323`.
+In Docker, `docker compose up` publishes it on `localhost:2323`. The same server also has a terminal in the browser, at `http://localhost:5250` in Docker: see [web-terminal.md](web-terminal.md).
 
 ## Signing on
 

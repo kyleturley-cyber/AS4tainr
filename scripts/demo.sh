@@ -25,18 +25,27 @@ else
 fi
 
 status=0
+# Trailing blanks and today's date (MM/DD/YY) do not count.
+normalize() {
+  sed -e 's/[[:space:]]*$//' -e 's#[ 0-9][0-9]/[0-9][0-9]/[0-9][0-9]#MM/DD/YY#g'
+}
 run() {
-  local pgm="$1" parm="$2" expected="$samples/expected/${1}_${2}.txt"
-  echo "--- CALL $pgm PARM($parm)"
-  local out
-  out=$("$bin" call "$pgm" "$parm" | grep -v '^Picked up JAVA_TOOL_OPTIONS' || true)
+  local pgm="$1" parm="${2:-}" expected out
+  if [ -n "$parm" ]; then
+    expected="$samples/expected/${pgm}_${parm}.txt"
+    echo "--- CALL $pgm PARM($parm)"
+    out=$("$bin" call "$pgm" "$parm" | grep -v '^Picked up JAVA_TOOL_OPTIONS' || true)
+  else
+    expected="$samples/expected/${pgm}.txt"
+    echo "--- CALL $pgm"
+    out=$("$bin" call "$pgm" | grep -v '^Picked up JAVA_TOOL_OPTIONS' || true)
+  fi
   echo "$out"
-  # Jariko prints DSPLY lines as-is; ignore surrounding blanks only.
-  if diff <(sed 's/[[:space:]]*$//' <<<"$out") <(sed 's/[[:space:]]*$//' "$expected") >/dev/null; then
+  if diff <(normalize <<<"$out") <(normalize <"$expected") >/dev/null; then
     echo "PASS: output matches $(basename "$expected")"
   else
     echo "FAIL: output differs from $(basename "$expected"):"
-    diff <(sed 's/[[:space:]]*$//' <<<"$out") <(sed 's/[[:space:]]*$//' "$expected") || true
+    diff <(normalize <<<"$out") <(normalize <"$expected") || true
     status=1
   fi
 }
@@ -44,6 +53,11 @@ run CUSTLIST 3
 run ORDTOTAL 1002
 run OWING L
 run CUSTRPT L
+# A printed report (O specs, EXCEPT). The conformance runner replays file
+# operations only; the page layout is the Jariko runner's.
+if [[ "${IBMISH_RUNNER:-}" != *BridgeConformance* ]]; then
+  run CUSTPRT
+fi
 # CUSTUPD changes data, so it only runs right after the sample files were created.
 if [ "$fresh" = 1 ]; then
   run CUSTUPD 5

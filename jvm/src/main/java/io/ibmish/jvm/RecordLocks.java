@@ -129,12 +129,24 @@ public final class RecordLocks {
         return "     C" + pad(cond, 5) + pad(f1, 14) + pad(op, 10) + rest;
     }
 
+    /** A signal statement: IBM#SG = 'text', with the given conditioning (positions 7-11). */
+    static String signalLine(String cond, String text) {
+        return cspec(cond, "", "EVAL", SIGNAL_FIELD + " = '" + text + "'");
+    }
+
+    /** The OUT that sends a signal. */
+    static String outLine(String cond) {
+        return cspec(cond, "", "OUT", SIGNAL_FIELD);
+    }
+
     /** Rewrite a program as the class comment describes. Free-form reads are left as they are. */
     public static synchronized String preprocess(String source) {
         String[] lines = source.split("\r?\n", -1);
         List<String> out = new ArrayList<>();
         boolean signals = false;
         for (String line : lines) {
+            // Signals other rewrites put in (Printers: EXCEPT).
+            if (isSpec(line, 'C') && up(cols(line, 36, 80)).startsWith(SIGNAL_FIELD)) signals = true;
             if (isSpec(line, 'F')) {
                 String name = up(cols(line, 7, 16));
                 String device = up(cols(line, 36, 42));
@@ -166,8 +178,8 @@ public final class RecordLocks {
                 }
                 if (flags != null && !f2.isEmpty()) {
                     String cond = cols(line, 7, 11);
-                    out.add(cspec(cond, "", "EVAL", SIGNAL_FIELD + " = '" + flags + " " + f2 + "'"));
-                    out.add(cspec(cond, "", "OUT", SIGNAL_FIELD));
+                    out.add(signalLine(cond, flags + " " + f2));
+                    out.add(outLine(cond));
                     signals = true;
                 }
             }

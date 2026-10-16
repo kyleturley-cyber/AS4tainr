@@ -26,19 +26,22 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/dspf.rs` | DDS display files: parser, drawing a record on a 5250 screen, input validation, response indicators |
 | `core/src/workstn.rs` | A program's display state: records on the screen (OVERLAY), subfiles (WRITE/READC/CHAIN/UPDATE), one EXFMT's interaction and paging |
 | `core/src/tn5250/` | 5250 display server: telnet + records (`telnet.rs`), data stream (`ds.rs`), EBCDIC (`ebcdic.rs`), screens (`session.rs`) |
+| `core/src/web/` | Browser 5250 terminal: HTTP + WebSocket (`mod.rs`, `ws.rs`, dependency-free), a 5250 display station that talks TN5250 to this process's server (`display.rs`), the page (`static/`). See `docs/web-terminal.md` |
 | `core/src/cl.rs` | CL parser and the command definition table (add new commands here first) |
 | `core/src/commands.rs` | CL command implementations for a job |
 | `core/src/clpgm.rs` | CL programs: parse/check (CRTBNDCL), expressions (exact decimals), run in the calling job with MONMSG |
 | `core/src/dtaara.rs` | Data areas: CRTDTAARA/CHGDTAARA/RTVDTAARA values, RPG `IN *LOCK`/`OUT` (PostgreSQL advisory locks) |
 | `core/src/jobs.rs` | Work management: jobs (`ibmish.jobs`), job logs, job queue QBATCH and its subsystem loop, user message queues |
+| `core/src/spool.rs` | Spooled files (`ibmish.spooled_files`, `ibmish.spool_lines`): printer output, QSYSPRT listings of batch display commands, QPJOBLOG |
 | `core/src/users.rs` | User profiles, Argon2id password hashes |
 | `core/src/main.rs` | `ibmish` CLI |
 | `core/tests/rla_test.rs` | Integration tests (need `IBMISH_TEST_DATABASE_URL`) |
 | `jvm/src/main/java/io/ibmish/bridge` | Dependency-free Java bridge client (keep it dependency-free) |
-| `jvm/src/main/java/io/ibmish/jvm` | Runner (`Launcher`, `Runner`): Jariko configuration, display files, EXFMT. `Workstation` rewrites WORKSTN programs (display record formats as DISK files, READC); `DisplayDBMManager`/`DisplayRecordFile` send those operations to core. `RecordLocks` adds signals for update files, N/E extenders and UNLOCK (record locks). Java, so it compiles with plain javac against the jar |
+| `jvm/src/main/java/io/ibmish/jvm` | Runner (`Launcher`, `Runner`): Jariko configuration, display files, EXFMT. `Workstation` rewrites WORKSTN programs (display record formats as DISK files, READC); `DisplayDBMManager`/`DisplayRecordFile` send those operations to core. `RecordLocks` adds signals for update files, N/E extenders and UNLOCK (record locks). `Printers` reads PRINTER F specs and O specs and turns EXCEPT into a signal that prints to a spooled file. Java, so it compiles with plain javac against the jar |
 | `jvm/src/main/kotlin/io/ibmish/jvm` | reload `DBMManager`/`DBFile` adapter (database I/O through the bridge) |
 | `jvm/src/test/java/.../BridgeConformance.java` | JDK-only stand-in runner used for end-to-end tests without Maven |
 | `tools/tn5250_driver.py`, `tools/e2e_5250.py` | Drive the real tn5250 client for end-to-end tests |
+| `tools/e2e_web.py` | Drives the browser terminal in Chromium (Playwright) |
 | `samples/` | DDS, CSV data, RPG and CL programs, golden outputs in `expected/`. The order entry app (Phase 2 gate) is described in `docs/order-entry.md` |
 | `scripts/samples.sh` | Creates every sample object in QGPL (used by demo.sh, the Docker entrypoint and CI). Add new sample objects here |
 | `docs/bridge-protocol.md` | Protocol spec. Update it in the same change as the protocol |
@@ -52,6 +55,7 @@ javac -d target/conformance-classes jvm/src/main/java/io/ibmish/bridge/*.java jv
 IBMISH_BIN=target/debug/ibmish IBMISH_RUNNER="java -cp target/conformance-classes io.ibmish.bridge.BridgeConformance" scripts/demo.sh
 cd jvm && ./gradlew fatJar   # needs Maven Central
 TN5250=/path/to/tn5250 python3 tools/e2e_5250.py 127.0.0.1:2323   # against a running `ibmish tn5250`
+python3 tools/e2e_web.py http://127.0.0.1:5250   # browser terminal in Chromium (pip install playwright), with --web-listen 127.0.0.1:5250
 ```
 
 ## Conventions

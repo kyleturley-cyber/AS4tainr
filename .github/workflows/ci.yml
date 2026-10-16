@@ -115,12 +115,17 @@ jobs:
         run: |
           IBMISH_BIN=target/debug/ibmish scripts/samples.sh
           IBMISH_WAITRCD=5 IBMISH_PGM_PATH=$PWD/samples/qrpglesrc nohup target/debug/ibmish tn5250 \
-            --listen 127.0.0.1:2323 --runner "java -jar jvm/build/libs/ibmish-jvm.jar" > tn5250-server.log 2>&1 &
+            --listen 127.0.0.1:2323 --web-listen 127.0.0.1:5250 --runner "java -jar jvm/build/libs/ibmish-jvm.jar" > tn5250-server.log 2>&1 &
           sleep 2
       - name: Sign on, CL commands, interactive RPG (subfiles) and the order entry app through tn5250
         env:
           TN5250: /tmp/tn5250/build/curses/tn5250
         run: python3 tools/e2e_5250.py 127.0.0.1:2323
+      - name: Browser 5250 terminal in Chromium
+        run: |
+          pip install playwright
+          python3 -m playwright install --with-deps chromium
+          python3 tools/e2e_web.py http://127.0.0.1:5250
       - if: failure()
         run: cat tn5250-server.log
 

@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ibmish 5250</title>
+<link rel="stylesheet" href="terminal.css">
+<script src="terminal.js" defer></script>
+</head>
+<body>
+<main class="app">
+  <header class="top">
+    <span class="brand">ibmish <span class="brand-sub">5250</span></span>
+    <span class="conn" id="conn" data-state="connecting">Connecting</span>
+  </header>
+
+  <section class="keyboard" aria-label="Function keys">
+    <div class="fkeys">
+      <div class="fkey-row" id="row-shift"></div>
+      <div class="fkey-row" id="row-base"></div>
+    </div>
+    <div class="cluster">
+      <button type="button" class="key" data-aid="HELP"><span class="cap">Help</span></button>
+      <button type="button" class="key" data-aid="ROLLDOWN" title="Page Up (Roll Down)"><span class="cap">PgUp</span></button>
+      <button type="button" class="key" data-local="reset" title="Reset (Esc)"><span class="cap">Reset</span></button>
+      <button type="button" class="key key-enter" data-aid="ENTER" title="Enter"><span class="cap">Enter</span></button>
+      <button type="button" class="key" data-aid="CLEAR"><span class="cap">Clear</span></button>
+      <button type="button" class="key" data-aid="ROLLUP" title="Page Down (Roll Up)"><span class="cap">PgDn</span></button>
+      <button type="button" class="key" data-local="fieldexit" title="Field Exit (numeric keypad Enter)"><span class="cap">Fld Exit</span></button>
+    </div>
+  </section>
+
+  <section class="screen-wrap">
+    <div class="screen" id="screen" role="application" aria-label="5250 display" tabindex="0"></div>
+    <div class="overlay" id="overlay" hidden>
+      <p id="overlay-text">The session ended.</p>
+      <button type="button" class="key" id="reconnect"><span class="cap">Connect again</span></button>
+    </div>
+  </section>
+
+  <footer class="oia" aria-live="polite">
+    <span id="oia-lock"></span>
+    <span id="oia-msg"></span>
+    <span class="oia-right"><span id="oia-ins"></span><span id="oia-pos">01/001</span></span>
+  </footer>
+
+  <details class="help">
+    <summary>Keyboard</summary>
+    <dl>
+      <dt>F1&ndash;F12</dt><dd>F1&ndash;F12. Shift+F1&ndash;F12 for F13&ndash;F24.</dd>
+      <dt>Enter</dt><dd>Enter. Keypad Enter is Field Exit.</dd>
+      <dt>Tab, Shift+Tab</dt><dd>Next and previous field.</dd>
+      <dt>Page Up, Page Down</dt><dd>Roll Down, Roll Up.</dd>
+      <dt>Insert</dt><dd>Insert mode on or off.</dd>
+      <dt>Keypad + and &minus;</dt><dd>Field+ and Field&minus; in numeric fields.</dd>
+      <dt>Esc</dt><dd>Reset an input error.</dd>
+      <dt>Click</dt><dd>Moves the cursor. Clicking a key hint such as <code>F3=Exit</code> on the screen presses that key.</dd>
+    </dl>
+  </details>
+</main>
+</body>
+</html>

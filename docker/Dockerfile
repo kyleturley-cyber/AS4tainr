@@ -22,7 +22,10 @@ COPY scripts/demo.sh scripts/samples.sh /opt/ibmish/
 COPY docker/entrypoint.sh /opt/ibmish/entrypoint.sh
 ENV IBMISH_RUNNER="java -jar /opt/ibmish/ibmish-jvm.jar" \
     IBMISH_PGM_PATH=/opt/ibmish/samples/qrpglesrc \
-    IBMISH_SAMPLES=/opt/ibmish/samples
+    IBMISH_SAMPLES=/opt/ibmish/samples \
+    IBMISH_WEB_LISTEN=0.0.0.0:8080
 # 5250 display sessions (telnet). Map it to a free host port, e.g. 2323.
 EXPOSE 23
+# The browser 5250 terminal (HTTP). Map it to a free host port, e.g. 5250.
+EXPOSE 8080
 ENTRYPOINT ["/opt/ibmish/entrypoint.sh"]

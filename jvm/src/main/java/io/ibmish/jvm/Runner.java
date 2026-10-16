@@ -120,8 +120,14 @@ public final class Runner {
         configuration.getJarikoCallback().setReadDataArea(dataAreas::in);
         configuration.getJarikoCallback().setWriteDataArea((name, value) -> {
             if (name.equalsIgnoreCase(RecordLocks.SIGNAL_AREA)) {
-                // Record lock signals put in by RecordLocks.preprocess.
-                if (!RecordLocks.signal(value)) dataAreas.unlock(value.trim().split("\\s+")[1]);
+                String v = value.trim();
+                if (v.startsWith("X ")) {
+                    // EXCEPT, put in by Printers.preprocess.
+                    Printers.except(v.substring(2).trim(), Workstation.interpreter(), bridge);
+                } else if (!RecordLocks.signal(v)) {
+                    // Record lock signals put in by RecordLocks.preprocess.
+                    dataAreas.unlock(v.split("\\s+")[1]);
+                }
             } else {
                 dataAreas.out(name);
             }
@@ -138,6 +144,12 @@ public final class Runner {
             System.err.println("RNQ0202: program " + program + " ended with an error: " + why);
             System.exit(1);
         } finally {
+            try {
+                // Spooled files the program printed are complete.
+                Printers.closeAll(bridge);
+            } catch (Exception e) {
+                System.err.println("ibmish: closing spooled files: " + e.getMessage());
+            }
             try {
                 bridge.close();
             } catch (Exception ignored) {
@@ -386,7 +398,8 @@ public final class Runner {
             } catch (IOException e) {
                 throw new IllegalStateException("cannot read " + f + ": " + e.getMessage(), e);
             }
-            String rewritten = RecordLocks.preprocess(Workstation.preprocess(source, displays::formats));
+            String rewritten = RecordLocks.preprocess(
+                    Printers.preprocess(Workstation.preprocess(source, displays::formats), nameOrSource));
             synchronized (connections) {
                 for (Workstation.Format fmt : Workstation.formats()) {
                     boolean known = connections.stream().anyMatch(c -> c.getFileName().equalsIgnoreCase(fmt.name));

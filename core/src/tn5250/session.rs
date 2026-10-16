@@ -949,8 +949,6 @@ async fn show_list(term: &mut Term, job: &mut Job<'_>, d: ListDisplay) -> Result
             }
             ListResult::Refresh => refresh_top(job, &mut stack, &mut message).await,
             ListResult::Run(cmds) => {
-                // Options change what the list shows (ENDJOB, ...).
-                refresh_top(job, &mut stack, &mut message).await;
                 let mut shown = Vec::new();
                 for c in cmds {
                     match job.run(&c).await {
@@ -959,6 +957,12 @@ async fn show_list(term: &mut Term, job: &mut Job<'_>, d: ListDisplay) -> Result
                         Ok(_) => {}
                         Err(e) => message = e.to_string().lines().last().unwrap_or("").to_string(),
                     }
+                }
+                // Options change what the list shows (ENDJOB, DLTSPLF, ...).
+                let kept = message.clone();
+                refresh_top(job, &mut stack, &mut message).await;
+                if message.is_empty() {
+                    message = kept;
                 }
                 // Shown in the order the options were typed.
                 stack.extend(shown.into_iter().rev());

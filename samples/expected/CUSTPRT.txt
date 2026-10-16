@@ -1,0 +1,10 @@
+10/16/26                   Customer Balance Report                        Page    1
+
+ Number    Name                             City                           Balance
+      1    Acme Tooling                     Des Moines                    1,250.50
+      2    Midwest Fasteners                Chicago                         310.00
+      3    Bluebird Supply                  Omaha                              .00
+      4    Prairie Freight                  Lincoln                   9,999,999.99
+      5    Lake, Pine & Co                  Duluth                           75.25-*
+
+         Customers:     5                         Total balance:     10,001,485.24

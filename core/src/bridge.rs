@@ -19,7 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_postgres::{Client, NoTls};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Clone, Debug)]
 pub struct BridgeConfig {
@@ -104,6 +104,15 @@ struct Request {
     /// open: the file is opened for update (RPG file type U).
     #[serde(default)]
     update: Option<bool>,
+    /// Spooled files: the spooled file (from splopen).
+    #[serde(default)]
+    spl: Option<i64>,
+    /// splopen: user data (the program name).
+    #[serde(default)]
+    user_data: Option<String>,
+    /// splwrite: lines as [page, line, text].
+    #[serde(default)]
+    lines: Option<Vec<(i32, i32, String)>>,
 }
 
 struct Session {
@@ -119,6 +128,11 @@ struct Session {
     locked: Vec<(String, String)>,
     /// The job's number, for WRKACTJOB's LCKW while waiting for a record.
     job_number: Option<i64>,
+    /// Spooled files opened on this connection. Without a job (`ibmish
+    /// call`), printed lines go to standard output instead: the last
+    /// (page, line) printed per spooled file.
+    stdout_spool: HashMap<i64, (i32, i32)>,
+    next_stdout_spool: i64,
 }
 
 fn indicators(s: Option<String>) -> [bool; 100] {
@@ -134,6 +148,16 @@ fn read_json(r: ReadResult) -> Value {
 }
 
 impl Session {
+    /// The job this bridge serves, when it is a system job.
+    fn job_id(&self) -> Option<crate::jobs::JobId> {
+        let spec = crate::jobs::parse_spec(self.config.job.as_deref()?).ok()?;
+        Some(crate::jobs::JobId {
+            number: spec.number?,
+            user: spec.user?,
+            name: spec.name,
+        })
+    }
+
     async fn display_file(&mut self, name: &str) -> Result<Arc<dspf::DisplayFile>> {
         let key = name.to_ascii_uppercase();
         if let Some(f) = self.displays.get(&key) {
@@ -403,6 +427,56 @@ impl Session {
                     }
                 }
             }
+            "splopen" => {
+                let file = req.file.ok_or_else(|| anyhow!("missing 'file'"))?;
+                match self.job_id() {
+                    Some(job) => {
+                        let id = crate::spool::open(
+                            &self.client,
+                            &job,
+                            &file,
+                            req.user_data.as_deref().unwrap_or(""),
+                        )
+                        .await?;
+                        Ok(json!({ "spl": id }))
+                    }
+                    None => {
+                        // No job: print to standard output.
+                        let id = self.next_stdout_spool;
+                        self.next_stdout_spool -= 1;
+                        self.stdout_spool.insert(id, (1, 0));
+                        Ok(json!({ "spl": id }))
+                    }
+                }
+            }
+            "splwrite" => {
+                let id = req.spl.ok_or_else(|| anyhow!("missing 'spl'"))?;
+                let lines = req.lines.unwrap_or_default();
+                if let Some(pos) = self.stdout_spool.get_mut(&id) {
+                    for (page, line, text) in lines {
+                        if page > pos.0 {
+                            println!("\x0c");
+                            *pos = (page, 0);
+                        }
+                        while pos.1 + 1 < line {
+                            println!();
+                            pos.1 += 1;
+                        }
+                        println!("{}", text.trim_end());
+                        pos.1 = line;
+                    }
+                } else {
+                    crate::spool::write(&self.client, id, &lines).await?;
+                }
+                Ok(json!({}))
+            }
+            "splclose" => {
+                let id = req.spl.ok_or_else(|| anyhow!("missing 'spl'"))?;
+                if self.stdout_spool.remove(&id).is_none() {
+                    crate::spool::close(&self.client, id).await?;
+                }
+                Ok(json!({}))
+            }
             other => Err(anyhow!("unknown op '{other}'")),
         }
     }
@@ -451,6 +525,8 @@ async fn handle_conn(
         next_handle: 1,
         locked: Vec::new(),
         job_number,
+        stdout_spool: HashMap::new(),
+        next_stdout_spool: -1,
     };
     let (rd, mut wr) = stream.into_split();
     let mut lines = BufReader::new(rd).lines();

@@ -262,6 +262,35 @@ with Tn5250(HOST) as t:
           "DSPDTAARA shows the data area", t)
     t.fkey(3); t.wait_for("Command Entry")
 
+    # Spooled files: a printed RPG report (O specs, EXCEPT) and a display
+    # command in batch both become spooled files QSYSPRT.
+    command(t, "sbmjob cmd(call custprt) job(custprt)", "submitted to job queue QBATCH")
+    command(t, "sbmjob cmd(dsppfm custmast) job(listing)", "submitted to job queue QBATCH")
+    command(t, "wrksplf", "Work with All Spooled Files")
+    for _ in range(60):
+        if t.text().count("QSYSPRT") >= 2:
+            break
+        t.fkey(5)
+        t.pump(1.5)
+    check(t.text().count("QSYSPRT") >= 2 and "CUSTPRT" in t.text(),
+          "WRKSPLF lists the report (user data CUSTPRT) and the DSPPFM listing", t)
+    t.type("5"); t.enter()
+    t.wait_for("Display Spooled File")
+    screen = t.text()
+    check("Customer Balance Report" in screen and "Midwest Fasteners" in screen and "Customers:     5" in screen,
+          "DSPSPLF shows the report as printed: heading, detail lines, totals", t)
+    t.fkey(20)
+    t.pump(1)
+    t.wait_for("75.25-*")
+    check("Page    1" in t.text(),
+          "F20 shows the rest of the 132-column lines: page number, edit code J and the conditioned '*'", t)
+    t.fkey(12); t.wait_for("Work with All Spooled Files")
+    t.tab(); t.type("4"); t.enter()
+    t.wait_for("deleted")
+    check("/LISTING" not in t.text() and "/CUSTPRT" in t.text(),
+          "option 4 deletes the listing (DLTSPLF); the list is refreshed", t)
+    t.fkey(3); t.wait_for("Command Entry")
+
     # F4 prompting, from the command definitions.
     t.type("crtlib"); t.fkey(4)
     t.wait_for("Create Library (CRTLIB)")
@@ -283,8 +312,8 @@ with Tn5250(HOST) as t:
     t.wait_for("Command Groups")
     check("4. User profile commands" in t.text() and "Selection or command" in t.text(),
           "F4 on an empty command line shows a numbered menu of command groups", t)
-    t.type("9"); t.enter()
-    t.wait_for("Selection 9 is not valid")
+    t.type("99"); t.enter()  # the menu has fewer groups than that
+    t.wait_for("Selection 99 is not valid")
     check(True, "a number that is not on the menu is rejected", t)
     t.type("4"); t.enter()
     t.wait_for("User Profile Commands")

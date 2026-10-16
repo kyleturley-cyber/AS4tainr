@@ -1,6 +1,6 @@
-# Bridge protocol (version 4)
+# Bridge protocol (version 5)
 
-Version 4 added record locks: `open` takes `update`, reads take `lock`, and the `unlock` operation. Version 3 added the data area operations `dtaara_in`, `dtaara_out` and `dtaara_unlock`. Version 2 added the display file operations `dspwrite`, `sflwrite`, `sflchain`, `sflreadc` and `sflupdate`.
+Version 5 added spooled files: `splopen`, `splwrite`, `splclose`. Version 4 added record locks: `open` takes `update`, reads take `lock`, and the `unlock` operation. Version 3 added the data area operations `dtaara_in`, `dtaara_out` and `dtaara_unlock`. Version 2 added the display file operations `dspwrite`, `sflwrite`, `sflchain`, `sflreadc` and `sflupdate`.
 
 The bridge connects the JVM (Jariko running RPG) to ibmish core, which carries out every file operation. It uses TCP on loopback only, with one UTF-8 JSON object per line in each direction, strictly request then response.
 
@@ -29,6 +29,9 @@ Records are objects that map field names to strings:
 | `hello` | | `server`, `version` | Sent first; clients refuse a version mismatch |
 | `metadata` | `file` | `library`, `name`, `format`, `text`, `unique`, `keys`, `fields[]` | Each field has `name`, `type` (`A`/`P`/`S`), `length`, `decimals`, `numeric`, `text`. `file` may be `LIB/FILE`; otherwise the library list is searched |
 | `open` | `file`, `update`? | `handle` | With `update: true` (RPG file type U) the file locks each record it reads; see [record-locks.md](record-locks.md) |
+| `splopen` | `file`, `user_data` | `spl` | Starts a spooled file for the job (printer output). Without a job (`ibmish call`), lines go to standard output instead |
+| `splwrite` | `spl`, `lines` | | `lines` is a list of `[page, line, text]` |
+| `splclose` | `spl` | | The spooled file is complete (status RDY); see [spooled-files.md](spooled-files.md) |
 | `unlock` | `handle` | | Releases the record this open file holds locked (RPG `UNLOCK`) |
 | `close` | `handle` | | |
 | `setll` | `handle`, `keys` | `equal` | `keys: []` means `*LOVAL`. `equal` is `%EQUAL` |

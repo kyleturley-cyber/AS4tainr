@@ -145,7 +145,20 @@ impl Job<'_> {
             "ENDJOB" => self.endjob(&cmd).await,
             "SNDMSG" => self.sndmsg(&cmd).await,
             "DSPMSG" => self.dspmsg(&cmd).await,
-            "SIGNOFF" => Ok(Outcome::SignOff),
+            "SIGNOFF" => {
+                // LOG(*LIST): the job log is kept as a spooled file.
+                if cmd.get("LOG") == "*LIST" {
+                    if let Some(id) = &self.id {
+                        let lines = crate::spool::job_log_lines(self.client, id).await?;
+                        crate::spool::print_lines(self.client, id, "QPJOBLOG", &id.name, &lines)
+                            .await?;
+                    }
+                }
+                Ok(Outcome::SignOff)
+            }
+            "WRKSPLF" => self.wrksplf(&cmd).await,
+            "DSPSPLF" => self.dspsplf(&cmd).await,
+            "DLTSPLF" => self.dltsplf(&cmd).await,
             other => bail!("CPD0030: Command {other} is not implemented yet."),
         }
     }
@@ -685,6 +698,18 @@ impl Job<'_> {
 
     async fn dspjoblog(&mut self, cmd: &Command) -> Result<Outcome> {
         let job = self.job_named(cmd.get("JOB")).await?;
+        if cmd.get("OUTPUT") == "*PRINT" {
+            let me = self
+                .id
+                .clone()
+                .ok_or_else(|| anyhow!("OUTPUT(*PRINT) needs a job to own the spooled file."))?;
+            let lines = crate::spool::job_log_lines(self.client, &job.id).await?;
+            crate::spool::print_lines(self.client, &me, "QPJOBLOG", &job.id.name, &lines).await?;
+            return Ok(Outcome::Messages(vec![format!(
+                "Job log of {} printed to spooled file QPJOBLOG.",
+                job.id
+            )]));
+        }
         let entries = jobs::job_log(self.client, job.id.number).await?;
         let rows = entries
             .iter()
@@ -805,6 +830,110 @@ impl Job<'_> {
             rows,
             ..Default::default()
         }))
+    }
+
+    async fn wrksplf(&mut self, cmd: &Command) -> Result<Outcome> {
+        let user = match cmd.get("SELECT") {
+            "*CURRENT" => self.user.clone(),
+            u => {
+                if u != self.user {
+                    self.require_secadm("work with other users' spooled files")
+                        .await?;
+                }
+                u.to_string()
+            }
+        };
+        let files = crate::spool::for_user(self.client, &user).await?;
+        let fmt = |file: &str,
+                   user: &str,
+                   data: &str,
+                   status: &str,
+                   pages: &str,
+                   job: &str,
+                   nbr: &str| {
+            format!(
+                "{file:<10}  {user:<10}  {data:<10}  {status:<4}  {pages:>5}  {job:<24}  {nbr:>4}"
+            )
+        };
+        let rows = files
+            .iter()
+            .map(|f| {
+                fmt(
+                    &f.file,
+                    &f.user,
+                    &f.user_data,
+                    &f.status,
+                    &f.pages.to_string(),
+                    &f.job_name,
+                    &f.number.to_string(),
+                )
+            })
+            .collect();
+        Ok(Outcome::Display(ListDisplay {
+            title: "Work with All Spooled Files".into(),
+            info: vec![("User".into(), user.clone())],
+            heading: fmt("File", "User", "User data", "Sts", "Pages", "Job", "Nbr"),
+            rows,
+            options: vec![
+                (4, "Delete".into(), "DLTSPLF {}".into()),
+                (5, "Display".into(), "DSPSPLF {}".into()),
+            ],
+            keys: files
+                .iter()
+                .map(|f| format!("FILE({}) JOB({}) SPLNBR({})", f.file, f.job_name, f.number))
+                .collect(),
+            refresh: Some(format!("WRKSPLF SELECT({user})")),
+        }))
+    }
+
+    /// The spooled file a FILE/JOB/SPLNBR command names.
+    async fn spooled_file(&self, cmd: &Command) -> Result<crate::spool::SpooledFile> {
+        let job = self.job_named(cmd.get("JOB")).await?;
+        let number = match cmd.get("SPLNBR") {
+            "*LAST" | "" => None,
+            n => Some(
+                n.parse::<i32>()
+                    .map_err(|_| anyhow!("SPLNBR({n}) is not a number."))?,
+            ),
+        };
+        let f = crate::spool::find(self.client, cmd.get("FILE"), job.id.number, number).await?;
+        if f.user != self.user {
+            self.require_secadm("use other users' spooled files")
+                .await?;
+        }
+        Ok(f)
+    }
+
+    async fn dspsplf(&mut self, cmd: &Command) -> Result<Outcome> {
+        let f = self.spooled_file(cmd).await?;
+        let pages = crate::spool::pages(self.client, f.id).await?;
+        let mut rows = Vec::new();
+        for (i, page) in pages.iter().enumerate() {
+            if i > 0 {
+                rows.push(format!("{:-^40}", format!(" Page {} ", i + 1)));
+            }
+            rows.extend(page.iter().cloned());
+        }
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display Spooled File".into(),
+            info: vec![
+                ("File".into(), f.file.clone()),
+                ("Job".into(), format!("{}   Number {}", f.job_name, f.number)),
+                ("Pages".into(), f.pages.to_string()),
+            ],
+            heading: "*...+....1....+....2....+....3....+....4....+....5....+....6....+....7....+....8....+....9....+....0....+....1....+....2....+....3..".into(),
+            rows,
+            ..Default::default()
+        }))
+    }
+
+    async fn dltsplf(&mut self, cmd: &Command) -> Result<Outcome> {
+        let f = self.spooled_file(cmd).await?;
+        crate::spool::delete(self.client, f.id).await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Spooled file {} number {} deleted.",
+            f.file, f.number
+        )]))
     }
 
     async fn crtdtaara(&mut self, cmd: &Command) -> Result<Outcome> {

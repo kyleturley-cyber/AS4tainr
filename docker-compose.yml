@@ -2,7 +2,8 @@
 #
 #   docker compose up --build
 #
-# Then connect a 5250 emulator (tn5250, tn5250j, IBM ACS) to localhost:2323
+# Then open http://localhost:5250 for the 5250 terminal in your browser, or
+# connect a 5250 emulator (tn5250, tn5250j, IBM ACS) to localhost:2323,
 # and sign on as QSECOFR. On first start the password is QSECOFR and must be
 # changed, unless IBMISH_QSECOFR_PASSWORD is set below.
 #
@@ -35,7 +36,8 @@ services:
       # IBMISH_QSECOFR_PASSWORD: change-me   # skips the forced first change
       # IBMISH_QPWDLVL: "2"   # case-sensitive passwords (default 0: not case sensitive, like IBM i as shipped)
     ports:
-      - "2323:23"
+      - "2323:23"   # 5250 emulators (telnet)
+      - "5250:8080" # browser 5250 terminal: http://localhost:5250
 
   demo:
     image: ghcr.io/ibmish/ibmish:dev

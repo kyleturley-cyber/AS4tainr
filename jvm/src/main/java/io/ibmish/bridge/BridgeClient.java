@@ -19,7 +19,7 @@ import java.util.Map;
  * See docs/bridge-protocol.md.
  */
 public final class BridgeClient implements AutoCloseable {
-    public static final int PROTOCOL_VERSION = 4;
+    public static final int PROTOCOL_VERSION = 5;
 
     private final Socket socket;
     private final BufferedReader in;
@@ -309,6 +309,31 @@ public final class BridgeClient implements AutoCloseable {
     public void dataAreaUnlock(String name) {
         Map<String, Object> m = req("dtaara_unlock");
         m.put("name", name);
+        call(m);
+    }
+
+    /** Start a spooled file (printer file output) for this job; returns its id. */
+    public long spoolOpen(String file, String userData) {
+        Map<String, Object> m = req("splopen");
+        m.put("file", file);
+        m.put("user_data", userData);
+        return ((Number) call(m).get("spl")).longValue();
+    }
+
+    /** Add lines to a spooled file: each is {page, line, text}. */
+    public void spoolWrite(long spl, List<Object[]> lines) {
+        Map<String, Object> m = req("splwrite");
+        m.put("spl", spl);
+        List<Object> ls = new java.util.ArrayList<>();
+        for (Object[] l : lines) ls.add(java.util.Arrays.asList(l));
+        m.put("lines", ls);
+        call(m);
+    }
+
+    /** The spooled file is complete. */
+    public void spoolClose(long spl) {
+        Map<String, Object> m = req("splclose");
+        m.put("spl", spl);
         call(m);
     }
 

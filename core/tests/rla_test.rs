@@ -371,7 +371,7 @@ async fn bridge_protocol_round_trip() {
     }
     server.abort();
 
-    assert_eq!(resp[0]["version"], 4);
+    assert_eq!(resp[0]["version"], 5);
     assert_eq!(resp[1]["format"], "ORDLINR");
     assert_eq!(resp[1]["keys"], json!(["ORDNO", "LINNO"]));
     assert_eq!(resp[1]["fields"][4]["decimals"], 2);
@@ -1940,4 +1940,204 @@ async fn bridge_record_locks() {
     );
     assert_eq!(b.ask(chain(&hb2, "4")).await["found"], true);
     server.abort();
+}
+
+/// Spooled files: lines kept by page and line, WRKSPLF/DSPSPLF/DLTSPLF,
+/// display commands in batch printing to QSYSPRT, and the job log of a
+/// batch job that ends abnormally kept as QPJOBLOG (QDFTJOBD has
+/// LOG(4 0 *NOLIST): no job log when the job ends normally). Also the
+/// bridge's splopen/splwrite/splclose.
+#[tokio::test]
+async fn spooled_files() {
+    use ibmish_core::commands::{Environment, Job, Outcome};
+    use ibmish_core::{jobs, spool};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let user = format!("U{}", &lib[1..]);
+    let env = Environment {
+        database_url: url.clone(),
+        runner: "false".into(),
+        call_timeout: std::time::Duration::from_secs(5),
+    };
+    let id = jobs::start_interactive(
+        &client,
+        "SPLDEV",
+        &user,
+        Some(&lib),
+        std::slice::from_ref(&lib),
+    )
+    .await
+    .unwrap();
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: user.clone(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: Some(id.clone()),
+    };
+
+    // Pages: lines land where they were printed; gaps are blank lines.
+    let spl = spool::open(&client, &id, "QSYSPRT", "MYPGM").await.unwrap();
+    spool::write(
+        &client,
+        spl,
+        &[
+            (1, 1, "Title   ".into()),
+            (1, 3, "Body".into()),
+            (2, 1, "Page two".into()),
+        ],
+    )
+    .await
+    .unwrap();
+    spool::close(&client, spl).await.unwrap();
+    let pages = spool::pages(&client, spl).await.unwrap();
+    assert_eq!(
+        pages,
+        vec![
+            vec!["Title".to_string(), String::new(), "Body".into()],
+            vec!["Page two".to_string()]
+        ]
+    );
+    let f = spool::find(&client, "qsysprt", id.number, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (f.number, f.pages, f.status.as_str(), f.user_data.as_str()),
+        (1, 2, "RDY", "MYPGM")
+    );
+
+    // The bridge: a program's printer output becomes a spooled file of its job.
+    let listener = bridge::bind(0).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(bridge::serve(
+        listener,
+        bridge::BridgeConfig {
+            database_url: url.clone(),
+            library_list: vec![lib.clone()],
+            display: None,
+            job: Some(id.to_string()),
+            record_wait: None,
+        },
+    ));
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (rd, mut wr) = stream.into_split();
+    let mut lines = BufReader::new(rd).lines();
+    let mut ask = async |req: Value| -> Value {
+        wr.write_all(format!("{req}\n").as_bytes()).await.unwrap();
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap()
+    };
+    let r = ask(json!({"op": "splopen", "file": "QSYSPRT", "user_data": "CUSTPRT"})).await;
+    let n = r["spl"].as_i64().unwrap();
+    ask(json!({"op": "splwrite", "spl": n, "lines": [[1, 1, "Report"], [1, 2, "line 2"]]})).await;
+    ask(json!({"op": "splclose", "spl": n})).await;
+    server.abort();
+    let f = spool::find(&client, "QSYSPRT", id.number, None)
+        .await
+        .unwrap();
+    assert_eq!((f.number, f.user_data.as_str(), f.pages), (2, "CUSTPRT", 1));
+
+    // WRKSPLF lists them; DSPSPLF shows one; DLTSPLF deletes it.
+    let Outcome::Display(d) = job.run("WRKSPLF").await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(d.rows.len(), 2);
+    assert!(d.keys[1].starts_with(&format!("FILE(QSYSPRT) JOB({id}) SPLNBR(2)")));
+    let Outcome::Display(d) = job
+        .run(&format!("DSPSPLF FILE(QSYSPRT) JOB({id}) SPLNBR(1)"))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        d.rows,
+        [
+            "Title",
+            "",
+            "Body",
+            "---------------- Page 2 ----------------",
+            "Page two"
+        ]
+    );
+    job.run("DLTSPLF QSYSPRT SPLNBR(1)").await.unwrap();
+    assert!(spool::find(&client, "QSYSPRT", id.number, Some(1))
+        .await
+        .is_err());
+
+    // DSPJOBLOG OUTPUT(*PRINT).
+    job.run("DSPJOBLOG OUTPUT(*PRINT)").await.unwrap();
+    assert!(spool::find(&client, "QPJOBLOG", id.number, None)
+        .await
+        .is_ok());
+
+    // Batch: a display command prints QSYSPRT; an abnormal end keeps QPJOBLOG.
+    let run_batch = |cmd: String| {
+        let env = env.clone();
+        let client = &client;
+        let user = user.clone();
+        let lib = lib.clone();
+        async move {
+            let b = jobs::submit(
+                client,
+                &jobs::Submit {
+                    name: "SPLTEST".into(),
+                    user: user.clone(),
+                    command: cmd,
+                    jobq: "SPLTESTQ".into(), // not QBATCH: a running server must not take it
+                    curlib: Some(lib.clone()),
+                    libl: vec![lib],
+                    submitted_by: user,
+                    submitter: None,
+                },
+            )
+            .await
+            .unwrap();
+            let info = jobs::claim(client, b.number).await.unwrap().unwrap();
+            let normal = jobs::run_batch_job(&env, &info).await.unwrap();
+            (b, normal)
+        }
+    };
+    let (b1, normal) = run_batch(format!("DSPPFM {lib}/CUSTMAST")).await;
+    assert!(normal);
+    let pages = spool::pages(
+        &client,
+        spool::find(&client, "QSYSPRT", b1.number, None)
+            .await
+            .unwrap()
+            .id,
+    )
+    .await
+    .unwrap();
+    assert!(
+        pages[0].iter().any(|l| l.contains("Bluebird Supply")),
+        "{pages:?}"
+    );
+    assert!(
+        spool::find(&client, "QPJOBLOG", b1.number, None)
+            .await
+            .is_err(),
+        "no job log after a normal end"
+    );
+    let (b2, normal) = run_batch("DLTDTAARA NOPE".into()).await;
+    assert!(!normal);
+    let log = spool::pages(
+        &client,
+        spool::find(&client, "QPJOBLOG", b2.number, None)
+            .await
+            .unwrap()
+            .id,
+    )
+    .await
+    .unwrap();
+    assert!(log[0].iter().any(|l| l.contains("CPF1015")), "{log:?}");
+    let Outcome::Display(d) = job.run("WRKSPLF").await.unwrap() else {
+        panic!()
+    };
+    assert!(d
+        .keys
+        .iter()
+        .any(|k| k.contains("QPJOBLOG") && k.contains("/SPLTEST)")));
+    jobs::end(&client, &id, true).await.unwrap();
 }

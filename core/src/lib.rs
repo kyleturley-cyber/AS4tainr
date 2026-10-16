@@ -8,7 +8,9 @@
 //! - [`sql`]: SQL in the DB2 for i dialect
 //! - [`dspf`], [`workstn`]: display files, subfiles and the screen
 //! - [`dtaara`]: data areas
+//! - [`spool`]: spooled files (printed output)
 //! - [`jobs`]: jobs, job queues, job logs, message queues, the QBATCH subsystem
+//! - [`web`]: the browser 5250 terminal
 
 pub mod bridge;
 pub mod catalog;
@@ -20,7 +22,9 @@ pub mod dspf;
 pub mod dtaara;
 pub mod jobs;
 pub mod rla;
+pub mod spool;
 pub mod sql;
 pub mod tn5250;
 pub mod users;
+pub mod web;
 pub mod workstn;

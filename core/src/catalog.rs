@@ -861,6 +861,27 @@ pub async fn create_logical_file(
     Ok(())
 }
 
+/// The physical file whose records a file holds: the file itself, or for
+/// a logical file the physical file it is built over.
+pub async fn physical_file_of(
+    client: &Client,
+    library: &str,
+    name: &str,
+) -> Result<(String, String)> {
+    Ok(
+        match client
+            .query_opt(
+                "SELECT pf_library, pf_name FROM ibmish.logical_files WHERE library=$1 AND name=$2",
+                &[&library, &name],
+            )
+            .await?
+        {
+            Some(r) => (r.get(0), r.get(1)),
+            None => (library.to_string(), name.to_string()),
+        },
+    )
+}
+
 /// Resolve a file name through the library list (first match wins).
 pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Result<FileRef> {
     let (lib_q, name) = match name.split_once('/') {

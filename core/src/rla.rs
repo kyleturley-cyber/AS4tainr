@@ -68,6 +68,41 @@ pub struct OpenFile {
     current_rrn: Option<i64>,
     eof: bool,
     equal: bool,
+    /// Opened for update (RPG file type U): reads lock the record found.
+    pub update: bool,
+    /// The record this open file holds locked, if any.
+    locked: Option<i64>,
+    /// What locks are taken on: the physical file (`LIB/FILE`), also when
+    /// this is a logical file over it.
+    lock_name: String,
+}
+
+/// Advisory lock class for record locks (a hash of the physical file
+/// name is the first key, the relative record number the second).
+const RECORD_LOCK_SQL: &str = "SELECT pg_advisory_lock(hashtext($1), ($2::bigint)::int)";
+const RECORD_TRY_LOCK_SQL: &str = "SELECT pg_try_advisory_lock(hashtext($1), ($2::bigint)::int)";
+const RECORD_UNLOCK_SQL: &str = "SELECT pg_advisory_unlock(hashtext($1), ($2::bigint)::int)";
+
+/// The job holding a record lock, by its database session's
+/// application_name (the bridge sets it to the job's name).
+async fn lock_holder(client: &Client, lock_name: &str, rrn: i64) -> Option<String> {
+    let row = client
+        .query_opt(
+            "SELECT a.application_name FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+             WHERE l.locktype = 'advisory' AND l.granted AND l.objsubid = 2
+               AND l.classid = (hashtext($1)::bigint & 4294967295)::oid
+               AND l.objid = ($2::bigint & 4294967295)::oid
+               AND l.pid <> pg_backend_pid() LIMIT 1",
+            &[&lock_name, &rrn],
+        )
+        .await
+        .ok()??;
+    let name: String = row.get(0);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 enum Dir {
@@ -84,11 +119,125 @@ impl OpenFile {
             current_rrn: None,
             eof: false,
             equal: false,
+            update: false,
+            locked: None,
+            lock_name: String::new(),
         }
     }
 
     pub fn eof(&self) -> bool {
         self.eof
+    }
+
+    /// Open for update: reads lock records. `lock_name` names the physical
+    /// file the records belong to.
+    pub fn for_update(mut self, lock_name: String) -> Self {
+        self.update = true;
+        self.lock_name = lock_name;
+        self
+    }
+
+    /// The record this open file holds locked.
+    pub fn locked(&self) -> Option<i64> {
+        self.locked
+    }
+
+    /// Record locks after a read (IBM i rules for a file opened for
+    /// update): reading releases the record locked before, and the record
+    /// read is locked, unless `lock` is false (the N extender). When another
+    /// job holds it, the read waits (the session's lock_timeout, WAITRCD)
+    /// and then fails with CPF5027; the record is read again once it is
+    /// locked, so the program sees the other job's changes.
+    pub async fn lock_after_read(
+        &mut self,
+        client: &Client,
+        mut r: ReadResult,
+        lock: bool,
+        job_number: Option<i64>,
+    ) -> Result<ReadResult> {
+        let want = if self.update && lock && r.found {
+            r.rrn
+        } else {
+            None
+        };
+        if self.locked.is_some() && self.locked != want {
+            self.release(client).await?;
+        }
+        let Some(rrn) = want else { return Ok(r) };
+        if self.locked == Some(rrn) {
+            return Ok(r);
+        }
+        let got: bool = client
+            .query_one(RECORD_TRY_LOCK_SQL, &[&self.lock_name, &rrn])
+            .await?
+            .get(0);
+        if !got {
+            // WRKACTJOB shows the job waiting for a lock (LCKW).
+            let set = |a: &'static str| async move {
+                if let Some(n) = job_number {
+                    let _ = client
+                        .execute(
+                            "UPDATE ibmish.jobs SET activity=$2 WHERE number=$1",
+                            &[&n, &a],
+                        )
+                        .await;
+                }
+            };
+            set("LCKW").await;
+            let waited = client
+                .execute(RECORD_LOCK_SQL, &[&self.lock_name, &rrn])
+                .await;
+            set("RUN").await;
+            if let Err(e) = waited {
+                if e.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE) {
+                    self.current_rrn = None;
+                    let by = lock_holder(client, &self.lock_name, rrn)
+                        .await
+                        .map(|j| format!(" by job {j}"))
+                        .unwrap_or_default();
+                    bail!(
+                        "CPF5027: Record {rrn} in file {} is in use{by}.",
+                        self.lock_name
+                    );
+                }
+                return Err(e.into());
+            }
+            // Another job may have changed or deleted it meanwhile.
+            match self
+                .fetch_one(
+                    client,
+                    "t.rrn = CAST($1::text AS bigint)",
+                    "t.rrn",
+                    &[rrn.to_string()],
+                )
+                .await?
+            {
+                Some((rec, _)) => r.record = Some(rec),
+                None => {
+                    client
+                        .execute(RECORD_UNLOCK_SQL, &[&self.lock_name, &rrn])
+                        .await?;
+                    self.current_rrn = None;
+                    bail!(
+                        "CPF5013: Record {rrn} in file {} was deleted by another job.",
+                        self.lock_name
+                    );
+                }
+            }
+        }
+        self.locked = Some(rrn);
+        Ok(r)
+    }
+
+    /// Release the record lock this open file holds (UPDATE, DELETE,
+    /// UNLOCK, close).
+    pub async fn release(&mut self, client: &Client) -> Result<()> {
+        if let Some(rrn) = self.locked.take() {
+            client
+                .execute(RECORD_UNLOCK_SQL, &[&self.lock_name, &rrn])
+                .await?;
+        }
+        Ok(())
     }
 
     /// %EQUAL after SETLL.

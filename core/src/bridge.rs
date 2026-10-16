@@ -19,7 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_postgres::{Client, NoTls};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Clone, Debug)]
 pub struct BridgeConfig {
@@ -28,6 +28,32 @@ pub struct BridgeConfig {
     /// The job's display, when it has one (interactive jobs). EXFMT fails
     /// without it.
     pub display: Option<DisplayHandle>,
+    /// The job's qualified name (`000123/USER/NAME`), shown to other jobs
+    /// waiting for a record this job has locked.
+    pub job: Option<String>,
+    /// How long a read waits for a record another job has locked (the
+    /// file's WAITRCD). None: `IBMISH_WAITRCD` seconds, else 60.
+    pub record_wait: Option<std::time::Duration>,
+}
+
+/// The record wait when the bridge config does not say: IBMISH_WAITRCD
+/// seconds, else 60. On IBM i each file has its own WAITRCD (CRTPF,
+/// OVRDBF); ibmish has one wait time for every file (a known gap).
+fn job_number_of(config: &BridgeConfig) -> Option<i64> {
+    config
+        .job
+        .as_deref()
+        .and_then(|j| j.split('/').next())
+        .and_then(|n| n.parse().ok())
+}
+
+fn default_record_wait() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("IBMISH_WAITRCD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60),
+    )
 }
 
 /// One EXFMT, sent to whatever owns the job's display.
@@ -71,9 +97,13 @@ struct Request {
     /// Data areas: the value to write.
     #[serde(default)]
     value: Option<String>,
-    /// Data areas: `IN *LOCK`.
+    /// Data areas: `IN *LOCK`. Reads: false for the N extender (read
+    /// without locking).
     #[serde(default)]
     lock: Option<bool>,
+    /// open: the file is opened for update (RPG file type U).
+    #[serde(default)]
+    update: Option<bool>,
 }
 
 struct Session {
@@ -87,6 +117,8 @@ struct Session {
     next_handle: u32,
     /// Data areas this session holds under `*LOCK` (library/name).
     locked: Vec<(String, String)>,
+    /// The job's number, for WRKACTJOB's LCKW while waiting for a record.
+    job_number: Option<i64>,
 }
 
 fn indicators(s: Option<String>) -> [bool; 100] {
@@ -150,14 +182,31 @@ impl Session {
                 let name = req.file.ok_or_else(|| anyhow!("missing 'file'"))?;
                 let f =
                     catalog::resolve_file(&self.client, &self.config.library_list, &name).await?;
+                let mut open = OpenFile::new(f.clone());
+                if req.update.unwrap_or(false) {
+                    let (lib, pf) =
+                        catalog::physical_file_of(&self.client, &f.library, &f.file.name).await?;
+                    open = open.for_update(format!("{lib}/{pf}"));
+                }
                 let h = self.next_handle;
                 self.next_handle += 1;
-                self.files.insert(h, OpenFile::new(f));
+                self.files.insert(h, open);
                 Ok(json!({ "handle": h }))
             }
             "close" => {
                 let h = req.handle.ok_or_else(|| anyhow!("missing 'handle'"))?;
-                self.files.remove(&h);
+                if let Some(mut f) = self.files.remove(&h) {
+                    f.release(&self.client).await?;
+                }
+                Ok(json!({}))
+            }
+            "unlock" => {
+                let client = &self.client;
+                let f = self
+                    .files
+                    .get_mut(&req.handle.unwrap_or(0))
+                    .ok_or_else(|| anyhow!("unknown handle"))?;
+                f.release(client).await?;
                 Ok(json!({}))
             }
             "eof" => Ok(json!({ "eof": self.file(req.handle)?.eof() })),
@@ -193,6 +242,9 @@ impl Session {
                     "reade" => f.read_equal(client, key).await?,
                     _ => f.read_previous_equal(client, key).await?,
                 };
+                let r = f
+                    .lock_after_read(client, r, req.lock.unwrap_or(true), self.job_number)
+                    .await?;
                 Ok(read_json(r))
             }
             "write" | "update" => {
@@ -206,6 +258,8 @@ impl Session {
                     Ok(json!({ "rrn": f.write(client, &rec).await? }))
                 } else {
                     f.update(client, &rec).await?;
+                    // UPDATE releases the record lock.
+                    f.release(client).await?;
                     Ok(json!({}))
                 }
             }
@@ -216,6 +270,7 @@ impl Session {
                     .get_mut(&req.handle.unwrap_or(0))
                     .ok_or_else(|| anyhow!("unknown handle"))?;
                 f.delete(client).await?;
+                f.release(client).await?;
                 Ok(json!({}))
             }
             "dspf" => {
@@ -369,6 +424,24 @@ async fn handle_conn(
     workstation: Arc<tokio::sync::Mutex<Workstation>>,
 ) -> Result<()> {
     let client = connect_db(&config.database_url).await?;
+    // Other jobs see who holds a record lock by application_name; reads
+    // wait for locked records up to WAITRCD (lock_timeout).
+    let wait = config.record_wait.unwrap_or_else(default_record_wait);
+    client
+        .batch_execute(&format!(
+            "SET application_name = '{}'; SET lock_timeout = '{}ms'",
+            config
+                .job
+                .as_deref()
+                .unwrap_or("")
+                .replace('\'', "")
+                .chars()
+                .take(60)
+                .collect::<String>(),
+            wait.as_millis().max(1)
+        ))
+        .await?;
+    let job_number = job_number_of(&config);
     let mut session = Session {
         client,
         config,
@@ -377,6 +450,7 @@ async fn handle_conn(
         files: HashMap::new(),
         next_handle: 1,
         locked: Vec::new(),
+        job_number,
     };
     let (rd, mut wr) = stream.into_split();
     let mut lines = BufReader::new(rd).lines();

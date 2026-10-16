@@ -114,7 +114,7 @@ jobs:
       - name: Start the 5250 server with the sample files
         run: |
           IBMISH_BIN=target/debug/ibmish scripts/samples.sh
-          IBMISH_PGM_PATH=$PWD/samples/qrpglesrc nohup target/debug/ibmish tn5250 \
+          IBMISH_WAITRCD=5 IBMISH_PGM_PATH=$PWD/samples/qrpglesrc nohup target/debug/ibmish tn5250 \
             --listen 127.0.0.1:2323 --runner "java -jar jvm/build/libs/ibmish-jvm.jar" > tn5250-server.log 2>&1 &
           sleep 2
       - name: Sign on, CL commands, interactive RPG (subfiles) and the order entry app through tn5250

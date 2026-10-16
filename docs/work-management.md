@@ -34,7 +34,7 @@ Batch programs run without a display: `EXFMT` in a batch job fails, as it does o
 | Command | What it does |
 | --- | --- |
 | `SBMJOB CMD(...) JOB(...) JOBQ(QBATCH) CURLIB(...) INLLIBL(...)` | Submits a batch job |
-| `WRKACTJOB` | Active jobs by subsystem, with what each is doing: `CMD-WRKACTJOB`, `PGM-ORDENT`, status `RUN` or `DSPW` (waiting at the display). Option 5 shows the job log, and F5 refreshes |
+| `WRKACTJOB` | Active jobs by subsystem, with what each is doing: `CMD-WRKACTJOB`, `PGM-ORDENT`, status `RUN`, `DSPW` (waiting at the display) or `LCKW` (waiting for a record lock, see [record-locks.md](record-locks.md)). Option 5 shows the job log, and F5 refreshes |
 | `WRKSBMJOB` | Jobs you submitted: `JOBQ` (waiting), `ACTIVE`, `OUTQ` (ended). Option 4 ends a job that has not started, option 5 shows its log, F5 refreshes |
 | `DSPJOBLOG JOB(*)` or `JOB(number/user/name)` | A job's log: the commands it ran (`>`) and the messages they sent |
 | `ENDJOB JOB(number/user/name)` | Ends a job that is still on the job queue |
@@ -50,4 +50,4 @@ They are on the F4 menu under "Job and message commands".
 - Other job queues and subsystems, subsystem descriptions, job descriptions (`JOBD` is always `QDFTJOBD`), routing entries.
 - Spooled files: job logs are kept in the catalog, not as `QPJOBLOG` spooled files, and there are no printer files or `WRKSPLF` yet.
 - Message replies (`*INQ` messages), break messages, message files, `RCVMSG`, the `QSYSOPR` operator's console. `DSPMSG` is a plain list.
-- Record locks and object authority (next in Phase 3).
+- Object authority (next in Phase 3). Record locks: see [record-locks.md](record-locks.md).

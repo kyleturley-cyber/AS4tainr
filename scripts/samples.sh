@@ -37,7 +37,7 @@ done
 for l in CUSTNAME CUSTOWE; do
   create crtlf "QGPL/$l" --src "$samples/qddssrc/$l.lf" || true
 done
-for d in CUSTINQD CUSTWRKD ORDENTD; do
+for d in CUSTINQD CUSTWRKD ORDENTD CUSTMNTD; do
   create crtdspf "QGPL/$d" --src "$samples/qddssrc/$d.dspf" || true
 done
 "$bin" crtbndcl QGPL/CUSTRPT --src "$samples/qclsrc/CUSTRPT.clle" --text 'Customer report driver' >/dev/null

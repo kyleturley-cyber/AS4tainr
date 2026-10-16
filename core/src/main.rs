@@ -345,6 +345,8 @@ async fn run(cli: Cli) -> Result<u8> {
                     database_url: cli.database_url,
                     library_list: libl,
                     display: None,
+                    job: None,
+                    record_wait: None,
                 },
             )
             .await?;
@@ -445,6 +447,8 @@ async fn run(cli: Cli) -> Result<u8> {
                 database_url: cli.database_url,
                 library_list: libl,
                 display: None,
+                job: None,
+                record_wait: None,
             };
             let server = tokio::spawn(bridge::serve(listener, cfg));
 

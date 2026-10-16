@@ -12,6 +12,12 @@ import io.ibmish.bridge.ReadResult
 /**
  * One open file (one F-spec) in a Jariko program. Each operation is one
  * bridge round trip; %EOF and %EQUAL are cached from the last response.
+ *
+ * Files the program opens for update lock the records they read (see
+ * [RecordLocks]): a read with the N extender does not lock, and a read
+ * whose lock wait fails comes back with the error indicator on when the
+ * program has one (or the E extender); otherwise the program ends with the
+ * error, as on IBM i.
  */
 class IbmishDBFile(
     override var name: String,
@@ -20,7 +26,27 @@ class IbmishDBFile(
 ) : DBFile {
     override var logger: Logger? = null
 
-    private val handle: Int = client.open(name)
+    private val handle: Int = client.open(name, RecordLocks.isUpdate(name))
+
+    init {
+        val format = client.metadata(name)["format"] as? String
+        RecordLocks.register(name, format) { client.unlock(handle) }
+    }
+
+    /** Run a read with the flags the program announced for it. */
+    private fun locked(op: (Boolean) -> ReadResult): Result {
+        val flags = RecordLocks.takeFlags(name)
+        return try {
+            result(op(!flags.contains('N')))
+        } catch (e: io.ibmish.bridge.BridgeException) {
+            if (flags.contains('E') && (e.message ?: "").startsWith("CPF5027")) {
+                lastEof = false
+                Result(indicatorLO = true)
+            } else {
+                throw e
+            }
+        }
+    }
     private var lastEof = false
     private var lastEqual = false
 
@@ -55,23 +81,23 @@ class IbmishDBFile(
 
     override fun chain(key: String): Result = chain(listOf(key))
 
-    override fun chain(keys: List<String>): Result = result(client.chain(handle, keys))
+    override fun chain(keys: List<String>): Result = locked { client.chain(handle, keys, it) }
 
-    override fun read(): Result = result(client.read(handle))
+    override fun read(): Result = locked { client.read(handle, it) }
 
-    override fun readPrevious(): Result = result(client.readPrevious(handle))
+    override fun readPrevious(): Result = locked { client.readPrevious(handle, it) }
 
-    override fun readEqual(): Result = result(client.readEqual(handle, null))
+    override fun readEqual(): Result = locked { client.readEqual(handle, null, it) }
 
     override fun readEqual(key: String): Result = readEqual(listOf(key))
 
-    override fun readEqual(keys: List<String>): Result = result(client.readEqual(handle, keys))
+    override fun readEqual(keys: List<String>): Result = locked { client.readEqual(handle, keys, it) }
 
-    override fun readPreviousEqual(): Result = result(client.readPreviousEqual(handle, null))
+    override fun readPreviousEqual(): Result = locked { client.readPreviousEqual(handle, null, it) }
 
     override fun readPreviousEqual(key: String): Result = readPreviousEqual(listOf(key))
 
-    override fun readPreviousEqual(keys: List<String>): Result = result(client.readPreviousEqual(handle, keys))
+    override fun readPreviousEqual(keys: List<String>): Result = locked { client.readPreviousEqual(handle, keys, it) }
 
     override fun write(record: Record): Result {
         client.write(handle, record)

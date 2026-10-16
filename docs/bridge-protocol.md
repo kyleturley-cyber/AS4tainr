@@ -1,6 +1,6 @@
-# Bridge protocol (version 3)
+# Bridge protocol (version 4)
 
-Version 3 added the data area operations `dtaara_in`, `dtaara_out` and `dtaara_unlock`. Version 2 added the display file operations `dspwrite`, `sflwrite`, `sflchain`, `sflreadc` and `sflupdate`.
+Version 4 added record locks: `open` takes `update`, reads take `lock`, and the `unlock` operation. Version 3 added the data area operations `dtaara_in`, `dtaara_out` and `dtaara_unlock`. Version 2 added the display file operations `dspwrite`, `sflwrite`, `sflchain`, `sflreadc` and `sflupdate`.
 
 The bridge connects the JVM (Jariko running RPG) to ibmish core, which carries out every file operation. It uses TCP on loopback only, with one UTF-8 JSON object per line in each direction, strictly request then response.
 
@@ -28,12 +28,13 @@ Records are objects that map field names to strings:
 | --- | --- | --- | --- |
 | `hello` | | `server`, `version` | Sent first; clients refuse a version mismatch |
 | `metadata` | `file` | `library`, `name`, `format`, `text`, `unique`, `keys`, `fields[]` | Each field has `name`, `type` (`A`/`P`/`S`), `length`, `decimals`, `numeric`, `text`. `file` may be `LIB/FILE`; otherwise the library list is searched |
-| `open` | `file` | `handle` | |
+| `open` | `file`, `update`? | `handle` | With `update: true` (RPG file type U) the file locks each record it reads; see [record-locks.md](record-locks.md) |
+| `unlock` | `handle` | | Releases the record this open file holds locked (RPG `UNLOCK`) |
 | `close` | `handle` | | |
 | `setll` | `handle`, `keys` | `equal` | `keys: []` means `*LOVAL`. `equal` is `%EQUAL` |
 | `setgt` | `handle`, `keys` | | `keys: []` means `*HIVAL` |
-| `chain` | `handle`, `keys` | read result | Never sets `eof` |
-| `read`, `readp` | `handle` | read result | |
+| `chain` | `handle`, `keys`, `lock`? | read result | Never sets `eof` |
+| `read`, `readp` | `handle`, `lock`? | read result | On a file opened for update, reads lock the record found and release the one locked before; `lock: false` is the N extender. A record another job holds is waited for, then `CPF5027`; after a wait the record is read again |
 | `reade`, `readpe` | `handle`, `keys`? | read result | Without `keys`, the key of the last SETLL/SETGT/CHAIN is used |
 | `write` | `handle`, `record` | `rrn` | Fields left out get their default (blanks or zero) |
 | `update` | `handle`, `record` | | Acts on the last record read; fields left out are unchanged |
@@ -72,6 +73,7 @@ These match IBM i record-level access for keyed physical files:
 | `CPF2110` | Library not found |
 | `CPF5013` | UPDATE/DELETE with no current record, or the record is gone |
 | `CPF5026` | Duplicate key on a UNIQUE file |
+| `CPF5027` | The record is locked by another job (after waiting); the text names the job |
 | `CPF7302` | File already exists (CRTPF) |
 | `CPF9812` | File not found in the library list |
 | `RNX0103` | Value does not fit the numeric field |

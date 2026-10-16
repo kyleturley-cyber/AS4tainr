@@ -345,6 +345,8 @@ async fn bridge_protocol_round_trip() {
             database_url: url.clone(),
             library_list: vec![lib.clone()],
             display: None,
+            job: None,
+            record_wait: None,
         },
     ));
 
@@ -369,7 +371,7 @@ async fn bridge_protocol_round_trip() {
     }
     server.abort();
 
-    assert_eq!(resp[0]["version"], 3);
+    assert_eq!(resp[0]["version"], 4);
     assert_eq!(resp[1]["format"], "ORDLINR");
     assert_eq!(resp[1]["keys"], json!(["ORDNO", "LINNO"]));
     assert_eq!(resp[1]["fields"][4]["decimals"], 2);
@@ -477,6 +479,8 @@ async fn bridge_exfmt_round_trip_with_a_display() {
             database_url: url.clone(),
             library_list: vec![lib.clone()],
             display: Some(tx),
+            job: None,
+            record_wait: None,
         },
     ));
     let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -556,6 +560,8 @@ async fn bridge_subfile_write_exfmt_readc() {
             database_url: url.clone(),
             library_list: vec![lib.clone()],
             display: Some(tx),
+            job: None,
+            record_wait: None,
         },
     ));
     async fn conn(
@@ -651,6 +657,8 @@ async fn exfmt_without_a_display_fails_clearly() {
             database_url: url.clone(),
             library_list: vec![lib.clone()],
             display: None,
+            job: None,
+            record_wait: None,
         },
     ));
     let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -1584,6 +1592,8 @@ async fn bridge_data_area_in_lock_out() {
             database_url: url.clone(),
             library_list: vec![lib.clone()],
             display: None,
+            job: None,
+            record_wait: None,
         },
     ));
     let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -1791,4 +1801,143 @@ async fn submitted_jobs_run_in_qbatch() {
 
     jobs::end(&client, &id, true).await.unwrap();
     assert_eq!(jobs::get(&client, id.number).await.unwrap().status, "OUTQ");
+}
+
+/// Record locks (IBM i record-level access for files opened for update):
+/// a read locks the record found until UPDATE, DELETE, the next read,
+/// UNLOCK or close; another job reading that record for update waits
+/// (WAITRCD), then fails with CPF5027; a read with the N extender, or of a
+/// file opened for input, does not lock and does not wait. Locks belong to
+/// the physical file's record, so a logical file over it sees them too.
+#[tokio::test]
+async fn bridge_record_locks() {
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    crtlf(
+        &mut client,
+        &lib,
+        "CUSTNAME",
+        include_str!("../../samples/qddssrc/CUSTNAME.lf"),
+    )
+    .await;
+    let listener = bridge::bind(0).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(bridge::serve(
+        listener,
+        bridge::BridgeConfig {
+            database_url: url.clone(),
+            library_list: vec![lib.clone()],
+            display: None,
+            job: Some(format!("000042/QSECOFR/L{lib}")),
+            record_wait: Some(std::time::Duration::from_millis(700)),
+        },
+    ));
+    struct Conn {
+        wr: tokio::net::tcp::OwnedWriteHalf,
+        lines: tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+    }
+    impl Conn {
+        async fn ask(&mut self, req: Value) -> Value {
+            self.wr
+                .write_all(format!("{req}\n").as_bytes())
+                .await
+                .unwrap();
+            serde_json::from_str(&self.lines.next_line().await.unwrap().unwrap()).unwrap()
+        }
+    }
+    let connect = || async {
+        let (rd, wr) = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap()
+            .into_split();
+        Conn {
+            wr,
+            lines: BufReader::new(rd).lines(),
+        }
+    };
+    let mut a = connect().await;
+    let mut b = connect().await;
+    let ha = a
+        .ask(json!({"op": "open", "file": "CUSTMAST", "update": true}))
+        .await["handle"]
+        .clone();
+    let hb = b
+        .ask(json!({"op": "open", "file": "CUSTMAST", "update": true}))
+        .await["handle"]
+        .clone();
+    let hin = b.ask(json!({"op": "open", "file": "CUSTMAST"})).await["handle"].clone();
+    let hlf = b
+        .ask(json!({"op": "open", "file": "CUSTNAME", "update": true}))
+        .await["handle"]
+        .clone();
+    let chain = |h: &Value, k: &str| json!({"op": "chain", "handle": h, "keys": [k]});
+
+    // A locks customer 1; B waits for it, then gets CPF5027 naming A's job.
+    assert_eq!(a.ask(chain(&ha, "1")).await["found"], true);
+    let t0 = std::time::Instant::now();
+    let r = b.ask(chain(&hb, "1")).await;
+    assert_eq!(r["ok"], false);
+    let err = r["error"].as_str().unwrap();
+    assert!(err.starts_with("CPF5027"), "{err}");
+    assert!(err.contains(&format!("000042/QSECOFR/L{lib}")), "{err}");
+    assert!(
+        t0.elapsed() >= std::time::Duration::from_millis(600),
+        "did not wait"
+    );
+    // N extender, and a file opened for input: no lock, no wait.
+    let mut nolock = chain(&hb, "1");
+    nolock["lock"] = json!(false);
+    assert_eq!(b.ask(nolock).await["found"], true);
+    assert_eq!(b.ask(chain(&hin, "1")).await["found"], true);
+    // The logical file shares the physical file's record locks.
+    let r = b.ask(chain(&hlf, "Acme Tooling")).await;
+    assert!(
+        r["error"].as_str().unwrap_or("").starts_with("CPF5027"),
+        "{r}"
+    );
+
+    // A's next read moves the lock: customer 1 is free, 2 is locked.
+    let r = a.ask(json!({"op": "read", "handle": ha})).await;
+    assert_eq!(r["record"]["CUSNO"], "2");
+    assert_eq!(b.ask(chain(&hb, "1")).await["found"], true);
+    assert!(b.ask(chain(&hb, "2")).await["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("CPF5027"));
+    // UPDATE releases (and B, waiting meanwhile, sees A's change).
+    let mut rec = a.ask(chain(&ha, "2")).await["record"].clone();
+    rec["CUSCTY"] = json!("Evanston");
+    let wait_b = tokio::spawn(async move {
+        let r = b
+            .ask(json!({"op": "chain", "handle": hb, "keys": ["2"]}))
+            .await;
+        (b, r)
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        a.ask(json!({"op": "update", "handle": ha, "record": rec}))
+            .await["ok"],
+        true
+    );
+    let (mut b, r) = wait_b.await.unwrap();
+    assert_eq!(r["found"], true, "{r}");
+    assert_eq!(r["record"]["CUSCTY"].as_str().unwrap().trim(), "Evanston");
+    // UNLOCK and close release too.
+    assert_eq!(a.ask(chain(&ha, "3")).await["found"], true);
+    assert_eq!(
+        a.ask(json!({"op": "unlock", "handle": ha})).await["ok"],
+        true
+    );
+    let hb2 = b
+        .ask(json!({"op": "open", "file": "CUSTMAST", "update": true}))
+        .await["handle"]
+        .clone();
+    assert_eq!(b.ask(chain(&hb2, "3")).await["found"], true);
+    assert_eq!(a.ask(chain(&ha, "4")).await["found"], true);
+    assert_eq!(
+        a.ask(json!({"op": "close", "handle": ha})).await["ok"],
+        true
+    );
+    assert_eq!(b.ask(chain(&hb2, "4")).await["found"], true);
+    server.abort();
 }

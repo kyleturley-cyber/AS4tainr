@@ -19,7 +19,7 @@ import java.util.Map;
  * See docs/bridge-protocol.md.
  */
 public final class BridgeClient implements AutoCloseable {
-    public static final int PROTOCOL_VERSION = 3;
+    public static final int PROTOCOL_VERSION = 4;
 
     private final Socket socket;
     private final BufferedReader in;
@@ -97,15 +97,31 @@ public final class BridgeClient implements AutoCloseable {
         return call(m);
     }
 
-    /** Open a file found through the library list; returns its handle. */
+    /** Open a file found through the library list for input; returns its handle. */
     public int open(String file) {
+        return open(file, false);
+    }
+
+    /**
+     * Open a file found through the library list; returns its handle. A file
+     * opened for {@code update} (RPG file type U) locks each record it reads
+     * until UPDATE, DELETE, the next read, {@link #unlock} or close; reading a
+     * record another job holds waits, then fails with CPF5027.
+     */
+    public int open(String file, boolean update) {
         Map<String, Object> m = req("open");
         m.put("file", file);
+        if (update) m.put("update", true);
         return ((Number) call(m).get("handle")).intValue();
     }
 
     public void closeFile(int handle) {
         call(req("close", handle));
+    }
+
+    /** UNLOCK: release the record this open file holds locked. */
+    public void unlock(int handle) {
+        call(req("unlock", handle));
     }
 
     /** SETLL; an empty key list means *LOVAL. Returns %EQUAL. */
@@ -122,29 +138,56 @@ public final class BridgeClient implements AutoCloseable {
         call(m);
     }
 
+    private static Map<String, Object> readReq(String op, int handle, boolean lock) {
+        Map<String, Object> m = req(op, handle);
+        if (!lock) m.put("lock", false);
+        return m;
+    }
+
     public ReadResult chain(int handle, List<String> keys) {
-        Map<String, Object> m = req("chain", handle);
+        return chain(handle, keys, true);
+    }
+
+    /** CHAIN; {@code lock=false} is the N extender (read without locking). */
+    public ReadResult chain(int handle, List<String> keys, boolean lock) {
+        Map<String, Object> m = readReq("chain", handle, lock);
         m.put("keys", keys);
         return toRead(call(m));
     }
 
     public ReadResult read(int handle) {
-        return toRead(call(req("read", handle)));
+        return read(handle, true);
+    }
+
+    public ReadResult read(int handle, boolean lock) {
+        return toRead(call(readReq("read", handle, lock)));
     }
 
     public ReadResult readPrevious(int handle) {
-        return toRead(call(req("readp", handle)));
+        return readPrevious(handle, true);
+    }
+
+    public ReadResult readPrevious(int handle, boolean lock) {
+        return toRead(call(readReq("readp", handle, lock)));
     }
 
     /** READE; null keys = use the key of the last SETLL/SETGT/CHAIN. */
     public ReadResult readEqual(int handle, List<String> keys) {
-        Map<String, Object> m = req("reade", handle);
+        return readEqual(handle, keys, true);
+    }
+
+    public ReadResult readEqual(int handle, List<String> keys, boolean lock) {
+        Map<String, Object> m = readReq("reade", handle, lock);
         if (keys != null) m.put("keys", keys);
         return toRead(call(m));
     }
 
     public ReadResult readPreviousEqual(int handle, List<String> keys) {
-        Map<String, Object> m = req("readpe", handle);
+        return readPreviousEqual(handle, keys, true);
+    }
+
+    public ReadResult readPreviousEqual(int handle, List<String> keys, boolean lock) {
+        Map<String, Object> m = readReq("readpe", handle, lock);
         if (keys != null) m.put("keys", keys);
         return toRead(call(m));
     }

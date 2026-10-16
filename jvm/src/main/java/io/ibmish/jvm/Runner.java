@@ -119,7 +119,12 @@ public final class Runner {
         DataAreas dataAreas = new DataAreas(bridge);
         configuration.getJarikoCallback().setReadDataArea(dataAreas::in);
         configuration.getJarikoCallback().setWriteDataArea((name, value) -> {
-            dataAreas.out(name);
+            if (name.equalsIgnoreCase(RecordLocks.SIGNAL_AREA)) {
+                // Record lock signals put in by RecordLocks.preprocess.
+                if (!RecordLocks.signal(value)) dataAreas.unlock(value.trim().split("\\s+")[1]);
+            } else {
+                dataAreas.out(name);
+            }
             return kotlin.Unit.INSTANCE;
         });
 
@@ -208,6 +213,18 @@ public final class Runner {
                 core.assign(def, v);
             }
             return null; // already assigned
+        }
+
+        /** UNLOCK of a data area field (releases IN *LOCK). */
+        void unlock(String field) {
+            String external = core().getStatus().getDataAreas().get(field.toUpperCase());
+            if (external == null) {
+                for (Map.Entry<String, String> e : core().getStatus().getDataAreas().entrySet()) {
+                    if (e.getKey().equalsIgnoreCase(field)) external = e.getValue();
+                }
+            }
+            if (external == null) throw new IllegalStateException("UNLOCK " + field + ": not an open file or a data area");
+            bridge.dataAreaUnlock(external);
         }
 
         void out(String name) {
@@ -369,7 +386,7 @@ public final class Runner {
             } catch (IOException e) {
                 throw new IllegalStateException("cannot read " + f + ": " + e.getMessage(), e);
             }
-            String rewritten = Workstation.preprocess(source, displays::formats);
+            String rewritten = RecordLocks.preprocess(Workstation.preprocess(source, displays::formats));
             synchronized (connections) {
                 for (Workstation.Format fmt : Workstation.formats()) {
                     boolean known = connections.stream().anyMatch(c -> c.getFileName().equalsIgnoreCase(fmt.name));

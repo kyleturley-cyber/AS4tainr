@@ -9,6 +9,7 @@ Usage:
 """
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 from tn5250_driver import Tn5250  # noqa: E402
@@ -364,6 +365,33 @@ with Tn5250(HOST) as t:
         command(t, "dspmsg", "Display Messages")
         check("Report is ready" in t.text() and "From BOB" in t.text(), "DSPMSG shows BOB's message", t)
         t.fkey(3); t.wait_for("Command Entry")
+        # Record locks: QSECOFR changes customer 3, which locks its record
+        # until the change is made; BOB's CHAIN of it waits.
+        command(t, "call custmnt", "Change Customer", timeout=90)
+        t.type("3"); t.send(FIELD_EXIT); t.enter()
+        t.wait_for("Type changes")
+        check("Bluebird Supply" in t.line(6), "CUSTMNT shows customer 3 for change (record locked)", t)
+        command(t2, "call custmnt", "Change Customer", timeout=90)
+        started = time.time()
+        t2.type("3"); t2.send(FIELD_EXIT); t2.enter()
+        t2.wait_for("in another job", timeout=90)
+        check(time.time() - started >= 3,
+              "BOB's CHAIN of the locked record waits, then sets the error indicator (CPF5027)", t2)
+        t2.type("3"); t2.send(FIELD_EXIT); t2.enter()  # waits again
+        time.sleep(1)
+        t.tab(); t.type("Kansas City"); t.send(FIELD_EXIT); t.enter()
+        t.wait_for("Customer changed.")
+        t2.wait_for("Kansas City", timeout=90)
+        check("Type changes" in t2.text(),
+              "UPDATE releases the lock: BOB's waiting CHAIN gets the record with QSECOFR's change", t2)
+        t2.fkey(12); t2.wait_for("Type a customer number")
+        t.type("3"); t.send(FIELD_EXIT); t.enter()
+        t.wait_for("Type changes")
+        check("Kansas City" in t.line(7),
+              "F12 (UNLOCK) released BOB's lock: QSECOFR can change customer 3 again", t)
+        t.fkey(12); t.wait_for("Type a customer number")
+        t.fkey(3); t.wait_for("Command Entry")
+        t2.fkey(3); t2.wait_for("Command Entry")
         command(t2, "signoff", "Sign On")
     command(t, "dspjoblog", "Display Job Log")
     check("> crtlib mylib text('My first library')" in t.text() and "QINTER" in t.text(),

@@ -972,6 +972,8 @@ impl Job<'_> {
                 database_url: self.env.database_url.clone(),
                 library_list: self.library_list(),
                 display: self.display.clone(),
+                job: self.id.as_ref().map(|i| i.to_string()),
+                record_wait: None,
             },
         ));
         let mut parts = self.env.runner.split_whitespace();

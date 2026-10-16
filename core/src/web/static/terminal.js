@@ -377,7 +377,7 @@
 
   document.addEventListener("keydown", (e) => {
     if (e.isComposing) return;
-    // Let the page's own controls (the Keyboard help, Connect again) work.
+    // Let the page's own controls (Connect again) work.
     if (e.target !== screenEl && e.target !== document.body) return;
     if (e.target === document.body) screenEl.focus();
     const fk = /^F(\d{1,2})$/.exec(e.key);

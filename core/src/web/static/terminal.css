@@ -164,7 +164,7 @@ body {
   box-shadow: inset 0 0 40px rgba(0, 0, 0, .55);
 }
 .screen:focus-visible { border-color: var(--accent); }
-.row { height: calc(var(--cell) * 1.32); width: 80ch; }
+.row { height: calc(var(--cell) * 1.32); width: 80ch; margin-inline: auto; }
 .screen span { display: inline; }
 .a-green { color: var(--c-green); }
 .a-white { color: var(--c-white); }
@@ -213,12 +213,6 @@ body {
 .oia-right { display: inline-flex; gap: 14px; }
 #oia-ins { color: var(--warn); }
 
-.help { font-size: 13px; color: var(--muted); }
-.help summary { cursor: pointer; width: max-content; }
-.help dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 8px 0 0; }
-.help dt { color: var(--text); font-weight: 600; }
-.help dd { margin: 0; }
-.help code { font-family: var(--mono); }
 
 @media (max-width: 760px) {
   .keyboard { flex-direction: column; gap: 8px; }

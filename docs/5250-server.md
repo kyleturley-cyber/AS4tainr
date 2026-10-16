@@ -17,6 +17,10 @@ The first `ibmish init` creates the security officer profile QSECOFR:
 
 Passwords are stored as Argon2id hashes. A wrong user and a wrong password give the same message (`CPF1107`), and take the same time, so the sign-on screen does not reveal which profiles exist. After 3 failed attempts the connection is closed.
 
+Passwords are not case sensitive by default, like IBM i as shipped (system value QPWDLVL 0); `IBMISH_QPWDLVL=2` makes them case sensitive. Passwords set before ibmish followed QPWDLVL still work as typed and are converted at the next sign-on.
+
+**Forgot the QSECOFR password?** `ibmish rstpwd` (or `ibmish rstpwd USER`) sets it back to the profile name, expired, so the next sign-on asks for a new one. In Docker: `docker compose exec ibmish ibmish rstpwd`.
+
 ## Screens
 
 The screens below are captured from the real `tn5250` client connected to ibmish (by `tools/e2e_5250.py`'s harness).
@@ -144,6 +148,12 @@ DSPLIB:
 | `ADDLIBLE LIB(name) POSITION(*FIRST\|*LAST)` | Adds a library to the job's library list. |
 | `CALL PGM(name) PARM('a' 'b')` | Runs an RPG program on Jariko with the job's library list. DSPLY output appears in the log. |
 | `SIGNOFF` | Ends the session and returns to the sign-on screen. |
+| `CRTUSRPRF USRPRF(name) PASSWORD(*USRPRF\|*NONE\|pw) PWDEXP STATUS USRCLS CURLIB TEXT SPCAUT` | Creates a user profile. Needs `*SECADM`. `SPCAUT(*USRCLS)` gives the class's special authorities (`*SECOFR`: all eight; `*SECADM`: `*SECADM`; `*SYSOPR`: `*JOBCTL *SAVSYS`; `*PGMR`, `*USER`: none). |
+| `DSPUSRPRF USRPRF(name)` | Shows a profile: class, status, special authorities, previous sign-on. Your own, or any with `*SECADM`. `CPF2204` if it does not exist. |
+| `DLTUSRPRF USRPRF(name)` | Deletes a profile. Needs `*SECADM`; not QSECOFR or yourself. |
+| `CHGPWD` | Shows the Change Password screen. |
+| `WRKOBJ OBJ(lib/name) OBJTYPE(*ALL\|*LIB\|*FILE)` | Lists objects. The name can be generic (`CUST*`) or `*ALL`; the library `*LIBL`, `*CURLIB`, `*USRLIBL`, `*ALL`, `*ALLUSR` or a name. List only for now: no options. |
+| `DSPPFM FILE(lib/name)` | Shows a physical file's records in arrival order, one line each with the field names above. F19/F20 shift left/right on wide files. |
 
 Keyword and positional forms both work (`CRTLIB MYLIB` = `CRTLIB LIB(MYLIB)`). Unquoted values are folded to upper case; quoted values keep their case, with `''` for an apostrophe.
 
@@ -155,7 +165,11 @@ Keys on the command entry screen:
 | F3 | Sign off |
 | F9 | Retrieve the previous command (repeat to go further back) |
 | F12 | Clear the command line |
-| F4 | Prompting is not implemented yet |
+| F4 | Prompt the command typed (what was typed so far fills the prompt); on an empty line, show the command menu |
+
+**Command menu (F4 on an empty line).** A numbered menu of command groups (Library, Object, File, User profile, Program, Session). Type a number and press Enter to open a group's menu of commands, then a number to prompt that command. The "Selection or command" line also takes a command name: Enter runs it, F4 prompts it. F12 goes back one menu, F3 returns to the command line. The groups are `cl::GROUPS`; a unit test checks that every command is in exactly one.
+
+**Prompting (F4).** The prompt has one line per parameter with its current value or default and the allowed values; required parameters are highlighted, qualified names get a separate Library line. Enter builds the command (parameters left at their default are left out), checks it, and runs it; the command as built appears in the log, so F9 retrieves it. F5 resets the values, F12 returns to the command line with what was typed, F3 returns to an empty command line. The prompt comes from the same command table (`cl::COMMANDS`) as parsing.
 
 On list screens, Page Down / Page Up (Roll Up / Roll Down) page through the list, and F3 or F12 return.
 
@@ -173,7 +187,7 @@ On list screens, Page Down / Page Up (Roll Up / Roll Down) page through the list
 
 ## Testing
 
-`tools/e2e_5250.py` drives the real tn5250 client in a pseudo-terminal and reads its screen with [pyte](https://github.com/selectel/pyte). It signs on (wrong password, forced password change, new password), runs CRTLIB/DSPLIB/CALL, checks the error messages, F9 and SIGNOFF. The `tn5250` CI job runs it on every push. To run it locally:
+`tools/e2e_5250.py` drives the real tn5250 client in a pseudo-terminal and reads its screen with [pyte](https://github.com/selectel/pyte). It signs on (wrong password, forced password change, new password), runs CRTLIB/DSPLIB/CALL, prompts with F4, creates a user profile and signs on with it, runs WRKOBJ and DSPPFM, and checks the error messages, F9 and SIGNOFF. The `tn5250` CI job runs it on every push. To run it locally:
 
 ```sh
 git clone https://github.com/tn5250/tn5250 && cmake -S tn5250 -B tn5250/build && cmake --build tn5250/build
@@ -185,4 +199,4 @@ The harness sets `TERM=xterm-r6`, because ncurses uses the "repeat character" es
 
 ## Not yet
 
-These are tracked in [fidelity-gaps.md](fidelity-gaps.md): TLS (port 992), automatic sign-on and device names from NEW-ENVIRON ([RFC 4777](https://www.rfc-editor.org/rfc/rfc4777)), 27x132 screens, F4 prompting, display files (DDS `*DSPF`) for RPG programs, disabling profiles after repeated failures, and job logs.
+These are tracked in [fidelity-gaps.md](fidelity-gaps.md): TLS (port 992), automatic sign-on and device names from NEW-ENVIRON ([RFC 4777](https://www.rfc-editor.org/rfc/rfc4777)), 27x132 screens, prompt help (F1) and list-parameter prompting, WRKOBJ options, disabling profiles after repeated failures, and job logs.

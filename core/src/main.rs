@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use ibmish_core::{bridge, catalog, commands, dds, rla, tn5250};
+use ibmish_core::{bridge, catalog, commands, dds, rla, tn5250, users};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -37,6 +37,13 @@ struct Cli {
 enum Cmd {
     /// Create the catalog and the system libraries (idempotent).
     Init,
+    /// Reset a user's password to the user name, expired, so the next
+    /// sign-on must change it. For a forgotten QSECOFR password.
+    Rstpwd {
+        /// User profile (default QSECOFR).
+        #[arg(default_value = "QSECOFR")]
+        user: String,
+    },
     /// CRTLIB: create a library.
     Crtlib {
         library: String,
@@ -155,6 +162,17 @@ async fn run(cli: Cli) -> Result<u8> {
             let client = bridge::connect_db(&cli.database_url).await?;
             catalog::init(&client).await?;
             println!("ibmish catalog ready.");
+        }
+        Cmd::Rstpwd { user } => {
+            let client = bridge::connect_db(&cli.database_url).await?;
+            catalog::init(&client).await?;
+            let user = user.to_ascii_uppercase();
+            if !users::reset_password(&client, &user).await? {
+                bail!("CPF2204: User profile {user} not found.");
+            }
+            println!(
+                "Password of {user} reset to {user} (expired: it must be changed at the next sign-on)."
+            );
         }
         Cmd::Crtlib { library, text } => {
             let client = bridge::connect_db(&cli.database_url).await?;

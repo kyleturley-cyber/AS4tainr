@@ -156,7 +156,11 @@ impl Screen {
 
     /// Text at (row, col) with a display attribute in the position before it.
     pub fn text(&mut self, row: u8, col: u8, attribute: u8, s: &str) -> &mut Self {
-        debug_assert!((1..=COLS).contains(&col) && (1..=ROWS).contains(&row));
+        if !((1..=COLS).contains(&col) && (1..=ROWS).contains(&row)) {
+            // Off the screen: drop it rather than corrupt the data stream.
+            debug_assert!(false, "text at {row},{col} is off the screen");
+            return self;
+        }
         let max = (COLS - col + 1) as usize;
         let s: String = s.chars().take(max).collect();
         if self.sba_attribute(row, col) {

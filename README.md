@@ -40,8 +40,12 @@ DSPLIB QSYS
 CALL CUSTLIST PARM('3')
 CALL CUSTINQ
 CALL WRKCUST
+WRKOBJ QGPL/*ALL
+DSPPFM CUSTMAST
 SIGNOFF
 ```
+
+Type a command name and press **F4** to prompt it, or press F4 on an empty line for a numbered menu of commands. QSECOFR can create more users with `CRTUSRPRF`.
 
 `docker compose run --rm demo` runs the sample programs and checks their output against `samples/expected/`.
 

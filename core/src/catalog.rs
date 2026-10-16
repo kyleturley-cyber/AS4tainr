@@ -175,6 +175,66 @@ pub async fn list_objects(client: &Client, library: &str) -> Result<Vec<ObjectEn
         .collect())
 }
 
+/// All libraries, by name.
+pub async fn list_libraries(client: &Client) -> Result<Vec<String>> {
+    Ok(client
+        .query(
+            "SELECT name FROM ibmish.objects WHERE library='QSYS' AND objtype='*LIB' ORDER BY name",
+            &[],
+        )
+        .await?
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect())
+}
+
+/// Does an object name match a name, a generic name (`CUST*`) or *ALL?
+pub fn name_matches(pattern: &str, name: &str) -> bool {
+    match pattern {
+        "*ALL" => true,
+        p => match p.strip_suffix('*') {
+            Some(prefix) => name.starts_with(prefix),
+            None => name == p,
+        },
+    }
+}
+
+/// The records of a physical file in arrival order (relative record
+/// number), each field as text (numbers as decimal strings). At most
+/// `limit` records.
+pub async fn member_records(
+    client: &Client,
+    f: &FileRef,
+    limit: i64,
+) -> Result<Vec<(i64, Vec<String>)>> {
+    let cols: Vec<String> = f
+        .file
+        .fields
+        .iter()
+        .map(|fd| format!("COALESCE(t.{}::text, '')", ident(&fd.name)))
+        .collect();
+    let sql = format!(
+        "SELECT t.rrn, {} FROM {} AS t ORDER BY t.rrn LIMIT $1",
+        if cols.is_empty() {
+            "''".to_string()
+        } else {
+            cols.join(", ")
+        },
+        f.table()
+    );
+    Ok(client
+        .query(&sql, &[&limit])
+        .await?
+        .into_iter()
+        .map(|r| {
+            let vals = (1..=f.file.fields.len())
+                .map(|i| r.get::<_, String>(i))
+                .collect();
+            (r.get::<_, i64>(0), vals)
+        })
+        .collect())
+}
+
 pub async fn create_library(client: &Client, library: &str, text: &str) -> Result<()> {
     let lib = validate_name("library", library)?;
     client

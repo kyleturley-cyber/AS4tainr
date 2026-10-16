@@ -8,6 +8,7 @@ use tokio_postgres::Client;
 use crate::bridge;
 use crate::catalog;
 use crate::cl::{self, Command};
+use crate::users;
 
 /// Settings that come from the server, not from the job.
 #[derive(Debug, Clone)]
@@ -44,8 +45,13 @@ pub enum Outcome {
     /// Completion and informational messages, in order.
     Messages(Vec<String>),
     Display(ListDisplay),
+    /// CHGPWD: show the Change Password screen.
+    ChangePassword,
     SignOff,
 }
+
+/// DSPPFM shows at most this many records.
+pub const DSPPFM_MAX_RECORDS: i64 = 9999;
 
 impl Job<'_> {
     /// The full library list, current library first, without duplicates.
@@ -67,6 +73,12 @@ impl Job<'_> {
             "DSPLIBL" => self.dsplibl().await,
             "ADDLIBLE" => self.addlible(&cmd).await,
             "CALL" => self.call(&cmd).await,
+            "CRTUSRPRF" => self.crtusrprf(&cmd).await,
+            "DSPUSRPRF" => self.dspusrprf(&cmd).await,
+            "DLTUSRPRF" => self.dltusrprf(&cmd).await,
+            "CHGPWD" => Ok(Outcome::ChangePassword),
+            "WRKOBJ" => self.wrkobj(&cmd).await,
+            "DSPPFM" => self.dsppfm(&cmd).await,
             "SIGNOFF" => Ok(Outcome::SignOff),
             other => bail!("CPD0030: Command {other} is not implemented yet."),
         }
@@ -145,6 +157,224 @@ impl Job<'_> {
         Ok(Outcome::Messages(vec![format!(
             "Library {lib} added to library list."
         )]))
+    }
+
+    async fn require_secadm(&self, what: &str) -> Result<()> {
+        if !users::has_special(self.client, &self.user, "*SECADM").await? {
+            bail!("Not authorized to {what}: *SECADM special authority is needed.");
+        }
+        Ok(())
+    }
+
+    async fn crtusrprf(&mut self, cmd: &Command) -> Result<Outcome> {
+        self.require_secadm("create user profiles").await?;
+        let name = cmd.get("USRPRF").to_string();
+        let password = match cmd.get("PASSWORD") {
+            "*USRPRF" => users::NewPassword::SameAsProfile,
+            "*NONE" => users::NewPassword::None,
+            pw => users::NewPassword::Value(pw.to_string()),
+        };
+        let usrcls = cmd.get("USRCLS").to_string();
+        let special = match cmd.list("SPCAUT").as_slice() {
+            [one] if one == "*USRCLS" => users::class_special_authorities(&usrcls),
+            [one] if one == "*NONE" => vec![],
+            list => list.to_vec(),
+        };
+        let curlib = match cmd.get("CURLIB") {
+            "*CRTDFT" => "QGPL".to_string(),
+            lib => {
+                if !catalog::library_exists(self.client, lib).await? {
+                    bail!("CPF2110: Library {lib} not found.");
+                }
+                lib.to_string()
+            }
+        };
+        users::create(
+            self.client,
+            users::NewProfile {
+                name: name.clone(),
+                password,
+                expired: cmd.get("PWDEXP") == "*YES",
+                enabled: cmd.get("STATUS") != "*DISABLED",
+                usrcls,
+                special,
+                curlib,
+                text: cmd.get("TEXT").to_string(),
+            },
+        )
+        .await?;
+        Ok(Outcome::Messages(vec![format!(
+            "User profile {name} created."
+        )]))
+    }
+
+    async fn dspusrprf(&mut self, cmd: &Command) -> Result<Outcome> {
+        let name = cmd.get("USRPRF").to_string();
+        if name != self.user {
+            self.require_secadm("display other user profiles").await?;
+        }
+        let Some(p) = users::get(self.client, &name).await? else {
+            bail!("CPF2204: User profile {name} not found.");
+        };
+        let yes_no = |b: bool| if b { "*YES" } else { "*NO" }.to_string();
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display User Profile".into(),
+            info: vec![
+                ("User profile".into(), p.name),
+                ("User class".into(), p.usrcls),
+                ("Status".into(), p.status),
+                ("Password is *NONE".into(), yes_no(p.no_password)),
+                ("Set password to expired".into(), yes_no(p.pwd_expired)),
+                ("Current library".into(), p.curlib),
+                ("Text".into(), p.text),
+                (
+                    "Previous sign-on".into(),
+                    p.last_signon.unwrap_or_else(|| "*NONE".into()),
+                ),
+                ("Created".into(), p.created),
+            ],
+            heading: "Special authority".into(),
+            rows: if p.special_auth.is_empty() {
+                vec!["*NONE".into()]
+            } else {
+                p.special_auth
+            },
+        }))
+    }
+
+    async fn dltusrprf(&mut self, cmd: &Command) -> Result<Outcome> {
+        self.require_secadm("delete user profiles").await?;
+        let name = cmd.get("USRPRF").to_string();
+        if name == "QSECOFR" {
+            bail!("User profile QSECOFR is supplied with the system and cannot be deleted.");
+        }
+        if name == self.user {
+            bail!("User profile {name} is signed on in this job and cannot be deleted.");
+        }
+        if !users::delete(self.client, &name).await? {
+            bail!("CPF2204: User profile {name} not found.");
+        }
+        Ok(Outcome::Messages(vec![format!(
+            "User profile {name} deleted."
+        )]))
+    }
+
+    async fn wrkobj(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, obj) = match cmd.get("OBJ").split_once('/') {
+            Some((l, o)) => (l.to_string(), o.to_string()),
+            None => ("*LIBL".to_string(), cmd.get("OBJ").to_string()),
+        };
+        let objtype = cmd.get("OBJTYPE").to_string();
+        let libs: Vec<String> = match lib.as_str() {
+            "*LIBL" => self.library_list(),
+            "*CURLIB" => vec![self.curlib.clone()],
+            "*USRLIBL" => self.libl.clone(),
+            "*ALL" => catalog::list_libraries(self.client).await?,
+            "*ALLUSR" => catalog::list_libraries(self.client)
+                .await?
+                .into_iter()
+                .filter(|l| !l.starts_with('Q'))
+                .collect(),
+            l => {
+                if !catalog::library_exists(self.client, l).await? {
+                    bail!("CPF2110: Library {l} not found.");
+                }
+                vec![l.to_string()]
+            }
+        };
+        let mut rows = Vec::new();
+        for l in &libs {
+            let Ok(objects) = catalog::list_objects(self.client, l).await else {
+                continue; // a library in the list that no longer exists
+            };
+            for o in objects {
+                if catalog::name_matches(&obj, &o.name)
+                    && (objtype == "*ALL" || objtype == o.objtype)
+                {
+                    rows.push(format!(
+                        "{:<10}  {:<8}  {:<10}  {:<10}  {}",
+                        o.name, o.objtype, l, o.attribute, o.text
+                    ));
+                }
+            }
+        }
+        if rows.is_empty() {
+            bail!("No objects match {lib}/{obj} type {objtype}.");
+        }
+        Ok(Outcome::Display(ListDisplay {
+            title: "Work with Objects".into(),
+            info: vec![],
+            heading: format!(
+                "{:<10}  {:<8}  {:<10}  {:<10}  {}",
+                "Object", "Type", "Library", "Attribute", "Text"
+            ),
+            rows,
+        }))
+    }
+
+    async fn dsppfm(&mut self, cmd: &Command) -> Result<Outcome> {
+        let name = match cmd.get("FILE").split_once('/') {
+            Some(("*LIBL", n)) => n.to_string(),
+            Some(("*CURLIB", n)) => format!("{}/{n}", self.curlib),
+            _ => cmd.get("FILE").to_string(),
+        };
+        let f = catalog::resolve_file(self.client, &self.library_list(), &name).await?;
+        let recs = catalog::member_records(self.client, &f, DSPPFM_MAX_RECORDS + 1).await?;
+        let widths: Vec<usize> = f
+            .file
+            .fields
+            .iter()
+            .map(|fd| {
+                let w = if fd.data_type.is_numeric() {
+                    // digits, decimal point, sign
+                    fd.length as usize + usize::from(fd.decimals > 0) + 1
+                } else {
+                    fd.length as usize
+                };
+                w.max(fd.name.len())
+            })
+            .collect();
+        // Numbers (and their headings) are right-aligned, text left-aligned.
+        let line = |vals: &[String], numeric_right: bool| -> String {
+            vals.iter()
+                .zip(&widths)
+                .zip(&f.file.fields)
+                .map(|((v, w), fd)| {
+                    if numeric_right && fd.data_type.is_numeric() {
+                        format!("{v:>w$}")
+                    } else {
+                        format!("{v:<w$}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim_end()
+                .to_string()
+        };
+        let names: Vec<String> = f.file.fields.iter().map(|fd| fd.name.clone()).collect();
+        let truncated = recs.len() as i64 > DSPPFM_MAX_RECORDS;
+        let rows: Vec<String> = recs
+            .iter()
+            .take(DSPPFM_MAX_RECORDS as usize)
+            .map(|(_, v)| line(v, true))
+            .collect();
+        let mut info = vec![
+            ("File".to_string(), f.file.name.clone()),
+            ("Library".to_string(), f.library.clone()),
+            ("Records shown".to_string(), rows.len().to_string()),
+        ];
+        if truncated {
+            info.push((
+                "Note".into(),
+                format!("only the first {DSPPFM_MAX_RECORDS} records are shown"),
+            ));
+        }
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display Physical File Member".into(),
+            info,
+            heading: line(&names, true),
+            rows,
+        }))
     }
 
     /// CALL: run an RPG program on the runner, with file I/O through a

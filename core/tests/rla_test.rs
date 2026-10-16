@@ -663,3 +663,132 @@ async fn exfmt_without_a_display_fails_clearly() {
     assert_eq!(r["ok"], false);
     assert!(r["error"].as_str().unwrap().contains("no display"), "{r}");
 }
+
+/// DSPPFM reads a member in arrival order (relative record number), not
+/// key order: the CSV loads customer 3 first.
+#[tokio::test]
+async fn member_records_in_arrival_order() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let f = catalog::resolve_file(&client, std::slice::from_ref(&lib), "CUSTMAST")
+        .await
+        .unwrap();
+    let recs = catalog::member_records(&client, &f, 100).await.unwrap();
+    assert_eq!(recs.len(), 5);
+    assert_eq!(recs[0].1[0], "3", "first record written comes first");
+    assert_eq!(recs[0].1[1], "Bluebird Supply");
+    assert_eq!(recs[1].1[3], "1250.50", "numbers keep their scale");
+    assert_eq!(
+        catalog::member_records(&client, &f, 2).await.unwrap().len(),
+        2
+    );
+}
+
+/// CRTUSRPRF / DSPUSRPRF / DLTUSRPRF at the catalog level.
+#[tokio::test]
+async fn user_profiles_create_get_delete() {
+    use ibmish_core::users;
+    let url = require_db!();
+    let client = bridge::connect_db(&url).await.unwrap();
+    catalog::init(&client).await.unwrap();
+    let name = format!("U{}", std::process::id() % 1_000_000);
+    users::delete(&client, &name).await.unwrap();
+    let new = |password| users::NewProfile {
+        name: name.clone(),
+        password,
+        expired: false,
+        enabled: true,
+        usrcls: "*PGMR".into(),
+        special: users::class_special_authorities("*PGMR"),
+        curlib: "QGPL".into(),
+        text: "Test profile".into(),
+    };
+    users::create(&client, new(users::NewPassword::SameAsProfile))
+        .await
+        .unwrap();
+    // PASSWORD(*USRPRF): the password is the profile name.
+    users::authenticate(&client, &name, &name).await.unwrap();
+    assert!(
+        users::create(&client, new(users::NewPassword::None))
+            .await
+            .is_err(),
+        "already exists"
+    );
+    let p = users::get(&client, &name).await.unwrap().unwrap();
+    assert_eq!(
+        (p.usrcls.as_str(), p.text.as_str()),
+        ("*PGMR", "Test profile")
+    );
+    assert!(p.special_auth.is_empty());
+    assert!(!users::has_special(&client, &name, "*SECADM").await.unwrap());
+    assert!(users::has_special(&client, "QSECOFR", "*SECADM")
+        .await
+        .unwrap());
+    assert!(users::delete(&client, &name).await.unwrap());
+    assert!(users::get(&client, &name).await.unwrap().is_none());
+    // PASSWORD(*NONE): the profile cannot sign on.
+    users::create(&client, new(users::NewPassword::None))
+        .await
+        .unwrap();
+    assert!(users::authenticate(&client, &name, "").await.is_err());
+    assert!(users::authenticate(&client, &name, "*NONE").await.is_err());
+    users::delete(&client, &name).await.unwrap();
+}
+
+/// A password stored before ibmish followed QPWDLVL (hashed exactly as
+/// typed, mixed case) still signs on, and is stored upper case from then
+/// on, so any case works afterwards (QPWDLVL 0). `ibmish rstpwd` resets
+/// a password to the profile name, expired.
+#[tokio::test]
+async fn passwords_from_before_qpwdlvl_still_work() {
+    use ibmish_core::users;
+    let url = require_db!();
+    let client = bridge::connect_db(&url).await.unwrap();
+    catalog::init(&client).await.unwrap();
+    let name = format!("L{}", std::process::id() % 1_000_000);
+    users::delete(&client, &name).await.unwrap();
+    users::create(
+        &client,
+        users::NewProfile {
+            name: name.clone(),
+            password: users::NewPassword::None,
+            expired: false,
+            enabled: true,
+            usrcls: "*USER".into(),
+            special: vec![],
+            curlib: "QGPL".into(),
+            text: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    // The old way: the hash of the password exactly as typed.
+    client
+        .execute(
+            "UPDATE ibmish.user_profiles SET password_hash = $2 WHERE name = $1",
+            &[&name, &users::hash_password("Green5creen!").unwrap()],
+        )
+        .await
+        .unwrap();
+    assert!(users::authenticate(&client, &name, "green5creen!")
+        .await
+        .is_err());
+    users::authenticate(&client, &name, "Green5creen!")
+        .await
+        .unwrap();
+    // Re-stored upper case: now any case signs on.
+    users::authenticate(&client, &name, "green5creen!")
+        .await
+        .unwrap();
+    users::authenticate(&client, &name, "GREEN5CREEN!")
+        .await
+        .unwrap();
+
+    assert!(users::reset_password(&client, &name).await.unwrap());
+    let p = users::authenticate(&client, &name, &name.to_lowercase())
+        .await
+        .unwrap();
+    assert!(p.pwd_expired, "a reset password must be changed");
+    assert!(!users::reset_password(&client, "NOSUCHUSR").await.unwrap());
+    users::delete(&client, &name).await.unwrap();
+}

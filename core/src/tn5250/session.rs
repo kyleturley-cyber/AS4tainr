@@ -11,6 +11,7 @@ use std::time::Duration;
 use super::ds::{self, attr, Aid, FieldKind, Screen};
 use super::telnet::{opcode, Connection};
 use crate::bridge;
+use crate::cl;
 use crate::commands::{Environment, Job, ListDisplay, Outcome};
 use crate::dspf;
 use crate::users;
@@ -318,15 +319,33 @@ async fn command_entry(
         prefill.clear();
         message.clear();
         let inp = term.show(&s).await?;
-        match inp.aid {
+        let line = match inp.aid {
             Aid::F(3) => return Ok(()),
             Aid::F(12) => continue,
             Aid::F(4) => {
-                message =
-                    "Prompting (F4) is not available yet. Type the command with its parameters."
-                        .into();
-                prefill = inp.get("CMD").to_string();
-                continue;
+                let typed = inp.get("CMD").trim().to_string();
+                if typed.is_empty() {
+                    match command_menu(term).await? {
+                        Some(line) => line,
+                        None => continue,
+                    }
+                } else {
+                    match cl::parse_partial(&typed) {
+                        Err(e) => {
+                            message = e.to_string();
+                            prefill = typed;
+                            continue;
+                        }
+                        Ok((def, vals)) => match prompt(term, def, &vals).await? {
+                            PromptResult::Run(line) => line,
+                            PromptResult::Exit => continue,
+                            PromptResult::Cancel => {
+                                prefill = typed;
+                                continue;
+                            }
+                        },
+                    }
+                }
             }
             Aid::F(9) => {
                 if retrieve.is_empty() {
@@ -342,10 +361,9 @@ async fn command_entry(
                 }
                 continue;
             }
-            Aid::Enter => {}
+            Aid::Enter => inp.get("CMD").trim().to_string(),
             _ => continue,
-        }
-        let line = inp.get("CMD").trim().to_string();
+        };
         if line.is_empty() {
             continue;
         }
@@ -355,17 +373,19 @@ async fn command_entry(
         // Run the command; while it runs, show any display file records
         // its program writes (EXFMT) on this terminal.
         let user = job.user.clone();
-        let run = job.run(&line);
-        tokio::pin!(run);
-        let result = loop {
-            tokio::select! {
-                r = &mut run => break r,
-                Some(req) = display_rx.recv() => {
-                    let resp = exfmt(term, &req, &user, &cfg.system_name).await;
-                    let failed = resp.is_err();
-                    let _ = req.reply.send(resp.map_err(|e| format!("{e:#}")));
-                    if failed {
-                        anyhow::bail!("the display stopped responding");
+        let result = {
+            let run = job.run(&line);
+            tokio::pin!(run);
+            loop {
+                tokio::select! {
+                    r = &mut run => break r,
+                    Some(req) = display_rx.recv() => {
+                        let resp = exfmt(term, &req, &user, &cfg.system_name).await;
+                        let failed = resp.is_err();
+                        let _ = req.reply.send(resp.map_err(|e| format!("{e:#}")));
+                        if failed {
+                            anyhow::bail!("the display stopped responding");
+                        }
                     }
                 }
             }
@@ -379,6 +399,14 @@ async fn command_entry(
             }
             Ok(Outcome::Display(d)) => {
                 list_display(term, &d).await?;
+            }
+            Ok(Outcome::ChangePassword) => {
+                if change_password(term, job.client, &job.user, false).await? {
+                    message = "Password changed successfully.".into();
+                } else {
+                    message = "Password not changed.".into();
+                }
+                log.push(format!("  {message}"));
             }
             Ok(Outcome::SignOff) => return Ok(()),
             Err(e) => {
@@ -440,11 +468,288 @@ fn clock() -> (String, String) {
     )
 }
 
-const LIST_ROWS: usize = 12;
+/// What the operator did on a menu.
+enum MenuChoice {
+    /// A valid option number (0-based index).
+    Option(usize),
+    /// A command typed on the selection line, and whether F4 was pressed.
+    Command(String, bool),
+    /// F12.
+    Back,
+    /// F3.
+    Exit,
+}
+
+/// A numbered menu with a "Selection or command" line, in the usual IBM i
+/// layout. Typing an option number and Enter selects it; a command name
+/// runs it (or prompts it with F4).
+async fn menu(
+    term: &mut Term,
+    title: &str,
+    items: &[String],
+    message: &mut String,
+) -> Result<MenuChoice> {
+    loop {
+        let mut s = Screen::new();
+        centered(&mut s, 1, title);
+        s.put(3, 2, "Select one of the following:");
+        for (i, item) in items.iter().enumerate() {
+            s.put(5 + i as u8, 6, &format!("{:>2}. {item}", i + 1));
+        }
+        s.put(19, 2, "Selection or command");
+        s.text(20, 2, attr::HIGH, "===>");
+        s.field("SEL", 20, 7, 74, FieldKind::Text, "");
+        keys(&mut s, 22, "F3=Exit   F4=Prompt   F12=Cancel");
+        s.message(message);
+        message.clear();
+        let inp = term.show(&s).await?;
+        let typed = inp.get("SEL").trim().to_string();
+        match inp.aid {
+            Aid::F(3) => return Ok(MenuChoice::Exit),
+            Aid::F(12) => return Ok(MenuChoice::Back),
+            Aid::Enter | Aid::F(4) => {}
+            _ => {
+                *message = "That key is not valid on this display.".into();
+                continue;
+            }
+        }
+        if typed.is_empty() {
+            if inp.aid == Aid::F(4) {
+                *message = "Type an option number or a command name to prompt.".into();
+            }
+            continue;
+        }
+        if typed.chars().all(|c| c.is_ascii_digit()) {
+            match typed.parse::<usize>() {
+                Ok(n) if (1..=items.len()).contains(&n) && inp.aid == Aid::Enter => {
+                    return Ok(MenuChoice::Option(n - 1))
+                }
+                _ => {
+                    *message = format!(
+                        "Selection {typed} is not valid. Type a number from 1 to {}.",
+                        items.len()
+                    );
+                    continue;
+                }
+            }
+        }
+        return Ok(MenuChoice::Command(typed, inp.aid == Aid::F(4)));
+    }
+}
+
+/// F4 on an empty command line: the command groups, then the commands of
+/// a group, then the prompt of the command chosen. Returns the command to
+/// run, or None to go back to the command line.
+async fn command_menu(term: &mut Term) -> Result<Option<String>> {
+    let mut group: Option<usize> = None;
+    let mut message = String::new();
+    loop {
+        let (title, items): (String, Vec<String>) = match group {
+            None => (
+                "Command Groups".into(),
+                cl::GROUPS.iter().map(|g| g.item.to_string()).collect(),
+            ),
+            Some(g) => {
+                let g = &cl::GROUPS[g];
+                (
+                    g.title.to_string(),
+                    g.commands
+                        .iter()
+                        .map(|name| {
+                            let def = cl::find(name).expect("groups list known commands");
+                            format!("{:<40}{}", def.description, def.name)
+                        })
+                        .collect(),
+                )
+            }
+        };
+        match menu(term, &title, &items, &mut message).await? {
+            MenuChoice::Exit => return Ok(None),
+            MenuChoice::Back => match group {
+                Some(_) => group = None,
+                None => return Ok(None),
+            },
+            MenuChoice::Option(i) => match group {
+                None => group = Some(i),
+                Some(g) => {
+                    let def =
+                        cl::find(cl::GROUPS[g].commands[i]).expect("groups list known commands");
+                    match prompt(term, def, &Default::default()).await? {
+                        PromptResult::Run(line) => return Ok(Some(line)),
+                        PromptResult::Exit => return Ok(None),
+                        PromptResult::Cancel => {}
+                    }
+                }
+            },
+            MenuChoice::Command(line, false) => return Ok(Some(line)),
+            MenuChoice::Command(line, true) => match cl::parse_partial(&line) {
+                Err(e) => message = e.to_string(),
+                Ok((def, vals)) => match prompt(term, def, &vals).await? {
+                    PromptResult::Run(line) => return Ok(Some(line)),
+                    PromptResult::Exit => return Ok(None),
+                    PromptResult::Cancel => {}
+                },
+            },
+        }
+    }
+}
+
+enum PromptResult {
+    /// Run this command.
+    Run(String),
+    /// F12: back to the command line with what was typed.
+    Cancel,
+    /// F3: back to an empty command line.
+    Exit,
+}
+
+const PROMPT_FIRST_ROW: u8 = 5;
+const PROMPT_LABEL_COL: u8 = 2;
+const PROMPT_FIELD_COL: u8 = 37;
+
+fn prompt_width(kind: cl::Kind) -> u16 {
+    match kind {
+        cl::Kind::Name | cl::Kind::Qualified => 10,
+        cl::Kind::Password => users::MAX_PASSWORD as u16,
+        cl::Kind::Text | cl::Kind::List => 42,
+    }
+}
+
+/// F4: a screen with one input field per parameter, filled with what was
+/// typed or the default. Enter builds the command and checks it.
+async fn prompt(
+    term: &mut Term,
+    def: &'static cl::CommandDef,
+    typed: &std::collections::BTreeMap<&'static str, Vec<cl::Value>>,
+) -> Result<PromptResult> {
+    use std::collections::BTreeMap;
+    let initial = || -> BTreeMap<String, String> {
+        let mut v = BTreeMap::new();
+        for pd in def.params {
+            let text = match typed.get(pd.keyword) {
+                Some(vals) => cl::prompt_text(pd.kind, vals),
+                None => pd.default.unwrap_or("").to_string(),
+            };
+            if pd.kind == cl::Kind::Qualified {
+                let (lib, obj) = text.split_once('/').unwrap_or(("*LIBL", &text));
+                v.insert(format!("{}.LIB", pd.keyword), lib.to_string());
+                v.insert(pd.keyword.to_string(), obj.to_string());
+            } else {
+                v.insert(pd.keyword.to_string(), text);
+            }
+        }
+        v
+    };
+    let mut values = initial();
+    let mut message = String::new();
+    loop {
+        let mut s = Screen::new();
+        centered(&mut s, 1, &format!("{} ({})", def.description, def.name));
+        s.put(3, 2, "Type choices, press Enter.");
+        let mut row = PROMPT_FIRST_ROW;
+        for pd in def.params {
+            let a = if pd.required {
+                attr::HIGH
+            } else {
+                attr::NORMAL
+            };
+            s.text(row, PROMPT_LABEL_COL, a, &label(pd.prompt, 33));
+            let w = prompt_width(pd.kind);
+            let kind = match pd.kind {
+                cl::Kind::Password => FieldKind::Hidden,
+                cl::Kind::Text | cl::Kind::List => FieldKind::Text,
+                _ => FieldKind::Upper,
+            };
+            let v = values.get(pd.keyword).cloned().unwrap_or_default();
+            s.field(pd.keyword, row, PROMPT_FIELD_COL, w, kind, &v);
+            // Allowed values to the right, when they fit on the line.
+            if !pd.choices.is_empty()
+                && PROMPT_FIELD_COL as usize + w as usize + 2 + pd.choices.len() <= 80
+            {
+                s.put(row, PROMPT_FIELD_COL + w as u8 + 2, pd.choices);
+            }
+            row += 1;
+            if pd.kind == cl::Kind::Qualified {
+                s.put(row, PROMPT_LABEL_COL + 2, &label("Library", 31));
+                let key = format!("{}.LIB", pd.keyword);
+                let v = values.get(&key).cloned().unwrap_or_default();
+                s.field(&key, row, PROMPT_FIELD_COL, 10, FieldKind::Upper, &v);
+                s.put(row, PROMPT_FIELD_COL + 12, "Name, *LIBL, *CURLIB");
+                row += 1;
+            }
+        }
+        s.put(22, 74, "Bottom");
+        keys(&mut s, 23, "F3=Exit   F5=Refresh   F12=Cancel");
+        s.message(&message);
+        message.clear();
+        let inp = term.show(&s).await?;
+        for (name, v) in &inp.values {
+            values.insert(name.clone(), v.trim_end().to_string());
+        }
+        match inp.aid {
+            Aid::F(3) => return Ok(PromptResult::Exit),
+            Aid::F(12) => return Ok(PromptResult::Cancel),
+            Aid::F(5) => {
+                values = initial();
+                continue;
+            }
+            Aid::Enter => {}
+            _ => {
+                message = "That key is not valid on this display.".into();
+                continue;
+            }
+        }
+        // Put qualified names back together, then build the command.
+        let mut flat = BTreeMap::new();
+        for pd in def.params {
+            let v = values.get(pd.keyword).cloned().unwrap_or_default();
+            if pd.kind == cl::Kind::Qualified {
+                let lib = values
+                    .get(&format!("{}.LIB", pd.keyword))
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_default();
+                let v = v.trim();
+                let q = if v.is_empty() || lib.is_empty() || lib == "*LIBL" {
+                    v.to_string()
+                } else {
+                    format!("{lib}/{v}")
+                };
+                flat.insert(pd.keyword.to_string(), q);
+            } else {
+                flat.insert(pd.keyword.to_string(), v);
+            }
+        }
+        let line = cl::build(def, &flat);
+        match cl::parse(&line) {
+            Ok(_) => return Ok(PromptResult::Run(line)),
+            Err(e) => message = e.to_string(),
+        }
+    }
+}
+
+/// The list area of a list display ends on line 20; line 21 says More...
+/// or Bottom. How many lines it has depends on the info lines above it.
+const LIST_LAST_ROW: usize = 20;
+
+/// Columns moved by F19 (Left) and F20 (Right) on wide lists.
+const SHIFT: usize = 40;
 
 async fn list_display(term: &mut Term, d: &ListDisplay) -> Result<()> {
     let mut top = 0usize;
+    let mut left = 0usize;
+    let width = d
+        .rows
+        .iter()
+        .chain(std::iter::once(&d.heading))
+        .map(|r| r.chars().count())
+        .max()
+        .unwrap_or(0);
+    let wide = width > 78;
+    let cut = |line: &str, left: usize| -> String { line.chars().skip(left).take(78).collect() };
     let mut message = String::new();
+    // Title, blank, info lines, blank, heading: the list starts after them.
+    let first_row = 3 + d.info.len() + 2;
+    let page_rows = (LIST_LAST_ROW + 1).saturating_sub(first_row).max(1);
     loop {
         let mut s = Screen::new();
         centered(&mut s, 1, &d.title);
@@ -454,30 +759,46 @@ async fn list_display(term: &mut Term, d: &ListDisplay) -> Result<()> {
             row += 1;
         }
         row += 1;
-        s.text(row, 2, attr::HIGH, &d.heading);
+        s.text(row, 2, attr::HIGH, &cut(&d.heading, left));
         let first = row + 1;
-        let page = &d.rows[top.min(d.rows.len())..(top + LIST_ROWS).min(d.rows.len())];
+        let page = &d.rows[top.min(d.rows.len())..(top + page_rows).min(d.rows.len())];
         if d.rows.is_empty() {
             s.put(first, 4, "(No entries)");
         }
         for (i, line) in page.iter().enumerate() {
-            s.put(first + i as u8, 2, line);
+            s.put(first + i as u8, 2, &cut(line, left));
         }
-        let more = if top + LIST_ROWS < d.rows.len() {
+        let more = if top + page_rows < d.rows.len() {
             "More..."
         } else {
             "Bottom"
         };
-        s.put(first + LIST_ROWS as u8, 72, more);
-        keys(&mut s, 23, "F3=Exit   F12=Cancel");
+        s.put(LIST_LAST_ROW as u8 + 1, 72, more);
+        keys(
+            &mut s,
+            23,
+            if wide {
+                "F3=Exit   F12=Cancel   F19=Left   F20=Right"
+            } else {
+                "F3=Exit   F12=Cancel"
+            },
+        );
         s.message(&message);
         message.clear();
         let inp = term.show(&s).await?;
         match inp.aid {
             Aid::F(3) | Aid::F(12) | Aid::Enter => return Ok(()),
+            Aid::F(19) if wide => left = left.saturating_sub(SHIFT),
+            Aid::F(20) if wide => {
+                if left + 78 < width {
+                    left += SHIFT;
+                } else {
+                    message = "Already at the right edge.".into();
+                }
+            }
             Aid::RollUp => {
-                if top + LIST_ROWS < d.rows.len() {
-                    top += LIST_ROWS;
+                if top + page_rows < d.rows.len() {
+                    top += page_rows;
                 } else {
                     message = "Already at the bottom of the list.".into();
                 }
@@ -486,7 +807,7 @@ async fn list_display(term: &mut Term, d: &ListDisplay) -> Result<()> {
                 if top == 0 {
                     message = "Already at the top of the list.".into();
                 } else {
-                    top = top.saturating_sub(LIST_ROWS);
+                    top = top.saturating_sub(page_rows);
                 }
             }
             _ => {}

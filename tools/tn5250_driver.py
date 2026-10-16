@@ -22,6 +22,8 @@ import time
 import pyte
 
 FKEYS = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7", 8: "8", 9: "9", 10: "0", 11: "-", 12: "="}
+# tn5250 curses: ESC + shifted digit row for F13-F20.
+FKEYS.update({13: "!", 14: "@", 15: "#", 16: "$", 17: "%", 18: "^", 19: "&", 20: "*"})
 
 
 class Tn5250:

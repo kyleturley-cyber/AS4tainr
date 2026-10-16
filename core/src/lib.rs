@@ -11,6 +11,7 @@
 pub mod bridge;
 pub mod catalog;
 pub mod cl;
+pub mod clpgm;
 pub mod commands;
 pub mod dds;
 pub mod dspf;

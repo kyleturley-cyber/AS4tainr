@@ -1,0 +1,10 @@
+NOSUCHFILE is missing, as expected.
+Names from L
+Steps 123 total 7.50
+Total is medium
+DSPLY  Prairie Freight 9999999.99
+DSPLY  Acme Tooling 1250.50
+DSPLY  Midwest Fasteners 310.00
+DSPLY  Lake, Pine & Co
+DSPLY  Midwest Fasteners
+Report done for QSECOFR

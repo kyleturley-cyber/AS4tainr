@@ -42,6 +42,9 @@ for l in CUSTNAME CUSTOWE; do
   fi
 done
 
+# The sample CL program (CRTBNDCL replaces it each time).
+"$bin" crtbndcl QGPL/CUSTRPT --src "$samples/qclsrc/CUSTRPT.clle" --text 'Customer report driver'
+
 status=0
 run() {
   local pgm="$1" parm="$2" expected="$samples/expected/${1}_${2}.txt"
@@ -61,6 +64,7 @@ run() {
 run CUSTLIST 3
 run ORDTOTAL 1002
 run OWING L
+run CUSTRPT L
 # CUSTUPD changes data, so it only runs right after the sample files were created.
 if [ "$fresh" = 1 ]; then
   run CUSTUPD 5

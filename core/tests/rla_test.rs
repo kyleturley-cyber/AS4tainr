@@ -1241,3 +1241,192 @@ async fn sql_reads_and_writes_dds_files() {
         .starts_with("SQL0551"));
     assert!(err("create table x (a int)").await.starts_with("SQL0084"));
 }
+
+async fn cl_job_run(
+    client: &Client,
+    url: &str,
+    lib: &str,
+    pgms: &[(&str, &str)],
+    call: &str,
+) -> anyhow::Result<Vec<String>> {
+    use ibmish_core::commands::{Environment, Job, Outcome};
+    let mut c = bridge::connect_db(url).await.unwrap();
+    for (name, src) in pgms {
+        ibmish_core::clpgm::compile(name, src).unwrap();
+        catalog::create_cl_program(&mut c, lib, name, "", src, true)
+            .await
+            .unwrap();
+    }
+    let env = Environment {
+        database_url: url.to_string(),
+        runner: "false".into(),
+        call_timeout: std::time::Duration::from_secs(5),
+    };
+    let mut job = Job {
+        client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: None,
+        libl: vec![lib.to_string()],
+        display: None,
+    };
+    match job.run(call).await? {
+        Outcome::Messages(m) => Ok(m),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// CL programs (IBM CL reference): loops with LEAVE and ITERATE, DOUNTIL
+/// running its body at least once, nested DOFOR, variables in command
+/// parameters, CALL between CL programs with parameters.
+#[tokio::test]
+async fn cl_programs_control_flow() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let loops = "PGM PARM(&N)
+  DCL &N *DEC (3 0)
+  DCL &I *DEC (3 0)
+  DCL &J *DEC (3 0)
+  DCL &S *DEC (5 0)
+  DCL &T *CHAR 20
+  /* DOWHILE with ITERATE (skip 3) and LEAVE (stop after 5) */
+  DOWHILE COND(&I < &N)
+    CHGVAR &I (&I + 1)
+    IF (&I = 3) THEN(ITERATE)
+    IF (&I > 5) THEN(LEAVE)
+    CHGVAR &S (&S + &I)
+  ENDDO
+  SNDPGMMSG MSG('while' *BCAT %CHAR(&S))
+  /* DOUNTIL runs once even when the condition is already true */
+  CHGVAR &S 0
+  DOUNTIL COND(&S > 0)
+    CHGVAR &S (&S + 10)
+  ENDDO
+  SNDPGMMSG MSG('until' *BCAT %CHAR(&S))
+  /* Nested DOFOR; ITERATE in the inner loop */
+  DOFOR VAR(&I) FROM(1) TO(3)
+    DOFOR VAR(&J) FROM(3) TO(1) BY(-1)
+      IF (&J = 2) THEN(ITERATE)
+      CHGVAR &T (&T *TCAT %CHAR(&I) *TCAT %CHAR(&J))
+    ENDDO
+  ENDDO
+  SNDPGMMSG MSG(%TRIM(&T))
+  CALL PGM(CLCHILD) PARM('abc' &N)
+ENDPGM";
+    let child = "PGM PARM(&A &B)
+  DCL &A *CHAR 5
+  DCL &B *DEC (3 0)
+  SNDPGMMSG MSG('child got' *BCAT %TRIM(&A) *BCAT %CHAR(&B * 2))
+ENDPGM";
+    // 1+2+4+5 = 12 (3 skipped, stops at 6); until: 10; pairs (i,j) with
+    // j in 3,1: 13 11 23 21 33 31; child doubles 9.
+    let m = cl_job_run(
+        &client,
+        &url,
+        &lib,
+        &[("CLLOOPS", loops), ("CLCHILD", child)],
+        "CALL CLLOOPS PARM(9)",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        m,
+        ["while 12", "until 10", "131123213331", "child got abc 18"]
+    );
+
+    // Variables in command parameters: CRTLIB with &LIB and &TXT.
+    let mk = "PGM
+  DCL &L *CHAR 10 VALUE('CLMADE')
+  DCL &TXT *CHAR 30 VALUE('Made by a CL program')
+  CRTLIB LIB(&L) TEXT(&TXT)
+  MONMSG MSGID(CPF2111) EXEC(SNDPGMMSG MSG('already there'))
+  CHKOBJ OBJ(&L) OBJTYPE(*LIB)
+  SNDPGMMSG MSG('found' *BCAT &L)
+ENDPGM";
+    client
+        .batch_execute("DROP SCHEMA IF EXISTS clmade CASCADE; DELETE FROM ibmish.objects WHERE library='QSYS' AND name='CLMADE'")
+        .await
+        .unwrap();
+    let m = cl_job_run(&client, &url, &lib, &[("CLMK", mk)], "CALL CLMK")
+        .await
+        .unwrap();
+    assert_eq!(m, ["Library CLMADE created.", "found CLMADE"]);
+    let m = cl_job_run(&client, &url, &lib, &[], "CALL CLMK")
+        .await
+        .unwrap();
+    assert_eq!(
+        m,
+        ["already there", "found CLMADE"],
+        "CPF2111 monitored at command level"
+    );
+}
+
+/// MONMSG (IBM CL reference): a command-level MONMSG is tried before the
+/// program-level one; generic IDs; an *ESCAPE message ends the program
+/// and the caller can monitor for it; an unmonitored error ends the
+/// program with the error.
+#[tokio::test]
+async fn cl_programs_monitor_messages() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let thrower = "PGM
+  SNDPGMMSG MSGID(CPF9898) MSGF(QCPFMSG) MSGDTA('thrown on purpose') MSGTYPE(*ESCAPE)
+  SNDPGMMSG MSG('not reached')
+ENDPGM";
+    let catcher = "PGM
+  DCL &OK *LGL
+  MONMSG MSGID(CPF0000) EXEC(GOTO CMDLBL(GLOBAL))
+  CALL CLTHROW
+  MONMSG MSGID(CPF9898) EXEC(CHGVAR &OK '1')
+  IF COND(&OK) THEN(SNDPGMMSG MSG('caught at command level'))
+  DSPLIB NOSUCHLIB
+  SNDPGMMSG MSG('not reached either')
+  RETURN
+GLOBAL:
+  SNDPGMMSG MSG('caught at program level')
+ENDPGM";
+    let m = cl_job_run(
+        &client,
+        &url,
+        &lib,
+        &[("CLTHROW", thrower), ("CLCATCH", catcher)],
+        "CALL CLCATCH",
+    )
+    .await
+    .unwrap();
+    assert_eq!(m, ["caught at command level", "caught at program level"]);
+
+    let e = cl_job_run(&client, &url, &lib, &[], "CALL CLTHROW")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF9898: thrown on purpose"), "{e}");
+    let unmonitored = "PGM
+  SNDPGMMSG MSG('before')
+  DSPLIB NOSUCHLIB
+ENDPGM";
+    let e = cl_job_run(&client, &url, &lib, &[("CLBAD", unmonitored)], "CALL CLBAD")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("CPF2110") && e.contains("line 3"), "{e}");
+    // Wrong number of parameters, decimal overflow.
+    let ovf = "PGM PARM(&D)
+  DCL &D *DEC (3 0)
+  CHGVAR &D (&D * 100)
+ENDPGM";
+    let e = cl_job_run(
+        &client,
+        &url,
+        &lib,
+        &[("CLOVF", ovf)],
+        "CALL CLOVF PARM(50)",
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("MCH1210"), "{e}");
+    assert!(cl_job_run(&client, &url, &lib, &[], "CALL CLOVF PARM(1 2)")
+        .await
+        .is_err());
+}

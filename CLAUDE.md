@@ -28,6 +28,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/tn5250/` | 5250 display server: telnet + records (`telnet.rs`), data stream (`ds.rs`), EBCDIC (`ebcdic.rs`), screens (`session.rs`) |
 | `core/src/cl.rs` | CL parser and the command definition table (add new commands here first) |
 | `core/src/commands.rs` | CL command implementations for a job |
+| `core/src/clpgm.rs` | CL programs: parse/check (CRTBNDCL), expressions (exact decimals), run in the calling job with MONMSG |
 | `core/src/users.rs` | User profiles, Argon2id password hashes |
 | `core/src/main.rs` | `ibmish` CLI |
 | `core/tests/rla_test.rs` | Integration tests (need `IBMISH_TEST_DATABASE_URL`) |

@@ -535,6 +535,46 @@ impl Job<'_> {
     /// messages.
     async fn call(&mut self, cmd: &Command) -> Result<Outcome> {
         let pgm = cmd.get("PGM").to_string();
+        self.call_program(&pgm, cmd.list("PARM")).await
+    }
+
+    /// Run a command line, boxed: CL programs run commands, and commands
+    /// run CL programs, so the futures nest.
+    pub fn run_boxed<'b>(
+        &'b mut self,
+        line: &'b str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Outcome>> + Send + 'b>> {
+        Box::pin(self.run(line))
+    }
+
+    /// CALL from a CL program (boxed for the same reason).
+    pub fn call_program_boxed<'b>(
+        &'b mut self,
+        pgm: &'b str,
+        args: Vec<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Outcome>> + Send + 'b>> {
+        Box::pin(self.call_program(pgm, args))
+    }
+
+    /// CALL: a CL program found through the library list runs here;
+    /// anything else goes to the RPG runner.
+    pub async fn call_program(&mut self, pgm: &str, args: Vec<String>) -> Result<Outcome> {
+        let pgm = pgm.to_ascii_uppercase();
+        let (libs, name) = match pgm.split_once('/') {
+            Some(("*LIBL", n)) => (self.library_list(), n.to_string()),
+            Some(("*CURLIB", n)) => (vec![self.current_library()], n.to_string()),
+            Some((l, n)) => (vec![l.to_string()], n.to_string()),
+            None => (self.library_list(), pgm.clone()),
+        };
+        if let Some((_, source)) = catalog::find_cl_program(self.client, &libs, &name).await? {
+            let program = crate::clpgm::compile(&name, &source)?;
+            return crate::clpgm::run(self, &program, &args).await;
+        }
+        self.call_rpg(&name, args).await
+    }
+
+    async fn call_rpg(&mut self, pgm: &str, args: Vec<String>) -> Result<Outcome> {
+        let pgm = pgm.to_string();
         let listener = bridge::bind(0).await?;
         let addr = listener.local_addr()?;
         let server = tokio::spawn(bridge::serve(
@@ -554,7 +594,7 @@ impl Job<'_> {
             .arg("--bridge")
             .arg(addr.to_string())
             .arg(&pgm)
-            .args(cmd.list("PARM"))
+            .args(&args)
             .env("IBMISH_LIBL", self.library_list().join(","))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -562,7 +602,13 @@ impl Job<'_> {
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("starting runner '{}'", self.env.runner))?;
-        let out = tokio::time::timeout(self.env.call_timeout, child.wait_with_output()).await;
+        // A batch call has a time limit; an interactive one waits for the
+        // operator as long as it takes.
+        let out = if self.display.is_some() {
+            Ok(child.wait_with_output().await)
+        } else {
+            tokio::time::timeout(self.env.call_timeout, child.wait_with_output()).await
+        };
         server.abort();
         let out = match out {
             Ok(r) => r?,

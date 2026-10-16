@@ -106,6 +106,11 @@ with Tn5250(HOST) as t:
     command(t, "rmvlible qtemp", "Library QTEMP removed from library list.")
     check(True, "RMVLIBLE removes a library from the user part", t)
 
+    # A CL program that calls an RPG program.
+    command(t, "call custrpt parm(L)", "Report done for QSECOFR", timeout=90)
+    check("Steps 123 total 7.50" in t.text() and "DSPLY  Acme Tooling 1250.50" in t.text(),
+          "CALL runs a CL program: its messages and the RPG program's DSPLY output are in the log", t)
+
     # SQL: STRSQL shows rows, RUNSQL changes them.
     command(t, "strsql", "Enter SQL Statements")
     t.type("select cusno, cusnam, cusbal from qgpl/custmast where cusbal > 0 order by cusbal desc"); t.enter()

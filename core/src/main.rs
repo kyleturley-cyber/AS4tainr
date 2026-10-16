@@ -69,6 +69,18 @@ enum Cmd {
         #[arg(long)]
         src: PathBuf,
     },
+    /// CRTBNDCL: check a CL program and create it (replacing one of the
+    /// same name, as REPLACE(*YES) does).
+    Crtbndcl {
+        /// Qualified name, LIB/PGM.
+        program: String,
+        /// CL source file.
+        #[arg(long)]
+        src: PathBuf,
+        /// Text description.
+        #[arg(long, default_value = "")]
+        text: String,
+    },
     /// Run one SQL statement (DB2 for i dialect) with the library list.
     Sql {
         /// The statement, e.g. "SELECT * FROM CUSTMAST".
@@ -194,6 +206,21 @@ async fn run(cli: Cli) -> Result<u8> {
             let client = bridge::connect_db(&cli.database_url).await?;
             catalog::create_library(&client, &library, &text).await?;
             println!("Library {} created.", library.to_ascii_uppercase());
+        }
+        Cmd::Crtbndcl { program, src, text } => {
+            let (lib, name) = split_lib_file(&program)?;
+            let source = std::fs::read_to_string(&src)
+                .with_context(|| format!("reading {}", src.display()))?;
+            let pgm = ibmish_core::clpgm::compile(&name, &source)?;
+            let mut client = bridge::connect_db(&cli.database_url).await?;
+            catalog::create_cl_program(&mut client, &lib, &name, &text, &source, true).await?;
+            println!(
+                "Program {} created in library {} ({} parameters, {} variables).",
+                pgm.name,
+                lib.to_ascii_uppercase(),
+                pgm.params.len(),
+                pgm.decls.len()
+            );
         }
         Cmd::Sql { statement } => {
             let client = bridge::connect_db(&cli.database_url).await?;
@@ -349,6 +376,50 @@ async fn run(cli: Cli) -> Result<u8> {
                 max_signon_attempts: 3,
             };
             tn5250::serve(listener, cfg).await?;
+        }
+        Cmd::Call {
+            program,
+            args,
+            runner,
+        } if {
+            // A CL program runs in a batch job here.
+            let client = bridge::connect_db(&cli.database_url).await?;
+            let name = program.to_ascii_uppercase();
+            let (libs, n) = match name.split_once('/') {
+                Some((l, n)) => (vec![l.to_string()], n.to_string()),
+                None => (libl.clone(), name.clone()),
+            };
+            catalog::find_cl_program(&client, &libs, &n)
+                .await?
+                .is_some()
+        } =>
+        {
+            let client = bridge::connect_db(&cli.database_url).await?;
+            let env = commands::Environment {
+                database_url: cli.database_url.clone(),
+                runner,
+                call_timeout: std::time::Duration::from_secs(120),
+            };
+            let mut job = commands::Job {
+                client: &client,
+                env: &env,
+                user: "QSECOFR".into(),
+                curlib: None,
+                libl: libl.clone(),
+                display: None,
+            };
+            match job.call_program(&program, args).await {
+                Ok(commands::Outcome::Messages(m)) => {
+                    for l in m {
+                        println!("{l}");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("ibmish: {e:#}");
+                    return Ok(1);
+                }
+            }
         }
         Cmd::Call {
             program,

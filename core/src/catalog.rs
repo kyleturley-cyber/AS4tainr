@@ -49,6 +49,13 @@ CREATE TABLE IF NOT EXISTS ibmish.file_keys (
     PRIMARY KEY (library, file, seq)
 );
 ALTER TABLE ibmish.file_keys ADD COLUMN IF NOT EXISTS descending boolean NOT NULL DEFAULT false;
+CREATE TABLE IF NOT EXISTS ibmish.programs (
+    library   text NOT NULL,
+    name      text NOT NULL,
+    attribute text NOT NULL,
+    source    text NOT NULL,
+    PRIMARY KEY (library, name)
+);
 CREATE TABLE IF NOT EXISTS ibmish.logical_files (
     library    text NOT NULL,
     name       text NOT NULL,
@@ -206,6 +213,105 @@ pub async fn list_objects(client: &Client, library: &str) -> Result<Vec<ObjectEn
         .into_iter()
         .map(|r| ObjectEntry { name: r.get(0), objtype: r.get(1), attribute: r.get(2), text: r.get(3) })
         .collect())
+}
+
+/// CRTBNDCL: keep a checked CL program as a *PGM object (attribute CLLE).
+/// With `replace`, an existing program of that name is replaced.
+pub async fn create_cl_program(
+    client: &mut Client,
+    library: &str,
+    name: &str,
+    text: &str,
+    source: &str,
+    replace: bool,
+) -> Result<()> {
+    let lib = validate_name("library", library)?;
+    let name = validate_name("program", name)?;
+    let tx = client.transaction().await?;
+    if tx
+        .query_opt(
+            "SELECT 1 FROM ibmish.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
+            &[&lib],
+        )
+        .await?
+        .is_none()
+    {
+        bail!("CPF2110: Library {lib} not found.");
+    }
+    let exists = tx
+        .query_opt(
+            "SELECT 1 FROM ibmish.objects WHERE library=$1 AND name=$2 AND objtype='*PGM'",
+            &[&lib, &name],
+        )
+        .await?
+        .is_some();
+    if exists && !replace {
+        bail!("Program {name} in library {lib} already exists.");
+    }
+    tx.execute(
+        "DELETE FROM ibmish.objects WHERE library=$1 AND name=$2 AND objtype='*PGM'",
+        &[&lib, &name],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM ibmish.programs WHERE library=$1 AND name=$2",
+        &[&lib, &name],
+    )
+    .await?;
+    tx.execute(
+        "INSERT INTO ibmish.objects (library, name, objtype, attribute, text) VALUES ($1,$2,'*PGM','CLLE',$3)",
+        &[&lib, &name, &text],
+    )
+    .await?;
+    tx.execute(
+        "INSERT INTO ibmish.programs VALUES ($1,$2,'CLLE',$3)",
+        &[&lib, &name, &source],
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// A CL program found through a list of libraries: (library, source).
+pub async fn find_cl_program(
+    client: &Client,
+    libs: &[String],
+    name: &str,
+) -> Result<Option<(String, String)>> {
+    for lib in libs {
+        if let Some(r) = client
+            .query_opt(
+                "SELECT source FROM ibmish.programs WHERE library=$1 AND name=$2",
+                &[lib, &name],
+            )
+            .await?
+        {
+            return Ok(Some((lib.clone(), r.get(0))));
+        }
+    }
+    Ok(None)
+}
+
+/// Is there an object of this type in one of these libraries (CHKOBJ)?
+/// Libraries themselves are *LIB objects in QSYS.
+pub async fn object_exists(
+    client: &Client,
+    libs: &[String],
+    name: &str,
+    objtype: &str,
+) -> Result<bool> {
+    let libs: Vec<String> = if objtype == "*LIB" {
+        vec!["QSYS".into()]
+    } else {
+        libs.to_vec()
+    };
+    Ok(client
+        .query_opt(
+            "SELECT 1 FROM ibmish.objects WHERE library = ANY($1) AND name=$2 AND objtype=$3",
+            &[&libs, &name, &objtype],
+        )
+        .await?
+        .is_some())
 }
 
 /// All libraries, by name.

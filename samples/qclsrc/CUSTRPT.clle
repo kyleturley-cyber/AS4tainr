@@ -1,0 +1,44 @@
+/* CUSTRPT: customer report driver (sample CL program).               */
+/* Checks the files it needs, works out a few values, calls the RPG   */
+/* program OWING and reports with SNDPGMMSG.                          */
+/* Parameter: where to start in name order (1 character).            */
+PGM PARM(&FROM)
+  DCL VAR(&FROM)  TYPE(*CHAR) LEN(1)
+  DCL VAR(&MSG)   TYPE(*CHAR) LEN(80)
+  DCL VAR(&I)     TYPE(*DEC)  LEN(3 0)
+  DCL VAR(&TOTAL) TYPE(*DEC)  LEN(7 2) VALUE(0)
+  DCL VAR(&LIST)  TYPE(*CHAR) LEN(40)
+  DCL VAR(&USER)  TYPE(*CHAR) LEN(10)
+  MONMSG MSGID(CPF0000) EXEC(GOTO CMDLBL(FAILED))
+
+  RTVJOBA USER(&USER)
+  CHKOBJ OBJ(CUSTOWE) OBJTYPE(*FILE)
+  CHKOBJ OBJ(NOSUCHFILE) OBJTYPE(*FILE)
+  MONMSG MSGID(CPF9801) EXEC(DO)
+    SNDPGMMSG MSG('NOSUCHFILE is missing, as expected.')
+  ENDDO
+
+  IF COND(&FROM *EQ ' ') THEN(CHGVAR VAR(&FROM) VALUE('A'))
+  ELSE CMD(SNDPGMMSG MSG('Names from ' *CAT &FROM))
+
+  DOFOR VAR(&I) FROM(1) TO(3)
+    CHGVAR VAR(&TOTAL) VALUE(&TOTAL + &I * 1.25)
+    CHGVAR VAR(&LIST) VALUE(&LIST *TCAT %CHAR(&I))
+  ENDDO
+  SNDPGMMSG MSG('Steps' *BCAT %TRIM(&LIST) *BCAT 'total' +
+                *BCAT %CHAR(&TOTAL))
+
+  SELECT
+    WHEN COND(&TOTAL > 10) THEN(CHGVAR &MSG 'big')
+    WHEN COND(&TOTAL > 5)  THEN(CHGVAR &MSG 'medium')
+    OTHERWISE CMD(CHGVAR &MSG 'small')
+  ENDSELECT
+  SNDPGMMSG MSG('Total is' *BCAT &MSG)
+
+  CALL PGM(OWING) PARM(&FROM)
+  SNDPGMMSG MSG('Report done for' *BCAT &USER) MSGTYPE(*COMP)
+  RETURN
+
+FAILED:
+  SNDPGMMSG MSG('CUSTRPT failed') MSGTYPE(*ESCAPE)
+ENDPGM

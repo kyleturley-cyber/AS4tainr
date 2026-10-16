@@ -24,7 +24,7 @@ It runs IBM i business applications (RPG, CL, DDS files) on ordinary Linux and c
 - **`core/`**: the Rust core (`ibmish` binary). It holds the object catalog, the DDS parser, record-level access over PostgreSQL, and the bridge server.
 - **`jvm/`**: the JVM side. `io.ibmish.bridge` is a dependency-free Java bridge client. `io.ibmish.jvm` plugs that client into Jariko as a reload `DBMManager` and provides the runner (`ibmish-jvm.jar`).
 - **`samples/`**: DDS sources, CSV data, RPG programs and their expected (golden) output.
-- **`docs/`**: [5250 server](docs/5250-server.md), [display files](docs/display-files.md), [logical files](docs/logical-files.md), [SQL](docs/sql.md), [bridge protocol](docs/bridge-protocol.md), [known fidelity gaps](docs/fidelity-gaps.md), [spike 01 report](docs/spike-01.md).
+- **`docs/`**: [5250 server](docs/5250-server.md), [display files](docs/display-files.md), [logical files](docs/logical-files.md), [SQL](docs/sql.md), [CL programs](docs/cl-programs.md), [bridge protocol](docs/bridge-protocol.md), [known fidelity gaps](docs/fidelity-gaps.md), [spike 01 report](docs/spike-01.md).
 
 ## Quick start (Docker)
 
@@ -40,6 +40,7 @@ DSPLIB QSYS
 CALL CUSTLIST PARM('3')
 CALL CUSTINQ
 CALL WRKCUST
+CALL CUSTRPT PARM(L)
 WRKOBJ QGPL/*ALL
 DSPPFM CUSTMAST
 STRSQL
@@ -89,6 +90,7 @@ target/debug/ibmish call SELFTEST --runner "java -cp target/conformance-classes 
 | `ibmish init` | | Creates the catalog and the `QSYS`, `QGPL` and `QTEMP` libraries |
 | `ibmish crtlib LIB` | `CRTLIB` | Creates a library (a PostgreSQL schema) |
 | `ibmish crtpf LIB/FILE --src x.pf` | `CRTPF` | Creates a physical file from DDS |
+| `ibmish crtbndcl LIB/PGM --src x.clle` | `CRTBNDCL` | Creates a CL program ([docs/cl-programs.md](docs/cl-programs.md)); `CALL` runs it |
 | `ibmish sql "SELECT ..."` | `RUNSQL` / `STRSQL` | Runs one SQL statement in the DB2 for i dialect ([docs/sql.md](docs/sql.md)) |
 | `ibmish crtlf LIB/FILE --src x.lf` | `CRTLF` | Creates a logical file over a physical file from DDS ([docs/logical-files.md](docs/logical-files.md)) |
 | `ibmish crtdspf LIB/FILE --src x.dspf` | `CRTDSPF` | Creates a display file from DDS |

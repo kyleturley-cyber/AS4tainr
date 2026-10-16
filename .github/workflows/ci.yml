@@ -118,6 +118,8 @@ jobs:
           target/debug/ibmish load CUSTMAST --csv samples/data/CUSTMAST.csv
           target/debug/ibmish crtdspf QGPL/CUSTINQD --src samples/qddssrc/CUSTINQD.dspf
           target/debug/ibmish crtdspf QGPL/CUSTWRKD --src samples/qddssrc/CUSTWRKD.dspf
+          for l in CUSTNAME CUSTOWE; do target/debug/ibmish crtlf QGPL/$l --src samples/qddssrc/$l.lf; done
+          target/debug/ibmish crtbndcl QGPL/CUSTRPT --src samples/qclsrc/CUSTRPT.clle
           IBMISH_PGM_PATH=$PWD/samples/qrpglesrc nohup target/debug/ibmish tn5250 \
             --listen 127.0.0.1:2323 --runner "java -jar jvm/build/libs/ibmish-jvm.jar" > tn5250-server.log 2>&1 &
           sleep 2

@@ -14,6 +14,7 @@ if [ "${IBMISH_LOAD_SAMPLES:-1}" = "1" ]; then
   for l in CUSTNAME CUSTOWE; do
     ibmish crtlf "QGPL/$l" --src "${IBMISH_SAMPLES:-/opt/ibmish/samples}/qddssrc/$l.lf" >/dev/null 2>&1 || true
   done
+  ibmish crtbndcl QGPL/CUSTRPT --src "${IBMISH_SAMPLES:-/opt/ibmish/samples}/qclsrc/CUSTRPT.clle" --text 'Customer report driver' >/dev/null 2>&1 || true
   for d in CUSTINQD CUSTWRKD; do
     ibmish crtdspf "QGPL/$d" --src "${IBMISH_SAMPLES:-/opt/ibmish/samples}/qddssrc/$d.dspf" >/dev/null 2>&1 || true
   done

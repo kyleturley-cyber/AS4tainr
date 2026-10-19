@@ -141,6 +141,8 @@ impl Job<'_> {
             "CHGPWD" => Ok(Outcome::ChangePassword),
             "STRSQL" => Ok(Outcome::StartSql),
             "RUNSQL" => self.runsql(&cmd).await,
+            "RUNSQLSTM" => self.runsqlstm(&cmd).await,
+            "DLTF" => self.dltf(&cmd).await,
             "WRKOBJ" => self.wrkobj(&cmd).await,
             "DSPPFM" => self.dsppfm(&cmd).await,
             "CRTDTAARA" => self.crtdtaara(&cmd).await,
@@ -337,6 +339,19 @@ impl Job<'_> {
     /// RUNSQL: one SQL statement that does not return rows.
     async fn runsql(&mut self, cmd: &Command) -> Result<Outcome> {
         let stmt = cmd.get("SQL");
+        let mut schema = None;
+        if let Some(msg) = crate::ddl::try_run(
+            &self.env.database_url,
+            &self.user,
+            &self.library_list(),
+            Some(self.current_library()),
+            &mut schema,
+            stmt,
+        )
+        .await?
+        {
+            return Ok(Outcome::Messages(vec![msg]));
+        }
         let t = crate::sql::translate(stmt, &|_| false)?;
         if t.kind == crate::sql::Kind::Query {
             bail!("SQL0084: RUNSQL cannot run a SELECT; use STRSQL to see rows.");
@@ -354,6 +369,141 @@ impl Job<'_> {
             }
             crate::sql::Outcome::Rows { .. } => Ok(Outcome::Messages(vec![])),
         }
+    }
+
+    /// RUNSQLSTM: the SQL statements in a source member, one after the
+    /// other. A statement that fails with a severity above ERRLVL stops the
+    /// run (SQL9010); SQL errors have severity 30, so ERRLVL(30) runs
+    /// every statement and reports the ones that failed.
+    async fn runsqlstm(&mut self, cmd: &Command) -> Result<Outcome> {
+        let errlvl: u32 = cmd
+            .get("ERRLVL")
+            .parse()
+            .ok()
+            .filter(|n| *n <= 40)
+            .ok_or_else(|| anyhow::anyhow!("CPD0084: ERRLVL must be a number from 0 to 40."))?;
+        let m = self.source_member(cmd, "").await?;
+        let schema = match cmd.get("DFTRDBCOL") {
+            "*NONE" => None,
+            s => Some(catalog::validate_name("library", s)?),
+        };
+        let what = format!("member {} in {}/{}", m.name, m.library, m.file);
+        let lines = self
+            .run_sql_script(&m.source, &what, errlvl, schema, true)
+            .await?;
+        Ok(Outcome::Messages(lines))
+    }
+
+    /// Run the statements of an SQL script (RUNSQLSTM). `schema`: the
+    /// default schema; with `set_schema` false, SET SCHEMA statements are
+    /// skipped (`as4tainr import` keeps every object in its library).
+    pub async fn run_sql_script(
+        &mut self,
+        source: &str,
+        what: &str,
+        errlvl: u32,
+        mut schema: Option<String>,
+        set_schema: bool,
+    ) -> Result<Vec<String>> {
+        let mut lines = Vec::new();
+        let mut errors = 0;
+        let statements = crate::ddl::split_statements(source);
+        for (k, stmt) in statements.iter().enumerate() {
+            if !set_schema
+                && matches!(
+                    crate::ddl::parse(stmt),
+                    Ok(Some(crate::ddl::Ddl::SetSchema(_)))
+                )
+            {
+                lines.push(format!("Statement {}: SET SCHEMA skipped.", k + 1));
+                continue;
+            }
+            let libl = match &schema {
+                Some(s) => vec![s.clone()],
+                None => self.library_list(),
+            };
+            let r = match crate::ddl::try_run(
+                &self.env.database_url,
+                &self.user,
+                &self.library_list(),
+                Some(self.current_library()),
+                &mut schema,
+                stmt,
+            )
+            .await
+            {
+                Ok(Some(msg)) => Ok(msg),
+                Ok(None) => {
+                    let t = crate::sql::translate(stmt, &|_| false);
+                    if matches!(&t, Ok(t) if t.kind == crate::sql::Kind::Query) {
+                        Err(anyhow::anyhow!(
+                            "SQL0084: SELECT is not valid in RUNSQLSTM."
+                        ))
+                    } else {
+                        match crate::sql::run(self.client, &self.env.database_url, &libl, stmt)
+                            .await
+                        {
+                            Ok(crate::sql::Outcome::Count(kind, n)) => {
+                                Ok(crate::sql::count_message(kind, n))
+                            }
+                            Ok(crate::sql::Outcome::Rows { .. }) => Ok(String::new()),
+                            Err(e) => Err(e),
+                        }
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            match r {
+                Ok(msg) => lines.push(format!("Statement {}: {msg}", k + 1)),
+                Err(e) => {
+                    errors += 1;
+                    lines.push(format!("Statement {}: {e:#}", k + 1));
+                    // SQL errors have severity 30.
+                    if 30 > errlvl {
+                        bail!(
+                            "SQL9010: RUNSQLSTM stopped at statement {} of {what}: {e:#}",
+                            k + 1
+                        );
+                    }
+                }
+            }
+        }
+        lines.push(format!(
+            "{} statements run from {what}; {errors} with errors.",
+            statements.len()
+        ));
+        Ok(lines)
+    }
+
+    /// DLTF: delete a file (not a physical file that logical files are
+    /// built over: CPF3203).
+    async fn dltf(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (libs, name) = self.search(cmd.get("FILE"));
+        let name = name.to_ascii_uppercase();
+        let mut found = None;
+        for l in &libs {
+            if catalog::object_exists(self.client, std::slice::from_ref(l), &name, "*FILE").await? {
+                found = Some(l.clone());
+                break;
+            }
+        }
+        let Some(lib) = found else {
+            bail!(
+                "CPF2105: File {name} in library {} not found.",
+                libs.join(" ")
+            );
+        };
+        if authority::effective(self.client, &self.user, &lib, &name, "*FILE").await? < Aut::All {
+            bail!("CPF2189: Not authorized to delete file {name} in library {lib}.");
+        }
+        if crate::source::is_source_file(self.client, &lib, &name).await? {
+            bail!("CPF2105: File {name} in library {lib} is a source file; deleting source files is not supported yet.");
+        }
+        let mut c = runtime::connect_db(&self.env.database_url).await?;
+        catalog::delete_file(&mut c, &lib, &name, false).await?;
+        Ok(Outcome::Messages(vec![format!(
+            "File {name} in library {lib} deleted."
+        )]))
     }
 
     async fn require_secadm(&self, what: &str) -> Result<()> {
@@ -613,6 +763,13 @@ impl Job<'_> {
                 m.name
             );
         }
+        // Compile options from the command (CRTBNDRPG ALWNULL).
+        let options = match cmd.def.name {
+            "CRTBNDRPG" if cmd.get("ALWNULL") != "*NO" => {
+                format!("ALWNULL({})", cmd.get("ALWNULL"))
+            }
+            _ => String::new(),
+        };
         // CL: includes are part of the program; then it is checked.
         let source = if attribute == "RPGLE" || attribute == "SQLRPGLE" {
             // The program is checked now, as the compiler does: syntax,
@@ -621,7 +778,7 @@ impl Job<'_> {
             if !libl.contains(&lib) {
                 libl.insert(0, lib.clone());
             }
-            crate::rpg::compile(self.client, &libl, &name, &m.source).await?;
+            crate::rpg::compile_with(self.client, &libl, &name, &m.source, &options).await?;
             m.source.clone()
         } else {
             let src =
@@ -646,6 +803,7 @@ impl Job<'_> {
         }
         let mut c = runtime::connect_db(&self.env.database_url).await?;
         catalog::create_program(&mut c, &lib, &name, attribute, &text, &source, replace).await?;
+        catalog::set_program_options(self.client, &lib, &name, &options).await?;
         authority::set_owner(self.client, &lib, &name, "*PGM", &self.user).await?;
         Ok(Outcome::Messages(vec![format!(
             "Program {name} created in library {lib}."
@@ -1603,11 +1761,11 @@ impl Job<'_> {
         let source = match library {
             Some(lib) => catalog::find_program(self.client, &[lib.to_string()], pgm)
                 .await?
-                .map(|p| p.source),
-            None => crate::rpg::source_from_path(pgm),
+                .map(|p| (p.source, p.options)),
+            None => crate::rpg::source_from_path(pgm).map(|s| (s, String::new())),
         }
         .ok_or_else(|| anyhow!("CPF4101: Program {pgm} not found."))?;
-        let r = crate::rpg::call(
+        let r = crate::rpg::call_with(
             &self.env.database_url,
             self.library_list(),
             self.user.clone(),

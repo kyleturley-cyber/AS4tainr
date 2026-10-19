@@ -84,6 +84,7 @@ pub fn default_source_file(srctype: &str) -> &'static str {
         "CLLE" | "CLP" => "QCLSRC",
         "CMD" => "QCMDSRC",
         "CBLLE" => "QCBLLESRC",
+        "SQL" => "QSQLSRC",
         _ => "QTXTSRC",
     }
 }
@@ -360,6 +361,85 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
             }
         }
     }
+    // 2b. SQL scripts (RUNSQLSTM with ERRLVL(30): every statement runs,
+    // and the ones that fail are reported). Objects go to the import
+    // library: it is the default schema and SET SCHEMA is skipped. Scripts
+    // that create tables run first.
+    let mut scripts: Vec<&Found> = of_type("SQL").collect();
+    let mut sources = BTreeMap::new();
+    for m in &scripts {
+        let src = source::find_member(job.client, std::slice::from_ref(&lib), &m.file, &m.member)
+            .await?
+            .source;
+        sources.insert(m.member.clone(), src);
+    }
+    let creates_table = |src: &str| {
+        crate::ddl::split_statements(src).iter().any(|st| {
+            matches!(
+                crate::ddl::parse(st),
+                Ok(Some(crate::ddl::Ddl::CreateTable { .. }))
+            )
+        })
+    };
+    scripts.sort_by_key(|m| !creates_table(&sources[&m.member]));
+    let mut sql_files = Vec::new();
+    for m in scripts {
+        let what = format!("member {} in {lib}/{}", m.member, m.file);
+        match job
+            .run_sql_script(&sources[&m.member], &what, 30, Some(lib.clone()), false)
+            .await
+        {
+            Ok(lines) => {
+                let failed: Vec<&String> = lines
+                    .iter()
+                    .filter(|l| l.contains(": SQL") && !l.contains("SET SCHEMA skipped"))
+                    .collect();
+                if failed.is_empty() {
+                    report.lines.push(format!(
+                        "  {}: {}",
+                        m.member,
+                        lines.last().cloned().unwrap_or_default()
+                    ));
+                } else {
+                    report.failed += 1;
+                    report.lines.push(format!(
+                        "  {}: FAILED: {} (first: {})",
+                        m.member,
+                        lines.last().cloned().unwrap_or_default(),
+                        failed[0]
+                    ));
+                }
+            }
+            Err(e) => {
+                report.failed += 1;
+                report.lines.push(format!("  {}: FAILED: {e:#}", m.member));
+            }
+        }
+        for st in crate::ddl::split_statements(&sources[&m.member]) {
+            if let Ok(Some(crate::ddl::Ddl::CreateTable { name, .. })) = crate::ddl::parse(&st) {
+                sql_files.push(name.name);
+            }
+        }
+    }
+    // Data for tables created by the scripts.
+    for name in &sql_files {
+        let Some(csv) = data.get(name) else { continue };
+        let Ok(f) = catalog::resolve_file(job.client, std::slice::from_ref(&lib), name).await
+        else {
+            continue;
+        };
+        let text = std::fs::read_to_string(csv)?;
+        match load_csv(job.client, f, &text).await {
+            Ok(n) => report.lines.push(format!("  {name}: {n} records loaded")),
+            Err(e) => {
+                report.failed += 1;
+                report
+                    .lines
+                    .push(format!("  {name}: loading data FAILED: {e}"));
+            }
+        }
+    }
+
     // 3. Logical and display files.
     for (t, command) in [("LF", "CRTLF"), ("DSPF", "CRTDSPF")] {
         for m in of_type(t) {
@@ -401,7 +481,7 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
     for m in members.iter().filter(|m| {
         !matches!(
             m.srctype.as_str(),
-            "PF" | "LF" | "DSPF" | "CLLE" | "CLP" | "RPGLE" | "SQLRPGLE" | "TXT"
+            "PF" | "LF" | "DSPF" | "CLLE" | "CLP" | "RPGLE" | "SQLRPGLE" | "SQL" | "TXT"
         )
     }) {
         report.lines.push(format!(
@@ -413,6 +493,7 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         if !members
             .iter()
             .any(|m| m.srctype == "PF" && &m.member == name)
+            && !sql_files.contains(name)
         {
             report.lines.push(format!(
                 "  {name}.csv: no PF member of that name, not loaded"

@@ -2664,4 +2664,281 @@ async fn rpg_embedded_sql() {
         let got: Vec<String> = r.messages.iter().map(|m| m.trim_end().to_string()).collect();
         assert_eq!(got, want, "{name}");
     }
+
+    // Data definition in a program: the table is created, used and
+    // dropped; dropping it again is SQLCODE -204 (Db2 for i SQL messages,
+    // SQL0204: object not found).
+    let src = format!(
+        "**FREE\ndcl-s n int(10);\nexec sql create table {lib}.t3 (a int not null);\ndsply %char(sqlcode);\nexec sql insert into t3 values (5);\nexec sql select a into :n from t3;\ndsply %char(n);\nexec sql drop table {lib}.t3;\ndsply %char(sqlcode);\nexec sql drop table {lib}.t3;\ndsply %char(sqlcode);\n*inlr = *on;\n"
+    );
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        None,
+        "SQL3".into(),
+        src,
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let got: Vec<String> = r
+        .messages
+        .iter()
+        .map(|m| m.trim_end().to_string())
+        .collect();
+    assert_eq!(got, ["0", "5", "0", "-204"]);
+}
+
+/// R6: SQL data definition (Db2 for i SQL Reference: CREATE TABLE, CREATE
+/// INDEX, DROP, LABEL ON; RUNSQLSTM). Expected values from those rules:
+/// a table is a physical file whose record format is named by RCDFMT; an
+/// index is a keyed logical file over it (DESC keys read backwards); a
+/// column without NOT NULL is null-capable; WITH DEFAULT gives the type's
+/// default; LABEL ON TABLE sets the object text and LABEL ON COLUMN ...
+/// TEXT IS the field text; PRIMARY KEY rejects a duplicate (SQL0803) and
+/// CHECK a row that fails it (SQL0545 from SQL, CPF502F from a WRITE);
+/// DROP TABLE drops the indexes over it; DLTF refuses a physical file
+/// that a logical file is built over (CPF3203); RUNSQLSTM with ERRLVL(10)
+/// stops at the first failing statement (SQL9010). An RPG program sees
+/// SQL INTEGER as binary 9,0, DATE/TIME/TIMESTAMP in *ISO form
+/// (YYYY-MM-DD, HH.MM.SS, YYYY-MM-DD-HH.MM.SS.ffffff) and VARCHAR as a
+/// varying field (ILE RPG Reference, externally described files).
+#[tokio::test]
+async fn sql_tables_indexes_and_runsqlstm() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::{dds::DataType, rpg, source};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+    };
+    let script = "
+        -- People; the index reads them by name, last first.
+        CREATE TABLE PERSON (
+          ID INTEGER NOT NULL PRIMARY KEY,
+          NAME VARCHAR(30) NOT NULL WITH DEFAULT,
+          BAL DECIMAL(9, 2) NOT NULL DEFAULT 0,
+          DOB DATE,
+          AT TIME NOT NULL DEFAULT '09.00.00',
+          JOINED TIMESTAMP NOT NULL DEFAULT '2026-01-01-08.30.00.000000',
+          CODE CHAR(1) NOT NULL DEFAULT 'Y' CHECK (CODE IN ('Y', 'N'))
+        ) RCDFMT PERSONR;
+        LABEL ON TABLE PERSON IS 'People';
+        LABEL ON COLUMN PERSON (NAME IS 'Name', NAME TEXT IS 'Full name');
+        CREATE INDEX PERSONIX ON PERSON (NAME DESC);
+        INSERT INTO PERSON (ID, NAME, BAL, DOB, AT) VALUES (1, 'Ada', 10.50, '1815-12-10', '09:15:00');
+        INSERT INTO PERSON (ID, NAME, DOB) VALUES (2, 'Grace', '1906-12-09');
+    ";
+    let lines = job
+        .run_sql_script(script, "test script", 10, None, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        lines.last().unwrap(),
+        "6 statements run from test script; 0 with errors."
+    );
+
+    let f = catalog::resolve_file(&client, std::slice::from_ref(&lib), "PERSON")
+        .await
+        .unwrap();
+    assert_eq!(f.file.format, "PERSONR");
+    let field = |n: &str| f.file.fields.iter().find(|x| x.name == n).unwrap().clone();
+    assert_eq!(
+        (field("ID").data_type, field("ID").length),
+        (DataType::Binary, 9)
+    );
+    assert!(field("NAME").varlen);
+    assert_eq!(field("NAME").text, "Full name");
+    assert!(field("DOB").null_capable && !field("BAL").null_capable);
+    let text: String = client
+        .query_one(
+            "SELECT text FROM as4tainr.objects WHERE library=$1 AND name='PERSON'",
+            &[&lib],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(text, "People");
+
+    // Constraints, from SQL.
+    let sql = |s: &'static str| {
+        let (url, lib) = (url.clone(), lib.clone());
+        async move {
+            as4tainr_core::sql::run(&runtime::connect_db(&url).await.unwrap(), &url, &[lib], s)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+    let e = sql("INSERT INTO PERSON (ID, NAME) VALUES (1, 'Again')")
+        .await
+        .unwrap_err();
+    assert!(e.starts_with("SQL0803"), "{e}");
+    let e = sql("INSERT INTO PERSON (ID, CODE) VALUES (3, 'X')")
+        .await
+        .unwrap_err();
+    assert!(e.starts_with("SQL0545"), "{e}");
+
+    // RPG: write through the table (a CHECK failure is CPF502F), read
+    // through the index.
+    let run = |name: &str, src: &str| {
+        rpg::call(
+            &url,
+            vec![lib.clone()],
+            "QSECOFR".into(),
+            None,
+            None,
+            None,
+            name.into(),
+            src.into(),
+            vec![],
+        )
+    };
+    let w = run("DDLW", "**FREE\ndcl-f person usage(*output);\nid = 3;\nname = 'Edsger';\nbal = 7.25;\ndob = d'1930-05-11';\nat = t'13.45.00';\njoined = z'2026-02-03-04.05.06.000007';\ncode = 'N';\nwrite personr;\nid = 4;\ncode = 'X';\nmonitor;\n  write personr;\non-error;\n  dsply 'rejected';\nendmon;\n*inlr = *on;\n").await.unwrap();
+    assert!(w.error.is_none(), "{:?}", w.error);
+    assert_eq!(w.messages, ["rejected"]);
+    let r = run("DDLR", "**FREE\ndcl-f personix keyed;\nread personix;\ndow not %eof(personix);\n  dsply (%trim(name) + ' ' + %char(id) + ' ' + %char(bal) + ' ' + %char(dob) + ' ' + %char(at) + ' ' + %char(joined) + ' ' + code);\n  read personix;\nenddo;\n*inlr = *on;\n").await.unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let got: Vec<String> = r
+        .messages
+        .iter()
+        .map(|m| m.trim_end().to_string())
+        .collect();
+    assert_eq!(
+        got,
+        [
+            "Grace 2 .00 1906-12-09 09.00.00 2026-01-01-08.30.00.000000 Y",
+            "Edsger 3 7.25 1930-05-11 13.45.00 2026-02-03-04.05.06.000007 N",
+            "Ada 1 10.50 1815-12-10 09.15.00 2026-01-01-08.30.00.000000 Y",
+        ]
+    );
+
+    // Null values (ILE RPG Reference, "Database Null Value Support" and
+    // the ALWNULL keyword): with ALWNULL(*NO), the default, a record with
+    // a null field cannot be read (data mapping error: an error on the
+    // operation, which the E extender catches); with *INPUTONLY the field
+    // has its default value (a date's is 0001-01-01; to be checked against
+    // a real system); with *USRCTL, %NULLIND says the field is null, and
+    // setting it writes the null value.
+    sql("INSERT INTO PERSON (ID, NAME) VALUES (9, 'Nobody')")
+        .await
+        .unwrap();
+    let r = run(
+        "NULLNO",
+        "**FREE\ndcl-f personix keyed;\nchain ('Nobody') personix;\n*inlr = *on;\n",
+    )
+    .await
+    .unwrap();
+    let e = format!("{:?}", r.error.expect("a data mapping error"));
+    assert!(e.contains("CPF5035"), "{e}");
+    let r = run("NULLE", "**FREE\ndcl-f personix keyed;\nchain(e) ('Nobody') personix;\ndsply %char(%error());\n*inlr = *on;\n").await.unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["1"]);
+    let r = run("NULLIN", "**FREE\nctl-opt alwnull(*inputonly);\ndcl-f personix keyed;\nchain ('Nobody') personix;\ndsply %char(dob);\n*inlr = *on;\n").await.unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["0001-01-01"]);
+    let r = run("NULLUC", "**FREE\nctl-opt alwnull(*usrctl);\ndcl-f personix keyed usage(*update);\nchain ('Nobody') personix;\ndsply %char(%nullind(dob));\nchain ('Ada') personix;\ndsply %char(%nullind(dob));\n%nullind(dob) = *on;\nupdate personr;\n*inlr = *on;\n").await.unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["1", "0"]);
+    let rows = match sql("SELECT ID FROM PERSON WHERE DOB IS NULL ORDER BY ID")
+        .await
+        .unwrap()
+    {
+        as4tainr_core::sql::Outcome::Rows { rows, .. } => rows,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(rows, vec![vec!["1".to_string()], vec!["9".to_string()]]);
+    // CRTBNDRPG ALWNULL(*INPUTONLY) has the effect of the keyword.
+    source::create_file(&client, &lib, "QRPGLESRC", "")
+        .await
+        .unwrap();
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QRPGLESRC".into(),
+            name: "NULLCMD".into(),
+            srctype: "RPGLE".into(),
+            text: String::new(),
+            source: "**FREE\ndcl-f personix keyed;\nchain ('Nobody') personix;\ndsply %char(dob);\n*inlr = *on;\n".into(),
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    job.run(&format!("CRTBNDRPG PGM({lib}/NULLCMD) ALWNULL(*INPUTONLY)"))
+        .await
+        .unwrap();
+    let out = job.run(&format!("CALL PGM({lib}/NULLCMD)")).await.unwrap();
+    assert!(format!("{out:?}").contains("0001-01-01"), "{out:?}");
+
+    // DLTF refuses; DROP TABLE takes the index with it.
+    let e = job
+        .run(&format!("DLTF FILE({lib}/PERSON)"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF3203"), "{e}");
+    source::create_file(&client, &lib, "QSQLSRC", "")
+        .await
+        .unwrap();
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QSQLSRC".into(),
+            name: "DROPS".into(),
+            srctype: "SQL".into(),
+            text: String::new(),
+            source: "DROP TABLE PERSON; DROP TABLE PERSON; CREATE TABLE AFTER (A INT);".into(),
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    let e = job
+        .run(&format!("RUNSQLSTM SRCFILE({lib}/QSQLSRC) SRCMBR(DROPS)"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("SQL9010") && e.contains("statement 2"), "{e}");
+    for name in ["PERSON", "PERSONIX", "AFTER"] {
+        assert!(
+            !catalog::object_exists(&client, std::slice::from_ref(&lib), name, "*FILE")
+                .await
+                .unwrap(),
+            "{name} should not exist"
+        );
+    }
+    // ERRLVL(30): the failing statement is reported and the rest runs.
+    let out = job
+        .run(&format!(
+            "RUNSQLSTM SRCFILE({lib}/QSQLSRC) SRCMBR(DROPS) ERRLVL(30)"
+        ))
+        .await
+        .unwrap();
+    let as4tainr_core::commands::Outcome::Messages(m) = out else {
+        panic!("{out:?}")
+    };
+    assert_eq!(
+        m.last().unwrap(),
+        &format!("3 statements run from member DROPS in {lib}/QSQLSRC; 2 with errors.")
+    );
+    assert!(
+        catalog::object_exists(&client, std::slice::from_ref(&lib), "AFTER", "*FILE")
+            .await
+            .unwrap()
+    );
 }

@@ -82,6 +82,9 @@ fn sqlstate(code: i64) -> &'static str {
         -518 => "07003",
         -551 => "42501",
         -803 => "23505",
+        -407 => "23502",
+        -545 => "23513",
+        -601 => "42710",
         -811 => "21000",
         _ => "58004",
     }
@@ -539,8 +542,24 @@ impl Machine<'_> {
                     return self.single_row(&query, &hosts);
                 }
             }
-            "GET" | "CALL" | "CREATE" | "DROP" | "ALTER" | "LABEL" | "COMMENT" | "GRANT"
-            | "REVOKE" | "RENAME" | "LOCK" | "MERGE" => {
+            "CREATE" | "DROP" | "LABEL" | "COMMENT" => {
+                // Data definition runs as it does in RUNSQLSTM; the
+                // statement has no host variables.
+                let curlib = self.io.cl.as_ref().and_then(|c| c.curlib.clone());
+                let rt = self.io.rt.clone();
+                let r = rt.block_on(crate::ddl::try_run(
+                    &self.io.database_url,
+                    &self.io.user,
+                    &self.io.libl,
+                    curlib,
+                    &mut None,
+                    sql,
+                ))?;
+                if r.is_some() {
+                    return Ok(Outcome::ok(0));
+                }
+            }
+            "GET" | "CALL" | "ALTER" | "GRANT" | "REVOKE" | "RENAME" | "LOCK" | "MERGE" => {
                 return Ok(Outcome::error(
                     -84,
                     format!("SQL0084: {first} statements are not supported in embedded SQL yet."),

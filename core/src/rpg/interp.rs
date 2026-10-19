@@ -59,6 +59,36 @@ struct FileState {
     status: Status,
 }
 
+/// How a program handles null values in externally described database
+/// files (ILE RPG Reference, "Database Null Value Support"; the ALWNULL
+/// control keyword and CRTBNDRPG parameter, default *NO).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlwNull {
+    /// A record with a null value cannot be read: data mapping error.
+    No,
+    /// Null values are read as the field's default; records are written
+    /// without nulls (*INPUTONLY, and *YES).
+    InputOnly,
+    /// The program sees and sets null indicators with %NULLIND.
+    UsrCtl,
+}
+
+impl AlwNull {
+    fn of(prog: &Program) -> AlwNull {
+        let v = prog
+            .control
+            .iter()
+            .find(|k| k.name.eq_ignore_ascii_case("ALWNULL"))
+            .and_then(|k| k.args.first())
+            .map(|a| a.trim().to_ascii_uppercase());
+        match v.as_deref() {
+            Some("*USRCTL") => AlwNull::UsrCtl,
+            Some("*INPUTONLY") | Some("*YES") => AlwNull::InputOnly,
+            _ => AlwNull::No,
+        }
+    }
+}
+
 /// How a routine ended.
 enum Flow {
     Normal,
@@ -95,6 +125,10 @@ pub struct Machine<'a> {
     /// Embedded SQL: the session (opened by the first statement), open
     /// cursors and prepared statements.
     sql: exec_sql::SqlState,
+    /// ALWNULL: how the program handles null values in database records.
+    alwnull: AlwNull,
+    /// ALWNULL(*USRCTL): the program fields whose null indicator is on.
+    nullind: std::collections::HashSet<String>,
 }
 
 /// One procedure call: its local storage starts at `base` in the
@@ -187,7 +221,35 @@ impl<'a> Machine<'a> {
             frames: Vec::new(),
             parms_passed: 0,
             sql: Default::default(),
+            alwnull: AlwNull::of(prog),
+            nullind: Default::default(),
         }
+    }
+
+    /// The field of %NULLIND(field): a null-capable field of an
+    /// externally described file, in a program compiled with
+    /// ALWNULL(*USRCTL) (ILE RPG Reference, %NULLIND).
+    fn nullind_field(&self, args: &[Expr]) -> Result<String> {
+        let Some(Expr::Name { parts, args: None }) = args.first() else {
+            bail!("%NULLIND needs the name of a field");
+        };
+        let name = parts.join(".");
+        if self.alwnull != AlwNull::UsrCtl {
+            bail!("%NULLIND({name}) needs ALWNULL(*USRCTL).");
+        }
+        let capable = self.prog.files.iter().any(|f| {
+            f.fref.as_ref().is_some_and(|r| {
+                r.file
+                    .fields
+                    .iter()
+                    .zip(&f.fields)
+                    .any(|(fd, p)| fd.null_capable && *p == name)
+            })
+        });
+        if !capable {
+            bail!("%NULLIND({name}): {name} is not a null-capable field.");
+        }
+        Ok(name)
     }
 
     fn block<F: std::future::Future>(&self, f: F) -> F::Output {
@@ -524,6 +586,10 @@ impl<'a> Machine<'a> {
             "FOUND" => Value::Ind(self.file_status(args)?.found),
             "EQUAL" => Value::Ind(self.file_status(args)?.equal),
             "ERROR" => Value::Ind(self.last.error),
+            "NULLIND" => {
+                let name = self.nullind_field(args)?;
+                Value::Ind(self.nullind.contains(&name))
+            }
             "CHAR" => {
                 let v = arg(self, 0)?;
                 match v {
@@ -745,7 +811,6 @@ impl<'a> Machine<'a> {
                 ))
             }
             "ADDR" | "PADDR" => Value::Fig(Fig::Null),
-            "NULLIND" => Value::Ind(false),
             "PARMS" => Value::Num(Dec::from_i64(match self.frames.last() {
                 Some(f) => f.passed,
                 None => self.parms_passed,
@@ -776,6 +841,14 @@ impl<'a> Machine<'a> {
                 for n in 1..=99usize {
                     let on = s.get(n - 1) == Some(&0xF1);
                     self.set_ind(&format!("{n:02}"), on);
+                }
+            }
+            Expr::Bif(b, args) if b == "NULLIND" => {
+                let name = self.nullind_field(args)?;
+                if val.truth()? {
+                    self.nullind.insert(name);
+                } else {
+                    self.nullind.remove(&name);
                 }
             }
             Expr::Bif(b, args) if b == "SUBST" => {
@@ -918,6 +991,19 @@ impl<'a> Machine<'a> {
             };
             rec.insert(fd.name.clone(), text);
         }
+        if self.alwnull == AlwNull::UsrCtl {
+            let nulls: Vec<String> = fref
+                .file
+                .fields
+                .iter()
+                .zip(&fi.fields)
+                .filter(|(fd, p)| fd.null_capable && self.nullind.contains(*p))
+                .map(|(fd, _)| fd.name.clone())
+                .collect();
+            if !nulls.is_empty() {
+                rec.insert(crate::rla::NULLS.to_string(), nulls.join(","));
+            }
+        }
         Ok(rec)
     }
 
@@ -925,14 +1011,34 @@ impl<'a> Machine<'a> {
     fn fill_fields(&mut self, i: usize, rec: &Record) -> Result<()> {
         let fi = self.prog.files[i].clone();
         let fref = fi.fref.as_ref().unwrap();
+        let nulls = crate::rla::null_fields(rec);
+        if !nulls.is_empty() && self.alwnull == AlwNull::No {
+            // ALWNULL(*NO): none of the record is available to the program.
+            bail!(
+                "CPF5035: Data mapping error on file {}: field {} has the null value, and the program does not allow null values (ALWNULL(*NO)).",
+                fref.file.name,
+                nulls[0]
+            );
+        }
+        if self.alwnull == AlwNull::UsrCtl {
+            for (fd, pname) in fref.file.fields.iter().zip(&fi.fields) {
+                if fd.null_capable {
+                    if nulls.contains(&fd.name) {
+                        self.nullind.insert(pname.clone());
+                    } else {
+                        self.nullind.remove(pname);
+                    }
+                }
+            }
+        }
         for (fd, pname) in fref.file.fields.iter().zip(&fi.fields) {
             let Some(text) = rec.get(&fd.name) else {
                 continue;
             };
-            let v = if fd.data_type == crate::dds::DataType::Char {
-                Value::str(text)
-            } else {
+            let v = if fd.data_type.is_numeric() {
                 Value::Num(Dec::parse(text)?)
+            } else {
+                Value::str(text)
             };
             self.assign(
                 &Expr::name(pname),
@@ -1089,7 +1195,23 @@ impl<'a> Machine<'a> {
             FileOp::Chain | FileOp::Read | FileOp::ReadP | FileOp::ReadE | FileOp::ReadPE => {
                 let r = result.unwrap();
                 if let Some(rec) = &r.record {
-                    self.fill_fields(i, rec)?;
+                    if let Err(e) = self.fill_fields(i, rec) {
+                        // A data mapping error is an error on the
+                        // operation: the E extender or the error
+                        // indicator takes it.
+                        if ext.error || ind.lo.is_some() {
+                            self.last = Status {
+                                error: true,
+                                ..Status::default()
+                            };
+                            self.files[i].status.error = true;
+                            if let Some(lo) = &ind.lo {
+                                self.set_ind(lo, true);
+                            }
+                            return Ok(());
+                        }
+                        return Err(e);
+                    }
                 }
                 let st = if op == FileOp::Chain {
                     Status {
@@ -2691,7 +2813,7 @@ impl<'a> Machine<'a> {
                     "*PGM",
                     crate::authority::Aut::Use,
                 ))?;
-                p.source
+                (p.source, p.options)
             }
             Some(p) if p.attribute == "CLLE" || p.attribute == "CLP" => {
                 // A CL program runs in the job; parameters go in as
@@ -2715,10 +2837,14 @@ impl<'a> Machine<'a> {
                 "CALL {name}: {} programs cannot be called from RPG on the native engine yet",
                 p.attribute
             ),
-            None => super::source_from_path(name)
-                .ok_or_else(|| anyhow!("CPF4101: Program {name} not found."))?,
+            None => (
+                super::source_from_path(name)
+                    .ok_or_else(|| anyhow!("CPF4101: Program {name} not found."))?,
+                String::new(),
+            ),
         };
-        let callee = self.block(super::compile(client, &libl, name, &source))?;
+        let (source, options) = source;
+        let callee = self.block(super::compile_with(client, &libl, name, &source, &options))?;
         let mut parms: Vec<Vec<u8>> = locs
             .iter()
             .map(|l| self.bufs[l.buf][l.off..l.off + l.size].to_vec())

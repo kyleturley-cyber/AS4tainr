@@ -18,7 +18,8 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 
 | Path | What |
 | --- | --- |
-| `core/src/dds.rs` | DDS parser: physical files (R, K lines with `DESCEND`, fields, `UNIQUE`, `TEXT`) and logical files (`PFILE`, field subsets, keys, select/omit) |
+| `core/src/dds.rs` | DDS parser: physical files (R, K lines with `DESCEND`, fields A/P/S/B/L/T/Z, `UNIQUE`, `TEXT`, `VARLEN`, `ALWNULL`, `DFT`) and logical files (`PFILE`, field subsets, keys, select/omit); a field's PostgreSQL type, default and external text form |
+| `core/src/ddl.rs` | SQL data definition (CREATE TABLE/INDEX, DROP, LABEL ON, SET SCHEMA) parsed into file descriptions, never passed on; RUNSQLSTM's statement splitting |
 | `core/src/catalog.rs` | Libraries = PostgreSQL schemas; file descriptions in schema `as4tainr`; library list resolution |
 | `core/src/rla.rs` | Record-level access: cursor position per open file, keyset queries ordered by (keys, rrn), record locks (advisory locks on the physical file + rrn) |
 | `core/src/sql.rs` | SQL in the DB2 for i dialect: translation to PostgreSQL, run on a separate connection as the restricted `as4tainr_sql` login |
@@ -34,7 +35,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/jobs.rs` | Work management: jobs (`as4tainr.jobs`), job logs, job queue QBATCH and its subsystem loop, user message queues |
 | `core/src/spool.rs` | Spooled files (`as4tainr.spooled_files`, `as4tainr.spool_lines`): printer output, QSYSPRT listings of batch display commands, QPJOBLOG |
 | `core/src/source.rs` | Source physical files (`PF-SRC` objects) and members (`as4tainr.source_members`), stream files for includes (`as4tainr.stream_files`), CL `INCLUDE` expansion |
-| `core/src/import.rs` | `as4tainr import DIR --lib LIB`: members (folders like QRPGLESRC/, TOBi names) and CSV data into a library, then CRTPF/CRTLF/CRTDSPF/CRTBNDCL/CRTBNDRPG. See `docs/import.md` |
+| `core/src/import.rs` | `as4tainr import DIR --lib LIB`: members (folders like QRPGLESRC/, TOBi names) and CSV data into a library, then CRTPF, SQL scripts, CRTLF/CRTDSPF/CRTBNDCL/CRTBNDRPG/CRTSQLRPGI. See `docs/import.md` |
 | `core/src/rpg/` | The native RPG engine (docs/rpg-engine.md): `dec.rs` exact decimals, `data.rs` storage formats (EBCDIC, zoned, packed, binary), `expr.rs`, `parse.rs` (fixed, mixed, **FREE, directives), `program.rs` (names, layout, external files), `code.rs` (blocks → jumps), `interp.rs` (cycle, opcodes, BIFs, file I/O on `rla` in its own session), `exec_sql.rs` (embedded SQL: SQLCA, host variables, cursors, on `sql::Session`), `mod.rs` (compile, call) |
 | `core/src/menus.rs` | Menus: the system menus (MAIN...) as data, GO/CRTMNU TYPE(*PGM)/DLTMNU; the session shows them (`tn5250/session.rs`: initial program, initial menu, menu stack) |
 | `core/src/authority.rs` | Object owners, *PUBLIC and private authorities; `check` before every object use (CPF9802) |
@@ -62,5 +63,5 @@ TN5250=/path/to/tn5250 AS4TAINR_BIN=target/debug/as4tainr python3 tools/gate3_52
 ## Conventions
 
 - Errors that a program could monitor for start with the IBM-style message ID, e.g. `CPF5026: ...`.
-- SQL is built dynamically only with `catalog::ident()` for identifiers. Values are always bound parameters (as text, then `CAST`). The exception is user SQL (`sql.rs`), which only ever runs as the `as4tainr_sql` login: never run user-supplied SQL on the main connection.
+- SQL is built dynamically only with `catalog::ident()` for identifiers. Values are always bound parameters (as text, then `CAST`), except in data definition, which takes no parameters: DEFAULT and CHECK constants are written with `dds::quote()` after `ddl.rs` has parsed them. The exception is user SQL (`sql.rs`), which only ever runs as the `as4tainr_sql` login: never run user-supplied SQL on the main connection.
 - Commits are signed off (`git commit -s`). Commit messages describe the IBM i behavior implemented.

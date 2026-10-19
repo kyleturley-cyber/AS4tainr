@@ -13,7 +13,7 @@
 //! | 17    | Name type: `R` record, `K` key, blank    |
 //! | 19-28 | Name                                     |
 //! | 30-34 | Length (right-aligned)                   |
-//! | 35    | Data type (`A`, `P`, `S`)                |
+//! | 35    | Data type (`A`, `P`, `S`, `B`, `L`, `T`, `Z`) |
 //! | 36-37 | Decimal positions                        |
 //! | 45-80 | Keywords (`TEXT`, `UNIQUE`, ...)         |
 
@@ -31,6 +31,18 @@ pub enum DataType {
     /// Zoned decimal.
     #[serde(rename = "S")]
     Zoned,
+    /// Binary: 1-18 digits, stored in 2, 4 or 8 bytes.
+    #[serde(rename = "B")]
+    Binary,
+    /// Date (DDS L), *ISO form `YYYY-MM-DD`.
+    #[serde(rename = "L")]
+    Date,
+    /// Time (DDS T), *ISO form `HH.MM.SS`.
+    #[serde(rename = "T")]
+    Time,
+    /// Timestamp (DDS Z), `YYYY-MM-DD-HH.MM.SS.ffffff`.
+    #[serde(rename = "Z")]
+    Timestamp,
 }
 
 impl DataType {
@@ -39,6 +51,10 @@ impl DataType {
             DataType::Char => "A",
             DataType::Packed => "P",
             DataType::Zoned => "S",
+            DataType::Binary => "B",
+            DataType::Date => "L",
+            DataType::Time => "T",
+            DataType::Timestamp => "Z",
         }
     }
 
@@ -47,13 +63,51 @@ impl DataType {
             "A" => DataType::Char,
             "P" => DataType::Packed,
             "S" => DataType::Zoned,
-            other => bail!("unsupported DDS data type '{other}' (supported: A, P, S)"),
+            "B" => DataType::Binary,
+            "L" => DataType::Date,
+            "T" => DataType::Time,
+            "Z" => DataType::Timestamp,
+            other => {
+                bail!("unsupported DDS data type '{other}' (supported: A, P, S, B, L, T, Z)")
+            }
         })
     }
 
     pub fn is_numeric(self) -> bool {
-        !matches!(self, DataType::Char)
+        matches!(self, DataType::Packed | DataType::Zoned | DataType::Binary)
     }
+
+    /// Date, time or timestamp.
+    pub fn is_datetime(self) -> bool {
+        matches!(self, DataType::Date | DataType::Time | DataType::Timestamp)
+    }
+
+    /// The length of a date, time or timestamp field in its *ISO form
+    /// (DDS reference: L is 10, T is 8, Z is 26 characters).
+    pub fn fixed_length(self) -> Option<u32> {
+        match self {
+            DataType::Date => Some(10),
+            DataType::Time => Some(8),
+            DataType::Timestamp => Some(26),
+            _ => None,
+        }
+    }
+}
+
+/// A field's default value (DDS DFT, SQL DEFAULT).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FieldDefault {
+    /// A constant, as text in the field's external form.
+    Value(String),
+    /// The type's own default (SQL `WITH DEFAULT` with no value): blanks,
+    /// zero, or the current date, time or timestamp when the record is
+    /// added.
+    System,
+    /// The null value.
+    Null,
+    /// No default: an SQL INSERT must give a value (SQL `NOT NULL` with no
+    /// DEFAULT).
+    Required,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,18 +117,182 @@ pub struct FieldDef {
     pub length: u32,
     pub decimals: u32,
     pub text: String,
+    /// Variable length (DDS VARLEN, SQL VARCHAR): up to `length` characters.
+    #[serde(default)]
+    pub varlen: bool,
+    /// Null-capable (DDS ALWNULL, an SQL column without NOT NULL).
+    #[serde(default)]
+    pub null_capable: bool,
+    /// Explicit default (DDS DFT, SQL DEFAULT); None means the type's.
+    #[serde(default)]
+    pub default: Option<FieldDefault>,
 }
 
 impl FieldDef {
+    /// A field with no keywords.
+    pub fn new(name: &str, data_type: DataType, length: u32, decimals: u32) -> FieldDef {
+        FieldDef {
+            name: name.to_string(),
+            data_type,
+            length,
+            decimals,
+            text: String::new(),
+            varlen: false,
+            null_capable: false,
+            default: None,
+        }
+    }
+
     /// PostgreSQL column type used to store this field.
     pub fn sql_type(&self) -> String {
         match self.data_type {
+            DataType::Char if self.varlen => format!("varchar({})", self.length),
             DataType::Char => format!("char({})", self.length),
             DataType::Packed | DataType::Zoned => {
                 format!("numeric({},{})", self.length, self.decimals)
             }
+            // Binary with no decimals is an SQL integer: SMALLINT is
+            // binary 4 digits, INTEGER 9, BIGINT 18 (Db2 for i SQL
+            // reference, data types and DDS equivalents).
+            DataType::Binary if self.decimals == 0 => match self.length {
+                0..=4 => "smallint".into(),
+                5..=9 => "integer".into(),
+                _ => "bigint".into(),
+            },
+            DataType::Binary => format!("numeric({},{})", self.length, self.decimals),
+            DataType::Date => "date".into(),
+            DataType::Time => "time(0)".into(),
+            DataType::Timestamp => "timestamp(6)".into(),
         }
     }
+
+    /// The value a program sees for this field when it holds no value of
+    /// its own (blanks, zero, and the lowest date, time and timestamp),
+    /// in the external form records use.
+    pub fn blank_value(&self) -> String {
+        match self.data_type {
+            DataType::Char if self.varlen => String::new(),
+            DataType::Char => " ".repeat(self.length as usize),
+            DataType::Packed | DataType::Zoned | DataType::Binary => "0".into(),
+            DataType::Date => "0001-01-01".into(),
+            DataType::Time => "00.00.00".into(),
+            DataType::Timestamp => "0001-01-01-00.00.00.000000".into(),
+        }
+    }
+
+    /// A value in the external form (`HH.MM.SS` times, `YYYY-MM-DD-HH.MM.SS.ffffff`
+    /// timestamps) in the form PostgreSQL reads. Empty values are the
+    /// field's blank value.
+    pub fn to_db(&self, v: &str) -> String {
+        let t = v.trim();
+        match self.data_type {
+            DataType::Packed | DataType::Zoned | DataType::Binary => {
+                if t.is_empty() {
+                    "0".into()
+                } else {
+                    t.to_string()
+                }
+            }
+            DataType::Date if t.is_empty() => "0001-01-01".into(),
+            DataType::Date => t.to_string(),
+            DataType::Time => {
+                if t.is_empty() {
+                    "00:00:00".into()
+                } else {
+                    t.replace('.', ":")
+                }
+            }
+            DataType::Timestamp => {
+                if t.is_empty() {
+                    return "0001-01-01 00:00:00".into();
+                }
+                // 2026-10-19-14.05.00.000000 -> 2026-10-19 14:05:00.000000
+                match (t.get(..10), t.get(10..11), t.get(11..)) {
+                    (Some(d), Some("-"), Some(rest)) => {
+                        let mut r = rest.to_string();
+                        // HH.MM.SS[.ffffff]: the first two dots become colons.
+                        for _ in 0..2 {
+                            if let Some(i) = r.find('.') {
+                                r.replace_range(i..i + 1, ":");
+                            }
+                        }
+                        format!("{d} {r}")
+                    }
+                    _ => t.to_string(),
+                }
+            }
+            DataType::Char => v.to_string(),
+        }
+    }
+
+    /// SQL expression reading this field (column `col`) as text in the
+    /// external form.
+    pub fn read_expr(&self, col: &str) -> String {
+        let e = match self.data_type {
+            // bpchar::text drops trailing blanks; programs expect them.
+            DataType::Char if !self.varlen => format!("rpad({col}::text, {})", self.length),
+            DataType::Date => format!("to_char({col}, 'YYYY-MM-DD')"),
+            DataType::Time => format!("to_char({col}, 'HH24.MI.SS')"),
+            DataType::Timestamp => format!("to_char({col}, 'YYYY-MM-DD-HH24.MI.SS.US')"),
+            _ => format!("{col}::text"),
+        };
+        if self.null_capable {
+            // A program that does not handle nulls sees the default value
+            // (ILE RPG Reference, null-capable fields without ALWNULL(*USRCTL)).
+            format!("coalesce({e}, {})", quote(&self.blank_value()))
+        } else {
+            e
+        }
+    }
+
+    /// The column's DEFAULT clause as SQL (empty for no default).
+    /// Without an explicit default, a null-capable field defaults to null
+    /// and other fields to the type's default (DDS DFT, SQL DEFAULT).
+    pub fn default_clause(&self) -> String {
+        match &self.default {
+            Some(FieldDefault::Required) => String::new(),
+            Some(FieldDefault::Null) => " DEFAULT NULL".into(),
+            None if self.null_capable => " DEFAULT NULL".into(),
+            Some(FieldDefault::Value(v)) => format!(
+                " DEFAULT CAST({} AS {})",
+                quote(&self.to_db(v)),
+                self.sql_type()
+            ),
+            Some(FieldDefault::System) | None => format!(" DEFAULT {}", self.system_default()),
+        }
+    }
+
+    fn system_default(&self) -> &'static str {
+        match self.data_type {
+            // Db2 for i: the default for a date, time or timestamp is
+            // the current one when the record is added (CREATE TABLE,
+            // WITH DEFAULT; DDS DFT not given).
+            DataType::Date => "CURRENT_DATE",
+            DataType::Time => "LOCALTIME(0)",
+            DataType::Timestamp => "LOCALTIMESTAMP(6)",
+            DataType::Char if self.varlen => "''",
+            DataType::Char => "' '",
+            _ => "0",
+        }
+    }
+}
+
+/// Check a numeric constant: digits with an optional sign and decimal point.
+pub fn check_number(v: &str) -> Result<()> {
+    let t = v.trim().trim_start_matches(['+', '-']);
+    let (i, f) = t.split_once('.').unwrap_or((t, ""));
+    if t.is_empty()
+        || !i.chars().all(|c| c.is_ascii_digit())
+        || !f.chars().all(|c| c.is_ascii_digit())
+    {
+        bail!("{v} is not a number");
+    }
+    Ok(())
+}
+
+/// A string as an SQL literal.
+pub fn quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -469,9 +687,19 @@ pub fn parse_pf(file_name: &str, source: &str) -> Result<PhysicalFile> {
                         "line {lineno}: field '{name}' appears before the record format (R) line"
                     );
                 }
-                let length: u32 = cols(line, 30, 34).parse().with_context(|| {
-                    format!("line {lineno}: field '{name}' needs a length in columns 30-34")
-                })?;
+                let type_txt = cols(line, 35, 35).to_ascii_uppercase();
+                // Dates, times and timestamps have no length of their own
+                // (DDS reference, data type L, T, Z).
+                let fixed = DataType::from_code(&type_txt)
+                    .ok()
+                    .and_then(|t| t.fixed_length());
+                let len_txt = cols(line, 30, 34);
+                let length: u32 = match fixed {
+                    Some(n) if len_txt.is_empty() => n,
+                    _ => len_txt.parse().with_context(|| {
+                        format!("line {lineno}: field '{name}' needs a length in columns 30-34")
+                    })?,
+                };
                 let dec_txt = cols(line, 36, 37);
                 let decimals: Option<u32> = if dec_txt.is_empty() {
                     None
@@ -480,7 +708,6 @@ pub fn parse_pf(file_name: &str, source: &str) -> Result<PhysicalFile> {
                         format!("line {lineno}: bad decimal positions '{dec_txt}'")
                     })?)
                 };
-                let type_txt = cols(line, 35, 35).to_ascii_uppercase();
                 let data_type = if type_txt.is_empty() {
                     // DDS default for physical files: packed when decimals given.
                     if decimals.is_some() {
@@ -495,19 +722,45 @@ pub fn parse_pf(file_name: &str, source: &str) -> Result<PhysicalFile> {
                 if data_type.is_numeric() && (length == 0 || length > 63 || decimals > length) {
                     bail!("line {lineno}: invalid numeric size {length},{decimals}");
                 }
+                if data_type == DataType::Binary && (length > 18 || decimals > length) {
+                    bail!("line {lineno}: binary fields have 1 to 18 digits");
+                }
+                if let Some(n) = data_type.fixed_length() {
+                    if length != n || decimals != 0 {
+                        bail!(
+                            "line {lineno}: a {} field has no length or decimals of its own",
+                            data_type.code()
+                        );
+                    }
+                }
                 if !data_type.is_numeric() && (length == 0 || length > 32766) {
                     bail!("line {lineno}: invalid character length {length}");
                 }
                 if pf.fields.iter().any(|f| f.name == name) {
                     bail!("line {lineno}: duplicate field '{name}'");
                 }
-                pf.fields.push(FieldDef {
-                    name,
-                    data_type,
-                    length,
-                    decimals,
-                    text: keyword_arg(keywords, "TEXT").unwrap_or_default(),
-                });
+                let varlen = has_keyword(keywords, "VARLEN");
+                if varlen && data_type != DataType::Char {
+                    bail!("line {lineno}: VARLEN is only valid for character fields");
+                }
+                let mut f = FieldDef::new(&name, data_type, length, decimals);
+                f.text = keyword_arg(keywords, "TEXT").unwrap_or_default();
+                f.varlen = varlen;
+                f.null_capable = has_keyword(keywords, "ALWNULL");
+                if let Some(a) = keyword_args(keywords, "DFT") {
+                    let [v] = a.as_slice() else {
+                        bail!("line {lineno}: DFT needs one value");
+                    };
+                    f.default = Some(match v.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')) {
+                        Some(inner) => FieldDefault::Value(inner.replace("''", "'")),
+                        None if data_type.is_numeric() => {
+                            check_number(v).with_context(|| format!("line {lineno}: DFT"))?;
+                            FieldDefault::Value(v.clone())
+                        }
+                        None => bail!("line {lineno}: DFT for a non-numeric field needs a value in apostrophes"),
+                    });
+                }
+                pf.fields.push(f);
             }
             other => bail!("line {lineno}: unsupported name type '{other}'"),
         }
@@ -649,5 +902,47 @@ mod tests {
         let src = "     A          R REC\n     A            F1             5L\n";
         let err = parse_pf("X", src).unwrap_err().to_string();
         assert!(err.contains("line 2"), "{err}");
+    }
+
+    #[test]
+    fn binary_date_time_varlen_and_null_fields() {
+        // DDS reference: B is binary (1-18 digits); L, T and Z take no
+        // length (10, 8 and 26 characters in *ISO form); VARLEN makes a
+        // character field variable length; ALWNULL makes it null-capable;
+        // DFT gives its default.
+        let src = "     A          R REC
+     A            QTY            9B 0
+     A            WHEN            L
+     A            AT              T
+     A            STAMP           Z
+     A            NOTE          50A         VARLEN ALWNULL
+     A            CODE           2A         DFT('XY')
+";
+        let pf = parse_pf("X", src).unwrap();
+        let f = |n: &str| pf.fields.iter().find(|f| f.name == n).unwrap().clone();
+        assert_eq!(f("QTY").sql_type(), "integer");
+        assert_eq!(
+            (f("WHEN").data_type, f("WHEN").length),
+            (DataType::Date, 10)
+        );
+        assert_eq!(f("AT").length, 8);
+        assert_eq!(f("STAMP").length, 26);
+        assert!(f("NOTE").varlen && f("NOTE").null_capable);
+        assert_eq!(f("NOTE").sql_type(), "varchar(50)");
+        assert_eq!(f("CODE").default, Some(FieldDefault::Value("XY".into())));
+        // External forms: *ISO time HH.MM.SS, timestamp YYYY-MM-DD-HH.MM.SS.ffffff.
+        assert_eq!(f("AT").to_db("14.05.30"), "14:05:30");
+        assert_eq!(
+            f("STAMP").to_db("2026-10-19-14.05.30.123456"),
+            "2026-10-19 14:05:30.123456"
+        );
+        assert_eq!(f("STAMP").blank_value(), "0001-01-01-00.00.00.000000");
+        let e = parse_pf(
+            "X",
+            "     A          R REC\n     A            N             20B 0\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("1 to 18"), "{e}");
     }
 }

@@ -12,7 +12,7 @@
 //! arrival (rrn) order.
 
 use crate::catalog::{ident, FileRef};
-use crate::dds::{DataType, FieldDef};
+use crate::dds::FieldDef;
 use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -22,6 +22,25 @@ use tokio_postgres::{Client, Row};
 /// Record values as strings keyed by field name (numbers as plain decimal
 /// text). Character fields keep their trailing blanks.
 pub type Record = BTreeMap<String, String>;
+
+/// The key under which a record lists its fields that hold the null value
+/// (names separated by commas). Field names cannot contain NUL, so the key
+/// is never a field. A record read has it when a field is null (the
+/// field's own entry then has the field's default value); a record written
+/// or updated with it writes those fields as null.
+pub const NULLS: &str = "\0NULLS";
+
+/// The fields a record says are null.
+pub fn null_fields(rec: &Record) -> Vec<String> {
+    rec.get(NULLS)
+        .map(|v| {
+            v.split(',')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum Position {
@@ -269,22 +288,43 @@ impl OpenFile {
             .file
             .fields
             .iter()
-            .map(|f| match f.data_type {
-                // bpchar::text drops trailing blanks; RPG expects them.
-                DataType::Char => format!("rpad(t.{}::text, {})", ident(&f.name), f.length),
-                _ => format!("t.{}::text", ident(&f.name)),
-            })
+            .map(|f| f.read_expr(&format!("t.{}", ident(&f.name))))
             .collect();
         cols.push("t.rrn".into());
+        // Which null-capable fields are null, by name.
+        let nulls: Vec<String> = self
+            .file
+            .file
+            .fields
+            .iter()
+            .filter(|f| f.null_capable)
+            .map(|f| {
+                format!(
+                    "CASE WHEN t.{} IS NULL THEN {} END",
+                    ident(&f.name),
+                    crate::dds::quote(&f.name)
+                )
+            })
+            .collect();
+        if nulls.is_empty() {
+            cols.push("''".into());
+        } else {
+            cols.push(format!("concat_ws(',', {})", nulls.join(", ")));
+        }
         cols.join(", ")
     }
 
     fn row_to_record(&self, row: &Row) -> (Record, i64) {
         let mut rec = Record::new();
+        let n = self.file.file.fields.len();
         for (i, f) in self.file.file.fields.iter().enumerate() {
             rec.insert(f.name.clone(), row.get::<_, String>(i));
         }
-        let rrn: i64 = row.get(self.file.file.fields.len());
+        let rrn: i64 = row.get(n);
+        let nulls: String = row.get(n + 1);
+        if !nulls.is_empty() {
+            rec.insert(NULLS.to_string(), nulls);
+        }
         (rec, rrn)
     }
 
@@ -299,16 +339,7 @@ impl OpenFile {
 
     /// Normalize a value for a field before it is bound as a parameter.
     fn normalize(f: &FieldDef, v: &str) -> String {
-        if f.data_type.is_numeric() {
-            let t = v.trim();
-            if t.is_empty() {
-                "0".into()
-            } else {
-                t.to_string()
-            }
-        } else {
-            v.to_string()
-        }
+        f.to_db(v)
     }
 
     /// Build `(k1, ..., km) <op> (CAST($n AS t1), ...)` for a key prefix.
@@ -606,11 +637,23 @@ impl OpenFile {
     // ---- writes -----------------------------------------------------------
 
     fn values_for(&self, rec: &Record, params: &mut Vec<String>) -> Result<Vec<(String, String)>> {
-        for k in rec.keys() {
+        for k in rec.keys().filter(|k| k.as_str() != NULLS) {
             self.field(k)?;
         }
         let mut out = Vec::new();
+        let nulls = null_fields(rec);
         for f in &self.file.file.fields {
+            if nulls.contains(&f.name) {
+                if !f.null_capable {
+                    bail!(
+                        "field {} of file {} is not null-capable",
+                        f.name,
+                        self.file.file.name
+                    );
+                }
+                out.push((ident(&f.name), "NULL".into()));
+                continue;
+            }
             if let Some(v) = rec.get(&f.name) {
                 params.push(Self::normalize(f, v));
                 out.push((
@@ -727,6 +770,9 @@ fn map_db_error(e: tokio_postgres::Error) -> anyhow::Error {
     if let Some(db) = e.as_db_error() {
         return match db.code().code() {
             "23505" => anyhow!("CPF5026: duplicate key on a UNIQUE file"),
+            "23514" => {
+                anyhow!("CPF502F: the record does not satisfy a check constraint of the file")
+            }
             "22003" => anyhow!(
                 "RNX0103: value does not fit the numeric field ({})",
                 db.message()

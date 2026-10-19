@@ -1103,6 +1103,8 @@ async fn sql_session(term: &mut Term, job: &mut Job<'_>) -> Result<()> {
     let mut message = String::new();
     let mut retrieve: Vec<String> = Vec::new();
     let mut retrieve_pos = 0usize;
+    // SET SCHEMA in the session: the default schema for what follows.
+    let mut schema: Option<String> = None;
     let mut prefill = String::new();
     loop {
         let mut s = Screen::new();
@@ -1151,14 +1153,34 @@ async fn sql_session(term: &mut Term, job: &mut Job<'_>) -> Result<()> {
         retrieve.push(stmt.clone());
         retrieve_pos = 0;
         log.push(format!("> {stmt}"));
-        match crate::sql::run(
-            job.client,
+        match crate::ddl::try_run(
             &job.env.database_url,
+            &job.user,
             &job.library_list(),
+            Some(job.current_library()),
+            &mut schema,
             &stmt,
         )
         .await
         {
+            Ok(Some(msg)) => {
+                message = msg;
+                log.push(format!("  {message}"));
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                message = e.to_string();
+                prefill = stmt;
+                log.push(format!("  {message}"));
+                continue;
+            }
+        }
+        let libl = match &schema {
+            Some(s) => vec![s.clone()],
+            None => job.library_list(),
+        };
+        match crate::sql::run(job.client, &job.env.database_url, &libl, &stmt).await {
             Ok(crate::sql::Outcome::Rows {
                 columns,
                 numeric,

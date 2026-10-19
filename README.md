@@ -80,7 +80,7 @@ scripts/demo.sh
 | `as4tainr system "COMMAND"` | `system` (QSH) | Runs one CL command as QSECOFR, e.g. `as4tainr system "CRTDTAARA DTAARA(QGPL/X) TYPE(*DEC)"` |
 | `as4tainr crtpf LIB/FILE --src x.pf` | `CRTPF` | Creates a physical file from DDS |
 | `as4tainr crtbndcl LIB/PGM --src x.clle` | `CRTBNDCL` | Creates a CL program ([docs/cl-programs.md](docs/cl-programs.md)); `CALL` runs it |
-| `as4tainr sql "SELECT ..."` | `RUNSQL` / `STRSQL` | Runs one SQL statement in the DB2 for i dialect ([docs/sql.md](docs/sql.md)) |
+| `as4tainr sql "SELECT ..."` | `RUNSQL` / `STRSQL` | Runs one SQL statement in the DB2 for i dialect, including CREATE TABLE and CREATE INDEX ([docs/sql.md](docs/sql.md)) |
 | `as4tainr crtlf LIB/FILE --src x.lf` | `CRTLF` | Creates a logical file over a physical file from DDS ([docs/logical-files.md](docs/logical-files.md)) |
 | `as4tainr crtdspf LIB/FILE --src x.dspf` | `CRTDSPF` | Creates a display file from DDS |
 | `as4tainr load FILE --csv x.csv` | `CPYFRMIMPF` (roughly) | Writes CSV rows with `WRITE` |

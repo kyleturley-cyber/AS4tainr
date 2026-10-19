@@ -157,7 +157,9 @@ DSPLIB:
 | `CHGPWD` | Shows the Change Password screen. |
 | `WRKOBJ OBJ(lib/name) OBJTYPE(*ALL\|*LIB\|*FILE)` | Lists objects. The name can be generic (`CUST*`) or `*ALL`; the library `*LIBL`, `*CURLIB`, `*USRLIBL`, `*ALL`, `*ALLUSR` or a name. List only for now: no options. |
 | `STRSQL` | Interactive SQL: type a statement, see the rows (see [sql.md](sql.md)). |
-| `RUNSQL SQL('...')` | Runs one INSERT, UPDATE or DELETE (not SELECT) and reports the rows changed. |
+| `RUNSQL SQL('...')` | Runs one INSERT, UPDATE or DELETE (not SELECT) and reports the rows changed, or a data definition statement such as CREATE TABLE. |
+| `RUNSQLSTM SRCFILE(LIB/QSQLSRC) SRCMBR(NAME)` | Runs the SQL statements in a source member ([sql.md](sql.md)). |
+| `DLTF FILE(LIB/NAME)` | Deletes a database or display file (not a physical file with logical files over it: CPF3203). |
 | `DSPPFM FILE(lib/name)` | Shows a physical file's records in arrival order, one line each with the field names above. F19/F20 shift left/right on wide files. |
 
 Keyword and positional forms both work (`CRTLIB MYLIB` = `CRTLIB LIB(MYLIB)`). Unquoted values are folded to upper case; quoted values keep their case, with `''` for an apostrophe.

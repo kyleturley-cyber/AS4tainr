@@ -48,7 +48,6 @@ CREATE TABLE IF NOT EXISTS as4tainr.file_keys (
     field   text NOT NULL,
     PRIMARY KEY (library, file, seq)
 );
-ALTER TABLE as4tainr.file_keys ADD COLUMN IF NOT EXISTS descending boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS as4tainr.programs (
     library   text NOT NULL,
     name      text NOT NULL,
@@ -65,6 +64,27 @@ CREATE TABLE IF NOT EXISTS as4tainr.logical_files (
     selection  text NOT NULL DEFAULT 'TRUE',
     PRIMARY KEY (library, name)
 );
+-- Columns added after the first release. ALTER TABLE locks the table even
+-- when the column exists, so it only runs when the column is missing
+-- (other sessions may be using the catalog).
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='file_keys' AND column_name='descending') THEN
+    ALTER TABLE as4tainr.file_keys ADD COLUMN descending boolean NOT NULL DEFAULT false;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='programs' AND column_name='options') THEN
+    ALTER TABLE as4tainr.programs ADD COLUMN IF NOT EXISTS options text NOT NULL DEFAULT '';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='file_fields' AND column_name='dft') THEN
+    ALTER TABLE as4tainr.file_fields
+      ADD COLUMN IF NOT EXISTS varlen boolean NOT NULL DEFAULT false,
+      ADD COLUMN IF NOT EXISTS null_capable boolean NOT NULL DEFAULT false,
+      ADD COLUMN IF NOT EXISTS dft text;
+  END IF;
+END $$;
 "#;
 
 /// Quote an SQL identifier. Object names are validated before use, but we
@@ -323,11 +343,27 @@ pub async fn create_program(
     )
     .await?;
     tx.execute(
-        "INSERT INTO as4tainr.programs VALUES ($1,$2,$4,$3)",
+        "INSERT INTO as4tainr.programs (library, name, attribute, source) VALUES ($1,$2,$4,$3)",
         &[&lib, &name, &source, &attribute],
     )
     .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// Record a program's compile options (see `Program::options`).
+pub async fn set_program_options(
+    client: &Client,
+    library: &str,
+    name: &str,
+    options: &str,
+) -> Result<()> {
+    client
+        .execute(
+            "UPDATE as4tainr.programs SET options=$3 WHERE library=$1 AND name=$2",
+            &[&library, &name, &options],
+        )
+        .await?;
     Ok(())
 }
 
@@ -351,6 +387,9 @@ pub struct Program {
     /// CLLE, CLP or RPGLE.
     pub attribute: String,
     pub source: String,
+    /// Compile options given on the create command, as control keywords
+    /// (e.g. `ALWNULL(*USRCTL)`); the source's own control keywords win.
+    pub options: String,
 }
 
 /// The first program of this name in a list of libraries.
@@ -359,7 +398,7 @@ pub async fn find_program(client: &Client, libs: &[String], name: &str) -> Resul
     for lib in libs {
         if let Some(r) = client
             .query_opt(
-                "SELECT attribute, source FROM as4tainr.programs WHERE library=$1 AND name=$2",
+                "SELECT attribute, source, options FROM as4tainr.programs WHERE library=$1 AND name=$2",
                 &[lib, &name],
             )
             .await?
@@ -369,6 +408,7 @@ pub async fn find_program(client: &Client, libs: &[String], name: &str) -> Resul
                 name,
                 attribute: r.get(0),
                 source: r.get(1),
+                options: r.get(2),
             }));
         }
     }
@@ -433,7 +473,18 @@ pub async fn member_records(
         .file
         .fields
         .iter()
-        .map(|fd| format!("COALESCE(t.{}::text, '')", ident(&fd.name)))
+        .map(|fd| {
+            let col = format!("t.{}", ident(&fd.name));
+            // Character values without their trailing blanks; dates and
+            // times in their external form; null shown as empty.
+            if fd.data_type.is_datetime() {
+                let mut plain = fd.clone();
+                plain.null_capable = false;
+                format!("COALESCE({}, '')", plain.read_expr(&col))
+            } else {
+                format!("COALESCE({col}::text, '')")
+            }
+        })
         .collect();
     let sql = format!(
         "SELECT t.rrn, {} FROM {} AS t ORDER BY t.rrn LIMIT $1",
@@ -520,7 +571,8 @@ pub async fn create_physical_file(
         let len = f.length as i32;
         let dec = f.decimals as i32;
         tx.execute(
-            "INSERT INTO as4tainr.file_fields VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
             &[
                 &lib,
                 &name,
@@ -530,6 +582,9 @@ pub async fn create_physical_file(
                 &len,
                 &dec,
                 &f.text,
+                &f.varlen,
+                &f.null_capable,
+                &f.default.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
             ],
         )
         .await?;
@@ -553,17 +608,13 @@ pub async fn create_physical_file(
         } else {
             ""
         };
-        let default = if f.data_type == DataType::Char {
-            "' '"
-        } else {
-            "0"
-        };
         cols.push(format!(
-            "{} {}{} NOT NULL DEFAULT {}",
+            "{} {}{}{}{}",
             ident(&f.name),
             f.sql_type(),
             coll,
-            default
+            if f.null_capable { "" } else { " NOT NULL" },
+            f.default_clause()
         ));
     }
     let table = format!("{}.{}", ident(&lib), ident(&name));
@@ -869,7 +920,8 @@ pub async fn create_logical_file(
     for (i, f) in fields.iter().enumerate() {
         let (seq, len, dec) = (i as i32, f.length as i32, f.decimals as i32);
         tx.execute(
-            "INSERT INTO as4tainr.file_fields VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
             &[
                 &lib,
                 &name,
@@ -879,6 +931,9 @@ pub async fn create_logical_file(
                 &len,
                 &dec,
                 &f.text,
+                &f.varlen,
+                &f.null_capable,
+                &f.default.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
             ],
         )
         .await?;
@@ -982,7 +1037,7 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
         let Some(row) = row else { continue };
         let fields = client
             .query(
-                "SELECT name, data_type, length, decimals, text FROM as4tainr.file_fields
+                "SELECT name, data_type, length, decimals, text, varlen, null_capable, dft FROM as4tainr.file_fields
                  WHERE library=$1 AND file=$2 ORDER BY seq",
                 &[lib, &name],
             )
@@ -995,6 +1050,11 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
                     length: r.get::<_, i32>(2) as u32,
                     decimals: r.get::<_, i32>(3) as u32,
                     text: r.get(4),
+                    varlen: r.get(5),
+                    null_capable: r.get(6),
+                    default: r
+                        .get::<_, Option<&str>>(7)
+                        .and_then(|d| serde_json::from_str(d).ok()),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1027,4 +1087,159 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
         "CPF9812: file {name} not found in library list {}",
         search.join(" ")
     )
+}
+
+/// Delete a database or display file: its description, its authorities
+/// and its data. A physical file with logical files over it is deleted
+/// only with `dependents` (SQL DROP TABLE drops the indexes and views
+/// over a table; DLTF refuses, CPF3203).
+pub async fn delete_file(
+    client: &mut Client,
+    library: &str,
+    name: &str,
+    dependents: bool,
+) -> Result<()> {
+    let lib = validate_name("library", library)?;
+    let name = validate_name("file", name)?;
+    let tx = client.transaction().await?;
+    let Some(row) = tx
+        .query_opt(
+            "SELECT attribute FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+            &[&lib, &name],
+        )
+        .await?
+    else {
+        bail!("CPF2105: File {name} in library {lib} not found.");
+    };
+    let attribute: String = row.get(0);
+    let over: Vec<(String, String)> = tx
+        .query(
+            "SELECT library, name FROM as4tainr.logical_files WHERE pf_library=$1 AND pf_name=$2 ORDER BY 1, 2",
+            &[&lib, &name],
+        )
+        .await?
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    if !over.is_empty() && !dependents {
+        bail!(
+            "CPF3203: File {name} in library {lib} cannot be deleted: logical file {}/{} is built over it.",
+            over[0].0,
+            over[0].1
+        );
+    }
+    let mut drop = over;
+    drop.push((lib.clone(), name.clone()));
+    for (l, n) in &drop {
+        let lf = tx
+            .query_opt(
+                "SELECT pf_library FROM as4tainr.logical_files WHERE library=$1 AND name=$2",
+                &[l, n],
+            )
+            .await?;
+        let qualified = format!("{}.{}", ident(l), ident(n));
+        match (&lf, attribute.as_str()) {
+            (Some(r), _) => {
+                // The view, and the indexes on the physical file's table.
+                let pf_lib: String = r.get(0);
+                tx.batch_execute(&format!(
+                    "DROP VIEW IF EXISTS {qualified};
+                     DROP INDEX IF EXISTS {}.{};
+                     DROP INDEX IF EXISTS {}.{};",
+                    ident(&pf_lib),
+                    ident(&format!("{l}_{n}_key")),
+                    ident(&pf_lib),
+                    ident(&format!("{l}_{n}_ukey")),
+                ))
+                .await?;
+            }
+            (None, "DSPF") => {}
+            (None, _) => {
+                tx.batch_execute(&format!("DROP TABLE IF EXISTS {qualified} CASCADE"))
+                    .await?;
+            }
+        }
+        for table in ["files", "logical_files", "display_files"] {
+            tx.execute(
+                &format!("DELETE FROM as4tainr.{table} WHERE library=$1 AND name=$2"),
+                &[l, n],
+            )
+            .await?;
+        }
+        for table in ["file_fields", "file_keys"] {
+            tx.execute(
+                &format!("DELETE FROM as4tainr.{table} WHERE library=$1 AND file=$2"),
+                &[l, n],
+            )
+            .await?;
+        }
+        tx.execute(
+            "DELETE FROM as4tainr.object_auths WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+            &[l, n],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+            &[l, n],
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Change a file's text description.
+pub async fn set_file_text(client: &Client, library: &str, name: &str, text: &str) -> Result<()> {
+    let n = client
+        .execute(
+            "UPDATE as4tainr.objects SET text=$3 WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+            &[&library, &name, &text],
+        )
+        .await?;
+    if n == 0 {
+        bail!("SQL0204: {library}/{name} not found.");
+    }
+    Ok(())
+}
+
+/// Change a field's text (in the file and in the logical files that
+/// share the field).
+pub async fn set_field_text(
+    client: &Client,
+    library: &str,
+    file: &str,
+    field: &str,
+    text: &str,
+) -> Result<()> {
+    let n = client
+        .execute(
+            "UPDATE as4tainr.file_fields SET text=$4 WHERE library=$1 AND file=$2 AND name=$3",
+            &[&library, &file, &field, &text],
+        )
+        .await?;
+    if n == 0 {
+        bail!("SQL0205: Column {field} not in table {file} in {library}.");
+    }
+    Ok(())
+}
+
+/// A unique constraint (SQL PRIMARY KEY or UNIQUE) on a physical file.
+pub async fn add_unique_constraint(
+    client: &Client,
+    library: &str,
+    file: &str,
+    constraint: &str,
+    columns: &[String],
+) -> Result<()> {
+    let cols: Vec<String> = columns.iter().map(|c| ident(c)).collect();
+    client
+        .batch_execute(&format!(
+            "CREATE UNIQUE INDEX {} ON {}.{} ({})",
+            ident(&format!("{file}_{constraint}")),
+            ident(library),
+            ident(file),
+            cols.join(", ")
+        ))
+        .await?;
+    Ok(())
 }

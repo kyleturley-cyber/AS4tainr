@@ -33,6 +33,48 @@ pub fn tokens(text: &str) -> Result<Vec<Tok>> {
             i += 1;
             continue;
         }
+        // Date, time and timestamp literals (*ISO): D'2026-10-19',
+        // T'13.45.00', Z'2026-10-19-13.45.00.000000' (ILE RPG Reference,
+        // literals). Their value is the text in that form.
+        let starts_word = i == 0 || !(cs[i - 1].is_alphanumeric() || "_$#@".contains(cs[i - 1]));
+        if starts_word
+            && matches!(c.to_ascii_uppercase(), 'D' | 'T' | 'Z')
+            && cs.get(i + 1) == Some(&'\'')
+        {
+            let kind = c.to_ascii_uppercase();
+            let Some(end) = cs[i + 2..].iter().position(|&x| x == '\'') else {
+                bail!("a literal is not ended: {text}");
+            };
+            let v: String = cs[i + 2..i + 2 + end].iter().collect();
+            let shape = |pattern: &str| {
+                v.len() == pattern.len()
+                    && v.chars().zip(pattern.chars()).all(|(a, p)| {
+                        if p == '9' {
+                            a.is_ascii_digit()
+                        } else {
+                            a == p
+                        }
+                    })
+            };
+            let ok = match kind {
+                'D' => shape("9999-99-99"),
+                'T' => shape("99.99.99"),
+                _ => shape("9999-99-99-99.99.99.999999"),
+            };
+            if !ok {
+                bail!(
+                    "{kind}'{v}' is not a valid {} literal in *ISO form",
+                    match kind {
+                        'D' => "date",
+                        'T' => "time",
+                        _ => "timestamp",
+                    }
+                );
+            }
+            out.push(Tok::Str(v));
+            i += end + 3;
+            continue;
+        }
         // Character literal, or X'..' hex literal.
         if c == '\'' || ((c == 'x' || c == 'X') && cs.get(i + 1) == Some(&'\'')) {
             let hex = c != '\'';

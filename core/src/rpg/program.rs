@@ -392,7 +392,12 @@ fn num_arg(a: &str, syms: &HashMap<String, Sym>) -> Result<u32> {
 /// of externally described files are packed in the program).
 fn program_type(f: &crate::dds::FieldDef, in_ds: bool) -> DType {
     match f.data_type {
+        DataType::Char if f.varlen => DType::Varchar(f.length),
         DataType::Char => DType::Char(f.length),
+        DataType::Binary => DType::Binary(f.length, f.decimals),
+        DataType::Date => DType::Date,
+        DataType::Time => DType::Time,
+        DataType::Timestamp => DType::Timestamp,
         DataType::Packed => DType::Packed(f.length, f.decimals),
         DataType::Zoned => {
             if in_ds {

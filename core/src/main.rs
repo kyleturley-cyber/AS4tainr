@@ -201,6 +201,19 @@ async fn run(cli: Cli) -> Result<u8> {
         }
         Cmd::Sql { statement } => {
             let client = runtime::connect_db(&cli.database_url).await?;
+            if let Some(msg) = as4tainr_core::ddl::try_run(
+                &cli.database_url,
+                "QSECOFR",
+                &libl,
+                libl.first().cloned(),
+                &mut None,
+                &statement,
+            )
+            .await?
+            {
+                println!("{msg}");
+                return Ok(0);
+            }
             match as4tainr_core::sql::run(&client, &cli.database_url, &libl, &statement).await? {
                 as4tainr_core::sql::Outcome::Rows {
                     columns,

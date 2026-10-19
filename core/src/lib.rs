@@ -21,6 +21,7 @@ pub mod catalog;
 pub mod cl;
 pub mod clpgm;
 pub mod commands;
+pub mod ddl;
 pub mod dds;
 pub mod dspf;
 pub mod dtaara;

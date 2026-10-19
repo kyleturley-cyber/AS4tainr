@@ -160,6 +160,38 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "RUNSQLSTM",
+        description: "Run SQL Statements",
+        params: &[
+            p("SRCFILE", Kind::Qualified, true, None, "Source file").ch("Name"),
+            p("SRCMBR", Kind::Name, true, None, "Source member").ch("Name"),
+            p(
+                "COMMIT",
+                Kind::Name,
+                false,
+                Some("*CHG"),
+                "Commitment control",
+            )
+            .ch("*CHG, *ALL, *CS, *NONE, *NC, *RR")
+            .keyword_only(),
+            p("NAMING", Kind::Name, false, Some("*SYS"), "Naming")
+                .ch("*SYS, *SQL")
+                .keyword_only(),
+            p("ERRLVL", Kind::Text, false, Some("10"), "Severity level")
+                .ch("0-40")
+                .keyword_only(),
+            p(
+                "DFTRDBCOL",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "Default collection",
+            )
+            .ch("Name, *NONE")
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
         name: "STRSQL",
         description: "Start SQL Interactive Session",
         params: &[],
@@ -518,6 +550,11 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[p("DTAARA", Kind::Qualified, true, None, "Data area").ch("Name")],
     },
     CommandDef {
+        name: "DLTF",
+        description: "Delete File",
+        params: &[p("FILE", Kind::Qualified, true, None, "File").ch("Name")],
+    },
+    CommandDef {
         name: "DSPPFM",
         description: "Display Physical File Member",
         params: &[
@@ -678,6 +715,15 @@ pub static COMMANDS: &[CommandDef] = &[
             .ch("Name"),
             p("SRCMBR", Kind::Name, false, Some("*PGM"), "Source member").ch("Name, *PGM"),
             p(
+                "ALWNULL",
+                Kind::Name,
+                false,
+                Some("*NO"),
+                "Allow null values",
+            )
+            .ch("*NO, *INPUTONLY, *USRCTL, *YES")
+            .keyword_only(),
+            p(
                 "TEXT",
                 Kind::Text,
                 false,
@@ -775,7 +821,7 @@ pub static GROUPS: &[Group] = &[
     Group {
         item: "File commands",
         title: "File Commands",
-        commands: &["DSPPFM"],
+        commands: &["DSPPFM", "DLTF"],
     },
     Group {
         item: "User profile commands",
@@ -790,7 +836,7 @@ pub static GROUPS: &[Group] = &[
     Group {
         item: "SQL commands",
         title: "SQL Commands",
-        commands: &["STRSQL", "RUNSQL"],
+        commands: &["STRSQL", "RUNSQL", "RUNSQLSTM"],
     },
     Group {
         item: "Program commands",

@@ -119,7 +119,7 @@ pub async fn grant_library(client: &Client, library: &str) -> Result<()> {
 // ------------------------------------------------------------ tokens
 
 #[derive(Debug, Clone, PartialEq)]
-enum Tok {
+pub(crate) enum Tok {
     Space(String),
     /// A word: identifier or keyword (as written).
     Word(String),
@@ -132,7 +132,7 @@ enum Tok {
     Punct(String),
 }
 
-fn tokenize(sql: &str) -> Result<Vec<Tok>> {
+pub(crate) fn tokenize(sql: &str) -> Result<Vec<Tok>> {
     let cs: Vec<char> = sql.chars().collect();
     let mut out = Vec::new();
     let mut i = 0;
@@ -521,6 +521,8 @@ fn map_error(e: &tokio_postgres::Error, sql: &str) -> anyhow::Error {
         ),
         "42601" => anyhow!("SQL0104: Statement not valid: {msg}."),
         "23505" => anyhow!("SQL0803: Duplicate key value: the record was not written."),
+        "23514" => anyhow!("SQL0545: The row does not satisfy a check constraint: {msg}."),
+        "23502" => anyhow!("SQL0407: Null value not allowed in a NOT NULL column: {msg}."),
         "42501" => anyhow!("SQL0551: Not authorized to an object in the statement."),
         "22P02" | "22003" => anyhow!("SQL0302: A value does not fit its column: {msg}."),
         _ => {
@@ -627,6 +629,10 @@ async fn run_in_transaction(
                 }
             })
             .collect();
+        let stamps: Vec<bool> = cols
+            .iter()
+            .map(|c| c.type_().name() == "timestamp")
+            .collect();
         let mut rows = Vec::new();
         for m in tx
             .simple_query(text)
@@ -640,7 +646,11 @@ async fn run_in_transaction(
                 rows.push(
                     (0..r.len())
                         .filter(|&j| keep.get(j).copied().unwrap_or(true))
-                        .map(|j| r.get(j).unwrap_or("-").to_string())
+                        .map(|j| match r.get(j) {
+                            Some(v) if stamps.get(j) == Some(&true) => db2_timestamp(v),
+                            Some(v) => v.to_string(),
+                            None => "-".to_string(),
+                        })
                         .collect(),
                 );
             }
@@ -658,6 +668,16 @@ async fn run_in_transaction(
         Outcome::Count(t.kind, n)
     };
     Ok(outcome)
+}
+
+/// A timestamp as Db2 for i shows it: `YYYY-MM-DD-HH.MM.SS.ffffff`
+/// (PostgreSQL: `YYYY-MM-DD HH:MM:SS[.ffffff]`).
+pub fn db2_timestamp(v: &str) -> String {
+    let Some((d, t)) = v.split_once(' ') else {
+        return v.to_string();
+    };
+    let (hms, frac) = t.split_once('.').unwrap_or((t, ""));
+    format!("{d}-{}.{frac:0<6}", hms.replace(':', "."))
 }
 
 /// A completion message like IBM i's for INSERT/UPDATE/DELETE.
@@ -899,6 +919,11 @@ impl Session {
                 .filter(|(_, k)| **k)
                 .map(|(c, _)| crate::catalog::ibm_name(c.name()))
                 .collect();
+            let stamps: Vec<bool> = stmt
+                .columns()
+                .iter()
+                .map(|c| c.type_().name() == "timestamp")
+                .collect();
             let mut rows = Vec::new();
             for m in self
                 .client
@@ -910,7 +935,15 @@ impl Session {
                     rows.push(
                         (0..r.len())
                             .filter(|&j| keep.get(j).copied().unwrap_or(true))
-                            .map(|j| r.get(j).map(str::to_string))
+                            .map(|j| {
+                                r.get(j).map(|v| {
+                                    if stamps.get(j) == Some(&true) {
+                                        db2_timestamp(v)
+                                    } else {
+                                        v.to_string()
+                                    }
+                                })
+                            })
                             .collect(),
                     );
                 }

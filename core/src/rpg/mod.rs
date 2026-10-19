@@ -74,8 +74,24 @@ pub async fn compile(
     name: &str,
     source: &str,
 ) -> Result<program::Program> {
+    compile_with(client, libl, name, source, "").await
+}
+
+/// Compile with the create command's options (control keywords such as
+/// `ALWNULL(*USRCTL)`); keywords in the source's control specifications
+/// take precedence over them, as on IBM i.
+pub async fn compile_with(
+    client: &Client,
+    libl: &[String],
+    name: &str,
+    source: &str,
+    options: &str,
+) -> Result<program::Program> {
     let includes = load_includes(client, libl, source).await;
-    let src = parse::parse(source, &|id| includes.get(id).cloned())?;
+    let mut src = parse::parse(source, &|id| includes.get(id).cloned())?;
+    if !options.trim().is_empty() {
+        src.control.extend(parse::keywords(options)?);
+    }
     let mut externals = HashMap::new();
     for f in program::external_files(&src) {
         let fr = crate::catalog::resolve_file(client, libl, &f)
@@ -127,6 +143,33 @@ pub async fn call(
     source: String,
     args: Vec<String>,
 ) -> Result<CallResult> {
+    call_with(
+        database_url,
+        libl,
+        user,
+        job,
+        display,
+        cl,
+        name,
+        (source, String::new()),
+        args,
+    )
+    .await
+}
+
+/// `call` of a program object: (source, compile options).
+#[allow(clippy::too_many_arguments)]
+pub async fn call_with(
+    database_url: &str,
+    libl: Vec<String>,
+    user: String,
+    job: Option<String>,
+    display: Option<crate::runtime::DisplayHandle>,
+    cl: Option<ClContext>,
+    name: String,
+    (source, options): (String, String),
+    args: Vec<String>,
+) -> Result<CallResult> {
     let rt = tokio::runtime::Handle::current();
     let url = database_url.to_string();
     tokio::task::spawn_blocking(move || -> Result<CallResult> {
@@ -149,7 +192,7 @@ pub async fn call(
                 name: parts.next()?.to_string(),
             })
         });
-        let prog = rt.block_on(compile(&client, &libl, &name, &source))?;
+        let prog = rt.block_on(compile_with(&client, &libl, &name, &source, &options))?;
         let mut m = interp::Machine::new(
             &prog,
             interp::Io {

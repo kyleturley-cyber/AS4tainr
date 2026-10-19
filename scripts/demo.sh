@@ -56,12 +56,14 @@ run CUSTRPT L
 # A printed report (O specs, EXCEPT). The conformance runner replays file
 # operations only; the page layout is the Jariko runner's or the native
 # RPG engine's.
-if [[ "${AS4TAINR_RUNNER:-}" != *BridgeConformance* || "${AS4TAINR_RPG_ENGINE:-}" == native ]]; then
+# The RPG engine: native unless AS4TAINR_RPG_ENGINE=jariko.
+engine="${AS4TAINR_RPG_ENGINE:-native}"
+if [[ "${AS4TAINR_RUNNER:-}" != *BridgeConformance* || "$engine" != jariko ]]; then
   run CUSTPRT
 fi
 # An imported application (samples/apps/contacts, in library CONTACTS):
 # RPG program objects (CRTBNDRPG) and a /INCLUDE stream file. Real RPG only.
-if [[ "${AS4TAINR_RUNNER:-}" != *BridgeConformance* || "${AS4TAINR_RPG_ENGINE:-}" == native ]]; then
+if [[ "${AS4TAINR_RUNNER:-}" != *BridgeConformance* || "$engine" != jariko ]]; then
   echo "--- CALL CONTACTS/CONTCNT"
   out=$(AS4TAINR_LIBL=CONTACTS,QGPL "$bin" call CONTACTS/CONTCNT | grep -v '^Picked up JAVA_TOOL_OPTIONS' || true)
   echo "$out"

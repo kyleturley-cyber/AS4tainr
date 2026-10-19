@@ -19,12 +19,12 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tokio_postgres::Client;
 
-/// Which engine runs RPG programs: `AS4TAINR_RPG_ENGINE=native` (this
-/// one) or `jariko` (the JVM runner; the default until the native engine
-/// passes everything, see docs/rpg-engine.md).
+/// Which engine runs RPG programs: this one (the default), or the
+/// Jariko runner on the JVM with `AS4TAINR_RPG_ENGINE=jariko` (kept for a
+/// while for comparison; see docs/rpg-engine.md).
 pub fn native_enabled() -> bool {
-    std::env::var("AS4TAINR_RPG_ENGINE")
-        .map(|v| v.eq_ignore_ascii_case("native"))
+    !std::env::var("AS4TAINR_RPG_ENGINE")
+        .map(|v| v.eq_ignore_ascii_case("jariko"))
         .unwrap_or(false)
 }
 
@@ -103,6 +103,16 @@ pub async fn compile(
     program::bind(name, &src, &externals, &displays)
 }
 
+/// What CL run from RPG (QCMDEXC, CALL of a CL program) needs of the
+/// calling job.
+#[derive(Clone, Debug)]
+pub struct ClContext {
+    pub env: crate::commands::Environment,
+    pub curlib: Option<String>,
+    /// The user part of the library list.
+    pub user_libl: Vec<String>,
+}
+
 /// What a call produced: DSPLY output, and an error if it ended
 /// abnormally.
 pub struct CallResult {
@@ -121,6 +131,7 @@ pub async fn call(
     user: String,
     job: Option<String>,
     display: Option<crate::bridge::DisplayHandle>,
+    cl: Option<ClContext>,
     name: String,
     source: String,
     args: Vec<String>,
@@ -158,6 +169,8 @@ pub async fn call(
                 libl: libl.clone(),
                 job: job_id,
                 display,
+                cl,
+                callers: vec![],
             },
         );
         let r = m.run(&args);

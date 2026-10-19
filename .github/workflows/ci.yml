@@ -36,17 +36,17 @@ jobs:
           java-version: "17"
       - name: Compile the dependency-free bridge client and conformance runner
         run: javac -d target/conformance-classes jvm/src/main/java/io/as4tainr/bridge/*.java jvm/src/test/java/io/as4tainr/bridge/*.java
-      - name: End-to-end with the conformance runner
+      - name: End-to-end with the conformance runner (bridge protocol, Jariko path)
         env:
           AS4TAINR_BIN: target/debug/as4tainr
+          AS4TAINR_RPG_ENGINE: jariko
           AS4TAINR_RUNNER: java -cp target/conformance-classes io.as4tainr.bridge.BridgeConformance
         run: |
           scripts/demo.sh
           target/debug/as4tainr call SELFTEST
-      - name: End-to-end on the native RPG engine (docs/rpg-engine.md)
+      - name: End-to-end on the RPG engine (docs/rpg-engine.md)
         env:
           AS4TAINR_BIN: target/debug/as4tainr
-          AS4TAINR_RPG_ENGINE: native
           PGPASSWORD: as4tainr
         run: |
           createdb -h 127.0.0.1 -U as4tainr as4tainr_native
@@ -82,6 +82,7 @@ jobs:
       - name: Run the sample RPG programs on Jariko against PostgreSQL
         env:
           AS4TAINR_BIN: target/debug/as4tainr
+          AS4TAINR_RPG_ENGINE: jariko
           AS4TAINR_RUNNER: java -jar jvm/build/libs/as4tainr-jvm.jar
         run: scripts/demo.sh
 
@@ -134,20 +135,20 @@ jobs:
           TN5250: /tmp/tn5250/build/curses/tn5250
           AS4TAINR_BIN: target/debug/as4tainr
         run: python3 tools/gate3_5250.py 127.0.0.1:2323
-      - name: 5250 end-to-end and the Phase 3 gate on the native RPG engine
+      - name: 5250 end-to-end and the Phase 3 gate on Jariko (AS4TAINR_RPG_ENGINE=jariko)
         env:
           TN5250: /tmp/tn5250/build/curses/tn5250
-          AS4TAINR_RPG_ENGINE: native
+          AS4TAINR_RPG_ENGINE: jariko
           PGPASSWORD: as4tainr
         run: |
-          createdb -h 127.0.0.1 -U as4tainr as4tainr_r2
-          export AS4TAINR_DATABASE_URL=postgres://as4tainr:as4tainr@127.0.0.1/as4tainr_r2
+          createdb -h 127.0.0.1 -U as4tainr as4tainr_jariko
+          export AS4TAINR_DATABASE_URL=postgres://as4tainr:as4tainr@127.0.0.1/as4tainr_jariko
           AS4TAINR_BIN=target/debug/as4tainr scripts/samples.sh
           AS4TAINR_WAITRCD=5 AS4TAINR_PGM_PATH=$PWD/samples/qrpglesrc nohup target/debug/as4tainr tn5250 \
-            --listen 127.0.0.1:2324 --runner "java -jar jvm/build/libs/as4tainr-jvm.jar" > tn5250-native.log 2>&1 &
+            --listen 127.0.0.1:2324 --runner "java -jar jvm/build/libs/as4tainr-jvm.jar" > tn5250-jariko.log 2>&1 &
           sleep 2
-          python3 tools/e2e_5250.py 127.0.0.1:2324 || { cat tn5250-native.log; exit 1; }
-          AS4TAINR_BIN=target/debug/as4tainr python3 tools/gate3_5250.py 127.0.0.1:2324 || { cat tn5250-native.log; exit 1; }
+          python3 tools/e2e_5250.py 127.0.0.1:2324 || { cat tn5250-jariko.log; exit 1; }
+          AS4TAINR_BIN=target/debug/as4tainr python3 tools/gate3_5250.py 127.0.0.1:2324 || { cat tn5250-jariko.log; exit 1; }
       - name: Browser 5250 terminal in Chromium
         run: |
           pip install playwright

@@ -32,6 +32,10 @@ pub struct Io<'a> {
     pub job: Option<crate::jobs::JobId>,
     /// The job's display (interactive jobs): EXFMT goes there.
     pub display: Option<crate::bridge::DisplayHandle>,
+    /// For CL commands run from RPG (QCMDEXC, CALL of a CL program).
+    pub cl: Option<super::ClContext>,
+    /// RPG programs active in the call stack above this one.
+    pub callers: Vec<String>,
 }
 
 /// Status of the last operation on a file (%FOUND, %EOF, %EQUAL, %ERROR).
@@ -102,6 +106,8 @@ struct Loc {
     buf: usize,
     off: usize,
     size: usize,
+    /// The variable's type (a data structure or whole array: its bytes).
+    dtype: DType,
 }
 
 /// A program-described printer file while the program runs: where the
@@ -1422,11 +1428,16 @@ impl<'a> Machine<'a> {
                     }
                     None => String::new(),
                 };
-                self.messages.push(text.trim_end().to_string());
-                if let Some(r) = response {
+                match (response, self.io.display.clone()) {
+                    // An interactive job: the message and a reply line on
+                    // the screen; the reply goes into the response field.
+                    (Some(r), Some(display)) => {
+                        let reply = self.dsply_screen(&display, text.trim_end(), r)?;
+                        self.assign(r, &reply, Fit::Truncate { half_adjust: false }, false)?;
+                    }
                     // No operator to answer in a batch call: the response
                     // stays as it was.
-                    let _ = r;
+                    _ => self.messages.push(text.trim_end().to_string()),
                 }
             }
             Stmt::File {
@@ -2020,6 +2031,7 @@ impl<'a> Machine<'a> {
                         buf: base + i,
                         off: 0,
                         size: p.len(),
+                        dtype: DType::Char(p.len() as u32),
                     }));
                 }
                 let r = self.call_proc(&prog.procs[m], call_args).map(|_| ());
@@ -2058,6 +2070,226 @@ impl<'a> Machine<'a> {
     }
 }
 
+impl Machine<'_> {
+    /// Programs of the operating system that RPG programs call, done
+    /// here (true when `name` is one of them).
+    fn system_program(&mut self, name: &str, locs: &[Loc]) -> Result<bool> {
+        let text = |m: &Self, l: &Loc| a(&m.bufs[l.buf][l.off..l.off + l.size]);
+        let num = |m: &Self, l: &Loc| -> Result<Dec> {
+            data::load(&l.dtype, &m.bufs[l.buf][l.off..l.off + l.size])?.num()
+        };
+        match name {
+            // QCMDEXC (command, length): run a CL command in the job.
+            "QCMDEXC" => {
+                let [cmd, len, ..] = locs else {
+                    bail!("QCMDEXC needs a command and its length");
+                };
+                let n = num(self, len)?.to_i128()?.max(0) as usize;
+                let c: String = text(self, cmd).chars().take(n).collect();
+                self.run_cl(c.trim())?;
+            }
+            // QDCXLATE (length, data, table): translate bytes in place
+            // between EBCDIC (CCSID 37) and ASCII (QTCPASC, QTCPEBC).
+            "QDCXLATE" => {
+                let [len, data_loc, table, ..] = locs else {
+                    bail!("QDCXLATE needs a length, the data and a table");
+                };
+                let n = (num(self, len)?.to_i128()?.max(0) as usize).min(data_loc.size);
+                let t = text(self, table).trim().to_ascii_uppercase();
+                let bytes = &mut self.bufs[data_loc.buf][data_loc.off..data_loc.off + n];
+                match t.as_str() {
+                    "QTCPASC" | "QASCII" => {
+                        for b in bytes.iter_mut() {
+                            let u = crate::tn5250::ebcdic::TO_UNICODE[*b as usize];
+                            *b = if u < 256 { u as u8 } else { b'?' };
+                        }
+                    }
+                    "QTCPEBC" | "QEBCDIC" => {
+                        for b in bytes.iter_mut() {
+                            *b = crate::tn5250::ebcdic::FROM_UNICODE[*b as usize];
+                        }
+                    }
+                    other => bail!("QDCXLATE: table {other} is not supported (QTCPASC, QTCPEBC)"),
+                }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Run a CL command in the calling job (QCMDEXC, CALL of a CL
+    /// program). Its messages go to the job log.
+    fn run_cl(&mut self, cmd: &str) -> Result<()> {
+        let ctx =
+            self.io.cl.clone().ok_or_else(|| {
+                anyhow!("CL command '{cmd}' cannot run here: the program has no job")
+            })?;
+        let mut job = crate::commands::Job {
+            client: self.io.client,
+            env: &ctx.env,
+            user: self.io.user.clone(),
+            curlib: ctx.curlib.clone(),
+            libl: ctx.user_libl.clone(),
+            display: self.io.display.clone(),
+            id: self.io.job.clone(),
+        };
+        let out = self.io.rt.block_on(job.run(cmd))?;
+        if let crate::commands::Outcome::Messages(msgs) = out {
+            for m in msgs {
+                self.job_log(&m);
+            }
+        }
+        Ok(())
+    }
+
+    /// A message to the job log; without a job (`as4tainr call`), to the
+    /// program's output.
+    fn job_log(&mut self, text: &str) {
+        match &self.io.job {
+            Some(id) => {
+                let client = self.io.client;
+                let id = id.clone();
+                self.io
+                    .rt
+                    .block_on(crate::jobs::log(client, &id, "INFO", text.trim_end()));
+            }
+            None => self.messages.push(text.trim_end().to_string()),
+        }
+    }
+
+    /// printf formatting: %s, %d, %i, %u, %%; the text ends at a null.
+    fn printf(&self, vals: &[Value]) -> Result<String> {
+        let show = |v: &Value| -> Result<String> {
+            Ok(match v {
+                Value::Num(d) => d.to_string(),
+                Value::Ind(b) => if *b { "1" } else { "0" }.into(),
+                Value::Fig(_) => String::new(),
+                Value::Char(c) => a(c),
+            })
+        };
+        let fmt = match vals.first() {
+            Some(v) => show(v)?,
+            None => return Ok(String::new()),
+        };
+        let fmt = fmt.split('\0').next().unwrap_or("").to_string();
+        let mut out = String::new();
+        let mut args = vals[1..].iter();
+        let mut cs = fmt.chars().peekable();
+        while let Some(c) = cs.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            // Flags, width and length modifiers are skipped.
+            let mut conv = None;
+            for d in cs.by_ref() {
+                if d.is_ascii_alphabetic() && !matches!(d, 'l' | 'h') || d == '%' {
+                    conv = Some(d);
+                    break;
+                }
+            }
+            match conv {
+                Some('%') => out.push('%'),
+                Some(_) => {
+                    if let Some(v) = args.next() {
+                        out.push_str(show(v)?.split('\0').next().unwrap_or(""));
+                    }
+                }
+                None => {}
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl Machine<'_> {
+    /// DSPLY with a response in an interactive job: a Display Program
+    /// Messages screen with the message and a reply field as long as the
+    /// response (at most 52 characters, ILE RPG Reference, DSPLY).
+    fn dsply_screen(
+        &mut self,
+        display: &crate::bridge::DisplayHandle,
+        text: &str,
+        response: &Expr,
+    ) -> Result<Value> {
+        let t = self
+            .type_of(response)
+            .ok_or_else(|| anyhow!("DSPLY: the response must be a variable"))?;
+        let numeric = t.is_numeric();
+        let len = if numeric {
+            t.precision().0 + 2
+        } else {
+            t.len()
+        }
+        .clamp(1, 52);
+        // DDS, columns placed as the DDS form has them.
+        let line = |parts: &[(usize, &str)]| -> String {
+            let mut l = vec![' '; 80];
+            l[5] = 'A';
+            for (pos, s) in parts {
+                for (k, c) in s.chars().enumerate() {
+                    if pos - 1 + k < 80 {
+                        l[pos - 1 + k] = c;
+                    }
+                }
+            }
+            l.into_iter().collect::<String>().trim_end().to_string()
+        };
+        let dds = [
+            line(&[(45, "DSPSIZ(24 80 *DS3)")]),
+            line(&[(17, "R"), (19, "DSPLYR")]),
+            line(&[(39, "  1"), (42, " 24"), (45, "'Display Program Messages'")]),
+            line(&[(45, "DSPATR(HI)")]),
+            line(&[
+                (19, "MSG"),
+                (30, "   76"),
+                (38, "O"),
+                (39, "  3"),
+                (42, "  4"),
+            ]),
+            line(&[(39, " 22"), (42, "  2"), (45, "'Type reply, press Enter.'")]),
+            line(&[(39, " 23"), (42, "  4"), (45, "'Reply . . .'")]),
+            line(&[
+                (19, "REPLY"),
+                (30, &format!("{len:>5}")),
+                (38, "B"),
+                (39, " 23"),
+                (42, " 17"),
+            ]),
+            line(&[(45, "DSPATR(UL)")]),
+            // The reply keeps lower case letters as typed.
+            line(&[(45, "CHECK(LC)")]),
+        ]
+        .join("\n");
+        let file = std::sync::Arc::new(crate::dspf::parse("QDSPLY", &dds)?);
+        let mut values = std::collections::BTreeMap::new();
+        values.insert("MSG".to_string(), text.to_string());
+        values.insert("REPLY".to_string(), String::new());
+        let mut ws = Workstation::new();
+        let frame = ws.frame(&file, "DSPLYR", values, [false; 100])?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let display = display.clone();
+        let resp = self.block(async move {
+            display
+                .send(crate::bridge::DisplayRequest { frame, reply: tx })
+                .await
+                .map_err(|_| anyhow!("the job's display is gone"))?;
+            rx.await
+                .map_err(|_| anyhow!("the job's display is gone"))?
+                .map_err(|e| anyhow!(e))
+        })?;
+        let reply = resp.values.get("REPLY").cloned().unwrap_or_default();
+        Ok(if numeric {
+            Value::Num(
+                Dec::parse(reply.trim())
+                    .map_err(|_| anyhow!("DSPLY: the reply '{}' is not a number", reply.trim()))?,
+            )
+        } else {
+            Value::str(&reply)
+        })
+    }
+}
+
 /// An argument of a procedure call.
 enum Arg {
     /// Passed by reference: the caller's storage.
@@ -2084,18 +2316,28 @@ impl<'a> Machine<'a> {
                         buf: v.buf,
                         off: self.elem_off(&v, index)?,
                         size: v.dtype.size(),
+                        dtype: v.dtype,
                     },
-                    None => Loc {
-                        buf: v.buf,
-                        off: v.off,
-                        size: v.stride * (v.dim.max(1) as usize - 1) + v.dtype.size(),
-                    },
+                    None => {
+                        let size = v.stride * (v.dim.max(1) as usize - 1) + v.dtype.size();
+                        Loc {
+                            buf: v.buf,
+                            off: v.off,
+                            size,
+                            dtype: if v.dim > 0 {
+                                DType::Char(size as u32)
+                            } else {
+                                v.dtype
+                            },
+                        }
+                    }
                 })
             }
             Some(Sym::Ds(d)) => Ok(Loc {
                 buf: d.buf,
                 off: d.off,
                 size: d.size * d.dim.max(1) as usize,
+                dtype: DType::Char((d.size * d.dim.max(1) as usize) as u32),
             }),
             _ => bail!("{name} is not a variable; it cannot be passed by reference"),
         }
@@ -2185,6 +2427,7 @@ impl<'a> Machine<'a> {
                             buf: self.bufs.len(),
                             off: 0,
                             size: buf.len(),
+                            dtype: p.dtype,
                         });
                         self.bufs.push(buf);
                     }
@@ -2201,6 +2444,16 @@ impl<'a> Machine<'a> {
             Some(pi) => {
                 let a = self.args_for(name, &pr.params, args)?;
                 self.call_proc(pi, a)
+            }
+            None if target == "QP0ZLPRINTF" => {
+                // Qp0zLprintf (C runtime): printf-style text to the job log.
+                let mut vals = Vec::new();
+                for a in args {
+                    vals.push(self.eval(a)?);
+                }
+                let text = self.printf(&vals)?;
+                self.job_log(&text);
+                Ok(Some(Value::Num(Dec::from_i64(text.len() as i64))))
             }
             None => bail!(
                 "procedure {target} is not in this program (service programs and binding directories come with milestone R6)"
@@ -2303,6 +2556,14 @@ impl<'a> Machine<'a> {
     /// passed by reference: the callee works on copies that come back
     /// when it returns.
     fn call_program(&mut self, name: &str, locs: &[Loc]) -> Result<()> {
+        if self.system_program(name, locs)? {
+            return Ok(());
+        }
+        // An RPG program that is active cannot be called again (ILE RPG
+        // Reference: a program is not recursive; only procedures are).
+        if name == self.prog.name || self.io.callers.iter().any(|c| c == name) {
+            bail!("Program {name} called recursively: it is already active in the job.");
+        }
         let client = self.io.client;
         let libl = self.io.libl.clone();
         let found = self.block(crate::catalog::find_program(client, &libl, name))?;
@@ -2317,6 +2578,24 @@ impl<'a> Machine<'a> {
                     crate::authority::Aut::Use,
                 ))?;
                 p.source
+            }
+            Some(p) if p.attribute == "CLLE" || p.attribute == "CLP" => {
+                // A CL program runs in the job; parameters go in as
+                // values (changes it makes do not come back yet).
+                let mut parms = Vec::new();
+                for l in locs {
+                    let bytes = &self.bufs[l.buf][l.off..l.off + l.size];
+                    parms.push(match data::load(&l.dtype, bytes)? {
+                        Value::Num(d) => d.to_string(),
+                        other => format!("'{}'", a(&other.chars()?).replace('\'', "''")),
+                    });
+                }
+                let parm = if parms.is_empty() {
+                    String::new()
+                } else {
+                    format!(" PARM({})", parms.join(" "))
+                };
+                return self.run_cl(&format!("CALL PGM({}/{}){parm}", p.library, p.name));
             }
             Some(p) => bail!(
                 "CALL {name}: {} programs cannot be called from RPG on the native engine yet",
@@ -2341,6 +2620,12 @@ impl<'a> Machine<'a> {
                     libl: libl.clone(),
                     job: self.io.job.clone(),
                     display: self.io.display.clone(),
+                    cl: self.io.cl.clone(),
+                    callers: {
+                        let mut c = self.io.callers.clone();
+                        c.push(self.prog.name.clone());
+                        c
+                    },
                 },
             );
             let r = m.run_bytes(&mut parms);

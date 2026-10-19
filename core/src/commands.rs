@@ -1693,6 +1693,11 @@ impl Job<'_> {
             self.user.clone(),
             self.id.as_ref().map(|i| i.to_string()),
             self.display.clone(),
+            Some(crate::rpg::ClContext {
+                env: self.env.clone(),
+                curlib: self.curlib.clone(),
+                user_libl: self.libl.clone(),
+            }),
             pgm.to_string(),
             source,
             args,

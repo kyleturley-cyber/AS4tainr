@@ -31,9 +31,20 @@ Character data is kept in EBCDIC, as on IBM i. Comparisons and sorting follow th
 
 - **CRTBNDRPG** parses and checks the program. Errors are reported with line numbers at create time, as IBM's compiler does, instead of at CALL. The checked program is kept with the object.
 - **CALL** of an RPG program object runs it in the job's own process. It uses the job's database connection, display and spooled files.
-- **The switch:** `AS4TAINR_RPG_ENGINE=native` uses the new engine, `jariko` the old one. The default moves to `native` once it passes everything Jariko passes: the samples, the demos, e2e, the Phase 3 gate, and the corpus. Jariko and the JVM are then removed.
+- **The switch:** the native engine is the default (since Oct 19, 2026, milestone R5). `AS4TAINR_RPG_ENGINE=jariko` still runs the old Jariko runner, for comparison, until Jariko and the JVM are removed.
 
 ## Status
+
+**R5: the native engine is the default (Oct 19, 2026).** It passes everything Jariko passed and more: the samples and demos, the 5250 end-to-end test (130 checks, two more than Jariko: DSPLY with a reply), the Phase 3 gate and the browser terminal test. CI runs them on the native engine, and the Jariko runner once more as a comparison.
+
+What R5 added so far, from running the corpus (Nick Litten's examples, `tools/corpus.sh`):
+- **DSPLY with a response** in an interactive job: a Display Program Messages screen with the message and a reply line; the reply goes into the response field (lower case kept). In batch the response stays as it was.
+- **System programs** RPG programs call: `QCMDEXC` (runs a CL command in the job), `QDCXLATE` (EBCDIC/ASCII translation with QTCPASC and QTCPEBC), and the C runtime's `Qp0zLprintf` (printf-style text to the job log).
+- **CALL of a CL program** from RPG, in the same job (parameters go in as values).
+- A program that calls itself is refused: RPG programs are not recursive (procedures are).
+- One-line empty interfaces (`dcl-pi *n int(10) end-pi;`).
+
+Corpus status: 22 of its programs (RPG and CL) are created. Most of the others need things outside RPG: embedded SQL (R6), SQL DDL for their files (`CREATE TABLE`), files or includes missing from the repository, or they are snippets that do not compile on IBM i either (fixed C specs inside `**FREE`, unbalanced parentheses). Still to do for R5: nested data structures (`LIKEDS` subfields), then removing Jariko and the JVM.
 
 **R4 is done (Oct 19, 2026).** Programs call each other and are built from procedures:
 - **Procedures** (`DCL-PROC`, P specs) with their own local storage on each call, `STATIC` locals, parameters by reference, `CONST` and `VALUE`, `LIKEDS` parameters, `OPTIONS(*NOPASS : *OMIT)`, `%PARMS`, return values in the declared type, recursion, subroutines inside procedures, `ON-EXIT`.

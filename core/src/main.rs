@@ -578,6 +578,15 @@ async fn run(cli: Cli) -> Result<u8> {
                     "QSECOFR".into(),
                     None,
                     None,
+                    Some(as4tainr_core::rpg::ClContext {
+                        env: commands::Environment {
+                            database_url: cli.database_url.clone(),
+                            runner: std::env::var("AS4TAINR_RUNNER").unwrap_or_default(),
+                            call_timeout: std::time::Duration::from_secs(60),
+                        },
+                        curlib: None,
+                        user_libl: cfg.library_list.clone(),
+                    }),
                     program.clone(),
                     source,
                     args,

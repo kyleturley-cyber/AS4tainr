@@ -2593,6 +2593,7 @@ async fn native_rpg_engine_runs_a_program() {
         "QSECOFR".into(),
         None,
         None,
+        None,
         "CONTCNT".into(),
         p.source,
         vec![],
@@ -2651,6 +2652,7 @@ async fn native_rpg_engine_runs_a_program() {
         "QSECOFR".into(),
         None,
         Some(tx),
+        None,
         "CONTLST".into(),
         p.source,
         vec![],
@@ -2675,6 +2677,7 @@ async fn native_rpg_engine_runs_a_program() {
         &url,
         vec![lib.clone()],
         "QSECOFR".into(),
+        None,
         None,
         None,
         "CYCLE".into(),
@@ -2728,6 +2731,7 @@ async fn native_rpg_engine_runs_a_program() {
             "QSECOFR".into(),
             None,
             None,
+            None,
             name.into(),
             source.into(),
             vec![],
@@ -2738,4 +2742,53 @@ async fn native_rpg_engine_runs_a_program() {
         let got: Vec<String> = r.messages.iter().map(|m| m.trim_end().to_string()).collect();
         assert_eq!(got, want, "{name}");
     }
+
+    // System programs and APIs called from RPG: QCMDEXC runs a CL command
+    // in the job (the second CRTLIB fails with CPF2111, which MONITOR
+    // catches); QDCXLATE with QTCPASC turns EBCDIC 'AB' (X'C1C2', CCSID 37)
+    // into ASCII X'4142' and QTCPEBC back; Qp0zLprintf formats %s and %d.
+    // Without a job, the printf line comes back with the program's output.
+    client
+        .batch_execute(
+            "DROP SCHEMA IF EXISTS \"RPGLIB1\" CASCADE; DELETE FROM as4tainr.objects WHERE library='RPGLIB1' OR name='RPGLIB1';",
+        )
+        .await
+        .unwrap();
+    let r = rpg::call(
+        &url,
+        vec![lib.clone(), "QGPL".into()],
+        "QSECOFR".into(),
+        None,
+        None,
+        Some(rpg::ClContext {
+            env: Environment {
+                database_url: url.clone(),
+                runner: "false".into(),
+                call_timeout: std::time::Duration::from_secs(5),
+            },
+            curlib: None,
+            user_libl: vec![lib.clone()],
+        }),
+        "SYSAPI".into(),
+        "**FREE\ndcl-pr qcmdexc extpgm('QCMDEXC');\n  cmd char(3000) const;\n  len packed(15:5) const;\nend-pr;\ndcl-pr xlate extpgm('QDCXLATE');\n  len packed(5:0) const;\n  data char(10);\n  table char(10) const;\nend-pr;\ndcl-pr printf int(10) extproc('Qp0zLprintf');\n  fmt pointer value options(*string);\n  a1 pointer value options(*string:*nopass);\n  a2 int(10) value options(*nopass);\nend-pr;\ndcl-s d char(2) inz('AB');\nqcmdexc('CRTLIB LIB(RPGLIB1)': 19);\nmonitor;\n  qcmdexc('CRTLIB LIB(RPGLIB1)': 19);\non-error;\n  dsply 'CRTLIB failed';\nendmon;\nxlate(2: d: 'QTCPASC');\nif d = x'4142';\n  dsply 'ascii';\nendif;\nxlate(2: d: 'QTCPEBC');\ndsply d;\nprintf('%s has %d items' + x'25': 'cart': 3);\n*inlr = *on;\n".into(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let got: Vec<String> = r
+        .messages
+        .iter()
+        .map(|m| m.trim_end().to_string())
+        .collect();
+    assert_eq!(
+        got,
+        [
+            "Library RPGLIB1 created.",
+            "CRTLIB failed",
+            "ascii",
+            "AB",
+            "cart has 3 items"
+        ]
+    );
 }

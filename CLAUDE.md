@@ -4,7 +4,7 @@ Guidance for AI coding sessions working in this repository.
 
 ## What as4tainr is
 
-An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (objects and libraries, DDS files, record-level access, 5250, CL, jobs) on Linux and PostgreSQL. RPG runs on Jariko (JVM) today and is moving to as4tainr's own RPG engine in Rust (`core/src/rpg/`, docs/rpg-engine.md; `AS4TAINR_RPG_ENGINE=native`). It is NOT a hardware emulator.
+An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (objects and libraries, DDS files, record-level access, 5250, CL, jobs) on Linux and PostgreSQL. RPG runs on as4tainr's own RPG engine in Rust (`core/src/rpg/`, docs/rpg-engine.md). The Jariko runner on the JVM (`jvm/`, the bridge) is still available with `AS4TAINR_RPG_ENGINE=jariko` and is being retired. It is NOT a hardware emulator.
 
 ## Non-negotiable rules
 

@@ -611,6 +611,15 @@ impl Job<'_> {
         }
         // CL: includes are part of the program; then it is checked.
         let source = if attribute == "RPGLE" {
+            // The native engine checks the program now, as the compiler
+            // does: syntax, names, types, files (docs/rpg-engine.md).
+            if crate::rpg::native_enabled() {
+                let mut libl = self.library_list();
+                if !libl.contains(&lib) {
+                    libl.insert(0, lib.clone());
+                }
+                crate::rpg::compile(self.client, &libl, &name, &m.source).await?;
+            }
             m.source.clone()
         } else {
             let src =
@@ -1592,6 +1601,9 @@ impl Job<'_> {
         args: Vec<String>,
     ) -> Result<Outcome> {
         let pgm = pgm.to_string();
+        if crate::rpg::native_enabled() && self.display.is_none() {
+            return self.call_native(&pgm, library, args).await;
+        }
         let listener = bridge::bind(0).await?;
         let addr = listener.local_addr()?;
         let server = tokio::spawn(bridge::serve(
@@ -1653,6 +1665,42 @@ impl Job<'_> {
                 .trim()
                 .to_string();
             msgs.push(reason);
+            msgs.push(format!("Program {pgm} ended abnormally."));
+            return Err(anyhow!(msgs.join("\n")));
+        }
+        Ok(Outcome::Messages(msgs))
+    }
+}
+
+impl Job<'_> {
+    /// Run an RPG program on the native engine (docs/rpg-engine.md).
+    async fn call_native(
+        &mut self,
+        pgm: &str,
+        library: Option<&str>,
+        args: Vec<String>,
+    ) -> Result<Outcome> {
+        let source = match library {
+            Some(lib) => catalog::find_program(self.client, &[lib.to_string()], pgm)
+                .await?
+                .map(|p| p.source),
+            None => crate::rpg::source_from_path(pgm),
+        }
+        .ok_or_else(|| anyhow!("CPF4101: Program {pgm} not found."))?;
+        let job_number = self.id.as_ref().map(|i| i.number);
+        let r = crate::rpg::call(
+            &self.env.database_url,
+            self.library_list(),
+            self.user.clone(),
+            job_number,
+            pgm.to_string(),
+            source,
+            args,
+        )
+        .await?;
+        let mut msgs: Vec<String> = r.messages.iter().map(|m| format!("DSPLY  {m}")).collect();
+        if let Some(e) = r.error {
+            msgs.push(format!("{e:#}"));
             msgs.push(format!("Program {pgm} ended abnormally."));
             return Err(anyhow!(msgs.join("\n")));
         }

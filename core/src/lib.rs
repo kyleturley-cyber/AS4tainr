@@ -29,6 +29,7 @@ pub mod import;
 pub mod jobs;
 pub mod menus;
 pub mod rla;
+pub mod rpg;
 pub mod source;
 pub mod spool;
 pub mod sql;

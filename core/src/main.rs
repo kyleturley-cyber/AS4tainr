@@ -180,6 +180,8 @@ fn split_lib_file(q: &str) -> Result<(String, String)> {
     }
 }
 
+fn server_abort_unused(_l: tokio::net::TcpListener) {}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     match run(Cli::parse()).await {
@@ -559,6 +561,37 @@ async fn run(cli: Cli) -> Result<u8> {
                     None => (String::new(), n),
                 }
             };
+            if ibmish_core::rpg::native_enabled() {
+                server_abort_unused(listener);
+                let client = bridge::connect_db(&cli.database_url).await?;
+                let source = if pgm_lib.is_empty() {
+                    ibmish_core::rpg::source_from_path(&program)
+                } else {
+                    catalog::find_program(&client, std::slice::from_ref(&pgm_lib), &program)
+                        .await?
+                        .map(|p| p.source)
+                }
+                .ok_or_else(|| anyhow::anyhow!("CPF4101: Program {program} not found."))?;
+                let r = ibmish_core::rpg::call(
+                    &cli.database_url,
+                    cfg.library_list.clone(),
+                    "QSECOFR".into(),
+                    None,
+                    program.clone(),
+                    source,
+                    args,
+                )
+                .await?;
+                for m in &r.messages {
+                    println!("{m}");
+                }
+                if let Some(e) = r.error {
+                    eprintln!("ibmish: {e:#}");
+                    eprintln!("ibmish: program {program} ended abnormally");
+                    return Ok(1);
+                }
+                return Ok(0);
+            }
             let server = tokio::spawn(bridge::serve(listener, cfg));
 
             let mut parts = runner.split_whitespace();

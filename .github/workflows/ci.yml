@@ -43,6 +43,14 @@ jobs:
         run: |
           scripts/demo.sh
           target/debug/ibmish call SELFTEST
+      - name: End-to-end on the native RPG engine (docs/rpg-engine.md)
+        env:
+          IBMISH_BIN: target/debug/ibmish
+          IBMISH_RPG_ENGINE: native
+          PGPASSWORD: ibmish
+        run: |
+          createdb -h 127.0.0.1 -U ibmish ibmish_native
+          IBMISH_DATABASE_URL=postgres://ibmish:ibmish@127.0.0.1/ibmish_native scripts/demo.sh
 
   jariko:
     name: Jariko runner end to end

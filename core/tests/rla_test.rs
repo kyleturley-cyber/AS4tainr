@@ -2555,3 +2555,65 @@ async fn import_an_application() {
         .unwrap();
     assert_eq!(rows[0].get::<_, i64>(0), 5);
 }
+
+/// The native RPG engine runs an imported program in its own session:
+/// READ until end of file (EOF indicator in positions 75-76), CHAIN found
+/// and not found (positions 71-72), a /INCLUDE stream file, DSPLY. The
+/// expected output follows from the sample's data (5 contacts; numbers
+/// 2 and 4 exist, 9 does not) and the ILE RPG reference semantics.
+#[tokio::test(flavor = "multi_thread")]
+async fn native_rpg_engine_runs_a_program() {
+    use ibmish_core::commands::{Environment, Job};
+    use ibmish_core::{import, rpg};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+        runner: "false".into(),
+        call_timeout: std::time::Duration::from_secs(5),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: None,
+        libl: vec![],
+        display: None,
+        id: None,
+    };
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../samples/apps/contacts");
+    import::import(&mut job, &dir, &lib).await.unwrap();
+    let p = catalog::find_program(&client, std::slice::from_ref(&lib), "CONTCNT")
+        .await
+        .unwrap()
+        .unwrap();
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        "CONTCNT".into(),
+        p.source,
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let trimmed: Vec<String> = r
+        .messages
+        .iter()
+        .map(|m| m.trim_end().to_string())
+        .collect();
+    assert_eq!(trimmed, ["5", "Grace Hopper", "Barbara Liskov", "2", "1"]);
+    // A compile error is reported with its line, before anything runs.
+    let e = rpg::compile(
+        &client,
+        std::slice::from_ref(&lib),
+        "BAD",
+        "**FREE\nif x = 1;\n",
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(e.to_string().contains("IF has no end"), "{e:#}");
+}

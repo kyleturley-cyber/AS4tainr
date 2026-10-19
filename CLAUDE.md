@@ -4,7 +4,7 @@ Guidance for AI coding sessions working in this repository.
 
 ## What ibmish is
 
-An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (objects and libraries, DDS files, record-level access, 5250, CL, jobs) on Linux and PostgreSQL. RPG runs on Jariko (JVM). It is NOT a hardware emulator.
+An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (objects and libraries, DDS files, record-level access, 5250, CL, jobs) on Linux and PostgreSQL. RPG runs on Jariko (JVM) today and is moving to ibmish's own RPG engine in Rust (`core/src/rpg/`, docs/rpg-engine.md; `IBMISH_RPG_ENGINE=native`). It is NOT a hardware emulator.
 
 ## Non-negotiable rules
 
@@ -35,6 +35,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/spool.rs` | Spooled files (`ibmish.spooled_files`, `ibmish.spool_lines`): printer output, QSYSPRT listings of batch display commands, QPJOBLOG |
 | `core/src/source.rs` | Source physical files (`PF-SRC` objects) and members (`ibmish.source_members`), stream files for includes (`ibmish.stream_files`), CL `INCLUDE` expansion |
 | `core/src/import.rs` | `ibmish import DIR --lib LIB`: members (folders like QRPGLESRC/, TOBi names) and CSV data into a library, then CRTPF/CRTLF/CRTDSPF/CRTBNDCL/CRTBNDRPG. See `docs/import.md` |
+| `core/src/rpg/` | The native RPG engine (docs/rpg-engine.md): `dec.rs` exact decimals, `data.rs` storage formats (EBCDIC, zoned, packed, binary), `expr.rs`, `parse.rs` (fixed, mixed, **FREE, directives), `program.rs` (names, layout, external files), `code.rs` (blocks → jumps), `interp.rs` (cycle, opcodes, BIFs, file I/O on `rla` in its own session), `mod.rs` (compile, call) |
 | `core/src/menus.rs` | Menus: the system menus (MAIN...) as data, GO/CRTMNU TYPE(*PGM)/DLTMNU; the session shows them (`tn5250/session.rs`: initial program, initial menu, menu stack) |
 | `core/src/authority.rs` | Object owners, *PUBLIC and private authorities; `check` before every object use (CPF9802) |
 | `core/src/users.rs` | User profiles, Argon2id password hashes |

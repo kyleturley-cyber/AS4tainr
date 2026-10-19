@@ -55,12 +55,13 @@ run OWING L
 run CUSTRPT L
 # A printed report (O specs, EXCEPT). The conformance runner replays file
 # operations only; the page layout is the Jariko runner's.
-if [[ "${IBMISH_RUNNER:-}" != *BridgeConformance* ]]; then
+# The native RPG engine prints from milestone R3 on (docs/rpg-engine.md).
+if [[ "${IBMISH_RUNNER:-}" != *BridgeConformance* && "${IBMISH_RPG_ENGINE:-}" != native ]]; then
   run CUSTPRT
 fi
 # An imported application (samples/apps/contacts, in library CONTACTS):
 # RPG program objects (CRTBNDRPG) and a /INCLUDE stream file. Real RPG only.
-if [[ "${IBMISH_RUNNER:-}" != *BridgeConformance* ]]; then
+if [[ "${IBMISH_RUNNER:-}" != *BridgeConformance* || "${IBMISH_RPG_ENGINE:-}" == native ]]; then
   echo "--- CALL CONTACTS/CONTCNT"
   out=$(IBMISH_LIBL=CONTACTS,QGPL "$bin" call CONTACTS/CONTCNT | grep -v '^Picked up JAVA_TOOL_OPTIONS' || true)
   echo "$out"

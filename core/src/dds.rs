@@ -126,6 +126,10 @@ pub struct FieldDef {
     /// Explicit default (DDS DFT, SQL DEFAULT); None means the type's.
     #[serde(default)]
     pub default: Option<FieldDefault>,
+    /// The alternative (SQL) name: an SQL column name longer than a
+    /// system name, or DDS ALIAS. `name` is the system name.
+    #[serde(default)]
+    pub alias: Option<String>,
 }
 
 impl FieldDef {
@@ -140,7 +144,23 @@ impl FieldDef {
             varlen: false,
             null_capable: false,
             default: None,
+            alias: None,
         }
+    }
+
+    /// The PostgreSQL column holding this field: the SQL name when it has
+    /// one (so SQL statements use it), else the system name; quoted.
+    pub fn column(&self) -> String {
+        crate::catalog::ident(self.alias.as_deref().unwrap_or(&self.name))
+    }
+
+    /// Is this the field's system name or its alternative name?
+    pub fn is_named(&self, n: &str) -> bool {
+        self.name.eq_ignore_ascii_case(n)
+            || self
+                .alias
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(n))
     }
 
     /// PostgreSQL column type used to store this field.
@@ -747,6 +767,17 @@ pub fn parse_pf(file_name: &str, source: &str) -> Result<PhysicalFile> {
                 f.text = keyword_arg(keywords, "TEXT").unwrap_or_default();
                 f.varlen = varlen;
                 f.null_capable = has_keyword(keywords, "ALWNULL");
+                // ALIAS(name): the field's alternative name (what SQL uses).
+                if let Some(a) = keyword_arg(keywords, "ALIAS") {
+                    let a = a.trim().to_ascii_uppercase();
+                    if a.is_empty()
+                        || a.len() > 30
+                        || !a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        bail!("line {lineno}: ALIAS({a}) is not a valid alternative name");
+                    }
+                    f.alias = Some(a);
+                }
                 if let Some(a) = keyword_args(keywords, "DFT") {
                     let [v] = a.as_slice() else {
                         bail!("line {lineno}: DFT needs one value");

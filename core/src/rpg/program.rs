@@ -768,9 +768,16 @@ impl Binder<'_> {
                 .externals
                 .get(&f)
                 .ok_or_else(|| anyhow!("EXTNAME({f}): file not found"))?;
+            // ALIAS: the subfields have the fields' alternative (SQL)
+            // names where they have one (ILE RPG Reference, ALIAS).
+            let alias = keyword(&d.keywords, "ALIAS").is_some();
             for fd in &fr.file.fields {
                 let t = program_type(fd, true);
-                subs.push((fd.name.clone(), t, next, 0, d));
+                let n = match (&fd.alias, alias) {
+                    (Some(a), true) => a.clone(),
+                    _ => fd.name.clone(),
+                };
+                subs.push((n, t, next, 0, d));
                 next += t.size();
             }
         }
@@ -1111,10 +1118,18 @@ pub fn bind(
             let prefix = keyword(&f.keywords, "PREFIX")
                 .and_then(|k| k.args.first())
                 .map(|p| p.trim().to_ascii_uppercase());
+            // ALIAS: the program uses the fields' alternative (SQL) names
+            // where they have one (ILE RPG Reference, ALIAS keyword for
+            // files).
+            let alias = keyword(&f.keywords, "ALIAS").is_some();
             for fd in &fr.file.fields {
+                let base = match (&fd.alias, alias) {
+                    (Some(a), true) => a.clone(),
+                    _ => fd.name.clone(),
+                };
                 let pname = match &prefix {
-                    Some(p) => format!("{p}{}", fd.name),
-                    None => fd.name.clone(),
+                    Some(p) => format!("{p}{base}"),
+                    None => base,
                 };
                 b.file_fields
                     .entry(pname.clone())

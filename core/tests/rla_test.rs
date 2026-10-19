@@ -2942,3 +2942,140 @@ async fn sql_tables_indexes_and_runsqlstm() {
             .unwrap()
     );
 }
+
+/// SQL names longer than system names (Db2 for i SQL Reference, rules for
+/// system names): a table or index named COUNTRY_LIST gets the system name
+/// COUNT00001 (first five characters and a five-digit number; the next
+/// object with that prefix gets COUNT00002); a column COUNTRY_CODE gets
+/// COUNT00001 within the table, unless FOR COLUMN names it; FOR SYSTEM
+/// NAME names the table. SQL statements use the SQL names (and the table's
+/// system name); CL commands and RPG use the system names, and RPG uses
+/// the SQL column names with the ALIAS keyword (ILE RPG Reference, ALIAS).
+#[tokio::test]
+async fn sql_long_names() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+    };
+    let lines = job
+        .run_sql_script(
+            "CREATE TABLE COUNTRY_LIST (
+               COUNTRY_CODE CHAR(2) NOT NULL PRIMARY KEY,
+               COUNTRY_NAME VARCHAR(40) NOT NULL WITH DEFAULT,
+               POPULATION_COUNT FOR COLUMN POP BIGINT NOT NULL DEFAULT 0);
+             CREATE TABLE ORDER_HISTORY FOR SYSTEM NAME ORDHIST (ORDER_NUMBER INT NOT NULL);
+             CREATE INDEX COUNTRY_BY_NAME ON COUNTRY_LIST (COUNTRY_NAME DESC);
+             LABEL ON COLUMN COUNTRY_LIST.COUNTRY_NAME TEXT IS 'Name of the country';
+             INSERT INTO COUNTRY_LIST (COUNTRY_CODE, COUNTRY_NAME, POPULATION_COUNT) VALUES ('NL', 'Netherlands', 17900000);
+             INSERT INTO COUNTRY_LIST VALUES ('IS', 'Iceland', 390000);",
+            "test",
+            10,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        lines.last().unwrap(),
+        "6 statements run from test; 0 with errors."
+    );
+    for (sys, exists) in [
+        ("COUNT00001", true),
+        ("COUNT00002", true),
+        ("ORDHIST", true),
+        ("ORDER_HIST", false),
+    ] {
+        assert_eq!(
+            catalog::object_exists(&client, std::slice::from_ref(&lib), sys, "*FILE")
+                .await
+                .unwrap(),
+            exists,
+            "{sys}"
+        );
+    }
+    let f = catalog::resolve_file(&client, std::slice::from_ref(&lib), "COUNT00001")
+        .await
+        .unwrap();
+    let cols: Vec<(String, Option<String>)> = f
+        .file
+        .fields
+        .iter()
+        .map(|x| (x.name.clone(), x.alias.clone()))
+        .collect();
+    assert_eq!(
+        cols,
+        vec![
+            ("COUNT00001".into(), Some("COUNTRY_CODE".into())),
+            ("COUNT00002".into(), Some("COUNTRY_NAME".into())),
+            ("POP".into(), Some("POPULATION_COUNT".into())),
+        ]
+    );
+    assert_eq!(f.file.format, "COUNT00001");
+    assert_eq!(f.file.fields[1].text, "Name of the country");
+
+    // SQL by either table name.
+    for t in ["COUNTRY_LIST", "COUNT00001"] {
+        let rows = match as4tainr_core::sql::run(
+            &client,
+            &url,
+            std::slice::from_ref(&lib),
+            &format!("SELECT COUNTRY_CODE, POPULATION_COUNT FROM {t} ORDER BY COUNTRY_CODE"),
+        )
+        .await
+        .unwrap()
+        {
+            as4tainr_core::sql::Outcome::Rows { rows, .. } => rows,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            rows,
+            vec![vec!["IS", "390000"], vec!["NL", "17900000"]],
+            "{t}"
+        );
+    }
+
+    // RPG through the index: system names, or SQL names with ALIAS.
+    let run = |name: &str, src: String| {
+        rpg::call(
+            &url,
+            vec![lib.clone()],
+            "QSECOFR".into(),
+            None,
+            None,
+            None,
+            name.into(),
+            src,
+            vec![],
+        )
+    };
+    let r = run("LONGA", "**FREE\ndcl-f count00002 keyed alias;\nread count00002;\ndow not %eof(count00002);\n  dsply (country_code + ' ' + %trim(country_name) + ' ' + %char(population_count));\n  read count00002;\nenddo;\n*inlr = *on;\n".into()).await.unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["NL Netherlands 17900000", "IS Iceland 390000"]);
+    let r = run("LONGS", "**FREE\ndcl-f count00002 keyed;\nread count00002;\ndsply (count00001 + ' ' + %trim(count00002) + ' ' + %char(pop));\n*inlr = *on;\n".into()).await.unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["NL Netherlands 17900000"]);
+
+    // DROP by the SQL name takes the index too.
+    job.run_sql_script("DROP TABLE COUNTRY_LIST;", "drop", 10, None, true)
+        .await
+        .unwrap();
+    for sys in ["COUNT00001", "COUNT00002"] {
+        assert!(
+            !catalog::object_exists(&client, std::slice::from_ref(&lib), sys, "*FILE")
+                .await
+                .unwrap()
+        );
+    }
+}

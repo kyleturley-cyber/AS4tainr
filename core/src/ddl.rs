@@ -46,6 +46,8 @@ impl std::fmt::Display for Name {
 pub enum Ddl {
     CreateTable {
         name: Name,
+        /// FOR SYSTEM NAME
+        system: Option<String>,
         replace: bool,
         file: PhysicalFile,
         /// PRIMARY KEY and UNIQUE constraints: (constraint name, columns).
@@ -55,6 +57,8 @@ pub enum Ddl {
     },
     CreateIndex {
         name: Name,
+        /// FOR SYSTEM NAME
+        system: Option<String>,
         table: Name,
         unique: bool,
         /// (column, descending)
@@ -193,6 +197,36 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
     Ok(Some(ddl))
 }
 
+/// An SQL name (Db2 for i: up to 128 characters). Names with lower case
+/// letters or special characters (quoted names) are not supported yet.
+fn sql_name(kind: &str, n: &str) -> Result<String> {
+    let ok = !n.is_empty()
+        && n.len() <= 128
+        && n.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase() || "$#@".contains(c))
+        && n.chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || "_$#@".contains(c));
+    if !ok {
+        bail!("SQL0084: {kind} name \"{n}\": names with lower case letters or special characters are not supported yet.");
+    }
+    Ok(n.to_string())
+}
+
+/// A generated system name (Db2 for i, rules for system names of SQL
+/// objects and columns): the first five characters of the SQL name and a
+/// five-digit number that makes it unique, e.g. CUSTO00001.
+pub fn generated_name(sql: &str, taken: &dyn Fn(&str) -> bool) -> Result<String> {
+    let prefix: String = sql.chars().take(5).collect();
+    for n in 1..=99999u32 {
+        let cand = format!("{prefix}{n:05}");
+        if !taken(&cand) {
+            return Ok(cand);
+        }
+    }
+    bail!("SQL0084: no system name is left for {sql}.")
+}
+
 fn sql0104(e: anyhow::Error) -> anyhow::Error {
     anyhow!("SQL0104: {e}.")
 }
@@ -284,15 +318,20 @@ impl P {
         }
     }
 
-    /// A field name (system names: 10 characters at most).
+    /// A column name as written: an SQL name (up to 128 characters).
     fn field(&mut self) -> Result<String> {
         let n = self.ident()?;
-        validate_name("column", &n).map_err(|_| {
-            anyhow!("SQL0084: column name {n}: names longer than 10 characters or with special characters are not supported yet.")
-        })
+        sql_name("column", &n)
     }
 
-    /// `name`, `lib.name` or `lib/name`.
+    /// A system name (10 characters at most): FOR COLUMN, FOR SYSTEM
+    /// NAME, RCDFMT.
+    fn system_name(&mut self, kind: &str) -> Result<String> {
+        let n = self.ident()?;
+        validate_name(kind, &n).map_err(sql0104)
+    }
+
+    /// `name`, `lib.name` or `lib/name`; the name can be an SQL name.
     fn name(&mut self) -> Result<Name> {
         let first = self.ident()?;
         let (lib, name) = if self.punct(".") || self.punct("/") {
@@ -300,14 +339,15 @@ impl P {
         } else {
             (None, first)
         };
-        let check = |kind: &str, n: &str| {
-            validate_name(kind, n).map_err(|_| {
-                anyhow!("SQL0084: {kind} name {n}: names longer than 10 characters or with special characters are not supported yet.")
-            })
-        };
         Ok(Name {
-            lib: lib.map(|l| check("schema", &l)).transpose()?,
-            name: check("object", &name)?,
+            lib: lib
+                .map(|l| {
+                    validate_name("schema", &l).map_err(|_| {
+                        anyhow!("SQL0084: schema name {l}: schema names longer than 10 characters are not supported yet.")
+                    })
+                })
+                .transpose()?,
+            name: sql_name("object", &name)?,
         })
     }
 
@@ -503,8 +543,23 @@ fn default_value(p: &mut P, f: &FieldDef) -> Result<FieldDefault> {
 fn check_sql(toks: &[Tok], fields: &[FieldDef]) -> Result<String> {
     const WORDS: &[&str] = &["AND", "OR", "NOT", "IN", "BETWEEN", "IS", "NULL", "LIKE"];
     const PUNCT: &[&str] = &["(", ")", ",", "=", "<", ">", "-", "+"];
+    // Scalar functions a condition may use: Db2 name -> PostgreSQL name.
+    const FUNCTIONS: &[(&str, &str)] = &[
+        ("LENGTH", "length"),
+        ("TRIM", "btrim"),
+        ("LTRIM", "ltrim"),
+        ("RTRIM", "rtrim"),
+        ("UPPER", "upper"),
+        ("UCASE", "upper"),
+        ("LOWER", "lower"),
+        ("LCASE", "lower"),
+        ("SUBSTR", "substr"),
+        ("ABS", "abs"),
+        ("MOD", "mod"),
+        ("COALESCE", "coalesce"),
+    ];
     let mut out = Vec::new();
-    for t in toks {
+    for (k, t) in toks.iter().enumerate() {
         let piece = match t {
             Tok::Word(w) | Tok::Quoted(w) => {
                 let up = if matches!(t, Tok::Word(_)) {
@@ -512,12 +567,18 @@ fn check_sql(toks: &[Tok], fields: &[FieldDef]) -> Result<String> {
                 } else {
                     w.clone()
                 };
-                if matches!(t, Tok::Word(_)) && WORDS.contains(&up.as_str()) {
+                let call = matches!(toks.get(k + 1), Some(Tok::Punct(p)) if p == "(");
+                if let (true, Some((_, pg))) = (
+                    call && matches!(t, Tok::Word(_)),
+                    FUNCTIONS.iter().find(|(d, _)| *d == up),
+                ) {
+                    pg.to_string()
+                } else if matches!(t, Tok::Word(_)) && WORDS.contains(&up.as_str()) {
                     up
-                } else if fields.iter().any(|f| f.name == up) {
-                    ident(&up)
+                } else if let Some(f) = fields.iter().find(|f| f.is_named(&up)) {
+                    f.column()
                 } else {
-                    bail!("SQL0084: CHECK ({}): only comparisons of the table's columns with constants are supported yet.", toks.iter().map(show).collect::<Vec<_>>().join(" "));
+                    bail!("SQL0084: CHECK ({}): only the table's columns, constants, comparisons and a few scalar functions are supported yet.", toks.iter().map(show).collect::<Vec<_>>().join(" "));
                 }
             }
             Tok::Str(s) => quote(s),
@@ -548,6 +609,13 @@ fn check_sql(toks: &[Tok], fields: &[FieldDef]) -> Result<String> {
 
 fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
     let name = p.name()?;
+    let system = if p.eat("FOR") {
+        p.expect("SYSTEM")?;
+        p.expect("NAME")?;
+        Some(p.system_name("table")?)
+    } else {
+        None
+    };
     p.expect_punct("(")?;
     let mut fields: Vec<FieldDef> = Vec::new();
     let mut uniques: Vec<(String, Vec<String>)> = Vec::new();
@@ -600,11 +668,32 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
             }
             _ => {
                 let fname = p.field()?;
-                if fields.iter().any(|f| f.name == fname) {
+                if fields.iter().any(|f| f.is_named(&fname)) {
                     bail!("SQL0612: {fname} is a duplicate column name.");
                 }
+                // The system column name: FOR COLUMN, the name itself when
+                // it is a valid system name, or a generated one.
+                let given = if p.eat("FOR") {
+                    p.expect("COLUMN")?;
+                    Some(p.system_name("column")?)
+                } else {
+                    None
+                };
+                let sys = match given {
+                    Some(g) => g,
+                    None if validate_name("column", &fname).is_ok() => fname.clone(),
+                    None => generated_name(&fname, &|c| {
+                        fields.iter().any(|f: &FieldDef| f.is_named(c))
+                    })?,
+                };
+                if fields.iter().any(|f| f.is_named(&sys)) {
+                    bail!("SQL0612: {sys} is a duplicate column name.");
+                }
                 let (t, len, dec, varlen) = data_type(p)?;
-                let mut f = FieldDef::new(&fname, t, len, dec);
+                let mut f = FieldDef::new(&sys, t, len, dec);
+                if sys != fname {
+                    f.alias = Some(fname.clone());
+                }
                 f.varlen = varlen;
                 f.null_capable = true;
                 // Column options, in any order.
@@ -624,10 +713,10 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
                         f.default = Some(default_value(p, &f)?);
                     } else if p.eat("PRIMARY") {
                         p.expect("KEY")?;
-                        not_null.push(fname.clone());
-                        uniques.push(("PK".into(), vec![fname.clone()]));
+                        not_null.push(sys.clone());
+                        uniques.push(("PK".into(), vec![sys.clone()]));
                     } else if p.eat("UNIQUE") {
-                        uniques.push((format!("U{}", uniques.len() + 1), vec![fname.clone()]));
+                        uniques.push((format!("U{}", uniques.len() + 1), vec![sys.clone()]));
                     } else if p.eat("CHECK") {
                         p.expect_punct("(")?;
                         checks.push((None, p.group()?));
@@ -661,6 +750,29 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
     if fields.is_empty() {
         bail!("SQL0104: a table needs at least one column.");
     }
+    // Constraint columns by system name (they may be written either way).
+    let system_of = |c: &str| {
+        fields
+            .iter()
+            .find(|f| f.is_named(c))
+            .map(|f| f.name.clone())
+    };
+    let mut not_null: Vec<String> = not_null
+        .iter()
+        .map(|c| system_of(c).unwrap_or_else(|| c.clone()))
+        .collect();
+    not_null.dedup();
+    let uniques: Vec<(String, Vec<String>)> = uniques
+        .into_iter()
+        .map(|(n, cols)| {
+            (
+                n,
+                cols.iter()
+                    .map(|c| system_of(c).unwrap_or_else(|| c.clone()))
+                    .collect(),
+            )
+        })
+        .collect();
     // A primary key's columns are NOT NULL (an SQL table has no null keys).
     for c in &not_null {
         let Some(f) = fields.iter_mut().find(|f| &f.name == c) else {
@@ -684,10 +796,12 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
             name.name
         );
     }
-    let mut format = name.name.clone();
+    // The record format: RCDFMT, else the system table name (set when the
+    // table is created, if it is generated).
+    let mut format = String::new();
     loop {
         if p.eat("RCDFMT") {
-            format = p.field()?;
+            format = p.system_name("record format")?;
         } else if p.eat("ON") {
             p.expect("REPLACE")?;
             if p.eat("PRESERVE") {
@@ -713,6 +827,7 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Ddl::CreateTable {
+        system,
         file: PhysicalFile {
             name: name.name.clone(),
             format,
@@ -731,6 +846,13 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
 
 fn create_index(p: &mut P, unique: bool) -> Result<Ddl> {
     let name = p.name()?;
+    let system = if p.eat("FOR") {
+        p.expect("SYSTEM")?;
+        p.expect("NAME")?;
+        Some(p.system_name("index")?)
+    } else {
+        None
+    };
     p.expect("ON")?;
     let table = p.name()?;
     p.expect_punct("(")?;
@@ -751,7 +873,7 @@ fn create_index(p: &mut P, unique: bool) -> Result<Ddl> {
     p.expect_punct(")")?;
     let mut format = None;
     if p.eat("RCDFMT") {
-        format = Some(p.field()?);
+        format = Some(p.system_name("record format")?);
         if p.eat("ADD") {
             bail!("SQL0084: RCDFMT ... ADD is not supported yet.");
         }
@@ -761,6 +883,7 @@ fn create_index(p: &mut P, unique: bool) -> Result<Ddl> {
     }
     Ok(Ddl::CreateIndex {
         name,
+        system,
         table,
         unique,
         keys,
@@ -828,7 +951,7 @@ fn label(p: &mut P) -> Result<Ddl> {
                 bail!("SQL0104: LABEL ON COLUMN needs table.column.");
             }
             let col = parts.pop().unwrap_or_default();
-            let col = validate_name("column", &col).map_err(sql0104)?;
+            let col = sql_name("column", &col)?;
             let table = name_of(&parts)?;
             let is_text = p.eat("TEXT");
             p.expect("IS")?;
@@ -859,15 +982,14 @@ fn label(p: &mut P) -> Result<Ddl> {
 }
 
 fn name_of(parts: &[String]) -> Result<Name> {
-    let v = |k: &str, n: &str| validate_name(k, n).map_err(sql0104);
     match parts {
         [n] => Ok(Name {
             lib: None,
-            name: v("table", n)?,
+            name: sql_name("table", n)?,
         }),
         [l, n] => Ok(Name {
-            lib: Some(v("schema", l)?),
-            name: v("table", n)?,
+            lib: Some(validate_name("schema", l).map_err(sql0104)?),
+            name: sql_name("table", n)?,
         }),
         _ => bail!("SQL0104: {} is not a table name.", parts.join(".")),
     }
@@ -904,21 +1026,50 @@ impl Ctx<'_> {
         }
     }
 
-    /// (library, attribute) of an existing file.
-    async fn find(&self, n: &Name) -> Result<Option<(String, String)>> {
+    /// (library, attribute, system name) of an existing file, found by
+    /// its system name or its SQL name.
+    async fn find(&self, n: &Name) -> Result<Option<(String, String, String)>> {
         for lib in self.search(n) {
             if let Some(r) = self
                 .client
                 .query_opt(
-                    "SELECT attribute FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+                    "SELECT o.attribute, o.name FROM as4tainr.objects o
+                       LEFT JOIN as4tainr.files f ON f.library=o.library AND f.name=o.name
+                     WHERE o.library=$1 AND o.objtype='*FILE' AND (o.name=$2 OR f.sql_name=$2)
+                     ORDER BY o.name=$2 DESC LIMIT 1",
                     &[&lib, &n.name],
                 )
                 .await?
             {
-                return Ok(Some((lib, r.get(0))));
+                return Ok(Some((lib, r.get(0), r.get(1))));
             }
         }
         Ok(None)
+    }
+
+    /// The system name of a new object: FOR SYSTEM NAME, the name itself
+    /// when it is a valid system name, or a generated one.
+    async fn new_system_name(&self, lib: &str, n: &Name, given: &Option<String>) -> Result<String> {
+        if let Some(g) = given {
+            return Ok(g.clone());
+        }
+        if validate_name("file", &n.name).is_ok() {
+            return Ok(n.name.clone());
+        }
+        let taken: Vec<String> = self
+            .client
+            .query(
+                "SELECT name FROM as4tainr.objects WHERE library=$1 AND name LIKE $2",
+                &[
+                    &lib,
+                    &format!("{}%", n.name.chars().take(5).collect::<String>()),
+                ],
+            )
+            .await?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        generated_name(&n.name, &|c| taken.iter().any(|t| t == c))
     }
 
     async fn may_delete(&self, lib: &str, name: &str) -> Result<()> {
@@ -950,6 +1101,7 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
         Ddl::Comment => Ok("Comment accepted (not kept).".into()),
         Ddl::CreateTable {
             name,
+            system,
             replace,
             file,
             uniques,
@@ -959,52 +1111,83 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
             if !catalog::library_exists(ctx.client, &lib).await? {
                 bail!("SQL0204: Schema {lib} not found.");
             }
-            let existing = Name {
+            let here = Name {
                 lib: Some(lib.clone()),
                 name: name.name.clone(),
             };
-            if let Some((_, attr)) = ctx.find(&existing).await? {
+            if let Some((_, attr, sys)) = ctx.find(&here).await? {
                 if !replace || attr != "PF" {
                     bail!("SQL0601: {} in {lib} type *FILE already exists.", name.name);
                 }
-                ctx.may_delete(&lib, &name.name).await?;
-                catalog::delete_file(ctx.client, &lib, &name.name, true).await?;
+                ctx.may_delete(&lib, &sys).await?;
+                catalog::delete_file(ctx.client, &lib, &sys, true).await?;
             }
-            catalog::create_physical_file(ctx.client, &lib, file).await?;
-            if let Err(e) = constraints(ctx.client, &lib, &name.name, uniques, checks).await {
-                let _ = catalog::delete_file(ctx.client, &lib, &name.name, true).await;
+            let sys = ctx.new_system_name(&lib, name, system).await?;
+            let mut file = file.clone();
+            file.name = sys.clone();
+            if file.format.is_empty() {
+                file.format = sys.clone();
+            }
+            catalog::create_physical_file(ctx.client, &lib, &file).await?;
+            let mut done = constraints(ctx.client, &lib, &sys, uniques, checks).await;
+            if done.is_ok() && sys != name.name {
+                done = catalog::set_sql_name(ctx.client, &lib, &sys, &name.name, true).await;
+            }
+            if let Err(e) = done {
+                let _ = catalog::delete_file(ctx.client, &lib, &sys, true).await;
                 return Err(e);
             }
-            authority::set_owner(ctx.client, &lib, &name.name, "*FILE", ctx.user).await?;
-            Ok(format!("Table {} created in {lib}.", name.name))
+            authority::set_owner(ctx.client, &lib, &sys, "*FILE", ctx.user).await?;
+            Ok(if sys == name.name {
+                format!("Table {sys} created in {lib}.")
+            } else {
+                format!("Table {} created in {lib} (system name {sys}).", name.name)
+            })
         }
         Ddl::CreateIndex {
             name,
+            system,
             table,
             unique,
             keys,
             format,
         } => {
-            let Some((tlib, attr)) = ctx.find(table).await? else {
+            let Some((tlib, attr, tsys)) = ctx.find(table).await? else {
                 return Err(not_found(table, "table"));
             };
             if attr != "PF" {
                 bail!("SQL0156: {} is not a table.", table.name);
             }
-            authority::check(ctx.client, ctx.user, &tlib, &table.name, "*FILE", Aut::Use).await?;
+            authority::check(ctx.client, ctx.user, &tlib, &tsys, "*FILE", Aut::Use).await?;
             let lib = ctx.target(name);
-            let tfile =
-                catalog::resolve_file(ctx.client, std::slice::from_ref(&tlib), &table.name).await?;
-            let lf = LogicalFile {
+            let here = Name {
+                lib: Some(lib.clone()),
                 name: name.name.clone(),
+            };
+            if ctx.find(&here).await?.is_some() {
+                bail!("SQL0601: {} in {lib} type *FILE already exists.", name.name);
+            }
+            let sys = ctx.new_system_name(&lib, name, system).await?;
+            let tfile =
+                catalog::resolve_file(ctx.client, std::slice::from_ref(&tlib), &tsys).await?;
+            // Key columns by system name.
+            let mut ks = Vec::new();
+            for (k, d) in keys {
+                let Some(f) = tfile.file.fields.iter().find(|f| f.is_named(k)) else {
+                    bail!("SQL0205: Column {k} not in table {}.", table.name);
+                };
+                ks.push((f.name.clone(), *d));
+            }
+            let lf = LogicalFile {
+                name: sys.clone(),
                 // The table's record format unless RCDFMT names another.
                 format: format.clone().unwrap_or_else(|| tfile.file.format.clone()),
                 text: String::new(),
                 unique: *unique,
-                based_on: format!("{tlib}/{}", table.name),
+                based_on: format!("{tlib}/{tsys}"),
                 fields: Vec::new(),
-                keys: keys.iter().map(|(k, _)| k.clone()).collect(),
-                descending: keys
+                keys: ks.iter().map(|(k, _)| k.clone()).collect(),
+                descending: ks
                     .iter()
                     .filter(|(_, d)| *d)
                     .map(|(k, _)| k.clone())
@@ -1012,20 +1195,19 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
                 select_omit: Vec::new(),
             };
             let libl = ctx.libl.to_vec();
-            catalog::create_logical_file(ctx.client, &libl, &lib, &lf)
-                .await
-                .map_err(|e| {
-                    let m = e.to_string();
-                    if m.starts_with("CPF7302") {
-                        anyhow!("SQL0601: {} in {lib} type *FILE already exists.", name.name)
-                    } else {
-                        e
-                    }
-                })?;
-            authority::set_owner(ctx.client, &lib, &name.name, "*FILE", ctx.user).await?;
+            catalog::create_logical_file(ctx.client, &libl, &lib, &lf).await?;
+            if sys != name.name {
+                catalog::set_sql_name(ctx.client, &lib, &sys, &name.name, false).await?;
+            }
+            authority::set_owner(ctx.client, &lib, &sys, "*FILE", ctx.user).await?;
             Ok(format!(
-                "Index {} created in {lib} over {tlib}/{}.",
-                name.name, table.name
+                "Index {} created in {lib} over {tlib}/{tsys}{}.",
+                name.name,
+                if sys == name.name {
+                    String::new()
+                } else {
+                    format!(" (system name {sys})")
+                }
             ))
         }
         Ddl::Drop {
@@ -1033,8 +1215,7 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
             name,
             if_exists,
         } => {
-            let found = ctx.find(name).await?;
-            let Some((lib, attr)) = found else {
+            let Some((lib, attr, sys)) = ctx.find(name).await? else {
                 if *if_exists {
                     return Ok(format!("{} does not exist; nothing dropped.", name.name));
                 }
@@ -1051,33 +1232,25 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
                     kind.to_ascii_lowercase()
                 );
             }
-            ctx.may_delete(&lib, &name.name).await?;
-            catalog::delete_file(ctx.client, &lib, &name.name, true).await?;
+            ctx.may_delete(&lib, &sys).await?;
+            catalog::delete_file(ctx.client, &lib, &sys, true).await?;
             Ok(format!("{} {} in {lib} dropped.", title(kind), name.name))
         }
         Ddl::LabelObject { name, text } => {
-            let Some((lib, _)) = ctx.find(name).await? else {
+            let Some((lib, _, sys)) = ctx.find(name).await? else {
                 return Err(not_found(name, "label"));
             };
-            authority::check(ctx.client, ctx.user, &lib, &name.name, "*FILE", Aut::Change).await?;
-            catalog::set_file_text(ctx.client, &lib, &name.name, text).await?;
+            authority::check(ctx.client, ctx.user, &lib, &sys, "*FILE", Aut::Change).await?;
+            catalog::set_file_text(ctx.client, &lib, &sys, text).await?;
             Ok(format!("Label on {} in {lib} changed.", name.name))
         }
         Ddl::LabelColumns { table, texts } => {
-            let Some((lib, _)) = ctx.find(table).await? else {
+            let Some((lib, _, sys)) = ctx.find(table).await? else {
                 return Err(not_found(table, "label"));
             };
-            authority::check(
-                ctx.client,
-                ctx.user,
-                &lib,
-                &table.name,
-                "*FILE",
-                Aut::Change,
-            )
-            .await?;
+            authority::check(ctx.client, ctx.user, &lib, &sys, "*FILE", Aut::Change).await?;
             for (c, t) in texts {
-                catalog::set_field_text(ctx.client, &lib, &table.name, c, t).await?;
+                catalog::set_field_text(ctx.client, &lib, &sys, c, t).await?;
             }
             Ok(format!("Labels on {} in {lib} changed.", table.name))
         }
@@ -1269,6 +1442,8 @@ mod tests {
 
     #[test]
     fn checks_are_limited_to_columns_and_constants() {
+        let (_, _, c) = table("CREATE TABLE T (N VARCHAR(10), CHECK (LENGTH(TRIM(N)) > 0))");
+        assert_eq!(c[0].1, "length ( btrim ( \"n\" ) ) > 0");
         let e = parse("CREATE TABLE T (A INT CHECK (A > PG_SLEEP(1)))")
             .unwrap_err()
             .to_string();
@@ -1284,7 +1459,7 @@ mod tests {
             "CREATE TABLE T (A INT GENERATED ALWAYS AS IDENTITY)",
             "CREATE VIEW V AS SELECT 1 FROM T",
             "ALTER TABLE T ADD COLUMN B INT",
-            "CREATE TABLE VERY_LONG_TABLE_NAME (A INT)",
+            "CREATE TABLE \"lower\" (A INT)",
         ] {
             let e = parse(sql).unwrap_err().to_string();
             assert!(e.starts_with("SQL0084"), "{sql}: {e}");
@@ -1292,6 +1467,41 @@ mod tests {
         // Queries and changes are not data definition.
         assert_eq!(parse("SELECT * FROM T").unwrap(), None);
         assert_eq!(parse("SET PATH = X").unwrap(), None);
+    }
+
+    #[test]
+    fn long_names_get_system_names() {
+        // Db2 for i: an SQL name that is not a valid system name gets a
+        // system name of its first five characters and a five-digit number
+        // (COUNTRY_CODE -> COUNT00001, the next COUNT... -> COUNT00002);
+        // FOR COLUMN names it; RCDFMT defaults to the system table name.
+        let (f, u, _) = table(
+            "CREATE TABLE COUNTRY_LIST FOR SYSTEM NAME COUNTRIES (
+               COUNTRY_CODE CHAR(2) NOT NULL PRIMARY KEY,
+               COUNTRY_NAME VARCHAR(40),
+               POPULATION_COUNT FOR COLUMN POP BIGINT,
+               ID INT)",
+        );
+        let names: Vec<(String, Option<String>)> = f
+            .fields
+            .iter()
+            .map(|x| (x.name.clone(), x.alias.clone()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("COUNT00001".into(), Some("COUNTRY_CODE".into())),
+                ("COUNT00002".into(), Some("COUNTRY_NAME".into())),
+                ("POP".into(), Some("POPULATION_COUNT".into())),
+                ("ID".into(), None),
+            ]
+        );
+        assert_eq!(u, vec![("PK".to_string(), vec!["COUNT00001".to_string()])]);
+        assert_eq!(f.format, "");
+        assert_eq!(
+            generated_name("CUSTOMER_MASTER", &|c| c == "CUSTO00001").unwrap(),
+            "CUSTO00002"
+        );
     }
 
     #[test]
@@ -1315,6 +1525,7 @@ mod tests {
                     lib: None,
                     name: "PERSONIX".into()
                 },
+                system: None,
                 table: Name {
                     lib: Some("NICK".into()),
                     name: "PERSON".into()
@@ -1369,6 +1580,6 @@ mod tests {
                 ..
             })
         ));
-        assert!(parse("DROP VIEW VW_FOOD_PUBLIC").is_err());
+        assert!(parse("DROP VIEW VW_FOOD_PUBLIC").is_ok());
     }
 }

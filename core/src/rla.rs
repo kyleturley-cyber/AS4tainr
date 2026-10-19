@@ -288,7 +288,7 @@ impl OpenFile {
             .file
             .fields
             .iter()
-            .map(|f| f.read_expr(&format!("t.{}", ident(&f.name))))
+            .map(|f| f.read_expr(&format!("t.{}", f.column())))
             .collect();
         cols.push("t.rrn".into());
         // Which null-capable fields are null, by name.
@@ -301,7 +301,7 @@ impl OpenFile {
             .map(|f| {
                 format!(
                     "CASE WHEN t.{} IS NULL THEN {} END",
-                    ident(&f.name),
+                    f.column(),
                     crate::dds::quote(&f.name)
                 )
             })
@@ -364,7 +364,7 @@ impl OpenFile {
         let mut desc = Vec::new();
         for (f, v) in kf.iter().zip(prefix) {
             params.push(Self::normalize(f, v));
-            lhs.push(format!("t.{}", ident(&f.name)));
+            lhs.push(format!("t.{}", f.column()));
             rhs.push(format!("CAST(${}::text AS {})", params.len(), f.sql_type()));
             desc.push(self.file.file.is_descending(&f.name));
         }
@@ -416,7 +416,17 @@ impl OpenFile {
             .file
             .keys
             .iter()
-            .map(|k| format!("t.{} {}", ident(k), d(self.file.file.is_descending(k))))
+            .map(|k| {
+                let col = self
+                    .file
+                    .file
+                    .fields
+                    .iter()
+                    .find(|f| &f.name == k)
+                    .map(|f| f.column())
+                    .unwrap_or_else(|| ident(k));
+                format!("t.{col} {}", d(self.file.file.is_descending(k)))
+            })
             .collect();
         cols.push(format!("t.rrn {}", d(false)));
         cols.join(", ")
@@ -651,13 +661,13 @@ impl OpenFile {
                         self.file.file.name
                     );
                 }
-                out.push((ident(&f.name), "NULL".into()));
+                out.push((f.column(), "NULL".into()));
                 continue;
             }
             if let Some(v) = rec.get(&f.name) {
                 params.push(Self::normalize(f, v));
                 out.push((
-                    ident(&f.name),
+                    f.column(),
                     format!("CAST(${}::text AS {})", params.len(), f.sql_type()),
                 ));
             }

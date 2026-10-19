@@ -74,6 +74,11 @@ BEGIN
     ALTER TABLE as4tainr.file_keys ADD COLUMN descending boolean NOT NULL DEFAULT false;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='file_fields' AND column_name='alias') THEN
+    ALTER TABLE as4tainr.file_fields ADD COLUMN IF NOT EXISTS alias text;
+    ALTER TABLE as4tainr.files ADD COLUMN IF NOT EXISTS sql_name text;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
                  WHERE table_schema='as4tainr' AND table_name='programs' AND column_name='options') THEN
     ALTER TABLE as4tainr.programs ADD COLUMN IF NOT EXISTS options text NOT NULL DEFAULT '';
   END IF;
@@ -474,7 +479,7 @@ pub async fn member_records(
         .fields
         .iter()
         .map(|fd| {
-            let col = format!("t.{}", ident(&fd.name));
+            let col = format!("t.{}", fd.column());
             // Character values without their trailing blanks; dates and
             // times in their external form; null shown as empty.
             if fd.data_type.is_datetime() {
@@ -571,8 +576,8 @@ pub async fn create_physical_file(
         let len = f.length as i32;
         let dec = f.decimals as i32;
         tx.execute(
-            "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+            "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
             &[
                 &lib,
                 &name,
@@ -585,6 +590,7 @@ pub async fn create_physical_file(
                 &f.varlen,
                 &f.null_capable,
                 &f.default.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
+                &f.alias,
             ],
         )
         .await?;
@@ -610,7 +616,7 @@ pub async fn create_physical_file(
         };
         cols.push(format!(
             "{} {}{}{}{}",
-            ident(&f.name),
+            f.column(),
             f.sql_type(),
             coll,
             if f.null_capable { "" } else { " NOT NULL" },
@@ -621,7 +627,7 @@ pub async fn create_physical_file(
     tx.batch_execute(&format!("CREATE TABLE {table} ({})", cols.join(", ")))
         .await?;
     if !pf.keys.is_empty() {
-        let keycols: Vec<String> = pf.keys.iter().map(|k| ident(k)).collect();
+        let keycols: Vec<String> = pf.keys.iter().map(|k| key_column(&pf.fields, k)).collect();
         // Access path: key order, then arrival order (rrn) for duplicate keys.
         tx.batch_execute(&format!(
             "CREATE INDEX {} ON {table} ({}, rrn)",
@@ -718,6 +724,15 @@ pub async fn resolve_display_file(
     )
 }
 
+/// The column of a key field (by system name).
+fn key_column(fields: &[FieldDef], k: &str) -> String {
+    fields
+        .iter()
+        .find(|f| f.name == k)
+        .map(|f| f.column())
+        .unwrap_or_else(|| ident(k))
+}
+
 /// Index columns for a file's access path: its keys (DESC where the key
 /// is descending), then arrival order.
 fn access_path(f: &PhysicalFile) -> String {
@@ -725,9 +740,9 @@ fn access_path(f: &PhysicalFile) -> String {
         .iter()
         .map(|k| {
             if f.is_descending(k) {
-                format!("{} DESC", ident(k))
+                format!("{} DESC", key_column(&f.fields, k))
             } else {
-                ident(k)
+                key_column(&f.fields, k)
             }
         })
         .collect::<Vec<_>>()
@@ -783,7 +798,7 @@ pub fn selection_sql(lf: &LogicalFile, fields: &[FieldDef], prefix: &str) -> Res
                     lf.based_on
                 )
             })?;
-            let col = format!("{prefix}{}", ident(name));
+            let col = format!("{prefix}{}", f.column());
             conds.push(match test {
                 Test::Comp(op, v) => {
                     let op = match op.as_str() {
@@ -920,8 +935,8 @@ pub async fn create_logical_file(
     for (i, f) in fields.iter().enumerate() {
         let (seq, len, dec) = (i as i32, f.length as i32, f.decimals as i32);
         tx.execute(
-            "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+            "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
             &[
                 &lib,
                 &name,
@@ -934,6 +949,7 @@ pub async fn create_logical_file(
                 &f.varlen,
                 &f.null_capable,
                 &f.default.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
+                &f.alias,
             ],
         )
         .await?;
@@ -951,10 +967,7 @@ pub async fn create_logical_file(
         &[&lib, &name, &pf.library, &pf.file.name, &index_selection],
     )
     .await?;
-    let cols: Vec<String> = fields
-        .iter()
-        .map(|f| format!("t.{}", ident(&f.name)))
-        .collect();
+    let cols: Vec<String> = fields.iter().map(|f| format!("t.{}", f.column())).collect();
     let view = format!("{}.{}", ident(&lib), ident(&name));
     tx.batch_execute(&format!(
         "CREATE VIEW {view} AS SELECT t.rrn, {} FROM {} AS t WHERE {selection}",
@@ -978,7 +991,7 @@ pub async fn create_logical_file(
         ))
         .await?;
         if lf.unique {
-            let keycols: Vec<String> = lf.keys.iter().map(|k| ident(k)).collect();
+            let keycols: Vec<String> = lf.keys.iter().map(|k| key_column(&fields, k)).collect();
             tx.batch_execute(&format!(
                 "CREATE UNIQUE INDEX {} ON {base} ({}){where_}",
                 ident(&format!("{lib}_{name}_ukey")),
@@ -1037,7 +1050,7 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
         let Some(row) = row else { continue };
         let fields = client
             .query(
-                "SELECT name, data_type, length, decimals, text, varlen, null_capable, dft FROM as4tainr.file_fields
+                "SELECT name, data_type, length, decimals, text, varlen, null_capable, dft, alias FROM as4tainr.file_fields
                  WHERE library=$1 AND file=$2 ORDER BY seq",
                 &[lib, &name],
             )
@@ -1055,6 +1068,7 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
                     default: r
                         .get::<_, Option<&str>>(7)
                         .and_then(|d| serde_json::from_str(d).ok()),
+                    alias: r.get(8),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1213,7 +1227,7 @@ pub async fn set_field_text(
 ) -> Result<()> {
     let n = client
         .execute(
-            "UPDATE as4tainr.file_fields SET text=$4 WHERE library=$1 AND file=$2 AND name=$3",
+            "UPDATE as4tainr.file_fields SET text=$4 WHERE library=$1 AND file=$2 AND (name=$3 OR alias=$3)",
             &[&library, &file, &field, &text],
         )
         .await?;
@@ -1221,6 +1235,62 @@ pub async fn set_field_text(
         bail!("SQL0205: Column {field} not in table {file} in {library}.");
     }
     Ok(())
+}
+
+/// A file's SQL name, when it is not its system name. For a table, SQL
+/// statements reach it by that name too: a view of the same records
+/// (PostgreSQL views of one table can be changed through).
+pub async fn set_sql_name(
+    client: &Client,
+    library: &str,
+    name: &str,
+    sql_name: &str,
+    table: bool,
+) -> Result<()> {
+    client
+        .execute(
+            "UPDATE as4tainr.files SET sql_name=$3 WHERE library=$1 AND name=$2",
+            &[&library, &name, &sql_name],
+        )
+        .await?;
+    if table {
+        client
+            .batch_execute(&format!(
+                "CREATE VIEW {}.{} AS SELECT * FROM {}.{}",
+                ident(library),
+                ident(sql_name),
+                ident(library),
+                ident(name)
+            ))
+            .await?;
+    }
+    Ok(())
+}
+
+/// A file found by its system name or its SQL name (SQL statements).
+pub async fn resolve_sql_file(client: &Client, libl: &[String], name: &str) -> Result<FileRef> {
+    let (libs, n) = match name.split_once('/') {
+        Some((l, n)) => (vec![l.to_ascii_uppercase()], n.to_ascii_uppercase()),
+        None => (libl.to_vec(), name.to_ascii_uppercase()),
+    };
+    for lib in &libs {
+        if validate_name("file", &n).is_ok() {
+            if let Ok(f) = resolve_file(client, std::slice::from_ref(lib), &n).await {
+                return Ok(f);
+            }
+        }
+        if let Some(r) = client
+            .query_opt(
+                "SELECT name FROM as4tainr.files WHERE library=$1 AND sql_name=$2",
+                &[lib, &n],
+            )
+            .await?
+        {
+            let sys: String = r.get(0);
+            return resolve_file(client, std::slice::from_ref(lib), &sys).await;
+        }
+    }
+    bail!("SQL0204: {n} not found.")
 }
 
 /// A unique constraint (SQL PRIMARY KEY or UNIQUE) on a physical file.
@@ -1231,7 +1301,22 @@ pub async fn add_unique_constraint(
     constraint: &str,
     columns: &[String],
 ) -> Result<()> {
-    let cols: Vec<String> = columns.iter().map(|c| ident(c)).collect();
+    let fields = client
+        .query(
+            "SELECT name, alias FROM as4tainr.file_fields WHERE library=$1 AND file=$2",
+            &[&library, &file],
+        )
+        .await?;
+    let cols: Vec<String> = columns
+        .iter()
+        .map(|c| {
+            let alias = fields
+                .iter()
+                .find(|r| r.get::<_, String>(0) == *c)
+                .and_then(|r| r.get::<_, Option<String>>(1));
+            ident(alias.as_deref().unwrap_or(c))
+        })
+        .collect();
     client
         .batch_execute(&format!(
             "CREATE UNIQUE INDEX {} ON {}.{} ({})",

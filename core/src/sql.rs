@@ -553,10 +553,10 @@ pub async fn run(
         } else {
             target.to_ascii_uppercase()
         };
-        let f = catalog::resolve_file(client, libl, &name)
+        let f = catalog::resolve_sql_file(client, libl, &name)
             .await
             .map_err(|_| anyhow!("SQL0204: {name} not found."))?;
-        let cols: Vec<String> = f.file.fields.iter().map(|fd| ident(&fd.name)).collect();
+        let cols: Vec<String> = f.file.fields.iter().map(|fd| fd.column()).collect();
         text.insert_str(*at, &format!(" ({})", cols.join(", ")));
     }
     let path: Vec<String> = libl.iter().map(|l| ident(l)).collect();
@@ -895,10 +895,10 @@ impl Session {
             } else {
                 target.to_ascii_uppercase()
             };
-            let f = catalog::resolve_file(catalog_client, &self.libl, &name)
+            let f = catalog::resolve_sql_file(catalog_client, &self.libl, &name)
                 .await
                 .map_err(|_| anyhow!("SQL0204: {name} not found."))?;
-            let cols: Vec<String> = f.file.fields.iter().map(|fd| ident(&fd.name)).collect();
+            let cols: Vec<String> = f.file.fields.iter().map(|fd| fd.column()).collect();
             text.insert_str(*at, &format!(" ({})", cols.join(", ")));
         }
         if t.kind == Kind::Query {

@@ -1749,7 +1749,12 @@ fn free(ctx: &mut Ctx, text: &str, lineno: usize) -> Result<()> {
             return Ok(());
         }
         "DCL-DS" | "DCL-PR" | "DCL-PI" => {
-            let (name, dtype, kws) = free_decl(&rest)?;
+            let (name, dtype, mut kws) = free_decl(&rest)?;
+            // `dcl-pi *n int(10) end-pi;`: an empty list ends on its line.
+            let ends_here = kws.iter().any(|k| {
+                matches!(k.name.as_str(), "END-DS" | "END-PR" | "END-PI") && k.args.is_empty()
+            });
+            kws.retain(|k| !matches!(k.name.as_str(), "END-DS" | "END-PR" | "END-PI"));
             let kind = match first.as_str() {
                 "DCL-DS" => DefKind::Ds,
                 "DCL-PR" => DefKind::Proto,
@@ -1769,7 +1774,11 @@ fn free(ctx: &mut Ctx, text: &str, lineno: usize) -> Result<()> {
                 keywords: kws,
                 line: lineno,
             });
-            ctx.free_block = if single { None } else { Some(kind) };
+            ctx.free_block = if single || ends_here {
+                None
+            } else {
+                Some(kind)
+            };
             return Ok(());
         }
         "END-DS" | "END-PR" | "END-PI" => {

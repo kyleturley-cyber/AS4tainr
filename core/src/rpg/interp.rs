@@ -9,7 +9,7 @@ use super::ast::*;
 use super::code::{Code, Ins};
 use super::data::{self, a, DType, Fig, Fit, Value};
 use super::dec::Dec;
-use super::program::{Display, Program, Sym, VarInfo};
+use super::program::{Display, ProcInfo, Program, Sym, VarInfo};
 use crate::rla::{OpenFile, ReadResult, Record};
 use crate::workstn::Workstation;
 use anyhow::{anyhow, bail, Result};
@@ -79,6 +79,29 @@ pub struct Machine<'a> {
     /// Printed lines when the call has no job (`as4tainr call`), as a
     /// printer would put them on paper: form feeds between pages.
     pub printed: Vec<String>,
+    /// Procedure calls in progress, innermost last.
+    frames: Vec<Frame<'a>>,
+    /// Parameters passed to the program (%PARMS outside a procedure).
+    parms_passed: usize,
+}
+
+/// One procedure call: its local storage starts at `base` in the
+/// machine's buffers; parameters passed by reference are aliases of the
+/// caller's storage.
+struct Frame<'a> {
+    proc: &'a ProcInfo,
+    base: usize,
+    /// Local buffer → (absolute buffer, offset) for reference parameters.
+    alias: HashMap<usize, (usize, usize)>,
+    passed: usize,
+}
+
+/// Where an argument passed by reference lives.
+#[derive(Clone, Copy, Debug)]
+struct Loc {
+    buf: usize,
+    off: usize,
+    size: usize,
 }
 
 /// A program-described printer file while the program runs: where the
@@ -147,11 +170,43 @@ impl<'a> Machine<'a> {
             dtaara_locks: Vec::new(),
             printers: HashMap::new(),
             printed: Vec::new(),
+            frames: Vec::new(),
+            parms_passed: 0,
         }
     }
 
     fn block<F: std::future::Future>(&self, f: F) -> F::Output {
         self.io.rt.block_on(f)
+    }
+
+    /// A name as the running code sees it: the current procedure's
+    /// locals first, then the program's globals. Local storage comes back
+    /// with its absolute buffer.
+    fn sym(&self, name: &str) -> Option<Sym> {
+        if let Some(f) = self.frames.last() {
+            if let Some(s) = f.proc.syms.get(name) {
+                let place = |buf: usize, off: usize| -> (usize, usize) {
+                    match f.alias.get(&buf) {
+                        Some((b, o)) => (*b, off + o),
+                        None => (f.base + buf, off),
+                    }
+                };
+                return Some(match s.clone() {
+                    Sym::Var(mut v) if v.local => {
+                        (v.buf, v.off) = place(v.buf, v.off);
+                        v.local = false;
+                        Sym::Var(v)
+                    }
+                    Sym::Ds(mut d) if d.local => {
+                        (d.buf, d.off) = place(d.buf, d.off);
+                        d.local = false;
+                        Sym::Ds(d)
+                    }
+                    other => other,
+                });
+            }
+        }
+        self.prog.syms.get(name).cloned()
     }
 
     pub fn ind(&self, n: &str) -> bool {
@@ -242,7 +297,7 @@ impl<'a> Machine<'a> {
             Expr::Omit => Value::Fig(Fig::Null),
             Expr::Name { parts, args } => {
                 let name = parts.join(".");
-                match self.prog.syms.get(&name).cloned() {
+                match self.sym(&name) {
                     Some(Sym::Var(v)) => {
                         let i = self.index_of(args)?;
                         if i.is_none() && v.dim > 0 {
@@ -251,7 +306,9 @@ impl<'a> Machine<'a> {
                         self.load_var(&v, i)?
                     }
                     Some(Sym::Const(c)) => c,
-                    Some(Sym::Ds(d)) => Value::Char(self.bufs[d.buf][d.off..d.off + d.size].to_vec()),
+                    Some(Sym::Ds(d)) => {
+                        Value::Char(self.bufs[d.buf][d.off..d.off + d.size].to_vec())
+                    }
                     Some(Sym::Klist(_)) => bail!("{name} is a key list, not a value"),
                     None => match name.as_str() {
                         "*DATE" | "UDATE" => Value::Num(Dec::from_i64(today_num(&name))),
@@ -259,7 +316,13 @@ impl<'a> Machine<'a> {
                         "*MONTH" | "UMONTH" => Value::Num(Dec::from_i64(today().1 as i64)),
                         "*YEAR" => Value::Num(Dec::from_i64(today().0 as i64)),
                         "UYEAR" => Value::Num(Dec::from_i64((today().0 % 100) as i64)),
-                        _ if args.is_some() => bail!("{name} is not an array or a procedure as4tainr knows (procedures come in a later milestone)"),
+                        _ if args.is_some() && self.callable(&name) => {
+                            let args = args.clone().unwrap_or_default();
+                            self.call_named(&name, &args)?.ok_or_else(|| {
+                                anyhow!("procedure {name} returns no value; it cannot be used in an expression")
+                            })?
+                        }
+                        _ if args.is_some() => bail!("{name} is not an array or a procedure"),
                         _ => bail!("{name} is not defined"),
                     },
                 }
@@ -330,7 +393,7 @@ impl<'a> Machine<'a> {
     /// The type of what an expression names, when it names a field.
     fn type_of(&self, ex: &Expr) -> Option<DType> {
         match ex {
-            Expr::Name { parts, .. } => match self.prog.syms.get(&parts.join(".")) {
+            Expr::Name { parts, .. } => match self.sym(&parts.join(".")) {
                 Some(Sym::Var(v)) => Some(v.dtype),
                 Some(Sym::Ds(d)) => Some(DType::Char(d.size as u32)),
                 _ => None,
@@ -438,7 +501,7 @@ impl<'a> Machine<'a> {
                     .first()
                     .ok_or_else(|| anyhow!("%SIZE needs an argument"))?;
                 let n = match a0 {
-                    Expr::Name { parts, .. } => match self.prog.syms.get(&parts.join(".")) {
+                    Expr::Name { parts, .. } => match self.sym(&parts.join(".")) {
                         Some(Sym::Var(v)) => {
                             v.dtype.size()
                                 * if args.len() > 1 {
@@ -455,7 +518,7 @@ impl<'a> Machine<'a> {
                 Value::Num(Dec::from_i64(n as i64))
             }
             "ELEM" => match args.first() {
-                Some(Expr::Name { parts, .. }) => match self.prog.syms.get(&parts.join(".")) {
+                Some(Expr::Name { parts, .. }) => match self.sym(&parts.join(".")) {
                     Some(Sym::Var(v)) => Value::Num(Dec::from_i64(v.dim as i64)),
                     Some(Sym::Ds(d)) => Value::Num(Dec::from_i64(d.dim as i64)),
                     _ => bail!("%ELEM needs an array"),
@@ -589,7 +652,10 @@ impl<'a> Machine<'a> {
             }
             "ADDR" | "PADDR" => Value::Fig(Fig::Null),
             "NULLIND" => Value::Ind(false),
-            "PARMS" => Value::Num(Dec::from_i64(self.prog.entry.len() as i64)),
+            "PARMS" => Value::Num(Dec::from_i64(match self.frames.last() {
+                Some(f) => f.passed,
+                None => self.parms_passed,
+            } as i64)),
             other => bail!("%{other} is not supported yet"),
         })
     }
@@ -639,7 +705,7 @@ impl<'a> Machine<'a> {
             }
             Expr::Name { parts, args } => {
                 let name = parts.join(".");
-                match self.prog.syms.get(&name).cloned() {
+                match self.sym(&name) {
                     Some(Sym::Var(v)) => {
                         let i = self.index_of(args)?;
                         self.store_var(&v, i, val, fit, right)?;
@@ -773,7 +839,7 @@ impl<'a> Machine<'a> {
     fn key_values(&mut self, key: &[Expr]) -> Result<Vec<String>> {
         // A KLIST name stands for its key fields.
         let exprs: Vec<Expr> = match key {
-            [Expr::Name { parts, args: None }] => match self.prog.syms.get(&parts.join(".")) {
+            [Expr::Name { parts, args: None }] => match self.sym(&parts.join(".")) {
                 Some(Sym::Klist(k)) => k.clone(),
                 _ => key.to_vec(),
             },
@@ -1083,7 +1149,7 @@ impl<'a> Machine<'a> {
     /// INDDS data structure.
     fn ws_inds(&self, d: &Display) -> [bool; 100] {
         let mut out = [false; 100];
-        match d.indds.as_ref().and_then(|n| self.prog.syms.get(n)) {
+        match d.indds.as_ref().and_then(|n| self.sym(n)) {
             Some(Sym::Ds(ds)) => {
                 let bytes = &self.bufs[ds.buf][ds.off..ds.off + ds.size];
                 for (n, slot) in out.iter_mut().enumerate().skip(1) {
@@ -1103,7 +1169,7 @@ impl<'a> Machine<'a> {
         if !(1..=99).contains(&n) {
             return;
         }
-        match d.indds.as_ref().and_then(|x| self.prog.syms.get(x)) {
+        match d.indds.as_ref().and_then(|x| self.sym(x)) {
             Some(Sym::Ds(ds)) => {
                 let at = ds.off + n as usize - 1;
                 if at < ds.off + ds.size {
@@ -1447,36 +1513,32 @@ impl<'a> Machine<'a> {
                 // CLEAR: blanks, zeros, '0' by type. (RESET to the INZ
                 // values: same as CLEAR here for now.)
                 match t {
-                    Expr::Name { parts, args: None } => {
-                        match self.prog.syms.get(&parts.join(".")).cloned() {
-                            Some(Sym::Var(v)) => {
-                                for k in 0..v.dim.max(1) as usize {
-                                    let at = v.off + k * v.stride;
-                                    self.bufs[v.buf][at..at + v.dtype.size()]
-                                        .copy_from_slice(&v.dtype.initial());
-                                }
+                    Expr::Name { parts, args: None } => match self.sym(&parts.join(".")) {
+                        Some(Sym::Var(v)) => {
+                            for k in 0..v.dim.max(1) as usize {
+                                let at = v.off + k * v.stride;
+                                self.bufs[v.buf][at..at + v.dtype.size()]
+                                    .copy_from_slice(&v.dtype.initial());
                             }
-                            Some(Sym::Ds(d)) => {
-                                let prefix = if d.qualified {
-                                    format!("{}.", parts.join("."))
-                                } else {
-                                    String::new()
-                                };
-                                for sf in &d.subfields {
-                                    if let Some(Sym::Var(v)) =
-                                        self.prog.syms.get(&format!("{prefix}{sf}")).cloned()
-                                    {
-                                        for k in 0..v.dim.max(1) as usize {
-                                            let at = v.off + k * v.stride;
-                                            self.bufs[v.buf][at..at + v.dtype.size()]
-                                                .copy_from_slice(&v.dtype.initial());
-                                        }
+                        }
+                        Some(Sym::Ds(d)) => {
+                            let prefix = if d.qualified {
+                                format!("{}.", parts.join("."))
+                            } else {
+                                String::new()
+                            };
+                            for sf in &d.subfields {
+                                if let Some(Sym::Var(v)) = self.sym(&format!("{prefix}{sf}")) {
+                                    for k in 0..v.dim.max(1) as usize {
+                                        let at = v.off + k * v.stride;
+                                        self.bufs[v.buf][at..at + v.dtype.size()]
+                                            .copy_from_slice(&v.dtype.initial());
                                     }
                                 }
                             }
-                            _ => bail!("CLEAR of {} is not supported", parts.join(".")),
                         }
-                    }
+                        _ => bail!("CLEAR of {} is not supported", parts.join(".")),
+                    },
                     Expr::Ind(n) => self.set_ind(n, false),
                     Expr::IndArray(None) => {
                         for n in 1..=99 {
@@ -1505,11 +1567,48 @@ impl<'a> Machine<'a> {
                 ind,
             } => self.misc_op(code, f1, f2, result, ind)?,
             Stmt::Nop => {}
-            Stmt::CallP(e) => {
-                bail!("CALLP / procedure calls are not supported by the native engine yet: {e:?}")
-            }
-            Stmt::Call { program, .. } => {
-                bail!("CALL from RPG is not supported by the native engine yet: {program:?}")
+            Stmt::CallP(e) => match e {
+                Expr::Name { parts, args } => {
+                    let name = parts.join(".");
+                    self.call_named(&name, args.as_deref().unwrap_or(&[]))?;
+                }
+                other => bail!("CALLP: a procedure or program call is needed, found {other:?}"),
+            },
+            Stmt::Call {
+                program,
+                parms,
+                ind,
+            } => {
+                let name = match program {
+                    Expr::Name { parts, args: None } if self.sym(&parts.join(".")).is_none() => {
+                        parts.join(".")
+                    }
+                    other => a(&self.eval(other)?.chars()?).trim().to_ascii_uppercase(),
+                };
+                // PARM: factor 2 is moved to the result field before the
+                // call.
+                let mut locs = Vec::new();
+                for p in parms {
+                    if let Some(v) = &p.value {
+                        let val = self.eval(v)?;
+                        self.assign(&p.target, &val, Fit::Strict { half_adjust: false }, false)?;
+                    }
+                    locs.push(self.loc_of(&p.target)?);
+                }
+                match self.call_program(&name, &locs) {
+                    Ok(()) => {
+                        if let Some(lo) = &ind.lo {
+                            self.set_ind(lo, false);
+                        }
+                    }
+                    // Positions 73-74: on if the called program ends in
+                    // error, instead of the error going on.
+                    Err(e) if ind.lo.is_some() => {
+                        let _ = e;
+                        self.set_ind(ind.lo.as_deref().unwrap(), true);
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             Stmt::Unsupported(op) => bail!("operation {op} is not supported yet"),
         }
@@ -1758,11 +1857,12 @@ impl<'a> Machine<'a> {
                         None
                     }
                     Ins::ExSr(name) => {
+                        let prog = self.prog;
                         let sub = self
-                            .prog
-                            .routines
-                            .subroutines
-                            .get(name)
+                            .frames
+                            .last()
+                            .and_then(|f| f.proc.routines.subroutines.get(name))
+                            .or_else(|| prog.routines.subroutines.get(name))
                             .ok_or_else(|| anyhow!("subroutine {name} is not defined"))?;
                         match self.run_code(sub)? {
                             Flow::Return(v) => return Err(ReturnSignal(v).into()),
@@ -1872,32 +1972,385 @@ impl<'a> Machine<'a> {
     /// Run the program: open the files, take the parameters, then the
     /// cycle: detail calculations until LR (or RETURN), then total
     /// calculations, then close.
+    /// Run the program with parameters given as text (a CL CALL, the
+    /// command line): each is converted to its entry parameter's type.
     pub fn run(&mut self, args: &[String]) -> Result<()> {
+        let types: Vec<DType> = match &self.prog.main {
+            Some(m) => self.prog.procs[m].params.iter().map(|p| p.dtype).collect(),
+            None => self
+                .prog
+                .entry
+                .iter()
+                .map(|p| self.type_of(&p.target).unwrap_or(DType::Char(32)))
+                .collect(),
+        };
+        let mut parms = Vec::new();
+        for (t, a) in types.iter().zip(args) {
+            let v = if t.is_numeric() {
+                Value::Num(Dec::parse(a).map_err(|_| anyhow!("parameter '{a}' is not a number"))?)
+            } else {
+                Value::str(a)
+            };
+            let mut buf = t.initial();
+            data::store(t, &v, &mut buf, Fit::Strict { half_adjust: false }, false)?;
+            parms.push(buf);
+        }
+        self.run_bytes(&mut parms)
+    }
+
+    /// Run the program with parameters passed by reference (a CALL from
+    /// another program): each is the bytes of the caller's variable, and
+    /// gets the parameter's value back when the program ends.
+    pub fn run_bytes(&mut self, parms: &mut [Vec<u8>]) -> Result<()> {
         for i in 0..self.prog.files.len() {
             if keyword(&self.prog.files[i].decl.keywords, "USROPN").is_none() {
                 self.open_file(i)?;
             }
         }
-        // *ENTRY PLIST: parameters arrive as text.
-        let entry = self.prog.entry.clone();
-        for (p, a) in entry.iter().zip(args) {
-            let t = self.type_of(&p.target);
-            let v = match t {
-                Some(t) if t.is_numeric() => Value::Num(
-                    Dec::parse(a).map_err(|_| anyhow!("parameter '{a}' is not a number"))?,
-                ),
-                _ => Value::str(a),
-            };
-            self.assign(&p.target, &v, Fit::Strict { half_adjust: false }, false)?;
-        }
-        let r = self.cycle();
+        self.parms_passed = parms.len();
+        let prog = self.prog;
+        let r = match &prog.main {
+            // ctl-opt main: the main procedure, with no cycle.
+            Some(m) => {
+                let base = self.bufs.len();
+                let mut call_args = Vec::new();
+                for (i, p) in parms.iter().enumerate() {
+                    self.bufs.push(p.clone());
+                    call_args.push(Arg::Ref(Loc {
+                        buf: base + i,
+                        off: 0,
+                        size: p.len(),
+                    }));
+                }
+                let r = self.call_proc(&prog.procs[m], call_args).map(|_| ());
+                for (i, p) in parms.iter_mut().enumerate() {
+                    *p = self.bufs[base + i].clone();
+                }
+                self.bufs.truncate(base);
+                r
+            }
+            None => {
+                // *ENTRY PLIST (or a PI outside procedures): the bytes go
+                // into the parameter fields, and come back after.
+                let mut locs = Vec::new();
+                for (p, bytes) in prog.entry.iter().zip(parms.iter()) {
+                    let l = self.loc_of(&p.target)?;
+                    let n = l.size.min(bytes.len());
+                    self.bufs[l.buf][l.off..l.off + n].copy_from_slice(&bytes[..n]);
+                    locs.push(l);
+                }
+                let r = self.cycle();
+                for (l, bytes) in locs.iter().zip(parms.iter_mut()) {
+                    let n = l.size.min(bytes.len());
+                    bytes[..n].copy_from_slice(&self.bufs[l.buf][l.off..l.off + n]);
+                }
+                r
+            }
+        };
         let closed = self.close_printers();
-        r?;
-        closed?;
         for f in self.files.iter_mut() {
             if let Some(mut o) = f.open.take() {
                 let _ = self.io.rt.block_on(o.release(self.io.client));
             }
+        }
+        r?;
+        closed
+    }
+}
+
+/// An argument of a procedure call.
+enum Arg {
+    /// Passed by reference: the caller's storage.
+    Ref(Loc),
+    /// VALUE or CONST: a value.
+    Val(Value),
+    /// *OMIT, or not passed (OPTIONS(*NOPASS)).
+    Omit,
+}
+
+impl<'a> Machine<'a> {
+    /// The storage an argument passed by reference names: a variable, an
+    /// array element, a whole array or a data structure.
+    fn loc_of(&mut self, ex: &Expr) -> Result<Loc> {
+        let Expr::Name { parts, args } = ex else {
+            bail!("a variable is needed for a parameter passed by reference, found {ex:?}");
+        };
+        let name = parts.join(".");
+        match self.sym(&name) {
+            Some(Sym::Var(v)) => {
+                let index = self.index_of(args)?;
+                Ok(match index {
+                    Some(_) => Loc {
+                        buf: v.buf,
+                        off: self.elem_off(&v, index)?,
+                        size: v.dtype.size(),
+                    },
+                    None => Loc {
+                        buf: v.buf,
+                        off: v.off,
+                        size: v.stride * (v.dim.max(1) as usize - 1) + v.dtype.size(),
+                    },
+                })
+            }
+            Some(Sym::Ds(d)) => Ok(Loc {
+                buf: d.buf,
+                off: d.off,
+                size: d.size * d.dim.max(1) as usize,
+            }),
+            _ => bail!("{name} is not a variable; it cannot be passed by reference"),
+        }
+    }
+
+    /// A procedure or prototype of this program.
+    fn callable(&self, name: &str) -> bool {
+        self.prog.procs.contains_key(name) || self.prog.protos.contains_key(name)
+    }
+
+    /// The arguments of a call, as the parameters take them.
+    fn args_for(
+        &mut self,
+        what: &str,
+        params: &[super::program::ParamInfo],
+        args: &[Expr],
+    ) -> Result<Vec<Arg>> {
+        if args.len() > params.len() {
+            bail!(
+                "{what}: {} parameters passed, it takes {}",
+                args.len(),
+                params.len()
+            );
+        }
+        let mut out = Vec::new();
+        for (i, p) in params.iter().enumerate() {
+            let Some(a) = args.get(i) else {
+                if !p.nopass {
+                    bail!("{what}: parameter {} is missing", p.name);
+                }
+                out.push(Arg::Omit);
+                continue;
+            };
+            out.push(if matches!(a, Expr::Omit) {
+                if !p.omit {
+                    bail!("{what}: *OMIT is not allowed for parameter {}", p.name);
+                }
+                Arg::Omit
+            } else if p.by_value || p.konst {
+                Arg::Val(self.eval(a)?)
+            } else {
+                Arg::Ref(self.loc_of(a)?)
+            });
+        }
+        Ok(out)
+    }
+
+    /// CALLP, or a call in an expression: a procedure of this program, or
+    /// a prototype for one or for a program (EXTPGM). Returns the
+    /// procedure's return value.
+    fn call_named(&mut self, name: &str, args: &[Expr]) -> Result<Option<Value>> {
+        let prog: &'a Program = self.prog;
+        if let Some(pi) = prog.procs.get(name) {
+            let a = self.args_for(name, &pi.params, args)?;
+            return self.call_proc(pi, a);
+        }
+        let Some(pr) = prog.protos.get(name) else {
+            bail!("{name} is not a procedure or prototype of this program");
+        };
+        if let Some(pgm) = &pr.extpgm {
+            // The program name may be a named constant or a variable.
+            let pgm = match self.sym(pgm) {
+                Some(Sym::Const(v)) => a(&v.chars()?).trim().to_ascii_uppercase(),
+                Some(Sym::Var(_)) => a(&self.eval(&Expr::name(pgm))?.chars()?)
+                    .trim()
+                    .to_ascii_uppercase(),
+                _ => pgm.clone(),
+            };
+            let call_args = self.args_for(name, &pr.params, args)?;
+            // Values (VALUE, CONST) are passed as copies in the
+            // parameter's type.
+            let base = self.bufs.len();
+            let mut locs = Vec::new();
+            for (arg, p) in call_args.into_iter().zip(&pr.params) {
+                match arg {
+                    Arg::Ref(l) => locs.push(l),
+                    Arg::Val(v) => {
+                        let mut buf = p.dtype.initial();
+                        data::store(
+                            &p.dtype,
+                            &v,
+                            &mut buf,
+                            Fit::Strict { half_adjust: false },
+                            false,
+                        )?;
+                        locs.push(Loc {
+                            buf: self.bufs.len(),
+                            off: 0,
+                            size: buf.len(),
+                        });
+                        self.bufs.push(buf);
+                    }
+                    Arg::Omit => break,
+                }
+            }
+            let r = self.call_program(&pgm, &locs);
+            self.bufs.truncate(base);
+            r?;
+            return Ok(None);
+        }
+        let target = pr.extproc.clone().unwrap_or_else(|| name.to_string());
+        match prog.procs.get(&target) {
+            Some(pi) => {
+                let a = self.args_for(name, &pr.params, args)?;
+                self.call_proc(pi, a)
+            }
+            None => bail!(
+                "procedure {target} is not in this program (service programs and binding directories come with milestone R6)"
+            ),
+        }
+    }
+
+    /// Call a procedure of this program: a new frame of local storage,
+    /// parameters by reference as aliases, its calculations, its return
+    /// value in its return type.
+    fn call_proc(&mut self, pi: &'a ProcInfo, args: Vec<Arg>) -> Result<Option<Value>> {
+        if self.frames.len() > 1000 {
+            bail!("procedure {}: calls are nested too deeply", pi.name);
+        }
+        let base = self.bufs.len();
+        let mut alias = HashMap::new();
+        let mut values = Vec::new();
+        let mut passed = 0;
+        for (i, arg) in args.into_iter().enumerate() {
+            let p = &pi.params[i];
+            match arg {
+                Arg::Ref(l) => {
+                    if let Some(b) = p.buf {
+                        alias.insert(b, (l.buf, l.off));
+                    }
+                    passed = i + 1;
+                }
+                Arg::Val(v) => {
+                    values.push((p.name.clone(), v));
+                    passed = i + 1;
+                }
+                Arg::Omit => {
+                    if i < passed || p.omit {
+                        passed = passed.max(i + 1);
+                    }
+                }
+            }
+        }
+        self.bufs.extend(pi.frame.iter().cloned());
+        self.frames.push(Frame {
+            proc: pi,
+            base,
+            alias,
+            passed,
+        });
+        let mut r = (|| -> Result<Option<Value>> {
+            for (n, v) in values {
+                self.assign(
+                    &Expr::name(&n),
+                    &v,
+                    Fit::Strict { half_adjust: false },
+                    false,
+                )?;
+            }
+            Ok(match self.run_code(&pi.routines.detail)? {
+                Flow::Return(v) => v,
+                _ => None,
+            })
+        })();
+        // ON-EXIT runs however the procedure ends; its indicator says
+        // whether it ended abnormally. A RETURN there replaces the value.
+        if let Some((ind, exit)) = &pi.on_exit {
+            let abnormal = r.is_err();
+            let x = (|| -> Result<Option<Value>> {
+                if let Some(n) = ind {
+                    self.assign(
+                        &Expr::name(n),
+                        &Value::Ind(abnormal),
+                        Fit::Strict { half_adjust: false },
+                        false,
+                    )?;
+                }
+                Ok(match self.run_code(&exit.detail)? {
+                    Flow::Return(v) => v,
+                    _ => None,
+                })
+            })();
+            match x {
+                Ok(Some(v)) if !abnormal => r = Ok(Some(v)),
+                Ok(_) => {}
+                Err(e) => r = Err(e),
+            }
+        }
+        self.frames.pop();
+        self.bufs.truncate(base);
+        let v = r?;
+        Ok(match (pi.returns, v) {
+            (Some(t), Some(v)) => {
+                let mut buf = t.initial();
+                data::store(&t, &v, &mut buf, Fit::Strict { half_adjust: false }, false)?;
+                Some(data::load(&t, &buf)?)
+            }
+            (Some(_), None) => bail!("procedure {} ended without returning a value", pi.name),
+            (None, _) => None,
+        })
+    }
+
+    /// CALL a program: an RPG program object (CRTBNDRPG) in the library
+    /// list, or a program source in AS4TAINR_PGM_PATH. Parameters are
+    /// passed by reference: the callee works on copies that come back
+    /// when it returns.
+    fn call_program(&mut self, name: &str, locs: &[Loc]) -> Result<()> {
+        let client = self.io.client;
+        let libl = self.io.libl.clone();
+        let found = self.block(crate::catalog::find_program(client, &libl, name))?;
+        let source = match found {
+            Some(p) if p.attribute == "RPGLE" => {
+                self.block(crate::authority::check(
+                    client,
+                    &self.io.user,
+                    &p.library,
+                    &p.name,
+                    "*PGM",
+                    crate::authority::Aut::Use,
+                ))?;
+                p.source
+            }
+            Some(p) => bail!(
+                "CALL {name}: {} programs cannot be called from RPG on the native engine yet",
+                p.attribute
+            ),
+            None => super::source_from_path(name)
+                .ok_or_else(|| anyhow!("CPF4101: Program {name} not found."))?,
+        };
+        let callee = self.block(super::compile(client, &libl, name, &source))?;
+        let mut parms: Vec<Vec<u8>> = locs
+            .iter()
+            .map(|l| self.bufs[l.buf][l.off..l.off + l.size].to_vec())
+            .collect();
+        let r = {
+            let mut m = Machine::new(
+                &callee,
+                Io {
+                    rt: self.io.rt.clone(),
+                    client,
+                    user: self.io.user.clone(),
+                    job_number: self.io.job_number,
+                    libl: libl.clone(),
+                    job: self.io.job.clone(),
+                    display: self.io.display.clone(),
+                },
+            );
+            let r = m.run_bytes(&mut parms);
+            self.messages.append(&mut m.messages);
+            self.printed.append(&mut m.printed);
+            r
+        };
+        r.map_err(|e| anyhow!("{e:#}\nProgram {name} ended abnormally."))?;
+        for (l, bytes) in locs.iter().zip(parms) {
+            self.bufs[l.buf][l.off..l.off + l.size].copy_from_slice(&bytes[..l.size]);
         }
         Ok(())
     }

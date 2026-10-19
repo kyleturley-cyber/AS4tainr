@@ -35,7 +35,14 @@ Character data is kept in EBCDIC, as on IBM i. Comparisons and sorting follow th
 
 ## Status
 
-**R3 is done (Oct 19, 2026).** The native engine prints: CUSTPRT matches its golden output, and with `AS4TAINR_RPG_ENGINE=native` the whole 5250 end-to-end test (128 checks) and the Phase 3 gate pass (three clerks entering orders while batch jobs print). CI runs both on the native engine.
+**R4 is done (Oct 19, 2026).** Programs call each other and are built from procedures:
+- **Procedures** (`DCL-PROC`, P specs) with their own local storage on each call, `STATIC` locals, parameters by reference, `CONST` and `VALUE`, `LIKEDS` parameters, `OPTIONS(*NOPASS : *OMIT)`, `%PARMS`, return values in the declared type, recursion, subroutines inside procedures, `ON-EXIT`.
+- **Prototypes** (`DCL-PR`, PR specs): calls to procedures (`EXTPROC`, or the prototype's name) and to programs (`EXTPGM`).
+- **Program calls:** `CALL` with `PARM` (factor 2 moved in first; error indicator in 73-74) and `CALLP` through an `EXTPGM` prototype. The called RPG program comes from the library list (CRTBNDRPG) or `AS4TAINR_PGM_PATH`; its parameters are passed by reference (`*ENTRY PLIST`, or a procedure interface outside procedures). Its DSPLY and printed output go to the caller's job.
+- **`ctl-opt main(name)`:** the program runs that procedure (no cycle); its interface is the program's parameter list.
+- The tests: `native_rpg_engine_runs_a_program` (rla_test.rs) calls programs with CALL and with prototypes, runs procedures with every kind of parameter, STATIC and automatic locals, recursion and ON-EXIT.
+
+**R3 (Oct 19, 2026).** The native engine prints: CUSTPRT matches its golden output, and with `AS4TAINR_RPG_ENGINE=native` the whole 5250 end-to-end test (128 checks) and the Phase 3 gate pass (three clerks entering orders while batch jobs print). CI runs both on the native engine.
 
 What R3 adds:
 - **Printer files** (program-described, `PRINTER`) and **O specs**: heading, detail, total and exception records; conditioning indicators with AND/OR lines; space and skip before and after; field end positions and `+n` placement; constants; edit codes; `PAGE`, `UDATE`, `*DATE`; blank after; `OFLIND` (the overflow indicator comes on when line 60 of 66 is printed on or passed). `EXCEPT` with and without a name. Lines go to the job's spooled file (`WRKSPLF`); without a job (`as4tainr call`) they are printed to standard output.
@@ -80,7 +87,7 @@ What R1 covers:
    - Primary files and level breaks.
    - Program-described files with I and O specs, EXCEPT, overflow.
    - Gate: CUSTPRT.
-4. **R4, the rest of the job.**
+4. **R4, the rest of the job.** Done, except `*LDA` and commitment control (see fidelity-gaps.md).
    - `*LDA`, commitment control (record locks and data areas came with R2).
    - CALL and CALLP between programs (RPG and CL), parameters by reference.
    - Procedures, prototypes, `RETURN` values, `EXPORT`, `ctl-opt main`.

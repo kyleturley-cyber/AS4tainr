@@ -87,6 +87,53 @@ impl Display {
     }
 }
 
+/// A parameter of a prototype or procedure interface.
+#[derive(Clone, Debug)]
+pub struct ParamInfo {
+    pub name: String,
+    /// Its type; a data structure parameter (LIKEDS) is its bytes.
+    pub dtype: DType,
+    /// VALUE: a copy is passed.
+    pub by_value: bool,
+    /// CONST: read only (passed as a copy of the value here).
+    pub konst: bool,
+    /// OPTIONS(*NOPASS), OPTIONS(*OMIT).
+    pub nopass: bool,
+    pub omit: bool,
+    /// In a procedure interface: the buffer the parameter is bound to
+    /// (aliased to the caller's storage when passed by reference).
+    pub buf: Option<usize>,
+}
+
+/// A prototype (DCL-PR / PR): what a call passes and where it goes.
+#[derive(Clone, Debug)]
+pub struct Proto {
+    pub name: String,
+    /// EXTPGM: a program call.
+    pub extpgm: Option<String>,
+    /// EXTPROC, or the prototype name: a procedure.
+    pub extproc: Option<String>,
+    pub params: Vec<ParamInfo>,
+    pub returns: Option<DType>,
+}
+
+/// A procedure of the program (DCL-PROC / P specs).
+#[derive(Clone, Debug)]
+pub struct ProcInfo {
+    pub name: String,
+    /// Local names (variables with `local` set: their buffers are the
+    /// frame's), constants and key lists.
+    pub syms: HashMap<String, Sym>,
+    /// Initial contents of the frame buffers of a call.
+    pub frame: Vec<Vec<u8>>,
+    pub params: Vec<ParamInfo>,
+    pub returns: Option<DType>,
+    pub routines: Routines,
+    /// ON-EXIT: its indicator variable (on when the procedure ends
+    /// abnormally) and its code, run however the procedure ends.
+    pub on_exit: Option<(Option<String>, Routines)>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Program {
     pub name: String,
@@ -102,6 +149,12 @@ pub struct Program {
     /// Data areas: program field → data area name (DEFINE *DTAARA, or
     /// the DTAARA keyword).
     pub dtaaras: HashMap<String, String>,
+    /// Prototypes, by name.
+    pub protos: HashMap<String, Proto>,
+    /// Procedures, by name.
+    pub procs: HashMap<String, ProcInfo>,
+    /// `ctl-opt main(name)`: the program runs that procedure, no cycle.
+    pub main: Option<String>,
 }
 
 fn expr_name(e: &Option<Expr>) -> Option<String> {
@@ -267,9 +320,220 @@ struct Binder<'a> {
     file_fields: HashMap<String, DType>,
     /// Pending INZ values: (variable, value).
     inz: Vec<(String, Value)>,
+    /// Binding a procedure's local storage.
+    local: bool,
+    /// Local buffers of STATIC variables (moved to global storage).
+    statics: Vec<usize>,
+}
+
+/// What a definitions list declared besides storage: its procedure
+/// interface (name, return type, parameters, keywords).
+type Interface = (String, Option<DType>, Vec<ParamInfo>, Vec<Keyword>);
+
+fn param_flags(d: &Def) -> (bool, bool, bool, bool) {
+    let opts: Vec<String> = keyword(&d.keywords, "OPTIONS")
+        .map(|k| {
+            k.args
+                .iter()
+                .map(|a| a.trim().to_ascii_uppercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    (
+        keyword(&d.keywords, "VALUE").is_some(),
+        keyword(&d.keywords, "CONST").is_some(),
+        opts.iter().any(|o| o == "*NOPASS"),
+        opts.iter().any(|o| o == "*OMIT"),
+    )
+}
+
+fn ext_name(kws: &[Keyword], key: &str) -> Option<Option<String>> {
+    keyword(kws, key).map(|k| {
+        k.args
+            .first()
+            .map(|a| a.trim().trim_matches('\'').to_ascii_uppercase())
+            .filter(|a| !a.is_empty())
+    })
 }
 
 impl Binder<'_> {
+    /// Bind a list of definitions (global, or a procedure's): constants,
+    /// fields, data structures, prototypes (into `protos`), and the
+    /// procedure interface, whose parameters become variables.
+    fn defs(
+        &mut self,
+        defs: &[Def],
+        protos: &mut HashMap<String, Proto>,
+    ) -> Result<Option<Interface>> {
+        let mut pi = None;
+        let mut i = 0;
+        while i < defs.len() {
+            let d = &defs[i];
+            match d.kind {
+                DefKind::Const => {
+                    let text = keyword(&d.keywords, "CONST")
+                        .and_then(|k| k.args.first().cloned())
+                        .or_else(|| {
+                            // A literal written in the keyword area.
+                            let joined = d
+                                .keywords
+                                .iter()
+                                .map(|k| k.name.clone())
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            if joined.is_empty() {
+                                None
+                            } else {
+                                Some(joined)
+                            }
+                        })
+                        .ok_or_else(|| {
+                            anyhow!("line {}: constant {} has no value", d.line, d.name)
+                        })?;
+                    let v = literal_value(&text, &self.syms)
+                        .map_err(|e| anyhow!("line {}: {e}", d.line))?;
+                    self.syms.insert(d.name.clone(), Sym::Const(v));
+                    i += 1;
+                }
+                DefKind::Field => {
+                    let t = self
+                        .resolve_type(d)?
+                        .or_else(|| self.file_fields.get(&d.name).copied())
+                        .ok_or_else(|| {
+                            anyhow!("line {}: {} needs a type and length", d.line, d.name)
+                        })?;
+                    let dim = self.dim(d)?;
+                    let v = self.add_var(&d.name, t, dim);
+                    if self.local && keyword(&d.keywords, "STATIC").is_some() {
+                        self.statics.push(v.buf);
+                    }
+                    self.inz(&d.name.clone(), d)?;
+                    i += 1;
+                }
+                DefKind::Ds => {
+                    let next = self
+                        .ds(defs, i)
+                        .map_err(|e| anyhow!("line {}: {e}", d.line))?;
+                    if self.local && keyword(&d.keywords, "STATIC").is_some() {
+                        self.statics.push(self.bufs.len() - 1);
+                    }
+                    i = next;
+                }
+                DefKind::Proto | DefKind::Interface => {
+                    let interface = d.kind == DefKind::Interface;
+                    let mut params = Vec::new();
+                    let mut j = i + 1;
+                    while j < defs.len() && defs[j].kind == DefKind::Param {
+                        let p = &defs[j];
+                        let (by_value, konst, nopass, omit) = param_flags(p);
+                        let likeds = keyword(&p.keywords, "LIKEDS").is_some();
+                        let (dtype, buf) = if interface {
+                            // The parameter is a variable of the procedure.
+                            if likeds {
+                                self.ds(defs, j)
+                                    .map_err(|e| anyhow!("line {}: {e}", p.line))?;
+                                let Some(Sym::Ds(ds)) = self.syms.get(&p.name) else {
+                                    bail!("line {}: parameter {} is not bound", p.line, p.name)
+                                };
+                                (DType::Char(ds.size as u32), Some(ds.buf))
+                            } else {
+                                let t = self.resolve_type(p)?.ok_or_else(|| {
+                                    anyhow!("line {}: {} needs a type and length", p.line, p.name)
+                                })?;
+                                let dim = self.dim(p)?;
+                                let v = self.add_var(&p.name, t, dim);
+                                (t, Some(v.buf))
+                            }
+                        } else if likeds {
+                            let other = keyword(&p.keywords, "LIKEDS")
+                                .and_then(|k| k.args.first())
+                                .map(|a| a.trim().to_ascii_uppercase())
+                                .unwrap_or_default();
+                            match self.syms.get(&other) {
+                                Some(Sym::Ds(ds)) => (DType::Char(ds.size as u32), None),
+                                _ => {
+                                    bail!("line {}: LIKEDS({other}): not a data structure", p.line)
+                                }
+                            }
+                        } else {
+                            let t = self.resolve_type(p)?.ok_or_else(|| {
+                                anyhow!(
+                                    "line {}: parameter {} needs a type and length",
+                                    p.line,
+                                    p.name
+                                )
+                            })?;
+                            (t, None)
+                        };
+                        params.push(ParamInfo {
+                            name: p.name.clone(),
+                            dtype,
+                            by_value,
+                            konst,
+                            nopass,
+                            omit,
+                            buf,
+                        });
+                        j += 1;
+                    }
+                    let returns = self.resolve_type(d)?;
+                    if interface {
+                        pi = Some((d.name.clone(), returns, params, d.keywords.clone()));
+                    } else {
+                        let extpgm = ext_name(&d.keywords, "EXTPGM")
+                            .map(|n| n.unwrap_or_else(|| d.name.clone()));
+                        let extproc = if extpgm.is_some() {
+                            None
+                        } else {
+                            Some(
+                                ext_name(&d.keywords, "EXTPROC")
+                                    .flatten()
+                                    .unwrap_or_else(|| d.name.clone()),
+                            )
+                        };
+                        protos.insert(
+                            d.name.clone(),
+                            Proto {
+                                name: d.name.clone(),
+                                extpgm,
+                                extproc,
+                                params,
+                                returns,
+                            },
+                        );
+                    }
+                    i = j;
+                }
+                DefKind::Subfield | DefKind::Param => bail!(
+                    "line {}: {} has no data structure or prototype",
+                    d.line,
+                    d.name
+                ),
+            }
+        }
+        Ok(pi)
+    }
+
+    /// Store the pending INZ values.
+    fn apply_inz(&mut self) -> Result<()> {
+        for (name, v) in std::mem::take(&mut self.inz) {
+            if let Some(Sym::Var(var)) = self.syms.get(&name).cloned() {
+                for k in 0..var.dim.max(1) as usize {
+                    let at = var.off + k * var.stride;
+                    let out = &mut self.bufs[var.buf][at..at + var.dtype.size()];
+                    data::store(
+                        &var.dtype,
+                        &v,
+                        out,
+                        data::Fit::Strict { half_adjust: false },
+                        false,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn new_buf(&mut self, size: usize, fill: u8) -> usize {
         self.bufs.push(vec![fill; size]);
         self.bufs.len() - 1
@@ -353,7 +617,7 @@ impl Binder<'_> {
             off: 0,
             dim,
             stride: dtype.size(),
-            local: false,
+            local: self.local,
         };
         self.syms.insert(name.to_string(), Sym::Var(v.clone()));
         v
@@ -486,7 +750,7 @@ impl Binder<'_> {
                 off: *off,
                 dim: *sdim,
                 stride: t.size(),
-                local: false,
+                local: self.local,
             };
             if has_inz || keyword(&sdef.keywords, "INZ").is_some() && !std::ptr::eq(*sdef, d) {
                 for e in 0..dim.max(1) as usize {
@@ -516,7 +780,7 @@ impl Binder<'_> {
                 dim,
                 qualified: qualified || likeds.is_some(),
                 subfields: names,
-                local: false,
+                local: self.local,
             }),
         );
         Ok(j)
@@ -537,6 +801,8 @@ pub fn bind(
         externals,
         file_fields: HashMap::new(),
         inz: vec![],
+        local: false,
+        statics: vec![],
     };
     // Files and their record fields.
     let mut files = Vec::new();
@@ -630,63 +896,8 @@ pub fn bind(
     }
     // Definitions, in order.
     let defs = &src.defs;
-    let mut i = 0;
-    while i < defs.len() {
-        let d = &defs[i];
-        match d.kind {
-            DefKind::Const => {
-                let text = keyword(&d.keywords, "CONST")
-                    .and_then(|k| k.args.first().cloned())
-                    .or_else(|| {
-                        // A literal written in the keyword area.
-                        let joined = d
-                            .keywords
-                            .iter()
-                            .map(|k| k.name.clone())
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        if joined.is_empty() {
-                            None
-                        } else {
-                            Some(joined)
-                        }
-                    })
-                    .ok_or_else(|| anyhow!("line {}: constant {} has no value", d.line, d.name))?;
-                let v =
-                    literal_value(&text, &b.syms).map_err(|e| anyhow!("line {}: {e}", d.line))?;
-                b.syms.insert(d.name.clone(), Sym::Const(v));
-                i += 1;
-            }
-            DefKind::Field => {
-                let t = b
-                    .resolve_type(d)?
-                    .or_else(|| b.file_fields.get(&d.name).copied())
-                    .ok_or_else(|| {
-                        anyhow!("line {}: {} needs a type and length", d.line, d.name)
-                    })?;
-                let dim = b.dim(d)?;
-                b.add_var(&d.name, t, dim);
-                b.inz(&d.name.clone(), d)?;
-                i += 1;
-            }
-            DefKind::Ds => {
-                i = b.ds(defs, i).map_err(|e| anyhow!("line {}: {e}", d.line))?;
-            }
-            DefKind::Proto | DefKind::Interface => {
-                // Prototypes and interfaces: parameters come with calls
-                // and procedures (later milestones); skip their lines.
-                i += 1;
-                while i < defs.len() && defs[i].kind == DefKind::Param {
-                    i += 1;
-                }
-            }
-            DefKind::Subfield | DefKind::Param => bail!(
-                "line {}: {} has no data structure or prototype",
-                d.line,
-                d.name
-            ),
-        }
-    }
+    let mut protos = HashMap::new();
+    let global_pi = b.defs(defs, &mut protos)?;
     // File fields not defined otherwise become standalone fields.
     let names: Vec<(String, DType)> = b.file_fields.iter().map(|(k, v)| (k.clone(), *v)).collect();
     for (n, t) in names {
@@ -700,21 +911,7 @@ pub fn bind(
         b.syms.insert(n.clone(), Sym::Klist(list.clone()));
     }
     // INZ values.
-    for (name, v) in std::mem::take(&mut b.inz) {
-        if let Some(Sym::Var(var)) = b.syms.get(&name).cloned() {
-            for k in 0..var.dim.max(1) as usize {
-                let at = var.off + k * var.stride;
-                let out = &mut b.bufs[var.buf][at..at + var.dtype.size()];
-                data::store(
-                    &var.dtype,
-                    &v,
-                    out,
-                    data::Fit::Strict { half_adjust: false },
-                    false,
-                )?;
-            }
-        }
-    }
+    b.apply_inz()?;
     // Compile-time arrays (CTDATA).
     let mut unnamed = src.ctdata.iter().filter(|c| c.0.is_none());
     for d in defs
@@ -761,6 +958,109 @@ pub fn bind(
         }
     }
     let _ = Fig::Blanks;
+    // Procedures: each with its own local storage, seeing the globals.
+    let mut procs = HashMap::new();
+    for pr in &src.procs {
+        let mut pb = Binder {
+            syms: b.syms.clone(),
+            bufs: vec![],
+            externals,
+            file_fields: b.file_fields.clone(),
+            inz: vec![],
+            local: true,
+            statics: vec![],
+        };
+        let pi = pb
+            .defs(&pr.defs, &mut protos)
+            .map_err(|e| anyhow!("procedure {}: {e}", pr.name))?;
+        pb.apply_inz()?;
+        // STATIC variables keep their values between calls: they live in
+        // global storage.
+        let mut moved: HashMap<usize, usize> = HashMap::new();
+        for lb in pb.statics.clone() {
+            b.bufs.push(pb.bufs[lb].clone());
+            moved.insert(lb, b.bufs.len() - 1);
+        }
+        let mut syms = HashMap::new();
+        for (k, v) in pb.syms {
+            let keep = match &v {
+                Sym::Var(x) => x.local,
+                Sym::Ds(x) => x.local,
+                _ => b.syms.get(&k) != Some(&v),
+            };
+            if !keep {
+                continue;
+            }
+            let v = match v {
+                Sym::Var(mut x) if x.local && moved.contains_key(&x.buf) => {
+                    x.buf = moved[&x.buf];
+                    x.local = false;
+                    Sym::Var(x)
+                }
+                Sym::Ds(mut x) if x.local && moved.contains_key(&x.buf) => {
+                    x.buf = moved[&x.buf];
+                    x.local = false;
+                    Sym::Ds(x)
+                }
+                other => other,
+            };
+            syms.insert(k, v);
+        }
+        let (params, returns) = match pi {
+            Some((_, r, p, _)) => (p, r),
+            None => (vec![], None),
+        };
+        // ON-EXIT splits the calculations: the rest is the exit code.
+        let split = pr.calcs.iter().position(
+            |c| matches!(&c.what, Line::Stmt(Stmt::Op { code, .. }) if code == "ON-EXIT"),
+        );
+        let (body, on_exit) = match split {
+            Some(k) => {
+                let ind = match &pr.calcs[k].what {
+                    Line::Stmt(Stmt::Op { f2, .. }) => expr_name(f2),
+                    _ => None,
+                };
+                let exit = code::build(&pr.calcs[k + 1..])
+                    .map_err(|e| anyhow!("procedure {} ON-EXIT: {e}", pr.name))?;
+                (&pr.calcs[..k], Some((ind, exit)))
+            }
+            None => (&pr.calcs[..], None),
+        };
+        procs.insert(
+            pr.name.clone(),
+            ProcInfo {
+                name: pr.name.clone(),
+                syms,
+                frame: pb.bufs,
+                params,
+                returns,
+                routines: code::build(body).map_err(|e| anyhow!("procedure {}: {e}", pr.name))?,
+                on_exit,
+            },
+        );
+    }
+    // A procedure interface outside any procedure is the program's entry
+    // parameter list (free-form *ENTRY PLIST).
+    let mut entry = src.entry.clone().unwrap_or_default();
+    if let Some((_, _, params, _)) = &global_pi {
+        if entry.is_empty() {
+            entry = params
+                .iter()
+                .map(|p| Parm {
+                    target: Expr::name(&p.name),
+                    value: None,
+                })
+                .collect();
+        }
+    }
+    let main = keyword(&src.control, "MAIN")
+        .and_then(|k| k.args.first())
+        .map(|a| a.trim().to_ascii_uppercase());
+    if let Some(m) = &main {
+        if !procs.contains_key(m) {
+            bail!("ctl-opt main({m}): there is no procedure {m}");
+        }
+    }
     let routines = code::build(&src.calcs)?;
     Ok(Program {
         name: name.to_ascii_uppercase(),
@@ -768,10 +1068,13 @@ pub fn bind(
         globals: b.bufs,
         files,
         routines,
-        entry: src.entry.clone().unwrap_or_default(),
+        entry,
         plists: src.plists.clone(),
         outputs: src.outputs.clone(),
         control: src.control.clone(),
         dtaaras: data_areas(src),
+        protos,
+        procs,
+        main,
     })
 }

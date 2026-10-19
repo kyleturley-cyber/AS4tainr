@@ -2696,4 +2696,46 @@ async fn native_rpg_engine_runs_a_program() {
             "END"
         ]
     );
+
+    // Milestone R4: procedures and calls (ILE RPG Reference: "Subprocedures",
+    // "Passing Parameters", CALL/PARM, EXTPGM, ctl-opt MAIN, STATIC).
+    // Expected values follow from those rules: CONST and VALUE pass copies,
+    // other parameters are passed by reference (the caller sees changes),
+    // STATIC locals keep their value between calls while automatic ones
+    // start over, a program called with CALL or a prototype gets its
+    // parameters by reference, and error indicator 73-74 on CALL catches a
+    // program that cannot be called.
+    let mut owner = as4tainr_core::bridge::connect_db(&url).await.unwrap();
+    for (name, source) in [
+        ("CALLEE", "     C     *ENTRY        PLIST\n     C                   PARM                    NAME             10\n     C                   PARM                    COUNT             5 0\n     C                   EVAL      NAME = 'Changed'\n     C                   EVAL      COUNT = COUNT + 1\n     C                   RETURN\n"),
+        ("MAINPGM", "**FREE\nctl-opt main(go);\ndcl-proc go;\n  dcl-pi *n extpgm('MAINPGM');\n    who char(10);\n  end-pi;\n  dsply ('Hi ' + %trim(who));\n  who = 'Back';\nend-proc;\n"),
+    ] {
+        catalog::create_program(&mut owner, &lib, name, "RPGLE", "", source, true)
+            .await
+            .unwrap();
+    }
+    for (name, source, want) in [
+        ("PROCS", "**FREE\ndcl-s total packed(9:2);\ndcl-ds cust qualified;\n  id zoned(5);\n  name char(20);\nend-ds;\ndcl-pr addTo;\n  amount packed(9:2) const;\n  acc packed(9:2);\nend-pr;\ntotal = 10;\naddTo(5.25: total);\ndsply %char(total);\ndsply %char(double(21));\ndsply greet('Ada');\nfill(cust);\ndsply cust.name;\ndsply %char(fact(5));\ndsply %char(counter());\ndsply %char(counter());\n*inlr = *on;\n\ndcl-proc addTo;\n  dcl-pi *n;\n    amount packed(9:2) const;\n    acc packed(9:2);\n  end-pi;\n  acc += amount;\nend-proc;\n\ndcl-proc double;\n  dcl-pi *n int(10);\n    n int(10) value;\n  end-pi;\n  return n * 2;\nend-proc;\n\ndcl-proc greet;\n  dcl-pi *n varchar(30);\n    who char(10) const;\n  end-pi;\n  return 'Hello, ' + %trim(who);\nend-proc;\n\ndcl-proc fill;\n  dcl-pi *n;\n    c likeds(cust);\n  end-pi;\n  c.name = 'Filled';\nend-proc;\n\ndcl-proc fact;\n  dcl-pi *n packed(15:0);\n    n packed(15:0) value;\n  end-pi;\n  if n <= 1;\n    return 1;\n  endif;\n  return n * fact(n - 1);\nend-proc;\n\ndcl-proc counter;\n  dcl-pi *n int(10) end-pi;\n  dcl-s count int(10) static;\n  dcl-s temp int(10);\n  count += 1;\n  temp += 1;\n  return count * 10 + temp;\nend-proc;\n", vec!["15.25", "42", "Hello, Ada", "Filled", "120", "11", "21"]),
+        ("CALLER", "     D N               S             10    INZ('Orig')\n     D C               S              5  0 INZ(41)\n     C                   CALL      'CALLEE'\n     C                   PARM                    N\n     C                   PARM                    C\n     C     N             DSPLY\n     C     C             DSPLY\n     C                   CALL      'NOSUCH'                             99\n     C   99'missing'     DSPLY\n     C                   SETON                                        LR\n", vec!["Changed", "42", "missing"]),
+        // ON-EXIT runs when the procedure returns; its indicator is off
+        // for a normal end.
+        ("ONEXIT", "**FREE\ndsply %char(t());\n*inlr = *on;\ndcl-proc t;\n  dcl-pi *n int(10) end-pi;\n  dcl-s bad ind inz(*on);\n  return 1;\n  on-exit bad;\n    if not bad;\n      dsply 'clean';\n    endif;\nend-proc;\n", vec!["clean", "1"]),
+        ("CALLER2", "**FREE\ndcl-pr callee extpgm('CALLEE');\n  name char(10);\n  count packed(5:0);\nend-pr;\ndcl-pr mainpgm extpgm('MAINPGM');\n  who char(10);\nend-pr;\ndcl-s n char(10) inz('Orig');\ndcl-s c packed(5:0) inz(41);\ndcl-s w char(10) inz('Ada');\ncallee(n: c);\ndsply n;\ndsply %char(c);\nmainpgm(w);\ndsply w;\n*inlr = *on;\n", vec!["Changed", "42", "Hi Ada", "Back"]),
+    ] {
+        let r = rpg::call(
+            &url,
+            vec![lib.clone()],
+            "QSECOFR".into(),
+            None,
+            None,
+            name.into(),
+            source.into(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(r.error.is_none(), "{name}: {:?}", r.error);
+        let got: Vec<String> = r.messages.iter().map(|m| m.trim_end().to_string()).collect();
+        assert_eq!(got, want, "{name}");
+    }
 }

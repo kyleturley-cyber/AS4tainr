@@ -177,7 +177,7 @@ impl OpenFile {
                 if let Some(n) = job_number {
                     let _ = client
                         .execute(
-                            "UPDATE ibmish.jobs SET activity=$2 WHERE number=$1",
+                            "UPDATE as4tainer.jobs SET activity=$2 WHERE number=$1",
                             &[&n, &a],
                         )
                         .await;

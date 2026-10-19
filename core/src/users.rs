@@ -1,12 +1,12 @@
 //! User profiles (*USRPRF) and sign-on checks.
 //!
 //! Passwords are stored as Argon2id hashes (PHC string format), never in
-//! clear text. The first `init` creates QSECOFR. If IBMISH_QSECOFR_PASSWORD
+//! clear text. The first `init` creates QSECOFR. If AS4TAINER_QSECOFR_PASSWORD
 //! is set, that is its password; otherwise the password is QSECOFR and is
 //! marked expired, so the first sign-on must change it.
 //!
 //! Password case follows the IBM i system value QPWDLVL, set here with
-//! IBMISH_QPWDLVL. IBM ships QPWDLVL 0, where passwords are not case
+//! AS4TAINER_QPWDLVL. IBM ships QPWDLVL 0, where passwords are not case
 //! sensitive: the system changes them to upper case. At levels 2 and 3
 //! they are case sensitive.
 
@@ -20,7 +20,7 @@ use tokio_postgres::Client;
 use crate::catalog::validate_name;
 
 pub const DDL: &str = r#"
-CREATE TABLE IF NOT EXISTS ibmish.user_profiles (
+CREATE TABLE IF NOT EXISTS as4tainer.user_profiles (
     name          text PRIMARY KEY,
     password_hash text NOT NULL,
     pwd_expired   boolean NOT NULL DEFAULT false,
@@ -31,16 +31,16 @@ CREATE TABLE IF NOT EXISTS ibmish.user_profiles (
     last_signon   timestamptz,
     created       timestamptz NOT NULL DEFAULT now()
 );
-ALTER TABLE ibmish.user_profiles ADD COLUMN IF NOT EXISTS usrcls text NOT NULL DEFAULT '*USER';
-UPDATE ibmish.user_profiles SET usrcls = '*SECOFR' WHERE name = 'QSECOFR' AND usrcls = '*USER';
+ALTER TABLE as4tainer.user_profiles ADD COLUMN IF NOT EXISTS usrcls text NOT NULL DEFAULT '*USER';
+UPDATE as4tainer.user_profiles SET usrcls = '*SECOFR' WHERE name = 'QSECOFR' AND usrcls = '*USER';
 -- QSECOFR is shipped without a current library (*CRTDFT); profiles made
--- before ibmish modelled that had QGPL.
-UPDATE ibmish.user_profiles SET curlib = '*CRTDFT'
+-- before as4tainer modelled that had QGPL.
+UPDATE as4tainer.user_profiles SET curlib = '*CRTDFT'
     WHERE name = 'QSECOFR' AND curlib = 'QGPL';
 -- Initial program and initial menu (CRTUSRPRF INLPGM, INLMNU): what runs
 -- after sign-on. IBM's defaults are *NONE and MAIN.
-ALTER TABLE ibmish.user_profiles ADD COLUMN IF NOT EXISTS inlpgm text NOT NULL DEFAULT '*NONE';
-ALTER TABLE ibmish.user_profiles ADD COLUMN IF NOT EXISTS inlmnu text NOT NULL DEFAULT 'MAIN';
+ALTER TABLE as4tainer.user_profiles ADD COLUMN IF NOT EXISTS inlpgm text NOT NULL DEFAULT '*NONE';
+ALTER TABLE as4tainer.user_profiles ADD COLUMN IF NOT EXISTS inlmnu text NOT NULL DEFAULT 'MAIN';
 "#;
 
 /// CRTUSRPRF INLPGM and INLMNU defaults (IBM i CL reference).
@@ -133,12 +133,12 @@ pub struct Profile {
     pub inlmnu: String,
 }
 
-/// The password level (QPWDLVL 0-3) from IBMISH_QPWDLVL; 0 when unset,
+/// The password level (QPWDLVL 0-3) from AS4TAINER_QPWDLVL; 0 when unset,
 /// like a new IBM i.
 pub fn password_level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| {
-        std::env::var("IBMISH_QPWDLVL")
+        std::env::var("AS4TAINER_QPWDLVL")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .filter(|l| *l <= 3)
@@ -179,13 +179,13 @@ pub async fn init(client: &Client) -> Result<()> {
     client.batch_execute(DDL).await?;
     let exists = client
         .query_opt(
-            "SELECT 1 FROM ibmish.user_profiles WHERE name = 'QSECOFR'",
+            "SELECT 1 FROM as4tainer.user_profiles WHERE name = 'QSECOFR'",
             &[],
         )
         .await?
         .is_some();
     if !exists {
-        let (pw, expired) = match std::env::var("IBMISH_QSECOFR_PASSWORD") {
+        let (pw, expired) = match std::env::var("AS4TAINER_QSECOFR_PASSWORD") {
             Ok(p) if !p.is_empty() => (p, false),
             _ => ("QSECOFR".to_string(), true),
         };
@@ -234,7 +234,7 @@ pub async fn create(client: &Client, p: NewProfile) -> Result<()> {
     let status = if p.enabled { "*ENABLED" } else { "*DISABLED" };
     let n = client
         .execute(
-            "INSERT INTO ibmish.user_profiles
+            "INSERT INTO as4tainer.user_profiles
                 (name, password_hash, pwd_expired, special_auth, curlib, text, status, usrcls,
                  inlpgm, inlmnu)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT DO NOTHING",
@@ -259,7 +259,7 @@ pub async fn get(client: &Client, name: &str) -> Result<Option<ProfileInfo>> {
                     to_char(last_signon AT TIME ZONE 'UTC', 'MM/DD/YY HH24:MI:SS'),
                     to_char(created AT TIME ZONE 'UTC', 'MM/DD/YY HH24:MI:SS'),
                     inlpgm, inlmnu
-             FROM ibmish.user_profiles WHERE name = $1",
+             FROM as4tainer.user_profiles WHERE name = $1",
             &[&name, &NO_PASSWORD],
         )
         .await?;
@@ -286,7 +286,7 @@ pub async fn reset_password(client: &Client, name: &str) -> Result<bool> {
     let name = name.trim().to_ascii_uppercase();
     Ok(client
         .execute(
-            "UPDATE ibmish.user_profiles
+            "UPDATE as4tainer.user_profiles
              SET password_hash = $2, pwd_expired = true, status = '*ENABLED'
              WHERE name = $1",
             &[&name, &hash_password(&normalized(&name))?],
@@ -314,7 +314,7 @@ pub async fn change(client: &Client, name: &str, c: &ProfileChanges) -> Result<b
         .map(|e| if e { "*ENABLED" } else { "*DISABLED" }.to_string());
     Ok(client
         .execute(
-            "UPDATE ibmish.user_profiles SET
+            "UPDATE as4tainer.user_profiles SET
                 pwd_expired = COALESCE($2, pwd_expired),
                 status = COALESCE($3, status),
                 curlib = COALESCE($4, curlib),
@@ -342,7 +342,7 @@ pub async fn has_special(client: &Client, name: &str, authority: &str) -> Result
 pub async fn delete(client: &Client, name: &str) -> Result<bool> {
     let name = name.trim().to_ascii_uppercase();
     Ok(client
-        .execute("DELETE FROM ibmish.user_profiles WHERE name = $1", &[&name])
+        .execute("DELETE FROM as4tainer.user_profiles WHERE name = $1", &[&name])
         .await?
         > 0)
 }
@@ -371,7 +371,7 @@ pub async fn authenticate(client: &Client, user: &str, password: &str) -> Result
     let row = client
         .query_opt(
             "SELECT password_hash, pwd_expired, special_auth, curlib, text, status, inlpgm, inlmnu
-             FROM ibmish.user_profiles WHERE name = $1",
+             FROM as4tainer.user_profiles WHERE name = $1",
             &[&user],
         )
         .await?;
@@ -385,12 +385,12 @@ pub async fn authenticate(client: &Client, user: &str, password: &str) -> Result
     };
     let hash: String = row.get(0);
     if !verify_hash(&normalized(password), &hash) {
-        // Passwords set before ibmish followed QPWDLVL were stored as typed.
+        // Passwords set before as4tainer followed QPWDLVL were stored as typed.
         // Accept those as typed, and store them the current way from now on.
         if normalized(password) != password && verify_hash(password, &hash) {
             client
                 .execute(
-                    "UPDATE ibmish.user_profiles SET password_hash = $2 WHERE name = $1",
+                    "UPDATE as4tainer.user_profiles SET password_hash = $2 WHERE name = $1",
                     &[&user, &hash_password(&normalized(password))?],
                 )
                 .await?;
@@ -404,7 +404,7 @@ pub async fn authenticate(client: &Client, user: &str, password: &str) -> Result
     }
     client
         .execute(
-            "UPDATE ibmish.user_profiles SET last_signon = now() WHERE name = $1",
+            "UPDATE as4tainer.user_profiles SET last_signon = now() WHERE name = $1",
             &[&user],
         )
         .await?;
@@ -429,7 +429,7 @@ pub async fn change_password(client: &Client, user: &str, current: &str, new: &s
     }
     client
         .execute(
-            "UPDATE ibmish.user_profiles SET password_hash = $2, pwd_expired = false WHERE name = $1",
+            "UPDATE as4tainer.user_profiles SET password_hash = $2, pwd_expired = false WHERE name = $1",
             &[&user, &hash_password(&normalized(new))?],
         )
         .await?;

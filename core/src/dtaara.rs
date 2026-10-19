@@ -5,7 +5,7 @@
 //! RTVDTAARA, DSPDTAARA and DLTDTAARA, and of the RPG `IN`/`OUT`/`UNLOCK`
 //! operations on `*DTAARA DEFINE`d fields. A data area is an object
 //! (`*DTAARA`) in a library; its description and value live in the catalog
-//! table `ibmish.data_areas`.
+//! table `as4tainer.data_areas`.
 //!
 //! Types: `*CHAR` (1-2000 characters, kept padded with blanks to its
 //! length), `*DEC` (up to 24 digits, up to 9 of them decimals, kept as exact
@@ -24,7 +24,7 @@ use tokio_postgres::GenericClient;
 use crate::catalog::validate_name;
 
 pub const DDL: &str = r#"
-CREATE TABLE IF NOT EXISTS ibmish.data_areas (
+CREATE TABLE IF NOT EXISTS as4tainer.data_areas (
     library  text NOT NULL,
     name     text NOT NULL,
     type     text NOT NULL,
@@ -310,8 +310,8 @@ fn from_row(r: &tokio_postgres::Row) -> Result<DataArea> {
 }
 
 const SELECT: &str = "SELECT d.library, d.name, d.type, d.length, d.decimals, d.value,
-    (SELECT text FROM ibmish.objects o WHERE o.library=d.library AND o.name=d.name AND o.objtype='*DTAARA')
-    FROM ibmish.data_areas d";
+    (SELECT text FROM as4tainer.objects o WHERE o.library=d.library AND o.name=d.name AND o.objtype='*DTAARA')
+    FROM as4tainer.data_areas d";
 
 /// Find a data area: the first library of `libs` that has it. CPF1015 if
 /// none does (`label` names the library in the message).
@@ -364,7 +364,7 @@ pub async fn create<C: GenericClient>(
     let value = normalize(ty, length, decimals, value)?;
     if client
         .query_opt(
-            "SELECT 1 FROM ibmish.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
+            "SELECT 1 FROM as4tainer.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
             &[&lib],
         )
         .await?
@@ -376,9 +376,9 @@ pub async fn create<C: GenericClient>(
     let r = client
         .execute(
             "WITH o AS (
-                INSERT INTO ibmish.objects (library, name, objtype, attribute, text)
+                INSERT INTO as4tainer.objects (library, name, objtype, attribute, text)
                 VALUES ($1, $2, '*DTAARA', '', $7) ON CONFLICT DO NOTHING RETURNING 1)
-             INSERT INTO ibmish.data_areas
+             INSERT INTO as4tainer.data_areas
              SELECT $1, $2, $3, $4, $5, $6 FROM o",
             &[
                 &lib,
@@ -443,7 +443,7 @@ pub async fn change<C: GenericClient>(
         let new = d.changed(part, value)?;
         client
             .execute(
-                "UPDATE ibmish.data_areas SET value=$3 WHERE library=$1 AND name=$2",
+                "UPDATE as4tainer.data_areas SET value=$3 WHERE library=$1 AND name=$2",
                 &[&d.library, &d.name, &new],
             )
             .await?;
@@ -464,8 +464,8 @@ pub async fn delete<C: GenericClient>(
     let d = resolve(client, qualified, libl, curlib).await?;
     client
         .execute(
-            "WITH d AS (DELETE FROM ibmish.data_areas WHERE library=$1 AND name=$2 RETURNING 1)
-             DELETE FROM ibmish.objects WHERE library=$1 AND name=$2 AND objtype='*DTAARA'",
+            "WITH d AS (DELETE FROM as4tainer.data_areas WHERE library=$1 AND name=$2 RETURNING 1)
+             DELETE FROM as4tainer.objects WHERE library=$1 AND name=$2 AND objtype='*DTAARA'",
             &[&d.library, &d.name],
         )
         .await?;
@@ -506,7 +506,7 @@ pub async fn write<C: GenericClient>(
     let new = normalize(d.ty, d.length, d.decimals, value)?;
     client
         .execute(
-            "UPDATE ibmish.data_areas SET value=$3 WHERE library=$1 AND name=$2",
+            "UPDATE as4tainer.data_areas SET value=$3 WHERE library=$1 AND name=$2",
             &[&d.library, &d.name, &new],
         )
         .await?;

@@ -3,7 +3,7 @@
 //! when the operator presses an AID key.
 //!
 //! Written from the public 5250 data stream descriptions (RFC 1205 and the
-//! 5250 functions reference). It covers what ibmish's server sends (Clear
+//! 5250 functions reference). It covers what as4tainer's server sends (Clear
 //! Unit, Write To Display with SBA/IC/SF, Read MDT Fields) plus the common
 //! orders a host may add (RA, EA, MC, SOH, TD), so it can be pointed at
 //! other 5250 hosts later. Coordinates are 1-based in the data stream and
@@ -249,7 +249,7 @@ impl Display {
                     self.locked = false;
                 }
                 cmd::WRITE_STRUCTURED_FIELD => {
-                    // Length-prefixed; nothing ibmish needs answers to.
+                    // Length-prefixed; nothing as4tainer needs answers to.
                     let len = data
                         .get(i..i + 2)
                         .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
@@ -459,7 +459,7 @@ mod tests {
         (row - 1) * COLS + col - 1
     }
 
-    /// The screens come from ibmish's own encoder (ds.rs), whose byte layout
+    /// The screens come from as4tainer's own encoder (ds.rs), whose byte layout
     /// is checked against the 5250 data stream description in its tests.
     fn signon() -> Screen {
         let mut s = Screen::new();

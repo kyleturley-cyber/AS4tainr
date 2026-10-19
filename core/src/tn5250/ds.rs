@@ -1,6 +1,6 @@
 //! 5250 data stream: building display screens and parsing the input that
 //! comes back. Written from the public 5250 data stream descriptions
-//! (RFC 1205 and the 5250 functions reference); only what ibmish needs so far.
+//! (RFC 1205 and the 5250 functions reference); only what as4tainer needs so far.
 //!
 //! Screen coordinates are 1-based (row 1..=24, column 1..=80), as in the
 //! data stream itself.

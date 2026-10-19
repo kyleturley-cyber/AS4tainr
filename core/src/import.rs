@@ -1,4 +1,4 @@
-//! `ibmish import DIR --lib LIB`: bring an application's source and data
+//! `as4tainer import DIR --lib LIB`: bring an application's source and data
 //! into a library and build its objects.
 //!
 //! The directory is laid out the way IBM i source is usually kept in git:
@@ -19,7 +19,7 @@
 //! 3. CRTLF, CRTDSPF;
 //! 4. CRTBNDCL (CLLE) and CRTCLPGM (CLP), CRTBNDRPG (RPGLE).
 //!
-//! Members ibmish cannot build yet (PRTF, SQLRPGLE, RPG III, COBOL, CMD)
+//! Members as4tainer cannot build yet (PRTF, SQLRPGLE, RPG III, COBOL, CMD)
 //! are kept as source and reported.
 
 use anyhow::{bail, Context, Result};
@@ -398,7 +398,7 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         )
     }) {
         report.lines.push(format!(
-            "  {}: {} source kept; ibmish cannot create {} objects yet",
+            "  {}: {} source kept; as4tainer cannot create {} objects yet",
             m.member, m.srctype, m.srctype
         ));
     }

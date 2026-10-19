@@ -7,8 +7,8 @@
 //! signs off.
 //!
 //! The system's menus (MAIN and the menus it leads to) are built in and
-//! belong to QSYS. Their titles, options and texts are ibmish's own: they
-//! lead to the commands ibmish has, not to the menus of IBM i.
+//! belong to QSYS. Their titles, options and texts are as4tainer's own: they
+//! lead to the commands as4tainer has, not to the menus of IBM i.
 //!
 //! User menus are made with CRTMNU. Only TYPE(*PGM) is supported: the menu
 //! is a program, called when the menu is shown (it draws its own display);
@@ -21,7 +21,7 @@ use tokio_postgres::Client;
 use crate::catalog::validate_name;
 
 pub const DDL: &str = r#"
-CREATE TABLE IF NOT EXISTS ibmish.menus (
+CREATE TABLE IF NOT EXISTS as4tainer.menus (
     library   text NOT NULL,
     name      text NOT NULL,
     menu_type text NOT NULL,
@@ -60,7 +60,7 @@ const SIGN_OFF: MenuOption = o(90, "Sign off", "SIGNOFF");
 pub const BUILTIN: &[BuiltinMenu] = &[
     BuiltinMenu {
         name: "MAIN",
-        title: "ibmish Main Menu",
+        title: "as4tainer Main Menu",
         options: &[
             o(1, "User tasks", "GO USER"),
             o(2, "Jobs and printed output", "GO JOBS"),
@@ -189,7 +189,7 @@ pub async fn find(client: &Client, qualified: &str, libl: &[String]) -> Result<M
     for l in &libs {
         if let Some(r) = client
             .query_opt(
-                "SELECT program FROM ibmish.menus WHERE library=$1 AND name=$2",
+                "SELECT program FROM as4tainer.menus WHERE library=$1 AND name=$2",
                 &[l, &name],
             )
             .await?
@@ -223,9 +223,9 @@ pub async fn create(
     let r = client
         .execute(
             "WITH o AS (
-                INSERT INTO ibmish.objects (library, name, objtype, attribute, text)
+                INSERT INTO as4tainer.objects (library, name, objtype, attribute, text)
                 VALUES ($1, $2, '*MENU', 'PGM', $4) ON CONFLICT DO NOTHING RETURNING 1)
-             INSERT INTO ibmish.menus SELECT $1, $2, '*PGM', $3 FROM o",
+             INSERT INTO as4tainer.menus SELECT $1, $2, '*PGM', $3 FROM o",
             &[&lib, &name, &program, &text],
         )
         .await?;
@@ -239,8 +239,8 @@ pub async fn create(
 pub async fn delete(client: &Client, library: &str, name: &str) -> Result<bool> {
     let n = client
         .execute(
-            "WITH m AS (DELETE FROM ibmish.menus WHERE library=$1 AND name=$2 RETURNING 1)
-             DELETE FROM ibmish.objects WHERE library=$1 AND name=$2 AND objtype='*MENU'
+            "WITH m AS (DELETE FROM as4tainer.menus WHERE library=$1 AND name=$2 RETURNING 1)
+             DELETE FROM as4tainer.objects WHERE library=$1 AND name=$2 AND objtype='*MENU'
                 AND EXISTS (SELECT 1 FROM m)",
             &[&library, &name],
         )
@@ -253,7 +253,7 @@ pub async fn library_of(client: &Client, name: &str, libl: &[String]) -> Result<
     for l in libl {
         if client
             .query_opt(
-                "SELECT 1 FROM ibmish.menus WHERE library=$1 AND name=$2",
+                "SELECT 1 FROM as4tainer.menus WHERE library=$1 AND name=$2",
                 &[l, &name],
             )
             .await?
@@ -285,7 +285,7 @@ mod tests {
                 "{}: duplicate option",
                 m.name
             );
-            // Every option's command is a command ibmish knows, and every
+            // Every option's command is a command as4tainer knows, and every
             // GO leads to a menu that exists.
             for o in m.options {
                 let cmd = o.command.trim_start_matches('?');

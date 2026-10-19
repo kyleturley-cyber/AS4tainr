@@ -1,6 +1,6 @@
 # Order entry sample (the Phase 2 gate)
 
-Phase 2 of the roadmap ends when "a sample order-entry app runs unmodified". This is that app. It is written the way such programs are written on IBM i: fixed-form RPG IV with an input subfile, DDS physical files and a display file, a data area for the next order number, and a CL program that starts it. Nothing in it is specific to ibmish.
+Phase 2 of the roadmap ends when "a sample order-entry app runs unmodified". This is that app. It is written the way such programs are written on IBM i: fixed-form RPG IV with an input subfile, DDS physical files and a display file, a data area for the next order number, and a CL program that starts it. Nothing in it is specific to as4tainer.
 
 The end-to-end test (`tools/e2e_5250.py`, run in CI with Jariko and the real tn5250 client) signs on, enters an order with mistakes, corrects them, creates the order and checks the files.
 
@@ -15,7 +15,7 @@ The end-to-end test (`tools/e2e_5250.py`, run in CI with Jariko and the real tn5
 | `ITEMMAST` | `*FILE` (PF) | `samples/qddssrc/ITEMMAST.pf` | Items with price and quantity on hand |
 | `ORDHDR` | `*FILE` (PF) | `samples/qddssrc/ORDHDR.pf` | Order headers |
 | `ORDLIN` | `*FILE` (PF) | `samples/qddssrc/ORDLIN.pf` | Order lines |
-| `ORDNXT` | `*DTAARA` (`*DEC 7 0`) | `scripts/samples.sh` (`ibmish system "CRTDTAARA ..."`) | The next order number, 1004 after the sample orders |
+| `ORDNXT` | `*DTAARA` (`*DEC 7 0`) | `scripts/samples.sh` (`as4tainer system "CRTDTAARA ..."`) | The next order number, 1004 after the sample orders |
 
 `scripts/samples.sh` creates them in `QGPL`, and the Docker image runs it at start-up.
 
@@ -24,7 +24,7 @@ The end-to-end test (`tools/e2e_5250.py`, run in CI with Jariko and the real tn5
 Sign on and type `CALL ORDENTC`.
 
 ```
- IBMISH                           Order Entry                          10/16/26
+ AS4TAINER                           Order Entry                          10/16/26
 
  Customer  . . :     2  Midwest Fasteners
  City  . . . . : Chicago

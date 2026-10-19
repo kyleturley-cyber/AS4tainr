@@ -2,7 +2,7 @@
 
 Version 6 added program objects and source members: `pgmsrc` and `srcmbr`. Version 5 added spooled files: `splopen`, `splwrite`, `splclose`. Version 4 added record locks: `open` takes `update`, reads take `lock`, and the `unlock` operation. Version 3 added the data area operations `dtaara_in`, `dtaara_out` and `dtaara_unlock`. Version 2 added the display file operations `dspwrite`, `sflwrite`, `sflchain`, `sflreadc` and `sflupdate`.
 
-The bridge connects the JVM (Jariko running RPG) to ibmish core, which carries out every file operation. It uses TCP on loopback only, with one UTF-8 JSON object per line in each direction, strictly request then response.
+The bridge connects the JVM (Jariko running RPG) to as4tainer core, which carries out every file operation. It uses TCP on loopback only, with one UTF-8 JSON object per line in each direction, strictly request then response.
 
 One connection is one job's database session. The handles it opens belong to that connection and disappear when it closes.
 
@@ -29,7 +29,7 @@ Records are objects that map field names to strings:
 | `hello` | | `server`, `version` | Sent first; clients refuse a version mismatch |
 | `metadata` | `file` | `library`, `name`, `format`, `text`, `unique`, `keys`, `fields[]` | Each field has `name`, `type` (`A`/`P`/`S`), `length`, `decimals`, `numeric`, `text`. `file` may be `LIB/FILE`; otherwise the library list is searched |
 | `open` | `file`, `update`? | `handle` | With `update: true` (RPG file type U) the file locks each record it reads; see [record-locks.md](record-locks.md) |
-| `splopen` | `file`, `user_data` | `spl` | Starts a spooled file for the job (printer output). Without a job (`ibmish call`), lines go to standard output instead |
+| `splopen` | `file`, `user_data` | `spl` | Starts a spooled file for the job (printer output). Without a job (`as4tainer call`), lines go to standard output instead |
 | `splwrite` | `spl`, `lines` | | `lines` is a list of `[page, line, text]` |
 | `splclose` | `spl` | | The spooled file is complete (status RDY); see [spooled-files.md](spooled-files.md) |
 | `unlock` | `handle` | | Releases the record this open file holds locked (RPG `UNLOCK`) |
@@ -53,7 +53,7 @@ Records are objects that map field names to strings:
 | `dtaara_in` | `name`, `lock`? | `library`, `name`, `type`, `length`, `decimals`, `value` | RPG `IN`: reads a data area found through the library list. `type` is `*CHAR`, `*DEC` or `*LGL`; `value` is the padded text, decimal text with `decimals` places, or `0`/`1`. With `lock: true` (`IN *LOCK`) this connection holds the data area until `dtaara_out`, `dtaara_unlock` or the connection closes; others wait |
 | `dtaara_out` | `name`, `value` | | RPG `OUT`: writes the whole value (decimal text for `*DEC`); a value that does not fit fails. Releases this connection's lock |
 | `dtaara_unlock` | `name` | | Releases this connection's lock without writing |
-| `pgmsrc` | `name`, `library`? | `found`, `library`, `source` | The source of an RPG program object (CRTBNDRPG, attribute RPGLE) in `library`, or the first on the library list. The runner asks for the program called (the core passes its library in `IBMISH_PGM_LIB`) and for programs it calls. Needs *USE authority to the program. `found: false` when there is no such RPG program (the runner then looks in `IBMISH_PGM_PATH`) |
+| `pgmsrc` | `name`, `library`? | `found`, `library`, `source` | The source of an RPG program object (CRTBNDRPG, attribute RPGLE) in `library`, or the first on the library list. The runner asks for the program called (the core passes its library in `AS4TAINER_PGM_LIB`) and for programs it calls. Needs *USE authority to the program. `found: false` when there is no such RPG program (the runner then looks in `AS4TAINER_PGM_PATH`) |
 | `srcmbr` | `member`, `file`?, `library`? | `found`, `library`, `source` | `/COPY`: a source member (`file` default QRPGLESRC, `library` default the library list). A `member` with `.` or `/` in it is a stream file path (`/INCLUDE 'x.rpgleinc'`): the shortest stream file path ending with it; `library` is then the path found |
 
 All connections of one bridge (one program call) share the display state: the records on the screen and the subfiles.

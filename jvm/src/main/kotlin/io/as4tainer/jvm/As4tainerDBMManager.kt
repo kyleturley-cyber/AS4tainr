@@ -1,31 +1,31 @@
-package io.ibmish.jvm
+package io.as4tainer.jvm
 
 import com.smeup.dbnative.ConnectionConfig
 import com.smeup.dbnative.DBManagerBaseImpl
 import com.smeup.dbnative.file.DBFile
 import com.smeup.dbnative.model.Field
 import com.smeup.dbnative.model.FileMetadata
-import io.ibmish.bridge.BridgeClient
+import io.as4tainer.bridge.BridgeClient
 
 /**
- * A reload DBMManager that sends every file operation to ibmish core over
+ * A reload DBMManager that sends every file operation to as4tainer core over
  * the bridge, instead of talking to a database over JDBC.
  *
- * Configure it with `impl = io.ibmish.jvm.IbmishDBMManager` and
- * `url = ibmish://HOST:PORT`. reload instantiates it reflectively with a
+ * Configure it with `impl = io.as4tainer.jvm.As4tainerDBMManager` and
+ * `url = as4tainer://HOST:PORT`. reload instantiates it reflectively with a
  * single ConnectionConfig argument.
  */
-class IbmishDBMManager(
+class As4tainerDBMManager(
     override val connectionConfig: ConnectionConfig,
 ) : DBManagerBaseImpl<String, Any>() {
     private val client: BridgeClient by lazy { BridgeClient.connect(hostPort()) }
-    private val openFiles = mutableMapOf<String, IbmishDBFile>()
+    private val openFiles = mutableMapOf<String, As4tainerDBFile>()
 
     private fun hostPort(): String = connectionConfig.url.removePrefix(URL_PREFIX)
 
     override fun validateConfig() {
         require(connectionConfig.url.startsWith(URL_PREFIX)) {
-            "ibmish connection URLs look like ${URL_PREFIX}HOST:PORT, got ${connectionConfig.url}"
+            "as4tainer connection URLs look like ${URL_PREFIX}HOST:PORT, got ${connectionConfig.url}"
         }
     }
 
@@ -35,13 +35,13 @@ class IbmishDBMManager(
         try {
             client.metadata(name)
             true
-        } catch (e: io.ibmish.bridge.BridgeException) {
+        } catch (e: io.as4tainer.bridge.BridgeException) {
             false
         }
 
     override fun openFile(name: String): DBFile =
         openFiles.getOrPut(name.uppercase()) {
-            IbmishDBFile(name.uppercase(), metadataOf(name), client)
+            As4tainerDBFile(name.uppercase(), metadataOf(name), client)
         }
 
     override fun closeFile(name: String) {
@@ -55,7 +55,7 @@ class IbmishDBMManager(
     }
 
     companion object {
-        const val URL_PREFIX = "ibmish://"
+        const val URL_PREFIX = "as4tainer://"
 
         @Suppress("UNCHECKED_CAST")
         fun reloadMetadata(md: Map<String, Any?>): FileMetadata {

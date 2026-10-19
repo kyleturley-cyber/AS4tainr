@@ -1,1 +1,1 @@
-rootProject.name = "ibmish-jvm"
+rootProject.name = "as4tainer-jvm"

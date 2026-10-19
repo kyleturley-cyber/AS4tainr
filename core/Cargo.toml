@@ -1,13 +1,13 @@
 [package]
-name = "ibmish-core"
-description = "ibmish core: object catalog, DDS, record-level access and the JVM bridge"
+name = "as4tainer-core"
+description = "as4tainer core: object catalog, DDS, record-level access and the JVM bridge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "ibmish"
+name = "as4tainer"
 path = "src/main.rs"
 
 [lib]

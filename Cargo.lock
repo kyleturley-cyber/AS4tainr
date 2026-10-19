@@ -77,6 +77,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
+name = "as4tainer-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "clap",
+ "password-hash",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -466,22 +482,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
 dependencies = [
  "typenum",
-]
-
-[[package]]
-name = "ibmish-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "argon2",
- "clap",
- "password-hash",
- "rust_decimal",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-postgres",
 ]
 
 [[package]]

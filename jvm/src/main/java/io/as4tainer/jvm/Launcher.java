@@ -1,10 +1,10 @@
-package io.ibmish.jvm;
+package io.as4tainer.jvm;
 
 import com.smeup.rpgparser.interpreter.FeaturesFactory;
 import java.io.PrintStream;
 
 /**
- * Entry point of ibmish-jvm.jar.
+ * Entry point of as4tainer-jvm.jar.
  *
  * Jariko prints a version banner and its feature-flag status on standard output
  * the first time it starts. Standard output belongs to the RPG program (DSPLY

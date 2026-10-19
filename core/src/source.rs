@@ -6,8 +6,8 @@
 //! SRCFILE and SRCMBR and copy what they need: changing a member does not
 //! change an object until it is created again.
 //!
-//! ibmish keeps a source file as a *FILE object (attribute PF-SRC) and its
-//! members as text in `ibmish.source_members`. Source files cannot be read
+//! as4tainer keeps a source file as a *FILE object (attribute PF-SRC) and its
+//! members as text in `as4tainer.source_members`. Source files cannot be read
 //! with record-level access yet (no SRCSEQ/SRCDAT/SRCDTA records).
 
 use anyhow::{bail, Result};
@@ -16,7 +16,7 @@ use tokio_postgres::Client;
 use crate::catalog::validate_name;
 
 pub const DDL: &str = r#"
-CREATE TABLE IF NOT EXISTS ibmish.source_members (
+CREATE TABLE IF NOT EXISTS as4tainer.source_members (
     library  text NOT NULL,
     file     text NOT NULL,
     member   text NOT NULL,
@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS ibmish.source_members (
 );
 -- Stream files (a small IFS): include files that source refers to by
 -- path, such as RPG `/INCLUDE 'header.rpgleinc'`.
-CREATE TABLE IF NOT EXISTS ibmish.stream_files (
+CREATE TABLE IF NOT EXISTS as4tainer.stream_files (
     path    text PRIMARY KEY,
     data    text NOT NULL,
     changed timestamptz NOT NULL DEFAULT now()
@@ -75,7 +75,7 @@ pub async fn create_file(client: &Client, library: &str, name: &str, text: &str)
     }
     let n = client
         .execute(
-            "INSERT INTO ibmish.objects (library, name, objtype, attribute, text)
+            "INSERT INTO as4tainer.objects (library, name, objtype, attribute, text)
              VALUES ($1, $2, '*FILE', 'PF-SRC', $3) ON CONFLICT DO NOTHING",
             &[&lib, &name, &text],
         )
@@ -90,7 +90,7 @@ pub async fn create_file(client: &Client, library: &str, name: &str, text: &str)
 pub async fn is_source_file(client: &Client, library: &str, name: &str) -> Result<bool> {
     Ok(client
         .query_opt(
-            "SELECT 1 FROM ibmish.objects WHERE library=$1 AND name=$2 AND objtype='*FILE' AND attribute='PF-SRC'",
+            "SELECT 1 FROM as4tainer.objects WHERE library=$1 AND name=$2 AND objtype='*FILE' AND attribute='PF-SRC'",
             &[&library, &name],
         )
         .await?
@@ -109,11 +109,11 @@ pub async fn put_member(client: &Client, m: &Member, replace: bool) -> Result<()
         );
     }
     let sql = if replace {
-        "INSERT INTO ibmish.source_members VALUES ($1,$2,$3,$4,$5,$6, now())
+        "INSERT INTO as4tainer.source_members VALUES ($1,$2,$3,$4,$5,$6, now())
          ON CONFLICT (library, file, member) DO UPDATE
          SET srctype=EXCLUDED.srctype, text=EXCLUDED.text, source=EXCLUDED.source, changed=now()"
     } else {
-        "INSERT INTO ibmish.source_members VALUES ($1,$2,$3,$4,$5,$6, now()) ON CONFLICT DO NOTHING"
+        "INSERT INTO as4tainer.source_members VALUES ($1,$2,$3,$4,$5,$6, now()) ON CONFLICT DO NOTHING"
     };
     let n = client
         .execute(
@@ -147,7 +147,7 @@ pub async fn find_member(
         }
         let Some(r) = client
             .query_opt(
-                "SELECT srctype, text, source FROM ibmish.source_members
+                "SELECT srctype, text, source FROM as4tainer.source_members
                  WHERE library=$1 AND file=$2 AND member=$3",
                 &[lib, &file, &member],
             )
@@ -175,7 +175,7 @@ pub async fn members(
 ) -> Result<Vec<(String, String, String)>> {
     Ok(client
         .query(
-            "SELECT member, srctype, text FROM ibmish.source_members
+            "SELECT member, srctype, text FROM as4tainer.source_members
              WHERE library=$1 AND file=$2 ORDER BY member",
             &[&library, &file],
         )
@@ -189,7 +189,7 @@ pub async fn members(
 pub async fn put_stream_file(client: &Client, path: &str, data: &str) -> Result<()> {
     client
         .execute(
-            "INSERT INTO ibmish.stream_files VALUES ($1, $2, now())
+            "INSERT INTO as4tainer.stream_files VALUES ($1, $2, now())
              ON CONFLICT (path) DO UPDATE SET data=EXCLUDED.data, changed=now()",
             &[&path, &data],
         )
@@ -210,7 +210,7 @@ pub async fn find_stream_file(client: &Client, path: &str) -> Result<Option<(Str
     );
     let r = client
         .query_opt(
-            "SELECT path, data FROM ibmish.stream_files
+            "SELECT path, data FROM as4tainer.stream_files
              WHERE lower(path) = lower($1) OR lower(path) LIKE lower($2)
              ORDER BY lower(path) = lower($1) DESC, length(path) LIMIT 1",
             &[&want, &suffix],

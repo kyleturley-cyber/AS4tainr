@@ -23,7 +23,7 @@ use tokio_postgres::Client;
 use crate::jobs::JobId;
 
 pub const DDL: &str = r#"
-CREATE TABLE IF NOT EXISTS ibmish.spooled_files (
+CREATE TABLE IF NOT EXISTS as4tainer.spooled_files (
     id        bigserial PRIMARY KEY,
     job       bigint NOT NULL,
     job_name  text NOT NULL,          -- number/user/name
@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS ibmish.spooled_files (
     pages     int NOT NULL DEFAULT 0,
     created   timestamptz NOT NULL DEFAULT now()
 );
-CREATE TABLE IF NOT EXISTS ibmish.spool_lines (
+CREATE TABLE IF NOT EXISTS as4tainer.spool_lines (
     spl   bigint NOT NULL,
     seq   int NOT NULL,
     page  int NOT NULL,
@@ -91,9 +91,9 @@ fn row(r: &tokio_postgres::Row) -> SpooledFile {
 pub async fn open(client: &Client, job: &JobId, file: &str, user_data: &str) -> Result<i64> {
     let r = client
         .query_one(
-            "INSERT INTO ibmish.spooled_files (job, job_name, user_name, file, number, user_data)
+            "INSERT INTO as4tainer.spooled_files (job, job_name, user_name, file, number, user_data)
              VALUES ($1, $2, $3, $4,
-                     (SELECT coalesce(max(number), 0) + 1 FROM ibmish.spooled_files WHERE job = $1), $5)
+                     (SELECT coalesce(max(number), 0) + 1 FROM as4tainer.spooled_files WHERE job = $1), $5)
              RETURNING id",
             &[
                 &job.number,
@@ -112,8 +112,8 @@ pub async fn write(client: &Client, id: i64, lines: &[(i32, i32, String)]) -> Re
     for (page, line, text) in lines {
         client
             .execute(
-                "INSERT INTO ibmish.spool_lines (spl, seq, page, line, text)
-                 VALUES ($1, (SELECT coalesce(max(seq), 0) + 1 FROM ibmish.spool_lines WHERE spl = $1), $2, $3, $4)",
+                "INSERT INTO as4tainer.spool_lines (spl, seq, page, line, text)
+                 VALUES ($1, (SELECT coalesce(max(seq), 0) + 1 FROM as4tainer.spool_lines WHERE spl = $1), $2, $3, $4)",
                 &[&id, page, line, &text.trim_end()],
             )
             .await?;
@@ -125,8 +125,8 @@ pub async fn write(client: &Client, id: i64, lines: &[(i32, i32, String)]) -> Re
 pub async fn close(client: &Client, id: i64) -> Result<()> {
     client
         .execute(
-            "UPDATE ibmish.spooled_files SET status = 'RDY',
-                 pages = (SELECT coalesce(max(page), 0) FROM ibmish.spool_lines WHERE spl = $1)
+            "UPDATE as4tainer.spooled_files SET status = 'RDY',
+                 pages = (SELECT coalesce(max(page), 0) FROM as4tainer.spool_lines WHERE spl = $1)
              WHERE id = $1",
             &[&id],
         )
@@ -165,7 +165,7 @@ pub async fn print_lines(
 pub async fn for_user(client: &Client, user: &str) -> Result<Vec<SpooledFile>> {
     Ok(client
         .query(
-            &format!("SELECT {COLS} FROM ibmish.spooled_files WHERE user_name = $1 ORDER BY id"),
+            &format!("SELECT {COLS} FROM as4tainer.spooled_files WHERE user_name = $1 ORDER BY id"),
             &[&user],
         )
         .await?
@@ -185,7 +185,7 @@ pub async fn find(
     client
         .query_opt(
             &format!(
-                "SELECT {COLS} FROM ibmish.spooled_files
+                "SELECT {COLS} FROM as4tainer.spooled_files
                  WHERE file = $1 AND job = $2 AND ($3::int IS NULL OR number = $3)
                  ORDER BY number DESC LIMIT 1"
             ),
@@ -207,7 +207,7 @@ pub async fn find(
 pub async fn pages(client: &Client, id: i64) -> Result<Vec<Vec<String>>> {
     let rows = client
         .query(
-            "SELECT page, line, text FROM ibmish.spool_lines WHERE spl = $1 ORDER BY seq",
+            "SELECT page, line, text FROM as4tainer.spool_lines WHERE spl = $1 ORDER BY seq",
             &[&id],
         )
         .await?;
@@ -230,10 +230,10 @@ pub async fn pages(client: &Client, id: i64) -> Result<Vec<Vec<String>>> {
 /// DLTSPLF.
 pub async fn delete(client: &Client, id: i64) -> Result<()> {
     client
-        .execute("DELETE FROM ibmish.spool_lines WHERE spl = $1", &[&id])
+        .execute("DELETE FROM as4tainer.spool_lines WHERE spl = $1", &[&id])
         .await?;
     client
-        .execute("DELETE FROM ibmish.spooled_files WHERE id = $1", &[&id])
+        .execute("DELETE FROM as4tainer.spooled_files WHERE id = $1", &[&id])
         .await?;
     Ok(())
 }

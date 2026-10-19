@@ -1,6 +1,6 @@
 # Spooled files
 
-Printed output on IBM i does not go straight to a printer. It becomes a **spooled file** that waits on an output queue, where the user can display it, print it or delete it. ibmish keeps spooled files the same way. They are written from IBM's public documentation of printer files and spooled files.
+Printed output on IBM i does not go straight to a printer. It becomes a **spooled file** that waits on an output queue, where the user can display it, print it or delete it. as4tainer keeps spooled files the same way. They are written from IBM's public documentation of printer files and spooled files.
 
 ## Where spooled files come from
 
@@ -69,7 +69,7 @@ Each spooled file belongs to the job that made it and to that job's user. It is 
          Customers:     5                         Total balance:     10,001,485.24
 ```
 
-`ibmish call CUSTPRT`, which runs without a job, prints the report to standard output. The demo compares that with `samples/expected/CUSTPRT.txt`. The expected layout was worked out by hand from the O specs, not copied from a run.
+`as4tainer call CUSTPRT`, which runs without a job, prints the report to standard output. The demo compares that with `samples/expected/CUSTPRT.txt`. The expected layout was worked out by hand from the O specs, not copied from a run.
 
 What is supported:
 
@@ -82,7 +82,7 @@ What is supported:
 
 ## How it works
 
-Jariko parses O specs but does nothing with them, and `EXCEPT` is not implemented. When a program is loaded, the runner (`Printers.java`) reads its PRINTER F specs and their O specs, and replaces each `EXCEPT` with a signal (the same mechanism as record locks, see [record-locks.md](record-locks.md)). On the signal, it lays out the lines from the program's variables and sends them to ibmish core (bridge operations `splopen`, `splwrite`, `splclose`, protocol version 5). Core keeps them by page and line (`ibmish.spooled_files`, `ibmish.spool_lines`). The spooled file is closed when the program ends.
+Jariko parses O specs but does nothing with them, and `EXCEPT` is not implemented. When a program is loaded, the runner (`Printers.java`) reads its PRINTER F specs and their O specs, and replaces each `EXCEPT` with a signal (the same mechanism as record locks, see [record-locks.md](record-locks.md)). On the signal, it lays out the lines from the program's variables and sends them to as4tainer core (bridge operations `splopen`, `splwrite`, `splclose`, protocol version 5). Core keeps them by page and line (`as4tainer.spooled_files`, `as4tainer.spool_lines`). The spooled file is closed when the program ends.
 
 ## Not yet
 

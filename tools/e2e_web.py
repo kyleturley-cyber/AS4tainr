@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end test of the browser 5250 terminal (`ibmish tn5250 --web-listen`)
+"""End-to-end test of the browser 5250 terminal (`as4tainer tn5250 --web-listen`)
 in a real browser (Chromium, through Playwright).
 
 Expects the sample objects in QGPL (scripts/samples.sh). QSECOFR's password
@@ -140,7 +140,7 @@ with sync_playwright() as pw:
           "the key bar has F13-F24 above F1-F12, like a 122-key 5250 keyboard")
 
     t.wait_for("Sign On")
-    check("IBMISH" in t.line(2) and "QPADEV" in t.line(4), "the browser shows the sign-on screen", t)
+    check("AS4TAINR" in t.line(2) and "QPADEV" in t.line(4), "the browser shows the sign-on screen", t)
     check(page.locator("#conn").get_attribute("data-state") == "open", "the connection indicator says connected")
 
     t.type("qsecofr"); t.key("Tab"); t.type("not-it"); t.key("Enter")

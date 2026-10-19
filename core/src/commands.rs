@@ -34,7 +34,7 @@ pub struct Job<'a> {
     /// The job's display, for programs that use display files.
     pub display: Option<bridge::DisplayHandle>,
     /// The job's qualified name, for jobs the system knows about
-    /// (interactive sessions, submitted jobs). None for `ibmish call`.
+    /// (interactive sessions, submitted jobs). None for `as4tainer call`.
     pub id: Option<jobs::JobId>,
 }
 
@@ -1586,14 +1586,14 @@ impl Job<'_> {
                 }
             }
             // Not a program object: the runner looks for the source in
-            // IBMISH_PGM_PATH (the samples).
+            // AS4TAINER_PGM_PATH (the samples).
             None => self.call_rpg(&name, None, args).await,
         }
     }
 
     /// Run an RPG program on the runner. `library`: where the program
     /// object is (the runner gets its source from the bridge); None: the
-    /// runner looks for PGM.rpgle in IBMISH_PGM_PATH.
+    /// runner looks for PGM.rpgle in AS4TAINER_PGM_PATH.
     async fn call_rpg(
         &mut self,
         pgm: &str,
@@ -1619,15 +1619,15 @@ impl Job<'_> {
         let mut parts = self.env.runner.split_whitespace();
         let exe = parts
             .next()
-            .ok_or_else(|| anyhow!("no runner configured (IBMISH_RUNNER)"))?;
+            .ok_or_else(|| anyhow!("no runner configured (AS4TAINER_RUNNER)"))?;
         let child = tokio::process::Command::new(exe)
             .args(parts)
             .arg("--bridge")
             .arg(addr.to_string())
             .arg(&pgm)
             .args(&args)
-            .env("IBMISH_LIBL", self.library_list().join(","))
-            .env("IBMISH_PGM_LIB", library.unwrap_or(""))
+            .env("AS4TAINER_LIBL", self.library_list().join(","))
+            .env("AS4TAINER_PGM_LIB", library.unwrap_or(""))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

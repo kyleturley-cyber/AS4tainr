@@ -1,9 +1,9 @@
 # Browser 5250 terminal
 
-`ibmish tn5250 --web-listen ADDR` also serves a 5250 terminal as a web page. Open it in a browser and you get the ibmish sign-on screen, with a row of clickable function keys above it, laid out like a 5250 keyboard. You don't need to install an emulator.
+`as4tainer tn5250 --web-listen ADDR` also serves a 5250 terminal as a web page. Open it in a browser and you get the as4tainer sign-on screen, with a row of clickable function keys above it, laid out like a 5250 keyboard. You don't need to install an emulator.
 
 ```sh
-ibmish tn5250 --listen 0.0.0.0:23 --web-listen 0.0.0.0:8080
+as4tainer tn5250 --listen 0.0.0.0:23 --web-listen 0.0.0.0:8080
 ```
 
 In Docker it is on by default. After `docker compose up`, open **http://localhost:5250**.
@@ -52,7 +52,7 @@ Fields behave like a display station's: monocase fields fold to upper case, nume
 ## How it works
 
 ```
- browser ──HTTP/WebSocket──▶ ibmish tn5250 process
+ browser ──HTTP/WebSocket──▶ as4tainer tn5250 process
                               ├─ web terminal (core/src/web)
                               │    a 5250 display station: screen buffer,
                               │    fields, input records
@@ -61,7 +61,7 @@ Fields behave like a display station's: monocase fields fold to upper case, nume
                               └─ 5250 server (core/src/tn5250) ─▶ jobs, CL, RPG
 ```
 
-Each browser tab opens a WebSocket. On the server side of that socket, ibmish runs a 5250 display station. It is terminal type `IBM-3179-2`, a 24x80 color display. It connects to the 5250 server in the same process, so a browser session is an ordinary 5250 session. It goes through the same telnet negotiation, sign-on, screens and jobs as tn5250 or IBM ACS. Each tab gets its own `QPADEVnnnn` device and its own job, and `WRKACTJOB` lists them.
+Each browser tab opens a WebSocket. On the server side of that socket, as4tainer runs a 5250 display station. It is terminal type `IBM-3179-2`, a 24x80 color display. It connects to the 5250 server in the same process, so a browser session is an ordinary 5250 session. It goes through the same telnet negotiation, sign-on, screens and jobs as tn5250 or IBM ACS. Each tab gets its own `QPADEVnnnn` device and its own job, and `WRKACTJOB` lists them.
 
 The 5250 data stream stays on the server. The display station applies the host's records (Clear Unit, Write To Display with SBA, IC, SF, RA, EA, TD and attribute bytes, Read MDT Fields). It sends the browser the screen as text, attribute positions and the field table. The browser draws the screen and edits the fields. When you press an AID key, the browser sends the key, the cursor and the fields you changed. The server builds the Read MDT Fields reply: cursor, AID, then SBA and data for each changed field. Typed control characters are sent as blanks, so input cannot inject orders.
 
@@ -87,12 +87,12 @@ Positions are 0-based offsets on the 24x80 screen (`row * 80 + col`). `f` is the
 
 | Setting | Default | |
 | --- | --- | --- |
-| `--web-listen` / `IBMISH_WEB_LISTEN` | off (CLI); `0.0.0.0:8080` in the Docker image | Address of the web terminal. Empty turns it off |
+| `--web-listen` / `AS4TAINER_WEB_LISTEN` | off (CLI); `0.0.0.0:8080` in the Docker image | Address of the web terminal. Empty turns it off |
 | `/healthz` | | Answers `ok`, for container health checks |
 
 ## Tests
 
-- Unit tests: `cargo test web::`. They cover the display station against screens from ibmish's own data stream encoder, with round trips through the server's input parser. They also cover WebSocket framing and the handshake (RFC 6455 examples), SHA-1 (RFC 3174 vectors), base64 (RFC 4648 vectors), the telnet replies, and the origin check.
+- Unit tests: `cargo test web::`. They cover the display station against screens from as4tainer's own data stream encoder, with round trips through the server's input parser. They also cover WebSocket framing and the handshake (RFC 6455 examples), SHA-1 (RFC 3174 vectors), base64 (RFC 4648 vectors), the telnet replies, and the origin check.
 - End to end in Chromium: `python3 tools/e2e_web.py http://127.0.0.1:5250` against a running server with the samples. It covers sign-on, the key bar's labels, clicked and typed function keys, a clicked key hint, Field Exit, subfile paging, order entry, two tabs as two jobs, and phone width.
 
 What is not there yet is in [fidelity-gaps.md](fidelity-gaps.md) under "Browser terminal".

@@ -4,7 +4,7 @@
       * the start and whenever the overflow indicator OF comes on (line 60
       * of 66), EXCEPT DETAIL per customer (a * after a negative balance),
       * EXCEPT TOTALS at the end. The report becomes spooled file QSYSPRT
-      * of the job (WRKSPLF); `ibmish call` prints it to standard output.
+      * of the job (WRKSPLF); `as4tainer call` prints it to standard output.
      FCUSTMAST  IF   E           K DISK
      FQSYSPRT   O    F  132        PRINTER OFLIND(*INOF)
      D TOTAL           S             11  2

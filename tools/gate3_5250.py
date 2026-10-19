@@ -13,10 +13,10 @@ everyone is done, the files must add up:
   totals (CHAIN and UPDATE under record locks: no update is lost);
 - the batch jobs ended normally and printed their spooled files.
 
-Expects a running `ibmish tn5250` with the sample objects, after
+Expects a running `as4tainer tn5250` with the sample objects, after
 tools/e2e_5250.py (QSECOFR's password is then Green5creen!; override with
-QSECOFR_PASSWORD). The files are checked with `ibmish sql` (IBMISH_BIN,
-IBMISH_DATABASE_URL). Usage:
+QSECOFR_PASSWORD). The files are checked with `as4tainer sql` (AS4TAINER_BIN,
+AS4TAINER_DATABASE_URL). Usage:
 
     TN5250=/path/to/tn5250 python3 tools/gate3_5250.py 127.0.0.1:2323
 """
@@ -32,7 +32,7 @@ from tn5250_driver import Tn5250  # noqa: E402
 
 HOST = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:2323"
 PW = os.environ.get("QSECOFR_PASSWORD", "Green5creen!")
-BIN = os.environ.get("IBMISH_BIN", "target/debug/ibmish")
+BIN = os.environ.get("AS4TAINER_BIN", "target/debug/as4tainer")
 FE = "\x0b"  # Field Exit
 DESCRIPTIONS = {"BOLT-M8": "Hex bolt", "NUT-M8": "Hex nut", "WIDGET-A": "Widget type A",
                 "GASKET-12": "Gasket 12 in"}
@@ -59,7 +59,7 @@ def check(cond, what, detail=""):
 
 
 def sql(stmt):
-    """Rows of an `ibmish sql` SELECT, as lists of strings."""
+    """Rows of an `as4tainer sql` SELECT, as lists of strings."""
     out = subprocess.run([BIN, "sql", stmt], capture_output=True, text=True, check=True).stdout
     lines = [l for l in out.splitlines() if l.strip()]
     return [l.split() for l in lines[1:] if not l.endswith("selected.")]
@@ -68,7 +68,7 @@ def sql(stmt):
 def sign_on(t, user, password):
     t.wait_for("Sign On")
     t.type(user); t.tab(); t.type(password); t.enter()
-    t.wait_for("ibmish Main Menu", 30)  # the initial menu
+    t.wait_for("as4tainer Main Menu", 30)  # the initial menu
     command(t, "call qcmd", "Command Entry")
 
 

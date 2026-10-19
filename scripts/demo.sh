@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# ibmish spike demo: create the sample files, load data, run the sample
+# as4tainer spike demo: create the sample files, load data, run the sample
 # programs and compare their output with the golden files.
 #
 # Env:
-#   IBMISH_DATABASE_URL  PostgreSQL URL (default: local ibmish database)
-#   IBMISH_RUNNER        runner command (default: the Jariko jar)
-#   IBMISH_PGM_PATH      directory holding the .rpgle sources
-#   IBMISH_BIN           path to the ibmish binary (default: ibmish on PATH)
+#   AS4TAINER_DATABASE_URL  PostgreSQL URL (default: local as4tainer database)
+#   AS4TAINER_RUNNER        runner command (default: the Jariko jar)
+#   AS4TAINER_PGM_PATH      directory holding the .rpgle sources
+#   AS4TAINER_BIN           path to the as4tainer binary (default: as4tainer on PATH)
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
-samples="${IBMISH_SAMPLES:-$here/samples}"
-bin="${IBMISH_BIN:-ibmish}"
-export IBMISH_PGM_PATH="${IBMISH_PGM_PATH:-$samples/qrpglesrc}"
+samples="${AS4TAINER_SAMPLES:-$here/samples}"
+bin="${AS4TAINER_BIN:-as4tainer}"
+export AS4TAINER_PGM_PATH="${AS4TAINER_PGM_PATH:-$samples/qrpglesrc}"
 
 # The sample files, display files and CL programs (scripts/samples.sh).
-setup=$(IBMISH_BIN="$bin" IBMISH_SAMPLES="$samples" "$(dirname "$0")/samples.sh")
+setup=$(AS4TAINER_BIN="$bin" AS4TAINER_SAMPLES="$samples" "$(dirname "$0")/samples.sh")
 echo "$setup"
 fresh=0
 if grep -qx "Loaded CUSTMAST" <<<"$setup"; then
@@ -56,14 +56,14 @@ run CUSTRPT L
 # A printed report (O specs, EXCEPT). The conformance runner replays file
 # operations only; the page layout is the Jariko runner's.
 # The native RPG engine prints from milestone R3 on (docs/rpg-engine.md).
-if [[ "${IBMISH_RUNNER:-}" != *BridgeConformance* && "${IBMISH_RPG_ENGINE:-}" != native ]]; then
+if [[ "${AS4TAINER_RUNNER:-}" != *BridgeConformance* && "${AS4TAINER_RPG_ENGINE:-}" != native ]]; then
   run CUSTPRT
 fi
 # An imported application (samples/apps/contacts, in library CONTACTS):
 # RPG program objects (CRTBNDRPG) and a /INCLUDE stream file. Real RPG only.
-if [[ "${IBMISH_RUNNER:-}" != *BridgeConformance* || "${IBMISH_RPG_ENGINE:-}" == native ]]; then
+if [[ "${AS4TAINER_RUNNER:-}" != *BridgeConformance* || "${AS4TAINER_RPG_ENGINE:-}" == native ]]; then
   echo "--- CALL CONTACTS/CONTCNT"
-  out=$(IBMISH_LIBL=CONTACTS,QGPL "$bin" call CONTACTS/CONTCNT | grep -v '^Picked up JAVA_TOOL_OPTIONS' || true)
+  out=$(AS4TAINER_LIBL=CONTACTS,QGPL "$bin" call CONTACTS/CONTCNT | grep -v '^Picked up JAVA_TOOL_OPTIONS' || true)
   echo "$out"
   if diff <(normalize <<<"$out") <(normalize <"$samples/expected/CONTCNT.txt") >/dev/null; then
     echo "PASS: output matches CONTCNT.txt"

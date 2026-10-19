@@ -1,14 +1,14 @@
 //! Object catalog. Libraries map to PostgreSQL schemas; a physical file's
 //! data lives in a table of that schema, and its description (fields, keys)
-//! lives in the `ibmish` catalog schema.
+//! lives in the `as4tainer` catalog schema.
 
 use crate::dds::{DataType, FieldDef, LogicalFile, PhysicalFile, Test};
 use anyhow::{bail, Context, Result};
 use tokio_postgres::Client;
 
 const CATALOG_DDL: &str = r#"
-CREATE SCHEMA IF NOT EXISTS ibmish;
-CREATE TABLE IF NOT EXISTS ibmish.objects (
+CREATE SCHEMA IF NOT EXISTS as4tainer;
+CREATE TABLE IF NOT EXISTS as4tainer.objects (
     library   text NOT NULL,
     name      text NOT NULL,
     objtype   text NOT NULL,
@@ -17,14 +17,14 @@ CREATE TABLE IF NOT EXISTS ibmish.objects (
     created   timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (library, name, objtype)
 );
-CREATE TABLE IF NOT EXISTS ibmish.files (
+CREATE TABLE IF NOT EXISTS as4tainer.files (
     library   text NOT NULL,
     name      text NOT NULL,
     format    text NOT NULL,
     is_unique boolean NOT NULL DEFAULT false,
     PRIMARY KEY (library, name)
 );
-CREATE TABLE IF NOT EXISTS ibmish.file_fields (
+CREATE TABLE IF NOT EXISTS as4tainer.file_fields (
     library   text NOT NULL,
     file      text NOT NULL,
     seq       int  NOT NULL,
@@ -35,28 +35,28 @@ CREATE TABLE IF NOT EXISTS ibmish.file_fields (
     text      text NOT NULL DEFAULT '',
     PRIMARY KEY (library, file, seq)
 );
-CREATE TABLE IF NOT EXISTS ibmish.display_files (
+CREATE TABLE IF NOT EXISTS as4tainer.display_files (
     library text NOT NULL,
     name    text NOT NULL,
     source  text NOT NULL,
     PRIMARY KEY (library, name)
 );
-CREATE TABLE IF NOT EXISTS ibmish.file_keys (
+CREATE TABLE IF NOT EXISTS as4tainer.file_keys (
     library text NOT NULL,
     file    text NOT NULL,
     seq     int  NOT NULL,
     field   text NOT NULL,
     PRIMARY KEY (library, file, seq)
 );
-ALTER TABLE ibmish.file_keys ADD COLUMN IF NOT EXISTS descending boolean NOT NULL DEFAULT false;
-CREATE TABLE IF NOT EXISTS ibmish.programs (
+ALTER TABLE as4tainer.file_keys ADD COLUMN IF NOT EXISTS descending boolean NOT NULL DEFAULT false;
+CREATE TABLE IF NOT EXISTS as4tainer.programs (
     library   text NOT NULL,
     name      text NOT NULL,
     attribute text NOT NULL,
     source    text NOT NULL,
     PRIMARY KEY (library, name)
 );
-CREATE TABLE IF NOT EXISTS ibmish.logical_files (
+CREATE TABLE IF NOT EXISTS as4tainer.logical_files (
     library    text NOT NULL,
     name       text NOT NULL,
     pf_library text NOT NULL,
@@ -78,7 +78,7 @@ pub fn ident(s: &str) -> String {
 /// in front, a character IBM i names cannot contain.
 const PG_SYSTEM_COLUMNS: &[&str] = &["tableoid", "xmin", "cmin", "xmax", "cmax", "ctid", "oid"];
 
-/// The name ibmish uses in PostgreSQL for an IBM i name.
+/// The name as4tainer uses in PostgreSQL for an IBM i name.
 pub fn pg_name(s: &str) -> String {
     let l = s.to_ascii_lowercase();
     if PG_SYSTEM_COLUMNS.contains(&l.as_str()) {
@@ -129,7 +129,8 @@ pub const SYSTEM_LIBRARIES: &[(&str, &str)] = &[
     ("QTEMP", "Temporary library"),
 ];
 
-/// Advisory lock key that serializes catalog creation ("IBMISH" in ASCII).
+/// Advisory lock key that serializes catalog creation ("IBMISH" in ASCII: the
+/// project's earlier name; the value must not change).
 const INIT_LOCK_KEY: i64 = 0x49424D495348;
 
 pub async fn init(client: &Client) -> Result<()> {
@@ -174,7 +175,7 @@ pub async fn init(client: &Client) -> Result<()> {
             // Catalogs made by older versions gave every one the same text.
             client
                 .execute(
-                    "UPDATE ibmish.objects SET text = $2
+                    "UPDATE as4tainer.objects SET text = $2
                      WHERE library = 'QSYS' AND name = $1 AND objtype = '*LIB' AND text = 'System library'",
                     &[lib, text],
                 )
@@ -184,7 +185,7 @@ pub async fn init(client: &Client) -> Result<()> {
         // SQL runs as a restricted role. A database user who may not
         // create roles still gets a working system, without SQL.
         if let Err(e) = crate::sql::init(client).await {
-            eprintln!("ibmish: SQL is not available: {e:#}");
+            eprintln!("as4tainer: SQL is not available: {e:#}");
         }
         Ok::<(), anyhow::Error>(())
     }
@@ -200,7 +201,7 @@ pub async fn create_library_new(client: &Client, library: &str, text: &str) -> R
     let lib = validate_name("library", library)?;
     let exists = client
         .query_opt(
-            "SELECT 1 FROM ibmish.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
+            "SELECT 1 FROM as4tainer.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
             &[&lib],
         )
         .await?;
@@ -224,7 +225,7 @@ pub async fn library_exists(client: &Client, library: &str) -> Result<bool> {
     let lib = validate_name("library", library)?;
     Ok(client
         .query_opt(
-            "SELECT 1 FROM ibmish.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
+            "SELECT 1 FROM as4tainer.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
             &[&lib],
         )
         .await?
@@ -234,7 +235,7 @@ pub async fn library_exists(client: &Client, library: &str) -> Result<bool> {
 pub async fn library_text(client: &Client, library: &str) -> Result<String> {
     Ok(client
         .query_opt(
-            "SELECT text FROM ibmish.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
+            "SELECT text FROM as4tainer.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
             &[&library],
         )
         .await?
@@ -250,7 +251,7 @@ pub async fn list_objects(client: &Client, library: &str) -> Result<Vec<ObjectEn
     }
     Ok(client
         .query(
-            "SELECT name, objtype, attribute, text FROM ibmish.objects WHERE library=$1 ORDER BY name, objtype",
+            "SELECT name, objtype, attribute, text FROM as4tainer.objects WHERE library=$1 ORDER BY name, objtype",
             &[&lib],
         )
         .await?
@@ -288,7 +289,7 @@ pub async fn create_program(
     let tx = client.transaction().await?;
     if tx
         .query_opt(
-            "SELECT 1 FROM ibmish.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
+            "SELECT 1 FROM as4tainer.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
             &[&lib],
         )
         .await?
@@ -298,7 +299,7 @@ pub async fn create_program(
     }
     let exists = tx
         .query_opt(
-            "SELECT 1 FROM ibmish.objects WHERE library=$1 AND name=$2 AND objtype='*PGM'",
+            "SELECT 1 FROM as4tainer.objects WHERE library=$1 AND name=$2 AND objtype='*PGM'",
             &[&lib, &name],
         )
         .await?
@@ -307,22 +308,22 @@ pub async fn create_program(
         bail!("Program {name} in library {lib} already exists.");
     }
     tx.execute(
-        "DELETE FROM ibmish.objects WHERE library=$1 AND name=$2 AND objtype='*PGM'",
+        "DELETE FROM as4tainer.objects WHERE library=$1 AND name=$2 AND objtype='*PGM'",
         &[&lib, &name],
     )
     .await?;
     tx.execute(
-        "DELETE FROM ibmish.programs WHERE library=$1 AND name=$2",
+        "DELETE FROM as4tainer.programs WHERE library=$1 AND name=$2",
         &[&lib, &name],
     )
     .await?;
     tx.execute(
-        "INSERT INTO ibmish.objects (library, name, objtype, attribute, text) VALUES ($1,$2,'*PGM',$4,$3)",
+        "INSERT INTO as4tainer.objects (library, name, objtype, attribute, text) VALUES ($1,$2,'*PGM',$4,$3)",
         &[&lib, &name, &text, &attribute],
     )
     .await?;
     tx.execute(
-        "INSERT INTO ibmish.programs VALUES ($1,$2,$4,$3)",
+        "INSERT INTO as4tainer.programs VALUES ($1,$2,$4,$3)",
         &[&lib, &name, &source, &attribute],
     )
     .await?;
@@ -342,7 +343,7 @@ pub async fn find_cl_program(
         .map(|p| (p.library, p.source)))
 }
 
-/// A program object (*PGM) kept by ibmish.
+/// A program object (*PGM) kept by as4tainer.
 #[derive(Debug, Clone)]
 pub struct Program {
     pub library: String,
@@ -358,7 +359,7 @@ pub async fn find_program(client: &Client, libs: &[String], name: &str) -> Resul
     for lib in libs {
         if let Some(r) = client
             .query_opt(
-                "SELECT attribute, source FROM ibmish.programs WHERE library=$1 AND name=$2",
+                "SELECT attribute, source FROM as4tainer.programs WHERE library=$1 AND name=$2",
                 &[lib, &name],
             )
             .await?
@@ -389,7 +390,7 @@ pub async fn object_exists(
     };
     Ok(client
         .query_opt(
-            "SELECT 1 FROM ibmish.objects WHERE library = ANY($1) AND name=$2 AND objtype=$3",
+            "SELECT 1 FROM as4tainer.objects WHERE library = ANY($1) AND name=$2 AND objtype=$3",
             &[&libs, &name, &objtype],
         )
         .await?
@@ -400,7 +401,7 @@ pub async fn object_exists(
 pub async fn list_libraries(client: &Client) -> Result<Vec<String>> {
     Ok(client
         .query(
-            "SELECT name FROM ibmish.objects WHERE library='QSYS' AND objtype='*LIB' ORDER BY name",
+            "SELECT name FROM as4tainer.objects WHERE library='QSYS' AND objtype='*LIB' ORDER BY name",
             &[],
         )
         .await?
@@ -465,7 +466,7 @@ pub async fn create_library(client: &Client, library: &str, text: &str) -> Resul
     let _ = crate::sql::grant_library(client, &lib).await;
     client
         .execute(
-            "INSERT INTO ibmish.objects (library, name, objtype, text) VALUES ('QSYS', $1, '*LIB', $2)
+            "INSERT INTO as4tainer.objects (library, name, objtype, text) VALUES ('QSYS', $1, '*LIB', $2)
              ON CONFLICT DO NOTHING",
             &[&lib, &text],
         )
@@ -487,7 +488,7 @@ pub async fn create_physical_file(
     let tx = client.transaction().await?;
     let exists = tx
         .query_opt(
-            "SELECT 1 FROM ibmish.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+            "SELECT 1 FROM as4tainer.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
             &[&lib, &name],
         )
         .await?;
@@ -496,7 +497,7 @@ pub async fn create_physical_file(
     }
     let lib_exists = tx
         .query_opt(
-            "SELECT 1 FROM ibmish.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
+            "SELECT 1 FROM as4tainer.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
             &[&lib],
         )
         .await?;
@@ -505,12 +506,12 @@ pub async fn create_physical_file(
     }
 
     tx.execute(
-        "INSERT INTO ibmish.objects (library, name, objtype, attribute, text) VALUES ($1,$2,'*FILE','PF',$3)",
+        "INSERT INTO as4tainer.objects (library, name, objtype, attribute, text) VALUES ($1,$2,'*FILE','PF',$3)",
         &[&lib, &name, &pf.text],
     )
     .await?;
     tx.execute(
-        "INSERT INTO ibmish.files (library, name, format, is_unique) VALUES ($1,$2,$3,$4)",
+        "INSERT INTO as4tainer.files (library, name, format, is_unique) VALUES ($1,$2,$3,$4)",
         &[&lib, &name, &pf.format, &pf.unique],
     )
     .await?;
@@ -519,7 +520,7 @@ pub async fn create_physical_file(
         let len = f.length as i32;
         let dec = f.decimals as i32;
         tx.execute(
-            "INSERT INTO ibmish.file_fields VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            "INSERT INTO as4tainer.file_fields VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
             &[
                 &lib,
                 &name,
@@ -537,7 +538,7 @@ pub async fn create_physical_file(
         let seq = i as i32;
         let desc = pf.is_descending(k);
         tx.execute(
-            "INSERT INTO ibmish.file_keys (library, file, seq, field, descending) VALUES ($1,$2,$3,$4,$5)",
+            "INSERT INTO as4tainer.file_keys (library, file, seq, field, descending) VALUES ($1,$2,$3,$4,$5)",
             &[&lib, &name, &seq, k, &desc],
         )
         .await?;
@@ -603,7 +604,7 @@ pub async fn create_display_file(
     let tx = client.transaction().await?;
     if tx
         .query_opt(
-            "SELECT 1 FROM ibmish.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
+            "SELECT 1 FROM as4tainer.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
             &[&lib],
         )
         .await?
@@ -613,7 +614,7 @@ pub async fn create_display_file(
     }
     if tx
         .query_opt(
-            "SELECT 1 FROM ibmish.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+            "SELECT 1 FROM as4tainer.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
             &[&lib, &name],
         )
         .await?
@@ -622,12 +623,12 @@ pub async fn create_display_file(
         bail!("CPF7302: File {name} already exists in library {lib}.");
     }
     tx.execute(
-        "INSERT INTO ibmish.objects (library, name, objtype, attribute, text) VALUES ($1,$2,'*FILE','DSPF','')",
+        "INSERT INTO as4tainer.objects (library, name, objtype, attribute, text) VALUES ($1,$2,'*FILE','DSPF','')",
         &[&lib, &name],
     )
     .await?;
     tx.execute(
-        "INSERT INTO ibmish.display_files VALUES ($1,$2,$3)",
+        "INSERT INTO as4tainer.display_files VALUES ($1,$2,$3)",
         &[&lib, &name, &source],
     )
     .await?;
@@ -652,7 +653,7 @@ pub async fn resolve_display_file(
     for lib in &search {
         if let Some(row) = client
             .query_opt(
-                "SELECT source FROM ibmish.display_files WHERE library=$1 AND name=$2",
+                "SELECT source FROM as4tainer.display_files WHERE library=$1 AND name=$2",
                 &[lib, &name],
             )
             .await?
@@ -786,7 +787,7 @@ pub async fn create_logical_file(
     let pf = resolve_file(client, libl, &lf.based_on).await?;
     if client
         .query_opt(
-            "SELECT 1 FROM ibmish.logical_files WHERE library=$1 AND name=$2",
+            "SELECT 1 FROM as4tainer.logical_files WHERE library=$1 AND name=$2",
             &[&pf.library, &pf.file.name],
         )
         .await?
@@ -837,7 +838,7 @@ pub async fn create_logical_file(
     let tx = client.transaction().await?;
     if tx
         .query_opt(
-            "SELECT 1 FROM ibmish.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+            "SELECT 1 FROM as4tainer.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
             &[&lib, &name],
         )
         .await?
@@ -847,7 +848,7 @@ pub async fn create_logical_file(
     }
     if tx
         .query_opt(
-            "SELECT 1 FROM ibmish.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
+            "SELECT 1 FROM as4tainer.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
             &[&lib],
         )
         .await?
@@ -856,19 +857,19 @@ pub async fn create_logical_file(
         bail!("CPF2110: library {lib} not found");
     }
     tx.execute(
-        "INSERT INTO ibmish.objects (library, name, objtype, attribute, text) VALUES ($1,$2,'*FILE','LF',$3)",
+        "INSERT INTO as4tainer.objects (library, name, objtype, attribute, text) VALUES ($1,$2,'*FILE','LF',$3)",
         &[&lib, &name, &lf.text],
     )
     .await?;
     tx.execute(
-        "INSERT INTO ibmish.files (library, name, format, is_unique) VALUES ($1,$2,$3,$4)",
+        "INSERT INTO as4tainer.files (library, name, format, is_unique) VALUES ($1,$2,$3,$4)",
         &[&lib, &name, &lf.format, &lf.unique],
     )
     .await?;
     for (i, f) in fields.iter().enumerate() {
         let (seq, len, dec) = (i as i32, f.length as i32, f.decimals as i32);
         tx.execute(
-            "INSERT INTO ibmish.file_fields VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            "INSERT INTO as4tainer.file_fields VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
             &[
                 &lib,
                 &name,
@@ -885,13 +886,13 @@ pub async fn create_logical_file(
     for (i, k) in lf.keys.iter().enumerate() {
         let (seq, desc) = (i as i32, lf.descending.contains(k));
         tx.execute(
-            "INSERT INTO ibmish.file_keys (library, file, seq, field, descending) VALUES ($1,$2,$3,$4,$5)",
+            "INSERT INTO as4tainer.file_keys (library, file, seq, field, descending) VALUES ($1,$2,$3,$4,$5)",
             &[&lib, &name, &seq, k, &desc],
         )
         .await?;
     }
     tx.execute(
-        "INSERT INTO ibmish.logical_files (library, name, pf_library, pf_name, selection) VALUES ($1,$2,$3,$4,$5)",
+        "INSERT INTO as4tainer.logical_files (library, name, pf_library, pf_name, selection) VALUES ($1,$2,$3,$4,$5)",
         &[&lib, &name, &pf.library, &pf.file.name, &index_selection],
     )
     .await?;
@@ -945,7 +946,7 @@ pub async fn physical_file_of(
     Ok(
         match client
             .query_opt(
-                "SELECT pf_library, pf_name FROM ibmish.logical_files WHERE library=$1 AND name=$2",
+                "SELECT pf_library, pf_name FROM as4tainer.logical_files WHERE library=$1 AND name=$2",
                 &[&library, &name],
             )
             .await?
@@ -972,16 +973,16 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
     for lib in &search {
         let row = client
             .query_opt(
-                "SELECT format, is_unique, (SELECT text FROM ibmish.objects o
+                "SELECT format, is_unique, (SELECT text FROM as4tainer.objects o
                     WHERE o.library=f.library AND o.name=f.name AND o.objtype='*FILE')
-                 FROM ibmish.files f WHERE library=$1 AND name=$2",
+                 FROM as4tainer.files f WHERE library=$1 AND name=$2",
                 &[lib, &name],
             )
             .await?;
         let Some(row) = row else { continue };
         let fields = client
             .query(
-                "SELECT name, data_type, length, decimals, text FROM ibmish.file_fields
+                "SELECT name, data_type, length, decimals, text FROM as4tainer.file_fields
                  WHERE library=$1 AND file=$2 ORDER BY seq",
                 &[lib, &name],
             )
@@ -999,7 +1000,7 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
             .collect::<Result<Vec<_>>>()?;
         let key_rows = client
             .query(
-                "SELECT field, descending FROM ibmish.file_keys WHERE library=$1 AND file=$2 ORDER BY seq",
+                "SELECT field, descending FROM as4tainer.file_keys WHERE library=$1 AND file=$2 ORDER BY seq",
                 &[lib, &name],
             )
             .await?;

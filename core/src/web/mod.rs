@@ -1,4 +1,4 @@
-//! Browser 5250 terminal: `ibmish tn5250 --web-listen ADDR` serves a web
+//! Browser 5250 terminal: `as4tainer tn5250 --web-listen ADDR` serves a web
 //! page that is a 5250 display station, with a row of clickable function
 //! keys above the screen.
 //!
@@ -43,7 +43,7 @@ pub async fn serve(listener: TcpListener, backend: SocketAddr) -> Result<()> {
         let (stream, peer) = listener.accept().await?;
         tokio::spawn(async move {
             if let Err(e) = handle(stream, peer, backend).await {
-                eprintln!("ibmish: web terminal {peer}: {e:#}");
+                eprintln!("as4tainer: web terminal {peer}: {e:#}");
             }
         });
     }
@@ -232,7 +232,7 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, backend: SocketAddr) ->
             };
             if !origin_allowed(req.header("Origin"), req.header("Host")) {
                 eprintln!(
-                    "ibmish: web terminal {peer}: refused a WebSocket from origin {:?}",
+                    "as4tainer: web terminal {peer}: refused a WebSocket from origin {:?}",
                     req.header("Origin")
                 );
                 return respond(
@@ -306,7 +306,7 @@ async fn session(stream: TcpStream, peer: SocketAddr, backend: SocketAddr) -> Re
         .with_context(|| format!("connecting to the 5250 server at {backend}"))?;
     host.set_nodelay(true).ok();
     let (mut host_r, mut host_w) = host.into_split();
-    eprintln!("ibmish: web terminal {peer} connected");
+    eprintln!("as4tainer: web terminal {peer} connected");
 
     // WebSocket reads are not cancel safe, so they run in their own task.
     let (tx, mut rx) = mpsc::channel::<FromBrowser>(16);
@@ -354,7 +354,7 @@ async fn session(stream: TcpStream, peer: SocketAddr, backend: SocketAddr) -> Re
                         Event::Record(r) => {
                             let data = telnet::record_data(&r)?;
                             if let Some(skipped) = display.apply(data) {
-                                eprintln!("ibmish: web terminal {peer}: {skipped}");
+                                eprintln!("as4tainer: web terminal {peer}: {skipped}");
                             }
                             redraw = true;
                         }
@@ -401,7 +401,7 @@ async fn session(stream: TcpStream, peer: SocketAddr, backend: SocketAddr) -> Re
         ws::send_text(&mut ws_w, &msg).await.ok();
         ws::send_close(&mut ws_w).await.ok();
     }
-    eprintln!("ibmish: web terminal {peer} disconnected");
+    eprintln!("as4tainer: web terminal {peer} disconnected");
     Ok(())
 }
 
@@ -416,8 +416,8 @@ mod tests {
             Some("localhost:5250")
         ));
         assert!(origin_allowed(
-            Some("https://ibmish.example.com"),
-            Some("IBMISH.example.com")
+            Some("https://as4tainer.example.com"),
+            Some("AS4TAINER.example.com")
         ));
         assert!(!origin_allowed(
             Some("https://evil.example"),

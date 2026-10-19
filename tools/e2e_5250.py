@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end test of the ibmish 5250 server with the real tn5250 client.
+"""End-to-end test of the as4tainer 5250 server with the real tn5250 client.
 
 Expects a fresh database (QSECOFR with its initial, expired password) and
 the sample objects in QGPL (scripts/samples.sh).
@@ -36,13 +36,13 @@ def command(t, cmd, expect, timeout=20):
 
 def qcmd(t):
     """From the initial menu (MAIN) to Command Entry, as CALL QCMD does."""
-    t.wait_for("ibmish Main Menu", 30)
+    t.wait_for("as4tainer Main Menu", 30)
     command(t, "call qcmd", "Command Entry")
 
 
 with Tn5250(HOST) as t:
     t.wait_for("Sign On")
-    check("IBMISH" in t.line(2) and "QPADEV" in t.line(4), "sign-on screen shows system and display names", t)
+    check("AS4TAINR" in t.line(2) and "QPADEV" in t.line(4), "sign-on screen shows system and display names", t)
 
     t.type("qsecofr"); t.tab(); t.type("wrong"); t.enter()
     t.wait_for("CPF1107")
@@ -66,12 +66,12 @@ with Tn5250(HOST) as t:
 
     # Blanks in front of the password (tn5250j sends them when the cursor
     # was put in the middle of the field) are not part of it. At QPWDLVL 0
-    # (IBM's shipped value, ibmish's default) passwords are not case
+    # (IBM's shipped value, as4tainer's default) passwords are not case
     # sensitive.
     t.type("qsecofr"); t.tab(); t.type("   " + NEWPW.lower()); t.enter()
     # The initial menu: CRTUSRPRF INLMNU is MAIN unless changed (IBM i CL
     # reference), and QSECOFR is shipped with INLMNU(MAIN).
-    t.wait_for("ibmish Main Menu")
+    t.wait_for("as4tainer Main Menu")
     check("MAIN" in t.line(1) and "QSECOFR" in t.line(2) and "Selection or command" in t.text()
           and "90. Sign off" in t.text(),
           "signed on (blanks ignored, password not case sensitive): the initial menu MAIN is shown", t)
@@ -277,8 +277,8 @@ with Tn5250(HOST) as t:
     # Spooled files: a printed RPG report (O specs, EXCEPT) and a display
     # command in batch both become spooled files QSYSPRT.
     # (Printing from RPG comes to the native engine in milestone R3, see
-    # docs/rpg-engine.md; with IBMISH_RPG_ENGINE=native these checks wait.)
-    if os.environ.get("IBMISH_RPG_ENGINE", "").lower() != "native":
+    # docs/rpg-engine.md; with AS4TAINER_RPG_ENGINE=native these checks wait.)
+    if os.environ.get("AS4TAINER_RPG_ENGINE", "").lower() != "native":
         command(t, "sbmjob cmd(call custprt) job(custprt)", "submitted to job queue QBATCH")
         command(t, "sbmjob cmd(dsppfm custmast) job(listing)", "submitted to job queue QBATCH")
         command(t, "wrksplf", "Work with All Spooled Files")
@@ -494,7 +494,7 @@ with Tn5250(HOST) as t:
     # leaves the menus; option 90 signs off; INLPGM runs at sign-on, and
     # INLMNU(*SIGNOFF) signs off when it ends; ending the initial menu
     # signs off.
-    command(t, "go main", "ibmish Main Menu")
+    command(t, "go main", "as4tainer Main Menu")
     check("Select one of the following:" in t.text() and " 1. User tasks" in t.text(),
           "GO MAIN shows the main menu from Command Entry", t)
     command(t, "1", "User Tasks")
@@ -502,12 +502,12 @@ with Tn5250(HOST) as t:
     command(t, "5", "Display Job Log")
     t.fkey(3); t.wait_for("User Tasks")
     check(True, "a menu option runs its command; leaving the display returns to the menu", t)
-    t.fkey(12); t.wait_for("ibmish Main Menu")
+    t.fkey(12); t.wait_for("as4tainer Main Menu")
     check(True, "F12 goes back one menu", t)
     command(t, "99", "not one of the options")
     check("99" in t.line(24), "a number that is not an option is rejected on the message line", t)
     command(t, "crtlib menulib", "Library MENULIB created.")
-    check("ibmish Main Menu" in t.text(), "a command typed on a menu's command line runs there, the menu stays", t)
+    check("as4tainer Main Menu" in t.text(), "a command typed on a menu's command line runs there, the menu stays", t)
     command(t, "6", "Go to Menu (GO)")
     check(True, "option 6 prompts GO (a ? in front of the command prompts it)", t)
     t.type("security"); t.enter()
@@ -559,7 +559,7 @@ with Tn5250(HOST) as t:
     t.fkey(12)
     command(t, "dltusrprf carl", "User profile CARL deleted.")
 
-    # An imported application (scripts/samples.sh: ibmish import
+    # An imported application (scripts/samples.sh: as4tainer import
     # samples/apps/contacts --lib CONTACTS). Expected behavior from IBM's
     # RPG reference: READ sets its positions 75-76 indicator at end of
     # file; CHAIN sets positions 71-72 when no record is found; CA03

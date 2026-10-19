@@ -1,10 +1,10 @@
-package io.ibmish.jvm;
+package io.as4tainer.jvm;
 
 import com.smeup.dbnative.ConnectionConfig;
 import com.smeup.dbnative.DBManagerBaseImpl;
 import com.smeup.dbnative.file.DBFile;
 import com.smeup.dbnative.model.FileMetadata;
-import io.ibmish.bridge.BridgeClient;
+import io.as4tainer.bridge.BridgeClient;
 
 import java.io.IOException;
 import java.util.HashMap;
@@ -13,11 +13,11 @@ import java.util.Map;
 /**
  * The reload DBMManager for display record formats declared as DISK files by
  * {@link Workstation#preprocess}. Configured with one ConnectionConfig per
- * record format, {@code url = ibmish-dspf://HOST:PORT}. reload creates it
+ * record format, {@code url = as4tainer-dspf://HOST:PORT}. reload creates it
  * reflectively with the ConnectionConfig.
  */
 public final class DisplayDBMManager extends DBManagerBaseImpl<String, Object> {
-    public static final String URL_PREFIX = "ibmish-dspf://";
+    public static final String URL_PREFIX = "as4tainer-dspf://";
 
     private final ConnectionConfig connectionConfig;
     private BridgeClient client;
@@ -37,7 +37,7 @@ public final class DisplayDBMManager extends DBManagerBaseImpl<String, Object> {
             try {
                 client = BridgeClient.connect(connectionConfig.getUrl().substring(URL_PREFIX.length()));
             } catch (IOException e) {
-                throw new IllegalStateException("cannot reach ibmish core: " + e.getMessage(), e);
+                throw new IllegalStateException("cannot reach as4tainer core: " + e.getMessage(), e);
             }
         }
         return client;

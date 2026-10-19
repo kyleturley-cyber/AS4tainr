@@ -630,7 +630,7 @@ pub fn parse(name: &str, source: &str) -> Result<DisplayFile> {
     Ok(f)
 }
 
-/// The DDS rules for subfiles that the rest of ibmish relies on: a control
+/// The DDS rules for subfiles that the rest of as4tainer relies on: a control
 /// record comes right after its subfile record and names it, and has
 /// SFLSIZ and SFLPAG; one page of subfile records fits on the display.
 fn check_subfiles(f: &DisplayFile) -> Result<()> {
@@ -1427,7 +1427,7 @@ mod tests {
         let f = parse("CUSTINQD", CUSTINQD).unwrap();
         let ctx = Context {
             user: "QSECOFR",
-            system: "IBMISH",
+            system: "AS4TAINR",
             date: "10/15/26".into(),
             time: "12:00:00".into(),
         };

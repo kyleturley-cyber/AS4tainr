@@ -1,4 +1,4 @@
-package io.ibmish.bridge;
+package io.as4tainer.bridge;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;

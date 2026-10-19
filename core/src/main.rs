@@ -1,21 +1,21 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use ibmish_core::{bridge, catalog, commands, dds, tn5250, users};
+use as4tainer_core::{bridge, catalog, commands, dds, tn5250, users};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "ibmish",
+    name = "as4tainer",
     version,
-    about = "ibmish: an IBM i-compatible runtime"
+    about = "as4tainer: an IBM i-compatible runtime"
 )]
 struct Cli {
     /// PostgreSQL connection URL.
     #[arg(
         long,
         global = true,
-        env = "IBMISH_DATABASE_URL",
-        default_value = "postgres://ibmish:ibmish@127.0.0.1/ibmish"
+        env = "AS4TAINER_DATABASE_URL",
+        default_value = "postgres://as4tainer:as4tainer@127.0.0.1/as4tainer"
     )]
     database_url: String,
 
@@ -24,7 +24,7 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        env = "IBMISH_LIBL",
+        env = "AS4TAINER_LIBL",
         default_value = "QGPL,QTEMP",
         value_delimiter = ','
     )]
@@ -107,8 +107,8 @@ enum Cmd {
         /// Command that runs RPG programs (unused by the import itself).
         #[arg(
             long,
-            env = "IBMISH_RUNNER",
-            default_value = "java -jar /opt/ibmish/ibmish-jvm.jar"
+            env = "AS4TAINER_RUNNER",
+            default_value = "java -jar /opt/as4tainer/as4tainer-jvm.jar"
         )]
         runner: String,
     },
@@ -120,7 +120,7 @@ enum Cmd {
         csv: PathBuf,
     },
     /// Run one CL command as QSECOFR, as the IBM i `system` utility does
-    /// (e.g. `ibmish system "CRTDTAARA DTAARA(QGPL/X) TYPE(*DEC)"`).
+    /// (e.g. `as4tainer system "CRTDTAARA DTAARA(QGPL/X) TYPE(*DEC)"`).
     /// Messages go to standard output; a failure exits with status 1.
     System {
         /// The command, as typed on a command line.
@@ -128,8 +128,8 @@ enum Cmd {
         /// Command that runs RPG programs (for CALL).
         #[arg(
             long,
-            env = "IBMISH_RUNNER",
-            default_value = "java -jar /opt/ibmish/ibmish-jvm.jar"
+            env = "AS4TAINER_RUNNER",
+            default_value = "java -jar /opt/as4tainer/as4tainer-jvm.jar"
         )]
         runner: String,
     },
@@ -141,21 +141,21 @@ enum Cmd {
     /// Run the TN5250 display server (5250 green-screen sessions).
     Tn5250 {
         /// Address to listen on.
-        #[arg(long, env = "IBMISH_TN5250_LISTEN", default_value = "0.0.0.0:23")]
+        #[arg(long, env = "AS4TAINER_TN5250_LISTEN", default_value = "0.0.0.0:23")]
         listen: String,
         /// System name shown on the sign-on screen.
-        #[arg(long, env = "IBMISH_SYSTEM_NAME", default_value = "IBMISH")]
+        #[arg(long, env = "AS4TAINER_SYSTEM_NAME", default_value = "AS4TAINR")]
         system_name: String,
         /// Command that runs RPG programs for CALL.
         #[arg(
             long,
-            env = "IBMISH_RUNNER",
-            default_value = "java -jar /opt/ibmish/ibmish-jvm.jar"
+            env = "AS4TAINER_RUNNER",
+            default_value = "java -jar /opt/as4tainer/as4tainer-jvm.jar"
         )]
         runner: String,
         /// Also serve the browser 5250 terminal on this address (HTTP), for
         /// example 0.0.0.0:8080. Off unless set.
-        #[arg(long, env = "IBMISH_WEB_LISTEN")]
+        #[arg(long, env = "AS4TAINER_WEB_LISTEN")]
         web_listen: Option<String>,
     },
     /// CALL: run a program. Starts a bridge on a free port and launches the
@@ -166,8 +166,8 @@ enum Cmd {
         /// Command that runs RPG programs.
         #[arg(
             long,
-            env = "IBMISH_RUNNER",
-            default_value = "java -jar /opt/ibmish/ibmish-jvm.jar"
+            env = "AS4TAINER_RUNNER",
+            default_value = "java -jar /opt/as4tainer/as4tainer-jvm.jar"
         )]
         runner: String,
     },
@@ -187,7 +187,7 @@ async fn main() -> std::process::ExitCode {
     match run(Cli::parse()).await {
         Ok(code) => std::process::ExitCode::from(code),
         Err(e) => {
-            eprintln!("ibmish: {e:#}");
+            eprintln!("as4tainer: {e:#}");
             std::process::ExitCode::from(1)
         }
     }
@@ -205,7 +205,7 @@ async fn run(cli: Cli) -> Result<u8> {
         Cmd::Init => {
             let client = bridge::connect_db(&cli.database_url).await?;
             catalog::init(&client).await?;
-            println!("ibmish catalog ready.");
+            println!("as4tainer catalog ready.");
         }
         Cmd::Rstpwd { user } => {
             let client = bridge::connect_db(&cli.database_url).await?;
@@ -227,7 +227,7 @@ async fn run(cli: Cli) -> Result<u8> {
             let (lib, name) = split_lib_file(&program)?;
             let source = std::fs::read_to_string(&src)
                 .with_context(|| format!("reading {}", src.display()))?;
-            let pgm = ibmish_core::clpgm::compile(&name, &source)?;
+            let pgm = as4tainer_core::clpgm::compile(&name, &source)?;
             let mut client = bridge::connect_db(&cli.database_url).await?;
             catalog::create_cl_program(&mut client, &lib, &name, &text, &source, true).await?;
             println!(
@@ -240,21 +240,21 @@ async fn run(cli: Cli) -> Result<u8> {
         }
         Cmd::Sql { statement } => {
             let client = bridge::connect_db(&cli.database_url).await?;
-            match ibmish_core::sql::run(&client, &cli.database_url, &libl, &statement).await? {
-                ibmish_core::sql::Outcome::Rows {
+            match as4tainer_core::sql::run(&client, &cli.database_url, &libl, &statement).await? {
+                as4tainer_core::sql::Outcome::Rows {
                     columns,
                     numeric,
                     rows,
                 } => {
-                    let (head, lines) = ibmish_core::sql::format_rows(&columns, &numeric, &rows);
+                    let (head, lines) = as4tainer_core::sql::format_rows(&columns, &numeric, &rows);
                     println!("{head}");
                     for l in lines {
                         println!("{l}");
                     }
                     println!("{} rows selected.", rows.len());
                 }
-                ibmish_core::sql::Outcome::Count(kind, n) => {
-                    println!("{}", ibmish_core::sql::count_message(kind, n))
+                as4tainer_core::sql::Outcome::Count(kind, n) => {
+                    println!("{}", as4tainer_core::sql::count_message(kind, n))
                 }
             }
         }
@@ -335,7 +335,7 @@ async fn run(cli: Cli) -> Result<u8> {
             let text = std::fs::read_to_string(&csv)
                 .with_context(|| format!("reading {}", csv.display()))?;
             let (lib, name) = (f.library.clone(), f.file.name.clone());
-            let n = ibmish_core::import::load_csv(&client, f, &text).await?;
+            let n = as4tainer_core::import::load_csv(&client, f, &text).await?;
             println!("{n} records written to {lib}/{name}.");
         }
         Cmd::Import { dir, lib, runner } => {
@@ -355,7 +355,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 display: None,
                 id: None,
             };
-            let report = ibmish_core::import::import(&mut job, &dir, &lib).await?;
+            let report = as4tainer_core::import::import(&mut job, &dir, &lib).await?;
             println!(
                 "Import of {} into {}:",
                 dir.display(),
@@ -405,14 +405,14 @@ async fn run(cli: Cli) -> Result<u8> {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    eprintln!("ibmish: {e:#}");
+                    eprintln!("as4tainer: {e:#}");
                     return Ok(1);
                 }
             }
         }
         Cmd::Serve { port } => {
             let listener = bridge::bind(port).await?;
-            println!("ibmish bridge listening on {}", listener.local_addr()?);
+            println!("as4tainer bridge listening on {}", listener.local_addr()?);
             bridge::serve(
                 listener,
                 bridge::BridgeConfig {
@@ -435,16 +435,16 @@ async fn run(cli: Cli) -> Result<u8> {
             let client = bridge::connect_db(&cli.database_url).await?;
             catalog::init(&client).await?;
             // Jobs left active by a server that stopped are not running.
-            let stale = ibmish_core::jobs::recover(&client).await?;
+            let stale = as4tainer_core::jobs::recover(&client).await?;
             if stale > 0 {
-                println!("ibmish: {stale} jobs from before the restart marked as ended");
+                println!("as4tainer: {stale} jobs from before the restart marked as ended");
             }
             drop(client);
             let listener = tokio::net::TcpListener::bind(&listen)
                 .await
                 .with_context(|| format!("listening on {listen}"))?;
             println!(
-                "ibmish 5250 server listening on {} (system {system_name})",
+                "as4tainer 5250 server listening on {} (system {system_name})",
                 listener.local_addr()?
             );
             // The browser terminal connects to this listener, in this process.
@@ -454,11 +454,11 @@ async fn run(cli: Cli) -> Result<u8> {
                         .await
                         .with_context(|| format!("listening on {w}"))?;
                     println!(
-                        "ibmish web terminal listening on http://{}",
+                        "as4tainer web terminal listening on http://{}",
                         web.local_addr()?
                     );
-                    let backend = ibmish_core::web::loopback_for(listener.local_addr()?);
-                    Some(tokio::spawn(ibmish_core::web::serve(web, backend)))
+                    let backend = as4tainer_core::web::loopback_for(listener.local_addr()?);
+                    Some(tokio::spawn(as4tainer_core::web::serve(web, backend)))
                 }
                 None => None,
             };
@@ -479,9 +479,9 @@ async fn run(cli: Cli) -> Result<u8> {
                 max_signon_attempts: 3,
             };
             // The QBATCH subsystem runs submitted jobs in this process.
-            let maxact = ibmish_core::jobs::batch_max_active();
-            println!("ibmish: subsystem QBATCH started (MAXACT {maxact})");
-            let qbatch = tokio::spawn(ibmish_core::jobs::run_subsystem(cfg.env.clone(), maxact));
+            let maxact = as4tainer_core::jobs::batch_max_active();
+            println!("as4tainer: subsystem QBATCH started (MAXACT {maxact})");
+            let qbatch = tokio::spawn(as4tainer_core::jobs::run_subsystem(cfg.env.clone(), maxact));
             tokio::select! {
                 r = tn5250::serve(listener, cfg) => r?,
                 r = qbatch => r??,
@@ -528,7 +528,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    eprintln!("ibmish: {e:#}");
+                    eprintln!("as4tainer: {e:#}");
                     return Ok(1);
                 }
             }
@@ -548,7 +548,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 record_wait: None,
             };
             // An RPG program object (CRTBNDRPG): the runner gets its source
-            // from the bridge; otherwise it looks in IBMISH_PGM_PATH.
+            // from the bridge; otherwise it looks in AS4TAINER_PGM_PATH.
             let (pgm_lib, program) = {
                 let client = bridge::connect_db(&cli.database_url).await?;
                 let name = program.to_ascii_uppercase();
@@ -561,18 +561,18 @@ async fn run(cli: Cli) -> Result<u8> {
                     None => (String::new(), n),
                 }
             };
-            if ibmish_core::rpg::native_enabled() {
+            if as4tainer_core::rpg::native_enabled() {
                 server_abort_unused(listener);
                 let client = bridge::connect_db(&cli.database_url).await?;
                 let source = if pgm_lib.is_empty() {
-                    ibmish_core::rpg::source_from_path(&program)
+                    as4tainer_core::rpg::source_from_path(&program)
                 } else {
                     catalog::find_program(&client, std::slice::from_ref(&pgm_lib), &program)
                         .await?
                         .map(|p| p.source)
                 }
                 .ok_or_else(|| anyhow::anyhow!("CPF4101: Program {program} not found."))?;
-                let r = ibmish_core::rpg::call(
+                let r = as4tainer_core::rpg::call(
                     &cli.database_url,
                     cfg.library_list.clone(),
                     "QSECOFR".into(),
@@ -587,8 +587,8 @@ async fn run(cli: Cli) -> Result<u8> {
                     println!("{m}");
                 }
                 if let Some(e) = r.error {
-                    eprintln!("ibmish: {e:#}");
-                    eprintln!("ibmish: program {program} ended abnormally");
+                    eprintln!("as4tainer: {e:#}");
+                    eprintln!("as4tainer: program {program} ended abnormally");
                     return Ok(1);
                 }
                 return Ok(0);
@@ -603,14 +603,14 @@ async fn run(cli: Cli) -> Result<u8> {
                 .arg(addr.to_string())
                 .arg(&program)
                 .args(&args)
-                .env("IBMISH_PGM_LIB", &pgm_lib)
+                .env("AS4TAINER_PGM_LIB", &pgm_lib)
                 .status()
                 .await
                 .with_context(|| format!("starting runner '{runner}'"))?;
             server.abort();
             if !status.success() {
                 eprintln!(
-                    "ibmish: program {} ended abnormally ({status})",
+                    "as4tainer: program {} ended abnormally ({status})",
                     program.to_ascii_uppercase()
                 );
                 return Ok(status.code().map(|c| c.clamp(1, 255) as u8).unwrap_or(1));

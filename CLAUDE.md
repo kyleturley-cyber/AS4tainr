@@ -2,9 +2,9 @@
 
 Guidance for AI coding sessions working in this repository.
 
-## What ibmish is
+## What as4tainer is
 
-An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (objects and libraries, DDS files, record-level access, 5250, CL, jobs) on Linux and PostgreSQL. RPG runs on Jariko (JVM) today and is moving to ibmish's own RPG engine in Rust (`core/src/rpg/`, docs/rpg-engine.md; `IBMISH_RPG_ENGINE=native`). It is NOT a hardware emulator.
+An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (objects and libraries, DDS files, record-level access, 5250, CL, jobs) on Linux and PostgreSQL. RPG runs on Jariko (JVM) today and is moving to as4tainer's own RPG engine in Rust (`core/src/rpg/`, docs/rpg-engine.md; `AS4TAINER_RPG_ENGINE=native`). It is NOT a hardware emulator.
 
 ## Non-negotiable rules
 
@@ -19,9 +19,9 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | Path | What |
 | --- | --- |
 | `core/src/dds.rs` | DDS parser: physical files (R, K lines with `DESCEND`, fields, `UNIQUE`, `TEXT`) and logical files (`PFILE`, field subsets, keys, select/omit) |
-| `core/src/catalog.rs` | Libraries = PostgreSQL schemas; file descriptions in schema `ibmish`; library list resolution |
+| `core/src/catalog.rs` | Libraries = PostgreSQL schemas; file descriptions in schema `as4tainer`; library list resolution |
 | `core/src/rla.rs` | Record-level access: cursor position per open file, keyset queries ordered by (keys, rrn), record locks (advisory locks on the physical file + rrn) |
-| `core/src/sql.rs` | SQL in the DB2 for i dialect: translation to PostgreSQL, run on a separate connection as the restricted `ibmish_sql` login |
+| `core/src/sql.rs` | SQL in the DB2 for i dialect: translation to PostgreSQL, run on a separate connection as the restricted `as4tainer_sql` login |
 | `core/src/bridge.rs` | JSON-lines TCP server the JVM calls for every file operation |
 | `core/src/dspf.rs` | DDS display files: parser, drawing a record on a 5250 screen, input validation, response indicators |
 | `core/src/workstn.rs` | A program's display state: records on the screen (OVERLAY), subfiles (WRITE/READC/CHAIN/UPDATE), one EXFMT's interaction and paging |
@@ -31,24 +31,24 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/commands.rs` | CL command implementations for a job |
 | `core/src/clpgm.rs` | CL programs: parse/check (CRTBNDCL), expressions (exact decimals), run in the calling job with MONMSG |
 | `core/src/dtaara.rs` | Data areas: CRTDTAARA/CHGDTAARA/RTVDTAARA values, RPG `IN *LOCK`/`OUT` (PostgreSQL advisory locks) |
-| `core/src/jobs.rs` | Work management: jobs (`ibmish.jobs`), job logs, job queue QBATCH and its subsystem loop, user message queues |
-| `core/src/spool.rs` | Spooled files (`ibmish.spooled_files`, `ibmish.spool_lines`): printer output, QSYSPRT listings of batch display commands, QPJOBLOG |
-| `core/src/source.rs` | Source physical files (`PF-SRC` objects) and members (`ibmish.source_members`), stream files for includes (`ibmish.stream_files`), CL `INCLUDE` expansion |
-| `core/src/import.rs` | `ibmish import DIR --lib LIB`: members (folders like QRPGLESRC/, TOBi names) and CSV data into a library, then CRTPF/CRTLF/CRTDSPF/CRTBNDCL/CRTBNDRPG. See `docs/import.md` |
+| `core/src/jobs.rs` | Work management: jobs (`as4tainer.jobs`), job logs, job queue QBATCH and its subsystem loop, user message queues |
+| `core/src/spool.rs` | Spooled files (`as4tainer.spooled_files`, `as4tainer.spool_lines`): printer output, QSYSPRT listings of batch display commands, QPJOBLOG |
+| `core/src/source.rs` | Source physical files (`PF-SRC` objects) and members (`as4tainer.source_members`), stream files for includes (`as4tainer.stream_files`), CL `INCLUDE` expansion |
+| `core/src/import.rs` | `as4tainer import DIR --lib LIB`: members (folders like QRPGLESRC/, TOBi names) and CSV data into a library, then CRTPF/CRTLF/CRTDSPF/CRTBNDCL/CRTBNDRPG. See `docs/import.md` |
 | `core/src/rpg/` | The native RPG engine (docs/rpg-engine.md): `dec.rs` exact decimals, `data.rs` storage formats (EBCDIC, zoned, packed, binary), `expr.rs`, `parse.rs` (fixed, mixed, **FREE, directives), `program.rs` (names, layout, external files), `code.rs` (blocks → jumps), `interp.rs` (cycle, opcodes, BIFs, file I/O on `rla` in its own session), `mod.rs` (compile, call) |
 | `core/src/menus.rs` | Menus: the system menus (MAIN...) as data, GO/CRTMNU TYPE(*PGM)/DLTMNU; the session shows them (`tn5250/session.rs`: initial program, initial menu, menu stack) |
 | `core/src/authority.rs` | Object owners, *PUBLIC and private authorities; `check` before every object use (CPF9802) |
 | `core/src/users.rs` | User profiles, Argon2id password hashes |
-| `core/src/main.rs` | `ibmish` CLI |
-| `core/tests/rla_test.rs` | Integration tests (need `IBMISH_TEST_DATABASE_URL`) |
-| `jvm/src/main/java/io/ibmish/bridge` | Dependency-free Java bridge client (keep it dependency-free) |
-| `jvm/src/main/java/io/ibmish/jvm` | Runner (`Launcher`, `Runner`): Jariko configuration, display files, EXFMT. `Workstation` rewrites WORKSTN programs (display record formats as DISK files, READC); `DisplayDBMManager`/`DisplayRecordFile` send those operations to core. `RecordLocks` adds signals for update files, N/E extenders and UNLOCK (record locks). `Printers` reads PRINTER F specs and O specs and turns EXCEPT into a signal that prints to a spooled file. `SourceForms` blanks `//` lines in columns 1-5 and expands quoted `/INCLUDE` stream files. RPG program objects (CRTBNDRPG) come from the bridge (`pgmsrc`), before `IBMISH_PGM_PATH`. Java, so it compiles with plain javac against the jar |
-| `jvm/src/main/kotlin/io/ibmish/jvm` | reload `DBMManager`/`DBFile` adapter (database I/O through the bridge) |
+| `core/src/main.rs` | `as4tainer` CLI |
+| `core/tests/rla_test.rs` | Integration tests (need `AS4TAINER_TEST_DATABASE_URL`) |
+| `jvm/src/main/java/io/as4tainer/bridge` | Dependency-free Java bridge client (keep it dependency-free) |
+| `jvm/src/main/java/io/as4tainer/jvm` | Runner (`Launcher`, `Runner`): Jariko configuration, display files, EXFMT. `Workstation` rewrites WORKSTN programs (display record formats as DISK files, READC); `DisplayDBMManager`/`DisplayRecordFile` send those operations to core. `RecordLocks` adds signals for update files, N/E extenders and UNLOCK (record locks). `Printers` reads PRINTER F specs and O specs and turns EXCEPT into a signal that prints to a spooled file. `SourceForms` blanks `//` lines in columns 1-5 and expands quoted `/INCLUDE` stream files. RPG program objects (CRTBNDRPG) come from the bridge (`pgmsrc`), before `AS4TAINER_PGM_PATH`. Java, so it compiles with plain javac against the jar |
+| `jvm/src/main/kotlin/io/as4tainer/jvm` | reload `DBMManager`/`DBFile` adapter (database I/O through the bridge) |
 | `jvm/src/test/java/.../BridgeConformance.java` | JDK-only stand-in runner used for end-to-end tests without Maven |
 | `tools/tn5250_driver.py`, `tools/e2e_5250.py` | Drive the real tn5250 client for end-to-end tests |
 | `tools/e2e_web.py` | Drives the browser terminal in Chromium (Playwright) |
 | `tools/gate3_5250.py` | Phase 3 gate: three clerks enter orders at once with batch jobs running; the files must add up. Run after e2e_5250.py |
-| `samples/` | DDS, CSV data, RPG and CL programs, golden outputs in `expected/`. `samples/apps/contacts` is an application laid out as a git repository, imported with `ibmish import` (into CONTACTS by samples.sh). The order entry app (Phase 2 gate) is described in `docs/order-entry.md` |
+| `samples/` | DDS, CSV data, RPG and CL programs, golden outputs in `expected/`. `samples/apps/contacts` is an application laid out as a git repository, imported with `as4tainer import` (into CONTACTS by samples.sh). The order entry app (Phase 2 gate) is described in `docs/order-entry.md` |
 | `scripts/samples.sh` | Creates every sample object in QGPL (used by demo.sh, the Docker entrypoint and CI). Add new sample objects here |
 | `tools/corpus.sh` | Clone a public repository of IBM i source and import it (real-world test; never vendored) |
 | `docs/bridge-protocol.md` | Protocol spec. Update it in the same change as the protocol |
@@ -57,18 +57,18 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 
 ```sh
 cargo fmt && cargo clippy --all-targets -- -D warnings
-IBMISH_TEST_DATABASE_URL=postgres://ibmish:ibmish@127.0.0.1/ibmish cargo test
-javac -d target/conformance-classes jvm/src/main/java/io/ibmish/bridge/*.java jvm/src/test/java/io/ibmish/bridge/*.java
-IBMISH_BIN=target/debug/ibmish IBMISH_RUNNER="java -cp target/conformance-classes io.ibmish.bridge.BridgeConformance" scripts/demo.sh
+AS4TAINER_TEST_DATABASE_URL=postgres://as4tainer:as4tainer@127.0.0.1/as4tainer cargo test
+javac -d target/conformance-classes jvm/src/main/java/io/as4tainer/bridge/*.java jvm/src/test/java/io/as4tainer/bridge/*.java
+AS4TAINER_BIN=target/debug/as4tainer AS4TAINER_RUNNER="java -cp target/conformance-classes io.as4tainer.bridge.BridgeConformance" scripts/demo.sh
 cd jvm && ./gradlew fatJar   # needs Maven Central
-TN5250=/path/to/tn5250 python3 tools/e2e_5250.py 127.0.0.1:2323   # against a running `ibmish tn5250`
+TN5250=/path/to/tn5250 python3 tools/e2e_5250.py 127.0.0.1:2323   # against a running `as4tainer tn5250`
 python3 tools/e2e_web.py http://127.0.0.1:5250   # browser terminal in Chromium (pip install playwright), with --web-listen 127.0.0.1:5250
-TN5250=/path/to/tn5250 IBMISH_BIN=target/debug/ibmish python3 tools/gate3_5250.py 127.0.0.1:2323   # then the Phase 3 gate
+TN5250=/path/to/tn5250 AS4TAINER_BIN=target/debug/as4tainer python3 tools/gate3_5250.py 127.0.0.1:2323   # then the Phase 3 gate
 ```
 
 ## Conventions
 
 - Errors that a program could monitor for start with the IBM-style message ID, e.g. `CPF5026: ...`.
-- SQL is built dynamically only with `catalog::ident()` for identifiers. Values are always bound parameters (as text, then `CAST`). The exception is user SQL (`sql.rs`), which only ever runs as the `ibmish_sql` login: never run user-supplied SQL on the main connection.
+- SQL is built dynamically only with `catalog::ident()` for identifiers. Values are always bound parameters (as text, then `CAST`). The exception is user SQL (`sql.rs`), which only ever runs as the `as4tainer_sql` login: never run user-supplied SQL on the main connection.
 - Bridge protocol changes are versioned: bump `PROTOCOL_VERSION` in both `bridge.rs` and `BridgeClient.java`.
 - Commits are signed off (`git commit -s`). Commit messages describe the IBM i behavior implemented.

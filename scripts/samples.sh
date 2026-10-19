@@ -4,14 +4,14 @@
 # again: existing files keep their data, CL programs are replaced.
 #
 # Env:
-#   IBMISH_BIN      path to the ibmish binary (default: ibmish on PATH)
-#   IBMISH_SAMPLES  samples directory (default: ../samples next to this script)
+#   AS4TAINER_BIN      path to the as4tainer binary (default: as4tainer on PATH)
+#   AS4TAINER_SAMPLES  samples directory (default: ../samples next to this script)
 # Prints "Loaded FILE" for each physical file created and loaded now.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
-samples="${IBMISH_SAMPLES:-$here/samples}"
-bin="${IBMISH_BIN:-ibmish}"
+samples="${AS4TAINER_SAMPLES:-$here/samples}"
+bin="${AS4TAINER_BIN:-as4tainer}"
 
 "$bin" init >/dev/null
 

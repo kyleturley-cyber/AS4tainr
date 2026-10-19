@@ -2,7 +2,7 @@
 //!
 //! Written from IBM's public security reference. Each object has an
 //! owner (the user who created it; QSECOFR for system objects and objects
-//! created with the `ibmish` CLI), a *PUBLIC authority, and private
+//! created with the `as4tainer` CLI), a *PUBLIC authority, and private
 //! authorities for named users. The authorities are *ALL, *CHANGE, *USE
 //! and *EXCLUDE.
 //!
@@ -23,9 +23,9 @@ use anyhow::{bail, Result};
 use tokio_postgres::Client;
 
 pub const DDL: &str = r#"
-ALTER TABLE ibmish.objects ADD COLUMN IF NOT EXISTS owner text NOT NULL DEFAULT 'QSECOFR';
-ALTER TABLE ibmish.objects ADD COLUMN IF NOT EXISTS public_aut text NOT NULL DEFAULT '*CHANGE';
-CREATE TABLE IF NOT EXISTS ibmish.object_auths (
+ALTER TABLE as4tainer.objects ADD COLUMN IF NOT EXISTS owner text NOT NULL DEFAULT 'QSECOFR';
+ALTER TABLE as4tainer.objects ADD COLUMN IF NOT EXISTS public_aut text NOT NULL DEFAULT '*CHANGE';
+CREATE TABLE IF NOT EXISTS as4tainer.object_auths (
     library   text NOT NULL,
     name      text NOT NULL,
     objtype   text NOT NULL,
@@ -86,7 +86,7 @@ pub async fn get(
 ) -> Result<Option<ObjectAuthority>> {
     let Some(row) = client
         .query_opt(
-            "SELECT owner, public_aut FROM ibmish.objects WHERE library=$1 AND name=$2 AND objtype=$3",
+            "SELECT owner, public_aut FROM as4tainer.objects WHERE library=$1 AND name=$2 AND objtype=$3",
             &[&library, &name, &objtype],
         )
         .await?
@@ -95,7 +95,7 @@ pub async fn get(
     };
     let private = client
         .query(
-            "SELECT user_name, aut FROM ibmish.object_auths
+            "SELECT user_name, aut FROM as4tainer.object_auths
              WHERE library=$1 AND name=$2 AND objtype=$3 ORDER BY user_name",
             &[&library, &name, &objtype],
         )
@@ -111,7 +111,7 @@ pub async fn get(
 }
 
 /// A user's authority to an object (see the module comment for the
-/// order). Objects ibmish does not catalog (RPG programs found as source)
+/// order). Objects as4tainer does not catalog (RPG programs found as source)
 /// are not checked: *ALL.
 pub async fn effective(
     client: &Client,
@@ -160,7 +160,7 @@ pub async fn set_owner(
 ) -> Result<()> {
     client
         .execute(
-            "UPDATE ibmish.objects SET owner=$4 WHERE library=$1 AND name=$2 AND objtype=$3",
+            "UPDATE as4tainer.objects SET owner=$4 WHERE library=$1 AND name=$2 AND objtype=$3",
             &[&library, &name, &objtype, &owner],
         )
         .await?;
@@ -194,14 +194,14 @@ pub async fn grant(
     if user == "*PUBLIC" {
         client
             .execute(
-                "UPDATE ibmish.objects SET public_aut=$4 WHERE library=$1 AND name=$2 AND objtype=$3",
+                "UPDATE as4tainer.objects SET public_aut=$4 WHERE library=$1 AND name=$2 AND objtype=$3",
                 &[&library, &name, &objtype, &aut.code()],
             )
             .await?;
     } else {
         client
             .execute(
-                "INSERT INTO ibmish.object_auths VALUES ($1,$2,$3,$4,$5)
+                "INSERT INTO as4tainer.object_auths VALUES ($1,$2,$3,$4,$5)
                  ON CONFLICT (library, name, objtype, user_name) DO UPDATE SET aut = EXCLUDED.aut",
                 &[&library, &name, &objtype, &user, &aut.code()],
             )
@@ -225,7 +225,7 @@ pub async fn revoke(
     }
     Ok(client
         .execute(
-            "DELETE FROM ibmish.object_auths WHERE library=$1 AND name=$2 AND objtype=$3 AND user_name=$4",
+            "DELETE FROM as4tainer.object_auths WHERE library=$1 AND name=$2 AND objtype=$3 AND user_name=$4",
             &[&library, &name, &objtype, &user],
         )
         .await?
@@ -236,7 +236,7 @@ pub async fn revoke(
 pub async fn forget(client: &Client, library: &str, name: &str, objtype: &str) -> Result<()> {
     client
         .execute(
-            "DELETE FROM ibmish.object_auths WHERE library=$1 AND name=$2 AND objtype=$3",
+            "DELETE FROM as4tainer.object_auths WHERE library=$1 AND name=$2 AND objtype=$3",
             &[&library, &name, &objtype],
         )
         .await?;

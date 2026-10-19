@@ -1,4 +1,4 @@
-//! ibmish core library: an IBM i-compatible runtime for containers.
+//! as4tainer core library: an IBM i-compatible runtime for containers.
 //!
 //! Modules:
 //! - [`dds`]: parse DDS source for physical files
@@ -10,7 +10,7 @@
 //! - [`dtaara`]: data areas
 //! - [`authority`]: object owners and authorities (*ALL, *CHANGE, *USE, *EXCLUDE)
 //! - [`spool`]: spooled files (printed output)
-//! - [`import`]: `ibmish import`: an application's source and data into a library
+//! - [`import`]: `as4tainer import`: an application's source and data into a library
 //! - [`source`]: source physical files and members (QRPGLESRC...)
 //! - [`menus`]: menus (GO, CRTMNU) and the system menus
 //! - [`jobs`]: jobs, job queues, job logs, message queues, the QBATCH subsystem

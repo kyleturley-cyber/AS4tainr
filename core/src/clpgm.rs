@@ -1,7 +1,7 @@
 //! CL programs (CLLE): parsing ("compiling") and running them.
 //!
 //! Written from IBM's public CL reference. A program is checked when it is
-//! created (`ibmish crtbndcl`) and its source is kept; CALL runs it here,
+//! created (`as4tainer crtbndcl`) and its source is kept; CALL runs it here,
 //! in the job that called it. Supported:
 //!
 //! - `PGM PARM(&a ...)` / `ENDPGM`, labels (`LABEL: command`), comments

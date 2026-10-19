@@ -1,10 +1,10 @@
-// ibmish JVM side: runs RPG on Jariko, with file I/O routed to ibmish core.
+// as4tainer JVM side: runs RPG on Jariko, with file I/O routed to as4tainer core.
 plugins {
     kotlin("jvm") version "2.1.0"
     application
 }
 
-group = "io.ibmish"
+group = "io.as4tainer"
 version = "0.1.0"
 
 val jarikoVersion: String by project
@@ -41,17 +41,17 @@ tasks.withType<JavaCompile>().configureEach {
 }
 
 application {
-    mainClass.set("io.ibmish.jvm.Launcher")
-    applicationName = "ibmish-jvm"
+    mainClass.set("io.as4tainer.jvm.Launcher")
+    applicationName = "as4tainer-jvm"
 }
 
-// Self-contained jar for the container image: java -jar ibmish-jvm.jar
+// Self-contained jar for the container image: java -jar as4tainer-jvm.jar
 tasks.register<Jar>("fatJar") {
     group = "build"
-    description = "Builds ibmish-jvm.jar with all dependencies."
-    archiveFileName.set("ibmish-jvm.jar")
+    description = "Builds as4tainer-jvm.jar with all dependencies."
+    archiveFileName.set("as4tainer-jvm.jar")
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-    manifest { attributes["Main-Class"] = "io.ibmish.jvm.Launcher" }
+    manifest { attributes["Main-Class"] = "io.as4tainer.jvm.Launcher" }
     from(sourceSets.main.get().output)
     dependsOn(configurations.runtimeClasspath)
     from({ configurations.runtimeClasspath.get().filter { it.name.endsWith("jar") }.map { zipTree(it) } }) {

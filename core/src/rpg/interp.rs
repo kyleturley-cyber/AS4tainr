@@ -234,7 +234,7 @@ impl<'a> Machine<'a> {
                         "*MONTH" | "UMONTH" => Value::Num(Dec::from_i64(today().1 as i64)),
                         "*YEAR" => Value::Num(Dec::from_i64(today().0 as i64)),
                         "UYEAR" => Value::Num(Dec::from_i64((today().0 % 100) as i64)),
-                        _ if args.is_some() => bail!("{name} is not an array or a procedure ibmish knows (procedures come in a later milestone)"),
+                        _ if args.is_some() => bail!("{name} is not an array or a procedure as4tainer knows (procedures come in a later milestone)"),
                         _ => bail!("{name} is not defined"),
                     },
                 }

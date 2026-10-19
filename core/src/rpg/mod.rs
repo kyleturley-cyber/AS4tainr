@@ -162,6 +162,7 @@ pub async fn call(
                 display,
                 cl,
                 callers: vec![],
+                database_url: url.clone(),
             },
         );
         let r = m.run(&args);

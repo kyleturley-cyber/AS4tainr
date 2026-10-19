@@ -400,6 +400,21 @@ impl Parser {
                 Some(Tok::Hex(b)) => Expr::Fig(Fig::All(b)),
                 other => bail!("*ALL needs a literal, found {other:?}"),
             },
+            // *ALLX'00': the hexadecimal form.
+            "*ALLX" => match self.next() {
+                Some(Tok::Str(p)) => {
+                    if !p.len().is_multiple_of(2) {
+                        bail!("*ALLX'{p}': an even number of hexadecimal digits is needed");
+                    }
+                    let bytes = (0..p.len())
+                        .step_by(2)
+                        .map(|j| u8::from_str_radix(&p[j..j + 2], 16))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|_| anyhow!("*ALLX'{p}' is not hexadecimal"))?;
+                    Expr::Fig(Fig::All(bytes))
+                }
+                other => bail!("*ALLX needs a hexadecimal literal, found {other:?}"),
+            },
             "*IN" => {
                 if self.eat_op("(") {
                     let i = self.expr()?;

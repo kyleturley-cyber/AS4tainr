@@ -28,6 +28,10 @@ Written from IBM's public DB2 for i SQL reference.
 
 Each statement is committed on its own (`COMMIT(*NONE)`).
 
+## Embedded SQL in RPG
+
+RPG programs with `EXEC SQL` (SQLRPGLE, created with CRTSQLRPGI) run their statements on this layer, as the same restricted login, with the program's library list as the search path. Each program has its own connection for the call. Host variables are put into the statement as values (character values quoted and escaped, numbers exact); identifiers never come from host variables. Cursors read all their rows when they are opened. The SQLCA (SQLCODE, SQLSTATE, SQLERRMC, SQLERRD) is set after each statement. See docs/rpg-engine.md for the statements supported.
+
 ## Security
 
 User SQL never runs as the database user as4tainr itself uses. `as4tainr init` creates a PostgreSQL login role, `as4tainr_sql`, that is not a superuser, has a random password (kept in the catalog) and may only use the library schemas: it cannot read the catalog (user profiles and password hashes), create or drop objects, switch to another role, or call server functions. Every statement opens a connection that logs in as that role. Statements that name the catalog or PostgreSQL's own schemas are also refused before they run, with a clearer message.
@@ -36,4 +40,4 @@ User SQL never runs as the database user as4tainr itself uses. `as4tainr init` c
 
 ## Not supported yet
 
-CREATE/ALTER/DROP and other DDL (create files with CRTPF/CRTLF), commitment control (COMMIT, ROLLBACK, `COMMIT(*CHG)`), embedded SQL in RPG (SQLRPGLE), the QSYS2 catalog views, `SELECT *` in `INSERT ... SELECT` (it includes the record number; list the columns), DB2-only scalar functions beyond the ones above, and special registers other than the dates and times. Object authority is not checked: anyone who can sign on can read and change every file with SQL, as with record-level access. See [fidelity-gaps.md](fidelity-gaps.md).
+CREATE/ALTER/DROP and other DDL (create files with CRTPF/CRTLF), commitment control (COMMIT, ROLLBACK, `COMMIT(*CHG)`), the QSYS2 catalog views, `SELECT *` in `INSERT ... SELECT` (it includes the record number; list the columns), DB2-only scalar functions beyond the ones above, and special registers other than the dates and times. Object authority is not checked: anyone who can sign on can read and change every file with SQL, as with record-level access. See [fidelity-gaps.md](fidelity-gaps.md).

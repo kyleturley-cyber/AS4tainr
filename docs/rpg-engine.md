@@ -35,6 +35,15 @@ Character data is kept in EBCDIC, as on IBM i. Comparisons and sorting follow th
 
 ## Status
 
+**R6 has started: embedded SQL (SQLRPGLE) runs (Oct 19, 2026).** `EXEC SQL` statements, in free form and between `C/EXEC SQL` and `C/END-EXEC` in fixed form, run on the SQL layer (docs/sql.md) as the restricted SQL login, with the program's library list as the search path. CRTSQLRPGI (`OBJTYPE(*PGM)`) creates the program, and `as4tainr import` builds SQLRPGLE members with it. What runs:
+- **The SQLCA:** `SQLCODE`/`SQLCOD`, `SQLSTATE`/`SQLSTT`, `SQLERRMC`, `SQLERRD` (`SQLERRD(3)`: rows changed or fetched), set after every statement. SQL errors do not end the program; it looks at SQLCODE (+100 for no row, negative numbers for errors, as in the Db2 for i SQL messages).
+- **Host variables:** `:name`, qualified subfields (`:ds.field`), a data structure as a host structure (its subfields in order), null indicators (`:var :ind`, `:var INDICATOR :ind`; -1 for null), `SQLTYPE(CLOB : n)` variables (`name_LEN`, `name_DATA`).
+- **Statements:** `SELECT ... INTO`, `VALUES ... INTO`, `SET :var = expression`, INSERT, UPDATE and DELETE (+100 when no row changes), `DECLARE CURSOR` for a SELECT or a prepared statement, `OPEN` (with `USING`), `FETCH` (NEXT, PRIOR, FIRST, LAST, RELATIVE, ABSOLUTE) `INTO`, `CLOSE`, `PREPARE`, `EXECUTE` (with `USING`), `EXECUTE IMMEDIATE`, `SET OPTION`, `WHENEVER` and `INCLUDE SQLCA` (accepted), `COMMIT` and `ROLLBACK` (accepted; statements are autocommitted).
+- Not yet: see fidelity-gaps.md (multi-row FETCH, positioned UPDATE/DELETE, GET DIAGNOSTICS, CALL of procedures, DDL, commitment control).
+- The test: `rpg_embedded_sql` (rla_test.rs) runs free-form and fixed-form programs against the sample customer file.
+
+Also from the corpus: `*ALLX'..'` figurative constants; prototypes may come after the definitions they use (`LIKEDS` of a later data structure); `%SIZE` and `%ELEM` in definition keywords (`INZ(%size(ds.field))`); a procedure's local data structure can have a subfield `LIKEDS` a global template. Corpus status: 35 programs created (23 before R6). Most of the others need SQL DDL for their files (`CREATE TABLE`), command definitions (CMD), CL `DCL ... STG(*DEFINED) DEFVAR`, files or includes missing from the repository, or are snippets that do not compile on IBM i either.
+
 **R5 is done (Oct 19, 2026): the native engine is the only RPG engine.** It passed everything Jariko passed and more: the samples and demos, the 5250 end-to-end test (130 checks, two more than Jariko: DSPLY with a reply), the Phase 3 gate and the browser terminal test. Then Jariko, the JVM runner, the JSON bridge and its conformance runner were removed: as4tainr is one Rust binary, and the container image has no JRE. The bridge's integration tests became RPG programs run on the engine (display files, subfiles, data area locks, spooled files, authority) or tests of the record-level access layer (record locks).
 
 What R5 added, from running the corpus (Nick Litten's examples, `tools/corpus.sh`):
@@ -44,7 +53,7 @@ What R5 added, from running the corpus (Nick Litten's examples, `tools/corpus.sh
 - A program that calls itself is refused: RPG programs are not recursive (procedures are).
 - One-line empty interfaces (`dcl-pi *n int(10) end-pi;`).
 
-Corpus status: 23 of its programs (RPG and CL) are created. Most of the others need things outside RPG: embedded SQL (R6), SQL DDL for their files (`CREATE TABLE`), files or includes missing from the repository, or they are snippets that do not compile on IBM i either (fixed C specs inside `**FREE`, unbalanced parentheses). - **Nested data structures:** a subfield defined with `LIKEDS` is a data structure inside the other one (`list.users(i).name`), also through a `LIKEDS` copy of the whole structure and as a parameter; `ds(i).field` for data structure arrays.
+- **Nested data structures:** a subfield defined with `LIKEDS` is a data structure inside the other one (`list.users(i).name`), also through a `LIKEDS` copy of the whole structure and as a parameter; `ds(i).field` for data structure arrays.
 
 **R4 is done (Oct 19, 2026).** Programs call each other and are built from procedures:
 - **Procedures** (`DCL-PROC`, P specs) with their own local storage on each call, `STATIC` locals, parameters by reference, `CONST` and `VALUE`, `LIKEDS` parameters, `OPTIONS(*NOPASS : *OMIT)`, `%PARMS`, return values in the declared type, recursion, subroutines inside procedures, `ON-EXIT`.
@@ -107,7 +116,7 @@ What R1 covers:
    - The corpus (`tools/corpus.sh`): free-form programs, data structures (`LIKEDS`, `QUALIFIED`, `DIM`, `OVERLAY`), dates, `MONITOR`, `%BIFs`, `/IF DEFINED`.
    - Gate: the default switches to native, then Jariko and the JVM are removed (done).
 6. **R6, beyond.**
-   - Embedded SQL (SQLRPGLE) on `sql.rs`.
+   - Embedded SQL (SQLRPGLE) on `sql.rs` (done, see Status).
    - Service programs and modules: CRTRPGMOD, CRTSRVPGM, binding directories.
    - RPG/400 (RPG III) source.
 

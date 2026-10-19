@@ -17,9 +17,10 @@
 //! 2. CRTPF for each PF member, and loads its CSV when the file is new
 //!    (an existing file keeps its records);
 //! 3. CRTLF, CRTDSPF;
-//! 4. CRTBNDCL (CLLE) and CRTCLPGM (CLP), CRTBNDRPG (RPGLE).
+//! 4. CRTBNDCL (CLLE) and CRTCLPGM (CLP), CRTBNDRPG (RPGLE), CRTSQLRPGI
+//!    (SQLRPGLE).
 //!
-//! Members as4tainr cannot build yet (PRTF, SQLRPGLE, RPG III, COBOL, CMD)
+//! Members as4tainr cannot build yet (PRTF, RPG III, COBOL, CMD)
 //! are kept as source and reported.
 
 use anyhow::{bail, Context, Result};
@@ -382,10 +383,16 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         ("CLLE", "CRTBNDCL"),
         ("CLP", "CRTCLPGM"),
         ("RPGLE", "CRTBNDRPG"),
+        ("SQLRPGLE", "CRTSQLRPGI"),
     ] {
         for m in of_type(t) {
+            let target = if command == "CRTSQLRPGI" {
+                "OBJ"
+            } else {
+                "PGM"
+            };
             let cmd = format!(
-                "{command} PGM({lib}/{}) SRCFILE({lib}/{}) SRCMBR({})",
+                "{command} {target}({lib}/{}) SRCFILE({lib}/{}) SRCMBR({})",
                 m.member, m.file, m.member
             );
             step(job, &mut report, &m.member, &cmd).await;
@@ -394,7 +401,7 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
     for m in members.iter().filter(|m| {
         !matches!(
             m.srctype.as_str(),
-            "PF" | "LF" | "DSPF" | "CLLE" | "CLP" | "RPGLE" | "TXT"
+            "PF" | "LF" | "DSPF" | "CLLE" | "CLP" | "RPGLE" | "SQLRPGLE" | "TXT"
         )
     }) {
         report.lines.push(format!(

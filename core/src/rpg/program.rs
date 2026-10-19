@@ -155,6 +155,72 @@ pub struct Program {
     pub procs: HashMap<String, ProcInfo>,
     /// `ctl-opt main(name)`: the program runs that procedure, no cycle.
     pub main: Option<String>,
+    /// Embedded SQL cursors (DECLARE name CURSOR FOR ...): the SELECT as
+    /// written, or the name of a prepared statement.
+    pub cursors: HashMap<String, Cursor>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Cursor {
+    Select(String),
+    Prepared(String),
+}
+
+/// The SQL communication area every program with embedded SQL has
+/// (DB2 for i SQL reference, "SQLCA"), with the short names RPG programs
+/// use for its fields (SQLCOD, SQLSTT, SQLER1-SQLER6).
+const SQLCA: &str = "**FREE
+dcl-ds SQLCA;
+  SQLCAID char(8) inz('SQLCA');
+  SQLCABC int(10) inz(136);
+  SQLCODE int(10);
+  SQLERRML int(5);
+  SQLERRMC char(70);
+  SQLERRP char(8);
+  SQLERRD int(10) dim(6);
+  SQLWARN char(11);
+  SQLSTATE char(5) inz('00000');
+  SQLCOD int(10) overlay(SQLCODE);
+  SQLER1 int(10) overlay(SQLERRD);
+  SQLER2 int(10) overlay(SQLERRD:5);
+  SQLER3 int(10) overlay(SQLERRD:9);
+  SQLER4 int(10) overlay(SQLERRD:13);
+  SQLER5 int(10) overlay(SQLERRD:17);
+  SQLER6 int(10) overlay(SQLERRD:21);
+  SQLSTT char(5) overlay(SQLSTATE);
+end-ds;
+";
+
+fn sql_statements(calcs: &[CalcLine]) -> impl Iterator<Item = &str> {
+    calcs.iter().filter_map(|c| match &c.what {
+        Line::Stmt(Stmt::Sql(s)) => Some(s.as_str()),
+        _ => None,
+    })
+}
+
+/// DECLARE c CURSOR [WITH HOLD...] FOR select | statement-name.
+fn declared_cursor(sql: &str) -> Option<(String, Cursor)> {
+    let words: Vec<&str> = sql.split_whitespace().collect();
+    if words.len() < 4 || !words[0].eq_ignore_ascii_case("DECLARE") {
+        return None;
+    }
+    let name = words[1].to_ascii_uppercase();
+    let up = sql.to_ascii_uppercase();
+    let at = up.find(" FOR ")?;
+    let rest = sql[at + 5..].trim();
+    let first = rest
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    Some((
+        name,
+        if matches!(first.as_str(), "SELECT" | "WITH" | "VALUES") || rest.starts_with('(') {
+            Cursor::Select(rest.to_string())
+        } else {
+            Cursor::Prepared(first)
+        },
+    ))
 }
 
 fn expr_name(e: &Option<Expr>) -> Option<String> {
@@ -281,6 +347,32 @@ fn const_value(e: &Expr, syms: &HashMap<String, Sym>) -> Result<Value> {
             _ => bail!("{} is not a constant", parts.join(".")),
         },
         Expr::Name { parts, .. } if parts[0].starts_with('*') => Value::Char(data::e(&parts[0])),
+        // %SIZE and %ELEM of a defined item are known when the program is
+        // compiled (ILE RPG Reference: both are allowed in definition
+        // keywords such as INZ and DIM). %SIZE of an array is the size of
+        // one element.
+        Expr::Bif(f, a) if (f == "SIZE" || f == "ELEM") && a.len() == 1 => {
+            let Expr::Name { parts, args: None } = &a[0] else {
+                bail!("%{f} needs the name of a defined item");
+            };
+            let name = parts.join(".");
+            let (size, dim) = match syms.get(&name) {
+                Some(Sym::Var(v)) => (v.dtype.size(), v.dim),
+                Some(Sym::Ds(d)) => (d.size, d.dim),
+                Some(Sym::Const(Value::Char(c))) if f == "SIZE" => (c.len(), 0),
+                _ => bail!("%{f}({name}): {name} is not defined before it is used"),
+            };
+            let n = if f == "SIZE" { size as i64 } else { dim as i64 };
+            Value::Num(Dec::from_i64(n))
+        }
+        Expr::Bin(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), l, r) => {
+            let (l, r) = (const_value(l, syms)?.num()?, const_value(r, syms)?.num()?);
+            Value::Num(match op {
+                BinOp::Add => l.add(&r)?,
+                BinOp::Sub => l.sub(&r)?,
+                _ => l.mul(&r)?,
+            })
+        }
         other => bail!("a constant value is needed, found {other:?}"),
     })
 }
@@ -324,6 +416,8 @@ struct Binder<'a> {
     local: bool,
     /// Local buffers of STATIC variables (moved to global storage).
     statics: Vec<usize>,
+    /// Global storage, seen (for templates) while binding a procedure.
+    globals: Vec<Vec<u8>>,
 }
 
 /// What a definitions list declared besides storage: its procedure
@@ -366,8 +460,38 @@ impl Binder<'_> {
         protos: &mut HashMap<String, Proto>,
     ) -> Result<Option<Interface>> {
         let mut pi = None;
-        let mut i = 0;
-        while i < defs.len() {
+        // Prototypes are bound last: they allocate nothing, and a
+        // parameter's LIKEDS may name a data structure defined after them.
+        let mut order: Vec<usize> = Vec::new();
+        let mut later: Vec<usize> = Vec::new();
+        {
+            let mut k = 0;
+            while k < defs.len() {
+                let start = k;
+                k += 1;
+                let follows = match defs[start].kind {
+                    DefKind::Ds => DefKind::Subfield,
+                    DefKind::Proto | DefKind::Interface => DefKind::Param,
+                    _ => DefKind::Const,
+                };
+                if defs[start].kind == DefKind::Ds
+                    || defs[start].kind == DefKind::Proto
+                    || defs[start].kind == DefKind::Interface
+                {
+                    while k < defs.len() && defs[k].kind == follows {
+                        k += 1;
+                    }
+                }
+                if defs[start].kind == DefKind::Proto {
+                    later.push(start);
+                } else {
+                    order.push(start);
+                }
+            }
+        }
+        order.extend(later);
+        for &i0 in &order {
+            let i = i0;
             let d = &defs[i];
             match d.kind {
                 DefKind::Const => {
@@ -393,7 +517,6 @@ impl Binder<'_> {
                     let v = literal_value(&text, &self.syms)
                         .map_err(|e| anyhow!("line {}: {e}", d.line))?;
                     self.syms.insert(d.name.clone(), Sym::Const(v));
-                    i += 1;
                 }
                 DefKind::Field => {
                     let t = self
@@ -408,16 +531,13 @@ impl Binder<'_> {
                         self.statics.push(v.buf);
                     }
                     self.inz(&d.name.clone(), d)?;
-                    i += 1;
                 }
                 DefKind::Ds => {
-                    let next = self
-                        .ds(defs, i)
+                    self.ds(defs, i)
                         .map_err(|e| anyhow!("line {}: {e}", d.line))?;
                     if self.local && keyword(&d.keywords, "STATIC").is_some() {
                         self.statics.push(self.bufs.len() - 1);
                     }
-                    i = next;
                 }
                 DefKind::Proto | DefKind::Interface => {
                     let interface = d.kind == DefKind::Interface;
@@ -502,7 +622,6 @@ impl Binder<'_> {
                             },
                         );
                     }
-                    i = j;
                 }
                 DefKind::Subfield | DefKind::Param => bail!(
                     "line {}: {} has no data structure or prototype",
@@ -821,7 +940,7 @@ impl Binder<'_> {
                 let Some(rest) = rest else { continue };
                 let rel = |x: usize| x - o.off;
                 match sym {
-                    Sym::Var(v) if v.buf == o.buf => add.push((
+                    Sym::Var(v) if v.buf == o.buf && v.local == o.local => add.push((
                         format!("{prefix}.{rest}"),
                         Sym::Var(VarInfo {
                             buf,
@@ -830,7 +949,7 @@ impl Binder<'_> {
                             ..v.clone()
                         }),
                     )),
-                    Sym::Ds(d) if d.buf == o.buf => add.push((
+                    Sym::Ds(d) if d.buf == o.buf && d.local == o.local => add.push((
                         format!("{prefix}.{rest}"),
                         Sym::Ds(DsInfo {
                             buf,
@@ -843,7 +962,13 @@ impl Binder<'_> {
                 }
             }
             // The template's initial contents (INZ) come along.
-            let src = self.bufs[o.buf][o.off..o.off + o.size].to_vec();
+            // A procedure's LIKEDS of a global template reads global storage.
+            let from = if self.local && !o.local {
+                &self.globals
+            } else {
+                &self.bufs
+            };
+            let src = from[o.buf][o.off..o.off + o.size].to_vec();
             for e in 0..dim.max(1) as usize {
                 for n in 0..(*sdim).max(1) as usize {
                     let at = e * size + off + n * o.size;
@@ -901,6 +1026,7 @@ pub fn bind(
         externals,
         file_fields: HashMap::new(),
         inz: vec![],
+        globals: vec![],
         local: false,
         statics: vec![],
     };
@@ -994,8 +1120,27 @@ pub fn bind(
         }
         files.push(info);
     }
+    // Embedded SQL: the SQLCA comes first, and the declared cursors.
+    let mut cursors = HashMap::new();
+    let mut uses_sql = false;
+    for s in
+        sql_statements(&src.calcs).chain(src.procs.iter().flat_map(|p| sql_statements(&p.calcs)))
+    {
+        uses_sql = true;
+        if let Some((n, c)) = declared_cursor(s) {
+            cursors.insert(n, c);
+        }
+    }
+    let with_sqlca;
+    let defs = if uses_sql && !src.defs.iter().any(|d| d.name == "SQLCA") {
+        let mut v = super::parse::parse(SQLCA, &|_| None)?.defs;
+        v.extend(src.defs.iter().cloned());
+        with_sqlca = v;
+        &with_sqlca
+    } else {
+        &src.defs
+    };
     // Definitions, in order.
-    let defs = &src.defs;
     let mut protos = HashMap::new();
     let global_pi = b.defs(defs, &mut protos)?;
     // File fields not defined otherwise become standalone fields.
@@ -1069,6 +1214,7 @@ pub fn bind(
             inz: vec![],
             local: true,
             statics: vec![],
+            globals: b.bufs.clone(),
         };
         let pi = pb
             .defs(&pr.defs, &mut protos)
@@ -1176,5 +1322,6 @@ pub fn bind(
         protos,
         procs,
         main,
+        cursors,
     })
 }

@@ -19,6 +19,9 @@ use std::collections::HashMap;
 use tokio::runtime::Handle;
 use tokio_postgres::Client;
 
+#[path = "exec_sql.rs"]
+mod exec_sql;
+
 /// What the program runs with: the database, the job.
 pub struct Io<'a> {
     pub rt: Handle,
@@ -36,6 +39,8 @@ pub struct Io<'a> {
     pub cl: Option<super::ClContext>,
     /// RPG programs active in the call stack above this one.
     pub callers: Vec<String>,
+    /// The database, for the embedded SQL session.
+    pub database_url: String,
 }
 
 /// Status of the last operation on a file (%FOUND, %EOF, %EQUAL, %ERROR).
@@ -87,6 +92,9 @@ pub struct Machine<'a> {
     frames: Vec<Frame<'a>>,
     /// Parameters passed to the program (%PARMS outside a procedure).
     parms_passed: usize,
+    /// Embedded SQL: the session (opened by the first statement), open
+    /// cursors and prepared statements.
+    sql: exec_sql::SqlState,
 }
 
 /// One procedure call: its local storage starts at `base` in the
@@ -178,6 +186,7 @@ impl<'a> Machine<'a> {
             printed: Vec::new(),
             frames: Vec::new(),
             parms_passed: 0,
+            sql: Default::default(),
         }
     }
 
@@ -1492,6 +1501,7 @@ impl<'a> Machine<'a> {
 
     fn stmt(&mut self, s: &Stmt) -> Result<()> {
         match s {
+            Stmt::Sql(text) => self.exec_sql(text)?,
             Stmt::Eval {
                 target,
                 value,
@@ -2672,7 +2682,7 @@ impl<'a> Machine<'a> {
         let libl = self.io.libl.clone();
         let found = self.block(crate::catalog::find_program(client, &libl, name))?;
         let source = match found {
-            Some(p) if p.attribute == "RPGLE" => {
+            Some(p) if p.attribute == "RPGLE" || p.attribute == "SQLRPGLE" => {
                 self.block(crate::authority::check(
                     client,
                     &self.io.user,
@@ -2730,6 +2740,7 @@ impl<'a> Machine<'a> {
                         c.push(self.prog.name.clone());
                         c
                     },
+                    database_url: self.io.database_url.clone(),
                 },
             );
             let r = m.run_bytes(&mut parms);

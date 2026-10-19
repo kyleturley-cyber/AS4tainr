@@ -122,6 +122,8 @@ impl Lines<'_> {
         let mut free_region = false;
         let mut pending = String::new();
         let mut pending_line = 0;
+        // Fixed-form embedded SQL: C/EXEC SQL, C+ lines, C/END-EXEC.
+        let mut sql_fixed: Option<(String, usize)> = None;
         // Conditional compilation: a stack of (this branch active, some
         // branch taken).
         let mut cond: Vec<(bool, bool)> = Vec::new();
@@ -159,6 +161,35 @@ impl Lines<'_> {
                     continue;
                 }
                 let content = col(&cs, 7, 80);
+                if c6 == 'C' || c6 == 'c' {
+                    let up = content.trim().to_ascii_uppercase();
+                    if up.starts_with("/EXEC SQL") || up == "/EXEC" {
+                        let rest = content.trim()[5..].trim().to_string();
+                        let rest = if rest.len() >= 3 && rest[..3].eq_ignore_ascii_case("SQL") {
+                            rest[3..].to_string()
+                        } else {
+                            rest
+                        };
+                        sql_fixed = Some((rest, lineno));
+                        continue;
+                    }
+                    if up.starts_with("/END-EXEC") {
+                        if let Some((text, at)) = sql_fixed.take() {
+                            if active(&cond) {
+                                self.units
+                                    .push(Unit::Free(format!("EXEC SQL {}", text.trim()), at));
+                            }
+                        }
+                        continue;
+                    }
+                    if c7 == '+' {
+                        if let Some((text, _)) = sql_fixed.as_mut() {
+                            text.push(' ');
+                            text.push_str(&col(&cs, 8, 80));
+                            continue;
+                        }
+                    }
+                }
                 if let Some((w, _)) = directive(&content) {
                     if c6 == ' ' || c6.is_ascii_digit() || c6 == 'C' || c6 == 'c' {
                         match w.as_str() {
@@ -1588,6 +1619,7 @@ const FREE_OPS: &[&str] = &[
     "OPEN",
     "CLOSE",
     "EXFMT",
+    "EXEC",
     "READC",
     "FEOD",
     "DSPLY",
@@ -1732,6 +1764,46 @@ fn free(ctx: &mut Ctx, text: &str, lineno: usize) -> Result<()> {
             } else {
                 free_decl(&rest)?
             };
+            // SQLTYPE(CLOB:n), BLOB, DBCLOB: the SQL precompiler declares a
+            // data structure NAME with NAME_LEN and NAME_DATA (Embedded SQL
+            // programming, "LOB host variables in ILE RPG").
+            if let Some(k) = keyword(&kws, "SQLTYPE") {
+                let t = k
+                    .args
+                    .first()
+                    .map(|a| a.trim().to_ascii_uppercase())
+                    .unwrap_or_default();
+                if matches!(t.as_str(), "CLOB" | "BLOB" | "DBCLOB") {
+                    let n: u32 = k
+                        .args
+                        .get(1)
+                        .and_then(|a| a.trim().parse().ok())
+                        .ok_or_else(|| anyhow!("line {lineno}: SQLTYPE({t}) needs a length"))?;
+                    let def = |name: String, kind, dtype| Def {
+                        name,
+                        kind,
+                        dtype,
+                        from: None,
+                        to: None,
+                        external: false,
+                        keywords: vec![],
+                        line: lineno,
+                    };
+                    ctx.add_def(def(name.clone(), DefKind::Ds, None));
+                    ctx.add_def(def(
+                        format!("{name}_LEN"),
+                        DefKind::Subfield,
+                        Some(DType::Uns(10)),
+                    ));
+                    ctx.add_def(def(
+                        format!("{name}_DATA"),
+                        DefKind::Subfield,
+                        Some(DType::Char(n)),
+                    ));
+                    return Ok(());
+                }
+                bail!("line {lineno}: SQLTYPE({t}) is not supported yet");
+            }
             ctx.add_def(Def {
                 name,
                 kind: if first == "DCL-C" {
@@ -1975,6 +2047,15 @@ fn free_calc(text: &str) -> Result<Line> {
             })
         }
         "CALLP" => Line::Stmt(Stmt::CallP(need("a call")?)),
+        "EXEC" => {
+            let t = rest_t;
+            let sql = if t.len() >= 3 && t[..3].eq_ignore_ascii_case("SQL") {
+                t[3..].trim()
+            } else {
+                bail!("EXEC: only EXEC SQL is supported")
+            };
+            Line::Stmt(Stmt::Sql(sql.to_string()))
+        }
         "READ" => file_stmt(FileOp::Read, false)?,
         "READP" => file_stmt(FileOp::ReadP, false)?,
         "READE" => file_stmt(FileOp::ReadE, true)?,

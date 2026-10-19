@@ -817,3 +817,112 @@ mod tests {
         assert_eq!(r, ["    1  Acme", "12345  B"]);
     }
 }
+
+// ------------------------------------------------------------ programs
+
+/// What an embedded statement returned: rows (each value as text, NULL as
+/// None) or a count of rows changed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Exec {
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Vec<Option<String>>>,
+    },
+    Count(Kind, u64),
+}
+
+/// The SQL session of a running program (embedded SQL): one connection as
+/// the SQL role, the job's library list as the search path, each
+/// statement committed when it succeeds (COMMIT(*NONE)).
+pub struct Session {
+    client: Client,
+    libraries: Vec<String>,
+    libl: Vec<String>,
+}
+
+impl Session {
+    pub async fn open(client: &Client, database_url: &str, libl: &[String]) -> Result<Session> {
+        let sql_client = connect_as_sql_role(client, database_url).await?;
+        let path: Vec<String> = libl.iter().map(|l| ident(l)).collect();
+        sql_client
+            .batch_execute(&format!(
+                "SET search_path TO {}",
+                if path.is_empty() {
+                    "\"qgpl\"".to_string()
+                } else {
+                    path.join(", ")
+                }
+            ))
+            .await?;
+        Ok(Session {
+            client: sql_client,
+            libraries: catalog::list_libraries(client).await?,
+            libl: libl.to_vec(),
+        })
+    }
+
+    /// Run one statement (host variables already in it as literals).
+    /// `catalog_client` reads file descriptions (INSERT without columns).
+    pub async fn exec(&self, catalog_client: &Client, sql: &str) -> Result<Exec> {
+        let t = translate(sql, &|n| self.libraries.iter().any(|l| l == n))?;
+        let mut text = t.sql.clone();
+        if let Some((target, at)) = &t.insert_needs_columns {
+            let name = if target.contains('.') {
+                target
+                    .replace('"', "")
+                    .replace('.', "/")
+                    .to_ascii_uppercase()
+            } else {
+                target.to_ascii_uppercase()
+            };
+            let f = catalog::resolve_file(catalog_client, &self.libl, &name)
+                .await
+                .map_err(|_| anyhow!("SQL0204: {name} not found."))?;
+            let cols: Vec<String> = f.file.fields.iter().map(|fd| ident(&fd.name)).collect();
+            text.insert_str(*at, &format!(" ({})", cols.join(", ")));
+        }
+        if t.kind == Kind::Query {
+            let stmt = self
+                .client
+                .prepare(&text)
+                .await
+                .map_err(|e| map_error(&e, &text))?;
+            let keep: Vec<bool> = stmt
+                .columns()
+                .iter()
+                .map(|c| t.wants_rrn || c.name() != "rrn")
+                .collect();
+            let columns = stmt
+                .columns()
+                .iter()
+                .zip(&keep)
+                .filter(|(_, k)| **k)
+                .map(|(c, _)| crate::catalog::ibm_name(c.name()))
+                .collect();
+            let mut rows = Vec::new();
+            for m in self
+                .client
+                .simple_query(&text)
+                .await
+                .map_err(|e| map_error(&e, &text))?
+            {
+                if let SimpleQueryMessage::Row(r) = m {
+                    rows.push(
+                        (0..r.len())
+                            .filter(|&j| keep.get(j).copied().unwrap_or(true))
+                            .map(|j| r.get(j).map(str::to_string))
+                            .collect(),
+                    );
+                }
+            }
+            Ok(Exec::Rows { columns, rows })
+        } else {
+            let n = self
+                .client
+                .execute(&text, &[])
+                .await
+                .map_err(|e| map_error(&e, &text))?;
+            Ok(Exec::Count(t.kind, n))
+        }
+    }
+}

@@ -134,7 +134,7 @@ impl Job<'_> {
             "CRTSRCPF" => self.crtsrcpf(&cmd).await,
             "DSPFD" => self.dspfd(&cmd).await,
             "CRTPF" | "CRTLF" | "CRTDSPF" => self.crtfile(&cmd).await,
-            "CRTBNDCL" | "CRTCLPGM" | "CRTBNDRPG" => self.crtpgm(&cmd).await,
+            "CRTBNDCL" | "CRTCLPGM" | "CRTBNDRPG" | "CRTSQLRPGI" => self.crtpgm(&cmd).await,
             "CRTMNU" => self.crtmnu(&cmd).await,
             "DLTMNU" => self.dltmnu(&cmd).await,
             "DLTUSRPRF" => self.dltusrprf(&cmd).await,
@@ -501,7 +501,7 @@ impl Job<'_> {
     async fn source_member(&self, cmd: &Command, object: &str) -> Result<crate::source::Member> {
         let (libs, file) = self.search(cmd.get("SRCFILE"));
         let member = match cmd.get("SRCMBR") {
-            "*FILE" | "*PGM" => object.to_string(),
+            "*FILE" | "*PGM" | "*OBJ" => object.to_string(),
             m => m.to_string(),
         };
         let m = crate::source::find_member(self.client, &libs, &file, &member).await?;
@@ -587,16 +587,24 @@ impl Job<'_> {
         Ok(Outcome::Messages(vec![msg]))
     }
 
-    /// CRTBNDCL, CRTCLPGM, CRTBNDRPG from a source member. CL is checked
-    /// here; RPG is checked by the runner when the program is called.
+    /// CRTBNDCL, CRTCLPGM, CRTBNDRPG, CRTSQLRPGI from a source member: the
+    /// program is checked (compiled) first.
     async fn crtpgm(&mut self, cmd: &Command) -> Result<Outcome> {
-        let (lib, name) = self.create_target(cmd.get("PGM"));
+        let sql = cmd.def.name == "CRTSQLRPGI";
+        if sql && cmd.get("OBJTYPE") != "*PGM" {
+            bail!(
+                "CRTSQLRPGI OBJTYPE({}): only *PGM can be created yet.",
+                cmd.get("OBJTYPE")
+            );
+        }
+        let (lib, name) = self.create_target(cmd.get(if sql { "OBJ" } else { "PGM" }));
         let lib = lib.to_ascii_uppercase();
         let name = name.to_ascii_uppercase();
         let m = self.source_member(cmd, &name).await?;
         let attribute = match cmd.def.name {
             "CRTBNDCL" => "CLLE",
             "CRTCLPGM" => "CLP",
+            "CRTSQLRPGI" => "SQLRPGLE",
             _ => "RPGLE",
         };
         if attribute == "RPGLE" && m.srctype == "RPG" {
@@ -606,7 +614,7 @@ impl Job<'_> {
             );
         }
         // CL: includes are part of the program; then it is checked.
-        let source = if attribute == "RPGLE" {
+        let source = if attribute == "RPGLE" || attribute == "SQLRPGLE" {
             // The program is checked now, as the compiler does: syntax,
             // names, types, files (docs/rpg-engine.md).
             let mut libl = self.library_list();

@@ -144,6 +144,8 @@ pub enum Arith {
 /// A statement that does not change the flow of control.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stmt {
+    /// EXEC SQL: the statement as written (host variables `:name`).
+    Sql(String),
     Eval {
         target: Expr,
         value: Expr,

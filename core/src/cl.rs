@@ -696,6 +696,51 @@ pub static COMMANDS: &[CommandDef] = &[
             .keyword_only(),
         ],
     },
+    CommandDef {
+        name: "CRTSQLRPGI",
+        description: "Create SQL ILE RPG Object",
+        params: &[
+            p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
+            p(
+                "SRCFILE",
+                Kind::Qualified,
+                false,
+                Some("QRPGLESRC"),
+                "Source file",
+            )
+            .ch("Name"),
+            p("SRCMBR", Kind::Name, false, Some("*OBJ"), "Source member").ch("Name, *OBJ"),
+            p(
+                "COMMIT",
+                Kind::Name,
+                false,
+                Some("*CHG"),
+                "Commitment control",
+            )
+            .ch("*CHG, *ALL, *CS, *NONE, *RR")
+            .keyword_only(),
+            p("OBJTYPE", Kind::Name, false, Some("*PGM"), "Type of object")
+                .ch("*PGM, *SRVPGM, *MODULE")
+                .keyword_only(),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*SRCMBRTXT"),
+                "Text 'description'",
+            )
+            .keyword_only(),
+            p(
+                "REPLACE",
+                Kind::Name,
+                false,
+                Some("*YES"),
+                "Replace program",
+            )
+            .ch("*YES, *NO")
+            .keyword_only(),
+        ],
+    },
 ];
 
 /// A group of commands on the F4 menu.
@@ -782,6 +827,7 @@ pub static GROUPS: &[Group] = &[
             "CRTBNDCL",
             "CRTCLPGM",
             "CRTBNDRPG",
+            "CRTSQLRPGI",
         ],
     },
     Group {

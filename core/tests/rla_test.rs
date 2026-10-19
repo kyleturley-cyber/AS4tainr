@@ -2530,6 +2530,16 @@ async fn native_rpg_engine_runs_a_program() {
         // nested element passed by reference is changed by the callee;
         // %SIZE of an array is the size of one element (10 + 3 bytes).
         ("NESTED", "**FREE\ndcl-ds user_t qualified template;\n  name char(10);\n  days zoned(3:0);\nend-ds;\ndcl-ds list qualified;\n  count int(10);\n  users likeds(user_t) dim(3);\nend-ds;\ndcl-ds copy likeds(list);\ndcl-ds pts qualified dim(2);\n  x zoned(3:0);\n  y zoned(3:0);\nend-ds;\ndcl-s i int(10);\nlist.count = 2;\nlist.users(1).name = 'ADA';\nlist.users(1).days = 5;\nlist.users(2).name = 'GRACE';\nlist.users(2).days = 12;\nfor i = 1 to list.count;\n  dsply (%trim(list.users(i).name) + ' ' + %char(list.users(i).days));\nendfor;\ncopy = list;\ndsply copy.users(2).name;\nshow(list.users(2));\ndsply %char(list.users(2).days);\npts(2).x = 7;\npts(1).y = 3;\ndsply %char(pts(2).x + pts(1).y);\ndsply %char(%size(list.users));\n*inlr = *on;\ndcl-proc show;\n  dcl-pi *n;\n    u likeds(user_t);\n  end-pi;\n  dsply ('show ' + %trim(u.name));\n  u.days = 99;\nend-proc;\n", vec!["ADA 5", "GRACE 12", "GRACE", "show GRACE", "99", "10", "13"]),
+        // A procedure's local data structure can have a subfield LIKEDS a
+        // global template (ILE RPG Reference, LIKEDS: the template may be
+        // any data structure in scope); the subfield gets the template's
+        // layout and its INZ values.
+        ("LOCNEST", "**FREE\ndcl-ds addr_t qualified template;\n  city char(10) inz('Nowhere');\n  zip zoned(5:0);\nend-ds;\ndcl-s keep char(10);\nlocal();\ndsply keep;\n*inlr = *on;\ndcl-proc local;\n  dcl-ds cust qualified;\n    id int(10);\n    home likeds(addr_t);\n  end-ds;\n  dsply cust.home.city;\n  cust.home.city = 'Reno';\n  keep = cust.home.city;\nend-proc;\n", vec!["Nowhere", "Reno"]),
+        // %SIZE and %ELEM in definition keywords are resolved when the
+        // program is compiled (ILE RPG Reference, %SIZE, %ELEM). Sizes per
+        // the reference's data types: int(10) is 4 bytes, packed(7:2) is
+        // 4, char(16) is 16, so the structure is 24 bytes.
+        ("CONSTBIF", "**FREE\ndcl-ds err qualified;\n  prov int(10);\n  amt packed(7:2);\n  data char(16);\nend-ds;\ndcl-s tbl char(3) dim(12);\ndcl-s a int(10) inz(%size(err.data));\ndcl-s b int(10) inz(%size(err));\ndcl-s c int(10) inz(%elem(tbl) * 2 + 1);\ndsply %char(a);\ndsply %char(b);\ndsply %char(c);\n*inlr = *on;\n", vec!["16", "24", "25"]),
         // ON-EXIT runs when the procedure returns; its indicator is off
         // for a normal end.
         ("ONEXIT", "**FREE\ndsply %char(t());\n*inlr = *on;\ndcl-proc t;\n  dcl-pi *n int(10) end-pi;\n  dcl-s bad ind inz(*on);\n  return 1;\n  on-exit bad;\n    if not bad;\n      dsply 'clean';\n    endif;\nend-proc;\n", vec!["clean", "1"]),
@@ -2599,4 +2609,59 @@ async fn native_rpg_engine_runs_a_program() {
             "cart has 3 items"
         ]
     );
+}
+
+/// Milestone R6: embedded SQL in RPG (SQLRPGLE). Expected values follow
+/// from the sample data (samples/data/CUSTMAST.csv) and the Db2 for i SQL
+/// Reference / Embedded SQL Programming rules: SELECT INTO with no row sets
+/// SQLCODE +100 and SQLSTATE '02000'; host variables in a cursor's SELECT
+/// are read when the cursor is OPENed; a host structure receives the
+/// columns into its subfields in order; SQLERRD(3) is the number of rows
+/// changed; an unknown column is SQLCODE -206; a parameter marker of a
+/// prepared statement takes the value from USING; a null value sets the
+/// indicator variable to -1. %CHAR of a zero packed(9:2) is '.00' (ILE RPG
+/// Reference, %CHAR). Fixed-form statements go between C/EXEC SQL and
+/// C/END-EXEC with C+ continuation lines.
+#[tokio::test]
+async fn rpg_embedded_sql() {
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    for (name, source, want) in [
+        (
+            "SQL1",
+            "**FREE\ndcl-s name char(30);\ndcl-s bal packed(9:2);\ndcl-s cnt int(10);\ndcl-s stmt varchar(200);\ndcl-s nullind int(5);\ndcl-ds cust qualified;\n  no zoned(5:0);\n  nam char(30);\nend-ds;\nexec sql set option commit = *none;\nexec sql select cusnam, cusbal into :name, :bal from custmast where cusno = 3;\ndsply (%trim(name) + ' ' + %char(bal));\nexec sql select count(*) into :cnt from custmast;\ndsply %char(cnt);\nexec sql select cusnam into :name from custmast where cusno = 99;\ndsply %char(sqlcode);\nexec sql declare c1 cursor for\n  select cusno, cusnam from custmast\n   where cusbal > :bal order by cusno;\nbal = 100;\nexec sql open c1;\ndow 1 = 1;\n  exec sql fetch next from c1 into :cust;\n  if sqlcode <> 0;\n    leave;\n  endif;\n  dsply (%char(cust.no) + ' ' + %trim(cust.nam));\nenddo;\nexec sql close c1;\nexec sql update custmast set cuscty = 'Ames' where cusno = 1;\ndsply %char(sqlerrd(3));\nexec sql update custmast set cuscty = 'X' where cusno = 99;\ndsply sqlstate;\nexec sql select nosuchcol into :name from custmast;\ndsply %char(sqlcod);\nstmt = 'select count(*) from custmast where cusbal < ?';\nexec sql prepare s1 from :stmt;\nexec sql declare c2 cursor for s1;\nbal = 0;\nexec sql open c2 using :bal;\nexec sql fetch c2 into :cnt;\ndsply %char(cnt);\nexec sql close c2;\nexec sql values (cast(null as integer)) into :cnt :nullind;\ndsply %char(nullind);\n*inlr = *on;\n",
+            vec![
+                "Bluebird Supply .00",
+                "5",
+                "100",
+                "1 Acme Tooling",
+                "2 Midwest Fasteners",
+                "4 Prairie Freight",
+                "1",
+                "02000",
+                "-206",
+                "1",
+                "-1",
+            ],
+        ),
+        ("SQL2", "     D NAME            S             30\n     D NO              S              5  0 INZ(2)\n     C/EXEC SQL\n     C+ SELECT CUSNAM INTO :NAME\n     C+   FROM CUSTMAST WHERE CUSNO = :NO\n     C/END-EXEC\n     C     NAME          DSPLY\n     C     SQLCOD        DSPLY\n     C                   SETON                                        LR\n", vec!["Midwest Fasteners", "0"]),
+    ] {
+        let r = rpg::call(
+            &url,
+            vec![lib.clone()],
+            "QSECOFR".into(),
+            None,
+            None,
+            None,
+            name.into(),
+            source.into(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(r.error.is_none(), "{name}: {:?}", r.error);
+        let got: Vec<String> = r.messages.iter().map(|m| m.trim_end().to_string()).collect();
+        assert_eq!(got, want, "{name}");
+    }
 }

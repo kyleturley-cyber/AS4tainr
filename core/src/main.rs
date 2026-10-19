@@ -583,7 +583,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     args,
                 )
                 .await?;
-                for m in &r.messages {
+                for m in r.messages.iter().chain(&r.printed) {
                     println!("{m}");
                 }
                 if let Some(e) = r.error {

@@ -365,11 +365,14 @@ pub struct OutRec {
     /// H heading, D detail, T total, E exception.
     pub kind: char,
     pub fetch_overflow: bool,
-    pub cond: Conditions,
+    /// Conditioning indicators: groups joined by OR, the indicators in a
+    /// group by AND (record lines with AND/OR in positions 16-18).
+    pub cond: Vec<Conditions>,
     /// EXCEPT name.
     pub name: Option<String>,
-    pub space_before: u32,
-    pub space_after: u32,
+    /// Space before and after (positions 40-42, 43-45); None when blank.
+    pub space_before: Option<u32>,
+    pub space_after: Option<u32>,
     pub skip_before: Option<u32>,
     pub skip_after: Option<u32>,
     pub fields: Vec<OutField>,

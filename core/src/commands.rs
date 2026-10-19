@@ -1699,6 +1699,9 @@ impl Job<'_> {
         )
         .await?;
         let mut msgs: Vec<String> = r.messages.iter().map(|m| format!("DSPLY  {m}")).collect();
+        // Without a job there are no spooled files: printed lines come back
+        // as they would be on paper.
+        msgs.extend(r.printed.iter().cloned());
         if let Some(e) = r.error {
             msgs.push(format!("{e:#}"));
             msgs.push(format!("Program {pgm} ended abnormally."));

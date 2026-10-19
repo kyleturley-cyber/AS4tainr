@@ -2662,4 +2662,38 @@ async fn native_rpg_engine_runs_a_program() {
     // One EXFMT: the control record over all five contacts (the same
     // count CONTCNT reads), with SFLDSP on (*IN31); F3 ends the DOU.
     assert_eq!(shown, [("CTL01".to_string(), 5, true)]);
+
+    // The RPG cycle with a primary file and cycle output (milestone R3).
+    // ILE RPG Reference, "Program Cycle": the first cycle prints the 1P
+    // heading before any record is read (an unconditioned detail line
+    // would print then too, so it is conditioned N1P); each record read
+    // from the primary file is printed at detail time; end of file sets
+    // LR, and total output conditioned by LR prints last. Without a job,
+    // the lines come back as printed.
+    let cycle = "     FCONTACT   IP   E           K DISK\n     FQSYSPRT   O    F  132        PRINTER\n     OQSYSPRT   H    1P                     1\n     O                                            5 'NAMES'\n     O          D   N1P                     1\n     O                       CTID          Z      5\n     O                       CTNAME              37\n     O          T    LR                     1\n     O                                            3 'END'\n";
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        "CYCLE".into(),
+        cycle.into(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.printed,
+        [
+            "NAMES",
+            "    1  Ada Lovelace",
+            "    2  Grace Hopper",
+            "    3  Edsger Dijkstra",
+            "    4  Barbara Liskov",
+            "    5  Ken Thompson",
+            "END"
+        ]
+    );
 }

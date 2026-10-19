@@ -27,6 +27,9 @@ pub struct Io<'a> {
     pub job_number: Option<i64>,
     /// The library list (data areas).
     pub libl: Vec<String>,
+    /// The job (spooled files). Without one, printed lines are returned
+    /// in [`Machine::printed`].
+    pub job: Option<crate::jobs::JobId>,
     /// The job's display (interactive jobs): EXFMT goes there.
     pub display: Option<crate::bridge::DisplayHandle>,
 }
@@ -71,6 +74,26 @@ pub struct Machine<'a> {
     ws: Workstation,
     /// Data areas this program holds locked (IN *LOCK): (library, name).
     dtaara_locks: Vec<(String, String)>,
+    /// Printer files in use, by file name.
+    printers: HashMap<String, Printer>,
+    /// Printed lines when the call has no job (`as4tainr call`), as a
+    /// printer would put them on paper: form feeds between pages.
+    pub printed: Vec<String>,
+}
+
+/// A program-described printer file while the program runs: where the
+/// next line goes, and lines not yet written to the spooled file.
+#[derive(Debug)]
+struct Printer {
+    /// The spooled file (with a job).
+    spl: Option<i64>,
+    page: i32,
+    /// The line the next record prints on, before its spacing.
+    line: i32,
+    printed_on_page: bool,
+    buffer: Vec<(i32, i32, String)>,
+    /// Without a job: (page, line) last written to `printed`.
+    out_pos: (i32, i32),
 }
 
 /// Function key indicators *INKA-*INKY for F1-F24 (there is no *INKO).
@@ -122,6 +145,8 @@ impl<'a> Machine<'a> {
             remainder: Dec::ZERO,
             ws: Workstation::new(),
             dtaara_locks: Vec::new(),
+            printers: HashMap::new(),
+            printed: Vec::new(),
         }
     }
 
@@ -1644,7 +1669,10 @@ impl<'a> Machine<'a> {
                 bail!("operation {code} is not supported by the native engine yet")
             }
             "DEFINE" | "COMMIT" | "ROLBK" | "FORCE" | "DUMP" | "DEALLOC" => {}
-            "EXCEPT" => bail!("EXCEPT (printer output) is not supported by the native engine yet"),
+            "EXCEPT" => {
+                let name = expr_name(f2);
+                self.except(name.as_deref())?;
+            }
             "IN" | "OUT" => {
                 let lock = expr_name(f1).as_deref() == Some("*LOCK");
                 let target =
@@ -1862,32 +1890,10 @@ impl<'a> Machine<'a> {
             };
             self.assign(&p.target, &v, Fit::Strict { half_adjust: false }, false)?;
         }
-        let prog = self.prog;
-        // *INZSR runs first.
-        if let Some(inz) = prog.routines.subroutines.get("*INZSR") {
-            self.run_code(inz)?;
-        }
-        let mut passes = 0u64;
-        loop {
-            passes += 1;
-            let flow = self.run_code(&prog.routines.detail)?;
-            if matches!(flow, Flow::Return(_)) {
-                break;
-            }
-            if self.ind("LR") {
-                self.run_code(&prog.routines.total)?;
-                break;
-            }
-            if self.ind("RT") {
-                break;
-            }
-            // No primary file: the cycle starts over until LR is set. A
-            // program that never sets LR runs until it is cancelled, as
-            // on IBM i; stop runaway loops in tests at a large bound.
-            if passes > 10_000_000 {
-                bail!("the program does not set on LR and keeps running");
-            }
-        }
+        let r = self.cycle();
+        let closed = self.close_printers();
+        r?;
+        closed?;
         for f in self.files.iter_mut() {
             if let Some(mut o) = f.open.take() {
                 let _ = self.io.rt.block_on(o.release(self.io.client));
@@ -1901,6 +1907,342 @@ fn expr_name(e: &Option<Expr>) -> Option<String> {
     match e {
         Some(Expr::Name { parts, args: None }) => Some(parts.join(".")),
         _ => None,
+    }
+}
+
+impl Machine<'_> {
+    /// The RPG cycle (ILE RPG Reference, "Program Cycle"): first-cycle
+    /// (1P) output, then for each cycle: read a record of the primary
+    /// file (end of file sets LR), total calculations and total output,
+    /// end at LR, detail calculations, detail output.
+    ///
+    /// Simplified (docs/fidelity-gaps.md): no level breaks (L1-L9) or
+    /// matching fields, one primary file and no secondary files, total
+    /// calculations only at LR, record fields are moved in when read.
+    fn cycle(&mut self) -> Result<()> {
+        let prog = self.prog;
+        let primary = prog.files.iter().position(|f| f.decl.designation == 'P');
+        // *INZSR runs first, then the first cycle's output (1P).
+        if let Some(inz) = prog.routines.subroutines.get("*INZSR") {
+            self.run_code(inz)?;
+        }
+        self.set_ind("1P", true);
+        self.output(&['H', 'D'])?;
+        self.set_ind("1P", false);
+        let mut first = true;
+        let mut passes = 0u64;
+        loop {
+            passes += 1;
+            if let Some(i) = primary {
+                let name = prog.files[i].decl.name.clone();
+                self.file_op(
+                    FileOp::Read,
+                    &name,
+                    &None,
+                    &Ext::default(),
+                    &ResultInd::default(),
+                )?;
+                if self.files[i].status.eof {
+                    self.set_ind("LR", true);
+                }
+            }
+            // Total time (not on the first cycle, which has no record
+            // before it).
+            if self.ind("LR") {
+                self.run_code(&prog.routines.total)?;
+            }
+            if !first || self.ind("LR") {
+                self.output(&['T'])?;
+            }
+            if self.ind("LR") {
+                break;
+            }
+            first = false;
+            let flow = self.run_code(&prog.routines.detail)?;
+            if matches!(flow, Flow::Return(_)) {
+                break;
+            }
+            self.output(&['H', 'D'])?;
+            if self.ind("RT") {
+                break;
+            }
+            // No primary file: the cycle starts over until LR is set. A
+            // program that never sets LR runs until it is cancelled, as
+            // on IBM i; stop runaway loops in tests at a large bound.
+            if passes > 10_000_000 {
+                bail!("the program does not set on LR and keeps running");
+            }
+        }
+        Ok(())
+    }
+
+    // ---- printer files (O specs, EXCEPT) -------------------------------
+
+    fn out_cond(&self, groups: &[Conditions]) -> bool {
+        groups.iter().all(|g| g.is_empty())
+            || groups
+                .iter()
+                .any(|g| !g.is_empty() && self.conditions_met(g))
+    }
+
+    /// EXCEPT: the exception (E) records with that name (or, without a
+    /// name, those without one) whose conditions are met.
+    fn except(&mut self, name: Option<&str>) -> Result<()> {
+        let prog = self.prog;
+        for r in &prog.outputs {
+            if r.kind == 'E' && r.name.as_deref() == name && self.out_cond(&r.cond) {
+                self.print_record(r)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Cycle output: heading and detail (H, D) or total (T) records. A
+    /// printer whose overflow indicator was on has it set off afterwards.
+    fn output(&mut self, kinds: &[char]) -> Result<()> {
+        let prog = self.prog;
+        let mut used: Vec<String> = Vec::new();
+        for r in &prog.outputs {
+            if kinds.contains(&r.kind) {
+                if !used.contains(&r.file) {
+                    used.push(r.file.clone());
+                }
+                if self.out_cond(&r.cond) {
+                    self.print_record(r)?;
+                }
+            }
+        }
+        if kinds.contains(&'D') {
+            for f in used {
+                if let Some(of) = self.overflow_ind(&f) {
+                    self.set_ind(&of, false);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// OFLIND(*INOF), OFLIND(*IN10)... of a printer file: the indicator.
+    fn overflow_ind(&self, file: &str) -> Option<String> {
+        let i = self.prog.file_index(file)?;
+        keyword(&self.prog.files[i].decl.keywords, "OFLIND")
+            .and_then(|k| k.args.first())
+            .map(|a| {
+                let a = a.trim().to_ascii_uppercase();
+                a.strip_prefix("*IN").map(str::to_string).unwrap_or(a)
+            })
+    }
+
+    /// The printed text of one output field.
+    fn out_text(&mut self, f: &OutField, page: i32) -> Result<String> {
+        if let Some(lit) = &f.literal {
+            return Ok(a(lit));
+        }
+        if f.edit_word.is_some() {
+            bail!("edit words on O specs are not supported by the native engine yet");
+        }
+        let name = f.name.clone().unwrap_or_default();
+        let (value, digits, decs) = match name.as_str() {
+            "PAGE" | "PAGE1" | "PAGE2" | "PAGE3" | "PAGE4" | "PAGE5" | "PAGE6" | "PAGE7" => {
+                (Dec::from_i64(page as i64), 4, 0)
+            }
+            "UDATE" => (Dec::from_i64(today_num("UDATE")), 6, 0),
+            "*DATE" => (Dec::from_i64(today_num("*DATE")), 8, 0),
+            _ => {
+                let ex = Expr::name(&name);
+                let t = self
+                    .type_of(&ex)
+                    .ok_or_else(|| anyhow!("O spec field {name} is not defined"))?;
+                let v = self.eval(&ex)?;
+                if !t.is_numeric() {
+                    return Ok(a(&v.chars()?));
+                }
+                let (p, s) = t.precision();
+                (v.num()?, p, s)
+            }
+        };
+        Ok(match f.edit_code {
+            Some(c) => edit_code(&value, digits, decs, c),
+            None => {
+                // No edit code: every digit, a minus sign after a
+                // negative number.
+                let d = value.rescale(decs as u8, false).unwrap_or(value);
+                let raw = format!("{:0>w$}", d.mantissa().unsigned_abs(), w = digits as usize);
+                format!("{raw}{}", if d.is_negative() { "-" } else { "" })
+            }
+        })
+    }
+
+    /// Print one output record: space and skip before, the line, space
+    /// and skip after (nothing given: space 1 after). Pages are
+    /// `spool::PAGE_LENGTH` lines; printing on or spacing past
+    /// `spool::OVERFLOW_LINE` sets the overflow indicator.
+    fn print_record(&mut self, r: &OutRec) -> Result<()> {
+        use crate::spool::{OVERFLOW_LINE, PAGE_LENGTH};
+        let i = self
+            .prog
+            .file_index(&r.file)
+            .ok_or_else(|| anyhow!("output to {}: not a file of this program", r.file))?;
+        let decl = &self.prog.files[i].decl;
+        if decl.device != "PRINTER" {
+            bail!(
+                "output to {} ({}): only printer files are written by O specs in the native engine yet",
+                r.file,
+                decl.device
+            );
+        }
+        let width = decl.record_len.unwrap_or(132) as usize;
+        if !self.printers.contains_key(&r.file) {
+            let spl = match &self.io.job {
+                Some(job) => Some(self.block(crate::spool::open(
+                    self.io.client,
+                    job,
+                    &r.file,
+                    &self.prog.name,
+                ))?),
+                None => None,
+            };
+            self.printers.insert(
+                r.file.clone(),
+                Printer {
+                    spl,
+                    page: 1,
+                    line: 1,
+                    printed_on_page: false,
+                    buffer: Vec::new(),
+                    out_pos: (1, 0),
+                },
+            );
+        }
+        let new_page = |p: &mut Printer| {
+            p.page += 1;
+            p.line = 1;
+            p.printed_on_page = false;
+        };
+        let page = {
+            let p = self.printers.get_mut(&r.file).unwrap();
+            if let Some(s) = r.skip_before.filter(|s| *s > 0) {
+                let s = s as i32;
+                if s < p.line || s == p.line && p.printed_on_page {
+                    new_page(p);
+                }
+                p.line = s;
+            }
+            if let Some(n) = r.space_before.filter(|n| *n > 0) {
+                p.line += n as i32;
+            }
+            if p.line > PAGE_LENGTH {
+                new_page(p);
+            }
+            p.page
+        };
+        let mut buf = vec![' '; width];
+        let mut prev_end = 0usize;
+        for f in &r.fields {
+            if !f.cond.is_empty() && !self.conditions_met(&f.cond) {
+                continue;
+            }
+            let text: Vec<char> = self.out_text(f, page)?.chars().collect();
+            let end = match (f.end, f.relative) {
+                (Some(e), _) => e as usize,
+                (None, Some(n)) => prev_end + n as usize + text.len(),
+                (None, None) => prev_end + text.len(),
+            };
+            let start = end.saturating_sub(text.len());
+            for (k, c) in text.iter().enumerate() {
+                if let Some(slot) = buf.get_mut(start + k) {
+                    *slot = *c;
+                }
+            }
+            prev_end = end;
+            if f.blank_after {
+                if let Some(n) = &f.name {
+                    self.stmt(&Stmt::Clear(Expr::name(n)))?;
+                }
+            }
+        }
+        let text: String = buf.into_iter().collect::<String>().trim_end().to_string();
+        let overflow_ind = self.overflow_ind(&r.file);
+        let p = self.printers.get_mut(&r.file).unwrap();
+        p.buffer.push((p.page, p.line, text));
+        p.printed_on_page = true;
+        let (printed_page, printed_line) = (p.page, p.line);
+        let mut moved = false;
+        if let Some(s) = r.skip_after.filter(|s| *s > 0) {
+            let s = s as i32;
+            if s <= p.line {
+                new_page(p);
+            }
+            p.line = s;
+            moved = true;
+        }
+        if let Some(n) = r.space_after {
+            p.line += n as i32;
+            moved = true;
+        }
+        if !moved && r.skip_before.is_none() && r.space_before.is_none() {
+            p.line += 1;
+        }
+        let overflow =
+            printed_line >= OVERFLOW_LINE || p.page == printed_page && p.line > OVERFLOW_LINE;
+        if p.line > PAGE_LENGTH {
+            new_page(p);
+        }
+        let full = p.buffer.len() >= 50;
+        if overflow {
+            if let Some(of) = overflow_ind {
+                self.set_ind(&of, true);
+            }
+        }
+        if full {
+            self.flush_printer(&r.file)?;
+        }
+        Ok(())
+    }
+
+    fn flush_printer(&mut self, file: &str) -> Result<()> {
+        let Some(p) = self.printers.get_mut(file) else {
+            return Ok(());
+        };
+        let lines = std::mem::take(&mut p.buffer);
+        match p.spl {
+            Some(id) => {
+                let client = self.io.client;
+                self.io
+                    .rt
+                    .block_on(crate::spool::write(client, id, &lines))?;
+            }
+            None => {
+                for (page, line, text) in lines {
+                    if page > p.out_pos.0 {
+                        self.printed.push("\x0c".to_string());
+                        p.out_pos = (page, 0);
+                    }
+                    while p.out_pos.1 + 1 < line {
+                        self.printed.push(String::new());
+                        p.out_pos.1 += 1;
+                    }
+                    self.printed.push(text);
+                    p.out_pos.1 = line;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The program ends: its spooled files are complete (RDY).
+    fn close_printers(&mut self) -> Result<()> {
+        let mut names: Vec<String> = self.printers.keys().cloned().collect();
+        names.sort();
+        for n in names {
+            self.flush_printer(&n)?;
+            if let Some(id) = self.printers.get(&n).and_then(|p| p.spl) {
+                let client = self.io.client;
+                self.io.rt.block_on(crate::spool::close(client, id))?;
+            }
+        }
+        self.printers.clear();
+        Ok(())
     }
 }
 
@@ -1966,14 +2308,23 @@ pub fn edit_code(v: &Dec, digits: u32, decs: u32, code: char) -> String {
         return raw;
     }
     if code == 'Y' {
-        // Date edit: nn/nn/nn.
-        let s = format!("{:0>6}", raw);
-        return format!(
-            "{}/{}/{}",
-            &s[s.len() - 6..s.len() - 4],
-            &s[s.len() - 4..s.len() - 2],
-            &s[s.len() - 2..]
-        );
+        // Date edit (ILE RPG Reference, edit codes): nn/nn/nn for six
+        // digits, nn/nn/nnnn for eight; the leftmost zero is suppressed.
+        let s = if digits == 8 {
+            format!("{}/{}/{}", &raw[0..2], &raw[2..4], &raw[4..8])
+        } else {
+            let s = format!("{:0>6}", raw);
+            format!(
+                "{}/{}/{}",
+                &s[s.len() - 6..s.len() - 4],
+                &s[s.len() - 4..s.len() - 2],
+                &s[s.len() - 2..]
+            )
+        };
+        return match s.strip_prefix('0') {
+            Some(rest) => format!(" {rest}"),
+            None => s,
+        };
     }
     let int_trim = int.trim_start_matches('0');
     let mut int_out = String::new();
@@ -1985,6 +2336,9 @@ pub fn edit_code(v: &Dec, digits: u32, decs: u32, code: char) -> String {
     }
     let body = if decs > 0 && code != 'Z' {
         format!("{int_out}.{frac}")
+    } else if int_out.is_empty() {
+        // Codes that do not blank zero show one zero.
+        "0".to_string()
     } else {
         int_out.clone()
     };
@@ -2097,6 +2451,22 @@ mod tests {
             " 1,234.50-"
         );
         assert_eq!(edit_code(&Dec::parse("0").unwrap(), 3, 0, 'Z'), "   ");
+        // J does not blank a zero value: one zero, then the sign position.
+        assert_eq!(edit_code(&Dec::parse("0").unwrap(), 3, 0, 'J'), "  0 ");
+        // Y: nn/nn/nn, nn/nn/nnnn for eight digits, leftmost zero
+        // suppressed (ILE RPG Reference, "Y edit code").
+        assert_eq!(
+            edit_code(&Dec::parse("101626").unwrap(), 6, 0, 'Y'),
+            "10/16/26"
+        );
+        assert_eq!(
+            edit_code(&Dec::parse("51626").unwrap(), 6, 0, 'Y'),
+            " 5/16/26"
+        );
+        assert_eq!(
+            edit_code(&Dec::parse("10162026").unwrap(), 8, 0, 'Y'),
+            "10/16/2026"
+        );
     }
 
     #[test]

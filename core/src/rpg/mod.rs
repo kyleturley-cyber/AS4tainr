@@ -107,6 +107,9 @@ pub async fn compile(
 /// abnormally.
 pub struct CallResult {
     pub messages: Vec<String>,
+    /// Printer output of a call without a job (otherwise it is in the
+    /// job's spooled files).
+    pub printed: Vec<String>,
     pub error: Option<anyhow::Error>,
 }
 
@@ -136,6 +139,14 @@ pub async fn call(
             .as_deref()
             .and_then(|j| j.split('/').next())
             .and_then(|n| n.parse().ok());
+        let job_id = job.as_deref().and_then(|j| {
+            let mut parts = j.split('/');
+            Some(crate::jobs::JobId {
+                number: parts.next()?.parse().ok()?,
+                user: parts.next()?.to_string(),
+                name: parts.next()?.to_string(),
+            })
+        });
         let prog = rt.block_on(compile(&client, &libl, &name, &source))?;
         let mut m = interp::Machine::new(
             &prog,
@@ -145,12 +156,14 @@ pub async fn call(
                 user,
                 job_number,
                 libl: libl.clone(),
+                job: job_id,
                 display,
             },
         );
         let r = m.run(&args);
         Ok(CallResult {
             messages: std::mem::take(&mut m.messages),
+            printed: std::mem::take(&mut m.printed),
             error: r.err(),
         })
     })

@@ -1431,10 +1431,10 @@ fn fixed_o(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
         }
     }
     let kind = ch(17);
-    if !file.is_empty()
-        || matches!(kind, 'H' | 'D' | 'T' | 'E')
-            && colt(cs, 30, 43).is_empty()
-            && !(and_or == "AND" || and_or == "OR")
+    // A record line has its type (H, D, T, E) in position 17; field
+    // lines leave positions 16-20 blank.
+    if !(and_or == "AND" || and_or == "OR")
+        && (!file.is_empty() || matches!(kind, 'H' | 'D' | 'T' | 'E'))
     {
         let num = |a: usize, b: usize| colt(cs, a, b).parse::<u32>().ok();
         let file = if file.is_empty() {
@@ -1450,10 +1450,10 @@ fn fixed_o(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
             file,
             kind,
             fetch_overflow: ch(18) == 'F',
-            cond,
+            cond: vec![cond],
             name: indicator(&col(cs, 30, 39)),
-            space_before: num(40, 42).unwrap_or(0),
-            space_after: num(43, 45).unwrap_or(0),
+            space_before: num(40, 42),
+            space_after: num(43, 45),
             skip_before: num(46, 48),
             skip_after: num(49, 51),
             fields: vec![],
@@ -1463,7 +1463,11 @@ fn fixed_o(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
     }
     if and_or == "AND" || and_or == "OR" {
         if let Some(o) = ctx.src.outputs.last_mut() {
-            o.cond.extend(cond);
+            if and_or == "OR" {
+                o.cond.push(cond);
+            } else if let Some(g) = o.cond.last_mut() {
+                g.extend(cond);
+            }
         }
         return Ok(());
     }
@@ -2063,6 +2067,32 @@ mod tests {
         assert!(
             matches!(&s.calcs[2].what, Line::Stmt(Stmt::SetInd { on: true, inds }) if inds == &vec!["LR".to_string()])
         );
+    }
+
+    #[test]
+    fn output_specs() {
+        // ILE RPG Reference, output specifications: record type in 17,
+        // conditioning indicators in 21-29 (N negates), EXCEPT name in
+        // 30-39, space before/after in 40-45, skip before/after in 46-51;
+        // an OR line starts another group of conditions; field end
+        // position in 47-51, constant in 53-80.
+        let s = p("     OQSYSPRT   E            HEADING        2  1\n     O          D    10N11                  1\n     O         OR    12\n     O               50                          84 '*'\n");
+        let h = &s.outputs[0];
+        assert_eq!((h.kind, h.name.as_deref()), ('E', Some("HEADING")));
+        assert_eq!((h.space_before, h.space_after), (None, Some(2)));
+        assert_eq!((h.skip_before, h.skip_after), (Some(1), None));
+        let d = &s.outputs[1];
+        assert_eq!(d.file, "QSYSPRT");
+        assert_eq!(
+            d.cond,
+            vec![
+                vec![(false, "10".to_string()), (true, "11".to_string())],
+                vec![(false, "12".to_string())]
+            ]
+        );
+        let f = &d.fields[0];
+        assert_eq!(f.cond, vec![(false, "50".to_string())]);
+        assert_eq!((f.end, f.literal.as_deref()), (Some(84), Some(&e("*")[..])));
     }
 
     #[test]

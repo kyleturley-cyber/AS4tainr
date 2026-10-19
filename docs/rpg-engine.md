@@ -35,7 +35,14 @@ Character data is kept in EBCDIC, as on IBM i. Comparisons and sorting follow th
 
 ## Status
 
-**R2 is done (Oct 19, 2026).** Interactive programs run on the native engine: CUSTINQ, WRKCUST (load-all subfile, READC, SFLNXTCHG), CUSTMNT (record locks: a second job waits WAITRCD, then gets the error indicator), ORDENT (input subfile, CHAIN/UPDATE of subfile records, data area ORDNXT with `IN *LOCK`/`OUT`) and CONTLST pass the 5250 end-to-end test with `AS4TAINR_RPG_ENGINE=native` (CI runs it). The three-clerk order entry of the Phase 3 gate works too; the gate's batch jobs print, which is R3.
+**R3 is done (Oct 19, 2026).** The native engine prints: CUSTPRT matches its golden output, and with `AS4TAINR_RPG_ENGINE=native` the whole 5250 end-to-end test (128 checks) and the Phase 3 gate pass (three clerks entering orders while batch jobs print). CI runs both on the native engine.
+
+What R3 adds:
+- **Printer files** (program-described, `PRINTER`) and **O specs**: heading, detail, total and exception records; conditioning indicators with AND/OR lines; space and skip before and after; field end positions and `+n` placement; constants; edit codes; `PAGE`, `UDATE`, `*DATE`; blank after; `OFLIND` (the overflow indicator comes on when line 60 of 66 is printed on or passed). `EXCEPT` with and without a name. Lines go to the job's spooled file (`WRKSPLF`); without a job (`as4tainr call`) they are printed to standard output.
+- **The cycle:** first-cycle output with `1P`, a primary file (`IP`) read once per cycle with LR at end of file, total output, detail output after the detail calculations, the overflow indicator set off after detail output.
+- **Edit code Y** for six and eight digits with the leftmost zero suppressed; codes that do not blank zero show `0` for a zero integer.
+
+**R2 (Oct 19, 2026).** Interactive programs run on the native engine: CUSTINQ, WRKCUST (load-all subfile, READC, SFLNXTCHG), CUSTMNT (record locks: a second job waits WAITRCD, then gets the error indicator), ORDENT (input subfile, CHAIN/UPDATE of subfile records, data area ORDNXT with `IN *LOCK`/`OUT`) and CONTLST pass the 5250 end-to-end test with `AS4TAINR_RPG_ENGINE=native` (CI runs it). The three-clerk order entry of the Phase 3 gate works too; the gate's batch jobs print, which is R3.
 
 What R2 adds:
 - **Display files** (externally described WORKSTN): the record formats' fields become program fields (numbers zoned); EXFMT, WRITE, READC; subfiles with `SFILE(format:rrn)`: WRITE, CHAIN and UPDATE by relative record number; `INDDS`; response indicators; `*INKA`-`*INKY` from the function key pressed. The display work itself (overlay, paging, validation) is the same code Jariko used (`workstn.rs`, `dspf.rs`).
@@ -74,10 +81,10 @@ What R1 covers:
    - Program-described files with I and O specs, EXCEPT, overflow.
    - Gate: CUSTPRT.
 4. **R4, the rest of the job.**
-   - Record locks, data areas, `*LDA`, commitment control.
+   - `*LDA`, commitment control (record locks and data areas came with R2).
    - CALL and CALLP between programs (RPG and CL), parameters by reference.
-   - Procedures, prototypes, `RETURN` values, `EXPORT`.
-   - Gate: the Phase 3 gate on the native engine.
+   - Procedures, prototypes, `RETURN` values, `EXPORT`, `ctl-opt main`.
+   - Gate: programs that call each other with parameters, and procedure-based programs from the corpus (HELLOADV). (The Phase 3 gate, first planned for R4, already passes on the native engine since R3.)
 5. **R5, real code.**
    - The corpus (`tools/corpus.sh`): free-form programs, data structures (`LIKEDS`, `QUALIFIED`, `DIM`, `OVERLAY`), dates, `MONITOR`, `%BIFs`, `/IF DEFINED`.
    - Gate: the default switches to native.

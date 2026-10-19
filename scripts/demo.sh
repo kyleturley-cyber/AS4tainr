@@ -54,9 +54,9 @@ run ORDTOTAL 1002
 run OWING L
 run CUSTRPT L
 # A printed report (O specs, EXCEPT). The conformance runner replays file
-# operations only; the page layout is the Jariko runner's.
-# The native RPG engine prints from milestone R3 on (docs/rpg-engine.md).
-if [[ "${AS4TAINR_RUNNER:-}" != *BridgeConformance* && "${AS4TAINR_RPG_ENGINE:-}" != native ]]; then
+# operations only; the page layout is the Jariko runner's or the native
+# RPG engine's.
+if [[ "${AS4TAINR_RUNNER:-}" != *BridgeConformance* || "${AS4TAINR_RPG_ENGINE:-}" == native ]]; then
   run CUSTPRT
 fi
 # An imported application (samples/apps/contacts, in library CONTACTS):

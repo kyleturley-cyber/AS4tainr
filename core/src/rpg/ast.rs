@@ -117,6 +117,8 @@ pub enum FileOp {
     Close,
     Exfmt,
     Feod,
+    /// READC: the next changed subfile record.
+    ReadC,
 }
 
 /// Fixed-form arithmetic and data movement.

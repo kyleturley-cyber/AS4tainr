@@ -10,8 +10,10 @@ use super::dec::Dec;
 use super::expr;
 use crate::catalog::FileRef;
 use crate::dds::DataType;
+use crate::dspf::DisplayFile;
 use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Where a variable's bytes are: a storage buffer and an offset.
 #[derive(Clone, Debug, PartialEq)]
@@ -56,6 +58,33 @@ pub struct FileInfo {
     pub format: String,
     /// The record's fields (program field names, in record order).
     pub fields: Vec<String>,
+    /// The display file, for WORKSTN files.
+    pub display: Option<Display>,
+}
+
+/// A display (WORKSTN) file as the program sees it.
+#[derive(Clone, Debug)]
+pub struct Display {
+    /// Library the display file was found in (for the authority check).
+    pub library: String,
+    pub file: Arc<DisplayFile>,
+    /// Record formats: (format, [(program field, display field)]).
+    pub formats: Vec<(String, Vec<(String, String)>)>,
+    /// SFILE(format:rrn): the relative record number field of each
+    /// subfile record format.
+    pub sfile: HashMap<String, String>,
+    /// INDDS(ds): indicators 01-99 are positions 1-99 of this data
+    /// structure instead of *IN01-*IN99.
+    pub indds: Option<String>,
+}
+
+impl Display {
+    pub fn fields(&self, format: &str) -> Option<&[(String, String)]> {
+        self.formats
+            .iter()
+            .find(|f| f.0 == format)
+            .map(|f| f.1.as_slice())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +99,52 @@ pub struct Program {
     pub plists: Vec<(String, Vec<Parm>)>,
     pub outputs: Vec<OutRec>,
     pub control: Vec<Keyword>,
+    /// Data areas: program field → data area name (DEFINE *DTAARA, or
+    /// the DTAARA keyword).
+    pub dtaaras: HashMap<String, String>,
+}
+
+fn expr_name(e: &Option<Expr>) -> Option<String> {
+    match e {
+        Some(Expr::Name { parts, args: None }) => Some(parts.join(".")),
+        _ => None,
+    }
+}
+
+/// The data areas a program names: `*DTAARA DEFINE name field` (name
+/// defaults to the field) and `DTAARA(name)` on a definition (ILE RPG
+/// Reference, DEFINE and DTAARA).
+fn data_areas(src: &Source) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for c in &src.calcs {
+        if let Line::Stmt(Stmt::Op {
+            code,
+            f1,
+            f2,
+            result,
+            ..
+        }) = &c.what
+        {
+            if code == "DEFINE" && expr_name(f1).as_deref() == Some("*DTAARA") {
+                if let Some(field) = expr_name(result) {
+                    let name = expr_name(f2).unwrap_or_else(|| field.clone());
+                    out.insert(field, name);
+                }
+            }
+        }
+    }
+    for d in &src.defs {
+        if let Some(k) = keyword(&d.keywords, "DTAARA") {
+            let name = k
+                .args
+                .iter()
+                .map(|a| a.trim().trim_matches('\'').to_ascii_uppercase())
+                .find(|a| !a.starts_with('*'))
+                .unwrap_or_else(|| d.name.clone());
+            out.insert(d.name.clone(), name);
+        }
+    }
+    out
 }
 
 impl Program {
@@ -79,6 +154,11 @@ impl Program {
             .iter()
             .position(|f| f.decl.name == name)
             .or_else(|| self.files.iter().position(|f| f.format == name))
+            .or_else(|| {
+                self.files
+                    .iter()
+                    .position(|f| f.display.as_ref().is_some_and(|d| d.fields(name).is_some()))
+            })
     }
 }
 
@@ -106,6 +186,30 @@ pub fn external_files(src: &Source) -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+/// The display files a source uses (WORKSTN files with E in position 22).
+pub fn display_files(src: &Source) -> Vec<String> {
+    src.files
+        .iter()
+        .filter(|f| f.external && f.device == "WORKSTN")
+        .map(|f| {
+            keyword(&f.keywords, "EXTDESC")
+                .and_then(|k| k.args.first())
+                .map(|a| a.trim_matches('\'').to_ascii_uppercase())
+                .unwrap_or_else(|| f.name.clone())
+        })
+        .collect()
+}
+
+/// The program field type of a display file field: zoned for numbers,
+/// character otherwise (ILE RPG Reference, externally described
+/// WORKSTN files).
+fn display_type(f: &crate::dspf::Field) -> DType {
+    match f.decimals {
+        Some(d) => DType::Zoned(f.length as u32, d as u32),
+        None => DType::Char(f.length as u32),
+    }
 }
 
 fn literal_value(text: &str, syms: &HashMap<String, Sym>) -> Result<Value> {
@@ -421,7 +525,12 @@ impl Binder<'_> {
 
 /// Bind a parsed source. `externals`: descriptions of the external files
 /// (by file name), from the catalog.
-pub fn bind(name: &str, src: &Source, externals: &HashMap<String, FileRef>) -> Result<Program> {
+pub fn bind(
+    name: &str,
+    src: &Source,
+    externals: &HashMap<String, FileRef>,
+    displays: &HashMap<String, (String, Arc<DisplayFile>)>,
+) -> Result<Program> {
     let mut b = Binder {
         syms: HashMap::new(),
         bufs: vec![],
@@ -437,7 +546,55 @@ pub fn bind(name: &str, src: &Source, externals: &HashMap<String, FileRef>) -> R
             fref: None,
             format: f.name.clone(),
             fields: vec![],
+            display: None,
         };
+        if f.device == "WORKSTN" && f.external {
+            let ext = keyword(&f.keywords, "EXTDESC")
+                .and_then(|k| k.args.first())
+                .map(|a| a.trim_matches('\'').to_ascii_uppercase())
+                .unwrap_or_else(|| f.name.clone());
+            let (library, file) = displays
+                .get(&ext)
+                .ok_or_else(|| anyhow!("display file {} is not described (not found)", f.name))?
+                .clone();
+            let prefix = keyword(&f.keywords, "PREFIX")
+                .and_then(|k| k.args.first())
+                .map(|p| p.trim().to_ascii_uppercase());
+            let mut formats = Vec::new();
+            for r in &file.records {
+                let mut fields = Vec::new();
+                for fd in &r.fields {
+                    let pname = match &prefix {
+                        Some(p) => format!("{p}{}", fd.name),
+                        None => fd.name.to_ascii_uppercase(),
+                    };
+                    b.file_fields
+                        .entry(pname.clone())
+                        .or_insert_with(|| display_type(fd));
+                    fields.push((pname, fd.name.clone()));
+                }
+                formats.push((r.name.to_ascii_uppercase(), fields));
+            }
+            let mut sfile = HashMap::new();
+            for k in f.keywords.iter().filter(|k| k.name == "SFILE") {
+                if k.args.len() == 2 {
+                    sfile.insert(
+                        k.args[0].trim().to_ascii_uppercase(),
+                        k.args[1].trim().to_ascii_uppercase(),
+                    );
+                }
+            }
+            let indds = keyword(&f.keywords, "INDDS")
+                .and_then(|k| k.args.first())
+                .map(|a| a.trim().to_ascii_uppercase());
+            info.display = Some(Display {
+                library,
+                file,
+                formats,
+                sfile,
+                indds,
+            });
+        }
         if f.device == "DISK" && f.external {
             let ext = keyword(&f.keywords, "EXTDESC")
                 .and_then(|k| k.args.first())
@@ -615,5 +772,6 @@ pub fn bind(name: &str, src: &Source, externals: &HashMap<String, FileRef>) -> R
         plists: src.plists.clone(),
         outputs: src.outputs.clone(),
         control: src.control.clone(),
+        dtaaras: data_areas(src),
     })
 }

@@ -9,10 +9,12 @@ use super::ast::*;
 use super::code::{Code, Ins};
 use super::data::{self, a, DType, Fig, Fit, Value};
 use super::dec::Dec;
-use super::program::{Program, Sym, VarInfo};
+use super::program::{Display, Program, Sym, VarInfo};
 use crate::rla::{OpenFile, ReadResult, Record};
+use crate::workstn::Workstation;
 use anyhow::{anyhow, bail, Result};
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use tokio::runtime::Handle;
 use tokio_postgres::Client;
@@ -23,6 +25,10 @@ pub struct Io<'a> {
     pub client: &'a Client,
     pub user: String,
     pub job_number: Option<i64>,
+    /// The library list (data areas).
+    pub libl: Vec<String>,
+    /// The job's display (interactive jobs): EXFMT goes there.
+    pub display: Option<crate::bridge::DisplayHandle>,
 }
 
 /// Status of the last operation on a file (%FOUND, %EOF, %EQUAL, %ERROR).
@@ -36,6 +42,8 @@ struct Status {
 
 struct FileState {
     open: Option<OpenFile>,
+    /// A display file is open.
+    ws_open: bool,
     status: Status,
 }
 
@@ -59,7 +67,14 @@ pub struct Machine<'a> {
     pub messages: Vec<String>,
     /// The remainder of the last DIV, for MVR.
     remainder: Dec,
+    /// The display files' screen and subfiles.
+    ws: Workstation,
+    /// Data areas this program holds locked (IN *LOCK): (library, name).
+    dtaara_locks: Vec<(String, String)>,
 }
+
+/// Function key indicators *INKA-*INKY for F1-F24 (there is no *INKO).
+const FKEYS: &[u8; 24] = b"ABCDEFGHIJKLMNPQRSTUVWXY";
 
 fn ind_name(n: &str) -> String {
     let t = n.trim().to_ascii_uppercase();
@@ -97,6 +112,7 @@ impl<'a> Machine<'a> {
                 .iter()
                 .map(|_| FileState {
                     open: None,
+                    ws_open: false,
                     status: Status::default(),
                 })
                 .collect(),
@@ -104,6 +120,8 @@ impl<'a> Machine<'a> {
             io,
             messages: Vec::new(),
             remainder: Dec::ZERO,
+            ws: Workstation::new(),
+            dtaara_locks: Vec::new(),
         }
     }
 
@@ -637,6 +655,24 @@ impl<'a> Machine<'a> {
 
     fn open_file(&mut self, i: usize) -> Result<()> {
         let fi = &self.prog.files[i];
+        if let Some(d) = &fi.display {
+            self.block(crate::authority::check(
+                self.io.client,
+                &self.io.user,
+                &d.library,
+                &d.file.name.to_ascii_uppercase(),
+                "*FILE",
+                crate::authority::Aut::Use,
+            ))?;
+            self.files[i].ws_open = true;
+            return Ok(());
+        }
+        if fi.decl.device == "WORKSTN" {
+            bail!(
+                "WORKSTN file {} is program-described; the native engine needs a display file (E in position 22)",
+                fi.decl.name
+            );
+        }
         let Some(fref) = fi.fref.clone() else {
             return Ok(());
         };
@@ -744,6 +780,9 @@ impl<'a> Machine<'a> {
             .file_index(file)
             .ok_or_else(|| anyhow!("{file} is not a file of this program"))?;
         let device = self.prog.files[i].decl.device.clone();
+        if device == "WORKSTN" {
+            return self.workstn_op(op, i, file, key, ind);
+        }
         if device != "DISK" {
             bail!(
                 "{} files are not supported by the native engine yet ({op:?} {file})",
@@ -817,7 +856,7 @@ impl<'a> Machine<'a> {
         })();
         let result = match result {
             Ok(r) => r,
-            Err(err) if ext.error => {
+            Err(err) if ext.error || ind.lo.is_some() => {
                 self.last = Status {
                     error: true,
                     ..Status::default()
@@ -945,7 +984,307 @@ impl<'a> Machine<'a> {
                 }
             }
             FileOp::Unlock | FileOp::Feod => {}
-            FileOp::Exfmt => bail!("EXFMT is not supported by the native engine yet"),
+            FileOp::Exfmt | FileOp::ReadC => bail!("{op:?} {file}: not a display file"),
+        }
+        Ok(())
+    }
+
+    // ---- data areas (IN, OUT; ILE RPG Reference) ------------------------
+
+    fn data_area(&mut self, input: bool, lock: bool, field: &str) -> Result<()> {
+        let name = self
+            .prog
+            .dtaaras
+            .get(field)
+            .cloned()
+            .ok_or_else(|| anyhow!("{field} is not defined as a data area (DEFINE *DTAARA)"))?;
+        let libl = self.io.libl.clone();
+        let cur = crate::commands::DEFAULT_CURRENT_LIBRARY;
+        let client = self.io.client;
+        let d = self.block(crate::dtaara::resolve(client, &name, &libl, cur))?;
+        let key = (d.library.clone(), d.name.clone());
+        let held = self.dtaara_locks.contains(&key);
+        if input {
+            self.block(crate::authority::check(
+                client,
+                &self.io.user,
+                &d.library,
+                &d.name,
+                "*DTAARA",
+                crate::authority::Aut::Use,
+            ))?;
+            let take = lock && !held;
+            let d = self.block(crate::dtaara::read(client, &name, &libl, cur, take))?;
+            if take {
+                self.dtaara_locks.push(key);
+            }
+            let numeric = self
+                .type_of(&Expr::name(field))
+                .is_some_and(|t| t.is_numeric());
+            let v = if numeric {
+                Value::Num(Dec::parse(d.value.trim())?)
+            } else {
+                Value::str(&d.value)
+            };
+            self.assign(
+                &Expr::name(field),
+                &v,
+                Fit::Truncate { half_adjust: false },
+                false,
+            )?;
+        } else {
+            self.block(crate::authority::check(
+                client,
+                &self.io.user,
+                &d.library,
+                &d.name,
+                "*DTAARA",
+                crate::authority::Aut::Change,
+            ))?;
+            let v = self.eval(&Expr::name(field))?;
+            let text = match v {
+                Value::Num(n) => n.to_string(),
+                other => a(&other.chars()?).trim_end().to_string(),
+            };
+            self.block(crate::dtaara::write(client, &d, &text, held))?;
+            self.dtaara_locks.retain(|k| *k != key);
+        }
+        Ok(())
+    }
+
+    // ---- display files (WORKSTN) ----------------------------------------
+
+    /// Indicators 01-99 as a display file sees them: *IN01-*IN99, or the
+    /// INDDS data structure.
+    fn ws_inds(&self, d: &Display) -> [bool; 100] {
+        let mut out = [false; 100];
+        match d.indds.as_ref().and_then(|n| self.prog.syms.get(n)) {
+            Some(Sym::Ds(ds)) => {
+                let bytes = &self.bufs[ds.buf][ds.off..ds.off + ds.size];
+                for (n, slot) in out.iter_mut().enumerate().skip(1) {
+                    *slot = bytes.get(n - 1) == Some(&0xF1);
+                }
+            }
+            _ => {
+                for (n, slot) in out.iter_mut().enumerate().skip(1) {
+                    *slot = self.ind(&format!("{n:02}"));
+                }
+            }
+        }
+        out
+    }
+
+    fn ws_set_ind(&mut self, d: &Display, n: u8, v: bool) {
+        if !(1..=99).contains(&n) {
+            return;
+        }
+        match d.indds.as_ref().and_then(|x| self.prog.syms.get(x)) {
+            Some(Sym::Ds(ds)) => {
+                let at = ds.off + n as usize - 1;
+                if at < ds.off + ds.size {
+                    self.bufs[ds.buf][at] = if v { 0xF1 } else { 0xF0 };
+                }
+            }
+            _ => self.set_ind(&format!("{n:02}"), v),
+        }
+    }
+
+    /// The program fields of a record format, as display text by display
+    /// field name (numbers as plain decimal text, "-12.50").
+    fn ws_values(&mut self, d: &Display, format: &str) -> Result<BTreeMap<String, String>> {
+        let rec = d.file.record(format);
+        let mut out = BTreeMap::new();
+        for (pname, dname) in d.fields(format).unwrap_or_default() {
+            let decimals = rec
+                .and_then(|r| r.fields.iter().find(|f| &f.name == dname))
+                .and_then(|f| f.decimals);
+            let v = self.eval(&Expr::name(pname))?;
+            let text = match (v, decimals) {
+                (Value::Num(n), Some(dec)) => n.rescale(dec as u8, false)?.to_string(),
+                (Value::Num(n), None) => n.to_string(),
+                (other, _) => a(&other.chars()?),
+            };
+            out.insert(dname.clone(), text);
+        }
+        Ok(out)
+    }
+
+    /// Display values → the program fields of a record format.
+    fn ws_fill(
+        &mut self,
+        d: &Display,
+        format: &str,
+        values: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let rec = d.file.record(format);
+        for (pname, dname) in d.fields(format).unwrap_or_default() {
+            let Some(text) = values.get(dname) else {
+                continue;
+            };
+            let numeric = rec
+                .and_then(|r| r.fields.iter().find(|f| &f.name == dname))
+                .is_some_and(|f| f.is_numeric());
+            let v = if numeric {
+                Value::Num(Dec::parse(text.trim())?)
+            } else {
+                Value::str(text)
+            };
+            self.assign(
+                &Expr::name(pname),
+                &v,
+                Fit::Truncate { half_adjust: false },
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn workstn_op(
+        &mut self,
+        op: FileOp,
+        i: usize,
+        name: &str,
+        key: &Option<Vec<Expr>>,
+        ind: &ResultInd,
+    ) -> Result<()> {
+        let prog = self.prog;
+        let d = prog.files[i]
+            .display
+            .as_ref()
+            .ok_or_else(|| anyhow!("{name} is not a display file"))?;
+        match op {
+            FileOp::Open => {
+                if self.files[i].ws_open {
+                    bail!("CPF4161: File {name} is already open.");
+                }
+                return self.open_file(i);
+            }
+            FileOp::Close => {
+                self.files[i].ws_open = false;
+                return Ok(());
+            }
+            _ => {}
+        }
+        if !self.files[i].ws_open {
+            bail!("CPF4135: File {} is not open.", prog.files[i].decl.name);
+        }
+        if d.fields(name).is_none() {
+            bail!(
+                "{op:?} {name}: name a record format of display file {}",
+                d.file.name
+            );
+        }
+        let format = name.to_string();
+        let file = d.file.clone();
+        let inds = self.ws_inds(d);
+        let set_status = |m: &mut Self, st: Status| {
+            m.files[i].status = st.clone();
+            m.last = st;
+        };
+        match op {
+            FileOp::Write => {
+                let values = self.ws_values(d, &format)?;
+                match d.sfile.get(&format) {
+                    Some(rrn_field) => {
+                        let rrn = self.eval(&Expr::name(rrn_field))?.num()?.to_i128()?;
+                        let rrn = i64::try_from(rrn).unwrap_or(-1);
+                        self.ws.sfl_write(&file, &format, rrn, values, inds)?;
+                    }
+                    None => self.ws.write(&file, &format, values, inds)?,
+                }
+                set_status(self, Status::default());
+            }
+            FileOp::Update => {
+                let values = self.ws_values(d, &format)?;
+                self.ws.sfl_update(&file, &format, values, inds)?;
+                set_status(self, Status::default());
+            }
+            FileOp::Exfmt => {
+                let Some(display) = self.io.display.clone() else {
+                    bail!(
+                        "Display file {} cannot be used here: this job has no display (it is not interactive).",
+                        d.file.name
+                    );
+                };
+                let values = self.ws_values(d, &format)?;
+                let frame = self.ws.frame(&file, &format, values, inds)?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let resp = self.block(async move {
+                    display
+                        .send(crate::bridge::DisplayRequest { frame, reply: tx })
+                        .await
+                        .map_err(|_| anyhow!("the job's display is gone"))?;
+                    rx.await
+                        .map_err(|_| anyhow!("the job's display is gone"))?
+                        .map_err(|e| anyhow!(e))
+                })?;
+                self.ws.apply(&file, &format, &resp);
+                self.ws_fill(d, &format, &resp.values)?;
+                for (n, v) in &resp.indicators {
+                    self.ws_set_ind(d, *n, *v);
+                }
+                // *INKA-*INKY: on for the function key pressed, off for
+                // the others (ILE RPG Reference, function key indicators).
+                for (k, letter) in FKEYS.iter().enumerate() {
+                    let on = resp.aid == format!("F{}", k + 1);
+                    self.set_ind(&format!("K{}", *letter as char), on);
+                }
+                set_status(self, Status::default());
+            }
+            FileOp::ReadC => {
+                let r = self.ws.sfl_readc(&file, &format)?;
+                let found = r.is_some();
+                if let Some((rrn, values)) = r {
+                    self.ws_fill(d, &format, &values)?;
+                    if let Some(f) = d.sfile.get(&format) {
+                        self.assign(
+                            &Expr::name(f),
+                            &Value::Num(Dec::from_i64(rrn as i64)),
+                            Fit::Strict { half_adjust: false },
+                            false,
+                        )?;
+                    }
+                }
+                set_status(
+                    self,
+                    Status {
+                        found,
+                        eof: !found,
+                        ..Status::default()
+                    },
+                );
+                // READC: positions 75-76 on at end of file.
+                if let Some(eq) = &ind.eq {
+                    self.set_ind(eq, !found);
+                }
+            }
+            FileOp::Chain => {
+                let k = key
+                    .as_deref()
+                    .and_then(|k| k.first())
+                    .ok_or_else(|| anyhow!("CHAIN {format}: a relative record number is needed"))?;
+                let rrn = self.eval(k)?.num()?.to_i128()?;
+                let r = self
+                    .ws
+                    .sfl_chain(&file, &format, i64::try_from(rrn).unwrap_or(0))?;
+                let found = r.is_some();
+                if let Some(values) = r {
+                    self.ws_fill(d, &format, &values)?;
+                }
+                set_status(
+                    self,
+                    Status {
+                        found,
+                        ..Status::default()
+                    },
+                );
+                if let Some(hi) = &ind.hi {
+                    self.set_ind(hi, !found);
+                }
+            }
+            other => bail!(
+                "{other:?} of display file record {format} is not supported by the native engine yet"
+            ),
         }
         Ok(())
     }
@@ -1306,7 +1645,21 @@ impl<'a> Machine<'a> {
             }
             "DEFINE" | "COMMIT" | "ROLBK" | "FORCE" | "DUMP" | "DEALLOC" => {}
             "EXCEPT" => bail!("EXCEPT (printer output) is not supported by the native engine yet"),
-            "IN" | "OUT" => bail!("data areas (IN/OUT) are not supported by the native engine yet"),
+            "IN" | "OUT" => {
+                let lock = expr_name(f1).as_deref() == Some("*LOCK");
+                let target =
+                    expr_name(f2).ok_or_else(|| anyhow!("{code}: a data area is needed"))?;
+                let fields: Vec<String> = if target == "*DTAARA" {
+                    let mut v: Vec<String> = self.prog.dtaaras.keys().cloned().collect();
+                    v.sort();
+                    v
+                } else {
+                    vec![target]
+                };
+                for field in fields {
+                    self.data_area(code == "IN", lock, &field)?;
+                }
+            }
             other => bail!("operation {other} is not supported yet"),
         }
         let _ = ind;
@@ -1541,6 +1894,13 @@ impl<'a> Machine<'a> {
             }
         }
         Ok(())
+    }
+}
+
+fn expr_name(e: &Option<Expr>) -> Option<String> {
+    match e {
+        Some(Expr::Name { parts, args: None }) => Some(parts.join(".")),
+        _ => None,
     }
 }
 

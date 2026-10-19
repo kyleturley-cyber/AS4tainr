@@ -2592,6 +2592,7 @@ async fn native_rpg_engine_runs_a_program() {
         vec![lib.clone()],
         "QSECOFR".into(),
         None,
+        None,
         "CONTCNT".into(),
         p.source,
         vec![],
@@ -2616,4 +2617,49 @@ async fn native_rpg_engine_runs_a_program() {
     .err()
     .unwrap();
     assert!(e.to_string().contains("IF has no end"), "{e:#}");
+
+    // An interactive program on the native engine (milestone R2): CONTLST
+    // fills a load-all subfile and shows it until F3 sets *INKC (ILE RPG
+    // Reference: function key indicators; DDS: SFL, SFLCTL). The display
+    // here is a stand-in that checks the frame and presses F3.
+    let p = catalog::find_program(&client, std::slice::from_ref(&lib), "CONTLST")
+        .await
+        .unwrap()
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ibmish_core::bridge::DisplayRequest>(1);
+    let operator = tokio::spawn(async move {
+        let mut shown = Vec::new();
+        while let Some(req) = rx.recv().await {
+            let sfl = req.frame.subfile.clone().expect("CTL01 controls a subfile");
+            shown.push((
+                req.frame.layers.last().unwrap().format.clone(),
+                sfl.rows.len(),
+                sfl.show,
+            ));
+            let _ = req.reply.send(Ok(ibmish_core::dspf::Response {
+                aid: "F3".into(),
+                values: Default::default(),
+                indicators: Default::default(),
+                changed: Default::default(),
+            }));
+        }
+        shown
+    });
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        Some(tx),
+        "CONTLST".into(),
+        p.source,
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let shown = operator.await.unwrap();
+    // One EXFMT: the control record over all five contacts (the same
+    // count CONTCNT reads), with SFLDSP on (*IN31); F3 ends the DOU.
+    assert_eq!(shown, [("CTL01".to_string(), 5, true)]);
 }

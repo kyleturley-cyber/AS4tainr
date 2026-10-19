@@ -276,32 +276,35 @@ with Tn5250(HOST) as t:
 
     # Spooled files: a printed RPG report (O specs, EXCEPT) and a display
     # command in batch both become spooled files QSYSPRT.
-    command(t, "sbmjob cmd(call custprt) job(custprt)", "submitted to job queue QBATCH")
-    command(t, "sbmjob cmd(dsppfm custmast) job(listing)", "submitted to job queue QBATCH")
-    command(t, "wrksplf", "Work with All Spooled Files")
-    for _ in range(60):
-        if t.text().count("QSYSPRT") >= 2:
-            break
-        t.fkey(5)
-        t.pump(1.5)
-    check(t.text().count("QSYSPRT") >= 2 and "CUSTPRT" in t.text(),
-          "WRKSPLF lists the report (user data CUSTPRT) and the DSPPFM listing", t)
-    t.type("5"); t.enter()
-    t.wait_for("Display Spooled File")
-    screen = t.text()
-    check("Customer Balance Report" in screen and "Midwest Fasteners" in screen and "Customers:     5" in screen,
-          "DSPSPLF shows the report as printed: heading, detail lines, totals", t)
-    t.fkey(20)
-    t.pump(1)
-    t.wait_for("75.25-*")
-    check("Page    1" in t.text(),
-          "F20 shows the rest of the 132-column lines: page number, edit code J and the conditioned '*'", t)
-    t.fkey(12); t.wait_for("Work with All Spooled Files")
-    t.tab(); t.type("4"); t.enter()
-    t.wait_for("deleted")
-    check("/LISTING" not in t.text() and "/CUSTPRT" in t.text(),
-          "option 4 deletes the listing (DLTSPLF); the list is refreshed", t)
-    t.fkey(3); t.wait_for("Command Entry")
+    # (Printing from RPG comes to the native engine in milestone R3, see
+    # docs/rpg-engine.md; with IBMISH_RPG_ENGINE=native these checks wait.)
+    if os.environ.get("IBMISH_RPG_ENGINE", "").lower() != "native":
+        command(t, "sbmjob cmd(call custprt) job(custprt)", "submitted to job queue QBATCH")
+        command(t, "sbmjob cmd(dsppfm custmast) job(listing)", "submitted to job queue QBATCH")
+        command(t, "wrksplf", "Work with All Spooled Files")
+        for _ in range(60):
+            if t.text().count("QSYSPRT") >= 2:
+                break
+            t.fkey(5)
+            t.pump(1.5)
+        check(t.text().count("QSYSPRT") >= 2 and "CUSTPRT" in t.text(),
+              "WRKSPLF lists the report (user data CUSTPRT) and the DSPPFM listing", t)
+        t.type("5"); t.enter()
+        t.wait_for("Display Spooled File")
+        screen = t.text()
+        check("Customer Balance Report" in screen and "Midwest Fasteners" in screen and "Customers:     5" in screen,
+              "DSPSPLF shows the report as printed: heading, detail lines, totals", t)
+        t.fkey(20)
+        t.pump(1)
+        t.wait_for("75.25-*")
+        check("Page    1" in t.text(),
+              "F20 shows the rest of the 132-column lines: page number, edit code J and the conditioned '*'", t)
+        t.fkey(12); t.wait_for("Work with All Spooled Files")
+        t.tab(); t.type("4"); t.enter()
+        t.wait_for("deleted")
+        check("/LISTING" not in t.text() and "/CUSTPRT" in t.text(),
+              "option 4 deletes the listing (DLTSPLF); the list is refreshed", t)
+        t.fkey(3); t.wait_for("Command Entry")
 
     # F4 prompting, from the command definitions.
     t.type("crtlib"); t.fkey(4)

@@ -1064,6 +1064,7 @@ fn fixed_c(ctx: &mut Ctx, cs: &[char], ext2: &str, lineno: usize) -> Result<()> 
             | FileOp::Open
             | FileOp::Close
             | FileOp::Exfmt
+            | FileOp::ReadC
             | FileOp::Feod => None,
             _ => f1()?.map(|k| vec![k]),
         };
@@ -1180,6 +1181,7 @@ fn fixed_c(ctx: &mut Ctx, cs: &[char], ext2: &str, lineno: usize) -> Result<()> 
         "OPEN" => file_op(FileOp::Open)?,
         "CLOSE" => file_op(FileOp::Close)?,
         "EXFMT" => file_op(FileOp::Exfmt)?,
+        "READC" => file_op(FileOp::ReadC)?,
         "FEOD" => file_op(FileOp::Feod)?,
         "DSPLY" => Line::Stmt(Stmt::Dsply {
             message: f1()?,
@@ -1582,6 +1584,7 @@ const FREE_OPS: &[&str] = &[
     "OPEN",
     "CLOSE",
     "EXFMT",
+    "READC",
     "FEOD",
     "DSPLY",
     "CLEAR",
@@ -1973,6 +1976,7 @@ fn free_calc(text: &str) -> Result<Line> {
         "OPEN" => file_stmt(FileOp::Open, false)?,
         "CLOSE" => file_stmt(FileOp::Close, false)?,
         "EXFMT" => file_stmt(FileOp::Exfmt, false)?,
+        "READC" => file_stmt(FileOp::ReadC, false)?,
         "FEOD" => file_stmt(FileOp::Feod, false)?,
         "DSPLY" => {
             let toks = words(rest_t)?;

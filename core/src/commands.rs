@@ -1601,7 +1601,7 @@ impl Job<'_> {
         args: Vec<String>,
     ) -> Result<Outcome> {
         let pgm = pgm.to_string();
-        if crate::rpg::native_enabled() && self.display.is_none() {
+        if crate::rpg::native_enabled() {
             return self.call_native(&pgm, library, args).await;
         }
         let listener = bridge::bind(0).await?;
@@ -1687,12 +1687,12 @@ impl Job<'_> {
             None => crate::rpg::source_from_path(pgm),
         }
         .ok_or_else(|| anyhow!("CPF4101: Program {pgm} not found."))?;
-        let job_number = self.id.as_ref().map(|i| i.number);
         let r = crate::rpg::call(
             &self.env.database_url,
             self.library_list(),
             self.user.clone(),
-            job_number,
+            self.id.as_ref().map(|i| i.to_string()),
+            self.display.clone(),
             pgm.to_string(),
             source,
             args,

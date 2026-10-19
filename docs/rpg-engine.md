@@ -35,7 +35,14 @@ Character data is kept in EBCDIC, as on IBM i. Comparisons and sorting follow th
 
 ## Status
 
-**R1 is done (Oct 19, 2026).** The batch samples (CUSTLIST, ORDTOTAL, OWING, CUSTUPD, the CL program CUSTRPT calling RPG, CONTCNT) produce their golden output on the native engine. CI runs the demo on it (`IBMISH_RPG_ENGINE=native`). Fully free-form programs run too: HELLOWORLD from the corpus prints its message, where Jariko did nothing.
+**R2 is done (Oct 19, 2026).** Interactive programs run on the native engine: CUSTINQ, WRKCUST (load-all subfile, READC, SFLNXTCHG), CUSTMNT (record locks: a second job waits WAITRCD, then gets the error indicator), ORDENT (input subfile, CHAIN/UPDATE of subfile records, data area ORDNXT with `IN *LOCK`/`OUT`) and CONTLST pass the 5250 end-to-end test with `IBMISH_RPG_ENGINE=native` (CI runs it). The three-clerk order entry of the Phase 3 gate works too; the gate's batch jobs print, which is R3.
+
+What R2 adds:
+- **Display files** (externally described WORKSTN): the record formats' fields become program fields (numbers zoned); EXFMT, WRITE, READC; subfiles with `SFILE(format:rrn)`: WRITE, CHAIN and UPDATE by relative record number; `INDDS`; response indicators; `*INKA`-`*INKY` from the function key pressed. The display work itself (overlay, paging, validation) is the same code Jariko used (`workstn.rs`, `dspf.rs`).
+- **Data areas:** `*DTAARA DEFINE`, the `DTAARA` keyword, `IN` (with `*LOCK`), `OUT`, `IN *DTAARA`.
+- **Record locks:** the job's database session is named after the job and waits WAITRCD for a locked record, as with Jariko; positions 73-74 (or `(E)`) catch the error.
+
+**R1 (Oct 19, 2026).** The batch samples (CUSTLIST, ORDTOTAL, OWING, CUSTUPD, the CL program CUSTRPT calling RPG, CONTCNT) produce their golden output on the native engine. CI runs the demo on it (`IBMISH_RPG_ENGINE=native`). Fully free-form programs run too: HELLOWORLD from the corpus prints its message, where Jariko did nothing.
 
 To try it: `IBMISH_RPG_ENGINE=native ibmish call CUSTLIST 3`. With the variable set, CRTBNDRPG checks programs (syntax, names, files) when it creates them.
 

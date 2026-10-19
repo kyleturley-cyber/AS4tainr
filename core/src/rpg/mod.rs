@@ -92,7 +92,15 @@ pub async fn compile(
             .map_err(|e| anyhow!("file {f} for the program: {e}"))?;
         externals.insert(f, fr);
     }
-    program::bind(name, &src, &externals)
+    let mut displays = HashMap::new();
+    for f in program::display_files(&src) {
+        let (library, text) = crate::catalog::resolve_display_file(client, libl, &f)
+            .await
+            .map_err(|e| anyhow!("display file {f} for the program: {e}"))?;
+        let parsed = crate::dspf::parse(&f, &text)?;
+        displays.insert(f, (library, std::sync::Arc::new(parsed)));
+    }
+    program::bind(name, &src, &externals, &displays)
 }
 
 /// What a call produced: DSPLY output, and an error if it ended
@@ -103,11 +111,13 @@ pub struct CallResult {
 }
 
 /// Run a program in its own database session, on a blocking thread.
+#[allow(clippy::too_many_arguments)]
 pub async fn call(
     database_url: &str,
     libl: Vec<String>,
     user: String,
-    job_number: Option<i64>,
+    job: Option<String>,
+    display: Option<crate::bridge::DisplayHandle>,
     name: String,
     source: String,
     args: Vec<String>,
@@ -116,6 +126,16 @@ pub async fn call(
     let url = database_url.to_string();
     tokio::task::spawn_blocking(move || -> Result<CallResult> {
         let client = rt.block_on(crate::bridge::connect_db(&url))?;
+        rt.block_on(crate::bridge::job_session(
+            &client,
+            job.as_deref(),
+            crate::bridge::default_record_wait(),
+        ))?;
+        // The job number of "000123/USER/NAME".
+        let job_number = job
+            .as_deref()
+            .and_then(|j| j.split('/').next())
+            .and_then(|n| n.parse().ok());
         let prog = rt.block_on(compile(&client, &libl, &name, &source))?;
         let mut m = interp::Machine::new(
             &prog,
@@ -124,6 +144,8 @@ pub async fn call(
                 client: &client,
                 user,
                 job_number,
+                libl: libl.clone(),
+                display,
             },
         );
         let r = m.run(&args);

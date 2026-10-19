@@ -134,6 +134,19 @@ jobs:
           TN5250: /tmp/tn5250/build/curses/tn5250
           IBMISH_BIN: target/debug/ibmish
         run: python3 tools/gate3_5250.py 127.0.0.1:2323
+      - name: 5250 end-to-end on the native RPG engine (milestone R2; printing waits for R3)
+        env:
+          TN5250: /tmp/tn5250/build/curses/tn5250
+          IBMISH_RPG_ENGINE: native
+          PGPASSWORD: ibmish
+        run: |
+          createdb -h 127.0.0.1 -U ibmish ibmish_r2
+          export IBMISH_DATABASE_URL=postgres://ibmish:ibmish@127.0.0.1/ibmish_r2
+          IBMISH_BIN=target/debug/ibmish scripts/samples.sh
+          IBMISH_WAITRCD=5 IBMISH_PGM_PATH=$PWD/samples/qrpglesrc nohup target/debug/ibmish tn5250 \
+            --listen 127.0.0.1:2324 --runner "java -jar jvm/build/libs/ibmish-jvm.jar" > tn5250-native.log 2>&1 &
+          sleep 2
+          python3 tools/e2e_5250.py 127.0.0.1:2324 || { cat tn5250-native.log; exit 1; }
       - name: Browser 5250 terminal in Chromium
         run: |
           pip install playwright

@@ -48,7 +48,29 @@ fn job_number_of(config: &BridgeConfig) -> Option<i64> {
         .and_then(|n| n.parse().ok())
 }
 
-fn default_record_wait() -> std::time::Duration {
+/// Set up a job's database session: other jobs see who holds a record
+/// lock by application_name; reads wait for locked records up to WAITRCD
+/// (lock_timeout).
+pub async fn job_session(
+    client: &Client,
+    job: Option<&str>,
+    wait: std::time::Duration,
+) -> Result<()> {
+    client
+        .batch_execute(&format!(
+            "SET application_name = '{}'; SET lock_timeout = '{}ms'",
+            job.unwrap_or("")
+                .replace('\'', "")
+                .chars()
+                .take(60)
+                .collect::<String>(),
+            wait.as_millis().max(1)
+        ))
+        .await?;
+    Ok(())
+}
+
+pub fn default_record_wait() -> std::time::Duration {
     std::time::Duration::from_secs(
         std::env::var("IBMISH_WAITRCD")
             .ok()
@@ -595,20 +617,7 @@ async fn handle_conn(
     // Other jobs see who holds a record lock by application_name; reads
     // wait for locked records up to WAITRCD (lock_timeout).
     let wait = config.record_wait.unwrap_or_else(default_record_wait);
-    client
-        .batch_execute(&format!(
-            "SET application_name = '{}'; SET lock_timeout = '{}ms'",
-            config
-                .job
-                .as_deref()
-                .unwrap_or("")
-                .replace('\'', "")
-                .chars()
-                .take(60)
-                .collect::<String>(),
-            wait.as_millis().max(1)
-        ))
-        .await?;
+    job_session(&client, config.job.as_deref(), wait).await?;
     let job_number = job_number_of(&config);
     let mut session = Session {
         client,

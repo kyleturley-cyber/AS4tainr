@@ -1,4 +1,4 @@
-package io.as4tainer.bridge;
+package io.as4tainr.bridge;
 
 import java.util.Collections;
 import java.util.Map;

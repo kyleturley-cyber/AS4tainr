@@ -1,31 +1,31 @@
-package io.as4tainer.jvm
+package io.as4tainr.jvm
 
 import com.smeup.dbnative.ConnectionConfig
 import com.smeup.dbnative.DBManagerBaseImpl
 import com.smeup.dbnative.file.DBFile
 import com.smeup.dbnative.model.Field
 import com.smeup.dbnative.model.FileMetadata
-import io.as4tainer.bridge.BridgeClient
+import io.as4tainr.bridge.BridgeClient
 
 /**
- * A reload DBMManager that sends every file operation to as4tainer core over
+ * A reload DBMManager that sends every file operation to as4tainr core over
  * the bridge, instead of talking to a database over JDBC.
  *
- * Configure it with `impl = io.as4tainer.jvm.As4tainerDBMManager` and
- * `url = as4tainer://HOST:PORT`. reload instantiates it reflectively with a
+ * Configure it with `impl = io.as4tainr.jvm.As4tainrDBMManager` and
+ * `url = as4tainr://HOST:PORT`. reload instantiates it reflectively with a
  * single ConnectionConfig argument.
  */
-class As4tainerDBMManager(
+class As4tainrDBMManager(
     override val connectionConfig: ConnectionConfig,
 ) : DBManagerBaseImpl<String, Any>() {
     private val client: BridgeClient by lazy { BridgeClient.connect(hostPort()) }
-    private val openFiles = mutableMapOf<String, As4tainerDBFile>()
+    private val openFiles = mutableMapOf<String, As4tainrDBFile>()
 
     private fun hostPort(): String = connectionConfig.url.removePrefix(URL_PREFIX)
 
     override fun validateConfig() {
         require(connectionConfig.url.startsWith(URL_PREFIX)) {
-            "as4tainer connection URLs look like ${URL_PREFIX}HOST:PORT, got ${connectionConfig.url}"
+            "as4tainr connection URLs look like ${URL_PREFIX}HOST:PORT, got ${connectionConfig.url}"
         }
     }
 
@@ -35,13 +35,13 @@ class As4tainerDBMManager(
         try {
             client.metadata(name)
             true
-        } catch (e: io.as4tainer.bridge.BridgeException) {
+        } catch (e: io.as4tainr.bridge.BridgeException) {
             false
         }
 
     override fun openFile(name: String): DBFile =
         openFiles.getOrPut(name.uppercase()) {
-            As4tainerDBFile(name.uppercase(), metadataOf(name), client)
+            As4tainrDBFile(name.uppercase(), metadataOf(name), client)
         }
 
     override fun closeFile(name: String) {
@@ -55,7 +55,7 @@ class As4tainerDBMManager(
     }
 
     companion object {
-        const val URL_PREFIX = "as4tainer://"
+        const val URL_PREFIX = "as4tainr://"
 
         @Suppress("UNCHECKED_CAST")
         fun reloadMetadata(md: Map<String, Any?>): FileMetadata {

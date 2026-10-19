@@ -1,10 +1,10 @@
 //! Integration tests for the catalog, record-level access and the bridge.
 //!
-//! Needs a PostgreSQL database. Set AS4TAINER_TEST_DATABASE_URL, e.g.
-//! `postgres://as4tainer:as4tainer@127.0.0.1/as4tainer`. Without it, tests are skipped.
+//! Needs a PostgreSQL database. Set AS4TAINR_TEST_DATABASE_URL, e.g.
+//! `postgres://as4tainr:as4tainr@127.0.0.1/as4tainr`. Without it, tests are skipped.
 //! Each test creates its own library, so tests can run in parallel.
 
-use as4tainer_core::{bridge, catalog, dds, rla};
+use as4tainr_core::{bridge, catalog, dds, rla};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -16,7 +16,7 @@ const ORDLIN: &str = include_str!("../../samples/qddssrc/ORDLIN.pf");
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
 fn db_url() -> Option<String> {
-    std::env::var("AS4TAINER_TEST_DATABASE_URL").ok()
+    std::env::var("AS4TAINR_TEST_DATABASE_URL").ok()
 }
 
 macro_rules! require_db {
@@ -24,7 +24,7 @@ macro_rules! require_db {
         match db_url() {
             Some(u) => u,
             None => {
-                eprintln!("skipped: AS4TAINER_TEST_DATABASE_URL not set");
+                eprintln!("skipped: AS4TAINR_TEST_DATABASE_URL not set");
                 return;
             }
         }
@@ -42,10 +42,10 @@ async fn setup(url: &str) -> (Client, String) {
     );
     client
         .batch_execute(&format!(
-            "DROP SCHEMA IF EXISTS {} CASCADE; DELETE FROM as4tainer.objects WHERE library='{lib}' OR name='{lib}';
-             DELETE FROM as4tainer.files WHERE library='{lib}'; DELETE FROM as4tainer.file_fields WHERE library='{lib}';
-             DELETE FROM as4tainer.file_keys WHERE library='{lib}';
-             DELETE FROM as4tainer.data_areas WHERE library='{lib}';",
+            "DROP SCHEMA IF EXISTS {} CASCADE; DELETE FROM as4tainr.objects WHERE library='{lib}' OR name='{lib}';
+             DELETE FROM as4tainr.files WHERE library='{lib}'; DELETE FROM as4tainr.file_fields WHERE library='{lib}';
+             DELETE FROM as4tainr.file_keys WHERE library='{lib}';
+             DELETE FROM as4tainr.data_areas WHERE library='{lib}';",
             catalog::ident(&lib)
         ))
         .await
@@ -462,7 +462,7 @@ async fn bridge_exfmt_round_trip_with_a_display() {
         indicators.insert(3u8, true);
         indicators.insert(30u8, false);
         req.reply
-            .send(Ok(as4tainer_core::dspf::Response {
+            .send(Ok(as4tainr_core::dspf::Response {
                 aid: "F3".into(),
                 values: Default::default(),
                 indicators,
@@ -543,7 +543,7 @@ async fn bridge_subfile_write_exfmt_readc() {
         let mut changed = std::collections::BTreeMap::new();
         changed.insert(2u16, [("OPT".to_string(), "5".to_string())].into());
         req.reply
-            .send(Ok(as4tainer_core::dspf::Response {
+            .send(Ok(as4tainr_core::dspf::Response {
                 aid: "ENTER".into(),
                 values: Default::default(),
                 indicators: Default::default(),
@@ -696,7 +696,7 @@ async fn member_records_in_arrival_order() {
 /// CRTUSRPRF / DSPUSRPRF / DLTUSRPRF at the catalog level.
 #[tokio::test]
 async fn user_profiles_create_get_delete() {
-    use as4tainer_core::users;
+    use as4tainr_core::users;
     let url = require_db!();
     let client = bridge::connect_db(&url).await.unwrap();
     catalog::init(&client).await.unwrap();
@@ -746,13 +746,13 @@ async fn user_profiles_create_get_delete() {
     users::delete(&client, &name).await.unwrap();
 }
 
-/// A password stored before as4tainer followed QPWDLVL (hashed exactly as
+/// A password stored before as4tainr followed QPWDLVL (hashed exactly as
 /// typed, mixed case) still signs on, and is stored upper case from then
-/// on, so any case works afterwards (QPWDLVL 0). `as4tainer rstpwd` resets
+/// on, so any case works afterwards (QPWDLVL 0). `as4tainr rstpwd` resets
 /// a password to the profile name, expired.
 #[tokio::test]
 async fn passwords_from_before_qpwdlvl_still_work() {
-    use as4tainer_core::users;
+    use as4tainr_core::users;
     let url = require_db!();
     let client = bridge::connect_db(&url).await.unwrap();
     catalog::init(&client).await.unwrap();
@@ -778,7 +778,7 @@ async fn passwords_from_before_qpwdlvl_still_work() {
     // The old way: the hash of the password exactly as typed.
     client
         .execute(
-            "UPDATE as4tainer.user_profiles SET password_hash = $2 WHERE name = $1",
+            "UPDATE as4tainr.user_profiles SET password_hash = $2 WHERE name = $1",
             &[&name, &users::hash_password("Green5creen!").unwrap()],
         )
         .await
@@ -812,7 +812,7 @@ async fn passwords_from_before_qpwdlvl_still_work() {
 /// and the current library can be changed.
 #[tokio::test]
 async fn job_library_list_commands() {
-    use as4tainer_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::commands::{Environment, Job, Outcome};
     let url = require_db!();
     let (client, lib) = setup(&url).await;
     let env = Environment {
@@ -1148,7 +1148,7 @@ async fn logical_file_select_omit_rules_and_unique() {
 /// RRN(); INSERT without a column list fills the file's fields in order.
 #[tokio::test]
 async fn sql_reads_and_writes_dds_files() {
-    use as4tainer_core::sql::{self, Outcome};
+    use as4tainr_core::sql::{self, Outcome};
     let url = require_db!();
     let (mut client, lib) = setup(&url).await;
     crtlf(
@@ -1250,7 +1250,7 @@ async fn sql_reads_and_writes_dds_files() {
     assert!(err("insert into custmast values (8, 'Dup', 'X', 0)")
         .await
         .starts_with("SQL0803"));
-    assert!(err("select * from \"AS4TAINER\".user_profiles")
+    assert!(err("select * from \"AS4TAINR\".user_profiles")
         .await
         .starts_with("SQL0551"));
     assert!(err("create table x (a int)").await.starts_with("SQL0084"));
@@ -1263,10 +1263,10 @@ async fn cl_job_run(
     pgms: &[(&str, &str)],
     call: &str,
 ) -> anyhow::Result<Vec<String>> {
-    use as4tainer_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::commands::{Environment, Job, Outcome};
     let mut c = bridge::connect_db(url).await.unwrap();
     for (name, src) in pgms {
-        as4tainer_core::clpgm::compile(name, src).unwrap();
+        as4tainr_core::clpgm::compile(name, src).unwrap();
         catalog::create_cl_program(&mut c, lib, name, "", src, true)
             .await
             .unwrap();
@@ -1359,7 +1359,7 @@ ENDPGM";
   SNDPGMMSG MSG('found' *BCAT &L)
 ENDPGM";
     client
-        .batch_execute("DROP SCHEMA IF EXISTS clmade CASCADE; DELETE FROM as4tainer.objects WHERE library='QSYS' AND name='CLMADE'")
+        .batch_execute("DROP SCHEMA IF EXISTS clmade CASCADE; DELETE FROM as4tainr.objects WHERE library='QSYS' AND name='CLMADE'")
         .await
         .unwrap();
     let m = cl_job_run(&client, &url, &lib, &[("CLMK", mk)], "CALL CLMK")
@@ -1451,8 +1451,8 @@ async fn job_run(
     client: &Client,
     lib: &str,
     line: &str,
-) -> anyhow::Result<as4tainer_core::commands::Outcome> {
-    use as4tainer_core::commands::{Environment, Job};
+) -> anyhow::Result<as4tainr_core::commands::Outcome> {
+    use as4tainr_core::commands::{Environment, Job};
     let env = Environment {
         database_url: String::new(),
         runner: "false".into(),
@@ -1477,7 +1477,7 @@ async fn job_run(
 /// the length and decimal positions, LEN(*DFT) for *DEC is (15 5).
 #[tokio::test]
 async fn data_areas_commands_and_rtvdtaara() {
-    use as4tainer_core::commands::Outcome;
+    use as4tainr_core::commands::Outcome;
     let url = require_db!();
     let (client, lib) = setup(&url).await;
     let run = |line: String| {
@@ -1576,11 +1576,11 @@ ENDPGM
 async fn bridge_data_area_in_lock_out() {
     let url = require_db!();
     let (client, lib) = setup(&url).await;
-    as4tainer_core::dtaara::create(
+    as4tainr_core::dtaara::create(
         &client,
         &lib,
         "ORDNXT",
-        as4tainer_core::dtaara::Type::Dec,
+        as4tainr_core::dtaara::Type::Dec,
         7,
         0,
         "1004",
@@ -1616,7 +1616,7 @@ async fn bridge_data_area_in_lock_out() {
     let libl = vec![lib.clone()];
     let lib2 = lib.clone();
     let change = tokio::spawn(async move {
-        as4tainer_core::dtaara::change(&other, "ORDNXT", &libl, &lib2, None, "5000")
+        as4tainr_core::dtaara::change(&other, "ORDNXT", &libl, &lib2, None, "5000")
             .await
             .unwrap()
     });
@@ -1646,8 +1646,8 @@ async fn bridge_data_area_in_lock_out() {
 /// still on the queue, SNDMSG and DSPMSG.
 #[tokio::test]
 async fn submitted_jobs_run_in_qbatch() {
-    use as4tainer_core::commands::{Environment, Job, Outcome};
-    use as4tainer_core::jobs;
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::jobs;
     let url = require_db!();
     let (client, lib) = setup(&url).await;
     let env = Environment {
@@ -1712,7 +1712,7 @@ async fn submitted_jobs_run_in_qbatch() {
     let n1 = number_in(&m);
     let done = run(n1).await;
     assert_eq!(done.end_code, "NORMAL");
-    let d = as4tainer_core::dtaara::resolve(&client, "D1", std::slice::from_ref(&lib), &lib)
+    let d = as4tainr_core::dtaara::resolve(&client, "D1", std::slice::from_ref(&lib), &lib)
         .await
         .unwrap();
     assert_eq!(d.value, "ok   ");
@@ -1953,8 +1953,8 @@ async fn bridge_record_locks() {
 /// bridge's splopen/splwrite/splclose.
 #[tokio::test]
 async fn spooled_files() {
-    use as4tainer_core::commands::{Environment, Job, Outcome};
-    use as4tainer_core::{jobs, spool};
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::{jobs, spool};
     let url = require_db!();
     let (client, lib) = setup(&url).await;
     let user = format!("U{}", &lib[1..]);
@@ -2153,8 +2153,8 @@ async fn spooled_files() {
 /// anything less fails with CPF9802.
 #[tokio::test]
 async fn object_authority() {
-    use as4tainer_core::commands::{Environment, Job, Outcome};
-    use as4tainer_core::{jobs, users};
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::{jobs, users};
     let url = require_db!();
     let (client, lib) = setup(&url).await;
     let bob = format!("B{}", &lib[1..]);
@@ -2342,8 +2342,8 @@ async fn object_authority() {
 /// program with the menu's name; CALL QCMD is the command entry display.
 #[tokio::test]
 async fn menus_and_initial_menu() {
-    use as4tainer_core::commands::{Environment, Job, Outcome};
-    use as4tainer_core::{menus, users};
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::{menus, users};
     let url = require_db!();
     let (client, lib) = setup(&url).await;
     let user = format!("M{}", &lib[1..]);
@@ -2435,7 +2435,7 @@ async fn menus_and_initial_menu() {
     users::delete(&client, &user).await.unwrap();
 }
 
-/// `as4tainer import` of the contacts sample: source files and members, then
+/// `as4tainr import` of the contacts sample: source files and members, then
 /// the objects, built with the create commands. Expected values from IBM's
 /// CL reference: CRTPF/CRTLF/CRTDSPF take SRCFILE(QDDSSRC) and
 /// SRCMBR(*FILE) by default, CRTBNDRPG SRCFILE(QRPGLESRC) and CRTBNDCL
@@ -2444,8 +2444,8 @@ async fn menus_and_initial_menu() {
 /// text. Records: the sample's CSV has 5 rows.
 #[tokio::test]
 async fn import_an_application() {
-    use as4tainer_core::commands::{Environment, Job, Outcome};
-    use as4tainer_core::{import, source};
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::{import, source};
     let url = require_db!();
     let (client, lib) = setup(&url).await;
     let env = Environment {
@@ -2563,8 +2563,8 @@ async fn import_an_application() {
 /// 2 and 4 exist, 9 does not) and the ILE RPG reference semantics.
 #[tokio::test(flavor = "multi_thread")]
 async fn native_rpg_engine_runs_a_program() {
-    use as4tainer_core::commands::{Environment, Job};
-    use as4tainer_core::{import, rpg};
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::{import, rpg};
     let url = require_db!();
     let (client, lib) = setup(&url).await;
     let env = Environment {
@@ -2626,7 +2626,7 @@ async fn native_rpg_engine_runs_a_program() {
         .await
         .unwrap()
         .unwrap();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<as4tainer_core::bridge::DisplayRequest>(1);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<as4tainr_core::bridge::DisplayRequest>(1);
     let operator = tokio::spawn(async move {
         let mut shown = Vec::new();
         while let Some(req) = rx.recv().await {
@@ -2636,7 +2636,7 @@ async fn native_rpg_engine_runs_a_program() {
                 sfl.rows.len(),
                 sfl.show,
             ));
-            let _ = req.reply.send(Ok(as4tainer_core::dspf::Response {
+            let _ = req.reply.send(Ok(as4tainr_core::dspf::Response {
                 aid: "F3".into(),
                 values: Default::default(),
                 indicators: Default::default(),

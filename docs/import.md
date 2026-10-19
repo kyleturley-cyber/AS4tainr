@@ -1,12 +1,12 @@
 # Importing an application
 
-`as4tainer import` brings an application's source and data into a library and builds its objects, the way an operator would with the IBM i create commands:
+`as4tainr import` brings an application's source and data into a library and builds its objects, the way an operator would with the IBM i create commands:
 
 ```sh
-as4tainer import path/to/app --lib MYAPP
+as4tainr import path/to/app --lib MYAPP
 ```
 
-In Docker: `docker compose exec as4tainer as4tainer import /path/in/container --lib MYAPP`. Mount or copy the directory into the container first.
+In Docker: `docker compose exec as4tainr as4tainr import /path/in/container --lib MYAPP`. Mount or copy the directory into the container first.
 
 ## The directory
 
@@ -53,7 +53,7 @@ CALL CONTACTS
 `tools/corpus.sh` clones a public repository of IBM i source and imports it. The default is Nick Litten's public IBM i examples (github.com/NickLitten/nick.litten.public). That repository has no license file, so it is cloned at test time and never added to this repository. What it showed on Oct 16, 2026:
 
 - **Runs unmodified:** fixed-form AS/400-style subfile programs (SIMPLESFL1, NOOBSFL1) and the CONTLST-style READ loop.
-- **Fixed by as4tainer along the way:**
+- **Fixed by as4tainr along the way:**
   - comment lines in DDS without the form type;
   - `//` comments in columns 1-5;
   - quoted `/INCLUDE` files;

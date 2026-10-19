@@ -1,6 +1,6 @@
-package io.as4tainer.bridge;
+package io.as4tainr.bridge;
 
-/** An error reported by as4tainer core, e.g. "CPF5026: duplicate key on a UNIQUE file". */
+/** An error reported by as4tainr core, e.g. "CPF5026: duplicate key on a UNIQUE file". */
 public class BridgeException extends RuntimeException {
     public BridgeException(String message) {
         super(message);

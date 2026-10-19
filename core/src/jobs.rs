@@ -3,7 +3,7 @@
 //! Written from IBM's public work management documentation. Every
 //! interactive session and every submitted batch job is a job with a
 //! qualified name `number/user/name` (`000123/QSECOFR/QPADEV0001`). Jobs
-//! live in the catalog table `as4tainer.jobs`, so every process sees them:
+//! live in the catalog table `as4tainr.jobs`, so every process sees them:
 //! WRKACTJOB in one session lists the others.
 //!
 //! - Interactive jobs run in subsystem QINTER, one per signed-on session.
@@ -12,9 +12,9 @@
 //!   queue in order, runs each command in a new job and keeps its job log.
 //!   When it ends, the user who submitted it gets CPF1241 (completed
 //!   normally) or CPF1240 (ended abnormally) on their message queue.
-//! - Each job has a job log (`as4tainer.job_log`): the commands it ran and
+//! - Each job has a job log (`as4tainr.job_log`): the commands it ran and
 //!   the messages they sent.
-//! - Each user profile has a message queue (`as4tainer.messages`), for
+//! - Each user profile has a message queue (`as4tainr.messages`), for
 //!   SNDMSG, DSPMSG and the job completion messages.
 
 use anyhow::{anyhow, bail, Result};
@@ -22,8 +22,8 @@ use std::time::Duration;
 use tokio_postgres::{Client, Row};
 
 pub const DDL: &str = r#"
-CREATE SEQUENCE IF NOT EXISTS as4tainer.job_number MINVALUE 1 MAXVALUE 999999;
-CREATE TABLE IF NOT EXISTS as4tainer.jobs (
+CREATE SEQUENCE IF NOT EXISTS as4tainr.job_number MINVALUE 1 MAXVALUE 999999;
+CREATE TABLE IF NOT EXISTS as4tainr.jobs (
     number       bigint PRIMARY KEY,
     name         text NOT NULL,
     user_name    text NOT NULL,
@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS as4tainer.jobs (
     ended        timestamptz,
     end_code     text NOT NULL DEFAULT ''  -- NORMAL, ABNORMAL
 );
-CREATE TABLE IF NOT EXISTS as4tainer.job_log (
+CREATE TABLE IF NOT EXISTS as4tainr.job_log (
     seq    bigserial PRIMARY KEY,
     job    bigint NOT NULL,
     sent   timestamptz NOT NULL DEFAULT now(),
@@ -51,8 +51,8 @@ CREATE TABLE IF NOT EXISTS as4tainer.job_log (
     kind   text NOT NULL,                 -- *RQS (request), *INFO, *COMP, *ESCAPE
     text   text NOT NULL
 );
-CREATE INDEX IF NOT EXISTS job_log_job ON as4tainer.job_log (job, seq);
-CREATE TABLE IF NOT EXISTS as4tainer.messages (
+CREATE INDEX IF NOT EXISTS job_log_job ON as4tainr.job_log (job, seq);
+CREATE TABLE IF NOT EXISTS as4tainr.messages (
     id        bigserial PRIMARY KEY,
     msgq      text NOT NULL,
     sent      timestamptz NOT NULL DEFAULT now(),
@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS as4tainer.messages (
     text      text NOT NULL,
     is_new    boolean NOT NULL DEFAULT true
 );
-CREATE INDEX IF NOT EXISTS messages_msgq ON as4tainer.messages (msgq, id);
+CREATE INDEX IF NOT EXISTS messages_msgq ON as4tainr.messages (msgq, id);
 "#;
 
 /// The job queue and subsystem for batch jobs (as shipped: QBATCH).
@@ -87,7 +87,7 @@ impl std::fmt::Display for JobId {
     }
 }
 
-/// One row of `as4tainer.jobs`.
+/// One row of `as4tainr.jobs`.
 #[derive(Debug, Clone)]
 pub struct JobInfo {
     pub id: JobId,
@@ -173,7 +173,7 @@ pub fn parse_spec(s: &str) -> Result<JobSpec> {
 
 async fn next_number(client: &Client) -> Result<i64> {
     Ok(client
-        .query_one("SELECT nextval('as4tainer.job_number')", &[])
+        .query_one("SELECT nextval('as4tainr.job_number')", &[])
         .await?
         .get(0))
 }
@@ -189,7 +189,7 @@ pub async fn start_interactive(
     let number = next_number(client).await?;
     client
         .execute(
-            "INSERT INTO as4tainer.jobs (number, name, user_name, type, subsystem, status, activity, curlib, libl, started)
+            "INSERT INTO as4tainr.jobs (number, name, user_name, type, subsystem, status, activity, curlib, libl, started)
              VALUES ($1, $2, $3, 'INT', $4, 'ACTIVE', 'DSPW', $5, $6, now())",
             &[&number, &device, &user, &INTERACTIVE_SUBSYSTEM, &curlib, &libl],
         )
@@ -206,7 +206,7 @@ pub async fn start_interactive(
 pub async fn end(client: &Client, id: &JobId, normal: bool) -> Result<()> {
     client
         .execute(
-            "UPDATE as4tainer.jobs SET status='OUTQ', ended=now(), function='', activity='',
+            "UPDATE as4tainr.jobs SET status='OUTQ', ended=now(), function='', activity='',
                  end_code=$2 WHERE number=$1",
             &[&id.number, &if normal { "NORMAL" } else { "ABNORMAL" }],
         )
@@ -220,7 +220,7 @@ pub async fn set_function(client: &Client, id: &JobId, function: &str, activity:
     // Display only: a failure here must not fail the command.
     let _ = client
         .execute(
-            "UPDATE as4tainer.jobs SET function=$2, activity=$3 WHERE number=$1",
+            "UPDATE as4tainr.jobs SET function=$2, activity=$3 WHERE number=$1",
             &[&id.number, &function, &activity],
         )
         .await;
@@ -244,7 +244,7 @@ pub fn message_id(text: &str) -> &str {
 pub async fn log(client: &Client, id: &JobId, kind: &str, text: &str) {
     let _ = client
         .execute(
-            "INSERT INTO as4tainer.job_log (job, msgid, kind, text) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO as4tainr.job_log (job, msgid, kind, text) VALUES ($1, $2, $3, $4)",
             &[&id.number, &message_id(text), &kind, &text],
         )
         .await;
@@ -261,7 +261,7 @@ pub struct LogEntry {
 pub async fn job_log(client: &Client, number: i64) -> Result<Vec<LogEntry>> {
     Ok(client
         .query(
-            "SELECT to_char(sent, 'HH24:MI:SS'), msgid, kind, text FROM as4tainer.job_log
+            "SELECT to_char(sent, 'HH24:MI:SS'), msgid, kind, text FROM as4tainr.job_log
              WHERE job=$1 ORDER BY seq",
             &[&number],
         )
@@ -294,7 +294,7 @@ pub async fn submit(client: &Client, s: &Submit) -> Result<JobId> {
     let number = next_number(client).await?;
     client
         .execute(
-            "INSERT INTO as4tainer.jobs (number, name, user_name, type, subsystem, jobq, status, command,
+            "INSERT INTO as4tainr.jobs (number, name, user_name, type, subsystem, jobq, status, command,
                  submitted_by, submitter, curlib, libl)
              VALUES ($1, $2, $3, 'BCH', $4, $4, 'JOBQ', $5, $6, $7, $8, $9)",
             &[
@@ -323,8 +323,8 @@ pub async fn claim_next(client: &Client, jobq: &str) -> Result<Option<JobInfo>> 
     let row = client
         .query_opt(
             &format!(
-                "UPDATE as4tainer.jobs SET status='ACTIVE', activity='RUN', started=now()
-                 WHERE number = (SELECT number FROM as4tainer.jobs WHERE status='JOBQ' AND jobq=$1
+                "UPDATE as4tainr.jobs SET status='ACTIVE', activity='RUN', started=now()
+                 WHERE number = (SELECT number FROM as4tainr.jobs WHERE status='JOBQ' AND jobq=$1
                                  ORDER BY entered, number LIMIT 1 FOR UPDATE SKIP LOCKED)
                  RETURNING {JOB_COLS}"
             ),
@@ -339,7 +339,7 @@ pub async fn claim(client: &Client, number: i64) -> Result<Option<JobInfo>> {
     let row = client
         .query_opt(
             &format!(
-                "UPDATE as4tainer.jobs SET status='ACTIVE', activity='RUN', started=now()
+                "UPDATE as4tainr.jobs SET status='ACTIVE', activity='RUN', started=now()
                  WHERE number=$1 AND status='JOBQ' RETURNING {JOB_COLS}"
             ),
             &[&number],
@@ -353,7 +353,7 @@ pub async fn active(client: &Client) -> Result<Vec<JobInfo>> {
     Ok(client
         .query(
             &format!(
-                "SELECT {JOB_COLS} FROM as4tainer.jobs WHERE status='ACTIVE' ORDER BY subsystem, name, number"
+                "SELECT {JOB_COLS} FROM as4tainr.jobs WHERE status='ACTIVE' ORDER BY subsystem, name, number"
             ),
             &[],
         )
@@ -368,7 +368,7 @@ pub async fn submitted_by(client: &Client, user: &str) -> Result<Vec<JobInfo>> {
     Ok(client
         .query(
             &format!(
-                "SELECT {JOB_COLS} FROM as4tainer.jobs WHERE submitted_by=$1 AND type='BCH' ORDER BY number"
+                "SELECT {JOB_COLS} FROM as4tainr.jobs WHERE submitted_by=$1 AND type='BCH' ORDER BY number"
             ),
             &[&user],
         )
@@ -384,7 +384,7 @@ pub async fn find(client: &Client, spec: &JobSpec) -> Result<JobInfo> {
     let rows = client
         .query(
             &format!(
-                "SELECT {JOB_COLS} FROM as4tainer.jobs
+                "SELECT {JOB_COLS} FROM as4tainr.jobs
                  WHERE name=$1 AND ($2::text IS NULL OR user_name=$2) AND ($3::bigint IS NULL OR number=$3)
                  ORDER BY number DESC"
             ),
@@ -407,7 +407,7 @@ pub async fn find(client: &Client, spec: &JobSpec) -> Result<JobInfo> {
 pub async fn get(client: &Client, number: i64) -> Result<JobInfo> {
     client
         .query_opt(
-            &format!("SELECT {JOB_COLS} FROM as4tainer.jobs WHERE number=$1"),
+            &format!("SELECT {JOB_COLS} FROM as4tainr.jobs WHERE number=$1"),
             &[&number],
         )
         .await?
@@ -419,7 +419,7 @@ pub async fn get(client: &Client, number: i64) -> Result<JobInfo> {
 pub async fn end_queued(client: &Client, id: &JobId) -> Result<bool> {
     let n = client
         .execute(
-            "UPDATE as4tainer.jobs SET status='OUTQ', ended=now(), end_code='ABNORMAL'
+            "UPDATE as4tainr.jobs SET status='OUTQ', ended=now(), end_code='ABNORMAL'
              WHERE number=$1 AND status='JOBQ'",
             &[&id.number],
         )
@@ -441,7 +441,7 @@ pub async fn end_queued(client: &Client, id: &JobId) -> Result<bool> {
 pub async fn recover(client: &Client) -> Result<u64> {
     let ended = client
         .query(
-            "UPDATE as4tainer.jobs SET status='OUTQ', ended=now(), function='', activity='', end_code='ABNORMAL'
+            "UPDATE as4tainr.jobs SET status='OUTQ', ended=now(), function='', activity='', end_code='ABNORMAL'
              WHERE status='ACTIVE' RETURNING number",
             &[],
         )
@@ -450,7 +450,7 @@ pub async fn recover(client: &Client) -> Result<u64> {
         let n: i64 = r.get(0);
         let _ = client
             .execute(
-                "INSERT INTO as4tainer.job_log (job, kind, text) VALUES ($1, '*INFO', $2)",
+                "INSERT INTO as4tainr.job_log (job, kind, text) VALUES ($1, '*INFO', $2)",
                 &[
                     &n,
                     &"The job was still active when the system stopped; it was ended.",
@@ -486,7 +486,7 @@ pub async fn send_message(
 ) -> Result<()> {
     client
         .execute(
-            "INSERT INTO as4tainer.messages (msgq, from_user, from_job, msgid, kind, text)
+            "INSERT INTO as4tainr.messages (msgq, from_user, from_job, msgid, kind, text)
              VALUES ($1, $2, $3, $4, $5, $6)",
             &[
                 &to_user,
@@ -507,14 +507,14 @@ pub async fn messages(client: &Client, user: &str, mark_old: bool) -> Result<Vec
     let rows = client
         .query(
             "SELECT id, to_char(sent, 'MM/DD/YY HH24:MI:SS'), from_user, from_job, msgid, kind, text, is_new
-             FROM as4tainer.messages WHERE msgq=$1 ORDER BY id",
+             FROM as4tainr.messages WHERE msgq=$1 ORDER BY id",
             &[&user],
         )
         .await?;
     if mark_old {
         client
             .execute(
-                "UPDATE as4tainer.messages SET is_new=false WHERE msgq=$1 AND is_new",
+                "UPDATE as4tainr.messages SET is_new=false WHERE msgq=$1 AND is_new",
                 &[&user],
             )
             .await?;
@@ -538,7 +538,7 @@ pub async fn messages(client: &Client, user: &str, mark_old: bool) -> Result<Vec
 pub async fn new_messages(client: &Client, user: &str) -> Result<i64> {
     Ok(client
         .query_one(
-            "SELECT count(*) FROM as4tainer.messages WHERE msgq=$1 AND is_new",
+            "SELECT count(*) FROM as4tainr.messages WHERE msgq=$1 AND is_new",
             &[&user],
         )
         .await?
@@ -549,7 +549,7 @@ pub async fn new_messages(client: &Client, user: &str) -> Result<i64> {
 pub async fn remove_messages(client: &Client, user: &str, all: bool) -> Result<u64> {
     Ok(client
         .execute(
-            "DELETE FROM as4tainer.messages WHERE msgq=$1 AND ($2 OR NOT is_new)",
+            "DELETE FROM as4tainr.messages WHERE msgq=$1 AND ($2 OR NOT is_new)",
             &[&user, &all],
         )
         .await?)
@@ -560,7 +560,7 @@ pub async fn remove_messages(client: &Client, user: &str, all: bool) -> Result<u
 /// How many batch jobs QBATCH runs at once (its job queue entry's
 /// MAXACT; IBM ships QBATCH with 1).
 pub fn batch_max_active() -> usize {
-    std::env::var("AS4TAINER_QBATCH_MAXACT")
+    std::env::var("AS4TAINR_QBATCH_MAXACT")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n| *n >= 1)
@@ -691,7 +691,7 @@ pub async fn run_subsystem(env: crate::commands::Environment, max_active: usize)
                 let env = env.clone();
                 tokio::spawn(async move {
                     if let Err(e) = run_batch_job(&env, &info).await {
-                        eprintln!("as4tainer: QBATCH: job {}: {e:#}", info.id);
+                        eprintln!("as4tainr: QBATCH: job {}: {e:#}", info.id);
                     }
                     drop(permit);
                 });
@@ -702,7 +702,7 @@ pub async fn run_subsystem(env: crate::commands::Environment, max_active: usize)
             }
             Err(e) => {
                 drop(permit);
-                eprintln!("as4tainer: QBATCH: {e:#}");
+                eprintln!("as4tainr: QBATCH: {e:#}");
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }

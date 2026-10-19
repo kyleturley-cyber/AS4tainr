@@ -1,4 +1,4 @@
-package io.as4tainer.jvm;
+package io.as4tainr.jvm;
 
 import com.smeup.rpgparser.execution.MainExecutionContext;
 import com.smeup.rpgparser.interpreter.AbstractDataDefinition;
@@ -24,7 +24,7 @@ import java.util.regex.Pattern;
  * for the other operations: WRITE and UPDATE look for a database file, and
  * READC does nothing. So before a program is parsed, {@link #preprocess}
  * declares each record format of its WORKSTN files as an extra DISK file
- * (served by {@link DisplayDBMManager}, which sends the operations to as4tainer
+ * (served by {@link DisplayDBMManager}, which sends the operations to as4tainr
  * core), takes the SFILE keywords off the F specs, and turns READC of a
  * subfile into READ of that "file". Core keeps the subfile and the records on
  * the screen; see docs/display-files.md.
@@ -112,7 +112,7 @@ public final class Workstation {
                     line = b.toString();
                     if (name.isEmpty() && cols(line, 7, 80).trim().isEmpty()) {
                         // Nothing left on the continuation line: keep it as a comment.
-                        line = pad(cols(line, 1, 5), 5) + "F* (SFILE: see as4tainer Workstation)";
+                        line = pad(cols(line, 1, 5), 5) + "F* (SFILE: see as4tainr Workstation)";
                     }
                 }
                 out.add(line);

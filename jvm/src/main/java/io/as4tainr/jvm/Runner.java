@@ -1,4 +1,4 @@
-package io.as4tainer.jvm;
+package io.as4tainr.jvm;
 
 import com.smeup.dbnative.ConnectionConfig;
 import com.smeup.dbnative.DBNativeAccessConfig;
@@ -34,7 +34,7 @@ import com.smeup.rpgparser.parsing.facade.CopyId;
 import com.smeup.rpgparser.parsing.parsetreetoast.RpgType;
 import com.smeup.rpgparser.rpginterop.DirRpgProgramFinder;
 import com.smeup.rpgparser.rpginterop.RpgProgramFinder;
-import io.as4tainer.bridge.BridgeClient;
+import io.as4tainr.bridge.BridgeClient;
 
 import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
@@ -52,17 +52,17 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * The as4tainer RPG runner. as4tainer core launches it as:
+ * The as4tainr RPG runner. as4tainr core launches it as:
  *
- * <pre>java -jar as4tainer-jvm.jar --bridge HOST:PORT PGM [parm...]</pre>
+ * <pre>java -jar as4tainr-jvm.jar --bridge HOST:PORT PGM [parm...]</pre>
  *
  * Programs are RPG program objects (CRTBNDRPG), whose source comes from
- * as4tainer core through the bridge: the program called in AS4TAINER_PGM_LIB (when
+ * as4tainr core through the bridge: the program called in AS4TAINR_PGM_LIB (when
  * set), programs it calls through the library list. Otherwise they are
- * looked up as PGM.rpgle in the directories listed in AS4TAINER_PGM_PATH
+ * looked up as PGM.rpgle in the directories listed in AS4TAINR_PGM_PATH
  * (path-separator separated; default ./qrpglesrc). /COPY members come from
  * source files the same way. Database
- * files and display files both come from as4tainer core through the bridge: file
+ * files and display files both come from as4tainr core through the bridge: file
  * I/O goes to PostgreSQL, and EXFMT shows the record on the job's 5250 display.
  */
 public final class Runner {
@@ -70,7 +70,7 @@ public final class Runner {
 
     public static void main(String[] args) {
         if (args.length < 3 || !args[0].equals("--bridge")) {
-            System.err.println("usage: as4tainer-jvm --bridge HOST:PORT PGM [parm...]");
+            System.err.println("usage: as4tainr-jvm --bridge HOST:PORT PGM [parm...]");
             System.exit(2);
         }
         String hostPort = args[1];
@@ -81,23 +81,23 @@ public final class Runner {
         try {
             bridge = BridgeClient.connect(hostPort);
         } catch (Exception e) {
-            System.err.println("cannot reach as4tainer core at " + hostPort + ": " + e.getMessage());
+            System.err.println("cannot reach as4tainr core at " + hostPort + ": " + e.getMessage());
             System.exit(1);
             return;
         }
         Displays displays = new Displays(bridge);
         Displays.current = displays;
 
-        // Database files go to As4tainerDBMManager. Display record formats used as
+        // Database files go to As4tainrDBMManager. Display record formats used as
         // files (see Workstation) get one entry each, added as programs load.
         List<ConnectionConfig> connections = new ArrayList<>();
         connections.add(new ConnectionConfig(
-                "*", As4tainerDBMManager.URL_PREFIX + hostPort, "", "", null, As4tainerDBMManager.class.getName()));
+                "*", As4tainrDBMManager.URL_PREFIX + hostPort, "", "", null, As4tainrDBMManager.class.getName()));
 
         List<RpgProgramFinder> finders = new ArrayList<>();
-        finders.add(new BridgeFinder(bridge, program, System.getenv().getOrDefault("AS4TAINER_PGM_LIB", ""),
+        finders.add(new BridgeFinder(bridge, program, System.getenv().getOrDefault("AS4TAINR_PGM_LIB", ""),
                 displays, connections, hostPort));
-        String path = System.getenv().getOrDefault("AS4TAINER_PGM_PATH", "qrpglesrc");
+        String path = System.getenv().getOrDefault("AS4TAINR_PGM_PATH", "qrpglesrc");
         for (String dir : path.split(File.pathSeparator)) {
             if (new File(dir).isDirectory()) {
                 finders.add(new PreprocessingFinder(new File(dir), displays, connections, hostPort));
@@ -150,7 +150,7 @@ public final class Runner {
                 // Spooled files the program printed are complete.
                 Printers.closeAll(bridge);
             } catch (Exception e) {
-                System.err.println("as4tainer: closing spooled files: " + e.getMessage());
+                System.err.println("as4tainr: closing spooled files: " + e.getMessage());
             }
             try {
                 bridge.close();
@@ -160,7 +160,7 @@ public final class Runner {
         }
     }
 
-    /** Map an as4tainer database file description to Jariko's typed FileMetadata. */
+    /** Map an as4tainr database file description to Jariko's typed FileMetadata. */
     @SuppressWarnings("unchecked")
     static FileMetadata fileMetadata(Map<String, Object> md) {
         List<DbField> fields = new ArrayList<>();
@@ -189,7 +189,7 @@ public final class Runner {
 
     /**
      * Data areas (*DTAARA DEFINE, IN, OUT) through the bridge. Jariko hands
-     * over only the data area's name and expects text back; as4tainer sets the
+     * over only the data area's name and expects text back; as4tainr sets the
      * program's field itself instead, so a numeric field gets the *DEC value
      * as a number (not as a byte image), and OUT sends a number as decimal
      * text.
@@ -409,7 +409,7 @@ public final class Runner {
     }
 
     /**
-     * Programs and /COPY members kept by as4tainer core (CRTBNDRPG, source
+     * Programs and /COPY members kept by as4tainr core (CRTBNDRPG, source
      * files), read through the bridge.
      */
     static final class BridgeFinder implements RpgProgramFinder {

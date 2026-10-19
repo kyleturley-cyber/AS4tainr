@@ -1,6 +1,6 @@
 # Data areas
 
-A data area (`*DTAARA`) is a small named value kept in a library, which programs share: the next order number, a company name, a switch. as4tainer implements data areas from IBM's public command and RPG documentation.
+A data area (`*DTAARA`) is a small named value kept in a library, which programs share: the next order number, a company name, a switch. as4tainr implements data areas from IBM's public command and RPG documentation.
 
 ## Commands
 
@@ -41,11 +41,11 @@ Under the covers, the lock is a PostgreSQL advisory lock on the program's databa
 
 ## Storage
 
-Each data area is an object row (`*DTAARA`) plus a row in `as4tainer.data_areas` (type, length, decimals, value). `*DEC` values are stored as exact decimal text, never as floating point.
+Each data area is an object row (`*DTAARA`) plus a row in `as4tainr.data_areas` (type, length, decimals, value). `*DEC` values are stored as exact decimal text, never as floating point.
 
 ## Not yet
 
 - The local data area `*LDA`, the group data area `*GDA` and `*PDA`.
 - `UNLOCK *DTAARA` and the `DTAARA` keyword on D specs (Jariko supports `DEFINE` only).
-- `RTVDTAARA` into a `*CHAR` variable from a `*DEC` data area. IBM i allows it in some cases; as4tainer refuses it with a clear message.
+- `RTVDTAARA` into a `*CHAR` variable from a `*DEC` data area. IBM i allows it in some cases; as4tainr refuses it with a clear message.
 - How long `CHGDTAARA` waits for a lock: it waits until the lock is released, with no time limit.

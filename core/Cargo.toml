@@ -1,13 +1,13 @@
 [package]
-name = "as4tainer-core"
-description = "as4tainer core: object catalog, DDS, record-level access and the JVM bridge"
+name = "as4tainr-core"
+description = "as4tainr core: object catalog, DDS, record-level access and the JVM bridge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "as4tainer"
+name = "as4tainr"
 path = "src/main.rs"
 
 [lib]

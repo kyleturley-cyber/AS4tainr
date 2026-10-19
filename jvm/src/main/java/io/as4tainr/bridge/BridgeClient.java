@@ -1,4 +1,4 @@
-package io.as4tainer.bridge;
+package io.as4tainr.bridge;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -12,7 +12,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Client for the as4tainer core bridge: one JSON object per line over a loopback
+ * Client for the as4tainr core bridge: one JSON object per line over a loopback
  * TCP socket. One client is one job's database session. Thread-safe (calls are
  * serialized), but a job normally uses it from one thread.
  *
@@ -34,7 +34,7 @@ public final class BridgeClient implements AutoCloseable {
         Map<String, Object> hello = call(req("hello"));
         long v = ((Number) hello.get("version")).longValue();
         if (v != PROTOCOL_VERSION) {
-            throw new BridgeException("as4tainer core speaks bridge protocol " + v + ", this client speaks " + PROTOCOL_VERSION);
+            throw new BridgeException("as4tainr core speaks bridge protocol " + v + ", this client speaks " + PROTOCOL_VERSION);
         }
     }
 
@@ -68,7 +68,7 @@ public final class BridgeClient implements AutoCloseable {
             out.write('\n');
             out.flush();
             String line = in.readLine();
-            if (line == null) throw new BridgeException("as4tainer core closed the bridge connection");
+            if (line == null) throw new BridgeException("as4tainr core closed the bridge connection");
             Map<String, Object> resp = (Map<String, Object>) Json.parse(line);
             if (!Boolean.TRUE.equals(resp.get("ok"))) {
                 throw new BridgeException(String.valueOf(resp.get("error")));

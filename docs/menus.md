@@ -1,9 +1,9 @@
 # Menus
 
-After sign-on, as4tainer shows the user's **initial menu**, as IBM i does. For a new profile, and for QSECOFR, that is the main menu, MAIN:
+After sign-on, as4tainr shows the user's **initial menu**, as IBM i does. For a new profile, and for QSECOFR, that is the main menu, MAIN:
 
 ```
- MAIN                          as4tainer Main Menu       System  . .:   AS4TAINER
+ MAIN                          as4tainr Main Menu       System  . .:   AS4TAINR
                                                       User  . . .:   QSECOFR
  Select one of the following:
 
@@ -42,11 +42,11 @@ A `?` in front of a command name prompts it. For example, `?CRTLIB` shows the CR
 
 ## The system menus
 
-These menus are built into as4tainer and belong to QSYS. Their texts are as4tainer's own. They lead to the commands as4tainer has, so they are not copies of the IBM i menus.
+These menus are built into as4tainr and belong to QSYS. Their texts are as4tainr's own. They lead to the commands as4tainr has, so they are not copies of the IBM i menus.
 
 | Menu | Title | Options |
 | --- | --- | --- |
-| MAIN | as4tainer Main Menu | the menus below; 6 prompts GO; 7 is Command Entry |
+| MAIN | as4tainr Main Menu | the menus below; 6 prompts GO; 7 is Command Entry |
 | USER | User Tasks | DSPMSG, SNDMSG, WRKSPLF, WRKSBMJOB, DSPJOBLOG, CHGPWD, DSPLIBL |
 | JOBS | Jobs and Printed Output | WRKACTJOB, WRKSBMJOB, SBMJOB, ENDJOB, WRKSPLF, DSPJOBLOG |
 | FILES | Files, Libraries and Objects | DSPLIBL, DSPLIB, CRTLIB, WRKOBJ, DSPPFM, DSPDTAARA, STRSQL |

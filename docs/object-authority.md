@@ -4,7 +4,7 @@ Who may use which object. It is written from IBM's public security reference.
 
 ## The rules
 
-- **Owner:** every object has one, the user who created it. Objects created with the `as4tainer` CLI (the sample files, `CRTBNDCL`) and system objects belong to QSECOFR.
+- **Owner:** every object has one, the user who created it. Objects created with the `as4tainr` CLI (the sample files, `CRTBNDCL`) and system objects belong to QSECOFR.
 - ***PUBLIC:** every object has a *PUBLIC authority. New objects get `*CHANGE`, which is the shipped value of system value `QCRTAUT`.
 - **Private authorities:** named users can have their own authority to an object.
 - **Levels:** `*ALL`, `*CHANGE`, `*USE` and `*EXCLUDE`.

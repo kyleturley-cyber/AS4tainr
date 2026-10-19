@@ -13,15 +13,15 @@ jobs:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_USER: as4tainer
-          POSTGRES_PASSWORD: as4tainer
-          POSTGRES_DB: as4tainer
+          POSTGRES_USER: as4tainr
+          POSTGRES_PASSWORD: as4tainr
+          POSTGRES_DB: as4tainr
         ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U as4tainer" --health-interval 2s --health-retries 30
+          --health-cmd "pg_isready -U as4tainr" --health-interval 2s --health-retries 30
     env:
-      AS4TAINER_TEST_DATABASE_URL: postgres://as4tainer:as4tainer@127.0.0.1/as4tainer
-      AS4TAINER_DATABASE_URL: postgres://as4tainer:as4tainer@127.0.0.1/as4tainer
+      AS4TAINR_TEST_DATABASE_URL: postgres://as4tainr:as4tainr@127.0.0.1/as4tainr
+      AS4TAINR_DATABASE_URL: postgres://as4tainr:as4tainr@127.0.0.1/as4tainr
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -35,22 +35,22 @@ jobs:
           distribution: temurin
           java-version: "17"
       - name: Compile the dependency-free bridge client and conformance runner
-        run: javac -d target/conformance-classes jvm/src/main/java/io/as4tainer/bridge/*.java jvm/src/test/java/io/as4tainer/bridge/*.java
+        run: javac -d target/conformance-classes jvm/src/main/java/io/as4tainr/bridge/*.java jvm/src/test/java/io/as4tainr/bridge/*.java
       - name: End-to-end with the conformance runner
         env:
-          AS4TAINER_BIN: target/debug/as4tainer
-          AS4TAINER_RUNNER: java -cp target/conformance-classes io.as4tainer.bridge.BridgeConformance
+          AS4TAINR_BIN: target/debug/as4tainr
+          AS4TAINR_RUNNER: java -cp target/conformance-classes io.as4tainr.bridge.BridgeConformance
         run: |
           scripts/demo.sh
-          target/debug/as4tainer call SELFTEST
+          target/debug/as4tainr call SELFTEST
       - name: End-to-end on the native RPG engine (docs/rpg-engine.md)
         env:
-          AS4TAINER_BIN: target/debug/as4tainer
-          AS4TAINER_RPG_ENGINE: native
-          PGPASSWORD: as4tainer
+          AS4TAINR_BIN: target/debug/as4tainr
+          AS4TAINR_RPG_ENGINE: native
+          PGPASSWORD: as4tainr
         run: |
-          createdb -h 127.0.0.1 -U as4tainer as4tainer_native
-          AS4TAINER_DATABASE_URL=postgres://as4tainer:as4tainer@127.0.0.1/as4tainer_native scripts/demo.sh
+          createdb -h 127.0.0.1 -U as4tainr as4tainr_native
+          AS4TAINR_DATABASE_URL=postgres://as4tainr:as4tainr@127.0.0.1/as4tainr_native scripts/demo.sh
 
   jariko:
     name: Jariko runner end to end
@@ -60,14 +60,14 @@ jobs:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_USER: as4tainer
-          POSTGRES_PASSWORD: as4tainer
-          POSTGRES_DB: as4tainer
+          POSTGRES_USER: as4tainr
+          POSTGRES_PASSWORD: as4tainr
+          POSTGRES_DB: as4tainr
         ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U as4tainer" --health-interval 2s --health-retries 30
+          --health-cmd "pg_isready -U as4tainr" --health-interval 2s --health-retries 30
     env:
-      AS4TAINER_DATABASE_URL: postgres://as4tainer:as4tainer@127.0.0.1/as4tainer
+      AS4TAINR_DATABASE_URL: postgres://as4tainr:as4tainr@127.0.0.1/as4tainr
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -76,13 +76,13 @@ jobs:
           distribution: temurin
           java-version: "17"
       - run: cargo build --locked
-      - name: Build as4tainer-jvm.jar (Jariko + bridge adapter)
+      - name: Build as4tainr-jvm.jar (Jariko + bridge adapter)
         working-directory: jvm
         run: ./gradlew --no-daemon fatJar
       - name: Run the sample RPG programs on Jariko against PostgreSQL
         env:
-          AS4TAINER_BIN: target/debug/as4tainer
-          AS4TAINER_RUNNER: java -jar jvm/build/libs/as4tainer-jvm.jar
+          AS4TAINR_BIN: target/debug/as4tainr
+          AS4TAINR_RUNNER: java -jar jvm/build/libs/as4tainr-jvm.jar
         run: scripts/demo.sh
 
   tn5250:
@@ -93,14 +93,14 @@ jobs:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_USER: as4tainer
-          POSTGRES_PASSWORD: as4tainer
-          POSTGRES_DB: as4tainer
+          POSTGRES_USER: as4tainr
+          POSTGRES_PASSWORD: as4tainr
+          POSTGRES_DB: as4tainr
         ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U as4tainer" --health-interval 2s --health-retries 30
+          --health-cmd "pg_isready -U as4tainr" --health-interval 2s --health-retries 30
     env:
-      AS4TAINER_DATABASE_URL: postgres://as4tainer:as4tainer@127.0.0.1/as4tainer
+      AS4TAINR_DATABASE_URL: postgres://as4tainr:as4tainr@127.0.0.1/as4tainr
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -116,14 +116,14 @@ jobs:
           cmake --build /tmp/tn5250/build -j 2
           pip install pyte
       - run: cargo build --locked
-      - name: Build as4tainer-jvm.jar
+      - name: Build as4tainr-jvm.jar
         working-directory: jvm
         run: ./gradlew --no-daemon fatJar
       - name: Start the 5250 server with the sample files
         run: |
-          AS4TAINER_BIN=target/debug/as4tainer scripts/samples.sh
-          AS4TAINER_WAITRCD=5 AS4TAINER_PGM_PATH=$PWD/samples/qrpglesrc nohup target/debug/as4tainer tn5250 \
-            --listen 127.0.0.1:2323 --web-listen 127.0.0.1:5250 --runner "java -jar jvm/build/libs/as4tainer-jvm.jar" > tn5250-server.log 2>&1 &
+          AS4TAINR_BIN=target/debug/as4tainr scripts/samples.sh
+          AS4TAINR_WAITRCD=5 AS4TAINR_PGM_PATH=$PWD/samples/qrpglesrc nohup target/debug/as4tainr tn5250 \
+            --listen 127.0.0.1:2323 --web-listen 127.0.0.1:5250 --runner "java -jar jvm/build/libs/as4tainr-jvm.jar" > tn5250-server.log 2>&1 &
           sleep 2
       - name: Sign on, CL commands, interactive RPG (subfiles) and the order entry app through tn5250
         env:
@@ -132,19 +132,19 @@ jobs:
       - name: Phase 3 gate - three clerks enter orders at once while batch jobs print
         env:
           TN5250: /tmp/tn5250/build/curses/tn5250
-          AS4TAINER_BIN: target/debug/as4tainer
+          AS4TAINR_BIN: target/debug/as4tainr
         run: python3 tools/gate3_5250.py 127.0.0.1:2323
       - name: 5250 end-to-end on the native RPG engine (milestone R2; printing waits for R3)
         env:
           TN5250: /tmp/tn5250/build/curses/tn5250
-          AS4TAINER_RPG_ENGINE: native
-          PGPASSWORD: as4tainer
+          AS4TAINR_RPG_ENGINE: native
+          PGPASSWORD: as4tainr
         run: |
-          createdb -h 127.0.0.1 -U as4tainer as4tainer_r2
-          export AS4TAINER_DATABASE_URL=postgres://as4tainer:as4tainer@127.0.0.1/as4tainer_r2
-          AS4TAINER_BIN=target/debug/as4tainer scripts/samples.sh
-          AS4TAINER_WAITRCD=5 AS4TAINER_PGM_PATH=$PWD/samples/qrpglesrc nohup target/debug/as4tainer tn5250 \
-            --listen 127.0.0.1:2324 --runner "java -jar jvm/build/libs/as4tainer-jvm.jar" > tn5250-native.log 2>&1 &
+          createdb -h 127.0.0.1 -U as4tainr as4tainr_r2
+          export AS4TAINR_DATABASE_URL=postgres://as4tainr:as4tainr@127.0.0.1/as4tainr_r2
+          AS4TAINR_BIN=target/debug/as4tainr scripts/samples.sh
+          AS4TAINR_WAITRCD=5 AS4TAINR_PGM_PATH=$PWD/samples/qrpglesrc nohup target/debug/as4tainr tn5250 \
+            --listen 127.0.0.1:2324 --runner "java -jar jvm/build/libs/as4tainr-jvm.jar" > tn5250-native.log 2>&1 &
           sleep 2
           python3 tools/e2e_5250.py 127.0.0.1:2324 || { cat tn5250-native.log; exit 1; }
       - name: Browser 5250 terminal in Chromium

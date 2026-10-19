@@ -1,8 +1,8 @@
-# The as4tainer RPG engine
+# The as4tainr RPG engine
 
-as4tainer compiles and runs ILE RPG (RPG IV) itself, in Rust. Fixed-form, mixed and fully free-form (`**FREE`) source are all supported. This replaces Jariko on the JVM, which as4tainer used through Phase 3.
+as4tainr compiles and runs ILE RPG (RPG IV) itself, in Rust. Fixed-form, mixed and fully free-form (`**FREE`) source are all supported. This replaces Jariko on the JVM, which as4tainr used through Phase 3.
 
-*Decision, 2026-10-19:* Jariko cannot run fully free-form RPG or free-form declarations. Most RPG written in the last ten years uses both. Jariko also has gaps in fixed form (see fidelity-gaps.md), and each CALL starts a JVM. The project has no deadline, so as4tainer gets its own engine: complete, and self-contained, with no JVM in the container at the end.
+*Decision, 2026-10-19:* Jariko cannot run fully free-form RPG or free-form declarations. Most RPG written in the last ten years uses both. Jariko also has gaps in fixed form (see fidelity-gaps.md), and each CALL starts a JVM. The project has no deadline, so as4tainr gets its own engine: complete, and self-contained, with no JVM in the container at the end.
 
 It is written from IBM's public *ILE RPG Reference* and *ILE RPG Programmer's Guide*. The clean-room rules in CLAUDE.md apply. No code is taken from Jariko or any other RPG implementation.
 
@@ -31,20 +31,20 @@ Character data is kept in EBCDIC, as on IBM i. Comparisons and sorting follow th
 
 - **CRTBNDRPG** parses and checks the program. Errors are reported with line numbers at create time, as IBM's compiler does, instead of at CALL. The checked program is kept with the object.
 - **CALL** of an RPG program object runs it in the job's own process. It uses the job's database connection, display and spooled files.
-- **The switch:** `AS4TAINER_RPG_ENGINE=native` uses the new engine, `jariko` the old one. The default moves to `native` once it passes everything Jariko passes: the samples, the demos, e2e, the Phase 3 gate, and the corpus. Jariko and the JVM are then removed.
+- **The switch:** `AS4TAINR_RPG_ENGINE=native` uses the new engine, `jariko` the old one. The default moves to `native` once it passes everything Jariko passes: the samples, the demos, e2e, the Phase 3 gate, and the corpus. Jariko and the JVM are then removed.
 
 ## Status
 
-**R2 is done (Oct 19, 2026).** Interactive programs run on the native engine: CUSTINQ, WRKCUST (load-all subfile, READC, SFLNXTCHG), CUSTMNT (record locks: a second job waits WAITRCD, then gets the error indicator), ORDENT (input subfile, CHAIN/UPDATE of subfile records, data area ORDNXT with `IN *LOCK`/`OUT`) and CONTLST pass the 5250 end-to-end test with `AS4TAINER_RPG_ENGINE=native` (CI runs it). The three-clerk order entry of the Phase 3 gate works too; the gate's batch jobs print, which is R3.
+**R2 is done (Oct 19, 2026).** Interactive programs run on the native engine: CUSTINQ, WRKCUST (load-all subfile, READC, SFLNXTCHG), CUSTMNT (record locks: a second job waits WAITRCD, then gets the error indicator), ORDENT (input subfile, CHAIN/UPDATE of subfile records, data area ORDNXT with `IN *LOCK`/`OUT`) and CONTLST pass the 5250 end-to-end test with `AS4TAINR_RPG_ENGINE=native` (CI runs it). The three-clerk order entry of the Phase 3 gate works too; the gate's batch jobs print, which is R3.
 
 What R2 adds:
 - **Display files** (externally described WORKSTN): the record formats' fields become program fields (numbers zoned); EXFMT, WRITE, READC; subfiles with `SFILE(format:rrn)`: WRITE, CHAIN and UPDATE by relative record number; `INDDS`; response indicators; `*INKA`-`*INKY` from the function key pressed. The display work itself (overlay, paging, validation) is the same code Jariko used (`workstn.rs`, `dspf.rs`).
 - **Data areas:** `*DTAARA DEFINE`, the `DTAARA` keyword, `IN` (with `*LOCK`), `OUT`, `IN *DTAARA`.
 - **Record locks:** the job's database session is named after the job and waits WAITRCD for a locked record, as with Jariko; positions 73-74 (or `(E)`) catch the error.
 
-**R1 (Oct 19, 2026).** The batch samples (CUSTLIST, ORDTOTAL, OWING, CUSTUPD, the CL program CUSTRPT calling RPG, CONTCNT) produce their golden output on the native engine. CI runs the demo on it (`AS4TAINER_RPG_ENGINE=native`). Fully free-form programs run too: HELLOWORLD from the corpus prints its message, where Jariko did nothing.
+**R1 (Oct 19, 2026).** The batch samples (CUSTLIST, ORDTOTAL, OWING, CUSTUPD, the CL program CUSTRPT calling RPG, CONTCNT) produce their golden output on the native engine. CI runs the demo on it (`AS4TAINR_RPG_ENGINE=native`). Fully free-form programs run too: HELLOWORLD from the corpus prints its message, where Jariko did nothing.
 
-To try it: `AS4TAINER_RPG_ENGINE=native as4tainer call CUSTLIST 3`. With the variable set, CRTBNDRPG checks programs (syntax, names, files) when it creates them.
+To try it: `AS4TAINR_RPG_ENGINE=native as4tainr call CUSTLIST 3`. With the variable set, CRTBNDRPG checks programs (syntax, names, files) when it creates them.
 
 What R1 covers:
 - **Source:** fixed form (H F D I C O P specs), `/FREE` regions, free-form calculations in positions 8-80, `**FREE`, `//` comments, `/COPY` and `/INCLUDE` (members and stream files), `/IF DEFINED` / `/DEFINE` / `/EOF`, `**CTDATA`.

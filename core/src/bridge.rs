@@ -33,13 +33,13 @@ pub struct BridgeConfig {
     /// waiting for a record this job has locked.
     pub job: Option<String>,
     /// How long a read waits for a record another job has locked (the
-    /// file's WAITRCD). None: `AS4TAINER_WAITRCD` seconds, else 60.
+    /// file's WAITRCD). None: `AS4TAINR_WAITRCD` seconds, else 60.
     pub record_wait: Option<std::time::Duration>,
 }
 
-/// The record wait when the bridge config does not say: AS4TAINER_WAITRCD
+/// The record wait when the bridge config does not say: AS4TAINR_WAITRCD
 /// seconds, else 60. On IBM i each file has its own WAITRCD (CRTPF,
-/// OVRDBF); as4tainer has one wait time for every file (a known gap).
+/// OVRDBF); as4tainr has one wait time for every file (a known gap).
 fn job_number_of(config: &BridgeConfig) -> Option<i64> {
     config
         .job
@@ -72,7 +72,7 @@ pub async fn job_session(
 
 pub fn default_record_wait() -> std::time::Duration {
     std::time::Duration::from_secs(
-        std::env::var("AS4TAINER_WAITRCD")
+        std::env::var("AS4TAINR_WAITRCD")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(60),
@@ -157,7 +157,7 @@ struct Session {
     locked: Vec<(String, String)>,
     /// The job's number, for WRKACTJOB's LCKW while waiting for a record.
     job_number: Option<i64>,
-    /// Spooled files opened on this connection. Without a job (`as4tainer
+    /// Spooled files opened on this connection. Without a job (`as4tainr
     /// call`), printed lines go to standard output instead: the last
     /// (page, line) printed per spooled file.
     stdout_spool: HashMap<i64, (i32, i32)>,
@@ -189,7 +189,7 @@ impl Session {
         })
     }
 
-    /// Object authority for the job's user (no job: `as4tainer call`, which
+    /// Object authority for the job's user (no job: `as4tainr call`, which
     /// runs as QSECOFR, is not checked).
     async fn require(&self, library: &str, name: &str, objtype: &str, need: Aut) -> Result<()> {
         match self.job_id() {
@@ -242,7 +242,7 @@ impl Session {
     async fn dispatch(&mut self, req: Request) -> Result<Value> {
         let keys = req.keys.clone().unwrap_or_default();
         match req.op.as_str() {
-            "hello" => Ok(json!({ "server": "as4tainer-core", "version": PROTOCOL_VERSION })),
+            "hello" => Ok(json!({ "server": "as4tainr-core", "version": PROTOCOL_VERSION })),
             "metadata" => {
                 let name = req.file.ok_or_else(|| anyhow!("missing 'file'"))?;
                 let f =
@@ -602,7 +602,7 @@ pub async fn connect_db(url: &str) -> Result<Client> {
     let (client, conn) = tokio_postgres::connect(url, NoTls).await?;
     tokio::spawn(async move {
         if let Err(e) = conn.await {
-            eprintln!("as4tainer: database connection error: {e}");
+            eprintln!("as4tainr: database connection error: {e}");
         }
     });
     Ok(client)
@@ -675,7 +675,7 @@ pub async fn serve(listener: TcpListener, config: BridgeConfig) -> Result<()> {
         let ws = workstation.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_conn(stream, cfg, ws).await {
-                eprintln!("as4tainer: bridge session ended with error: {e:#}");
+                eprintln!("as4tainr: bridge session ended with error: {e:#}");
             }
         });
     }

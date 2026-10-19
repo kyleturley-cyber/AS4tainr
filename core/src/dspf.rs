@@ -630,7 +630,7 @@ pub fn parse(name: &str, source: &str) -> Result<DisplayFile> {
     Ok(f)
 }
 
-/// The DDS rules for subfiles that the rest of as4tainer relies on: a control
+/// The DDS rules for subfiles that the rest of as4tainr relies on: a control
 /// record comes right after its subfile record and names it, and has
 /// SFLSIZ and SFLPAG; one page of subfile records fits on the display.
 fn check_subfiles(f: &DisplayFile) -> Result<()> {

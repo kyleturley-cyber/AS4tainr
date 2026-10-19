@@ -1,35 +1,35 @@
 # 5250 display server
 
-`as4tainer tn5250` serves 5250 green-screen sessions over telnet (TN5250, [RFC 1205](https://www.rfc-editor.org/rfc/rfc1205), [RFC 2877](https://www.rfc-editor.org/rfc/rfc2877)). Any 5250 emulator can connect: tn5250, tn5250j, or IBM ACS.
+`as4tainr tn5250` serves 5250 green-screen sessions over telnet (TN5250, [RFC 1205](https://www.rfc-editor.org/rfc/rfc1205), [RFC 2877](https://www.rfc-editor.org/rfc/rfc2877)). Any 5250 emulator can connect: tn5250, tn5250j, or IBM ACS.
 
 ```sh
-as4tainer tn5250 --listen 0.0.0.0:23 --system-name AS4TAINER
+as4tainr tn5250 --listen 0.0.0.0:23 --system-name AS4TAINR
 ```
 
 In Docker, `docker compose up` publishes it on `localhost:2323`. The same server also has a terminal in the browser, at `http://localhost:5250` in Docker: see [web-terminal.md](web-terminal.md).
 
 ## Signing on
 
-The first `as4tainer init` creates the security officer profile QSECOFR:
+The first `as4tainr init` creates the security officer profile QSECOFR:
 
-- If `AS4TAINER_QSECOFR_PASSWORD` is set, that is its password.
+- If `AS4TAINR_QSECOFR_PASSWORD` is set, that is its password.
 - Otherwise the password is `QSECOFR`, and it has expired: the first sign-on goes to the Change Password screen.
 
 Passwords are stored as Argon2id hashes. A wrong user and a wrong password give the same message (`CPF1107`), and take the same time, so the sign-on screen does not reveal which profiles exist. After 3 failed attempts the connection is closed.
 
-Passwords are not case sensitive by default, like IBM i as shipped (system value QPWDLVL 0); `AS4TAINER_QPWDLVL=2` makes them case sensitive. Passwords set before as4tainer followed QPWDLVL still work as typed and are converted at the next sign-on.
+Passwords are not case sensitive by default, like IBM i as shipped (system value QPWDLVL 0); `AS4TAINR_QPWDLVL=2` makes them case sensitive. Passwords set before as4tainr followed QPWDLVL still work as typed and are converted at the next sign-on.
 
-**Forgot the QSECOFR password?** `as4tainer rstpwd` (or `as4tainer rstpwd USER`) sets it back to the profile name, expired, so the next sign-on asks for a new one. In Docker: `docker compose exec as4tainer as4tainer rstpwd`.
+**Forgot the QSECOFR password?** `as4tainr rstpwd` (or `as4tainr rstpwd USER`) sets it back to the profile name, expired, so the next sign-on asks for a new one. In Docker: `docker compose exec as4tainr as4tainr rstpwd`.
 
 ## Screens
 
-The screens below are captured from the real `tn5250` client connected to as4tainer (by `tools/e2e_5250.py`'s harness).
+The screens below are captured from the real `tn5250` client connected to as4tainr (by `tools/e2e_5250.py`'s harness).
 
 Sign-on:
 
 ```
                                    Sign On
-                                               System  . . . . .:   AS4TAINER
+                                               System  . . . . .:   AS4TAINR
                                                Subsystem . . . .:   QINTER
                                                Display . . . . .:   QPADEV0003
 
@@ -49,15 +49,15 @@ Sign-on:
 
 
 
-              as4tainer - legacy RPG and 5250 applications in a container
+              as4tainr - legacy RPG and 5250 applications in a container
 ```
 
 Command entry, after CRTLIB and a CALL of an RPG program on Jariko:
 
 ```
-                                Command Entry                            AS4TAINER
+                                Command Entry                            AS4TAINR
                                                                         QSECOFR
- Signed on to AS4TAINER as QSECOFR.
+ Signed on to AS4TAINR as QSECOFR.
  > crtlib salesx text('Sales applications')
    Library SALESX created.
  > call ordtotal parm('1002')
@@ -84,9 +84,9 @@ Command entry, after CRTLIB and a CALL of an RPG program on Jariko:
 An error keeps the command on the command line so it can be corrected:
 
 ```
-                                Command Entry                            AS4TAINER
+                                Command Entry                            AS4TAINR
                                                                         QSECOFR
- Signed on to AS4TAINER as QSECOFR.
+ Signed on to AS4TAINR as QSECOFR.
  > crtlib salesx text('Sales applications')
    Library SALESX created.
  > call ordtotal parm('1002')
@@ -180,7 +180,7 @@ Keys on the command entry screen:
 
 On list screens, Page Down / Page Up (Roll Up / Roll Down) page through the list. Lists with options (DSPLIBL) have an Opt column: type an option number next to one or more entries and press Enter to run it on each, then you come back to the list. F12 goes back one screen, F3 goes back to the command line.
 
-**Library list.** A job's library list is searched in order: the system part, the current library, the user part. The system part is fixed. The user part of a new job comes from `AS4TAINER_LIBL` (default `QGPL,QTEMP`); the current library comes from the sign-on screen, else the user profile (`*CRTDFT` = none, as QSECOFR is shipped).
+**Library list.** A job's library list is searched in order: the system part, the current library, the user part. The system part is fixed. The user part of a new job comes from `AS4TAINR_LIBL` (default `QGPL,QTEMP`); the current library comes from the sign-on screen, else the user profile (`*CRTDFT` = none, as QSECOFR is shipped).
 
 ## How it is built
 

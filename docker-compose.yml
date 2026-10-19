@@ -1,11 +1,11 @@
-# as4tainer: PostgreSQL plus the as4tainer 5250 server.
+# as4tainr: PostgreSQL plus the as4tainr 5250 server.
 #
 #   docker compose up --build
 #
 # Then open http://localhost:5250 for the 5250 terminal in your browser, or
 # connect a 5250 emulator (tn5250, tn5250j, IBM ACS) to localhost:2323,
 # and sign on as QSECOFR. On first start the password is QSECOFR and must be
-# changed, unless AS4TAINER_QSECOFR_PASSWORD is set below.
+# changed, unless AS4TAINR_QSECOFR_PASSWORD is set below.
 #
 # The spike demo (sample programs checked against golden output):
 #   docker compose run --rm demo
@@ -13,41 +13,41 @@ services:
   db:
     image: postgres:16
     environment:
-      POSTGRES_USER: as4tainer
-      POSTGRES_PASSWORD: as4tainer
-      POSTGRES_DB: as4tainer
+      POSTGRES_USER: as4tainr
+      POSTGRES_PASSWORD: as4tainr
+      POSTGRES_DB: as4tainr
     volumes: ["pgdata:/var/lib/postgresql/data"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U as4tainer"]
+      test: ["CMD-SHELL", "pg_isready -U as4tainr"]
       interval: 2s
       retries: 30
 
-  as4tainer:
+  as4tainr:
     build:
       context: .
       dockerfile: docker/Dockerfile
-    image: ghcr.io/as4tainer/as4tainer:dev
+    image: ghcr.io/as4tainr/as4tainr:dev
     depends_on:
       db:
         condition: service_healthy
     environment:
-      AS4TAINER_DATABASE_URL: postgres://as4tainer:as4tainer@db/as4tainer
-      AS4TAINER_SYSTEM_NAME: AS4TAINR
-      # AS4TAINER_QSECOFR_PASSWORD: change-me   # skips the forced first change
-      # AS4TAINER_QPWDLVL: "2"   # case-sensitive passwords (default 0: not case sensitive, like IBM i as shipped)
+      AS4TAINR_DATABASE_URL: postgres://as4tainr:as4tainr@db/as4tainr
+      AS4TAINR_SYSTEM_NAME: AS4TAINR
+      # AS4TAINR_QSECOFR_PASSWORD: change-me   # skips the forced first change
+      # AS4TAINR_QPWDLVL: "2"   # case-sensitive passwords (default 0: not case sensitive, like IBM i as shipped)
     ports:
       - "2323:23"   # 5250 emulators (telnet)
       - "5250:8080" # browser 5250 terminal: http://localhost:5250
 
   demo:
-    image: ghcr.io/as4tainer/as4tainer:dev
+    image: ghcr.io/as4tainr/as4tainr:dev
     profiles: ["demo"]
     depends_on:
       db:
         condition: service_healthy
     environment:
-      AS4TAINER_DATABASE_URL: postgres://as4tainer:as4tainer@db/as4tainer
-    entrypoint: ["/opt/as4tainer/demo.sh"]
+      AS4TAINR_DATABASE_URL: postgres://as4tainr:as4tainr@db/as4tainr
+    entrypoint: ["/opt/as4tainr/demo.sh"]
 
 volumes:
   pgdata: {}

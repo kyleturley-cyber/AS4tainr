@@ -11,7 +11,7 @@ Every signed-on session and every submitted batch job is a **job** with a qualif
 | A 5250 session | the display device, e.g. `QPADEV0001` | `QINTER` | `INT` |
 | A job submitted with `SBMJOB` | `JOB(...)`, or `QDFTJOBD` for `JOB(*JOBD)` | `QBATCH` | `BCH` |
 
-Job numbers are six digits, in order. Jobs are kept in the catalog (`as4tainer.jobs`), so every session sees every job. A job that has ended keeps its row and its job log (status `OUTQ`).
+Job numbers are six digits, in order. Jobs are kept in the catalog (`as4tainr.jobs`), so every session sees every job. A job that has ended keeps its row and its job log (status `OUTQ`).
 
 When the server starts, jobs that were still active when it stopped are marked as ended abnormally.
 
@@ -23,7 +23,7 @@ SBMJOB CMD(CALL PGM(CUSTRPT) PARM(L)) JOB(RPT)
 
 - `CMD` is any command, written as you would type it. It is checked when you submit it, and a command with errors is never submitted.
 - The job runs as the submitting user, with the submitter's current library (`CURLIB(*CURRENT)`) and library list (`INLLIBL(*CURRENT)`), or the ones you give.
-- It goes on job queue `QBATCH` and gets message `CPC1221` (submitted). The `QBATCH` subsystem runs in the server process. It takes jobs off the queue first in, first out, one at a time (`AS4TAINER_QBATCH_MAXACT` raises that).
+- It goes on job queue `QBATCH` and gets message `CPC1221` (submitted). The `QBATCH` subsystem runs in the server process. It takes jobs off the queue first in, first out, one at a time (`AS4TAINR_QBATCH_MAXACT` raises that).
 - What the command sends goes to the job's log: CL program messages, `DSPLY` lines from RPG, and errors. A display command in batch writes its list to the job log.
 - When the job ends, the submitting user gets `CPF1241` (completed normally) or `CPF1240` (ended abnormally) on their message queue. The command entry screen says when a new message is waiting.
 

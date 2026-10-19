@@ -1,23 +1,23 @@
 # Display files (interactive RPG)
 
-RPG programs that use DDS display files run on as4tainer. When a program does `EXFMT`, as4tainer draws the record format on the user's 5250 session, waits for input, and hands the field values and response indicators back to the program. Subfiles (the scrolling lists of "Work with..." screens) work too; see [Subfiles](#subfiles).
+RPG programs that use DDS display files run on as4tainr. When a program does `EXFMT`, as4tainr draws the record format on the user's 5250 session, waits for input, and hands the field values and response indicators back to the program. Subfiles (the scrolling lists of "Work with..." screens) work too; see [Subfiles](#subfiles).
 
 ## How it works
 
 ```
- 5250 session ◄── as4tainer core ◄── bridge ◄── Jariko (EXFMT)
+ 5250 session ◄── as4tainr core ◄── bridge ◄── Jariko (EXFMT)
    (screen)       (DDS parsed,      "exfmt"     onExfmt callback:
                    drawn, input      op          sends field values
                    validated)                    and *IN01-*IN99,
                                                  applies the response
 ```
 
-1. `as4tainer crtdspf LIB/FILE --src FILE.dspf` checks and stores the DDS source. It is a `*FILE` object with attribute `DSPF`.
+1. `as4tainr crtdspf LIB/FILE --src FILE.dspf` checks and stores the DDS source. It is a `*FILE` object with attribute `DSPF`.
 2. The runner gives Jariko the same source (bridge op `dspf`), so the program's variables match the display file's fields.
-3. On `EXFMT`, the runner sends the record's field values and all 99 indicators (bridge op `exfmt`). as4tainer draws the record, honoring option indicators, `DSPATR`, `COLOR`, `EDTCDE` and `ERRMSG`. It then validates the input: numbers must fit, and only the function keys defined with `CA`/`CF` are allowed. It returns the new field values and the response indicators.
+3. On `EXFMT`, the runner sends the record's field values and all 99 indicators (bridge op `exfmt`). as4tainr draws the record, honoring option indicators, `DSPATR`, `COLOR`, `EDTCDE` and `ERRMSG`. It then validates the input: numbers must fit, and only the function keys defined with `CA`/`CF` are allowed. It returns the new field values and the response indicators.
 4. The runner applies them to the program: fields through Jariko's `OnExfmtResponse`, indicators through the program's indicator table.
 
-A program called from a batch job (`as4tainer call`) has no display. `EXFMT` then fails with "this job has no display".
+A program called from a batch job (`as4tainr call`) has no display. `EXFMT` then fails with "this job has no display".
 
 ## Example
 
@@ -90,7 +90,7 @@ A program called from a batch job (`as4tainer call`) has no display. `EXFMT` the
 Customer 42 does not exist. The program turns on `*IN30`, so `ERRMSG` shows the message and highlights the field:
 
 ```
- AS4TAINER                       Customer Inquiry                         10/15/26
+ AS4TAINR                       Customer Inquiry                         10/15/26
 
  Type a customer number, press Enter.
 
@@ -119,7 +119,7 @@ Customer 42 does not exist. The program turns on `*IN30`, so `ERRMSG` shows the 
 Customer 5. `EDTCDE(J)` edits the negative balance, and `*IN40` shows it in red:
 
 ```
- AS4TAINER                       Customer Inquiry                         10/15/26
+ AS4TAINR                       Customer Inquiry                         10/15/26
 
 
 
@@ -168,7 +168,7 @@ A subfile is a list of records, numbered 1 to 9999 (relative record numbers), th
      F                                     SFILE(CUSTSFL:RRN)
 ```
 
-| Program does | as4tainer does |
+| Program does | as4tainr does |
 | --- | --- |
 | `WRITE ctl` with `SFLCLR` (or `SFLDLT`) on | Empties the subfile |
 | `WRITE sfl` | Adds the record at number `RRN`, with the current indicators (for option indicators and `SFLNXTCHG`). A number already used, or outside 1-9999, is an error |
@@ -183,18 +183,18 @@ The DDS rules are checked by `crtdspf`: the control record comes right after its
 
 Jariko v2.2.0 handles `EXFMT` through a callback, but nothing else on a WORKSTN file: `WRITE` and `UPDATE` look for a database file, and `READC` does nothing. So when the runner loads a program it rewrites the source first (`Workstation.java`):
 
-1. Each record format of each WORKSTN file becomes an extra F spec, `Fformat UF A E K DISK`. These "files" are served by `DisplayDBMManager`, which sends their operations to as4tainer core (`dspwrite`, `sflwrite`, `sflchain`, `sflreadc`, `sflupdate`; see [bridge-protocol.md](bridge-protocol.md)).
+1. Each record format of each WORKSTN file becomes an extra F spec, `Fformat UF A E K DISK`. These "files" are served by `DisplayDBMManager`, which sends their operations to as4tainr core (`dspwrite`, `sflwrite`, `sflchain`, `sflreadc`, `sflupdate`; see [bridge-protocol.md](bridge-protocol.md)).
 2. The `SFILE` keywords are taken off the F specs; the runner remembers which variable holds each subfile's record number.
 3. `READC sfl` becomes `READ sfl`, which the subfile "file" answers with the next changed record.
 
-The subfile, the records on the screen, and paging all live in as4tainer core (`core/src/workstn.rs`), where they are unit tested.
+The subfile, the records on the screen, and paging all live in as4tainr core (`core/src/workstn.rs`), where they are unit tested.
 
 ### Example
 
 `samples/qrpglesrc/WRKCUST.rpgle` with `samples/qddssrc/CUSTWRKD.dspf` loads every customer into a subfile of 4 lines a page. Option 5 shows the customer; a wrong option is shown in reverse image with an `SFLMSG` message, and stays selected through `SFLNXTCHG`:
 
 ```
- AS4TAINER                    Work with Customers                         10/15/26
+ AS4TAINR                    Work with Customers                         10/15/26
 
  Type options, press Enter.
    5=Display

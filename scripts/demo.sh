@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# as4tainer spike demo: create the sample files, load data, run the sample
+# as4tainr spike demo: create the sample files, load data, run the sample
 # programs and compare their output with the golden files.
 #
 # Env:
-#   AS4TAINER_DATABASE_URL  PostgreSQL URL (default: local as4tainer database)
-#   AS4TAINER_RUNNER        runner command (default: the Jariko jar)
-#   AS4TAINER_PGM_PATH      directory holding the .rpgle sources
-#   AS4TAINER_BIN           path to the as4tainer binary (default: as4tainer on PATH)
+#   AS4TAINR_DATABASE_URL  PostgreSQL URL (default: local as4tainr database)
+#   AS4TAINR_RUNNER        runner command (default: the Jariko jar)
+#   AS4TAINR_PGM_PATH      directory holding the .rpgle sources
+#   AS4TAINR_BIN           path to the as4tainr binary (default: as4tainr on PATH)
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
-samples="${AS4TAINER_SAMPLES:-$here/samples}"
-bin="${AS4TAINER_BIN:-as4tainer}"
-export AS4TAINER_PGM_PATH="${AS4TAINER_PGM_PATH:-$samples/qrpglesrc}"
+samples="${AS4TAINR_SAMPLES:-$here/samples}"
+bin="${AS4TAINR_BIN:-as4tainr}"
+export AS4TAINR_PGM_PATH="${AS4TAINR_PGM_PATH:-$samples/qrpglesrc}"
 
 # The sample files, display files and CL programs (scripts/samples.sh).
-setup=$(AS4TAINER_BIN="$bin" AS4TAINER_SAMPLES="$samples" "$(dirname "$0")/samples.sh")
+setup=$(AS4TAINR_BIN="$bin" AS4TAINR_SAMPLES="$samples" "$(dirname "$0")/samples.sh")
 echo "$setup"
 fresh=0
 if grep -qx "Loaded CUSTMAST" <<<"$setup"; then
@@ -56,14 +56,14 @@ run CUSTRPT L
 # A printed report (O specs, EXCEPT). The conformance runner replays file
 # operations only; the page layout is the Jariko runner's.
 # The native RPG engine prints from milestone R3 on (docs/rpg-engine.md).
-if [[ "${AS4TAINER_RUNNER:-}" != *BridgeConformance* && "${AS4TAINER_RPG_ENGINE:-}" != native ]]; then
+if [[ "${AS4TAINR_RUNNER:-}" != *BridgeConformance* && "${AS4TAINR_RPG_ENGINE:-}" != native ]]; then
   run CUSTPRT
 fi
 # An imported application (samples/apps/contacts, in library CONTACTS):
 # RPG program objects (CRTBNDRPG) and a /INCLUDE stream file. Real RPG only.
-if [[ "${AS4TAINER_RUNNER:-}" != *BridgeConformance* || "${AS4TAINER_RPG_ENGINE:-}" == native ]]; then
+if [[ "${AS4TAINR_RUNNER:-}" != *BridgeConformance* || "${AS4TAINR_RPG_ENGINE:-}" == native ]]; then
   echo "--- CALL CONTACTS/CONTCNT"
-  out=$(AS4TAINER_LIBL=CONTACTS,QGPL "$bin" call CONTACTS/CONTCNT | grep -v '^Picked up JAVA_TOOL_OPTIONS' || true)
+  out=$(AS4TAINR_LIBL=CONTACTS,QGPL "$bin" call CONTACTS/CONTCNT | grep -v '^Picked up JAVA_TOOL_OPTIONS' || true)
   echo "$out"
   if diff <(normalize <<<"$out") <(normalize <"$samples/expected/CONTCNT.txt") >/dev/null; then
     echo "PASS: output matches CONTCNT.txt"

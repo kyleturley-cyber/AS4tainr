@@ -1,4 +1,4 @@
-//! The as4tainer RPG engine: ILE RPG compiled and run in Rust. See
+//! The as4tainr RPG engine: ILE RPG compiled and run in Rust. See
 //! docs/rpg-engine.md.
 //!
 //! - [`parse`]: source member → [`ast::Source`]
@@ -19,11 +19,11 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tokio_postgres::Client;
 
-/// Which engine runs RPG programs: `AS4TAINER_RPG_ENGINE=native` (this
+/// Which engine runs RPG programs: `AS4TAINR_RPG_ENGINE=native` (this
 /// one) or `jariko` (the JVM runner; the default until the native engine
 /// passes everything, see docs/rpg-engine.md).
 pub fn native_enabled() -> bool {
-    std::env::var("AS4TAINER_RPG_ENGINE")
+    std::env::var("AS4TAINR_RPG_ENGINE")
         .map(|v| v.eq_ignore_ascii_case("native"))
         .unwrap_or(false)
 }
@@ -157,10 +157,10 @@ pub async fn call(
     .await?
 }
 
-/// The source of an RPG program kept as a file in AS4TAINER_PGM_PATH (the
+/// The source of an RPG program kept as a file in AS4TAINR_PGM_PATH (the
 /// samples): NAME.rpgle in any of its directories.
 pub fn source_from_path(name: &str) -> Option<String> {
-    let path = std::env::var("AS4TAINER_PGM_PATH").unwrap_or_else(|_| "qrpglesrc".into());
+    let path = std::env::var("AS4TAINR_PGM_PATH").unwrap_or_else(|_| "qrpglesrc".into());
     for dir in std::env::split_paths(&path) {
         for n in [
             name.to_string(),

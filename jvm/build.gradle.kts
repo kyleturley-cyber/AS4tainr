@@ -1,10 +1,10 @@
-// as4tainer JVM side: runs RPG on Jariko, with file I/O routed to as4tainer core.
+// as4tainr JVM side: runs RPG on Jariko, with file I/O routed to as4tainr core.
 plugins {
     kotlin("jvm") version "2.1.0"
     application
 }
 
-group = "io.as4tainer"
+group = "io.as4tainr"
 version = "0.1.0"
 
 val jarikoVersion: String by project
@@ -41,17 +41,17 @@ tasks.withType<JavaCompile>().configureEach {
 }
 
 application {
-    mainClass.set("io.as4tainer.jvm.Launcher")
-    applicationName = "as4tainer-jvm"
+    mainClass.set("io.as4tainr.jvm.Launcher")
+    applicationName = "as4tainr-jvm"
 }
 
-// Self-contained jar for the container image: java -jar as4tainer-jvm.jar
+// Self-contained jar for the container image: java -jar as4tainr-jvm.jar
 tasks.register<Jar>("fatJar") {
     group = "build"
-    description = "Builds as4tainer-jvm.jar with all dependencies."
-    archiveFileName.set("as4tainer-jvm.jar")
+    description = "Builds as4tainr-jvm.jar with all dependencies."
+    archiveFileName.set("as4tainr-jvm.jar")
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-    manifest { attributes["Main-Class"] = "io.as4tainer.jvm.Launcher" }
+    manifest { attributes["Main-Class"] = "io.as4tainr.jvm.Launcher" }
     from(sourceSets.main.get().output)
     dependsOn(configurations.runtimeClasspath)
     from({ configurations.runtimeClasspath.get().filter { it.name.endsWith("jar") }.map { zipTree(it) } }) {

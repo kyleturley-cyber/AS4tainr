@@ -3,7 +3,7 @@
 A logical file gives programs another view of a physical file's records: in another key order, with fewer fields, or only the records that pass its select/omit rules. RPG opens it like any database file (`F...IF E K DISK`), and it holds no data of its own: a record changed through the physical file shows up in the logical file at once, and the other way round.
 
 ```sh
-as4tainer crtlf QGPL/CUSTOWE --src samples/qddssrc/CUSTOWE.lf
+as4tainr crtlf QGPL/CUSTOWE --src samples/qddssrc/CUSTOWE.lf
 ```
 
 ## Supported DDS
@@ -21,7 +21,7 @@ Physical files also accept `DESCEND` on their key fields now.
 
 ## How it is stored
 
-| IBM i | as4tainer |
+| IBM i | as4tainr |
 | --- | --- |
 | Logical file | A PostgreSQL view over the physical file's table: `rrn` and the chosen fields, `WHERE` the select/omit rules |
 | Its access path | An index on the physical file's table, in key order (DESC for DESCEND keys) then arrival order, partial (`WHERE` select/omit) when there are rules |

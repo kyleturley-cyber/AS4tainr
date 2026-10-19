@@ -2,8 +2,8 @@
 //!
 //! Written from IBM's public DB2 for i SQL reference. A statement is
 //! translated, then run in its own transaction on a separate connection
-//! that logs in as the `as4tainer_sql` role. That role is not a superuser and
-//! can use the library schemas and nothing else (not the `as4tainer`
+//! that logs in as the `as4tainr_sql` role. That role is not a superuser and
+//! can use the library schemas and nothing else (not the `as4tainr`
 //! catalog, where password hashes live); its password is random and kept
 //! in the catalog. Because the connection's own login is the restricted
 //! role, a statement has no more powerful role to switch to. The job's
@@ -29,7 +29,7 @@ use tokio_postgres::{Client, SimpleQueryMessage};
 use crate::catalog::{self, ident};
 
 /// The PostgreSQL role user SQL runs as.
-pub const SQL_ROLE: &str = "as4tainer_sql";
+pub const SQL_ROLE: &str = "as4tainr_sql";
 
 /// Create the SQL login role with a random password (made once, then
 /// kept, so processes starting together agree on it) and give it the
@@ -48,19 +48,19 @@ pub async fn init(client: &Client) -> Result<()> {
              ALTER ROLE {SQL_ROLE} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
              ALTER DEFAULT PRIVILEGES GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {SQL_ROLE};
              ALTER DEFAULT PRIVILEGES GRANT USAGE, SELECT ON SEQUENCES TO {SQL_ROLE};
-             REVOKE ALL ON SCHEMA as4tainer FROM {SQL_ROLE};
-             CREATE TABLE IF NOT EXISTS as4tainer.sql_login (id int PRIMARY KEY, password text NOT NULL);"
+             REVOKE ALL ON SCHEMA as4tainr FROM {SQL_ROLE};
+             CREATE TABLE IF NOT EXISTS as4tainr.sql_login (id int PRIMARY KEY, password text NOT NULL);"
         ))
         .await?;
     let fresh = SaltString::generate(&mut OsRng).to_string();
     client
         .execute(
-            "INSERT INTO as4tainer.sql_login VALUES (1, $1) ON CONFLICT (id) DO NOTHING",
+            "INSERT INTO as4tainr.sql_login VALUES (1, $1) ON CONFLICT (id) DO NOTHING",
             &[&fresh],
         )
         .await?;
     let password: String = client
-        .query_one("SELECT password FROM as4tainer.sql_login WHERE id = 1", &[])
+        .query_one("SELECT password FROM as4tainr.sql_login WHERE id = 1", &[])
         .await?
         .get(0);
     // A random base64 string: no quotes to escape.
@@ -82,12 +82,12 @@ pub async fn init(client: &Client) -> Result<()> {
 /// A connection that logs in as the SQL role, to the same database.
 async fn connect_as_sql_role(client: &Client, database_url: &str) -> Result<Client> {
     let password: String = client
-        .query_opt("SELECT password FROM as4tainer.sql_login WHERE id = 1", &[])
+        .query_opt("SELECT password FROM as4tainr.sql_login WHERE id = 1", &[])
         .await?
         .map(|r| r.get(0))
         .ok_or_else(|| {
             anyhow!(
-                "SQL is not available: run `as4tainer init` as a database user who may create roles."
+                "SQL is not available: run `as4tainr init` as a database user who may create roles."
             )
         })?;
     let mut cfg: tokio_postgres::Config = database_url.parse()?;
@@ -212,7 +212,7 @@ fn render(toks: &[Tok]) -> String {
         .map(|t| match t {
             Tok::Space(s) | Tok::Word(s) | Tok::Number(s) | Tok::Punct(s) => s.clone(),
             Tok::Str(s) => format!("'{}'", s.replace('\'', "''")),
-            // DB2 names are upper case; as4tainer stores them lower case.
+            // DB2 names are upper case; as4tainr stores them lower case.
             Tok::Quoted(s) => ident(s),
         })
         .collect()
@@ -271,7 +271,7 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
     // (the role cannot either; this gives a clearer message).
     for t in &toks {
         if let Some(w) = word(t) {
-            if w == "AS4TAINER"
+            if w == "AS4TAINR"
                 || w.starts_with("PG_")
                 || w == "INFORMATION_SCHEMA"
                 || w == "SET_CONFIG"
@@ -739,7 +739,7 @@ mod tests {
     #[test]
     fn fields_named_like_postgresql_system_columns() {
         // CTID is a valid IBM i field name; in PostgreSQL ctid is a system
-        // column (PostgreSQL manual, "System Columns"), so as4tainer stores it
+        // column (PostgreSQL manual, "System Columns"), so as4tainr stores it
         // as "~ctid".
         assert_eq!(
             tr("select ctid, name from mylib/contact where ctid > 3").sql,
@@ -796,7 +796,7 @@ mod tests {
         let err = |s: &str| translate(s, &|_| false).unwrap_err().to_string();
         assert!(err("drop table t").starts_with("SQL0084"));
         assert!(err("select 1; drop table t").starts_with("SQL0104"));
-        assert!(err("select * from as4tainer.user_profiles").starts_with("SQL0551"));
+        assert!(err("select * from as4tainr.user_profiles").starts_with("SQL0551"));
         assert!(err("select * from pg_shadow").starts_with("SQL0551"));
         assert!(err("select 'abc").starts_with("SQL0010"));
         // ';' inside a string is data.

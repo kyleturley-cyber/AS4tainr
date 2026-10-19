@@ -4,14 +4,14 @@
 # again: existing files keep their data, CL programs are replaced.
 #
 # Env:
-#   AS4TAINER_BIN      path to the as4tainer binary (default: as4tainer on PATH)
-#   AS4TAINER_SAMPLES  samples directory (default: ../samples next to this script)
+#   AS4TAINR_BIN      path to the as4tainr binary (default: as4tainr on PATH)
+#   AS4TAINR_SAMPLES  samples directory (default: ../samples next to this script)
 # Prints "Loaded FILE" for each physical file created and loaded now.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
-samples="${AS4TAINER_SAMPLES:-$here/samples}"
-bin="${AS4TAINER_BIN:-as4tainer}"
+samples="${AS4TAINR_SAMPLES:-$here/samples}"
+bin="${AS4TAINR_BIN:-as4tainr}"
 
 "$bin" init >/dev/null
 

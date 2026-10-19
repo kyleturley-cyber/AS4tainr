@@ -196,7 +196,7 @@ pub enum Stmt {
     Reset(Expr),
     /// DEFINE, KLIST, PLIST and such: declarations kept in the calcs.
     Nop,
-    /// An operation as4tainer does not run yet: fails when reached.
+    /// An operation as4tainr does not run yet: fails when reached.
     Unsupported(String),
     /// CAT, SUBST, SCAN, CHECK, CHECKR, XLATE, LOOKUP, TIME, IN, OUT...:
     /// the fixed-form string and misc operations.

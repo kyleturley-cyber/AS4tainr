@@ -1,4 +1,4 @@
-package io.as4tainer.jvm;
+package io.as4tainr.jvm;
 
 import com.smeup.dbnative.file.DBFile;
 import com.smeup.dbnative.file.Record;
@@ -6,8 +6,8 @@ import com.smeup.dbnative.file.RecordField;
 import com.smeup.dbnative.file.Result;
 import com.smeup.dbnative.log.Logger;
 import com.smeup.dbnative.model.FileMetadata;
-import io.as4tainer.bridge.BridgeClient;
-import io.as4tainer.bridge.ReadResult;
+import io.as4tainr.bridge.BridgeClient;
+import io.as4tainr.bridge.ReadResult;
 
 import java.math.BigDecimal;
 import java.util.LinkedHashMap;
@@ -18,7 +18,7 @@ import java.util.Map;
  * One display record format seen as a file: WRITE puts the record on the
  * screen (shown with the next EXFMT), and for subfile records WRITE, CHAIN,
  * READ (= READC, see {@link Workstation}) and UPDATE work on the subfile kept
- * by as4tainer core.
+ * by as4tainr core.
  */
 final class DisplayRecordFile implements DBFile {
     private final Workstation.Format format;

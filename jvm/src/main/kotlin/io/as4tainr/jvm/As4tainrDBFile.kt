@@ -1,4 +1,4 @@
-package io.as4tainer.jvm
+package io.as4tainr.jvm
 
 import com.smeup.dbnative.file.DBFile
 import com.smeup.dbnative.file.Record
@@ -6,8 +6,8 @@ import com.smeup.dbnative.file.RecordField
 import com.smeup.dbnative.file.Result
 import com.smeup.dbnative.log.Logger
 import com.smeup.dbnative.model.FileMetadata
-import io.as4tainer.bridge.BridgeClient
-import io.as4tainer.bridge.ReadResult
+import io.as4tainr.bridge.BridgeClient
+import io.as4tainr.bridge.ReadResult
 
 /**
  * One open file (one F-spec) in a Jariko program. Each operation is one
@@ -19,7 +19,7 @@ import io.as4tainer.bridge.ReadResult
  * program has one (or the E extender); otherwise the program ends with the
  * error, as on IBM i.
  */
-class As4tainerDBFile(
+class As4tainrDBFile(
     override var name: String,
     override var fileMetadata: FileMetadata,
     private val client: BridgeClient,
@@ -38,7 +38,7 @@ class As4tainerDBFile(
         val flags = RecordLocks.takeFlags(name)
         return try {
             result(op(!flags.contains('N')), chain)
-        } catch (e: io.as4tainer.bridge.BridgeException) {
+        } catch (e: io.as4tainr.bridge.BridgeException) {
             if (flags.contains('E') && (e.message ?: "").startsWith("CPF5027")) {
                 lastEof = false
                 Result(indicatorLO = true)

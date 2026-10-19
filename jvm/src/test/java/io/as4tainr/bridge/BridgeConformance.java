@@ -1,4 +1,4 @@
-package io.as4tainer.bridge;
+package io.as4tainr.bridge;
 
 import java.math.BigDecimal;
 import java.util.Arrays;
@@ -7,7 +7,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * A stand-in runner for `as4tainer call`, with no dependencies beyond the JDK.
+ * A stand-in runner for `as4tainr call`, with no dependencies beyond the JDK.
  *
  * It is launched exactly like the Jariko runner (`--bridge HOST:PORT PGM args...`)
  * and replays, in Java, the file operations of the sample RPG programs in

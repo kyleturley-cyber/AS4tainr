@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end test of the browser 5250 terminal (`as4tainer tn5250 --web-listen`)
+"""End-to-end test of the browser 5250 terminal (`as4tainr tn5250 --web-listen`)
 in a real browser (Chromium, through Playwright).
 
 Expects the sample objects in QGPL (scripts/samples.sh). QSECOFR's password

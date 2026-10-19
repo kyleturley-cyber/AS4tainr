@@ -1,12 +1,12 @@
 # SQL
 
-as4tainer runs SQL in the DB2 for i dialect against the same files RPG programs use: a physical or logical file created from DDS is a table (or view) to SQL, and a change made one way is seen the other way at once.
+as4tainr runs SQL in the DB2 for i dialect against the same files RPG programs use: a physical or logical file created from DDS is a table (or view) to SQL, and a change made one way is seen the other way at once.
 
 | Where | How |
 | --- | --- |
 | 5250 session | `STRSQL`: type a statement, press Enter. A SELECT shows its rows on a Display Data screen (Page Up/Down, F19/F20 to shift wide results); other statements report how many rows they changed. F9 retrieves the previous statement, F3 ends. |
 | Command line | `RUNSQL SQL('UPDATE CUSTMAST SET CUSBAL = 0 WHERE CUSNO = 3')`: one statement that does not return rows (as on IBM i, RUNSQL does not run SELECT). |
-| Shell | `as4tainer sql "SELECT * FROM QGPL/CUSTMAST"`, with the library list from `AS4TAINER_LIBL`. In Docker: `docker compose exec as4tainer as4tainer sql "..."`. |
+| Shell | `as4tainr sql "SELECT * FROM QGPL/CUSTMAST"`, with the library list from `AS4TAINR_LIBL`. In Docker: `docker compose exec as4tainr as4tainr sql "..."`. |
 
 ## The dialect
 
@@ -30,9 +30,9 @@ Each statement is committed on its own (`COMMIT(*NONE)`).
 
 ## Security
 
-User SQL never runs as the database user as4tainer itself uses. `as4tainer init` creates a PostgreSQL login role, `as4tainer_sql`, that is not a superuser, has a random password (kept in the catalog) and may only use the library schemas: it cannot read the catalog (user profiles and password hashes), create or drop objects, switch to another role, or call server functions. Every statement opens a connection that logs in as that role. Statements that name the catalog or PostgreSQL's own schemas are also refused before they run, with a clearer message.
+User SQL never runs as the database user as4tainr itself uses. `as4tainr init` creates a PostgreSQL login role, `as4tainr_sql`, that is not a superuser, has a random password (kept in the catalog) and may only use the library schemas: it cannot read the catalog (user profiles and password hashes), create or drop objects, switch to another role, or call server functions. Every statement opens a connection that logs in as that role. Statements that name the catalog or PostgreSQL's own schemas are also refused before they run, with a clearer message.
 
-`as4tainer init` needs a database user who may create roles (the Docker and CI setups use one). Without one, as4tainer still runs, and SQL statements are refused with a message saying so.
+`as4tainr init` needs a database user who may create roles (the Docker and CI setups use one). Without one, as4tainr still runs, and SQL statements are refused with a message saying so.
 
 ## Not supported yet
 

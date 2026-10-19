@@ -1,6 +1,6 @@
 # Record locks
 
-Two people changing the same customer at the same time must not overwrite each other's work. IBM i prevents this with record locks, and as4tainer implements the same rules for RPG programs. They are written from IBM's public documentation of record-level access.
+Two people changing the same customer at the same time must not overwrite each other's work. IBM i prevents this with record locks, and as4tainr implements the same rules for RPG programs. They are written from IBM's public documentation of record-level access.
 
 ## The rules
 
@@ -11,7 +11,7 @@ Two people changing the same customer at the same time must not overwrite each o
 - Locks belong to the record of the **physical file**: a logical file over it sees the same locks.
 - While a job waits for a lock, `WRKACTJOB` shows it with status `LCKW`.
 
-How long a read waits is `AS4TAINER_WAITRCD` (seconds, default 60). On IBM i each file has its own `WAITRCD`; as4tainer uses one wait for every file.
+How long a read waits is `AS4TAINR_WAITRCD` (seconds, default 60). On IBM i each file has its own `WAITRCD`; as4tainr uses one wait for every file.
 
 ## Example
 

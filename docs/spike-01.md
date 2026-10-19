@@ -13,7 +13,7 @@
 | Record-level access: SETLL, SETGT, CHAIN, READ, READP, READE, READPE, WRITE, UPDATE, DELETE | Done | 12 integration tests on PostgreSQL 16 |
 | Bridge server (JSON lines over loopback TCP) | Done | Protocol round-trip test |
 | Java bridge client, no dependencies | Done | `SELFTEST`: 11 checks pass |
-| `as4tainer call`: starts the bridge, launches the JVM runner, returns its exit code | Done | `scripts/demo.sh` matches the golden outputs |
+| `as4tainr call`: starts the bridge, launches the JVM runner, returns its exit code | Done | `scripts/demo.sh` matches the golden outputs |
 | Jariko adapter (reload `DBMManager` + `DBFile`) and runner | Done | Built on Windows (JDK 21); 3 sample programs match golden output on Jariko |
 | Docker image + compose | Written, not yet built | CI job `docker` |
 
@@ -37,7 +37,7 @@ This is exactly the "plausible but wrong" failure that AI-assisted development r
 
 ## Findings from the first Jariko run
 
-1. **Jariko prints a banner on standard output.** `io.as4tainer.jvm.Launcher` now initializes Jariko with standard output pointed at standard error.
+1. **Jariko prints a banner on standard output.** `io.as4tainr.jvm.Launcher` now initializes Jariko with standard output pointed at standard error.
 2. **`%FOUND(filename)` is not implemented in Jariko v2.2.0.** The sample uses `%FOUND` with no argument instead. This is a good first upstream contribution (see fidelity-gaps.md).
 3. **Numbers on WRITE/UPDATE work.** Jariko sends plain decimal strings; -75.25 + 10.25 stored as -65.00, and -1234.56 round-trips.
 4. **DSPLY output is padded** to the message field's length; the golden comparison ignores trailing blanks.

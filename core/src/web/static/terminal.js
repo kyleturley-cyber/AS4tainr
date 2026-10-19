@@ -1,4 +1,4 @@
-// as4tainer browser 5250 terminal.
+// as4tainr browser 5250 terminal.
 // The server keeps the 5250 data stream; this page draws the screen, edits
 // input fields like a display station, and sends AID keys with the changed
 // fields. See core/src/web/mod.rs for the message format.

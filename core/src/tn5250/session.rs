@@ -1,5 +1,5 @@
 //! One interactive 5250 session: sign-on, password change, the initial
-//! program and menu, menus, command entry, and list displays. The screen texts are as4tainer's own; the layout follows
+//! program and menu, menus, command entry, and list displays. The screen texts are as4tainr's own; the layout follows
 //! common 5250 conventions (title on line 1, function keys on line 22 or
 //! 23, messages on line 24).
 
@@ -39,8 +39,8 @@ pub async fn serve(listener: tokio::net::TcpListener, cfg: ServerConfig) -> Resu
         let device = format!("QPADEV{:04}", DEVICE_SEQ.fetch_add(1, Ordering::SeqCst));
         tokio::spawn(async move {
             match run(stream, &cfg, &device).await {
-                Ok(()) => eprintln!("as4tainer: {device} ({peer}) session ended"),
-                Err(e) => eprintln!("as4tainer: {device} ({peer}) session ended: {e:#}"),
+                Ok(()) => eprintln!("as4tainr: {device} ({peer}) session ended"),
+                Err(e) => eprintln!("as4tainr: {device} ({peer}) session ended: {e:#}"),
             }
         });
     }
@@ -112,7 +112,7 @@ fn label(text: &str, width: usize) -> String {
 pub async fn run(stream: tokio::net::TcpStream, cfg: &ServerConfig, device: &str) -> Result<()> {
     let mut conn = Connection::new(stream);
     conn.negotiate().await?;
-    eprintln!("as4tainer: {device}: terminal type {}", conn.terminal_type);
+    eprintln!("as4tainr: {device}: terminal type {}", conn.terminal_type);
     let mut term = Term { conn };
     let client = bridge::connect_db(&cfg.env.database_url).await?;
     let mut message = String::new();
@@ -146,7 +146,7 @@ pub async fn run(stream: tokio::net::TcpStream, cfg: &ServerConfig, device: &str
             22,
             15,
             attr::BLUE,
-            "as4tainer - legacy RPG and 5250 applications in a container",
+            "as4tainr - legacy RPG and 5250 applications in a container",
         );
         s.message(&message);
         let inp = term.show(&s).await?;
@@ -164,7 +164,7 @@ pub async fn run(stream: tokio::net::TcpStream, cfg: &ServerConfig, device: &str
             Err(e) => {
                 attempts += 1;
                 eprintln!(
-                    "as4tainer: {device}: sign-on failed for user '{user}' ({}); password received: {}; fields modified: {:?}; cursor {:?}",
+                    "as4tainr: {device}: sign-on failed for user '{user}' ({}); password received: {}; fields modified: {:?}; cursor {:?}",
                     e,
                     describe_secret(inp.get("PASSWORD")),
                     inp.modified,

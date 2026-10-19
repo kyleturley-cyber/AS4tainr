@@ -1,1 +1,1 @@
-rootProject.name = "as4tainer-jvm"
+rootProject.name = "as4tainr-jvm"

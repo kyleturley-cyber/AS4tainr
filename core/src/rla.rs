@@ -647,12 +647,18 @@ impl OpenFile {
     // ---- writes -----------------------------------------------------------
 
     fn values_for(&self, rec: &Record, params: &mut Vec<String>) -> Result<Vec<(String, String)>> {
+        self.not_a_view()?;
         for k in rec.keys().filter(|k| k.as_str() != NULLS) {
             self.field(k)?;
         }
         let mut out = Vec::new();
         let nulls = null_fields(rec);
         for f in &self.file.file.fields {
+            // GENERATED ALWAYS: the database gives the value; the one in
+            // the record is not used.
+            if f.identity.as_ref().is_some_and(|i| i.always) {
+                continue;
+            }
             if nulls.contains(&f.name) {
                 if !f.null_capable {
                     bail!(
@@ -755,7 +761,20 @@ impl OpenFile {
         }
     }
 
+    /// Records are changed through physical and logical files; changing
+    /// them through an SQL view is not supported yet.
+    fn not_a_view(&self) -> Result<()> {
+        if self.file.file.view.is_some() {
+            bail!(
+                "File {} is an SQL view; changing records through it is not supported yet.",
+                self.file.file.name
+            );
+        }
+        Ok(())
+    }
+
     pub async fn delete(&mut self, client: &Client) -> Result<()> {
+        self.not_a_view()?;
         let rrn = self.require_current("DELETE")?;
         let n = client
             .execute(

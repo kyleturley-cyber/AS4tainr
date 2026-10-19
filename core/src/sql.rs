@@ -497,7 +497,7 @@ pub enum Outcome {
 /// The most rows one SELECT returns to a display.
 pub const MAX_ROWS: usize = 9999;
 
-fn map_error(e: &tokio_postgres::Error, sql: &str) -> anyhow::Error {
+pub(crate) fn map_error(e: &tokio_postgres::Error, sql: &str) -> anyhow::Error {
     let Some(db) = e.as_db_error() else {
         return anyhow!("SQL0901: {e}");
     };
@@ -522,6 +522,7 @@ fn map_error(e: &tokio_postgres::Error, sql: &str) -> anyhow::Error {
         "42601" => anyhow!("SQL0104: Statement not valid: {msg}."),
         "23505" => anyhow!("SQL0803: Duplicate key value: the record was not written."),
         "23514" => anyhow!("SQL0545: The row does not satisfy a check constraint: {msg}."),
+        "2BP01" => anyhow!("SQL0478: Other objects depend on this one: {msg}."),
         "23502" => anyhow!("SQL0407: Null value not allowed in a NOT NULL column: {msg}."),
         "42501" => anyhow!("SQL0551: Not authorized to an object in the statement."),
         "22P02" | "22003" => anyhow!("SQL0302: A value does not fit its column: {msg}."),
@@ -958,4 +959,86 @@ impl Session {
             Ok(Exec::Count(t.kind, n))
         }
     }
+}
+
+/// CREATE VIEW: the view's query, translated like any statement, is
+/// defined by the SQL role (which owns the view, so the query reads only
+/// what the SQL role may read). The SQL role may create objects in the
+/// library only while this runs. `columns`: the view's column names, if
+/// given. `alias`: a second name for the view (its SQL name, when it has
+/// a system name of its own).
+#[allow(clippy::too_many_arguments)]
+pub async fn create_view(
+    client: &Client,
+    database_url: &str,
+    libl: &[String],
+    library: &str,
+    name: &str,
+    alias: Option<&str>,
+    columns: &[String],
+    query: &str,
+    check_option: bool,
+) -> Result<()> {
+    let libraries = catalog::list_libraries(client).await?;
+    let t = translate(query, &|n| libraries.iter().any(|l| l == n))?;
+    if t.kind != Kind::Query {
+        bail!("SQL0104: a view is defined by a query (SELECT).");
+    }
+    let session = Session::open(client, database_url, libl).await?;
+    let me: String = client
+        .query_one("SELECT current_user::text", &[])
+        .await?
+        .get(0);
+    let schema = ident(library);
+    client
+        .batch_execute(&format!("GRANT CREATE ON SCHEMA {schema} TO {SQL_ROLE}"))
+        .await?;
+    let cols = if columns.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({})",
+            columns
+                .iter()
+                .map(|c| ident(c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let view = format!("{schema}.{}", ident(name));
+    let mut text = format!(
+        "CREATE VIEW {view}{cols} AS {}{};",
+        t.sql.trim_end().trim_end_matches(';'),
+        if check_option {
+            " WITH CASCADED CHECK OPTION"
+        } else {
+            ""
+        }
+    );
+    text.push_str(&format!(" GRANT SELECT ON {view} TO {};", ident_role(&me)));
+    if let Some(a) = alias {
+        let second = format!("{schema}.{}", ident(a));
+        text.push_str(&format!(
+            " CREATE VIEW {second} AS SELECT * FROM {view}; GRANT SELECT ON {second} TO {};",
+            ident_role(&me)
+        ));
+    }
+    let r = session
+        .client
+        .batch_execute(&format!("BEGIN; {text} COMMIT;"))
+        .await;
+    if r.is_err() {
+        let _ = session.client.batch_execute("ROLLBACK").await;
+    }
+    let revoke = client
+        .batch_execute(&format!("REVOKE CREATE ON SCHEMA {schema} FROM {SQL_ROLE}"))
+        .await;
+    r.map_err(|e| map_error(&e, &text))?;
+    revoke?;
+    Ok(())
+}
+
+/// A role name quoted as is (role names are not IBM i names).
+fn ident_role(r: &str) -> String {
+    format!("\"{}\"", r.replace('"', "\"\""))
 }

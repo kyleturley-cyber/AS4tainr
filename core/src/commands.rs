@@ -1016,10 +1016,29 @@ impl Job<'_> {
                 let w = if fd.data_type.is_numeric() {
                     // digits, decimal point, sign
                     fd.length as usize + usize::from(fd.decimals > 0) + 1
+                } else if fd.varlen {
+                    // Variable length: as wide as the longest value shown.
+                    0
                 } else {
                     fd.length as usize
                 };
                 w.max(fd.name.len())
+            })
+            .collect();
+        let widths: Vec<usize> = widths
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                if f.file.fields[i].varlen {
+                    recs.iter()
+                        .take(DSPPFM_MAX_RECORDS as usize)
+                        .map(|(_, v)| v.get(i).map(|x| x.chars().count()).unwrap_or(0))
+                        .max()
+                        .unwrap_or(0)
+                        .max(*w)
+                } else {
+                    *w
+                }
             })
             .collect();
         // Numbers (and their headings) are right-aligned, text left-aligned.

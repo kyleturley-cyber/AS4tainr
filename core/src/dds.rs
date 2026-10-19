@@ -130,6 +130,52 @@ pub struct FieldDef {
     /// system name, or DDS ALIAS. `name` is the system name.
     #[serde(default)]
     pub alias: Option<String>,
+    /// An identity column (SQL GENERATED ... AS IDENTITY).
+    #[serde(default)]
+    pub identity: Option<Identity>,
+}
+
+/// An identity column's generation (Db2 for i, CREATE TABLE).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    /// GENERATED ALWAYS (else BY DEFAULT).
+    pub always: bool,
+    pub start: Option<i64>,
+    pub increment: Option<i64>,
+    pub min: Option<i64>,
+    pub max: Option<i64>,
+    pub cycle: bool,
+}
+
+impl Identity {
+    /// The PostgreSQL column clause.
+    pub fn sql(&self) -> String {
+        let mut opts = Vec::new();
+        if let Some(n) = self.start {
+            opts.push(format!("START WITH {n}"));
+        }
+        if let Some(n) = self.increment {
+            opts.push(format!("INCREMENT BY {n}"));
+        }
+        if let Some(n) = self.min {
+            opts.push(format!("MINVALUE {n}"));
+        }
+        if let Some(n) = self.max {
+            opts.push(format!("MAXVALUE {n}"));
+        }
+        if self.cycle {
+            opts.push("CYCLE".into());
+        }
+        format!(
+            " GENERATED {} AS IDENTITY{}",
+            if self.always { "ALWAYS" } else { "BY DEFAULT" },
+            if opts.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", opts.join(" "))
+            }
+        )
+    }
 }
 
 impl FieldDef {
@@ -145,6 +191,7 @@ impl FieldDef {
             null_capable: false,
             default: None,
             alias: None,
+            identity: None,
         }
     }
 
@@ -326,6 +373,10 @@ pub struct PhysicalFile {
     /// Key fields in descending order (DESCEND on the K line).
     #[serde(default)]
     pub descending: Vec<String>,
+    /// An SQL view (a logical file defined by a query): Some(true) when
+    /// its rows have the record number of a single underlying table.
+    #[serde(default)]
+    pub view: Option<bool>,
 }
 
 impl PhysicalFile {
@@ -653,6 +704,7 @@ pub fn parse_pf(file_name: &str, source: &str) -> Result<PhysicalFile> {
         fields: Vec::new(),
         keys: Vec::new(),
         descending: Vec::new(),
+        view: None,
     };
 
     for (idx, raw) in source.lines().enumerate() {

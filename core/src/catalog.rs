@@ -74,6 +74,18 @@ BEGIN
     ALTER TABLE as4tainr.file_keys ADD COLUMN descending boolean NOT NULL DEFAULT false;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='file_fields' AND column_name='identity') THEN
+    ALTER TABLE as4tainr.file_fields ADD COLUMN IF NOT EXISTS identity text;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='files' AND column_name='view') THEN
+    ALTER TABLE as4tainr.files ADD COLUMN IF NOT EXISTS view text;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='files' AND column_name='view_def') THEN
+    ALTER TABLE as4tainr.files ADD COLUMN IF NOT EXISTS view_def text;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
                  WHERE table_schema='as4tainr' AND table_name='file_fields' AND column_name='alias') THEN
     ALTER TABLE as4tainr.file_fields ADD COLUMN IF NOT EXISTS alias text;
     ALTER TABLE as4tainr.files ADD COLUMN IF NOT EXISTS sql_name text;
@@ -140,7 +152,16 @@ pub struct FileRef {
 
 impl FileRef {
     pub fn table(&self) -> String {
-        format!("{}.{}", ident(&self.library), ident(&self.file.name))
+        match self.file.view {
+            // An SQL view whose rows have no record number of their own:
+            // they are numbered in the order the view returns them.
+            Some(false) => format!(
+                "(SELECT row_number() OVER () AS rrn, v.* FROM {}.{} AS v)",
+                ident(&self.library),
+                ident(&self.file.name)
+            ),
+            _ => format!("{}.{}", ident(&self.library), ident(&self.file.name)),
+        }
     }
 }
 
@@ -576,8 +597,8 @@ pub async fn create_physical_file(
         let len = f.length as i32;
         let dec = f.decimals as i32;
         tx.execute(
-            "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+            "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
             &[
                 &lib,
                 &name,
@@ -591,6 +612,7 @@ pub async fn create_physical_file(
                 &f.null_capable,
                 &f.default.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
                 &f.alias,
+                &f.identity.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
             ],
         )
         .await?;
@@ -620,7 +642,10 @@ pub async fn create_physical_file(
             f.sql_type(),
             coll,
             if f.null_capable { "" } else { " NOT NULL" },
-            f.default_clause()
+            match &f.identity {
+                Some(i) => i.sql(),
+                None => f.default_clause(),
+            }
         ));
     }
     let table = format!("{}.{}", ident(&lib), ident(&name));
@@ -899,6 +924,7 @@ pub async fn create_logical_file(
         fields: fields.clone(),
         keys: lf.keys.clone(),
         descending: lf.descending.clone(),
+        view: None,
     };
 
     let tx = client.transaction().await?;
@@ -935,8 +961,8 @@ pub async fn create_logical_file(
     for (i, f) in fields.iter().enumerate() {
         let (seq, len, dec) = (i as i32, f.length as i32, f.decimals as i32);
         tx.execute(
-            "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+            "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
             &[
                 &lib,
                 &name,
@@ -950,6 +976,7 @@ pub async fn create_logical_file(
                 &f.null_capable,
                 &f.default.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
                 &f.alias,
+                &f.identity.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
             ],
         )
         .await?;
@@ -1042,7 +1069,7 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
         let row = client
             .query_opt(
                 "SELECT format, is_unique, (SELECT text FROM as4tainr.objects o
-                    WHERE o.library=f.library AND o.name=f.name AND o.objtype='*FILE')
+                    WHERE o.library=f.library AND o.name=f.name AND o.objtype='*FILE'), view
                  FROM as4tainr.files f WHERE library=$1 AND name=$2",
                 &[lib, &name],
             )
@@ -1050,7 +1077,7 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
         let Some(row) = row else { continue };
         let fields = client
             .query(
-                "SELECT name, data_type, length, decimals, text, varlen, null_capable, dft, alias FROM as4tainr.file_fields
+                "SELECT name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity FROM as4tainr.file_fields
                  WHERE library=$1 AND file=$2 ORDER BY seq",
                 &[lib, &name],
             )
@@ -1069,6 +1096,9 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
                         .get::<_, Option<&str>>(7)
                         .and_then(|d| serde_json::from_str(d).ok()),
                     alias: r.get(8),
+                    identity: r
+                        .get::<_, Option<&str>>(9)
+                        .and_then(|d| serde_json::from_str(d).ok()),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1094,6 +1124,7 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
                 fields,
                 keys,
                 descending,
+                view: row.get::<_, Option<String>>(3).map(|v| v == "RRN"),
             },
         });
     }
@@ -1126,7 +1157,14 @@ pub async fn delete_file(
         bail!("CPF2105: File {name} in library {lib} not found.");
     };
     let attribute: String = row.get(0);
-    let over: Vec<(String, String)> = tx
+    let is_view = tx
+        .query_opt(
+            "SELECT 1 FROM as4tainr.files WHERE library=$1 AND name=$2 AND view IS NOT NULL",
+            &[&lib, &name],
+        )
+        .await?
+        .is_some();
+    let mut over: Vec<(String, String)> = tx
         .query(
             "SELECT library, name FROM as4tainr.logical_files WHERE pf_library=$1 AND pf_name=$2 ORDER BY 1, 2",
             &[&lib, &name],
@@ -1135,6 +1173,9 @@ pub async fn delete_file(
         .iter()
         .map(|r| (r.get(0), r.get(1)))
         .collect();
+    // SQL views built over this file (any view in PostgreSQL that uses
+    // it, other than the view giving a table its SQL name).
+    over.extend(sql_views_over(&tx, &lib, &name).await?);
     if !over.is_empty() && !dependents {
         bail!(
             "CPF3203: File {name} in library {lib} cannot be deleted: logical file {}/{} is built over it.",
@@ -1142,6 +1183,7 @@ pub async fn delete_file(
             over[0].1
         );
     }
+    let _ = is_view;
     let mut drop = over;
     drop.push((lib.clone(), name.clone()));
     for (l, n) in &drop {
@@ -1152,7 +1194,18 @@ pub async fn delete_file(
             )
             .await?;
         let qualified = format!("{}.{}", ident(l), ident(n));
+        let view = tx
+            .query_opt(
+                "SELECT 1 FROM as4tainr.files WHERE library=$1 AND name=$2 AND view IS NOT NULL",
+                &[l, n],
+            )
+            .await?
+            .is_some();
         match (&lf, attribute.as_str()) {
+            _ if view => {
+                tx.batch_execute(&format!("DROP VIEW IF EXISTS {qualified} CASCADE"))
+                    .await?;
+            }
             (Some(r), _) => {
                 // The view, and the indexes on the physical file's table.
                 let pf_lib: String = r.get(0);
@@ -1327,4 +1380,203 @@ pub async fn add_unique_constraint(
         ))
         .await?;
     Ok(())
+}
+
+/// The SQL views (catalog files with a query) that use a file, found in
+/// PostgreSQL's dependencies; views of views are found too, also through
+/// the view that gives a table its SQL name.
+async fn sql_views_over(
+    tx: &tokio_postgres::Transaction<'_>,
+    library: &str,
+    name: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: Vec<(String, String)> = Vec::new();
+    // PostgreSQL schema and relation names (lower case).
+    let mut todo = vec![(library.to_ascii_lowercase(), name.to_ascii_lowercase())];
+    while let Some((s, r)) = todo.pop() {
+        let rows = tx
+            .query(
+                "SELECT DISTINCT n.nspname::text, v.relname::text, f.library, f.name
+                   FROM pg_depend d
+                   JOIN pg_rewrite w ON w.oid = d.objid
+                   JOIN pg_class v ON v.oid = w.ev_class
+                   JOIN pg_namespace n ON n.oid = v.relnamespace
+                   LEFT JOIN as4tainr.files f
+                     ON lower(f.library) = n.nspname AND lower(f.name) = v.relname AND f.view IS NOT NULL
+                  WHERE d.refobjid = to_regclass(format('%I.%I', $1::text, $2::text))
+                    AND v.oid <> d.refobjid",
+                &[&s, &r],
+            )
+            .await?;
+        for row in rows {
+            let k: (String, String) = (row.get(0), row.get(1));
+            if seen.contains(&k) {
+                continue;
+            }
+            seen.push(k.clone());
+            todo.push(k);
+            if let (Some(l), Some(n)) = (
+                row.get::<_, Option<String>>(2),
+                row.get::<_, Option<String>>(3),
+            ) {
+                out.push((l, n));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// An SQL view as a file: its description from the PostgreSQL view's
+/// columns (types mapped to their DDS equivalents), not keyed.
+pub async fn register_view(
+    client: &mut Client,
+    library: &str,
+    name: &str,
+    format: &str,
+    def: &crate::ddl::ViewDef,
+) -> Result<()> {
+    let lib = validate_name("library", library)?;
+    let name = validate_name("file", name)?;
+    let cols = client
+        .query(
+            "SELECT column_name::text, data_type::text, character_maximum_length, numeric_precision, numeric_scale
+               FROM information_schema.columns
+              WHERE table_schema = lower($1) AND table_name = lower($2)
+              ORDER BY ordinal_position",
+            &[&lib, &name],
+        )
+        .await?;
+    let mut fields: Vec<FieldDef> = Vec::new();
+    let mut has_rrn = false;
+    for c in &cols {
+        let col: String = c.get(0);
+        if col == "rrn" {
+            has_rrn = true;
+            continue;
+        }
+        let ty: String = c.get(1);
+        let len: Option<i32> = c.get(2);
+        let prec: Option<i32> = c.get(3);
+        let scale: Option<i32> = c.get(4);
+        let (t, l, d, varlen) = match ty.as_str() {
+            "character" => (DataType::Char, len.unwrap_or(1) as u32, 0, false),
+            "character varying" => (DataType::Char, len.unwrap_or(32740) as u32, 0, true),
+            // Text without a length (expressions): the longest VARCHAR.
+            "text" => (DataType::Char, 32740, 0, true),
+            "smallint" => (DataType::Binary, 4, 0, false),
+            "integer" => (DataType::Binary, 9, 0, false),
+            "bigint" => (DataType::Binary, 18, 0, false),
+            "numeric" => (
+                DataType::Packed,
+                prec.unwrap_or(31) as u32,
+                scale.unwrap_or(0) as u32,
+                false,
+            ),
+            "date" => (DataType::Date, 10, 0, false),
+            "time without time zone" => (DataType::Time, 8, 0, false),
+            "timestamp without time zone" => (DataType::Timestamp, 26, 0, false),
+            other => bail!("SQL0084: a view column of type {other} ({col}) is not supported yet."),
+        };
+        // A column name that is not a valid system name gets a generated
+        // one (Db2 for i: first five characters and a number).
+        let upper = col.to_ascii_uppercase();
+        let (sys, alias) = if validate_name("column", &upper).is_ok() {
+            (upper.clone(), None)
+        } else {
+            let sys = crate::ddl::generated_name(&upper, &|c| {
+                fields.iter().any(|f| f.is_named(c))
+                    || cols
+                        .iter()
+                        .any(|o| o.get::<_, String>(0).eq_ignore_ascii_case(c))
+            })?;
+            (sys, Some(upper.clone()))
+        };
+        let mut f = FieldDef::new(&sys, t, l, d);
+        f.varlen = varlen;
+        f.null_capable = true;
+        f.alias = alias;
+        fields.push(f);
+    }
+    let tx = client.transaction().await?;
+    tx.execute(
+        "INSERT INTO as4tainr.objects (library, name, objtype, attribute, text) VALUES ($1,$2,'*FILE','LF','')",
+        &[&lib, &name],
+    )
+    .await?;
+    let view = if has_rrn { "RRN" } else { "NORRN" };
+    tx.execute(
+        "INSERT INTO as4tainr.files (library, name, format, is_unique, view, view_def) VALUES ($1,$2,$3,false,$4,$5)",
+        &[&lib, &name, &format, &view, &serde_json::to_string(def)?],
+    )
+    .await?;
+    for (i, f) in fields.iter().enumerate() {
+        let (seq, len, dec) = (i as i32, f.length as i32, f.decimals as i32);
+        tx.execute(
+            "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,'',$8,$9,NULL,$10)",
+            &[&lib, &name, &seq, &f.name, &f.data_type.code(), &len, &dec, &f.varlen, &f.null_capable, &f.alias],
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The SQL views (catalog files) that use a column of a table, also
+/// through the view that gives the table its SQL name.
+pub async fn views_using_column(
+    client: &Client,
+    library: &str,
+    table: &str,
+    field: &FieldDef,
+) -> Result<Vec<(String, String)>> {
+    let col = crate::catalog::pg_name(field.alias.as_deref().unwrap_or(&field.name));
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut todo = vec![(library.to_ascii_lowercase(), table.to_ascii_lowercase())];
+    while let Some((s, r)) = todo.pop() {
+        let rows = client
+            .query(
+                "SELECT DISTINCT n.nspname::text, v.relname::text, f.library, f.name
+                   FROM pg_depend d
+                   JOIN pg_rewrite w ON w.oid = d.objid
+                   JOIN pg_class v ON v.oid = w.ev_class
+                   JOIN pg_namespace n ON n.oid = v.relnamespace
+                   JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+                   LEFT JOIN as4tainr.files f
+                     ON lower(f.library) = n.nspname AND lower(f.name) = v.relname AND f.view IS NOT NULL
+                  WHERE d.refobjid = to_regclass(format('%I.%I', $1::text, $2::text))
+                    AND a.attname = $3 AND v.oid <> d.refobjid",
+                &[&s, &r, &col],
+            )
+            .await?;
+        for row in rows {
+            let k: (String, String) = (row.get(0), row.get(1));
+            if seen.contains(&k) {
+                continue;
+            }
+            seen.push(k.clone());
+            todo.push(k);
+            if let (Some(l), Some(n)) = (
+                row.get::<_, Option<String>>(2),
+                row.get::<_, Option<String>>(3),
+            ) {
+                out.push((l, n));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The SQL views (catalog files) built over a file, directly or not.
+pub async fn views_over(
+    client: &mut Client,
+    library: &str,
+    name: &str,
+) -> Result<Vec<(String, String)>> {
+    let tx = client.transaction().await?;
+    let v = sql_views_over(&tx, library, name).await?;
+    tx.commit().await?;
+    Ok(v)
 }

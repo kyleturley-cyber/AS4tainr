@@ -19,7 +19,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | Path | What |
 | --- | --- |
 | `core/src/dds.rs` | DDS parser: physical files (R, K lines with `DESCEND`, fields A/P/S/B/L/T/Z, `UNIQUE`, `TEXT`, `VARLEN`, `ALWNULL`, `DFT`) and logical files (`PFILE`, field subsets, keys, select/omit); a field's PostgreSQL type, default and external text form |
-| `core/src/ddl.rs` | SQL data definition (CREATE TABLE/INDEX, DROP, LABEL ON, SET SCHEMA) parsed into file descriptions, never passed on; RUNSQLSTM's statement splitting |
+| `core/src/ddl.rs` | SQL data definition (CREATE TABLE/INDEX/VIEW, ALTER TABLE, DROP, LABEL ON, SET SCHEMA) parsed into file descriptions, never passed on (a view's query is translated and defined by the restricted SQL login, `sql::create_view`); system names for long SQL names; RUNSQLSTM's statement splitting |
 | `core/src/catalog.rs` | Libraries = PostgreSQL schemas; file descriptions in schema `as4tainr`; library list resolution |
 | `core/src/rla.rs` | Record-level access: cursor position per open file, keyset queries ordered by (keys, rrn), record locks (advisory locks on the physical file + rrn) |
 | `core/src/sql.rs` | SQL in the DB2 for i dialect: translation to PostgreSQL, run on a separate connection as the restricted `as4tainr_sql` login |

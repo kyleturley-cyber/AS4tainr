@@ -3079,3 +3079,161 @@ async fn sql_long_names() {
         );
     }
 }
+
+/// Views, identity columns and ALTER TABLE (Db2 for i SQL Reference):
+/// an identity column GENERATED ALWAYS (START WITH 1000 INCREMENT BY 5)
+/// numbers rows 1000, 1005, ...; a record written by a program gets the
+/// next value too (the database generates it; the program's value is not
+/// used). A view is a logical file a program reads; its rows are the
+/// query's. ALTER TABLE ADD COLUMN gives existing rows the default; ADD
+/// CHECK constrains later changes (SQL0545); SET DATA TYPE keeps the
+/// values; DROP COLUMN RESTRICT is refused while a view uses the column
+/// (SQL0478) and CASCADE (the default) drops that view; DROP TABLE drops
+/// the views over the table.
+#[tokio::test]
+async fn sql_views_identity_and_alter() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+    };
+    let script = "
+        CREATE TABLE ORDERS (
+          ORDER_ID INTEGER GENERATED ALWAYS AS IDENTITY (START WITH 1000 INCREMENT BY 5),
+          CUSTOMER_NAME VARCHAR(30) NOT NULL,
+          AMOUNT DECIMAL(9, 2) NOT NULL DEFAULT 0,
+          PRIMARY KEY (ORDER_ID));
+        INSERT INTO ORDERS (CUSTOMER_NAME, AMOUNT) VALUES ('Ada', 10);
+        INSERT INTO ORDERS (CUSTOMER_NAME, AMOUNT) VALUES ('Grace', 250);
+        CREATE VIEW BIG_ORDERS AS SELECT ORDER_ID, CUSTOMER_NAME, AMOUNT FROM ORDERS WHERE AMOUNT > 100;
+        ALTER TABLE ORDERS ADD COLUMN STATUS CHAR(1) NOT NULL DEFAULT 'O';
+        ALTER TABLE ORDERS ADD CONSTRAINT STATUS_OK CHECK (STATUS IN ('O', 'C'));
+        ALTER TABLE ORDERS ALTER COLUMN AMOUNT SET DATA TYPE DECIMAL(11, 2);
+    ";
+    let lines = job
+        .run_sql_script(script, "test", 10, None, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        lines.last().unwrap(),
+        "7 statements run from test; 0 with errors."
+    );
+    let sql = |s: String| {
+        let (url, lib) = (url.clone(), lib.clone());
+        async move {
+            as4tainr_core::sql::run(&runtime::connect_db(&url).await.unwrap(), &url, &[lib], &s)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+    let rows = |o: as4tainr_core::sql::Outcome| match o {
+        as4tainr_core::sql::Outcome::Rows { rows, .. } => rows,
+        other => panic!("{other:?}"),
+    };
+    let e = sql("UPDATE ORDERS SET STATUS = 'X'".into())
+        .await
+        .unwrap_err();
+    assert!(e.starts_with("SQL0545"), "{e}");
+
+    // A program writes an order (the identity is generated) and reads the
+    // view.
+    let run = |name: &str, src: &str| {
+        rpg::call(
+            &url,
+            vec![lib.clone()],
+            "QSECOFR".into(),
+            None,
+            None,
+            None,
+            name.into(),
+            src.into(),
+            vec![],
+        )
+    };
+    // ORDERS's record format is ORDERS (the table's system name), so the
+    // program renames it (ILE RPG: a record format cannot have the file's
+    // name); CUSTOMER_NAME's system name is CUSTO00001.
+    let r = run("IDW", "**FREE\ndcl-f orders usage(*output) rename(orders:ordr);\norder_id = 1;\ncusto00001 = 'Edsger';\namount = 500;\nstatus = 'C';\nwrite ordr;\n*inlr = *on;\n").await.unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        rows(
+            sql(
+                "SELECT ORDER_ID, CUSTOMER_NAME, AMOUNT, STATUS FROM ORDERS ORDER BY ORDER_ID"
+                    .into()
+            )
+            .await
+            .unwrap()
+        ),
+        vec![
+            vec!["1000", "Ada", "10.00", "O"],
+            vec!["1005", "Grace", "250.00", "O"],
+            vec!["1010", "Edsger", "500.00", "C"],
+        ]
+    );
+    let r = run("VIEWR", "**FREE\ndcl-f big_orders alias;\nread big_orders;\ndow not %eof(big_orders);\n  dsply (%char(order_id) + ' ' + %trim(customer_name) + ' ' + %char(amount));\n  read big_orders;\nenddo;\n*inlr = *on;\n").await.unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let mut got = r.messages.clone();
+    got.sort();
+    assert_eq!(got, ["1005 Grace 250.00", "1010 Edsger 500.00"]);
+
+    // DROP COLUMN: RESTRICT refused while the view uses the column;
+    // CASCADE drops the view.
+    let e = job
+        .run_sql_script(
+            "ALTER TABLE ORDERS DROP COLUMN AMOUNT RESTRICT;",
+            "t",
+            10,
+            None,
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("SQL0478"), "{e}");
+    job.run_sql_script("ALTER TABLE ORDERS DROP CONSTRAINT STATUS_OK; ALTER TABLE ORDERS DROP COLUMN STATUS RESTRICT; ALTER TABLE ORDERS DROP COLUMN AMOUNT;", "t", 10, None, true)
+        .await
+        .unwrap();
+    assert!(
+        !catalog::object_exists(&client, std::slice::from_ref(&lib), "BIG_O00001", "*FILE")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        rows(
+            sql("SELECT * FROM ORDERS ORDER BY ORDER_ID".into())
+                .await
+                .unwrap()
+        ),
+        vec![
+            vec!["1000", "Ada"],
+            vec!["1005", "Grace"],
+            vec!["1010", "Edsger"]
+        ]
+    );
+    // DROP TABLE takes the views over it.
+    job.run_sql_script(
+        "CREATE VIEW ADA AS SELECT * FROM ORDERS WHERE CUSTOMER_NAME = 'Ada'; DROP TABLE ORDERS;",
+        "t",
+        10,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !catalog::object_exists(&client, std::slice::from_ref(&lib), "ADA", "*FILE")
+            .await
+            .unwrap()
+    );
+}

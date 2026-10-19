@@ -71,8 +71,27 @@ pub enum Ddl {
         name: Name,
         if_exists: bool,
     },
+    CreateView {
+        name: Name,
+        /// FOR SYSTEM NAME
+        system: Option<String>,
+        replace: bool,
+        /// Column names given after the view name.
+        columns: Vec<String>,
+        /// The query, as written.
+        query: String,
+        check_option: bool,
+        format: Option<String>,
+    },
+    AlterTable {
+        table: Name,
+        action: Alter,
+    },
     /// LABEL ON TABLE / INDEX / VIEW: the object's text.
-    LabelObject { name: Name, text: String },
+    LabelObject {
+        name: Name,
+        text: String,
+    },
     /// LABEL ON COLUMN with TEXT IS: the fields' text. Column headings
     /// (plain `IS`) are not kept.
     LabelColumns {
@@ -111,6 +130,10 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
                 Some("INDEX") if !replace => {
                     p.i += 1;
                     create_index(&mut p, unique)?
+                }
+                Some("VIEW") if !unique => {
+                    // The query is taken from the statement's text.
+                    return create_view(sql, replace).map(Some);
                 }
                 Some(other) => {
                     bail!("SQL0084: CREATE {other} is not supported yet.")
@@ -186,7 +209,12 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
             };
             Ddl::SetSchema(validate_name("library", &schema).map_err(sql0104)?)
         }
-        "ALTER" | "RENAME" | "TRUNCATE" | "GRANT" | "REVOKE" => {
+        "ALTER" => {
+            p.i += 1;
+            p.expect("TABLE")?;
+            alter_table(&mut p)?
+        }
+        "RENAME" | "TRUNCATE" | "GRANT" | "REVOKE" => {
             bail!("SQL0084: {first} is not supported yet.")
         }
         _ => return Ok(None),
@@ -234,8 +262,8 @@ fn sql0104(e: anyhow::Error) -> anyhow::Error {
 fn show(t: &Tok) -> String {
     match t {
         Tok::Space(s) | Tok::Word(s) | Tok::Number(s) | Tok::Punct(s) => s.clone(),
-        Tok::Str(s) => format!("'{s}'"),
-        Tok::Quoted(s) => format!("\"{s}\""),
+        Tok::Str(s) => quote(s),
+        Tok::Quoted(s) => format!("\"{}\"", s.replace('"', "\"\"")),
     }
 }
 
@@ -607,6 +635,78 @@ fn check_sql(toks: &[Tok], fields: &[FieldDef]) -> Result<String> {
     Ok(s)
 }
 
+/// GENERATED ALWAYS | BY DEFAULT AS IDENTITY [(options)], after
+/// GENERATED (Db2 for i, CREATE TABLE): only integers and decimals with no
+/// decimal places can be identity columns.
+fn identity(p: &mut P, f: &FieldDef) -> Result<crate::dds::Identity> {
+    let always = if p.eat("ALWAYS") {
+        true
+    } else {
+        p.expect("BY")?;
+        p.expect("DEFAULT")?;
+        false
+    };
+    if !p.eat("AS") || !p.eat("IDENTITY") {
+        bail!("SQL0084: GENERATED columns other than identity columns (row change timestamps, expressions) are not supported yet.");
+    }
+    if !(f.data_type.is_numeric() && f.decimals == 0) {
+        bail!("SQL0574: Identity column {} must be an integer or a decimal number with no decimal places.", f.name);
+    }
+    let mut id = crate::dds::Identity {
+        always,
+        start: None,
+        increment: None,
+        min: None,
+        max: None,
+        cycle: false,
+    };
+    let int = |p: &mut P| -> Result<i64> {
+        let neg = p.punct("-");
+        match p.next() {
+            Some(Tok::Number(n)) => {
+                let v: i64 = n
+                    .parse()
+                    .map_err(|_| anyhow!("SQL0104: {n} is not an integer."))?;
+                Ok(if neg { -v } else { v })
+            }
+            _ => bail!("SQL0104: an integer is expected."),
+        }
+    };
+    if p.punct("(") {
+        loop {
+            if p.eat("START") {
+                p.expect("WITH")?;
+                id.start = Some(int(p)?);
+            } else if p.eat("INCREMENT") {
+                p.expect("BY")?;
+                id.increment = Some(int(p)?);
+            } else if p.eat("MINVALUE") {
+                id.min = Some(int(p)?);
+            } else if p.eat("MAXVALUE") {
+                id.max = Some(int(p)?);
+            } else if p.eat("CYCLE") {
+                id.cycle = true;
+            } else if p.eat("CACHE") {
+                // Caching changes performance only.
+                int(p)?;
+            } else if p.eat("NO") {
+                // NO MINVALUE, NO MAXVALUE, NO CYCLE, NO CACHE, NO ORDER
+                let _ = p.eat("MINVALUE")
+                    || p.eat("MAXVALUE")
+                    || p.eat("CYCLE")
+                    || p.eat("CACHE")
+                    || p.eat("ORDER");
+            } else if p.eat("ORDER") {
+            } else {
+                break;
+            }
+            let _ = p.punct(",");
+        }
+        p.expect_punct(")")?;
+    }
+    Ok(id)
+}
+
 fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
     let name = p.name()?;
     let system = if p.eat("FOR") {
@@ -725,7 +825,9 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
                     } else if p.eat("CCSID") {
                         p.number()?;
                     } else if p.eat("GENERATED") {
-                        bail!("SQL0084: GENERATED columns (identity, row change timestamp, expressions) are not supported yet.");
+                        f.identity = Some(identity(p, &f)?);
+                        f.null_capable = false;
+                        f.default = None;
                     } else if p.eat("REFERENCES") {
                         bail!("SQL0084: REFERENCES constraints are not supported yet.");
                     } else if p.eat("IMPLICITLY") {
@@ -836,11 +938,322 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
             fields,
             keys: Vec::new(),
             descending: Vec::new(),
+            view: None,
         },
         name,
         replace,
         uniques,
         checks,
+    })
+}
+
+/// What ALTER TABLE does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Alter {
+    /// ADD COLUMN: the field (its system name may be renumbered when the
+    /// column is added), its unique and check constraints.
+    AddColumn {
+        field: FieldDef,
+        uniques: Uniques,
+        checks: Checks,
+    },
+    /// ADD PRIMARY KEY / UNIQUE (columns as written).
+    AddUnique {
+        name: String,
+        primary: bool,
+        columns: Vec<String>,
+    },
+    /// ADD CHECK: the condition's tokens, checked against the table.
+    AddCheck {
+        name: Option<String>,
+        condition: String,
+    },
+    DropColumn {
+        column: String,
+        cascade: bool,
+    },
+    /// DROP PRIMARY KEY (name PK), DROP CONSTRAINT / UNIQUE / CHECK name.
+    DropConstraint {
+        name: String,
+    },
+    AlterColumn {
+        column: String,
+        change: ColumnChange,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColumnChange {
+    /// SET DATA TYPE: (type, length or digits, decimals, varying).
+    DataType(DataType, u32, u32, bool),
+    SetDefault(FieldDefault),
+    DropDefault,
+    SetNotNull,
+    DropNotNull,
+}
+
+/// ALTER TABLE name action (Db2 for i SQL Reference, ALTER TABLE): one
+/// action per statement.
+fn alter_table(p: &mut P) -> Result<Ddl> {
+    let table = p.name()?;
+    let action = if p.eat("ADD") {
+        let constraint = if p.eat("CONSTRAINT") {
+            Some(p.field()?)
+        } else {
+            None
+        };
+        match p.word().as_deref() {
+            Some("PRIMARY") | Some("UNIQUE") => {
+                let primary = p.eat("PRIMARY");
+                if primary {
+                    p.expect("KEY")?;
+                } else {
+                    p.i += 1;
+                }
+                p.expect_punct("(")?;
+                let mut columns = Vec::new();
+                loop {
+                    columns.push(p.field()?);
+                    if !p.punct(",") {
+                        break;
+                    }
+                }
+                p.expect_punct(")")?;
+                Alter::AddUnique {
+                    name: constraint.unwrap_or_else(|| {
+                        if primary {
+                            "PK".into()
+                        } else {
+                            format!("U_{}", columns.join("_"))
+                        }
+                    }),
+                    primary,
+                    columns,
+                }
+            }
+            Some("CHECK") => {
+                p.i += 1;
+                p.expect_punct("(")?;
+                let toks = p.group()?;
+                Alter::AddCheck {
+                    name: constraint,
+                    condition: toks.iter().map(show).collect::<Vec<_>>().join(" "),
+                }
+            }
+            Some("FOREIGN") => bail!("SQL0084: FOREIGN KEY constraints are not supported yet."),
+            _ if constraint.is_some() => bail!("SQL0104: a constraint is expected{}.", p.at()),
+            _ => {
+                let _ = p.eat("COLUMN");
+                // The column definition, read as CREATE TABLE reads one.
+                let rest: Vec<String> = p.t[p.i..].iter().map(show).collect();
+                p.i = p.t.len();
+                if rest.iter().any(|w| w.eq_ignore_ascii_case("BEFORE")) {
+                    bail!("SQL0084: ADD COLUMN ... BEFORE is not supported yet.");
+                }
+                let text = format!("CREATE TABLE X ({})", rest.join(" "));
+                let Some(Ddl::CreateTable {
+                    file,
+                    uniques,
+                    checks,
+                    ..
+                }) = parse(&text)?
+                else {
+                    bail!("SQL0104: a column definition is expected.");
+                };
+                let [field] = file.fields.as_slice() else {
+                    bail!("SQL0104: ADD COLUMN adds one column.");
+                };
+                Alter::AddColumn {
+                    field: field.clone(),
+                    uniques,
+                    checks,
+                }
+            }
+        }
+    } else if p.eat("DROP") {
+        if p.eat("PRIMARY") {
+            p.expect("KEY")?;
+            Alter::DropConstraint { name: "PK".into() }
+        } else if p.eat("CONSTRAINT") || p.eat("UNIQUE") || p.eat("CHECK") {
+            Alter::DropConstraint { name: p.field()? }
+        } else if p.eat("FOREIGN") {
+            bail!("SQL0084: FOREIGN KEY constraints are not supported yet.");
+        } else {
+            let _ = p.eat("COLUMN");
+            let column = p.field()?;
+            // CASCADE is the default (Db2 for i, ALTER TABLE DROP COLUMN).
+            let cascade = !p.eat("RESTRICT");
+            let _ = p.eat("CASCADE");
+            Alter::DropColumn { column, cascade }
+        }
+    } else if p.eat("ALTER") {
+        let _ = p.eat("COLUMN");
+        let column = p.field()?;
+        let change = if p.eat("SET") {
+            if p.eat("DATA") {
+                p.expect("TYPE")?;
+                let (t, l, d, v) = data_type(p)?;
+                ColumnChange::DataType(t, l, d, v)
+            } else if p.eat("NOT") {
+                p.expect("NULL")?;
+                ColumnChange::SetNotNull
+            } else {
+                let _ = p.eat("WITH");
+                p.expect("DEFAULT")?;
+                // The value is checked against the column when it runs.
+                let rest: Vec<String> = p.t[p.i..].iter().map(show).collect();
+                p.i = p.t.len();
+                ColumnChange::SetDefault(FieldDefault::Value(rest.join(" ")))
+            }
+        } else if p.eat("DROP") {
+            if p.eat("DEFAULT") {
+                ColumnChange::DropDefault
+            } else {
+                p.expect("NOT")?;
+                p.expect("NULL")?;
+                ColumnChange::DropNotNull
+            }
+        } else {
+            bail!("SQL0084: this ALTER COLUMN change is not supported yet.");
+        };
+        Alter::AlterColumn { column, change }
+    } else {
+        bail!("SQL0084: this ALTER TABLE action is not supported yet.");
+    };
+    Ok(Ddl::AlterTable { table, action })
+}
+
+/// Top-level words of a statement with their byte offsets (outside
+/// constants, quoted names, comments and parentheses).
+fn top_words(sql: &str) -> Vec<(usize, String)> {
+    let b: Vec<(usize, char)> = sql.char_indices().collect();
+    let mut out = Vec::new();
+    let (mut i, mut depth) = (0, 0i32);
+    while i < b.len() {
+        let c = b[i].1;
+        if c == '\'' || c == '"' {
+            i += 1;
+            while i < b.len() && b[i].1 != c {
+                i += 1;
+            }
+            i += 1;
+        } else if c == '-' && b.get(i + 1).map(|x| x.1) == Some('-') {
+            while i < b.len() && b[i].1 != '\n' {
+                i += 1;
+            }
+        } else if c == '(' {
+            depth += 1;
+            i += 1;
+        } else if c == ')' {
+            depth -= 1;
+            i += 1;
+        } else if c.is_alphanumeric() || "_$#@".contains(c) {
+            let start = i;
+            while i < b.len() && (b[i].1.is_alphanumeric() || "_$#@".contains(b[i].1)) {
+                i += 1;
+            }
+            if depth == 0 {
+                let w: String = b[start..i].iter().map(|x| x.1).collect();
+                out.push((b[start].0, w.to_ascii_uppercase()));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// CREATE [OR REPLACE] VIEW name [FOR SYSTEM NAME s] [(columns)] AS query
+/// [WITH [CASCADED | LOCAL] CHECK OPTION] [RCDFMT name].
+fn create_view(sql: &str, replace: bool) -> Result<Ddl> {
+    let words = top_words(sql);
+    let Some(k) = words.iter().position(|(_, w)| w == "VIEW") else {
+        bail!("SQL0104: VIEW expected.");
+    };
+    let Some(as_at) = words[k + 1..]
+        .iter()
+        .position(|(_, w)| w == "AS")
+        .map(|j| j + k + 1)
+    else {
+        bail!("SQL0104: AS and a query are expected in CREATE VIEW.");
+    };
+    // The head: VIEW name [FOR SYSTEM NAME s] [(columns)].
+    let head = &sql[words[k].0 + 4..words[as_at].0];
+    let toks: Vec<Tok> = tokenize(head)?
+        .into_iter()
+        .filter(|t| !matches!(t, Tok::Space(_)))
+        .collect();
+    let mut p = P { t: toks, i: 0 };
+    let name = p.name()?;
+    let system = if p.eat("FOR") {
+        p.expect("SYSTEM")?;
+        p.expect("NAME")?;
+        Some(p.system_name("view")?)
+    } else {
+        None
+    };
+    let mut columns = Vec::new();
+    if p.punct("(") {
+        loop {
+            columns.push(p.field()?);
+            if !p.punct(",") {
+                break;
+            }
+        }
+        p.expect_punct(")")?;
+    }
+    if let Some(t) = p.t.get(p.i) {
+        bail!("SQL0104: Token {} not valid here.", show(t));
+    }
+    // The tail: WITH ... CHECK OPTION, RCDFMT name.
+    let mut end = sql.trim_end().trim_end_matches(';').len();
+    let mut format = None;
+    let mut check_option = false;
+    let tail: Vec<&(usize, String)> = words[as_at + 1..].iter().collect();
+    if let Some(r) = tail.iter().rposition(|(_, w)| w == "RCDFMT") {
+        let (at, _) = tail[r];
+        let rest: Vec<Tok> = tokenize(&sql[*at + 6..end])?
+            .into_iter()
+            .filter(|t| !matches!(t, Tok::Space(_)))
+            .collect();
+        let mut q = P { t: rest, i: 0 };
+        format = Some(q.system_name("record format")?);
+        if q.t.get(q.i).is_some() {
+            bail!("SQL0104: RCDFMT must end the statement.");
+        }
+        end = *at;
+    }
+    let ws: Vec<&String> = tail
+        .iter()
+        .filter(|(o, _)| *o < end)
+        .map(|(_, w)| w)
+        .collect();
+    if ws.len() >= 3 && ws[ws.len() - 2] == "CHECK" && ws[ws.len() - 1] == "OPTION" {
+        let w = tail
+            .iter()
+            .filter(|(o, _)| *o < end)
+            .rev()
+            .find(|(_, w)| w == "WITH")
+            .map(|(o, _)| *o)
+            .ok_or_else(|| anyhow!("SQL0104: WITH CHECK OPTION expected."))?;
+        if tail.iter().any(|(o, x)| *o > w && *o < end && x == "LOCAL") {
+            bail!("SQL0084: WITH LOCAL CHECK OPTION is not supported yet.");
+        }
+        check_option = true;
+        end = w;
+    }
+    let query = sql[words[as_at].0 + 2..end].trim().to_string();
+    if query.is_empty() {
+        bail!("SQL0104: a query is expected after AS.");
+    }
+    Ok(Ddl::CreateView {
+        name,
+        system,
+        replace,
+        columns,
+        query,
+        check_option,
+        format,
     })
 }
 
@@ -1001,6 +1414,8 @@ pub struct Ctx<'a> {
     pub user: &'a str,
     pub libl: &'a [String],
     pub curlib: Option<String>,
+    /// For CREATE VIEW (a connection as the SQL role).
+    pub database_url: String,
     /// SET SCHEMA (or RUNSQLSTM DFTRDBCOL): the library for unqualified
     /// names instead of the current library and the library list.
     pub schema: Option<String>,
@@ -1210,6 +1625,58 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
                 }
             ))
         }
+        Ddl::CreateView {
+            name,
+            system,
+            replace,
+            columns,
+            query,
+            check_option,
+            format,
+        } => {
+            let lib = ctx.target(name);
+            if !catalog::library_exists(ctx.client, &lib).await? {
+                bail!("SQL0204: Schema {lib} not found.");
+            }
+            let here = Name {
+                lib: Some(lib.clone()),
+                name: name.name.clone(),
+            };
+            if let Some((_, _, sys)) = ctx.find(&here).await? {
+                let is_view = catalog::resolve_file(ctx.client, std::slice::from_ref(&lib), &sys)
+                    .await
+                    .map(|f| f.file.view.is_some())
+                    .unwrap_or(false);
+                if !replace || !is_view {
+                    bail!("SQL0601: {} in {lib} type *FILE already exists.", name.name);
+                }
+                ctx.may_delete(&lib, &sys).await?;
+                catalog::delete_file(ctx.client, &lib, &sys, true).await?;
+            }
+            let sys = ctx.new_system_name(&lib, name, system).await?;
+            // The query runs with the job's library list (or the default
+            // schema) for unqualified names.
+            let libl = match &ctx.schema {
+                Some(s) => vec![s.clone()],
+                None => ctx.libl.to_vec(),
+            };
+            let def = ViewDef {
+                sql_name: name.name.clone(),
+                query: query.clone(),
+                columns: columns.clone(),
+                check_option: *check_option,
+                format: format.clone(),
+                libl,
+            };
+            let url = ctx.database_url.clone();
+            make_view(ctx.client, &url, &lib, &sys, &def, ctx.user).await?;
+            Ok(if sys == name.name {
+                format!("View {sys} created in {lib}.")
+            } else {
+                format!("View {} created in {lib} (system name {sys}).", name.name)
+            })
+        }
+        Ddl::AlterTable { table, action } => alter(ctx, table, action).await,
         Ddl::Drop {
             kind,
             name,
@@ -1221,9 +1688,14 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
                 }
                 return Err(not_found(name, &kind.to_ascii_lowercase()));
             };
+            let is_view = catalog::resolve_file(ctx.client, std::slice::from_ref(&lib), &sys)
+                .await
+                .map(|f| f.file.view.is_some())
+                .unwrap_or(false);
             let fits = match *kind {
                 "TABLE" => attr == "PF",
-                _ => attr == "LF",
+                "VIEW" => attr == "LF" && is_view,
+                _ => attr == "LF" && !is_view,
             };
             if !fits {
                 bail!(
@@ -1277,6 +1749,7 @@ pub async fn try_run(
         user,
         libl,
         curlib,
+        database_url: database_url.to_string(),
         schema: schema.clone(),
     };
     let msg = run(&mut ctx, &ddl).await?;
@@ -1342,6 +1815,501 @@ pub fn split_statements(script: &str) -> Vec<String> {
         out.push(cur.trim().to_string());
     }
     out
+}
+
+fn db(e: tokio_postgres::Error) -> anyhow::Error {
+    crate::sql::map_error(&e, "")
+}
+
+/// What a view was created from: kept with the view, so that it can be
+/// made again when the tables under it change (Db2 for i recreates
+/// dependent views on ALTER TABLE).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ViewDef {
+    pub sql_name: String,
+    pub query: String,
+    pub columns: Vec<String>,
+    pub check_option: bool,
+    pub format: Option<String>,
+    /// The library list the query's unqualified names were found in.
+    pub libl: Vec<String>,
+}
+
+/// Create a view and describe it as a file.
+async fn make_view(
+    client: &mut Client,
+    url: &str,
+    lib: &str,
+    sys: &str,
+    def: &ViewDef,
+    owner: &str,
+) -> Result<()> {
+    let alias = (sys != def.sql_name).then_some(def.sql_name.as_str());
+    crate::sql::create_view(
+        client,
+        url,
+        &def.libl,
+        lib,
+        sys,
+        alias,
+        &def.columns,
+        &def.query,
+        def.check_option,
+    )
+    .await?;
+    let registered = async {
+        catalog::register_view(client, lib, sys, def.format.as_deref().unwrap_or(sys), def).await?;
+        if let Some(a) = alias {
+            catalog::set_sql_name(client, lib, sys, a, false).await?;
+        }
+        authority::set_owner(client, lib, sys, "*FILE", owner).await
+    }
+    .await;
+    if let Err(e) = registered {
+        let _ = client
+            .batch_execute(&format!(
+                "DROP VIEW IF EXISTS {}.{} CASCADE",
+                ident(lib),
+                ident(sys)
+            ))
+            .await;
+        let _ = catalog::delete_file(client, lib, sys, true).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// The views over a table, with what they were made from, in the order
+/// they can be made again (a view before the views over it).
+async fn views_to_rebuild(
+    client: &mut Client,
+    lib: &str,
+    sys: &str,
+) -> Result<Vec<(String, String, ViewDef, String)>> {
+    let mut out = Vec::new();
+    for (l, n) in catalog::views_over(client, lib, sys).await? {
+        let r = client
+            .query_one(
+                "SELECT f.view_def, o.owner FROM as4tainr.files f
+                   JOIN as4tainr.objects o ON o.library=f.library AND o.name=f.name AND o.objtype='*FILE'
+                  WHERE f.library=$1 AND f.name=$2",
+                &[&l, &n],
+            )
+            .await?;
+        let def: Option<String> = r.get(0);
+        let Some(def) = def.and_then(|d| serde_json::from_str::<ViewDef>(&d).ok()) else {
+            continue;
+        };
+        out.push((l, n, def, r.get(1)));
+    }
+    Ok(out)
+}
+
+/// Make again the view that gives a table its SQL name (it lists the
+/// table's columns, so it follows a change of columns).
+async fn remake_alias(c: &Client, view: &Option<String>, tbl: &str) -> Result<()> {
+    if let Some(v) = view {
+        // A new column comes last: the view can be replaced in place,
+        // keeping the views built over it.
+        if c.batch_execute(&format!(
+            "CREATE OR REPLACE VIEW {v} AS SELECT * FROM {tbl}"
+        ))
+        .await
+        .is_err()
+        {
+            c.batch_execute(&format!(
+                "DROP VIEW IF EXISTS {v}; CREATE VIEW {v} AS SELECT * FROM {tbl}"
+            ))
+            .await
+            .map_err(db)?;
+        }
+    }
+    Ok(())
+}
+
+/// ALTER TABLE.
+async fn alter(ctx: &mut Ctx<'_>, table: &Name, action: &Alter) -> Result<String> {
+    let Some((lib, attr, sys)) = ctx.find(table).await? else {
+        return Err(not_found(table, "table"));
+    };
+    let f = catalog::resolve_file(ctx.client, std::slice::from_ref(&lib), &sys).await?;
+    if attr != "PF" || f.file.view.is_some() {
+        bail!("SQL0156: {} is not a table.", table.name);
+    }
+    ctx.may_delete(&lib, &sys).await?;
+    let tbl = format!("{}.{}", ident(&lib), ident(&sys));
+    let alias: Option<String> = ctx
+        .client
+        .query_one(
+            "SELECT sql_name FROM as4tainr.files WHERE library=$1 AND name=$2",
+            &[&lib, &sys],
+        )
+        .await?
+        .get(0);
+    let fields = f.file.fields.clone();
+    let field = |c: &str| -> Result<FieldDef> {
+        fields
+            .iter()
+            .find(|x| x.is_named(c))
+            .cloned()
+            .ok_or_else(|| anyhow!("SQL0205: Column {c} not in table {}.", table.name))
+    };
+    // The view giving the table its SQL name lists the table's columns:
+    // it is made again after the columns change.
+    let alias_view = alias
+        .as_ref()
+        .map(|a| format!("{}.{}", ident(&lib), ident(a)));
+    match action {
+        Alter::AddColumn {
+            field: new,
+            uniques,
+            checks,
+        } => {
+            let mut new = new.clone();
+            let mut uniques = uniques.clone();
+            if let Some(a) = new.alias.clone() {
+                if fields.iter().any(|x| x.is_named(&a)) {
+                    bail!("SQL0612: {a} is a duplicate column name.");
+                }
+                // A generated system name is numbered among the table's
+                // columns.
+                if fields.iter().any(|x| x.is_named(&new.name)) && new.name.ends_with("00001") {
+                    let old = new.name.clone();
+                    new.name = generated_name(&a, &|c| fields.iter().any(|x| x.is_named(c)))?;
+                    for (_, cols) in uniques.iter_mut() {
+                        for c in cols.iter_mut() {
+                            if *c == old {
+                                *c = new.name.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            if fields.iter().any(|x| x.is_named(&new.name)) {
+                bail!("SQL0612: {} is a duplicate column name.", new.name);
+            }
+            let tx = ctx.client.transaction().await?;
+            let seq = fields.len() as i32;
+            tx.execute(
+                "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,'',$8,$9,$10,$11,$12)",
+                &[
+                    &lib,
+                    &sys,
+                    &seq,
+                    &new.name,
+                    &new.data_type.code(),
+                    &(new.length as i32),
+                    &(new.decimals as i32),
+                    &new.varlen,
+                    &new.null_capable,
+                    &new.default.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
+                    &new.alias,
+                    &new.identity.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
+                ],
+            )
+            .await?;
+            let coll = if new.data_type == DataType::Char {
+                " COLLATE \"C\""
+            } else {
+                ""
+            };
+            tx.batch_execute(&format!(
+                "ALTER TABLE {tbl} ADD COLUMN {} {}{coll}{}{}",
+                new.column(),
+                new.sql_type(),
+                if new.null_capable { "" } else { " NOT NULL" },
+                match &new.identity {
+                    Some(i) => i.sql(),
+                    None => new.default_clause(),
+                }
+            ))
+            .await
+            .map_err(db)?;
+            tx.commit().await?;
+            constraints(ctx.client, &lib, &sys, &uniques, checks).await?;
+            remake_alias(ctx.client, &alias_view, &tbl).await?;
+            Ok(format!(
+                "Column {} added to {}.",
+                new.alias.as_ref().unwrap_or(&new.name),
+                table.name
+            ))
+        }
+        Alter::AddUnique {
+            name,
+            primary,
+            columns,
+        } => {
+            let mut cols = Vec::new();
+            for c in columns {
+                let fd = field(c)?;
+                if *primary && fd.null_capable {
+                    bail!("SQL0542: Column {c} of a primary key must be NOT NULL.");
+                }
+                cols.push(fd.name);
+            }
+            constraints(ctx.client, &lib, &sys, &[(name.clone(), cols)], &[]).await?;
+            Ok(format!("Constraint {name} added to {}.", table.name))
+        }
+        Alter::AddCheck { name, condition } => {
+            let toks: Vec<Tok> = tokenize(condition)?
+                .into_iter()
+                .filter(|t| !matches!(t, Tok::Space(_)))
+                .collect();
+            let cond = check_sql(&toks, &fields)?;
+            let cname = name
+                .clone()
+                .unwrap_or_else(|| format!("C_{}", std::process::id() % 100000));
+            constraints(ctx.client, &lib, &sys, &[], &[(cname.clone(), cond)]).await?;
+            Ok(format!("Check constraint {cname} added to {}.", table.name))
+        }
+        Alter::DropConstraint { name } => {
+            let obj = format!("{sys}_{name}");
+            let index = format!("{}.{}", ident(&lib), ident(&obj));
+            let is_index = ctx
+                .client
+                .query_one("SELECT to_regclass($1) IS NOT NULL", &[&index])
+                .await?
+                .get::<_, bool>(0);
+            if is_index {
+                ctx.client
+                    .batch_execute(&format!("DROP INDEX {index}"))
+                    .await
+                    .map_err(db)?;
+            } else {
+                let found = ctx
+                    .client
+                    .query_opt(
+                        "SELECT 1 FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+                           JOIN pg_namespace n ON n.oid = t.relnamespace
+                          WHERE n.nspname = lower($1) AND t.relname = lower($2) AND c.conname = lower($3)",
+                        &[&lib, &sys, &obj],
+                    )
+                    .await?
+                    .is_some();
+                if !found {
+                    bail!("SQL0204: Constraint {name} not found for {}.", table.name);
+                }
+                ctx.client
+                    .batch_execute(&format!(
+                        "ALTER TABLE {tbl} DROP CONSTRAINT {}",
+                        ident(&obj)
+                    ))
+                    .await
+                    .map_err(db)?;
+            }
+            Ok(format!("Constraint {name} dropped from {}.", table.name))
+        }
+        Alter::DropColumn { column, cascade } => {
+            let fd = field(column)?;
+            if fields.len() == 1 {
+                bail!(
+                    "SQL0195: The last column of {} cannot be dropped.",
+                    table.name
+                );
+            }
+            if f.file.keys.contains(&fd.name) {
+                bail!(
+                    "SQL0084: dropping a key field of a keyed physical file is not supported yet."
+                );
+            }
+            // Logical files and SQL views that use the column.
+            let mut users: Vec<(String, String)> = ctx
+                .client
+                .query(
+                    "SELECT DISTINCT l.library, l.name FROM as4tainr.logical_files l
+                       JOIN as4tainr.file_fields ff ON ff.library = l.library AND ff.file = l.name
+                      WHERE l.pf_library = $1 AND l.pf_name = $2 AND ff.name = $3",
+                    &[&lib, &sys, &fd.name],
+                )
+                .await?
+                .iter()
+                .map(|r| (r.get(0), r.get(1)))
+                .collect();
+            users.extend(catalog::views_using_column(ctx.client, &lib, &sys, &fd).await?);
+            if !cascade {
+                // RESTRICT: no constraint or index may use the column either.
+                let used = ctx
+                    .client
+                    .query_opt(
+                        "SELECT 1 FROM pg_attribute a
+                          WHERE a.attrelid = to_regclass(format('%I.%I', lower($1), lower($2)))
+                            AND a.attname = $3
+                            AND (EXISTS (SELECT 1 FROM pg_constraint c
+                                          WHERE c.conrelid = a.attrelid AND a.attnum = ANY(c.conkey))
+                              OR EXISTS (SELECT 1 FROM pg_index i
+                                          WHERE i.indrelid = a.attrelid AND a.attnum = ANY(i.indkey::int2[])))",
+                        &[&lib, &sys, &catalog::pg_name(fd.alias.as_deref().unwrap_or(&fd.name))],
+                    )
+                    .await?
+                    .is_some();
+                if used {
+                    bail!("SQL0478: Column {column} cannot be dropped: a constraint or index uses it.");
+                }
+            }
+            if let Some((l, n)) = users.first() {
+                if !cascade {
+                    bail!("SQL0478: Column {column} cannot be dropped: {l}/{n} uses it.");
+                }
+            }
+            // The views over the table go, and those that do not use the
+            // column are made again afterwards (the others are dropped with
+            // the column, with the views over them).
+            let views = views_to_rebuild(ctx.client, &lib, &sys).await?;
+            for (l, n) in users
+                .iter()
+                .cloned()
+                .chain(views.iter().map(|(l, n, _, _)| (l.clone(), n.clone())))
+            {
+                if catalog::object_exists(ctx.client, std::slice::from_ref(&l), &n, "*FILE").await?
+                {
+                    catalog::delete_file(ctx.client, &l, &n, true).await?;
+                }
+            }
+            let tx = ctx.client.transaction().await?;
+            tx.batch_execute(&format!(
+                "ALTER TABLE {tbl} DROP COLUMN {} CASCADE",
+                fd.column()
+            ))
+            .await
+            .map_err(db)?;
+            let seq: i32 = tx
+                .query_one(
+                    "DELETE FROM as4tainr.file_fields WHERE library=$1 AND file=$2 AND name=$3 RETURNING seq",
+                    &[&lib, &sys, &fd.name],
+                )
+                .await?
+                .get(0);
+            tx.execute(
+                "UPDATE as4tainr.file_fields SET seq = seq - 1 WHERE library=$1 AND file=$2 AND seq > $3",
+                &[&lib, &sys, &seq],
+            )
+            .await?;
+            tx.commit().await?;
+            remake_alias(ctx.client, &alias_view, &tbl).await?;
+            let url = ctx.database_url.clone();
+            let mut gone: Vec<(String, String)> = users.clone();
+            for (l, n, def, owner) in &views {
+                if gone.contains(&(l.clone(), n.clone())) {
+                    continue;
+                }
+                if make_view(ctx.client, &url, l, n, def, owner).await.is_err() {
+                    gone.push((l.clone(), n.clone()));
+                }
+            }
+            Ok(format!("Column {column} dropped from {}.", table.name))
+        }
+        Alter::AlterColumn { column, change } => {
+            let fd = field(column)?;
+            let mut nf = fd.clone();
+            let col = fd.column();
+            let pg = match change {
+                ColumnChange::DataType(t, l, d, v) => {
+                    nf.data_type = *t;
+                    nf.length = *l;
+                    nf.decimals = *d;
+                    nf.varlen = *v;
+                    if fd.data_type.is_numeric() != t.is_numeric() && fd.data_type != *t {
+                        // Character and number columns do not convert.
+                        if fd.data_type == DataType::Char || *t == DataType::Char {
+                            bail!("SQL0408: Column {column} cannot change between character and numeric types.");
+                        }
+                    }
+                    format!(
+                        "ALTER TABLE {tbl} ALTER COLUMN {col} TYPE {} USING {col}::{}",
+                        nf.sql_type(),
+                        nf.sql_type()
+                    )
+                }
+                ColumnChange::SetDefault(FieldDefault::Value(text)) => {
+                    let toks: Vec<Tok> = tokenize(text)?
+                        .into_iter()
+                        .filter(|t| !matches!(t, Tok::Space(_)))
+                        .collect();
+                    let mut q = P { t: toks, i: 0 };
+                    nf.default = Some(default_value(&mut q, &fd)?);
+                    if let Some(t) = q.t.get(q.i) {
+                        bail!("SQL0104: Token {} not valid here.", show(t));
+                    }
+                    let clause = nf.default_clause();
+                    format!("ALTER TABLE {tbl} ALTER COLUMN {col} SET{clause}")
+                }
+                ColumnChange::SetDefault(_) => unreachable!("parsed as a value"),
+                ColumnChange::DropDefault => {
+                    nf.default = if fd.null_capable {
+                        None
+                    } else {
+                        Some(FieldDefault::Required)
+                    };
+                    format!("ALTER TABLE {tbl} ALTER COLUMN {col} DROP DEFAULT")
+                }
+                ColumnChange::SetNotNull => {
+                    nf.null_capable = false;
+                    if nf.default.is_none() {
+                        nf.default = Some(FieldDefault::Required);
+                    }
+                    format!("ALTER TABLE {tbl} ALTER COLUMN {col} SET NOT NULL")
+                }
+                ColumnChange::DropNotNull => {
+                    nf.null_capable = true;
+                    format!("ALTER TABLE {tbl} ALTER COLUMN {col} DROP NOT NULL")
+                }
+            };
+            let retype = matches!(change, ColumnChange::DataType(..));
+            // Changing a column's type: the views over the table are made
+            // again afterwards.
+            let views = if retype {
+                let v = views_to_rebuild(ctx.client, &lib, &sys).await?;
+                for (l, n, _, _) in &v {
+                    if catalog::object_exists(ctx.client, std::slice::from_ref(l), n, "*FILE")
+                        .await?
+                    {
+                        catalog::delete_file(ctx.client, l, n, true).await?;
+                    }
+                }
+                v
+            } else {
+                Vec::new()
+            };
+            let tx = ctx.client.transaction().await?;
+            if retype {
+                if let Some(v) = &alias_view {
+                    tx.batch_execute(&format!("DROP VIEW IF EXISTS {v}"))
+                        .await
+                        .map_err(db)?;
+                }
+            }
+            tx.batch_execute(&pg).await.map_err(db)?;
+            // The field, in the table and in the logical files over it.
+            tx.execute(
+                "UPDATE as4tainr.file_fields ff SET data_type=$4, length=$5, decimals=$6, varlen=$7, null_capable=$8, dft=$9
+                  WHERE ff.name=$3 AND ((ff.library=$1 AND ff.file=$2) OR EXISTS (
+                    SELECT 1 FROM as4tainr.logical_files l
+                     WHERE l.library=ff.library AND l.name=ff.file AND l.pf_library=$1 AND l.pf_name=$2))",
+                &[
+                    &lib,
+                    &sys,
+                    &fd.name,
+                    &nf.data_type.code(),
+                    &(nf.length as i32),
+                    &(nf.decimals as i32),
+                    &nf.varlen,
+                    &nf.null_capable,
+                    &nf.default.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
+                ],
+            )
+            .await?;
+            tx.commit().await?;
+            if retype {
+                remake_alias(ctx.client, &alias_view, &tbl).await?;
+            }
+            let url = ctx.database_url.clone();
+            for (l, n, def, owner) in &views {
+                make_view(ctx.client, &url, l, n, def, owner).await?;
+            }
+            Ok(format!("Column {column} of {} changed.", table.name))
+        }
+    }
 }
 
 /// A new table's unique and check constraints.
@@ -1456,9 +2424,9 @@ mod tests {
     fn unsupported_definitions_say_so() {
         for sql in [
             "CREATE TABLE T (A FLOAT)",
-            "CREATE TABLE T (A INT GENERATED ALWAYS AS IDENTITY)",
-            "CREATE VIEW V AS SELECT 1 FROM T",
-            "ALTER TABLE T ADD COLUMN B INT",
+            "CREATE TABLE T (A INT GENERATED ALWAYS AS (B + 1))",
+            "CREATE VIEW V AS SELECT 1 FROM T WITH LOCAL CHECK OPTION",
+            "ALTER TABLE T ADD COLUMN B INT BEFORE A",
             "CREATE TABLE \"lower\" (A INT)",
         ] {
             let e = parse(sql).unwrap_err().to_string();
@@ -1502,6 +2470,38 @@ mod tests {
             generated_name("CUSTOMER_MASTER", &|c| c == "CUSTO00001").unwrap(),
             "CUSTO00002"
         );
+    }
+
+    #[test]
+    fn views_and_identity_columns() {
+        // CREATE VIEW: the query is kept as written; WITH CHECK OPTION
+        // and RCDFMT come after it (Db2 for i SQL Reference, CREATE VIEW).
+        assert_eq!(
+            parse("CREATE OR REPLACE VIEW BIG_ORDERS (NUM, AMT) AS SELECT ORDNO, AMOUNT FROM ORDERS WHERE AMOUNT > 100 WITH CHECK OPTION RCDFMT BIGR").unwrap(),
+            Some(Ddl::CreateView {
+                name: Name { lib: None, name: "BIG_ORDERS".into() },
+                system: None,
+                replace: true,
+                columns: vec!["NUM".into(), "AMT".into()],
+                query: "SELECT ORDNO, AMOUNT FROM ORDERS WHERE AMOUNT > 100".into(),
+                check_option: true,
+                format: Some("BIGR".into()),
+            })
+        );
+        // Identity columns: integers or decimals with no decimal places,
+        // ALWAYS or BY DEFAULT, with START WITH and INCREMENT BY.
+        let (f, _, _) = table(
+            "CREATE TABLE T (ID INTEGER GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10), N INT GENERATED BY DEFAULT AS IDENTITY)",
+        );
+        assert_eq!(
+            f.fields[0].identity.as_ref().unwrap().sql(),
+            " GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10)"
+        );
+        assert_eq!(
+            f.fields[1].identity.as_ref().unwrap().sql(),
+            " GENERATED BY DEFAULT AS IDENTITY"
+        );
+        assert!(parse("CREATE TABLE T (X DECIMAL(5,2) GENERATED ALWAYS AS IDENTITY)").is_err());
     }
 
     #[test]

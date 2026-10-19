@@ -70,7 +70,27 @@ CREATE TABLE IF NOT EXISTS ibmish.logical_files (
 /// Quote an SQL identifier. Object names are validated before use, but we
 /// still quote everything that reaches dynamic SQL.
 pub fn ident(s: &str) -> String {
-    format!("\"{}\"", s.to_ascii_lowercase().replace('"', "\"\""))
+    format!("\"{}\"", pg_name(s).replace('"', "\"\""))
+}
+
+/// PostgreSQL's system column names. A field can have one of these names
+/// on IBM i (CTID: a contact ID), so in PostgreSQL it is stored with a `~`
+/// in front, a character IBM i names cannot contain.
+const PG_SYSTEM_COLUMNS: &[&str] = &["tableoid", "xmin", "cmin", "xmax", "cmax", "ctid", "oid"];
+
+/// The name ibmish uses in PostgreSQL for an IBM i name.
+pub fn pg_name(s: &str) -> String {
+    let l = s.to_ascii_lowercase();
+    if PG_SYSTEM_COLUMNS.contains(&l.as_str()) {
+        format!("~{l}")
+    } else {
+        l
+    }
+}
+
+/// The IBM i name of a PostgreSQL column (upper case).
+pub fn ibm_name(pg: &str) -> String {
+    pg.trim_start_matches('~').to_ascii_uppercase()
 }
 
 /// IBM i object names: 1-10 chars, start with A-Z, $, # or @; then also
@@ -135,6 +155,10 @@ pub async fn init(client: &Client) -> Result<()> {
             .context("creating catalog")?;
         client
             .batch_execute(crate::menus::DDL)
+            .await
+            .context("creating catalog")?;
+        client
+            .batch_execute(crate::source::DDL)
             .await
             .context("creating catalog")?;
         client
@@ -245,6 +269,20 @@ pub async fn create_cl_program(
     source: &str,
     replace: bool,
 ) -> Result<()> {
+    create_program(client, library, name, "CLLE", text, source, replace).await
+}
+
+/// Keep a program's source as a *PGM object with this attribute (CLLE,
+/// CLP, RPGLE): what CRTBNDCL, CRTCLPGM and CRTBNDRPG create.
+pub async fn create_program(
+    client: &mut Client,
+    library: &str,
+    name: &str,
+    attribute: &str,
+    text: &str,
+    source: &str,
+    replace: bool,
+) -> Result<()> {
     let lib = validate_name("library", library)?;
     let name = validate_name("program", name)?;
     let tx = client.transaction().await?;
@@ -279,13 +317,13 @@ pub async fn create_cl_program(
     )
     .await?;
     tx.execute(
-        "INSERT INTO ibmish.objects (library, name, objtype, attribute, text) VALUES ($1,$2,'*PGM','CLLE',$3)",
-        &[&lib, &name, &text],
+        "INSERT INTO ibmish.objects (library, name, objtype, attribute, text) VALUES ($1,$2,'*PGM',$4,$3)",
+        &[&lib, &name, &text, &attribute],
     )
     .await?;
     tx.execute(
-        "INSERT INTO ibmish.programs VALUES ($1,$2,'CLLE',$3)",
-        &[&lib, &name, &source],
+        "INSERT INTO ibmish.programs VALUES ($1,$2,$4,$3)",
+        &[&lib, &name, &source, &attribute],
     )
     .await?;
     tx.commit().await?;
@@ -298,15 +336,39 @@ pub async fn find_cl_program(
     libs: &[String],
     name: &str,
 ) -> Result<Option<(String, String)>> {
+    Ok(find_program(client, libs, name)
+        .await?
+        .filter(|p| p.attribute == "CLLE" || p.attribute == "CLP")
+        .map(|p| (p.library, p.source)))
+}
+
+/// A program object (*PGM) kept by ibmish.
+#[derive(Debug, Clone)]
+pub struct Program {
+    pub library: String,
+    pub name: String,
+    /// CLLE, CLP or RPGLE.
+    pub attribute: String,
+    pub source: String,
+}
+
+/// The first program of this name in a list of libraries.
+pub async fn find_program(client: &Client, libs: &[String], name: &str) -> Result<Option<Program>> {
+    let name = name.to_ascii_uppercase();
     for lib in libs {
         if let Some(r) = client
             .query_opt(
-                "SELECT source FROM ibmish.programs WHERE library=$1 AND name=$2",
+                "SELECT attribute, source FROM ibmish.programs WHERE library=$1 AND name=$2",
                 &[lib, &name],
             )
             .await?
         {
-            return Ok(Some((lib.clone(), r.get(0))));
+            return Ok(Some(Program {
+                library: lib.clone(),
+                name,
+                attribute: r.get(0),
+                source: r.get(1),
+            }));
         }
     }
     Ok(None)

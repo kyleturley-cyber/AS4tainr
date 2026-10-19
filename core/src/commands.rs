@@ -135,6 +135,10 @@ impl Job<'_> {
             "DSPUSRPRF" => self.dspusrprf(&cmd).await,
             "CHGUSRPRF" => self.chgusrprf(&cmd).await,
             "GO" => self.go(&cmd).await,
+            "CRTSRCPF" => self.crtsrcpf(&cmd).await,
+            "DSPFD" => self.dspfd(&cmd).await,
+            "CRTPF" | "CRTLF" | "CRTDSPF" => self.crtfile(&cmd).await,
+            "CRTBNDCL" | "CRTCLPGM" | "CRTBNDRPG" => self.crtpgm(&cmd).await,
             "CRTMNU" => self.crtmnu(&cmd).await,
             "DLTMNU" => self.dltmnu(&cmd).await,
             "DLTUSRPRF" => self.dltusrprf(&cmd).await,
@@ -476,6 +480,167 @@ impl Job<'_> {
         )]))
     }
 
+    /// A qualified name to create: LIB/NAME, *CURLIB/NAME or NAME (the
+    /// current library).
+    fn create_target(&self, q: &str) -> (String, String) {
+        match q.split_once('/') {
+            Some(("*CURLIB", n)) => (self.current_library(), n.to_string()),
+            Some((l, n)) => (l.to_string(), n.to_string()),
+            None => (self.current_library(), q.to_string()),
+        }
+    }
+
+    /// The libraries a qualified name is looked for in, and the name.
+    fn search(&self, q: &str) -> (Vec<String>, String) {
+        match q.split_once('/') {
+            Some(("*LIBL", n)) => (self.library_list(), n.to_string()),
+            Some(("*CURLIB", n)) => (vec![self.current_library()], n.to_string()),
+            Some((l, n)) => (vec![l.to_string()], n.to_string()),
+            None => (self.library_list(), q.to_string()),
+        }
+    }
+
+    /// SRCFILE and SRCMBR of a create command (SRCMBR(*FILE), (*PGM): the
+    /// member named like the object).
+    async fn source_member(&self, cmd: &Command, object: &str) -> Result<crate::source::Member> {
+        let (libs, file) = self.search(cmd.get("SRCFILE"));
+        let member = match cmd.get("SRCMBR") {
+            "*FILE" | "*PGM" => object.to_string(),
+            m => m.to_string(),
+        };
+        let m = crate::source::find_member(self.client, &libs, &file, &member).await?;
+        authority::check(
+            self.client,
+            &self.user,
+            &m.library,
+            &m.file,
+            "*FILE",
+            Aut::Use,
+        )
+        .await?;
+        Ok(m)
+    }
+
+    async fn crtsrcpf(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = self.create_target(cmd.get("FILE"));
+        number(cmd.get("RCDLEN"), "RCDLEN")?;
+        crate::source::create_file(self.client, &lib, &name, cmd.get("TEXT")).await?;
+        let name = name.to_ascii_uppercase();
+        authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Source file {name} created in library {lib}."
+        )]))
+    }
+
+    /// DSPFD TYPE(*MBRLIST) of a source file.
+    async fn dspfd(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (libs, name) = self.search(cmd.get("FILE"));
+        let name = name.to_ascii_uppercase();
+        let mut found = None;
+        for l in &libs {
+            if crate::source::is_source_file(self.client, l, &name).await? {
+                found = Some(l.clone());
+                break;
+            }
+        }
+        let Some(lib) = found else {
+            bail!("CPF9812: File {name} in library *LIBL not found, or it is not a source file (DSPFD shows the members of source files only).");
+        };
+        authority::check(self.client, &self.user, &lib, &name, "*FILE", Aut::Use).await?;
+        let members = crate::source::members(self.client, &lib, &name).await?;
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display File Description".into(),
+            info: vec![
+                ("File".into(), name.clone()),
+                ("Library".into(), lib.clone()),
+                ("Members".into(), members.len().to_string()),
+            ],
+            heading: format!("{:<10}  {:<10}  Text", "Member", "Type"),
+            rows: members
+                .iter()
+                .map(|(m, t, x)| format!("{m:<10}  {t:<10}  {x}"))
+                .collect(),
+            ..Default::default()
+        }))
+    }
+
+    /// CRTPF, CRTLF, CRTDSPF from a source member.
+    async fn crtfile(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = self.create_target(cmd.get("FILE"));
+        let lib = lib.to_ascii_uppercase();
+        let name = name.to_ascii_uppercase();
+        let m = self.source_member(cmd, &name).await?;
+        let mut c = bridge::connect_db(&self.env.database_url).await?;
+        let msg = match cmd.def.name {
+            "CRTPF" => {
+                let pf = crate::dds::parse_pf(&name, &m.source)?;
+                catalog::create_physical_file(&mut c, &lib, &pf).await?;
+                format!("File {name} created in library {lib}.")
+            }
+            "CRTLF" => {
+                let lf = crate::dds::parse_lf(&name, &m.source)?;
+                catalog::create_logical_file(&mut c, &self.library_list(), &lib, &lf).await?;
+                format!("File {name} created in library {lib} over {}.", lf.based_on)
+            }
+            _ => {
+                catalog::create_display_file(&mut c, &lib, &name, &m.source).await?;
+                format!("Display file {name} created in library {lib}.")
+            }
+        };
+        authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
+        Ok(Outcome::Messages(vec![msg]))
+    }
+
+    /// CRTBNDCL, CRTCLPGM, CRTBNDRPG from a source member. CL is checked
+    /// here; RPG is checked by the runner when the program is called.
+    async fn crtpgm(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = self.create_target(cmd.get("PGM"));
+        let lib = lib.to_ascii_uppercase();
+        let name = name.to_ascii_uppercase();
+        let m = self.source_member(cmd, &name).await?;
+        let attribute = match cmd.def.name {
+            "CRTBNDCL" => "CLLE",
+            "CRTCLPGM" => "CLP",
+            _ => "RPGLE",
+        };
+        if attribute == "RPGLE" && m.srctype == "RPG" {
+            bail!(
+                "Member {} is RPG/400 (RPG III) source; RPG III is not supported yet.",
+                m.name
+            );
+        }
+        // CL: includes are part of the program; then it is checked.
+        let source = if attribute == "RPGLE" {
+            m.source.clone()
+        } else {
+            let src =
+                crate::source::expand_cl_includes(self.client, &self.library_list(), &m.source)
+                    .await?;
+            crate::clpgm::compile(&name, &src)?;
+            src
+        };
+        let text = match cmd.get("TEXT") {
+            "*SRCMBRTXT" => m.text.clone(),
+            "*BLANK" => String::new(),
+            t => t.to_string(),
+        };
+        let replace = cmd.get("REPLACE") != "*NO";
+        if let Some(p) =
+            catalog::find_program(self.client, std::slice::from_ref(&lib), &name).await?
+        {
+            if !replace {
+                bail!("Program {name} in library {lib} already exists (REPLACE(*NO)).");
+            }
+            authority::check(self.client, &self.user, &p.library, &name, "*PGM", Aut::All).await?;
+        }
+        let mut c = bridge::connect_db(&self.env.database_url).await?;
+        catalog::create_program(&mut c, &lib, &name, attribute, &text, &source, replace).await?;
+        authority::set_owner(self.client, &lib, &name, "*PGM", &self.user).await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Program {name} created in library {lib}."
+        )]))
+    }
+
     /// GO: find the menu; the display shows it.
     async fn go(&mut self, cmd: &Command) -> Result<Outcome> {
         let menu = crate::menus::find(self.client, cmd.get("MENU"), &self.library_list()).await?;
@@ -615,6 +780,49 @@ impl Job<'_> {
     }
 
     async fn dsppfm(&mut self, cmd: &Command) -> Result<Outcome> {
+        // A source file: the lines of a member.
+        {
+            let (libs, file) = self.search(cmd.get("FILE"));
+            let file = file.to_ascii_uppercase();
+            for l in &libs {
+                if !crate::source::is_source_file(self.client, l, &file).await? {
+                    continue;
+                }
+                authority::check(self.client, &self.user, l, &file, "*FILE", Aut::Use).await?;
+                let member = match cmd.get("MBR") {
+                    "*FIRST" => crate::source::members(self.client, l, &file)
+                        .await?
+                        .first()
+                        .map(|m| m.0.clone())
+                        .ok_or_else(|| anyhow!("File {file} in library {l} has no members."))?,
+                    m => m.to_string(),
+                };
+                let m = crate::source::find_member(
+                    self.client,
+                    std::slice::from_ref(l),
+                    &file,
+                    &member,
+                )
+                .await?;
+                return Ok(Outcome::Display(ListDisplay {
+                    title: "Display Physical File Member".into(),
+                    info: vec![
+                        ("File".into(), file.clone()),
+                        ("Library".into(), l.clone()),
+                        ("Member".into(), m.name.clone()),
+                        ("Type".into(), m.srctype.clone()),
+                    ],
+                    heading: "SEQNBR  *...+... 1 ...+... 2 ...+... 3 ...+... 4 ...+... 5 ...+... 6 ...+... 7".into(),
+                    rows: m
+                        .source
+                        .lines()
+                        .enumerate()
+                        .map(|(i, line)| format!("{:>4}.00 {}", i + 1, line))
+                        .collect(),
+                    ..Default::default()
+                }));
+            }
+        }
         let name = match cmd.get("FILE").split_once('/') {
             Some(("*LIBL", n)) => n.to_string(),
             Some(("*CURLIB", n)) => format!("{}/{n}", self.current_library()),
@@ -1356,15 +1564,33 @@ impl Job<'_> {
         if let Some(id) = &self.id {
             jobs::set_function(self.client, id, &format!("PGM-{name}"), "RUN").await;
         }
-        if let Some((lib, source)) = catalog::find_cl_program(self.client, &libs, &name).await? {
-            authority::check(self.client, &self.user, &lib, &name, "*PGM", Aut::Use).await?;
-            let program = crate::clpgm::compile(&name, &source)?;
-            return crate::clpgm::run(self, &program, &args).await;
+        match catalog::find_program(self.client, &libs, &name).await? {
+            Some(p) => {
+                authority::check(self.client, &self.user, &p.library, &name, "*PGM", Aut::Use)
+                    .await?;
+                match p.attribute.as_str() {
+                    "CLLE" | "CLP" => {
+                        let program = crate::clpgm::compile(&name, &p.source)?;
+                        crate::clpgm::run(self, &program, &args).await
+                    }
+                    _ => self.call_rpg(&name, Some(&p.library), args).await,
+                }
+            }
+            // Not a program object: the runner looks for the source in
+            // IBMISH_PGM_PATH (the samples).
+            None => self.call_rpg(&name, None, args).await,
         }
-        self.call_rpg(&name, args).await
     }
 
-    async fn call_rpg(&mut self, pgm: &str, args: Vec<String>) -> Result<Outcome> {
+    /// Run an RPG program on the runner. `library`: where the program
+    /// object is (the runner gets its source from the bridge); None: the
+    /// runner looks for PGM.rpgle in IBMISH_PGM_PATH.
+    async fn call_rpg(
+        &mut self,
+        pgm: &str,
+        library: Option<&str>,
+        args: Vec<String>,
+    ) -> Result<Outcome> {
         let pgm = pgm.to_string();
         let listener = bridge::bind(0).await?;
         let addr = listener.local_addr()?;
@@ -1389,6 +1615,7 @@ impl Job<'_> {
             .arg(&pgm)
             .args(&args)
             .env("IBMISH_LIBL", self.library_list().join(","))
+            .env("IBMISH_PGM_LIB", library.unwrap_or(""))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

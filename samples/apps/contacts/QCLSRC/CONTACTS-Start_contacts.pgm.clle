@@ -1,0 +1,8 @@
+/* CONTACTS: start the contact list. */
+PGM
+DCLPRCOPT DFTACTGRP(*NO) ACTGRP(*CALLER)
+COPYRIGHT TEXT('ibmish sample')
+INCLUDE SRCSTMF('contacts.clleinc')
+CALL PGM(CONTLST)
+SNDPGMMSG MSG('Contact list ended (' *CAT &APP *TCAT ').') MSGTYPE(*COMP)
+ENDPGM

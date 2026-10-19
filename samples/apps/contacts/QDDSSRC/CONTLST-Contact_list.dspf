@@ -1,0 +1,31 @@
+     A*  CONTLST: the contact list. F3 is CA03 without a response
+     A*  indicator, so the program tests *INKC.
+     A                                      DSPSIZ(24 80 *DS3)
+     A                                      INDARA
+     A                                      CA03
+     A          R SFL01                     SFL
+     A            CTID           5S 0O  6  3
+     A            CTNAME        30A  O  6 11
+     A            CTCITY        20A  O  6 43
+     A          R CTL01                     SFLCTL(SFL01)
+     A                                      SFLSIZ(0050)
+     A                                      SFLPAG(0012)
+     A                                      OVERLAY
+     A  30                                  SFLCLR
+     A  31                                  SFLDSP
+     A  31                                  SFLDSPCTL
+     A N31                                  SFLDSPCTL
+     A  32                                  SFLEND(*MORE)
+     A                                  1 31'Contact List'
+     A                                      DSPATR(HI)
+     A            COUNT          3S 0O  3  3EDTCDE(Z)
+     A                                  3  8'contacts'
+     A                                  5  3'Number'
+     A                                      DSPATR(UL)
+     A                                  5 11'Name'
+     A                                      DSPATR(UL)
+     A                                  5 43'City'
+     A                                      DSPATR(UL)
+     A          R CMD01
+     A                                 23  2'F3=Exit'
+     A                                      COLOR(BLU)

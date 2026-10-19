@@ -1400,7 +1400,14 @@ pub fn compile(name: &str, source: &str) -> Result<Program> {
         i = 1;
     }
     let mut decls = Vec::new();
-    while i < sts.len() && sts[i].name == "DCL" {
+    // DCLPRCOPT (compile options) and COPYRIGHT (text kept in the
+    // program) belong with the declarations; they change nothing here.
+    let is_declare = |n: &str| matches!(n, "DCL" | "DCLPRCOPT" | "COPYRIGHT");
+    while i < sts.len() && is_declare(&sts[i].name) {
+        if sts[i].name != "DCL" {
+            i += 1;
+            continue;
+        }
         let (n, v) = parse_dcl(&sts[i])?;
         if decls.iter().any(|(d, _): &(String, Var)| *d == n) {
             bail!("line {}: {n} is declared twice", sts[i].line);

@@ -371,7 +371,7 @@ async fn bridge_protocol_round_trip() {
     }
     server.abort();
 
-    assert_eq!(resp[0]["version"], 5);
+    assert_eq!(resp[0]["version"], 6);
     assert_eq!(resp[1]["format"], "ORDLINR");
     assert_eq!(resp[1]["keys"], json!(["ORDNO", "LINNO"]));
     assert_eq!(resp[1]["fields"][4]["decimals"], 2);
@@ -2433,4 +2433,125 @@ async fn menus_and_initial_menu() {
     let e = sec.run("GO ORDERS").await.unwrap_err().to_string();
     assert!(e.contains("not found"), "{e}");
     users::delete(&client, &user).await.unwrap();
+}
+
+/// `ibmish import` of the contacts sample: source files and members, then
+/// the objects, built with the create commands. Expected values from IBM's
+/// CL reference: CRTPF/CRTLF/CRTDSPF take SRCFILE(QDDSSRC) and
+/// SRCMBR(*FILE) by default, CRTBNDRPG SRCFILE(QRPGLESRC) and CRTBNDCL
+/// SRCFILE(QCLSRC) with SRCMBR(*PGM); the source type comes from the
+/// member (PF, DSPF, RPGLE, CLLE); TEXT(*SRCMBRTXT) takes the member's
+/// text. Records: the sample's CSV has 5 rows.
+#[tokio::test]
+async fn import_an_application() {
+    use ibmish_core::commands::{Environment, Job, Outcome};
+    use ibmish_core::{import, source};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+        runner: "false".into(),
+        call_timeout: std::time::Duration::from_secs(5),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: None,
+        libl: vec![],
+        display: None,
+        id: None,
+    };
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../samples/apps/contacts");
+    let report = import::import(&mut job, &dir, &lib).await.unwrap();
+    assert_eq!(report.failed, 0, "{:#?}", report.lines);
+    assert!(report
+        .lines
+        .iter()
+        .any(|l| l.contains("CONTACT: 5 records loaded")));
+
+    // The members, with their types and texts (TOBi names).
+    let rpg = source::members(&client, &lib, "QRPGLESRC").await.unwrap();
+    assert_eq!(
+        rpg,
+        vec![
+            (
+                "CONTCNT".to_string(),
+                "RPGLE".to_string(),
+                "Count contacts".to_string()
+            ),
+            (
+                "CONTLST".to_string(),
+                "RPGLE".to_string(),
+                "List contacts".to_string()
+            ),
+        ]
+    );
+    let dds = source::members(&client, &lib, "QDDSSRC").await.unwrap();
+    assert_eq!(
+        dds.iter().map(|m| m.1.as_str()).collect::<Vec<_>>(),
+        ["PF", "DSPF"]
+    );
+
+    // The programs: attribute by create command, text from the member.
+    let p = catalog::find_program(&client, std::slice::from_ref(&lib), "CONTCNT")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(p.attribute, "RPGLE");
+    let c = catalog::find_program(&client, std::slice::from_ref(&lib), "CONTACTS")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(c.attribute, "CLLE");
+    // The CL INCLUDE is part of the program.
+    assert!(c.source.contains("DCL VAR(&APP)"), "{}", c.source);
+
+    // Create commands with their defaults, from a job.
+    job.curlib = Some(lib.clone());
+    let msgs = |o: Outcome| match o {
+        Outcome::Messages(m) => m.join("\n"),
+        _ => String::new(),
+    };
+    let m = msgs(job.run("CRTBNDRPG PGM(CONTCNT)").await.unwrap());
+    assert_eq!(m, format!("Program CONTCNT created in library {lib}."));
+    let e = job
+        .run("CRTBNDRPG PGM(CONTCNT) REPLACE(*NO)")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("already exists"), "{e}");
+    // SRCMBR(*FILE): the member named like the file.
+    let e = job
+        .run("CRTPF FILE(CONTACT)")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("CPF7302"), "{e}");
+    let e = job.run("CRTPF FILE(NOSUCH)").await.unwrap_err().to_string();
+    assert!(e.starts_with("CPF9815"), "{e}");
+    // DSPFD *MBRLIST and DSPPFM of a source member.
+    let Outcome::Display(d) = job.run("DSPFD QRPGLESRC").await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(d.rows.len(), 2);
+    let Outcome::Display(d) = job.run("DSPPFM QDDSSRC MBR(CONTACT)").await.unwrap() else {
+        panic!()
+    };
+    assert!(d.rows[0].starts_with("   1.00 "), "{:?}", d.rows);
+    assert!(d.rows.iter().any(|r| r.contains("K CTID")));
+
+    // A field named like a PostgreSQL system column (CTID) works in SQL.
+    let rows = client
+        .query(
+            &format!(
+                "SELECT count(*) FROM {}.{}",
+                catalog::ident(&lib),
+                catalog::ident("CONTACT")
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows[0].get::<_, i64>(0), 5);
 }

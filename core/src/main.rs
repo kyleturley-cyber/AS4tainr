@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use ibmish_core::{bridge, catalog, commands, dds, rla, tn5250, users};
+use ibmish_core::{bridge, catalog, commands, dds, tn5250, users};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -94,6 +94,24 @@ enum Cmd {
         #[arg(long)]
         src: PathBuf,
     },
+    /// Import an application: source members (folders like QRPGLESRC/ or
+    /// TOBi project folders, files like ORDENT.RPGLE or
+    /// ORDENT-Order_entry.pgm.rpgle) and CSV data into a library, then
+    /// build its files and programs with the create commands.
+    Import {
+        /// The directory (a clone of the application's git repository).
+        dir: PathBuf,
+        /// The library to import into (created if needed).
+        #[arg(long)]
+        lib: String,
+        /// Command that runs RPG programs (unused by the import itself).
+        #[arg(
+            long,
+            env = "IBMISH_RUNNER",
+            default_value = "java -jar /opt/ibmish/ibmish-jvm.jar"
+        )]
+        runner: String,
+    },
     /// Load records from a CSV file (header row = field names) with WRITE.
     Load {
         /// File name, optionally qualified LIB/FILE.
@@ -160,28 +178,6 @@ fn split_lib_file(q: &str) -> Result<(String, String)> {
         Some((l, f)) => Ok((l.to_string(), f.to_string())),
         None => bail!("expected a qualified name LIB/FILE, got '{q}'"),
     }
-}
-
-/// Minimal CSV: comma-separated, double quotes for fields containing
-/// commas or quotes ("" escapes a quote).
-fn parse_csv_line(line: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut quoted = false;
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        match (c, quoted) {
-            ('"', true) if chars.peek() == Some(&'"') => {
-                cur.push('"');
-                chars.next();
-            }
-            ('"', _) => quoted = !quoted,
-            (',', false) => out.push(std::mem::take(&mut cur)),
-            _ => cur.push(c),
-        }
-    }
-    out.push(cur);
-    out
 }
 
 #[tokio::main]
@@ -336,23 +332,41 @@ async fn run(cli: Cli) -> Result<u8> {
             let f = catalog::resolve_file(&client, &libl, &file).await?;
             let text = std::fs::read_to_string(&csv)
                 .with_context(|| format!("reading {}", csv.display()))?;
-            let mut lines = text.lines().filter(|l| !l.trim().is_empty());
-            let header: Vec<String> = parse_csv_line(lines.next().context("empty CSV")?)
-                .into_iter()
-                .map(|h| h.trim().to_ascii_uppercase())
-                .collect();
-            let mut of = rla::OpenFile::new(f);
-            let mut n = 0;
-            for line in lines {
-                let vals = parse_csv_line(line);
-                let rec: rla::Record = header.iter().cloned().zip(vals).collect();
-                of.write(&client, &rec).await?;
-                n += 1;
-            }
+            let (lib, name) = (f.library.clone(), f.file.name.clone());
+            let n = ibmish_core::import::load_csv(&client, f, &text).await?;
+            println!("{n} records written to {lib}/{name}.");
+        }
+        Cmd::Import { dir, lib, runner } => {
+            let client = bridge::connect_db(&cli.database_url).await?;
+            catalog::init(&client).await?;
+            let env = commands::Environment {
+                database_url: cli.database_url.clone(),
+                runner,
+                call_timeout: std::time::Duration::from_secs(120),
+            };
+            let mut job = commands::Job {
+                client: &client,
+                env: &env,
+                user: "QSECOFR".into(),
+                curlib: None,
+                libl: libl.clone(),
+                display: None,
+                id: None,
+            };
+            let report = ibmish_core::import::import(&mut job, &dir, &lib).await?;
             println!(
-                "{n} records written to {}/{}.",
-                of.file.library, of.file.file.name
+                "Import of {} into {}:",
+                dir.display(),
+                lib.to_ascii_uppercase()
             );
+            for l in &report.lines {
+                println!("{l}");
+            }
+            if report.failed > 0 {
+                println!("{} objects could not be created.", report.failed);
+                return Ok(1);
+            }
+            println!("All objects created.");
         }
         Cmd::System { command, runner } => {
             let client = bridge::connect_db(&cli.database_url).await?;
@@ -525,11 +539,25 @@ async fn run(cli: Cli) -> Result<u8> {
             let listener = bridge::bind(0).await?;
             let addr = listener.local_addr()?;
             let cfg = bridge::BridgeConfig {
-                database_url: cli.database_url,
+                database_url: cli.database_url.clone(),
                 library_list: libl,
                 display: None,
                 job: None,
                 record_wait: None,
+            };
+            // An RPG program object (CRTBNDRPG): the runner gets its source
+            // from the bridge; otherwise it looks in IBMISH_PGM_PATH.
+            let (pgm_lib, program) = {
+                let client = bridge::connect_db(&cli.database_url).await?;
+                let name = program.to_ascii_uppercase();
+                let (libs, n) = match name.split_once('/') {
+                    Some((l, n)) => (vec![l.to_string()], n.to_string()),
+                    None => (cfg.library_list.clone(), name.clone()),
+                };
+                match catalog::find_program(&client, &libs, &n).await? {
+                    Some(p) => (p.library, n),
+                    None => (String::new(), n),
+                }
             };
             let server = tokio::spawn(bridge::serve(listener, cfg));
 
@@ -541,6 +569,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 .arg(addr.to_string())
                 .arg(&program)
                 .args(&args)
+                .env("IBMISH_PGM_LIB", &pgm_lib)
                 .status()
                 .await
                 .with_context(|| format!("starting runner '{runner}'"))?;

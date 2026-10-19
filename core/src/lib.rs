@@ -10,6 +10,8 @@
 //! - [`dtaara`]: data areas
 //! - [`authority`]: object owners and authorities (*ALL, *CHANGE, *USE, *EXCLUDE)
 //! - [`spool`]: spooled files (printed output)
+//! - [`import`]: `ibmish import`: an application's source and data into a library
+//! - [`source`]: source physical files and members (QRPGLESRC...)
 //! - [`menus`]: menus (GO, CRTMNU) and the system menus
 //! - [`jobs`]: jobs, job queues, job logs, message queues, the QBATCH subsystem
 //! - [`web`]: the browser 5250 terminal
@@ -23,9 +25,11 @@ pub mod commands;
 pub mod dds;
 pub mod dspf;
 pub mod dtaara;
+pub mod import;
 pub mod jobs;
 pub mod menus;
 pub mod rla;
+pub mod source;
 pub mod spool;
 pub mod sql;
 pub mod tn5250;

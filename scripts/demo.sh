@@ -58,6 +58,20 @@ run CUSTRPT L
 if [[ "${IBMISH_RUNNER:-}" != *BridgeConformance* ]]; then
   run CUSTPRT
 fi
+# An imported application (samples/apps/contacts, in library CONTACTS):
+# RPG program objects (CRTBNDRPG) and a /INCLUDE stream file. Real RPG only.
+if [[ "${IBMISH_RUNNER:-}" != *BridgeConformance* ]]; then
+  echo "--- CALL CONTACTS/CONTCNT"
+  out=$(IBMISH_LIBL=CONTACTS,QGPL "$bin" call CONTACTS/CONTCNT | grep -v '^Picked up JAVA_TOOL_OPTIONS' || true)
+  echo "$out"
+  if diff <(normalize <<<"$out") <(normalize <"$samples/expected/CONTCNT.txt") >/dev/null; then
+    echo "PASS: output matches CONTCNT.txt"
+  else
+    echo "FAIL: output differs from CONTCNT.txt:"
+    diff <(normalize <<<"$out") <(normalize <"$samples/expected/CONTCNT.txt") || true
+    status=1
+  fi
+fi
 # CUSTUPD changes data, so it only runs right after the sample files were created.
 if [ "$fresh" = 1 ]; then
   run CUSTUPD 5

@@ -33,20 +33,23 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/dtaara.rs` | Data areas: CRTDTAARA/CHGDTAARA/RTVDTAARA values, RPG `IN *LOCK`/`OUT` (PostgreSQL advisory locks) |
 | `core/src/jobs.rs` | Work management: jobs (`ibmish.jobs`), job logs, job queue QBATCH and its subsystem loop, user message queues |
 | `core/src/spool.rs` | Spooled files (`ibmish.spooled_files`, `ibmish.spool_lines`): printer output, QSYSPRT listings of batch display commands, QPJOBLOG |
+| `core/src/source.rs` | Source physical files (`PF-SRC` objects) and members (`ibmish.source_members`), stream files for includes (`ibmish.stream_files`), CL `INCLUDE` expansion |
+| `core/src/import.rs` | `ibmish import DIR --lib LIB`: members (folders like QRPGLESRC/, TOBi names) and CSV data into a library, then CRTPF/CRTLF/CRTDSPF/CRTBNDCL/CRTBNDRPG. See `docs/import.md` |
 | `core/src/menus.rs` | Menus: the system menus (MAIN...) as data, GO/CRTMNU TYPE(*PGM)/DLTMNU; the session shows them (`tn5250/session.rs`: initial program, initial menu, menu stack) |
 | `core/src/authority.rs` | Object owners, *PUBLIC and private authorities; `check` before every object use (CPF9802) |
 | `core/src/users.rs` | User profiles, Argon2id password hashes |
 | `core/src/main.rs` | `ibmish` CLI |
 | `core/tests/rla_test.rs` | Integration tests (need `IBMISH_TEST_DATABASE_URL`) |
 | `jvm/src/main/java/io/ibmish/bridge` | Dependency-free Java bridge client (keep it dependency-free) |
-| `jvm/src/main/java/io/ibmish/jvm` | Runner (`Launcher`, `Runner`): Jariko configuration, display files, EXFMT. `Workstation` rewrites WORKSTN programs (display record formats as DISK files, READC); `DisplayDBMManager`/`DisplayRecordFile` send those operations to core. `RecordLocks` adds signals for update files, N/E extenders and UNLOCK (record locks). `Printers` reads PRINTER F specs and O specs and turns EXCEPT into a signal that prints to a spooled file. Java, so it compiles with plain javac against the jar |
+| `jvm/src/main/java/io/ibmish/jvm` | Runner (`Launcher`, `Runner`): Jariko configuration, display files, EXFMT. `Workstation` rewrites WORKSTN programs (display record formats as DISK files, READC); `DisplayDBMManager`/`DisplayRecordFile` send those operations to core. `RecordLocks` adds signals for update files, N/E extenders and UNLOCK (record locks). `Printers` reads PRINTER F specs and O specs and turns EXCEPT into a signal that prints to a spooled file. `SourceForms` blanks `//` lines in columns 1-5 and expands quoted `/INCLUDE` stream files. RPG program objects (CRTBNDRPG) come from the bridge (`pgmsrc`), before `IBMISH_PGM_PATH`. Java, so it compiles with plain javac against the jar |
 | `jvm/src/main/kotlin/io/ibmish/jvm` | reload `DBMManager`/`DBFile` adapter (database I/O through the bridge) |
 | `jvm/src/test/java/.../BridgeConformance.java` | JDK-only stand-in runner used for end-to-end tests without Maven |
 | `tools/tn5250_driver.py`, `tools/e2e_5250.py` | Drive the real tn5250 client for end-to-end tests |
 | `tools/e2e_web.py` | Drives the browser terminal in Chromium (Playwright) |
 | `tools/gate3_5250.py` | Phase 3 gate: three clerks enter orders at once with batch jobs running; the files must add up. Run after e2e_5250.py |
-| `samples/` | DDS, CSV data, RPG and CL programs, golden outputs in `expected/`. The order entry app (Phase 2 gate) is described in `docs/order-entry.md` |
+| `samples/` | DDS, CSV data, RPG and CL programs, golden outputs in `expected/`. `samples/apps/contacts` is an application laid out as a git repository, imported with `ibmish import` (into CONTACTS by samples.sh). The order entry app (Phase 2 gate) is described in `docs/order-entry.md` |
 | `scripts/samples.sh` | Creates every sample object in QGPL (used by demo.sh, the Docker entrypoint and CI). Add new sample objects here |
+| `tools/corpus.sh` | Clone a public repository of IBM i source and import it (real-world test; never vendored) |
 | `docs/bridge-protocol.md` | Protocol spec. Update it in the same change as the protocol |
 
 ## Commands

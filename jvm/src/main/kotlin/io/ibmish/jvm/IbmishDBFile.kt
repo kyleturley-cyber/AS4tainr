@@ -34,10 +34,10 @@ class IbmishDBFile(
     }
 
     /** Run a read with the flags the program announced for it. */
-    private fun locked(op: (Boolean) -> ReadResult): Result {
+    private fun locked(chain: Boolean = false, op: (Boolean) -> ReadResult): Result {
         val flags = RecordLocks.takeFlags(name)
         return try {
-            result(op(!flags.contains('N')))
+            result(op(!flags.contains('N')), chain)
         } catch (e: io.ibmish.bridge.BridgeException) {
             if (flags.contains('E') && (e.message ?: "").startsWith("CPF5027")) {
                 lastEof = false
@@ -54,12 +54,19 @@ class IbmishDBFile(
 
     override fun equal(): Boolean = lastEqual
 
-    private fun result(r: ReadResult): Result {
+    private fun result(r: ReadResult, chain: Boolean): Result {
         lastEof = r.eof
         val rec = Record()
         r.record.forEach { (k, v) -> rec.add(RecordField(k, v)) }
-        // An empty record tells Jariko "not found".
-        return Result(record = rec)
+        // An empty record tells Jariko "not found". The resulting
+        // indicators (RPG reference): CHAIN sets the one in positions 71-72
+        // (HI) when no record is found; READ, READE, READP and READPE set
+        // the one in positions 75-76 (EQ) at end of file.
+        return Result(
+            record = rec,
+            indicatorHI = chain && !r.found,
+            indicatorEQ = !chain && r.eof,
+        )
     }
 
     override fun setll(key: String): Boolean = setll(listOf(key))
@@ -81,7 +88,7 @@ class IbmishDBFile(
 
     override fun chain(key: String): Result = chain(listOf(key))
 
-    override fun chain(keys: List<String>): Result = locked { client.chain(handle, keys, it) }
+    override fun chain(keys: List<String>): Result = locked(chain = true) { client.chain(handle, keys, it) }
 
     override fun read(): Result = locked { client.read(handle, it) }
 

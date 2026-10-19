@@ -301,6 +301,14 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
                 continue;
             }
         }
+        // A field named like a PostgreSQL system column (CTID, XMIN...).
+        if let (Tok::Word(name), Some(_)) = (t, &w) {
+            if crate::catalog::pg_name(name).starts_with('~') {
+                out.push(Tok::Word(ident(name)));
+                i += 1;
+                continue;
+            }
+        }
         match w.as_deref() {
             Some("CURRENT") => {
                 if let Some(j) = next_non_space(&toks, i + 1) {
@@ -615,7 +623,7 @@ async fn run_in_transaction(
                 if c.name() == "?column?" || values_col {
                     (n + 1).to_string()
                 } else {
-                    c.name().to_ascii_uppercase()
+                    crate::catalog::ibm_name(c.name())
                 }
             })
             .collect();
@@ -728,6 +736,18 @@ mod tests {
 
     // DB2 for i SQL reference: special registers, CONCAT operator, scalar
     // functions UCASE/LCASE, RRN, SYSIBM.SYSDUMMY1, isolation clause.
+    #[test]
+    fn fields_named_like_postgresql_system_columns() {
+        // CTID is a valid IBM i field name; in PostgreSQL ctid is a system
+        // column (PostgreSQL manual, "System Columns"), so ibmish stores it
+        // as "~ctid".
+        assert_eq!(
+            tr("select ctid, name from mylib/contact where ctid > 3").sql,
+            "select \"~ctid\", name from \"mylib\".\"contact\" where \"~ctid\" > 3"
+        );
+        assert_eq!(crate::catalog::ibm_name("~ctid"), "CTID");
+    }
+
     #[test]
     fn db2_dialect() {
         assert_eq!(tr("values current date").sql, "values (CURRENT_DATE)");

@@ -1,6 +1,6 @@
-# Bridge protocol (version 5)
+# Bridge protocol (version 6)
 
-Version 5 added spooled files: `splopen`, `splwrite`, `splclose`. Version 4 added record locks: `open` takes `update`, reads take `lock`, and the `unlock` operation. Version 3 added the data area operations `dtaara_in`, `dtaara_out` and `dtaara_unlock`. Version 2 added the display file operations `dspwrite`, `sflwrite`, `sflchain`, `sflreadc` and `sflupdate`.
+Version 6 added program objects and source members: `pgmsrc` and `srcmbr`. Version 5 added spooled files: `splopen`, `splwrite`, `splclose`. Version 4 added record locks: `open` takes `update`, reads take `lock`, and the `unlock` operation. Version 3 added the data area operations `dtaara_in`, `dtaara_out` and `dtaara_unlock`. Version 2 added the display file operations `dspwrite`, `sflwrite`, `sflchain`, `sflreadc` and `sflupdate`.
 
 The bridge connects the JVM (Jariko running RPG) to ibmish core, which carries out every file operation. It uses TCP on loopback only, with one UTF-8 JSON object per line in each direction, strictly request then response.
 
@@ -53,6 +53,8 @@ Records are objects that map field names to strings:
 | `dtaara_in` | `name`, `lock`? | `library`, `name`, `type`, `length`, `decimals`, `value` | RPG `IN`: reads a data area found through the library list. `type` is `*CHAR`, `*DEC` or `*LGL`; `value` is the padded text, decimal text with `decimals` places, or `0`/`1`. With `lock: true` (`IN *LOCK`) this connection holds the data area until `dtaara_out`, `dtaara_unlock` or the connection closes; others wait |
 | `dtaara_out` | `name`, `value` | | RPG `OUT`: writes the whole value (decimal text for `*DEC`); a value that does not fit fails. Releases this connection's lock |
 | `dtaara_unlock` | `name` | | Releases this connection's lock without writing |
+| `pgmsrc` | `name`, `library`? | `found`, `library`, `source` | The source of an RPG program object (CRTBNDRPG, attribute RPGLE) in `library`, or the first on the library list. The runner asks for the program called (the core passes its library in `IBMISH_PGM_LIB`) and for programs it calls. Needs *USE authority to the program. `found: false` when there is no such RPG program (the runner then looks in `IBMISH_PGM_PATH`) |
+| `srcmbr` | `member`, `file`?, `library`? | `found`, `library`, `source` | `/COPY`: a source member (`file` default QRPGLESRC, `library` default the library list). A `member` with `.` or `/` in it is a stream file path (`/INCLUDE 'x.rpgleinc'`): the shortest stream file path ending with it; `library` is then the path found |
 
 All connections of one bridge (one program call) share the display state: the records on the screen and the subfiles.
 

@@ -265,11 +265,13 @@ pub fn parse_lf(file_name: &str, source: &str) -> Result<LogicalFile> {
         if line.trim().is_empty() {
             continue;
         }
-        if !cols(line, 6, 6).eq_ignore_ascii_case("A") {
-            bail!("line {lineno}: expected form type 'A' in column 6");
-        }
+        // An asterisk in position 7 makes a comment line; the form type A
+        // in position 6 is optional (DDS reference, positions 1-7).
         if cols(line, 7, 7) == "*" {
             continue;
+        }
+        if !cols(line, 6, 6).eq_ignore_ascii_case("A") && !cols(line, 6, 6).trim().is_empty() {
+            bail!("line {lineno}: expected form type 'A' in column 6");
         }
         let name_type = cols(line, 17, 17).to_ascii_uppercase();
         let name = cols(line, 19, 28).to_ascii_uppercase();
@@ -421,11 +423,13 @@ pub fn parse_pf(file_name: &str, source: &str) -> Result<PhysicalFile> {
         if line.trim().is_empty() {
             continue;
         }
-        if !cols(line, 6, 6).eq_ignore_ascii_case("A") {
-            bail!("line {lineno}: expected form type 'A' in column 6");
-        }
+        // An asterisk in position 7 makes a comment line; the form type A
+        // in position 6 is optional (DDS reference, positions 1-7).
         if cols(line, 7, 7) == "*" {
             continue;
+        }
+        if !cols(line, 6, 6).eq_ignore_ascii_case("A") && !cols(line, 6, 6).trim().is_empty() {
+            bail!("line {lineno}: expected form type 'A' in column 6");
         }
         let name_type = cols(line, 17, 17).to_ascii_uppercase();
         let name = cols(line, 19, 28).to_ascii_uppercase();
@@ -538,6 +542,17 @@ mod tests {
      A            CUSZON         3S 0
      A          K CUSNO
 ";
+
+    #[test]
+    fn comment_lines_without_form_type() {
+        // DDS reference: an asterisk in position 7 makes a comment line, and
+        // the form type A in position 6 is optional.
+        let src = "      * a comment, no form type\n     A*  a comment with A\n                R REC\n     A            F1             5A\n";
+        let pf = parse_pf("T", src).unwrap();
+        assert_eq!(pf.format, "REC");
+        assert_eq!(pf.fields.len(), 1);
+        assert!(parse_pf("T", "     X          R REC\n").is_err());
+    }
 
     #[test]
     fn parses_custmast() {

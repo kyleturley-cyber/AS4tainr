@@ -555,6 +555,33 @@ with Tn5250(HOST) as t:
     check(True, "DLTMNU deletes the menu; GO then says it is not found", t)
     t.fkey(12)
     command(t, "dltusrprf carl", "User profile CARL deleted.")
+
+    # An imported application (scripts/samples.sh: ibmish import
+    # samples/apps/contacts --lib CONTACTS). Expected behavior from IBM's
+    # RPG reference: READ sets its positions 75-76 indicator at end of
+    # file; CHAIN sets positions 71-72 when no record is found; CA03
+    # without a response indicator sets *INKC.
+    command(t, "addlible contacts", "Library CONTACTS added")
+    command(t, "call contacts", "Contact List", timeout=90)
+    screen = t.text()
+    check("5  contacts" in screen and "Grace Hopper" in screen and "Ken Thompson" in screen,
+          "an imported CL program calls an imported RPG subfile program (READ loop ends at end of file)", t)
+    t.fkey(3)
+    t.wait_for("Contact list ended (CONTACTS).", 60)
+    check("Command Entry" in t.text(), "F3 sets *INKC and ends the program; the CL INCLUDE declared &APP", t)
+    command(t, "dspfd contacts/qrpglesrc", "Display File Description")
+    check("CONTLST" in t.text() and "List contacts" in t.text() and "RPGLE" in t.text(),
+          "DSPFD lists a source file's members, types and texts", t)
+    t.fkey(3); t.wait_for("Command Entry")
+    command(t, "dsppfm contacts/qrpglesrc mbr(contcnt)", "Display Physical File Member")
+    check("1.00" in t.text() and "CONTCNT" in t.text(), "DSPPFM shows a source member's lines", t)
+    t.fkey(3); t.wait_for("Command Entry")
+    command(t, "crtbndrpg contacts/contcnt", "Program CONTCNT created in library CONTACTS.")
+    check(True, "CRTBNDRPG creates a program from QRPGLESRC (SRCMBR(*PGM))", t)
+    command(t, "call contacts/contcnt", "DSPLY  Barbara Liskov", timeout=90)
+    check("DSPLY  5" in t.text() and "DSPLY  Grace Hopper" in t.text(),
+          "the RPG program object runs: READ to end of file, CHAIN found and not found", t)
+    command(t, "rmvlible contacts", "removed from library list")
     command(t, "signoff", "Sign On")
 
 print(f"\nAll {passed} checks passed.")

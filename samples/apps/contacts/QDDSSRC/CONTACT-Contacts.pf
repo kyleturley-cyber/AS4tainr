@@ -1,0 +1,8 @@
+      * CONTACT: one record per contact, keyed by contact number.
+      * (Comment lines: an asterisk in position 7, no form type.)
+     A          R RCONTACT                  TEXT('Contact')
+     A            CTID           5S 0       TEXT('Contact number')
+     A            CTNAME        30A         TEXT('Name')
+     A            CTCITY        20A         TEXT('City')
+     A            CTPHONE       15A         TEXT('Phone')
+     A          K CTID

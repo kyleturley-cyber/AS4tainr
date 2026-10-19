@@ -19,7 +19,7 @@ import java.util.Map;
  * See docs/bridge-protocol.md.
  */
 public final class BridgeClient implements AutoCloseable {
-    public static final int PROTOCOL_VERSION = 5;
+    public static final int PROTOCOL_VERSION = 6;
 
     private final Socket socket;
     private final BufferedReader in;
@@ -310,6 +310,35 @@ public final class BridgeClient implements AutoCloseable {
         Map<String, Object> m = req("dtaara_unlock");
         m.put("name", name);
         call(m);
+    }
+
+    /**
+     * The source of an RPG program object (CRTBNDRPG) in {@code library}, or
+     * through the library list when it is null or empty.
+     *
+     * @return the source, or null when there is no such RPG program
+     */
+    public String programSource(String name, String library) {
+        Map<String, Object> m = req("pgmsrc");
+        m.put("name", name);
+        if (library != null && !library.isEmpty()) m.put("library", library);
+        Map<String, Object> r = call(m);
+        return Boolean.TRUE.equals(r.get("found")) ? (String) r.get("source") : null;
+    }
+
+    /**
+     * A source member (/COPY): {@code file} defaults to QRPGLESRC,
+     * {@code library} to the library list.
+     *
+     * @return the source, or null when there is no such member
+     */
+    public String sourceMember(String library, String file, String member) {
+        Map<String, Object> m = req("srcmbr");
+        if (library != null && !library.isEmpty()) m.put("library", library);
+        if (file != null && !file.isEmpty()) m.put("file", file);
+        m.put("member", member);
+        Map<String, Object> r = call(m);
+        return Boolean.TRUE.equals(r.get("found")) ? (String) r.get("source") : null;
     }
 
     /** Start a spooled file (printer file output) for this job; returns its id. */

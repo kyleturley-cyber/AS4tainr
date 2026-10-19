@@ -1,0 +1,4 @@
+      * Shared definitions for the contacts programs.
+     D RRN             S              4  0
+     D FOUND           S              3  0
+     D MISSING         S              3  0

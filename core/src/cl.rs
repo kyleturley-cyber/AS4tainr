@@ -520,7 +520,181 @@ pub static COMMANDS: &[CommandDef] = &[
     CommandDef {
         name: "DSPPFM",
         description: "Display Physical File Member",
-        params: &[p("FILE", Kind::Qualified, true, None, "File").ch("Name")],
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "File").ch("Name"),
+            p("MBR", Kind::Name, false, Some("*FIRST"), "Member").ch("Name, *FIRST"),
+        ],
+    },
+    CommandDef {
+        name: "CRTSRCPF",
+        description: "Create Source Physical File",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "File").ch("Name"),
+            p("RCDLEN", Kind::Text, false, Some("92"), "Record length").ch("Number"),
+            p("TEXT", Kind::Text, false, Some(""), "Text 'description'").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "DSPFD",
+        description: "Display File Description",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "File").ch("Name"),
+            p(
+                "TYPE",
+                Kind::Name,
+                false,
+                Some("*MBRLIST"),
+                "Type of information",
+            )
+            .ch("*MBRLIST"),
+        ],
+    },
+    CommandDef {
+        name: "CRTPF",
+        description: "Create Physical File",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "File").ch("Name"),
+            p(
+                "SRCFILE",
+                Kind::Qualified,
+                false,
+                Some("QDDSSRC"),
+                "Source file",
+            )
+            .ch("Name"),
+            p("SRCMBR", Kind::Name, false, Some("*FILE"), "Source member").ch("Name, *FILE"),
+        ],
+    },
+    CommandDef {
+        name: "CRTLF",
+        description: "Create Logical File",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "File").ch("Name"),
+            p(
+                "SRCFILE",
+                Kind::Qualified,
+                false,
+                Some("QDDSSRC"),
+                "Source file",
+            )
+            .ch("Name"),
+            p("SRCMBR", Kind::Name, false, Some("*FILE"), "Source member").ch("Name, *FILE"),
+        ],
+    },
+    CommandDef {
+        name: "CRTDSPF",
+        description: "Create Display File",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "File").ch("Name"),
+            p(
+                "SRCFILE",
+                Kind::Qualified,
+                false,
+                Some("QDDSSRC"),
+                "Source file",
+            )
+            .ch("Name"),
+            p("SRCMBR", Kind::Name, false, Some("*FILE"), "Source member").ch("Name, *FILE"),
+        ],
+    },
+    CommandDef {
+        name: "CRTBNDCL",
+        description: "Create Bound CL Program",
+        params: &[
+            p("PGM", Kind::Qualified, true, None, "Program").ch("Name"),
+            p(
+                "SRCFILE",
+                Kind::Qualified,
+                false,
+                Some("QCLSRC"),
+                "Source file",
+            )
+            .ch("Name"),
+            p("SRCMBR", Kind::Name, false, Some("*PGM"), "Source member").ch("Name, *PGM"),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*SRCMBRTXT"),
+                "Text 'description'",
+            )
+            .keyword_only(),
+            p(
+                "REPLACE",
+                Kind::Name,
+                false,
+                Some("*YES"),
+                "Replace program",
+            )
+            .ch("*YES, *NO")
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CRTCLPGM",
+        description: "Create CL Program",
+        params: &[
+            p("PGM", Kind::Qualified, true, None, "Program").ch("Name"),
+            p(
+                "SRCFILE",
+                Kind::Qualified,
+                false,
+                Some("QCLSRC"),
+                "Source file",
+            )
+            .ch("Name"),
+            p("SRCMBR", Kind::Name, false, Some("*PGM"), "Source member").ch("Name, *PGM"),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*SRCMBRTXT"),
+                "Text 'description'",
+            )
+            .keyword_only(),
+            p(
+                "REPLACE",
+                Kind::Name,
+                false,
+                Some("*YES"),
+                "Replace program",
+            )
+            .ch("*YES, *NO")
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CRTBNDRPG",
+        description: "Create Bound RPG Program",
+        params: &[
+            p("PGM", Kind::Qualified, true, None, "Program").ch("Name"),
+            p(
+                "SRCFILE",
+                Kind::Qualified,
+                false,
+                Some("QRPGLESRC"),
+                "Source file",
+            )
+            .ch("Name"),
+            p("SRCMBR", Kind::Name, false, Some("*PGM"), "Source member").ch("Name, *PGM"),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*SRCMBRTXT"),
+                "Text 'description'",
+            )
+            .keyword_only(),
+            p(
+                "REPLACE",
+                Kind::Name,
+                false,
+                Some("*YES"),
+                "Replace program",
+            )
+            .ch("*YES, *NO")
+            .keyword_only(),
+        ],
     },
 ];
 
@@ -595,6 +769,20 @@ pub static GROUPS: &[Group] = &[
         item: "Spooled file commands",
         title: "Spooled File Commands",
         commands: &["WRKSPLF", "DSPSPLF", "DLTSPLF"],
+    },
+    Group {
+        item: "Source and create commands",
+        title: "Source and Create Commands",
+        commands: &[
+            "CRTSRCPF",
+            "DSPFD",
+            "CRTPF",
+            "CRTLF",
+            "CRTDSPF",
+            "CRTBNDCL",
+            "CRTCLPGM",
+            "CRTBNDRPG",
+        ],
     },
     Group {
         item: "Menu commands",

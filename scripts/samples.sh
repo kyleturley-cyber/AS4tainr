@@ -49,4 +49,10 @@ if ! out=$("$bin" system "CRTDTAARA DTAARA(QGPL/ORDNXT) TYPE(*DEC) LEN(7 0) VALU
 fi
 "$bin" crtbndcl QGPL/CUSTRPT --src "$samples/qclsrc/CUSTRPT.clle" --text 'Customer report driver' >/dev/null
 "$bin" crtbndcl QGPL/ORDENTC --src "$samples/qclsrc/ORDENTC.clle" --text 'Order entry' >/dev/null
-echo "Sample objects ready in QGPL."
+# A small legacy-style application, imported the way a customer's git
+# repository of IBM i source would be (docs/import.md).
+if ! out=$("$bin" import "$samples/apps/contacts" --lib CONTACTS 2>&1); then
+  echo "$out" >&2
+  exit 1
+fi
+echo "Sample objects ready in QGPL; the contacts application is in CONTACTS."

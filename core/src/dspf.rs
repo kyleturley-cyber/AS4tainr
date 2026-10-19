@@ -431,11 +431,11 @@ pub fn parse(name: &str, source: &str) -> Result<DisplayFile> {
         if line.trim().is_empty() {
             continue;
         }
-        if !cols(line, 6, 6).eq_ignore_ascii_case("A") && !cols(line, 6, 6).trim().is_empty() {
-            bail!("line {lineno}: expected form type 'A' in column 6");
-        }
         if cols(line, 7, 7) == "*" {
             continue;
+        }
+        if !cols(line, 6, 6).eq_ignore_ascii_case("A") && !cols(line, 6, 6).trim().is_empty() {
+            bail!("line {lineno}: expected form type 'A' in column 6");
         }
         let andor = cols(line, 7, 7).trim().to_ascii_uppercase();
         let inds = parse_indicators(cols(line, 8, 16))

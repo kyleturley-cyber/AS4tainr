@@ -20,7 +20,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_postgres::{Client, NoTls};
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Clone, Debug)]
 pub struct BridgeConfig {
@@ -114,6 +114,12 @@ struct Request {
     /// splwrite: lines as [page, line, text].
     #[serde(default)]
     lines: Option<Vec<(i32, i32, String)>>,
+    /// pgmsrc, srcmbr: a library (absent: the library list).
+    #[serde(default)]
+    library: Option<String>,
+    /// srcmbr: the source member.
+    #[serde(default)]
+    member: Option<String>,
 }
 
 struct Session {
@@ -475,6 +481,44 @@ impl Session {
                         }
                         Ok(json!({}))
                     }
+                }
+            }
+            "pgmsrc" => {
+                // The source of an RPG program object (CRTBNDRPG), for the
+                // runner: the program called, and programs it calls.
+                let name = req.name.ok_or_else(|| anyhow!("missing 'name'"))?;
+                let libs = match req.library.as_deref() {
+                    Some(l) if !l.is_empty() => vec![l.to_ascii_uppercase()],
+                    _ => self.config.library_list.clone(),
+                };
+                match catalog::find_program(&self.client, &libs, &name).await? {
+                    Some(p) if p.attribute == "RPGLE" => {
+                        self.require(&p.library, &p.name, "*PGM", Aut::Use).await?;
+                        Ok(json!({ "found": true, "library": p.library, "source": p.source }))
+                    }
+                    _ => Ok(json!({ "found": false })),
+                }
+            }
+            "srcmbr" => {
+                // /COPY: a member of a source file (default QRPGLESRC).
+                let member = req.member.ok_or_else(|| anyhow!("missing 'member'"))?;
+                // `/INCLUDE 'path/name.rpgleinc'`: a stream file.
+                if member.contains('.') || member.contains('/') {
+                    return match crate::source::find_stream_file(&self.client, &member).await? {
+                        Some((path, data)) => {
+                            Ok(json!({ "found": true, "library": path, "source": data }))
+                        }
+                        None => Ok(json!({ "found": false })),
+                    };
+                }
+                let file = req.file.unwrap_or_else(|| "QRPGLESRC".into());
+                let libs = match req.library.as_deref() {
+                    Some(l) if !l.is_empty() && l != "*LIBL" => vec![l.to_ascii_uppercase()],
+                    _ => self.config.library_list.clone(),
+                };
+                match crate::source::find_member(&self.client, &libs, &file, &member).await {
+                    Ok(m) => Ok(json!({ "found": true, "library": m.library, "source": m.source })),
+                    Err(_) => Ok(json!({ "found": false })),
                 }
             }
             "splopen" => {

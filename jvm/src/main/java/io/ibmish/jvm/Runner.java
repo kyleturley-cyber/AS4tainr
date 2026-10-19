@@ -56,8 +56,12 @@ import java.util.Map;
  *
  * <pre>java -jar ibmish-jvm.jar --bridge HOST:PORT PGM [parm...]</pre>
  *
- * Programs are looked up as PGM.rpgle in the directories listed in
- * IBMISH_PGM_PATH (path-separator separated; default ./qrpglesrc). Database
+ * Programs are RPG program objects (CRTBNDRPG), whose source comes from
+ * ibmish core through the bridge: the program called in IBMISH_PGM_LIB (when
+ * set), programs it calls through the library list. Otherwise they are
+ * looked up as PGM.rpgle in the directories listed in IBMISH_PGM_PATH
+ * (path-separator separated; default ./qrpglesrc). /COPY members come from
+ * source files the same way. Database
  * files and display files both come from ibmish core through the bridge: file
  * I/O goes to PostgreSQL, and EXFMT shows the record on the job's 5250 display.
  */
@@ -91,15 +95,13 @@ public final class Runner {
                 "*", IbmishDBMManager.URL_PREFIX + hostPort, "", "", null, IbmishDBMManager.class.getName()));
 
         List<RpgProgramFinder> finders = new ArrayList<>();
+        finders.add(new BridgeFinder(bridge, program, System.getenv().getOrDefault("IBMISH_PGM_LIB", ""),
+                displays, connections, hostPort));
         String path = System.getenv().getOrDefault("IBMISH_PGM_PATH", "qrpglesrc");
         for (String dir : path.split(File.pathSeparator)) {
             if (new File(dir).isDirectory()) {
                 finders.add(new PreprocessingFinder(new File(dir), displays, connections, hostPort));
             }
-        }
-        if (finders.isEmpty()) {
-            System.err.println("CPF4101: no program directory found (set IBMISH_PGM_PATH)");
-            System.exit(1);
         }
 
         Configuration configuration = new Configuration();
@@ -168,7 +170,11 @@ public final class Runner {
             Type type;
             switch (String.valueOf(f.get("type"))) {
                 case "P": type = new NumberType(length - decimals, decimals, RpgType.PACKED); break;
-                case "S": type = new NumberType(length - decimals, decimals, RpgType.ZONED); break;
+                // RPG defines numeric input fields of externally described
+                // files as packed in the program, whatever their type in the
+                // file (ILE RPG reference, externally described files), so
+                // one name can be zoned in one file and packed in another.
+                case "S": type = new NumberType(length - decimals, decimals, RpgType.PACKED); break;
                 default: type = new StringType(length, false);
             }
             fields.add(new DbField((String) f.get("name"), type));
@@ -261,6 +267,10 @@ public final class Runner {
 
         Displays(BridgeClient bridge) {
             this.bridge = bridge;
+        }
+
+        BridgeClient bridge() {
+            return bridge;
         }
 
         DSPF dspf(String file) {
@@ -356,6 +366,13 @@ public final class Runner {
             for (Map.Entry<String, Object> e : resInd.entrySet()) {
                 indicators.put(Integer.parseInt(e.getKey()), new BooleanValue(Boolean.TRUE.equals(e.getValue())));
             }
+            // Function key indicators *INKA-*INKY (F1-F24; there is no
+            // *INKO): on for the key pressed, off for the others, at each
+            // input. Jariko numbers them 105-128.
+            String aid = String.valueOf(resp.get("aid"));
+            for (int n = 1; n <= 24; n++) {
+                indicators.put(104 + n, new BooleanValue(aid.equals("F" + n)));
+            }
             return new OnExfmtResponse(snapshot, newValues);
         }
 
@@ -364,6 +381,80 @@ public final class Runner {
             if (v instanceof NumberValue) return ((NumberValue) v).getBigDecimal().toPlainString();
             if (v instanceof Value) return ((Value) v).asString().getValue();
             return String.valueOf(v);
+        }
+    }
+
+    /**
+     * An RPG program from its source: the source rewrites (display files,
+     * printer files, record locks), then Jariko's parser.
+     */
+    static RpgProgram load(String name, String source, Displays displays, List<ConnectionConfig> connections,
+            String hostPort) {
+        String rewritten = RecordLocks.preprocess(Printers.preprocess(
+                Workstation.preprocess(SourceForms.normalize(source,
+                        path -> displays.bridge().sourceMember(null, null, path)), displays::formats), name));
+        synchronized (connections) {
+            for (Workstation.Format fmt : Workstation.formats()) {
+                boolean known = connections.stream().anyMatch(c -> c.getFileName().equalsIgnoreCase(fmt.name));
+                if (!known) {
+                    // Before the "*" entry, so the format is not looked up as a database file.
+                    connections.add(0, new ConnectionConfig(fmt.name, DisplayDBMManager.URL_PREFIX + hostPort,
+                            "", "", null, DisplayDBMManager.class.getName()));
+                }
+            }
+        }
+        return RpgProgram.Companion.fromInputStream(
+                new ByteArrayInputStream(rewritten.getBytes(StandardCharsets.UTF_8)),
+                name.toUpperCase(), SourceProgram.RPGLE);
+    }
+
+    /**
+     * Programs and /COPY members kept by ibmish core (CRTBNDRPG, source
+     * files), read through the bridge.
+     */
+    static final class BridgeFinder implements RpgProgramFinder {
+        private final BridgeClient bridge;
+        private final String first;
+        private final String firstLibrary;
+        private final Displays displays;
+        private final List<ConnectionConfig> connections;
+        private final String hostPort;
+
+        BridgeFinder(BridgeClient bridge, String first, String firstLibrary, Displays displays,
+                List<ConnectionConfig> connections, String hostPort) {
+            this.bridge = bridge;
+            this.first = first;
+            this.firstLibrary = firstLibrary;
+            this.displays = displays;
+            this.connections = connections;
+            this.hostPort = hostPort;
+        }
+
+        @Override
+        public RpgProgram findRpgProgram(String nameOrSource) {
+            String name = nameOrSource.trim().toUpperCase();
+            if (name.isEmpty() || name.contains("\n")) return null;
+            // The program called: the library core found it in. Programs it
+            // calls: the library list.
+            String library = name.equals(first) ? firstLibrary : "";
+            String source = bridge.programSource(name, library);
+            return source == null ? null : load(name, source, displays, connections, hostPort);
+        }
+
+        @Override
+        public Copy findCopy(CopyId copyId) {
+            String source = bridge.sourceMember(copyId.getLibrary(), copyId.getFile(), copyId.getMember());
+            return source == null ? null : new Copy(source);
+        }
+
+        @Override
+        public ApiDescriptor findApiDescriptor(ApiId apiId) {
+            return null;
+        }
+
+        @Override
+        public Api findApi(ApiId apiId) {
+            return null;
         }
     }
 
@@ -398,21 +489,7 @@ public final class Runner {
             } catch (IOException e) {
                 throw new IllegalStateException("cannot read " + f + ": " + e.getMessage(), e);
             }
-            String rewritten = RecordLocks.preprocess(
-                    Printers.preprocess(Workstation.preprocess(source, displays::formats), nameOrSource));
-            synchronized (connections) {
-                for (Workstation.Format fmt : Workstation.formats()) {
-                    boolean known = connections.stream().anyMatch(c -> c.getFileName().equalsIgnoreCase(fmt.name));
-                    if (!known) {
-                        // Before the "*" entry, so the format is not looked up as a database file.
-                        connections.add(0, new ConnectionConfig(fmt.name, DisplayDBMManager.URL_PREFIX + hostPort,
-                                "", "", null, DisplayDBMManager.class.getName()));
-                    }
-                }
-            }
-            return RpgProgram.Companion.fromInputStream(
-                    new ByteArrayInputStream(rewritten.getBytes(StandardCharsets.UTF_8)),
-                    nameOrSource.toUpperCase(), SourceProgram.RPGLE);
+            return load(nameOrSource, source, displays, connections, hostPort);
         }
 
         @Override

@@ -1,0 +1,2 @@
+/* Shared declarations for the contacts CL programs. */
+DCL VAR(&APP) TYPE(*CHAR) LEN(10) VALUE('CONTACTS')

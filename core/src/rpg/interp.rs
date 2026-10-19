@@ -31,7 +31,7 @@ pub struct Io<'a> {
     /// in [`Machine::printed`].
     pub job: Option<crate::jobs::JobId>,
     /// The job's display (interactive jobs): EXFMT goes there.
-    pub display: Option<crate::bridge::DisplayHandle>,
+    pub display: Option<crate::runtime::DisplayHandle>,
     /// For CL commands run from RPG (QCMDEXC, CALL of a CL program).
     pub cl: Option<super::ClContext>,
     /// RPG programs active in the call stack above this one.
@@ -215,6 +215,68 @@ impl<'a> Machine<'a> {
         self.prog.syms.get(name).cloned()
     }
 
+    /// The storage a qualified name with indexes names: each index moves
+    /// to that element of a data structure array (`list.users(3).name`).
+    fn path_sym(&mut self, parts: &[String], idx: &[Option<Box<Expr>>]) -> Result<Sym> {
+        let mut extra = 0usize;
+        let mut name = String::new();
+        for (k, part) in parts.iter().enumerate() {
+            if k > 0 {
+                name.push('.');
+            }
+            name.push_str(part);
+            if let Some(Some(ix)) = idx.get(k) {
+                let i = self.eval(ix)?.num()?.to_i128()?;
+                match self.sym(&name) {
+                    Some(Sym::Ds(d)) => {
+                        if d.dim == 0 {
+                            bail!("{name} is not a data structure array");
+                        }
+                        if i < 1 || i > d.dim as i128 {
+                            bail!(
+                                "RNQ0121: An array index is out of range (index {i}, {} elements).",
+                                d.dim
+                            );
+                        }
+                        extra += (i as usize - 1) * d.size;
+                    }
+                    _ => bail!("{name} is not a data structure array"),
+                }
+            }
+        }
+        Ok(match self.sym(&name) {
+            Some(Sym::Var(mut v)) => {
+                v.off += extra;
+                Sym::Var(v)
+            }
+            Some(Sym::Ds(mut d)) => {
+                d.off += extra;
+                Sym::Ds(d)
+            }
+            _ => bail!("{name} is not defined"),
+        })
+    }
+
+    /// A data structure, or one element of a data structure array.
+    fn ds_element(
+        &mut self,
+        d: &super::program::DsInfo,
+        args: &Option<Vec<Expr>>,
+    ) -> Result<usize> {
+        match self.index_of(args)? {
+            None => Ok(d.off),
+            Some(i) => {
+                if d.dim == 0 || i < 1 || i > d.dim as i128 {
+                    bail!(
+                        "RNQ0121: An array index is out of range (index {i}, {} elements).",
+                        d.dim
+                    );
+                }
+                Ok(d.off + (i as usize - 1) * d.size)
+            }
+        }
+    }
+
     pub fn ind(&self, n: &str) -> bool {
         self.inds.get(&ind_name(n)).copied().unwrap_or(false)
     }
@@ -301,6 +363,20 @@ impl<'a> Machine<'a> {
                 Value::Char(s)
             }
             Expr::Omit => Value::Fig(Fig::Null),
+            Expr::Path { parts, idx, args } => match self.path_sym(parts, idx)? {
+                Sym::Var(v) => {
+                    let i = self.index_of(args)?;
+                    if i.is_none() && v.dim > 0 {
+                        bail!("{} is an array: an index is needed here", parts.join("."));
+                    }
+                    self.load_var(&v, i)?
+                }
+                Sym::Ds(d) => {
+                    let off = self.ds_element(&d, args)?;
+                    Value::Char(self.bufs[d.buf][off..off + d.size].to_vec())
+                }
+                _ => bail!("{} is not a field", parts.join(".")),
+            },
             Expr::Name { parts, args } => {
                 let name = parts.join(".");
                 match self.sym(&name) {
@@ -313,7 +389,8 @@ impl<'a> Machine<'a> {
                     }
                     Some(Sym::Const(c)) => c,
                     Some(Sym::Ds(d)) => {
-                        Value::Char(self.bufs[d.buf][d.off..d.off + d.size].to_vec())
+                        let off = self.ds_element(&d, args)?;
+                        Value::Char(self.bufs[d.buf][off..off + d.size].to_vec())
                     }
                     Some(Sym::Klist(_)) => bail!("{name} is a key list, not a value"),
                     None => match name.as_str() {
@@ -399,11 +476,13 @@ impl<'a> Machine<'a> {
     /// The type of what an expression names, when it names a field.
     fn type_of(&self, ex: &Expr) -> Option<DType> {
         match ex {
-            Expr::Name { parts, .. } => match self.sym(&parts.join(".")) {
-                Some(Sym::Var(v)) => Some(v.dtype),
-                Some(Sym::Ds(d)) => Some(DType::Char(d.size as u32)),
-                _ => None,
-            },
+            Expr::Name { parts, .. } | Expr::Path { parts, .. } => {
+                match self.sym(&parts.join(".")) {
+                    Some(Sym::Var(v)) => Some(v.dtype),
+                    Some(Sym::Ds(d)) => Some(DType::Char(d.size as u32)),
+                    _ => None,
+                }
+            }
             Expr::Ind(_) => Some(DType::Ind),
             _ => None,
         }
@@ -709,6 +788,19 @@ impl<'a> Machine<'a> {
                 cur[start - 1..start - 1 + len].copy_from_slice(&piece);
                 self.assign(base, &Value::Char(cur), fit, false)?;
             }
+            Expr::Path { parts, idx, args } => match self.path_sym(parts, idx)? {
+                Sym::Var(v) => {
+                    let i = self.index_of(args)?;
+                    self.store_var(&v, i, val, fit, right)?;
+                }
+                Sym::Ds(d) => {
+                    let off = self.ds_element(&d, args)?;
+                    let t = DType::Char(d.size as u32);
+                    let out = &mut self.bufs[d.buf][off..off + d.size];
+                    data::store(&t, val, out, fit, right)?;
+                }
+                _ => bail!("{} cannot be changed", parts.join(".")),
+            },
             Expr::Name { parts, args } => {
                 let name = parts.join(".");
                 match self.sym(&name) {
@@ -717,8 +809,9 @@ impl<'a> Machine<'a> {
                         self.store_var(&v, i, val, fit, right)?;
                     }
                     Some(Sym::Ds(d)) => {
+                        let off = self.ds_element(&d, args)?;
                         let t = DType::Char(d.size as u32);
-                        let out = &mut self.bufs[d.buf][d.off..d.off + d.size];
+                        let out = &mut self.bufs[d.buf][off..off + d.size];
                         data::store(&t, val, out, fit, right)?;
                     }
                     Some(_) => bail!("{name} cannot be changed"),
@@ -1308,7 +1401,7 @@ impl<'a> Machine<'a> {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let resp = self.block(async move {
                     display
-                        .send(crate::bridge::DisplayRequest { frame, reply: tx })
+                        .send(crate::runtime::DisplayRequest { frame, reply: tx })
                         .await
                         .map_err(|_| anyhow!("the job's display is gone"))?;
                     rx.await
@@ -2208,7 +2301,7 @@ impl Machine<'_> {
     /// response (at most 52 characters, ILE RPG Reference, DSPLY).
     fn dsply_screen(
         &mut self,
-        display: &crate::bridge::DisplayHandle,
+        display: &crate::runtime::DisplayHandle,
         text: &str,
         response: &Expr,
     ) -> Result<Value> {
@@ -2271,7 +2364,7 @@ impl Machine<'_> {
         let display = display.clone();
         let resp = self.block(async move {
             display
-                .send(crate::bridge::DisplayRequest { frame, reply: tx })
+                .send(crate::runtime::DisplayRequest { frame, reply: tx })
                 .await
                 .map_err(|_| anyhow!("the job's display is gone"))?;
             rx.await
@@ -2304,11 +2397,13 @@ impl<'a> Machine<'a> {
     /// The storage an argument passed by reference names: a variable, an
     /// array element, a whole array or a data structure.
     fn loc_of(&mut self, ex: &Expr) -> Result<Loc> {
-        let Expr::Name { parts, args } = ex else {
-            bail!("a variable is needed for a parameter passed by reference, found {ex:?}");
+        let (parts, args, sym) = match ex {
+            Expr::Name { parts, args } => (parts, args, self.sym(&parts.join("."))),
+            Expr::Path { parts, idx, args } => (parts, args, Some(self.path_sym(parts, idx)?)),
+            _ => bail!("a variable is needed for a parameter passed by reference, found {ex:?}"),
         };
         let name = parts.join(".");
-        match self.sym(&name) {
+        match sym {
             Some(Sym::Var(v)) => {
                 let index = self.index_of(args)?;
                 Ok(match index {
@@ -2333,12 +2428,21 @@ impl<'a> Machine<'a> {
                     }
                 })
             }
-            Some(Sym::Ds(d)) => Ok(Loc {
-                buf: d.buf,
-                off: d.off,
-                size: d.size * d.dim.max(1) as usize,
-                dtype: DType::Char((d.size * d.dim.max(1) as usize) as u32),
-            }),
+            Some(Sym::Ds(d)) => {
+                let one = args.is_some();
+                let off = self.ds_element(&d, args)?;
+                let size = if one {
+                    d.size
+                } else {
+                    d.size * d.dim.max(1) as usize
+                };
+                Ok(Loc {
+                    buf: d.buf,
+                    off,
+                    size,
+                    dtype: DType::Char(size as u32),
+                })
+            }
             _ => bail!("{name} is not a variable; it cannot be passed by reference"),
         }
     }

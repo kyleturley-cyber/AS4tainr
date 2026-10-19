@@ -7,7 +7,7 @@ as4tainr crtbndcl QGPL/CUSTRPT --src samples/qclsrc/CUSTRPT.clle --text 'Custome
 as4tainr call CUSTRPT L          # or, on the 5250 command line: CALL CUSTRPT PARM(L)
 ```
 
-`crtbndcl` reports errors with their line numbers and does not create a program that has any. It replaces an existing program of the same name, as `REPLACE(*YES)` does. `CALL` finds a CL program through the library list; a name that is not a CL program goes to the RPG runner.
+`crtbndcl` reports errors with their line numbers and does not create a program that has any. It replaces an existing program of the same name, as `REPLACE(*YES)` does. `CALL` finds a CL program through the library list; a name that is not a CL program runs on the RPG engine.
 
 ## Supported
 

@@ -52,7 +52,7 @@ Sign-on:
               as4tainr - legacy RPG and 5250 applications in a container
 ```
 
-Command entry, after CRTLIB and a CALL of an RPG program on Jariko:
+Command entry, after CRTLIB and a CALL of an RPG program:
 
 ```
                                 Command Entry                            AS4TAINR
@@ -149,7 +149,7 @@ DSPLIB:
 | `RMVLIBLE LIB(name)` | Removes a library from the user part of the library list. |
 | `CHGCURLIB CURLIB(name\|*CRTDFT)` | Sets the current library; `*CRTDFT` means none (objects are then created in QGPL). |
 | `CHGLIBL LIBL(names\|*SAME\|*NONE) CURLIB(*SAME\|*CRTDFT\|name)` | Replaces the user part of the library list, and optionally the current library. |
-| `CALL PGM(name) PARM('a' 'b')` | Runs an RPG program on Jariko with the job's library list. DSPLY output appears in the log. |
+| `CALL PGM(name) PARM('a' 'b')` | Runs a CL or RPG program with the job's library list. DSPLY output appears in the log; DSPLY with a response asks on the screen. |
 | `SIGNOFF` | Ends the session and returns to the sign-on screen. |
 | `CRTUSRPRF USRPRF(name) PASSWORD(*USRPRF\|*NONE\|pw) PWDEXP STATUS USRCLS CURLIB TEXT SPCAUT` | Creates a user profile. Needs `*SECADM`. `SPCAUT(*USRCLS)` gives the class's special authorities (`*SECOFR`: all eight; `*SECADM`: `*SECADM`; `*SYSOPR`: `*JOBCTL *SAVSYS`; `*PGMR`, `*USER`: none). |
 | `DSPUSRPRF USRPRF(name)` | Shows a profile: class, status, special authorities, previous sign-on. Your own, or any with `*SECADM`. `CPF2204` if it does not exist. |

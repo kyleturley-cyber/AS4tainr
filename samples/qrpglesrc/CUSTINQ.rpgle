@@ -2,7 +2,6 @@
       * PROMPT asks for a customer number; DETAIL shows the customer.
       * F3 ends the program; F12 on DETAIL returns to PROMPT.
       * An unknown customer turns on *IN30, which shows ERRMSG on PROMPT.
-      * (No ITER: Jariko v2.2.0 does not support ITER inside DOW.)
      FCUSTINQD  CF   E             WORKSTN
      FCUSTMAST  IF   E           K DISK
      C                   DOW       NOT *IN03

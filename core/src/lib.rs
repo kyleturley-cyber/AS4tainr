@@ -4,7 +4,7 @@
 //! - [`dds`]: parse DDS source for physical files
 //! - [`catalog`]: libraries and file descriptions stored in PostgreSQL
 //! - [`rla`]: record-level access (SETLL, CHAIN, READ, ...) over PostgreSQL
-//! - [`bridge`]: the JSON-lines protocol the JVM (Jariko) uses for file I/O
+//! - [`runtime`]: what a running program shares with its job (database session, display)
 //! - [`sql`]: SQL in the DB2 for i dialect
 //! - [`dspf`], [`workstn`]: display files, subfiles and the screen
 //! - [`dtaara`]: data areas
@@ -17,7 +17,6 @@
 //! - [`web`]: the browser 5250 terminal
 
 pub mod authority;
-pub mod bridge;
 pub mod catalog;
 pub mod cl;
 pub mod clpgm;
@@ -30,6 +29,7 @@ pub mod jobs;
 pub mod menus;
 pub mod rla;
 pub mod rpg;
+pub mod runtime;
 pub mod source;
 pub mod spool;
 pub mod sql;

@@ -571,7 +571,7 @@ pub fn batch_max_active() -> usize {
 /// submitter's library list, the messages in its job log, and the
 /// completion message to the submitting user's message queue.
 pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -> Result<bool> {
-    let client = crate::bridge::connect_db(&env.database_url).await?;
+    let client = crate::runtime::connect_db(&env.database_url).await?;
     let id = info.id.clone();
     log(
         &client,
@@ -681,7 +681,7 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
 /// The QBATCH subsystem: take jobs off job queue QBATCH and run them, at
 /// most `max_active` at a time, until the task is dropped.
 pub async fn run_subsystem(env: crate::commands::Environment, max_active: usize) -> Result<()> {
-    let client = crate::bridge::connect_db(&env.database_url).await?;
+    let client = crate::runtime::connect_db(&env.database_url).await?;
     let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(max_active));
     let env = std::sync::Arc::new(env);
     loop {

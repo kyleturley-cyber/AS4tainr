@@ -10,11 +10,11 @@ use std::time::Duration;
 
 use super::ds::{self, attr, Aid, FieldKind, Screen};
 use super::telnet::{opcode, Connection};
-use crate::bridge;
 use crate::cl;
 use crate::commands::{Environment, Job, ListDisplay, Outcome};
 use crate::dspf;
 use crate::menus;
+use crate::runtime;
 use crate::users;
 use crate::workstn;
 
@@ -114,7 +114,7 @@ pub async fn run(stream: tokio::net::TcpStream, cfg: &ServerConfig, device: &str
     conn.negotiate().await?;
     eprintln!("as4tainr: {device}: terminal type {}", conn.terminal_type);
     let mut term = Term { conn };
-    let client = bridge::connect_db(&cfg.env.database_url).await?;
+    let client = runtime::connect_db(&cfg.env.database_url).await?;
     let mut message = String::new();
     let mut attempts = 0;
 
@@ -216,7 +216,7 @@ pub async fn run(stream: tokio::net::TcpStream, cfg: &ServerConfig, device: &str
             Some(curlib)
         };
         // Programs called from this session show their display files here.
-        let (display_tx, mut display_rx) = tokio::sync::mpsc::channel::<bridge::DisplayRequest>(1);
+        let (display_tx, mut display_rx) = tokio::sync::mpsc::channel::<runtime::DisplayRequest>(1);
         // The session is an interactive job in QINTER.
         let id = crate::jobs::start_interactive(
             &client,
@@ -390,7 +390,7 @@ async fn workstation(
     term: &mut Term,
     job: &mut Job<'_>,
     cfg: &ServerConfig,
-    display_rx: &mut tokio::sync::mpsc::Receiver<bridge::DisplayRequest>,
+    display_rx: &mut tokio::sync::mpsc::Receiver<runtime::DisplayRequest>,
     profile: &users::Profile,
 ) -> Result<()> {
     let mut rq = Requests {
@@ -627,7 +627,7 @@ async fn request(
     term: &mut Term,
     job: &mut Job<'_>,
     cfg: &ServerConfig,
-    display_rx: &mut tokio::sync::mpsc::Receiver<bridge::DisplayRequest>,
+    display_rx: &mut tokio::sync::mpsc::Receiver<runtime::DisplayRequest>,
     rq: &mut Requests,
     line: &str,
 ) -> Result<Done> {
@@ -787,7 +787,7 @@ async fn request(
 /// through a subfile happens here, without the program.
 async fn exfmt(
     term: &mut Term,
-    req: &bridge::DisplayRequest,
+    req: &runtime::DisplayRequest,
     user: &str,
     system: &str,
 ) -> Result<dspf::Response> {

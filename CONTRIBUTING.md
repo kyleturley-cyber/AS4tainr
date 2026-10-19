@@ -21,7 +21,7 @@ Every commit must be signed off (`git commit -s`). The sign-off certifies the [D
 Business software must give the right answer to the cent, so every behavior needs a test that pins it down:
 
 - **Rust core:** unit tests next to the code, integration tests in `core/tests/` (these need `AS4TAINR_TEST_DATABASE_URL`).
-- **Programs:** add an RPG program to `samples/qrpglesrc/` and its expected `DSPLY` output to `samples/expected/PGM_PARM.txt`. `scripts/demo.sh` runs it in CI on the real Jariko runner.
+- **Programs:** add an RPG program to `samples/qrpglesrc/` and its expected `DSPLY` output to `samples/expected/PGM_PARM.txt`. `scripts/demo.sh` runs it in CI.
 - When you know what real IBM i does (from documentation or a licensed system), say where the expected result comes from in the test or the PR.
 - Known differences go in [docs/fidelity-gaps.md](docs/fidelity-gaps.md). A documented gap is fine; a silent one is not.
 
@@ -34,7 +34,7 @@ AI assistants are welcome, and `CLAUDE.md` describes the project's conventions f
 ```sh
 cargo fmt && cargo clippy --all-targets -- -D warnings
 AS4TAINR_TEST_DATABASE_URL=postgres://as4tainr:as4tainr@127.0.0.1/as4tainr cargo test
-cd jvm && ./gradlew fatJar && cd .. && scripts/demo.sh
+AS4TAINR_BIN=target/debug/as4tainr scripts/demo.sh
 ```
 
 Keep pull requests small and focused, and describe what IBM i behavior they implement.

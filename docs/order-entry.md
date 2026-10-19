@@ -2,7 +2,7 @@
 
 Phase 2 of the roadmap ends when "a sample order-entry app runs unmodified". This is that app. It is written the way such programs are written on IBM i: fixed-form RPG IV with an input subfile, DDS physical files and a display file, a data area for the next order number, and a CL program that starts it. Nothing in it is specific to as4tainr.
 
-The end-to-end test (`tools/e2e_5250.py`, run in CI with Jariko and the real tn5250 client) signs on, enters an order with mistakes, corrects them, creates the order and checks the files.
+The end-to-end test (`tools/e2e_5250.py`, run in CI with the real tn5250 client) signs on, enters an order with mistakes, corrects them, creates the order and checks the files.
 
 ## Objects
 
@@ -70,5 +70,5 @@ The first run of the gate found a race in an earlier version of `ORDENTC`: it cr
 
 ## Found while building it
 
-- Jariko caches `CHAIN` results by default. On IBM i every `CHAIN` reads the file, and the record found is the one `UPDATE` changes. With the cache, a `CHAIN` that hit the cache left the file positioned on another record, and `UPDATE` overwrote that one. The runner turns the cache off.
+- On IBM i every `CHAIN` reads the file, and the record found is the one `UPDATE` changes. (Jariko, the RPG runner used then, cached `CHAIN` results; with the cache, `UPDATE` could overwrite another record. The RPG engine that replaced it has no such cache.)
 - An input-capable numeric field with an edit code is now shown edited, so a zero quantity with `EDTCDE(Z)` is blank instead of `0`.

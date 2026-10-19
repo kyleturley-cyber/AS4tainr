@@ -1,6 +1,4 @@
 /target/
-jvm/build/
-jvm/.gradle/
 .gradle/
 .idea/
 *.iml

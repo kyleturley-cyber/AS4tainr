@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use as4tainr_core::{bridge, catalog, commands, dds, tn5250, users};
+use as4tainr_core::{catalog, commands, dds, runtime, tn5250, users};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -104,13 +104,6 @@ enum Cmd {
         /// The library to import into (created if needed).
         #[arg(long)]
         lib: String,
-        /// Command that runs RPG programs (unused by the import itself).
-        #[arg(
-            long,
-            env = "AS4TAINR_RUNNER",
-            default_value = "java -jar /opt/as4tainr/as4tainr-jvm.jar"
-        )]
-        runner: String,
     },
     /// Load records from a CSV file (header row = field names) with WRITE.
     Load {
@@ -125,18 +118,6 @@ enum Cmd {
     System {
         /// The command, as typed on a command line.
         command: String,
-        /// Command that runs RPG programs (for CALL).
-        #[arg(
-            long,
-            env = "AS4TAINR_RUNNER",
-            default_value = "java -jar /opt/as4tainr/as4tainr-jvm.jar"
-        )]
-        runner: String,
-    },
-    /// Run the JVM bridge server.
-    Serve {
-        #[arg(long, default_value_t = 7250)]
-        port: u16,
     },
     /// Run the TN5250 display server (5250 green-screen sessions).
     Tn5250 {
@@ -146,31 +127,13 @@ enum Cmd {
         /// System name shown on the sign-on screen.
         #[arg(long, env = "AS4TAINR_SYSTEM_NAME", default_value = "AS4TAINR")]
         system_name: String,
-        /// Command that runs RPG programs for CALL.
-        #[arg(
-            long,
-            env = "AS4TAINR_RUNNER",
-            default_value = "java -jar /opt/as4tainr/as4tainr-jvm.jar"
-        )]
-        runner: String,
         /// Also serve the browser 5250 terminal on this address (HTTP), for
         /// example 0.0.0.0:8080. Off unless set.
         #[arg(long, env = "AS4TAINR_WEB_LISTEN")]
         web_listen: Option<String>,
     },
-    /// CALL: run a program. Starts a bridge on a free port and launches the
-    /// runner (the JVM with Jariko), passing `--bridge HOST:PORT` first.
-    Call {
-        program: String,
-        args: Vec<String>,
-        /// Command that runs RPG programs.
-        #[arg(
-            long,
-            env = "AS4TAINR_RUNNER",
-            default_value = "java -jar /opt/as4tainr/as4tainr-jvm.jar"
-        )]
-        runner: String,
-    },
+    /// CALL: run a program (CL or RPG) as QSECOFR, outside any job.
+    Call { program: String, args: Vec<String> },
 }
 
 fn split_lib_file(q: &str) -> Result<(String, String)> {
@@ -179,8 +142,6 @@ fn split_lib_file(q: &str) -> Result<(String, String)> {
         None => bail!("expected a qualified name LIB/FILE, got '{q}'"),
     }
 }
-
-fn server_abort_unused(_l: tokio::net::TcpListener) {}
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -203,12 +164,12 @@ async fn run(cli: Cli) -> Result<u8> {
 
     match cli.cmd {
         Cmd::Init => {
-            let client = bridge::connect_db(&cli.database_url).await?;
+            let client = runtime::connect_db(&cli.database_url).await?;
             catalog::init(&client).await?;
             println!("as4tainr catalog ready.");
         }
         Cmd::Rstpwd { user } => {
-            let client = bridge::connect_db(&cli.database_url).await?;
+            let client = runtime::connect_db(&cli.database_url).await?;
             catalog::init(&client).await?;
             let user = user.to_ascii_uppercase();
             if !users::reset_password(&client, &user).await? {
@@ -219,7 +180,7 @@ async fn run(cli: Cli) -> Result<u8> {
             );
         }
         Cmd::Crtlib { library, text } => {
-            let client = bridge::connect_db(&cli.database_url).await?;
+            let client = runtime::connect_db(&cli.database_url).await?;
             catalog::create_library(&client, &library, &text).await?;
             println!("Library {} created.", library.to_ascii_uppercase());
         }
@@ -228,7 +189,7 @@ async fn run(cli: Cli) -> Result<u8> {
             let source = std::fs::read_to_string(&src)
                 .with_context(|| format!("reading {}", src.display()))?;
             let pgm = as4tainr_core::clpgm::compile(&name, &source)?;
-            let mut client = bridge::connect_db(&cli.database_url).await?;
+            let mut client = runtime::connect_db(&cli.database_url).await?;
             catalog::create_cl_program(&mut client, &lib, &name, &text, &source, true).await?;
             println!(
                 "Program {} created in library {} ({} parameters, {} variables).",
@@ -239,7 +200,7 @@ async fn run(cli: Cli) -> Result<u8> {
             );
         }
         Cmd::Sql { statement } => {
-            let client = bridge::connect_db(&cli.database_url).await?;
+            let client = runtime::connect_db(&cli.database_url).await?;
             match as4tainr_core::sql::run(&client, &cli.database_url, &libl, &statement).await? {
                 as4tainr_core::sql::Outcome::Rows {
                     columns,
@@ -263,7 +224,7 @@ async fn run(cli: Cli) -> Result<u8> {
             let source = std::fs::read_to_string(&src)
                 .with_context(|| format!("reading {}", src.display()))?;
             let lf = dds::parse_lf(&name, &source)?;
-            let mut client = bridge::connect_db(&cli.database_url).await?;
+            let mut client = runtime::connect_db(&cli.database_url).await?;
             catalog::create_logical_file(&mut client, &libl, &lib, &lf).await?;
             let keys: Vec<String> = lf
                 .keys
@@ -298,7 +259,7 @@ async fn run(cli: Cli) -> Result<u8> {
             let source = std::fs::read_to_string(&src)
                 .with_context(|| format!("reading {}", src.display()))?;
             let pf = dds::parse_pf(&name, &source)?;
-            let mut client = bridge::connect_db(&cli.database_url).await?;
+            let mut client = runtime::connect_db(&cli.database_url).await?;
             catalog::create_physical_file(&mut client, &lib, &pf).await?;
             println!(
                 "File {} created in library {} ({} fields, key: {}).",
@@ -316,7 +277,7 @@ async fn run(cli: Cli) -> Result<u8> {
             let (lib, name) = split_lib_file(&file)?;
             let source = std::fs::read_to_string(&src)
                 .with_context(|| format!("reading {}", src.display()))?;
-            let mut client = bridge::connect_db(&cli.database_url).await?;
+            let mut client = runtime::connect_db(&cli.database_url).await?;
             let f = catalog::create_display_file(&mut client, &lib, &name, &source).await?;
             println!(
                 "Display file {} created in library {} (record formats: {}).",
@@ -330,7 +291,7 @@ async fn run(cli: Cli) -> Result<u8> {
             );
         }
         Cmd::Load { file, csv } => {
-            let client = bridge::connect_db(&cli.database_url).await?;
+            let client = runtime::connect_db(&cli.database_url).await?;
             let f = catalog::resolve_file(&client, &libl, &file).await?;
             let text = std::fs::read_to_string(&csv)
                 .with_context(|| format!("reading {}", csv.display()))?;
@@ -338,13 +299,11 @@ async fn run(cli: Cli) -> Result<u8> {
             let n = as4tainr_core::import::load_csv(&client, f, &text).await?;
             println!("{n} records written to {lib}/{name}.");
         }
-        Cmd::Import { dir, lib, runner } => {
-            let client = bridge::connect_db(&cli.database_url).await?;
+        Cmd::Import { dir, lib } => {
+            let client = runtime::connect_db(&cli.database_url).await?;
             catalog::init(&client).await?;
             let env = commands::Environment {
                 database_url: cli.database_url.clone(),
-                runner,
-                call_timeout: std::time::Duration::from_secs(120),
             };
             let mut job = commands::Job {
                 client: &client,
@@ -370,13 +329,11 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             println!("All objects created.");
         }
-        Cmd::System { command, runner } => {
-            let client = bridge::connect_db(&cli.database_url).await?;
+        Cmd::System { command } => {
+            let client = runtime::connect_db(&cli.database_url).await?;
             catalog::init(&client).await?;
             let env = commands::Environment {
                 database_url: cli.database_url.clone(),
-                runner,
-                call_timeout: std::time::Duration::from_secs(120),
             };
             let mut job = commands::Job {
                 client: &client,
@@ -410,29 +367,13 @@ async fn run(cli: Cli) -> Result<u8> {
                 }
             }
         }
-        Cmd::Serve { port } => {
-            let listener = bridge::bind(port).await?;
-            println!("as4tainr bridge listening on {}", listener.local_addr()?);
-            bridge::serve(
-                listener,
-                bridge::BridgeConfig {
-                    database_url: cli.database_url,
-                    library_list: libl,
-                    display: None,
-                    job: None,
-                    record_wait: None,
-                },
-            )
-            .await?;
-        }
         Cmd::Tn5250 {
             listen,
             system_name,
-            runner,
             web_listen,
         } => {
             // Make sure the catalog and QSECOFR exist before anyone signs on.
-            let client = bridge::connect_db(&cli.database_url).await?;
+            let client = runtime::connect_db(&cli.database_url).await?;
             catalog::init(&client).await?;
             // Jobs left active by a server that stopped are not running.
             let stale = as4tainr_core::jobs::recover(&client).await?;
@@ -471,8 +412,6 @@ async fn run(cli: Cli) -> Result<u8> {
             let cfg = tn5250::ServerConfig {
                 env: commands::Environment {
                     database_url: cli.database_url,
-                    runner,
-                    call_timeout: std::time::Duration::from_secs(120),
                 },
                 system_name: system_name.to_ascii_uppercase(),
                 libl: libl.clone(),
@@ -488,28 +427,30 @@ async fn run(cli: Cli) -> Result<u8> {
                 r = web => r?,
             }
         }
-        Cmd::Call {
-            program,
-            args,
-            runner,
-        } if {
-            // A CL program runs in a batch job here.
-            let client = bridge::connect_db(&cli.database_url).await?;
-            let name = program.to_ascii_uppercase();
-            let (libs, n) = match name.split_once('/') {
-                Some((l, n)) => (vec![l.to_string()], n.to_string()),
-                None => (libl.clone(), name.clone()),
-            };
-            catalog::find_cl_program(&client, &libs, &n)
-                .await?
-                .is_some()
-        } =>
-        {
-            let client = bridge::connect_db(&cli.database_url).await?;
+        Cmd::Call { program, args } => {
+            // A CL program runs here as a job would run it; an RPG program
+            // on the RPG engine. Printed output goes to standard output.
+            let client = runtime::connect_db(&cli.database_url).await?;
             let env = commands::Environment {
                 database_url: cli.database_url.clone(),
-                runner,
-                call_timeout: std::time::Duration::from_secs(120),
+            };
+            // An RPG program's DSPLY output is printed as it wrote it; a CL
+            // program's messages as its job log would show them.
+            let is_cl = {
+                let name = program.to_ascii_uppercase();
+                let (libs, n) = match name.split_once('/') {
+                    Some((l, n)) => (vec![l.to_string()], n.to_string()),
+                    None => (libl.clone(), name.clone()),
+                };
+                catalog::find_cl_program(&client, &libs, &n)
+                    .await?
+                    .is_some()
+            };
+            let show = |l: &str| -> String {
+                match l.strip_prefix("DSPLY  ") {
+                    Some(t) if !is_cl => t.to_string(),
+                    _ => l.to_string(),
+                }
             };
             let mut job = commands::Job {
                 client: &client,
@@ -523,106 +464,22 @@ async fn run(cli: Cli) -> Result<u8> {
             match job.call_program(&program, args).await {
                 Ok(commands::Outcome::Messages(m)) => {
                     for l in m {
-                        println!("{l}");
+                        println!("{}", show(&l));
                     }
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    eprintln!("as4tainr: {e:#}");
+                    let text = format!("{e:#}");
+                    let mut lines: Vec<&str> = text.lines().collect();
+                    // DSPLY lines before the error are output too.
+                    while lines.first().is_some_and(|l| l.starts_with("DSPLY  ")) {
+                        println!("{}", show(lines.remove(0)));
+                    }
+                    for l in lines {
+                        eprintln!("as4tainr: {l}");
+                    }
                     return Ok(1);
                 }
-            }
-        }
-        Cmd::Call {
-            program,
-            args,
-            runner,
-        } => {
-            let listener = bridge::bind(0).await?;
-            let addr = listener.local_addr()?;
-            let cfg = bridge::BridgeConfig {
-                database_url: cli.database_url.clone(),
-                library_list: libl,
-                display: None,
-                job: None,
-                record_wait: None,
-            };
-            // An RPG program object (CRTBNDRPG): the runner gets its source
-            // from the bridge; otherwise it looks in AS4TAINR_PGM_PATH.
-            let (pgm_lib, program) = {
-                let client = bridge::connect_db(&cli.database_url).await?;
-                let name = program.to_ascii_uppercase();
-                let (libs, n) = match name.split_once('/') {
-                    Some((l, n)) => (vec![l.to_string()], n.to_string()),
-                    None => (cfg.library_list.clone(), name.clone()),
-                };
-                match catalog::find_program(&client, &libs, &n).await? {
-                    Some(p) => (p.library, n),
-                    None => (String::new(), n),
-                }
-            };
-            if as4tainr_core::rpg::native_enabled() {
-                server_abort_unused(listener);
-                let client = bridge::connect_db(&cli.database_url).await?;
-                let source = if pgm_lib.is_empty() {
-                    as4tainr_core::rpg::source_from_path(&program)
-                } else {
-                    catalog::find_program(&client, std::slice::from_ref(&pgm_lib), &program)
-                        .await?
-                        .map(|p| p.source)
-                }
-                .ok_or_else(|| anyhow::anyhow!("CPF4101: Program {program} not found."))?;
-                let r = as4tainr_core::rpg::call(
-                    &cli.database_url,
-                    cfg.library_list.clone(),
-                    "QSECOFR".into(),
-                    None,
-                    None,
-                    Some(as4tainr_core::rpg::ClContext {
-                        env: commands::Environment {
-                            database_url: cli.database_url.clone(),
-                            runner: std::env::var("AS4TAINR_RUNNER").unwrap_or_default(),
-                            call_timeout: std::time::Duration::from_secs(60),
-                        },
-                        curlib: None,
-                        user_libl: cfg.library_list.clone(),
-                    }),
-                    program.clone(),
-                    source,
-                    args,
-                )
-                .await?;
-                for m in r.messages.iter().chain(&r.printed) {
-                    println!("{m}");
-                }
-                if let Some(e) = r.error {
-                    eprintln!("as4tainr: {e:#}");
-                    eprintln!("as4tainr: program {program} ended abnormally");
-                    return Ok(1);
-                }
-                return Ok(0);
-            }
-            let server = tokio::spawn(bridge::serve(listener, cfg));
-
-            let mut parts = runner.split_whitespace();
-            let exe = parts.next().context("empty --runner")?;
-            let status = tokio::process::Command::new(exe)
-                .args(parts)
-                .arg("--bridge")
-                .arg(addr.to_string())
-                .arg(&program)
-                .args(&args)
-                .env("AS4TAINR_PGM_LIB", &pgm_lib)
-                .status()
-                .await
-                .with_context(|| format!("starting runner '{runner}'"))?;
-            server.abort();
-            if !status.success() {
-                eprintln!(
-                    "as4tainr: program {} ended abnormally ({status})",
-                    program.to_ascii_uppercase()
-                );
-                return Ok(status.code().map(|c| c.clamp(1, 255) as u8).unwrap_or(1));
             }
         }
     }

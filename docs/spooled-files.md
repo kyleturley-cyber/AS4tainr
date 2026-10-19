@@ -82,11 +82,11 @@ What is supported:
 
 ## How it works
 
-Jariko parses O specs but does nothing with them, and `EXCEPT` is not implemented. When a program is loaded, the runner (`Printers.java`) reads its PRINTER F specs and their O specs, and replaces each `EXCEPT` with a signal (the same mechanism as record locks, see [record-locks.md](record-locks.md)). On the signal, it lays out the lines from the program's variables and sends them to as4tainr core (bridge operations `splopen`, `splwrite`, `splclose`, protocol version 5). Core keeps them by page and line (`as4tainr.spooled_files`, `as4tainr.spool_lines`). The spooled file is closed when the program ends.
+The RPG engine (docs/rpg-engine.md) lays out each output record from the program's fields as the O specs say, and writes the lines to the job's spooled file, kept by page and line (`as4tainr.spooled_files`, `as4tainr.spool_lines`). The spooled file is opened by the first line printed and closed when the program ends. A call without a job (`as4tainr call`) prints to standard output instead.
 
 ## Not yet
 
-- **Program cycle output:** `H`, `D` and `T` records (heading, detail and total output of the program cycle), and fetch overflow (`F`).
+- **Fetch overflow** (`F` in position 18).
 - **Formats and editing:** externally described printer files (DDS `*PRTF` with `WRITE`), edit words, data formats `P`/`B`/`L`/`R`, and the overflow indicators `OA`-`OG`.
 - **Printer settings:** `PRTCTL`, form length and overflow line from `OVRPRTF`/`CRTPRTF` (always 66/60).
 - **Output queues:** `WRKOUTQ`, `CHGSPLFA`, `HLDSPLF`/`RLSSPLF`, `CPYSPLF`, and printing to a real printer or to PDF.

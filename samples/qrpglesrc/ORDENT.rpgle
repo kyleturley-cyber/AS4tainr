@@ -10,7 +10,6 @@
       * lines to ORDLIN, the quantities are taken off ITMQOH and the total
       * is added to the customer's balance. F12 goes back to the customer
       * prompt, F3 ends the program.
-      * (No ITER: Jariko v2.2.0 does not support ITER inside DOW.)
      FORDENTD   CF   E             WORKSTN
      F                                     SFILE(ORDSFL:RRN)
      FCUSTMAST  UF   E           K DISK

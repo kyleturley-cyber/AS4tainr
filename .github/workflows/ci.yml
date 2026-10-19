@@ -7,7 +7,7 @@ on:
 
 jobs:
   core:
-    name: Rust core + bridge conformance
+    name: Rust core, RPG engine and the sample programs
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -21,7 +21,6 @@ jobs:
           --health-cmd "pg_isready -U as4tainr" --health-interval 2s --health-retries 30
     env:
       AS4TAINR_TEST_DATABASE_URL: postgres://as4tainr:as4tainr@127.0.0.1/as4tainr
-      AS4TAINR_DATABASE_URL: postgres://as4tainr:as4tainr@127.0.0.1/as4tainr
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -30,30 +29,16 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --locked
-      - uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: "17"
-      - name: Compile the dependency-free bridge client and conformance runner
-        run: javac -d target/conformance-classes jvm/src/main/java/io/as4tainr/bridge/*.java jvm/src/test/java/io/as4tainr/bridge/*.java
-      - name: End-to-end with the conformance runner (bridge protocol, Jariko path)
-        env:
-          AS4TAINR_BIN: target/debug/as4tainr
-          AS4TAINR_RPG_ENGINE: jariko
-          AS4TAINR_RUNNER: java -cp target/conformance-classes io.as4tainr.bridge.BridgeConformance
-        run: |
-          scripts/demo.sh
-          target/debug/as4tainr call SELFTEST
-      - name: End-to-end on the RPG engine (docs/rpg-engine.md)
+      - name: The sample programs match their golden output (scripts/demo.sh)
         env:
           AS4TAINR_BIN: target/debug/as4tainr
           PGPASSWORD: as4tainr
         run: |
-          createdb -h 127.0.0.1 -U as4tainr as4tainr_native
-          AS4TAINR_DATABASE_URL=postgres://as4tainr:as4tainr@127.0.0.1/as4tainr_native scripts/demo.sh
+          createdb -h 127.0.0.1 -U as4tainr as4tainr_demo
+          AS4TAINR_DATABASE_URL=postgres://as4tainr:as4tainr@127.0.0.1/as4tainr_demo scripts/demo.sh
 
-  jariko:
-    name: Jariko runner end to end
+  tn5250:
+    name: 5250 server with the real tn5250 client
     runs-on: ubuntu-latest
     needs: core
     services:
@@ -71,44 +56,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: "17"
-      - run: cargo build --locked
-      - name: Build as4tainr-jvm.jar (Jariko + bridge adapter)
-        working-directory: jvm
-        run: ./gradlew --no-daemon fatJar
-      - name: Run the sample RPG programs on Jariko against PostgreSQL
-        env:
-          AS4TAINR_BIN: target/debug/as4tainr
-          AS4TAINR_RPG_ENGINE: jariko
-          AS4TAINR_RUNNER: java -jar jvm/build/libs/as4tainr-jvm.jar
-        run: scripts/demo.sh
-
-  tn5250:
-    name: 5250 server with the real tn5250 client
-    runs-on: ubuntu-latest
-    needs: jariko
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: as4tainr
-          POSTGRES_PASSWORD: as4tainr
-          POSTGRES_DB: as4tainr
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U as4tainr" --health-interval 2s --health-retries 30
-    env:
-      AS4TAINR_DATABASE_URL: postgres://as4tainr:as4tainr@127.0.0.1/as4tainr
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: "17"
       - name: Build tn5250 (test client only; not shipped)
         run: |
           sudo apt-get update && sudo apt-get install -y cmake libncurses-dev libssl-dev
@@ -117,14 +64,11 @@ jobs:
           cmake --build /tmp/tn5250/build -j 2
           pip install pyte
       - run: cargo build --locked
-      - name: Build as4tainr-jvm.jar
-        working-directory: jvm
-        run: ./gradlew --no-daemon fatJar
       - name: Start the 5250 server with the sample files
         run: |
           AS4TAINR_BIN=target/debug/as4tainr scripts/samples.sh
           AS4TAINR_WAITRCD=5 AS4TAINR_PGM_PATH=$PWD/samples/qrpglesrc nohup target/debug/as4tainr tn5250 \
-            --listen 127.0.0.1:2323 --web-listen 127.0.0.1:5250 --runner "java -jar jvm/build/libs/as4tainr-jvm.jar" > tn5250-server.log 2>&1 &
+            --listen 127.0.0.1:2323 --web-listen 127.0.0.1:5250 > tn5250-server.log 2>&1 &
           sleep 2
       - name: Sign on, CL commands, interactive RPG (subfiles) and the order entry app through tn5250
         env:
@@ -135,20 +79,6 @@ jobs:
           TN5250: /tmp/tn5250/build/curses/tn5250
           AS4TAINR_BIN: target/debug/as4tainr
         run: python3 tools/gate3_5250.py 127.0.0.1:2323
-      - name: 5250 end-to-end and the Phase 3 gate on Jariko (AS4TAINR_RPG_ENGINE=jariko)
-        env:
-          TN5250: /tmp/tn5250/build/curses/tn5250
-          AS4TAINR_RPG_ENGINE: jariko
-          PGPASSWORD: as4tainr
-        run: |
-          createdb -h 127.0.0.1 -U as4tainr as4tainr_jariko
-          export AS4TAINR_DATABASE_URL=postgres://as4tainr:as4tainr@127.0.0.1/as4tainr_jariko
-          AS4TAINR_BIN=target/debug/as4tainr scripts/samples.sh
-          AS4TAINR_WAITRCD=5 AS4TAINR_PGM_PATH=$PWD/samples/qrpglesrc nohup target/debug/as4tainr tn5250 \
-            --listen 127.0.0.1:2324 --runner "java -jar jvm/build/libs/as4tainr-jvm.jar" > tn5250-jariko.log 2>&1 &
-          sleep 2
-          python3 tools/e2e_5250.py 127.0.0.1:2324 || { cat tn5250-jariko.log; exit 1; }
-          AS4TAINR_BIN=target/debug/as4tainr python3 tools/gate3_5250.py 127.0.0.1:2324 || { cat tn5250-jariko.log; exit 1; }
       - name: Browser 5250 terminal in Chromium
         run: |
           pip install playwright
@@ -160,7 +90,7 @@ jobs:
   docker:
     name: Container image
     runs-on: ubuntu-latest
-    needs: jariko
+    needs: core
     steps:
       - uses: actions/checkout@v5
       - run: docker compose build

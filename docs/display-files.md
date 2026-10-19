@@ -5,17 +5,16 @@ RPG programs that use DDS display files run on as4tainr. When a program does `EX
 ## How it works
 
 ```
- 5250 session ◄── as4tainr core ◄── bridge ◄── Jariko (EXFMT)
-   (screen)       (DDS parsed,      "exfmt"     onExfmt callback:
-                   drawn, input      op          sends field values
-                   validated)                    and *IN01-*IN99,
-                                                 applies the response
+ 5250 session ◄── the job's display ◄── RPG engine (EXFMT)
+   (screen)       (DDS drawn, input      sends the record's field values
+                   validated)            and *IN01-*IN99, applies the
+                                         response
 ```
 
 1. `as4tainr crtdspf LIB/FILE --src FILE.dspf` checks and stores the DDS source. It is a `*FILE` object with attribute `DSPF`.
-2. The runner gives Jariko the same source (bridge op `dspf`), so the program's variables match the display file's fields.
-3. On `EXFMT`, the runner sends the record's field values and all 99 indicators (bridge op `exfmt`). as4tainr draws the record, honoring option indicators, `DSPATR`, `COLOR`, `EDTCDE` and `ERRMSG`. It then validates the input: numbers must fit, and only the function keys defined with `CA`/`CF` are allowed. It returns the new field values and the response indicators.
-4. The runner applies them to the program: fields through Jariko's `OnExfmtResponse`, indicators through the program's indicator table.
+2. When an RPG program with the display file is compiled, the record formats' fields become program fields (numbers zoned).
+3. On `EXFMT`, the engine sends the record's field values and all 99 indicators (or the `INDDS` data structure) to the job's display. as4tainr draws the record, honoring option indicators, `DSPATR`, `COLOR`, `EDTCDE` and `ERRMSG`. It then validates the input: numbers must fit, and only the function keys defined with `CA`/`CF` are allowed. It returns the new field values and the response indicators.
+4. The engine puts them in the program's fields and indicators, and sets `*INKA`-`*INKY` from the key pressed.
 
 A program called from a batch job (`as4tainr call`) has no display. `EXFMT` then fails with "this job has no display".
 
@@ -65,7 +64,6 @@ A program called from a batch job (`as4tainr call`) has no display. `EXFMT` then
       * PROMPT asks for a customer number; DETAIL shows the customer.
       * F3 ends the program; F12 on DETAIL returns to PROMPT.
       * An unknown customer turns on *IN30, which shows ERRMSG on PROMPT.
-      * (No ITER: Jariko v2.2.0 does not support ITER inside DOW.)
      FCUSTINQD  CF   E             WORKSTN
      FCUSTMAST  IF   E           K DISK
      C                   DOW       NOT *IN03
@@ -179,13 +177,9 @@ A subfile is a list of records, numbered 1 to 9999 (relative record numbers), th
 
 The DDS rules are checked by `crtdspf`: the control record comes right after its subfile record and names it in `SFLCTL`, it has `SFLSIZ` and `SFLPAG`, and a page fits on the display. With `SFLSIZ` equal to `SFLPAG` the subfile cannot grow past one page; with `SFLSIZ` larger it grows as needed, as on IBM i.
 
-### How the runner does it
+### How it is done
 
-Jariko v2.2.0 handles `EXFMT` through a callback, but nothing else on a WORKSTN file: `WRITE` and `UPDATE` look for a database file, and `READC` does nothing. So when the runner loads a program it rewrites the source first (`Workstation.java`):
-
-1. Each record format of each WORKSTN file becomes an extra F spec, `Fformat UF A E K DISK`. These "files" are served by `DisplayDBMManager`, which sends their operations to as4tainr core (`dspwrite`, `sflwrite`, `sflchain`, `sflreadc`, `sflupdate`; see [bridge-protocol.md](bridge-protocol.md)).
-2. The `SFILE` keywords are taken off the F specs; the runner remembers which variable holds each subfile's record number.
-3. `READC sfl` becomes `READ sfl`, which the subfile "file" answers with the next changed record.
+The RPG engine sends `WRITE`, `READC`, `CHAIN` and `UPDATE` of display records to the program's display state, `core/src/workstn.rs`; `SFILE(format:field)` names the field that holds each subfile's record number.
 
 The subfile, the records on the screen, and paging all live in as4tainr core (`core/src/workstn.rs`), where they are unit tested.
 
@@ -222,4 +216,4 @@ The subfile, the records on the screen, and paging all live in as4tainr core (`c
 
 ## Testing
 
-`dspf.rs` has unit tests for parsing, indicator conditions, edit codes (expected values from IBM's published edit code table), numeric input, and response indicators. `workstn.rs` tests the subfile DDS rules, record numbers, `SFLCLR`, `OVERLAY`, paging and `SFLEND`, `READC` order and `SFLNXTCHG`, `CA` keys and `SFLMSG`. The bridge `exfmt` and subfile ops have integration tests. `tools/e2e_5250.py` runs `CUSTINQ` and `WRKCUST` through the real tn5250 client: error messages, edited numbers, function keys, Page Down/Up, `More...`/`Bottom`, option 5, a wrong option.
+`dspf.rs` has unit tests for parsing, indicator conditions, edit codes (expected values from IBM's published edit code table), numeric input, and response indicators. `workstn.rs` tests the subfile DDS rules, record numbers, `SFLCLR`, `OVERLAY`, paging and `SFLEND`, `READC` order and `SFLNXTCHG`, `CA` keys and `SFLMSG`. Integration tests run CUSTINQ and WRKCUST on the RPG engine with a stand-in display. `tools/e2e_5250.py` runs `CUSTINQ` and `WRKCUST` through the real tn5250 client: error messages, edited numbers, function keys, Page Down/Up, `More...`/`Bottom`, option 5, a wrong option.

@@ -650,6 +650,9 @@ impl Binder<'_> {
                 next += t.size();
             }
         }
+        // Subfields that are data structures themselves (LIKEDS):
+        // (subfield index, the template's name, the template).
+        let mut nested: Vec<(usize, String, DsInfo)> = Vec::new();
         // LIKEDS: the same subfields as another DS (qualified).
         let likeds = keyword(&d.keywords, "LIKEDS")
             .and_then(|k| k.args.first())
@@ -664,8 +667,19 @@ impl Binder<'_> {
                 } else {
                     sf.clone()
                 };
-                if let Some(Sym::Var(v)) = self.syms.get(&key).cloned() {
-                    subs.push((sf.clone(), v.dtype, v.off - o.off, v.dim, d));
+                match self.syms.get(&key).cloned() {
+                    Some(Sym::Var(v)) => subs.push((sf.clone(), v.dtype, v.off - o.off, v.dim, d)),
+                    Some(Sym::Ds(n)) => {
+                        nested.push((subs.len(), key.clone(), n.clone()));
+                        subs.push((
+                            sf.clone(),
+                            DType::Char(n.size as u32),
+                            n.off - o.off,
+                            n.dim,
+                            d,
+                        ));
+                    }
+                    _ => {}
                 }
             }
             next = o.size;
@@ -673,6 +687,20 @@ impl Binder<'_> {
         while j < defs.len() && defs[j].kind == DefKind::Subfield {
             let s = &defs[j];
             let mut t = self.resolve_type(s)?;
+            if t.is_none() {
+                if let Some(k) = keyword(&s.keywords, "LIKEDS") {
+                    let other = k
+                        .args
+                        .first()
+                        .map(|a| a.trim().to_ascii_uppercase())
+                        .unwrap_or_default();
+                    let Some(Sym::Ds(o)) = self.syms.get(&other).cloned() else {
+                        bail!("LIKEDS({other}): not a data structure");
+                    };
+                    t = Some(DType::Char(o.size as u32));
+                    nested.push((subs.len(), other, o));
+                }
+            }
             if t.is_none() {
                 t = self.file_fields.get(&s.name).copied().map(|t| match t {
                     // In a DS, an external numeric field keeps its type.
@@ -765,6 +793,78 @@ impl Binder<'_> {
                 self.inz(&key, sdef)?;
             }
             names.push(sname.clone());
+        }
+        // A LIKEDS subfield is a qualified data structure at its offset,
+        // with the template's subfields (and their own nested ones) under
+        // its name: LIST.USERS.NAME.
+        for (k, template, o) in &nested {
+            let (sname, _, off, sdim, _) = &subs[*k];
+            let prefix = if qualified || likeds.is_some() {
+                format!("{name}.{sname}")
+            } else {
+                sname.clone()
+            };
+            let template_prefix = if o.qualified {
+                format!("{template}.")
+            } else {
+                String::new()
+            };
+            let mut add: Vec<(String, Sym)> = Vec::new();
+            for (key, sym) in &self.syms {
+                let rest = if o.qualified {
+                    key.strip_prefix(&template_prefix)
+                } else if o.subfields.contains(key) {
+                    Some(key.as_str())
+                } else {
+                    None
+                };
+                let Some(rest) = rest else { continue };
+                let rel = |x: usize| x - o.off;
+                match sym {
+                    Sym::Var(v) if v.buf == o.buf => add.push((
+                        format!("{prefix}.{rest}"),
+                        Sym::Var(VarInfo {
+                            buf,
+                            off: off + rel(v.off),
+                            local: self.local,
+                            ..v.clone()
+                        }),
+                    )),
+                    Sym::Ds(d) if d.buf == o.buf => add.push((
+                        format!("{prefix}.{rest}"),
+                        Sym::Ds(DsInfo {
+                            buf,
+                            off: off + rel(d.off),
+                            local: self.local,
+                            ..d.clone()
+                        }),
+                    )),
+                    _ => {}
+                }
+            }
+            // The template's initial contents (INZ) come along.
+            let src = self.bufs[o.buf][o.off..o.off + o.size].to_vec();
+            for e in 0..dim.max(1) as usize {
+                for n in 0..(*sdim).max(1) as usize {
+                    let at = e * size + off + n * o.size;
+                    self.bufs[buf][at..at + o.size].copy_from_slice(&src);
+                }
+            }
+            for (key, sym) in add {
+                self.syms.insert(key, sym);
+            }
+            self.syms.insert(
+                prefix,
+                Sym::Ds(DsInfo {
+                    buf,
+                    off: *off,
+                    size: o.size,
+                    dim: *sdim,
+                    qualified: true,
+                    subfields: o.subfields.clone(),
+                    local: self.local,
+                }),
+            );
         }
         let ds_name = if name.is_empty() {
             format!("*DS{i}")

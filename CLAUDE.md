@@ -4,7 +4,7 @@ Guidance for AI coding sessions working in this repository.
 
 ## What as4tainr is
 
-An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (objects and libraries, DDS files, record-level access, 5250, CL, jobs) on Linux and PostgreSQL. RPG runs on as4tainr's own RPG engine in Rust (`core/src/rpg/`, docs/rpg-engine.md). The Jariko runner on the JVM (`jvm/`, the bridge) is still available with `AS4TAINR_RPG_ENGINE=jariko` and is being retired. It is NOT a hardware emulator.
+An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (objects and libraries, DDS files, record-level access, 5250, CL, jobs) on Linux and PostgreSQL. RPG runs on as4tainr's own RPG compiler and runtime in Rust (`core/src/rpg/`, docs/rpg-engine.md); there is no JVM. It is NOT a hardware emulator.
 
 ## Non-negotiable rules
 
@@ -22,7 +22,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/catalog.rs` | Libraries = PostgreSQL schemas; file descriptions in schema `as4tainr`; library list resolution |
 | `core/src/rla.rs` | Record-level access: cursor position per open file, keyset queries ordered by (keys, rrn), record locks (advisory locks on the physical file + rrn) |
 | `core/src/sql.rs` | SQL in the DB2 for i dialect: translation to PostgreSQL, run on a separate connection as the restricted `as4tainr_sql` login |
-| `core/src/bridge.rs` | JSON-lines TCP server the JVM calls for every file operation |
+| `core/src/runtime.rs` | What a running program shares with its job: database sessions (`connect_db`, `job_session`: application name and record wait), the display channel (`DisplayRequest`) |
 | `core/src/dspf.rs` | DDS display files: parser, drawing a record on a 5250 screen, input validation, response indicators |
 | `core/src/workstn.rs` | A program's display state: records on the screen (OVERLAY), subfiles (WRITE/READC/CHAIN/UPDATE), one EXFMT's interaction and paging |
 | `core/src/tn5250/` | 5250 display server: telnet + records (`telnet.rs`), data stream (`ds.rs`), EBCDIC (`ebcdic.rs`), screens (`session.rs`) |
@@ -41,26 +41,19 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/users.rs` | User profiles, Argon2id password hashes |
 | `core/src/main.rs` | `as4tainr` CLI |
 | `core/tests/rla_test.rs` | Integration tests (need `AS4TAINR_TEST_DATABASE_URL`) |
-| `jvm/src/main/java/io/as4tainr/bridge` | Dependency-free Java bridge client (keep it dependency-free) |
-| `jvm/src/main/java/io/as4tainr/jvm` | Runner (`Launcher`, `Runner`): Jariko configuration, display files, EXFMT. `Workstation` rewrites WORKSTN programs (display record formats as DISK files, READC); `DisplayDBMManager`/`DisplayRecordFile` send those operations to core. `RecordLocks` adds signals for update files, N/E extenders and UNLOCK (record locks). `Printers` reads PRINTER F specs and O specs and turns EXCEPT into a signal that prints to a spooled file. `SourceForms` blanks `//` lines in columns 1-5 and expands quoted `/INCLUDE` stream files. RPG program objects (CRTBNDRPG) come from the bridge (`pgmsrc`), before `AS4TAINR_PGM_PATH`. Java, so it compiles with plain javac against the jar |
-| `jvm/src/main/kotlin/io/as4tainr/jvm` | reload `DBMManager`/`DBFile` adapter (database I/O through the bridge) |
-| `jvm/src/test/java/.../BridgeConformance.java` | JDK-only stand-in runner used for end-to-end tests without Maven |
 | `tools/tn5250_driver.py`, `tools/e2e_5250.py` | Drive the real tn5250 client for end-to-end tests |
 | `tools/e2e_web.py` | Drives the browser terminal in Chromium (Playwright) |
 | `tools/gate3_5250.py` | Phase 3 gate: three clerks enter orders at once with batch jobs running; the files must add up. Run after e2e_5250.py |
 | `samples/` | DDS, CSV data, RPG and CL programs, golden outputs in `expected/`. `samples/apps/contacts` is an application laid out as a git repository, imported with `as4tainr import` (into CONTACTS by samples.sh). The order entry app (Phase 2 gate) is described in `docs/order-entry.md` |
 | `scripts/samples.sh` | Creates every sample object in QGPL (used by demo.sh, the Docker entrypoint and CI). Add new sample objects here |
 | `tools/corpus.sh` | Clone a public repository of IBM i source and import it (real-world test; never vendored) |
-| `docs/bridge-protocol.md` | Protocol spec. Update it in the same change as the protocol |
 
 ## Commands
 
 ```sh
 cargo fmt && cargo clippy --all-targets -- -D warnings
 AS4TAINR_TEST_DATABASE_URL=postgres://as4tainr:as4tainr@127.0.0.1/as4tainr cargo test
-javac -d target/conformance-classes jvm/src/main/java/io/as4tainr/bridge/*.java jvm/src/test/java/io/as4tainr/bridge/*.java
-AS4TAINR_BIN=target/debug/as4tainr AS4TAINR_RUNNER="java -cp target/conformance-classes io.as4tainr.bridge.BridgeConformance" scripts/demo.sh
-cd jvm && ./gradlew fatJar   # needs Maven Central
+AS4TAINR_BIN=target/debug/as4tainr scripts/demo.sh
 TN5250=/path/to/tn5250 python3 tools/e2e_5250.py 127.0.0.1:2323   # against a running `as4tainr tn5250`
 python3 tools/e2e_web.py http://127.0.0.1:5250   # browser terminal in Chromium (pip install playwright), with --web-listen 127.0.0.1:5250
 TN5250=/path/to/tn5250 AS4TAINR_BIN=target/debug/as4tainr python3 tools/gate3_5250.py 127.0.0.1:2323   # then the Phase 3 gate
@@ -70,5 +63,4 @@ TN5250=/path/to/tn5250 AS4TAINR_BIN=target/debug/as4tainr python3 tools/gate3_52
 
 - Errors that a program could monitor for start with the IBM-style message ID, e.g. `CPF5026: ...`.
 - SQL is built dynamically only with `catalog::ident()` for identifiers. Values are always bound parameters (as text, then `CAST`). The exception is user SQL (`sql.rs`), which only ever runs as the `as4tainr_sql` login: never run user-supplied SQL on the main connection.
-- Bridge protocol changes are versioned: bump `PROTOCOL_VERSION` in both `bridge.rs` and `BridgeClient.java`.
 - Commits are signed off (`git commit -s`). Commit messages describe the IBM i behavior implemented.

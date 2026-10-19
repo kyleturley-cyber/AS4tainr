@@ -160,15 +160,13 @@ with Tn5250(HOST) as t:
     check("call custlist" in t.line(20), "F9 retrieves the previous command", t)
     t.fkey(12)
 
-    # DSPLY with a response asks the operator (the RPG engine; the Jariko
-    # runner has no reply screen).
-    if os.environ.get("AS4TAINR_RPG_ENGINE", "").lower() != "jariko":
-        command(t, "call askname", "Display Program Messages", timeout=90)
-        check("What is your name?" in t.line(3) and "Reply" in t.line(23),
-              "DSPLY with a response shows the message and a reply line", t)
-        t.type("Ada"); t.enter()
-        t.wait_for("Hello, Ada")
-        check("Command Entry" in t.text(), "the reply goes into the response field", t)
+    # DSPLY with a response asks the operator.
+    command(t, "call askname", "Display Program Messages", timeout=90)
+    check("What is your name?" in t.line(3) and "Reply" in t.line(23),
+          "DSPLY with a response shows the message and a reply line", t)
+    t.type("Ada"); t.enter()
+    t.wait_for("Hello, Ada")
+    check("Command Entry" in t.text(), "the reply goes into the response field", t)
 
     # Interactive RPG: EXFMT with the CUSTINQD display file.
     FIELD_EXIT = "\x0b"  # tn5250: Ctrl-K

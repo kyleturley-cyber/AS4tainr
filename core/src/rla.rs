@@ -19,8 +19,8 @@ use std::collections::BTreeMap;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Row};
 
-/// Record values as strings keyed by field name, matching what Jariko's
-/// reload layer exchanges. Character fields keep their trailing blanks.
+/// Record values as strings keyed by field name (numbers as plain decimal
+/// text). Character fields keep their trailing blanks.
 pub type Record = BTreeMap<String, String>;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,7 +84,7 @@ const RECORD_TRY_LOCK_SQL: &str = "SELECT pg_try_advisory_lock(hashtext($1), ($2
 const RECORD_UNLOCK_SQL: &str = "SELECT pg_advisory_unlock(hashtext($1), ($2::bigint)::int)";
 
 /// The job holding a record lock, by its database session's
-/// application_name (the bridge sets it to the job's name).
+/// application_name (`runtime::job_session` sets it to the job's name).
 async fn lock_holder(client: &Client, lock_name: &str, rrn: i64) -> Option<String> {
     let row = client
         .query_opt(

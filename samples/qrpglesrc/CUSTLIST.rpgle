@@ -15,8 +15,7 @@
      C                   enddo
       * Random access by key
      C     toFind        chain     CUSTMAST
-      * %FOUND without a file name (last file operation): Jariko v2.2.0
-      * does not implement %FOUND(file) yet. See docs/fidelity-gaps.md.
+      * %FOUND without a file name: the last file operation.
      C                   if        %found
      C                   eval      msg = 'Found ' + %trim(CUSNAM) + ' in '
      C                                   + %trim(CUSCTY)

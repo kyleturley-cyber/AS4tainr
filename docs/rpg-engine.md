@@ -1,6 +1,6 @@
 # The as4tainr RPG engine
 
-as4tainr compiles and runs ILE RPG (RPG IV) itself, in Rust. Fixed-form, mixed and fully free-form (`**FREE`) source are all supported. This replaces Jariko on the JVM, which as4tainr used through Phase 3.
+as4tainr compiles and runs ILE RPG (RPG IV) itself, in Rust. Fixed-form, mixed and fully free-form (`**FREE`) source are all supported. It replaced Jariko on the JVM, which as4tainr used through Phase 3; since milestone R5 there is no JVM.
 
 *Decision, 2026-10-19:* Jariko cannot run fully free-form RPG or free-form declarations. Most RPG written in the last ten years uses both. Jariko also has gaps in fixed form (see fidelity-gaps.md), and each CALL starts a JVM. The project has no deadline, so as4tainr gets its own engine: complete, and self-contained, with no JVM in the container at the end.
 
@@ -23,7 +23,7 @@ source member ──► source.rs ──► parse ──► check ──► Prog
 | `parse_fixed.rs`, `parse_free.rs`, `expr.rs` | H, F, D, I, C, O, P specs; free-form statements and `DCL-*` declarations; the expression language (used by both forms) |
 | `storage.rs` | Every variable lives in bytes in its declared format: character in EBCDIC (CCSID 37), zoned, packed, binary, integer, date/time. Data structure subfields are views of the structure's bytes, so overlays behave as on IBM i |
 | `interp.rs` | The RPG cycle, indicators, opcodes, built-in functions, procedures and calls |
-| `io.rs` | File operations on `rla` in the same process (no bridge), display files on `workstn`, printer files on `spool`, data areas on `dtaara` |
+| `io.rs` | File operations on `rla` in the same process, display files on `workstn`, printer files on `spool`, data areas on `dtaara` |
 
 Character data is kept in EBCDIC, as on IBM i. Comparisons and sorting follow the EBCDIC order: lower case before upper case, letters before digits. Hex literals (`X'C1'`) and byte-level code work as written. Text is converted at the edges: the database, the display and DSPLY.
 
@@ -31,20 +31,20 @@ Character data is kept in EBCDIC, as on IBM i. Comparisons and sorting follow th
 
 - **CRTBNDRPG** parses and checks the program. Errors are reported with line numbers at create time, as IBM's compiler does, instead of at CALL. The checked program is kept with the object.
 - **CALL** of an RPG program object runs it in the job's own process. It uses the job's database connection, display and spooled files.
-- **The switch:** the native engine is the default (since Oct 19, 2026, milestone R5). `AS4TAINR_RPG_ENGINE=jariko` still runs the old Jariko runner, for comparison, until Jariko and the JVM are removed.
+- **No switch any more:** the native engine is the only one. Jariko, the JVM runner and the JSON bridge it used were removed in milestone R5 (Oct 19, 2026).
 
 ## Status
 
-**R5: the native engine is the default (Oct 19, 2026).** It passes everything Jariko passed and more: the samples and demos, the 5250 end-to-end test (130 checks, two more than Jariko: DSPLY with a reply), the Phase 3 gate and the browser terminal test. CI runs them on the native engine, and the Jariko runner once more as a comparison.
+**R5 is done (Oct 19, 2026): the native engine is the only RPG engine.** It passed everything Jariko passed and more: the samples and demos, the 5250 end-to-end test (130 checks, two more than Jariko: DSPLY with a reply), the Phase 3 gate and the browser terminal test. Then Jariko, the JVM runner, the JSON bridge and its conformance runner were removed: as4tainr is one Rust binary, and the container image has no JRE. The bridge's integration tests became RPG programs run on the engine (display files, subfiles, data area locks, spooled files, authority) or tests of the record-level access layer (record locks).
 
-What R5 added so far, from running the corpus (Nick Litten's examples, `tools/corpus.sh`):
+What R5 added, from running the corpus (Nick Litten's examples, `tools/corpus.sh`):
 - **DSPLY with a response** in an interactive job: a Display Program Messages screen with the message and a reply line; the reply goes into the response field (lower case kept). In batch the response stays as it was.
 - **System programs** RPG programs call: `QCMDEXC` (runs a CL command in the job), `QDCXLATE` (EBCDIC/ASCII translation with QTCPASC and QTCPEBC), and the C runtime's `Qp0zLprintf` (printf-style text to the job log).
 - **CALL of a CL program** from RPG, in the same job (parameters go in as values).
 - A program that calls itself is refused: RPG programs are not recursive (procedures are).
 - One-line empty interfaces (`dcl-pi *n int(10) end-pi;`).
 
-Corpus status: 22 of its programs (RPG and CL) are created. Most of the others need things outside RPG: embedded SQL (R6), SQL DDL for their files (`CREATE TABLE`), files or includes missing from the repository, or they are snippets that do not compile on IBM i either (fixed C specs inside `**FREE`, unbalanced parentheses). Still to do for R5: nested data structures (`LIKEDS` subfields), then removing Jariko and the JVM.
+Corpus status: 23 of its programs (RPG and CL) are created. Most of the others need things outside RPG: embedded SQL (R6), SQL DDL for their files (`CREATE TABLE`), files or includes missing from the repository, or they are snippets that do not compile on IBM i either (fixed C specs inside `**FREE`, unbalanced parentheses). - **Nested data structures:** a subfield defined with `LIKEDS` is a data structure inside the other one (`list.users(i).name`), also through a `LIKEDS` copy of the whole structure and as a parameter; `ds(i).field` for data structure arrays.
 
 **R4 is done (Oct 19, 2026).** Programs call each other and are built from procedures:
 - **Procedures** (`DCL-PROC`, P specs) with their own local storage on each call, `STATIC` locals, parameters by reference, `CONST` and `VALUE`, `LIKEDS` parameters, `OPTIONS(*NOPASS : *OMIT)`, `%PARMS`, return values in the declared type, recursion, subroutines inside procedures, `ON-EXIT`.
@@ -65,11 +65,11 @@ What R3 adds:
 What R2 adds:
 - **Display files** (externally described WORKSTN): the record formats' fields become program fields (numbers zoned); EXFMT, WRITE, READC; subfiles with `SFILE(format:rrn)`: WRITE, CHAIN and UPDATE by relative record number; `INDDS`; response indicators; `*INKA`-`*INKY` from the function key pressed. The display work itself (overlay, paging, validation) is the same code Jariko used (`workstn.rs`, `dspf.rs`).
 - **Data areas:** `*DTAARA DEFINE`, the `DTAARA` keyword, `IN` (with `*LOCK`), `OUT`, `IN *DTAARA`.
-- **Record locks:** the job's database session is named after the job and waits WAITRCD for a locked record, as with Jariko; positions 73-74 (or `(E)`) catch the error.
+- **Record locks:** the job's database session is named after the job and waits WAITRCD for a locked record, positions 73-74 (or `(E)`) catch the error.
 
 **R1 (Oct 19, 2026).** The batch samples (CUSTLIST, ORDTOTAL, OWING, CUSTUPD, the CL program CUSTRPT calling RPG, CONTCNT) produce their golden output on the native engine. CI runs the demo on it (`AS4TAINR_RPG_ENGINE=native`). Fully free-form programs run too: HELLOWORLD from the corpus prints its message, where Jariko did nothing.
 
-To try it: `AS4TAINR_RPG_ENGINE=native as4tainr call CUSTLIST 3`. With the variable set, CRTBNDRPG checks programs (syntax, names, files) when it creates them.
+To try it: `as4tainr call CUSTLIST 3`. CRTBNDRPG checks programs (syntax, names, files) when it creates them.
 
 What R1 covers:
 - **Source:** fixed form (H F D I C O P specs), `/FREE` regions, free-form calculations in positions 8-80, `**FREE`, `//` comments, `/COPY` and `/INCLUDE` (members and stream files), `/IF DEFINED` / `/DEFINE` / `/EOF`, `**CTDATA`.
@@ -105,8 +105,8 @@ What R1 covers:
    - Gate: programs that call each other with parameters, and procedure-based programs from the corpus (HELLOADV). (The Phase 3 gate, first planned for R4, already passes on the native engine since R3.)
 5. **R5, real code.**
    - The corpus (`tools/corpus.sh`): free-form programs, data structures (`LIKEDS`, `QUALIFIED`, `DIM`, `OVERLAY`), dates, `MONITOR`, `%BIFs`, `/IF DEFINED`.
-   - Gate: the default switches to native.
-6. **R6, beyond Jariko.**
+   - Gate: the default switches to native, then Jariko and the JVM are removed (done).
+6. **R6, beyond.**
    - Embedded SQL (SQLRPGLE) on `sql.rs`.
    - Service programs and modules: CRTRPGMOD, CRTSRVPGM, binding directories.
    - RPG/400 (RPG III) source.

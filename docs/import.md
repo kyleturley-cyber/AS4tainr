@@ -32,7 +32,7 @@ app/
 1. Creates the library if needed (CRTLIB), and each source file (CRTSRCPF). Then it adds every member, replacing a member of the same name.
 2. Creates the physical files with `CRTPF FILE(LIB/NAME) SRCFILE(LIB/QDDSSRC) SRCMBR(NAME)` and loads their CSV data.
 3. Creates the logical files (CRTLF) and display files (CRTDSPF). Files that exist are kept.
-4. Creates the programs: CRTBNDCL (CLLE), CRTCLPGM (CLP) and CRTBNDRPG (RPGLE). These are replaced, since they are built from the source just imported. CL programs are checked when they are created. RPG programs are checked by the runner when they are called.
+4. Creates the programs: CRTBNDCL (CLLE), CRTCLPGM (CLP) and CRTBNDRPG (RPGLE). These are replaced, since they are built from the source just imported. CL programs are checked when they are created. RPG programs are compiled (checked) when they are created, as CRTBNDRPG does.
 5. Reports each object, and the members it cannot build yet: SQLRPGLE, RPG III, CMD, PRTF, COBOL and SQL scripts. Their source is kept.
 
 The import exits with status 1 if any object could not be created. The report says why.
@@ -63,7 +63,7 @@ CALL CONTACTS
   - a field named CTID (a PostgreSQL system column name);
   - zoned and packed fields with the same name.
 - **Not yet:**
-  - **Fully free-form RPG (`**FREE`) and free-form declarations.** Jariko does not support them, and most modern code uses them.
+  - **Fully free-form RPG (`**FREE`) and free-form declarations.** Jariko did not support them; this is why as4tainr got its own RPG engine, which does (docs/rpg-engine.md).
   - Embedded SQL (SQLRPGLE).
   - CL pointers and defined storage (`TYPE(*PTR)`, `STG(*DEFINED)`).
   - DDS date and time fields.

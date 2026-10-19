@@ -4,25 +4,22 @@
 
 AS4tainr (`as4tainr`) is an open, IBM i-compatible runtime that runs in a container. It was called ibmish until October 2026.
 
-It runs IBM i business applications (RPG, CL, DDS files) on ordinary Linux and cloud hosts. It does not emulate POWER hardware or boot IBM's operating system. It reimplements the interfaces that programs and people use, the same way Wine runs Windows programs: libraries and objects, database files with record-level access, 5250 green screens, and CL commands. RPG runs on AS4tainr's own RPG compiler and runtime, written in Rust ([docs/rpg-engine.md](docs/rpg-engine.md)): fixed form and fully free form, display files, printing, procedures and program calls. The earlier runner, [Jariko](https://github.com/smeup/jariko) on the JVM, is still there with `AS4TAINR_RPG_ENGINE=jariko` and will be removed.
+It runs IBM i business applications (RPG, CL, DDS files) on ordinary Linux and cloud hosts. It does not emulate POWER hardware or boot IBM's operating system. It reimplements the interfaces that programs and people use, the same way Wine runs Windows programs: libraries and objects, database files with record-level access, 5250 green screens, and CL commands. RPG runs on AS4tainr's own RPG compiler and runtime, written in Rust ([docs/rpg-engine.md](docs/rpg-engine.md)): fixed form and fully free form, display files, printing, procedures and program calls. Until October 2026 RPG ran on [Jariko](https://github.com/smeup/jariko), an open-source RPG interpreter for the JVM; as4tainr is now one Rust program with no JVM.
 
 > Status: **early prototype**. Sign on with a real 5250 emulator, run CL commands, and `CALL` CL and RPG programs, all against PostgreSQL. That includes **interactive programs that use DDS display files** (`EXFMT`, and subfiles: the scrolling lists behind "Work with..." screens), DDS physical and logical files, SQL, and data areas. The Phase 2 gate is met: a sample **order entry application** (CL driver, RPG with an input subfile, five files, a data area) runs unmodified. See [docs/order-entry.md](docs/order-entry.md), [docs/5250-server.md](docs/5250-server.md) and [docs/display-files.md](docs/display-files.md). Phase 3 has started: jobs, `SBMJOB` with a QBATCH subsystem, job logs and message queues ([docs/work-management.md](docs/work-management.md)). Two users changing the same record are kept apart with IBM i-style record locks ([docs/record-locks.md](docs/record-locks.md)). Printed reports become spooled files (`WRKSPLF`, [docs/spooled-files.md](docs/spooled-files.md)), and objects have owners and authorities ([docs/object-authority.md](docs/object-authority.md)). The Phase 3 gate is met: three clerks enter orders at once while batch jobs print, and the files add up (`tools/gate3_5250.py`).
 
 ## How it fits together
 
 ```
- as4tainr call PGM ──► Rust core ──(starts)──► JVM: Jariko runs PGM.rpgle
-                         ▲                         │
-                         └── bridge: JSON lines ◄──┘  every file operation
-                         │
-                         ▼
-                    PostgreSQL  (catalog + one table per physical file)
+ 5250 / browser ──► as4tainr (one Rust binary) ──► PostgreSQL
+                     CL, jobs, display files,      catalog + one table
+                     spool, RPG compiler and       per physical file
+                     runtime (core/src/rpg/)
 ```
 
-- **`core/`**: the Rust core (`as4tainr` binary). It holds the object catalog, the DDS parser, record-level access over PostgreSQL, and the bridge server.
-- **`jvm/`**: the JVM side. `io.as4tainr.bridge` is a dependency-free Java bridge client. `io.as4tainr.jvm` plugs that client into Jariko as a reload `DBMManager` and provides the runner (`as4tainr-jvm.jar`).
+- **`core/`**: the `as4tainr` binary: the object catalog, the DDS parser, record-level access over PostgreSQL, CL, jobs, the 5250 server and browser terminal, and the RPG engine.
 - **`samples/`**: DDS sources, CSV data, RPG programs and their expected (golden) output.
-- **`docs/`**: [5250 server](docs/5250-server.md), [browser terminal](docs/web-terminal.md), [display files](docs/display-files.md), [logical files](docs/logical-files.md), [SQL](docs/sql.md), [CL programs](docs/cl-programs.md), [data areas](docs/data-areas.md), [work management](docs/work-management.md), [record locks](docs/record-locks.md), [spooled files](docs/spooled-files.md), [object authority](docs/object-authority.md), [menus](docs/menus.md), [importing an application](docs/import.md), [the RPG engine](docs/rpg-engine.md), [order entry sample](docs/order-entry.md), [bridge protocol](docs/bridge-protocol.md), [known fidelity gaps](docs/fidelity-gaps.md), [spike 01 report](docs/spike-01.md).
+- **`docs/`**: [5250 server](docs/5250-server.md), [browser terminal](docs/web-terminal.md), [display files](docs/display-files.md), [logical files](docs/logical-files.md), [SQL](docs/sql.md), [CL programs](docs/cl-programs.md), [data areas](docs/data-areas.md), [work management](docs/work-management.md), [record locks](docs/record-locks.md), [spooled files](docs/spooled-files.md), [object authority](docs/object-authority.md), [menus](docs/menus.md), [importing an application](docs/import.md), [the RPG engine](docs/rpg-engine.md), [order entry sample](docs/order-entry.md), [known fidelity gaps](docs/fidelity-gaps.md), [spike 01 report](docs/spike-01.md).
 
 ## Quick start (Docker)
 
@@ -59,15 +56,11 @@ Type a command name and press **F4** to prompt it, or press F4 on an empty line 
 
 ## Building from source
 
-Requirements: Rust (stable), JDK 17, and PostgreSQL 16 for the integration tests.
+Requirements: Rust (stable), and PostgreSQL 16 for the integration tests and the samples.
 
 ```sh
-# Rust core
 cargo build
 AS4TAINR_TEST_DATABASE_URL=postgres://as4tainr:as4tainr@127.0.0.1/as4tainr cargo test
-
-# JVM runner (downloads Jariko from Maven Central)
-cd jvm && ./gradlew fatJar        # -> jvm/build/libs/as4tainr-jvm.jar
 ```
 
 Run the samples against a local database:
@@ -75,18 +68,7 @@ Run the samples against a local database:
 ```sh
 export AS4TAINR_DATABASE_URL=postgres://as4tainr:as4tainr@127.0.0.1/as4tainr
 export AS4TAINR_BIN=target/debug/as4tainr
-export AS4TAINR_RUNNER="java -jar jvm/build/libs/as4tainr-jvm.jar"
 scripts/demo.sh
-```
-
-### Without Maven access
-
-The bridge can be tested end to end with just a JDK. `BridgeConformance` is a stand-in runner that replays the sample programs' file operations in Java:
-
-```sh
-javac -d target/conformance-classes jvm/src/main/java/io/as4tainr/bridge/*.java jvm/src/test/java/io/as4tainr/bridge/*.java
-AS4TAINR_RUNNER="java -cp target/conformance-classes io.as4tainr.bridge.BridgeConformance" scripts/demo.sh
-target/debug/as4tainr call SELFTEST --runner "java -cp target/conformance-classes io.as4tainr.bridge.BridgeConformance"
 ```
 
 ## CLI
@@ -102,11 +84,10 @@ target/debug/as4tainr call SELFTEST --runner "java -cp target/conformance-classe
 | `as4tainr crtlf LIB/FILE --src x.lf` | `CRTLF` | Creates a logical file over a physical file from DDS ([docs/logical-files.md](docs/logical-files.md)) |
 | `as4tainr crtdspf LIB/FILE --src x.dspf` | `CRTDSPF` | Creates a display file from DDS |
 | `as4tainr load FILE --csv x.csv` | `CPYFRMIMPF` (roughly) | Writes CSV rows with `WRITE` |
-| `as4tainr call PGM [parms]` | `CALL` | Runs an RPG program through the runner |
-| `as4tainr serve --port 7250` | | Runs a standalone bridge server |
+| `as4tainr call PGM [parms]` | `CALL` | Runs a CL or RPG program; DSPLY and printed output go to standard output |
 | `as4tainr tn5250 --listen 0.0.0.0:23` | | Runs the 5250 display server (sign-on, menus, command entry) and the QBATCH subsystem for submitted jobs. `--web-listen 0.0.0.0:8080` also serves the browser 5250 terminal |
 
-Settings: `AS4TAINR_DATABASE_URL`, `AS4TAINR_QSECOFR_PASSWORD` (initial QSECOFR password), `AS4TAINR_SYSTEM_NAME`, `AS4TAINR_LIBL` (library list, comma-separated, default `QGPL`), `AS4TAINR_RUNNER`, `AS4TAINR_PGM_PATH`.
+Settings: `AS4TAINR_DATABASE_URL`, `AS4TAINR_QSECOFR_PASSWORD` (initial QSECOFR password), `AS4TAINR_SYSTEM_NAME`, `AS4TAINR_LIBL` (library list, comma-separated, default `QGPL`), `AS4TAINR_PGM_PATH` (directories with RPG sources run by name, the samples), `AS4TAINR_WAITRCD` (seconds to wait for a locked record).
 
 ## Roadmap
 
@@ -114,7 +95,7 @@ Settings: `AS4TAINR_DATABASE_URL`, `AS4TAINR_QSECOFR_PASSWORD` (initial QSECOFR 
 | --- | --- | --- |
 | 0 · Foundations | Object store, EBCDIC/decimal library, TN5250 sign-on, CL shell | Sign on with tn5250, run `CRTLIB` and `DSPLIB` |
 | 1 · Data | DDS physical and logical files, record-level access, SQL | `CRTPF` from DDS, read it with RLA and SQL |
-| 2 · Programs (v1) | CL compiler, RPG IV on Jariko, display files | A sample order-entry app runs unmodified (met: [docs/order-entry.md](docs/order-entry.md)) |
+| 2 · Programs (v1) | CL compiler, RPG IV (first on Jariko, now as4tainr's own RPG engine), display files | A sample order-entry app runs unmodified (met: [docs/order-entry.md](docs/order-entry.md)) |
 | 3 · Operations | Jobs, subsystems, spool, security | Multi-user interactive and batch workload (met: `tools/gate3_5250.py`) |
 | 4 · Ecosystem | RPG/400, COBOL, host servers, migration tools | ACS and ODBC tools connect |
 

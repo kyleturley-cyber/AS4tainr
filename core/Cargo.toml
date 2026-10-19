@@ -1,6 +1,6 @@
 [package]
 name = "as4tainr-core"
-description = "as4tainr core: object catalog, DDS, record-level access and the JVM bridge"
+description = "as4tainr: an IBM i-compatible runtime: catalog, DDS, record-level access, CL, 5250 and an RPG engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

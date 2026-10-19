@@ -4,7 +4,6 @@
 #
 # Env:
 #   AS4TAINR_DATABASE_URL  PostgreSQL URL (default: local as4tainr database)
-#   AS4TAINR_RUNNER        runner command (default: the Jariko jar)
 #   AS4TAINR_PGM_PATH      directory holding the .rpgle sources
 #   AS4TAINR_BIN           path to the as4tainr binary (default: as4tainr on PATH)
 set -euo pipefail
@@ -34,11 +33,11 @@ run() {
   if [ -n "$parm" ]; then
     expected="$samples/expected/${pgm}_${parm}.txt"
     echo "--- CALL $pgm PARM($parm)"
-    out=$("$bin" call "$pgm" "$parm" | grep -v '^Picked up JAVA_TOOL_OPTIONS' || true)
+    out=$("$bin" call "$pgm" "$parm" || true)
   else
     expected="$samples/expected/${pgm}.txt"
     echo "--- CALL $pgm"
-    out=$("$bin" call "$pgm" | grep -v '^Picked up JAVA_TOOL_OPTIONS' || true)
+    out=$("$bin" call "$pgm" || true)
   fi
   echo "$out"
   if diff <(normalize <<<"$out") <(normalize <"$expected") >/dev/null; then
@@ -53,27 +52,19 @@ run CUSTLIST 3
 run ORDTOTAL 1002
 run OWING L
 run CUSTRPT L
-# A printed report (O specs, EXCEPT). The conformance runner replays file
-# operations only; the page layout is the Jariko runner's or the native
-# RPG engine's.
-# The RPG engine: native unless AS4TAINR_RPG_ENGINE=jariko.
-engine="${AS4TAINR_RPG_ENGINE:-native}"
-if [[ "${AS4TAINR_RUNNER:-}" != *BridgeConformance* || "$engine" != jariko ]]; then
-  run CUSTPRT
-fi
+# A printed report (O specs, EXCEPT).
+run CUSTPRT
 # An imported application (samples/apps/contacts, in library CONTACTS):
-# RPG program objects (CRTBNDRPG) and a /INCLUDE stream file. Real RPG only.
-if [[ "${AS4TAINR_RUNNER:-}" != *BridgeConformance* || "$engine" != jariko ]]; then
-  echo "--- CALL CONTACTS/CONTCNT"
-  out=$(AS4TAINR_LIBL=CONTACTS,QGPL "$bin" call CONTACTS/CONTCNT | grep -v '^Picked up JAVA_TOOL_OPTIONS' || true)
-  echo "$out"
-  if diff <(normalize <<<"$out") <(normalize <"$samples/expected/CONTCNT.txt") >/dev/null; then
-    echo "PASS: output matches CONTCNT.txt"
-  else
-    echo "FAIL: output differs from CONTCNT.txt:"
-    diff <(normalize <<<"$out") <(normalize <"$samples/expected/CONTCNT.txt") || true
-    status=1
-  fi
+# RPG program objects (CRTBNDRPG) and a /INCLUDE stream file.
+echo "--- CALL CONTACTS/CONTCNT"
+out=$(AS4TAINR_LIBL=CONTACTS,QGPL "$bin" call CONTACTS/CONTCNT || true)
+echo "$out"
+if diff <(normalize <<<"$out") <(normalize <"$samples/expected/CONTCNT.txt") >/dev/null; then
+  echo "PASS: output matches CONTCNT.txt"
+else
+  echo "FAIL: output differs from CONTCNT.txt:"
+  diff <(normalize <<<"$out") <(normalize <"$samples/expected/CONTCNT.txt") || true
+  status=1
 fi
 # CUSTUPD changes data, so it only runs right after the sample files were created.
 if [ "$fresh" = 1 ]; then

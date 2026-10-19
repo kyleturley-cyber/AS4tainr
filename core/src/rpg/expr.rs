@@ -103,8 +103,15 @@ pub fn tokens(text: &str) -> Result<Vec<Tok>> {
             ));
             continue;
         }
-        if is_name_char(c) {
+        // `.NAME` right after an index: `list.users(i).name`.
+        let after_index = c == '.'
+            && matches!(out.last(), Some(Tok::Op(")")))
+            && cs.get(i + 1).is_some_and(|d| d.is_ascii_alphabetic());
+        if is_name_char(c) || after_index {
             let start = i;
+            if after_index {
+                i += 1;
+            }
             while i < cs.len()
                 && (is_name_char(cs[i])
                     || (cs[i] == '.' && cs.get(i + 1).is_some_and(|d| d.is_ascii_alphabetic())))
@@ -337,19 +344,40 @@ impl Parser {
             }
             Some(Tok::Special(s)) => self.special(&s),
             Some(Tok::Name(n)) => {
-                let parts: Vec<String> = n.split('.').map(|p| p.to_string()).collect();
-                let args = if self.eat_op("(") {
+                let mut parts: Vec<String> = n.split('.').map(|p| p.to_string()).collect();
+                let mut args = if self.eat_op("(") {
                     Some(self.args()?)
                 } else {
                     None
                 };
-                // DS(i).FIELD
-                if args.is_some() {
-                    if let Some(Tok::Name(m)) = self.peek().cloned() {
-                        if m.starts_with('.') {
-                            self.pos += 1;
-                        }
+                // DS(i).FIELD, A.B(i).C(j): an index before the last part.
+                let mut idx: Vec<Option<Box<Expr>>> = vec![None; parts.len() - 1];
+                let mut path = false;
+                while args.is_some() {
+                    let Some(Tok::Name(m)) = self.peek().cloned() else {
+                        break;
+                    };
+                    let Some(rest) = m.strip_prefix('.') else {
+                        break;
+                    };
+                    self.pos += 1;
+                    let a = args.take().unwrap();
+                    if a.len() != 1 {
+                        bail!("{}: one index is expected before .{rest}", parts.join("."));
                     }
+                    idx.push(Some(Box::new(a.into_iter().next().unwrap())));
+                    let more: Vec<String> = rest.split('.').map(|p| p.to_string()).collect();
+                    idx.extend(std::iter::repeat_n(None, more.len() - 1));
+                    parts.extend(more);
+                    path = true;
+                    args = if self.eat_op("(") {
+                        Some(self.args()?)
+                    } else {
+                        None
+                    };
+                }
+                if path {
+                    return Ok(Expr::Path { parts, idx, args });
                 }
                 Ok(Expr::Name { parts, args })
             }

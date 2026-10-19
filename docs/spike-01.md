@@ -1,5 +1,7 @@
 # Spike 01: Rust core → Jariko → PostgreSQL
 
+*Historical (Oct 2026). Jariko and the JVM bridge were later replaced by as4tainr's own RPG engine and removed; see rpg-engine.md.*
+
 **Question:** can RPG programs running on Jariko do their file I/O through a Rust core that stores the data in PostgreSQL, with IBM i record-level-access semantics?
 
 **Answer: yes.** On 2026-10-15 the real Jariko v2.2.0 runner (built on Windows) ran all three sample RPG programs, CUSTLIST, ORDTOTAL and CUSTUPD, against PostgreSQL through the Rust core. Their output matched the golden files, including READ, READE, CHAIN, UPDATE and WRITE with negative and fractional packed values.

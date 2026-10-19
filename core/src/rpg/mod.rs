@@ -19,15 +19,6 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tokio_postgres::Client;
 
-/// Which engine runs RPG programs: this one (the default), or the
-/// Jariko runner on the JVM with `AS4TAINR_RPG_ENGINE=jariko` (kept for a
-/// while for comparison; see docs/rpg-engine.md).
-pub fn native_enabled() -> bool {
-    !std::env::var("AS4TAINR_RPG_ENGINE")
-        .map(|v| v.eq_ignore_ascii_case("jariko"))
-        .unwrap_or(false)
-}
-
 /// The text of an include: `FILE,MEMBER`, `LIB/FILE,MEMBER`, `MEMBER`
 /// (QRPGLESRC), or a stream file path.
 async fn fetch_include(client: &Client, libl: &[String], id: &str) -> Option<String> {
@@ -130,7 +121,7 @@ pub async fn call(
     libl: Vec<String>,
     user: String,
     job: Option<String>,
-    display: Option<crate::bridge::DisplayHandle>,
+    display: Option<crate::runtime::DisplayHandle>,
     cl: Option<ClContext>,
     name: String,
     source: String,
@@ -139,11 +130,11 @@ pub async fn call(
     let rt = tokio::runtime::Handle::current();
     let url = database_url.to_string();
     tokio::task::spawn_blocking(move || -> Result<CallResult> {
-        let client = rt.block_on(crate::bridge::connect_db(&url))?;
-        rt.block_on(crate::bridge::job_session(
+        let client = rt.block_on(crate::runtime::connect_db(&url))?;
+        rt.block_on(crate::runtime::job_session(
             &client,
             job.as_deref(),
-            crate::bridge::default_record_wait(),
+            crate::runtime::default_record_wait(),
         ))?;
         // The job number of "000123/USER/NAME".
         let job_number = job

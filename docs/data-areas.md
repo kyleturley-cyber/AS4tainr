@@ -21,7 +21,7 @@ Messages: `CPF1015` (data area not found), `CPF1023` (data area already exists),
 
 ## RPG
 
-The usual fixed-form pattern works on Jariko:
+The usual fixed-form pattern:
 
 ```
      D NXTORD          S              7  0
@@ -46,6 +46,6 @@ Each data area is an object row (`*DTAARA`) plus a row in `as4tainr.data_areas` 
 ## Not yet
 
 - The local data area `*LDA`, the group data area `*GDA` and `*PDA`.
-- `UNLOCK *DTAARA` and the `DTAARA` keyword on D specs (Jariko supports `DEFINE` only).
+- `UNLOCK *DTAARA`. (`DEFINE` and the `DTAARA` keyword on definitions both work.)
 - `RTVDTAARA` into a `*CHAR` variable from a `*DEC` data area. IBM i allows it in some cases; as4tainr refuses it with a clear message.
 - How long `CHGDTAARA` waits for a lock: it waits until the lock is released, with no time limit.

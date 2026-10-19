@@ -3,10 +3,6 @@ Copyright 2026 The as4tainr contributors
 
 This product is licensed under the Apache License, Version 2.0.
 
-as4tainr runs RPG programs with Jariko (https://github.com/smeup/jariko),
-Copyright Sme.UP S.p.A., licensed under the Apache License, Version 2.0.
-Jariko is a runtime dependency and is not copied into this repository.
-
 IBM, IBM i, AS/400, iSeries and DB2 are trademarks of International Business
 Machines Corporation. as4tainr is an independent project, not affiliated with
 or endorsed by IBM.

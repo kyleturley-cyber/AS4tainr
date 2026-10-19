@@ -1,5 +1,5 @@
       * CUSTUPD: change a balance with UPDATE, add a customer with WRITE,
-      * then read both back. Exercises the numbers Jariko sends to as4tainr.
+      * then read both back: negative and fractional packed values.
       * Parameter: customer number to change (5,0).
      FCUSTMAST  UF A E           K DISK
      D msg             S             52

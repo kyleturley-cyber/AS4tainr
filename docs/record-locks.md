@@ -33,8 +33,7 @@ Sign on twice and `CALL CUSTMNT` in both sessions. When the second session asks 
 ## How it works
 
 - **Locks:** the record lock is a PostgreSQL advisory lock on the job's database session. The key is the physical file's name and the record number. The wait is the session's `lock_timeout`. The session's `application_name` is the job name, which is how `CPF5027` names the job that holds the record.
-- **The runner:** Jariko v2.2.0 does not pass the file's type, the `N` and `E` extenders, or `UNLOCK` to its file layer. So when a program is loaded, the runner (`RecordLocks.java`) reads its F specs and puts a short "signal" in front of each read that has `N`, `E` or an error indicator, and in front of each `UNLOCK`. A signal is an `EVAL` and an `OUT` to a data area field named `IBM#SG`, which the runner intercepts. Error messages from Jariko show line numbers a few lines higher than the source because of the added statements.
-- **The bridge:** `open` takes `"update": true`, reads take `"lock": false` for `N`, and `unlock` releases the lock (protocol version 4).
+- **The RPG engine:** a file opened for update (`U` in position 17) locks each record it reads, unless the read has the `N` extender. `UPDATE`, `DELETE`, the next read, `UNLOCK` and closing the file release it. An error indicator in positions 73-74 (or `(E)`) catches CPF5027 instead of ending the program. Each program call has its own database session, named after the job (`runtime::job_session`).
 
 ## Not yet
 

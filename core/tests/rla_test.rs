@@ -1,13 +1,11 @@
-//! Integration tests for the catalog, record-level access and the bridge.
+//! Integration tests: the catalog, record-level access, CL, jobs and the RPG engine.
 //!
 //! Needs a PostgreSQL database. Set AS4TAINR_TEST_DATABASE_URL, e.g.
 //! `postgres://as4tainr:as4tainr@127.0.0.1/as4tainr`. Without it, tests are skipped.
 //! Each test creates its own library, so tests can run in parallel.
 
-use as4tainr_core::{bridge, catalog, dds, rla};
-use serde_json::{json, Value};
+use as4tainr_core::{catalog, dds, rla, runtime};
 use std::sync::atomic::{AtomicU32, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_postgres::Client;
 
 const CUSTMAST: &str = include_str!("../../samples/qddssrc/CUSTMAST.pf");
@@ -33,7 +31,7 @@ macro_rules! require_db {
 
 /// A fresh library with CUSTMAST and ORDLIN created and loaded.
 async fn setup(url: &str) -> (Client, String) {
-    let mut client = bridge::connect_db(url).await.unwrap();
+    let mut client = runtime::connect_db(url).await.unwrap();
     catalog::init(&client).await.unwrap();
     let lib = format!(
         "T{}{:03}",
@@ -332,56 +330,193 @@ async fn library_list_resolution() {
     assert!(err.contains("CPF9812"), "{err}");
 }
 
-/// Talk to the bridge the way the JVM does: JSON lines over TCP.
-#[tokio::test]
-async fn bridge_protocol_round_trip() {
-    let url = require_db!();
-    let (_client, lib) = setup(&url).await;
-    let listener = bridge::bind(0).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(bridge::serve(
-        listener,
-        bridge::BridgeConfig {
-            database_url: url.clone(),
-            library_list: vec![lib.clone()],
-            display: None,
-            job: None,
-            record_wait: None,
-        },
-    ));
+/// Run an RPG program (source text) on the native engine in the test
+/// library, as `user`, with an optional display and job.
+async fn run_rpg(
+    url: &str,
+    lib: &str,
+    user: &str,
+    name: &str,
+    source: &str,
+    display: Option<runtime::DisplayHandle>,
+    job: Option<String>,
+) -> as4tainr_core::rpg::CallResult {
+    as4tainr_core::rpg::call(
+        url,
+        vec![lib.to_string()],
+        user.to_string(),
+        job,
+        display,
+        None,
+        name.into(),
+        source.into(),
+        vec![],
+    )
+    .await
+    .unwrap()
+}
 
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let (rd, mut wr) = stream.into_split();
-    let mut lines = BufReader::new(rd).lines();
-    let requests = [
-        json!({"id": 1, "op": "hello"}),
-        json!({"id": 2, "op": "metadata", "file": "ORDLIN"}),
-        json!({"id": 3, "op": "open", "file": "ORDLIN"}),
-        json!({"id": 4, "op": "setll", "handle": 1, "keys": ["1001"]}),
-        json!({"id": 5, "op": "reade", "handle": 1}),
-        json!({"id": 6, "op": "reade", "handle": 1}),
-        json!({"id": 7, "op": "chain", "handle": 9, "keys": ["1"]}),
-        json!({"id": 8, "op": "bogus"}),
-    ];
-    let mut resp = Vec::new();
-    for req in requests {
-        wr.write_all(format!("{req}\n").as_bytes()).await.unwrap();
-        let r: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-        resp.push(r);
+/// What a test looks at on a screen before answering it.
+type Check = Box<dyn FnOnce(&as4tainr_core::workstn::Frame) + Send>;
+
+/// A display stand-in: answers each EXFMT with the next response, after
+/// letting `check` look at what would be on the screen.
+fn operator(
+    mut answers: Vec<(as4tainr_core::dspf::Response, Check)>,
+) -> (runtime::DisplayHandle, tokio::task::JoinHandle<usize>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<runtime::DisplayRequest>(1);
+    answers.reverse();
+    let task = tokio::spawn(async move {
+        let mut n = 0;
+        while let Some(req) = rx.recv().await {
+            let (resp, check) = answers.pop().expect("more screens than expected");
+            check(&req.frame);
+            n += 1;
+            let _ = req.reply.send(Ok(resp));
+        }
+        n
+    });
+    (tx, task)
+}
+
+fn press(aid: &str, values: &[(&str, &str)], ind: &[(u8, bool)]) -> as4tainr_core::dspf::Response {
+    as4tainr_core::dspf::Response {
+        aid: aid.into(),
+        values: values
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        indicators: ind.iter().copied().collect(),
+        changed: Default::default(),
     }
-    server.abort();
+}
 
-    assert_eq!(resp[0]["version"], 6);
-    assert_eq!(resp[1]["format"], "ORDLINR");
-    assert_eq!(resp[1]["keys"], json!(["ORDNO", "LINNO"]));
-    assert_eq!(resp[1]["fields"][4]["decimals"], 2);
-    assert_eq!(resp[2]["handle"], 1);
-    assert_eq!(resp[3]["equal"], true);
-    assert_eq!(resp[4]["record"]["ITEM"], format!("{:<15}", "WIDGET-A"));
-    assert_eq!(resp[5]["eof"], true);
-    assert_eq!(resp[6]["ok"], false);
-    assert_eq!(resp[7]["ok"], false);
-    assert_eq!(resp[7]["id"], 8);
+/// EXFMT on the native engine (sample CUSTINQ, display file CUSTINQD):
+/// the record's fields and indicators go to the job's display; what the
+/// operator typed, the response indicators (CA03 sets 03) and *INKx come
+/// back. An unknown customer turns on *IN30, which conditions ERRMSG.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpg_exfmt_with_a_display() {
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    catalog::create_display_file(
+        &mut client,
+        &lib,
+        "CUSTINQD",
+        include_str!("../../samples/qddssrc/CUSTINQD.dspf"),
+    )
+    .await
+    .unwrap();
+    let (tx, seen) = operator(vec![
+        (
+            press("ENTER", &[("CUSNUM", "42")], &[]),
+            Box::new(|f| {
+                let l = f.layers.last().unwrap();
+                assert_eq!(l.format, "PROMPT");
+                assert!(!l.ind[30]);
+            }),
+        ),
+        (
+            press("F3", &[], &[(3, true)]),
+            Box::new(|f| {
+                let l = f.layers.last().unwrap();
+                assert_eq!(l.format, "PROMPT");
+                assert!(l.ind[30], "*IN30 is on after CHAIN found nothing");
+                assert_eq!(l.values.get("CUSNUM").map(String::as_str), Some("42"));
+            }),
+        ),
+    ]);
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "CUSTINQ",
+        include_str!("../../samples/qrpglesrc/CUSTINQ.rpgle"),
+        Some(tx),
+        None,
+    )
+    .await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(seen.await.unwrap(), 2);
+
+    // Without a display (batch), EXFMT fails with a clear message.
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "CUSTINQ",
+        include_str!("../../samples/qrpglesrc/CUSTINQ.rpgle"),
+        None,
+        None,
+    )
+    .await;
+    let e = format!("{:#}", r.error.unwrap());
+    assert!(e.contains("no display"), "{e}");
+}
+
+/// A load-all subfile on the native engine (sample WRKCUST, display file
+/// CUSTWRKD): every customer is written to the subfile; the control record
+/// is shown with FOOTER kept (OVERLAY); the operator types 5 on line 2,
+/// READC returns it and the program shows that customer; UPDATE clears the
+/// option; F3 ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpg_subfile_with_a_display() {
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    catalog::create_display_file(
+        &mut client,
+        &lib,
+        "CUSTWRKD",
+        include_str!("../../samples/qddssrc/CUSTWRKD.dspf"),
+    )
+    .await
+    .unwrap();
+    let mut opt5 = press("ENTER", &[], &[]);
+    opt5.changed
+        .insert(2, [("OPT".to_string(), "5".to_string())].into());
+    let (tx, seen) = operator(vec![
+        (
+            opt5,
+            Box::new(|f| {
+                let names: Vec<&str> = f.layers.iter().map(|l| l.format.as_str()).collect();
+                assert_eq!(
+                    names,
+                    ["FOOTER", "CUSTCTL"],
+                    "FOOTER stays: CUSTCTL has OVERLAY"
+                );
+                let sf = f.subfile.as_ref().unwrap();
+                assert!(sf.show);
+                assert_eq!(sf.rows.len(), 5);
+            }),
+        ),
+        (
+            press("F12", &[], &[(12, true)]),
+            Box::new(|f| {
+                let l = f.layers.last().unwrap();
+                assert_eq!(l.format, "DETAIL");
+                assert_eq!(l.values.get("CUSNO").map(|v| v.trim()), Some("2"));
+            }),
+        ),
+        (
+            press("F3", &[], &[(3, true)]),
+            Box::new(|f| {
+                let sf = f.subfile.as_ref().unwrap();
+                assert_eq!(sf.rows[1].values.get("OPT").map(|v| v.trim()), Some(""));
+            }),
+        ),
+    ]);
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "WRKCUST",
+        include_str!("../../samples/qrpglesrc/WRKCUST.rpgle"),
+        Some(tx),
+        None,
+    )
+    .await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(seen.await.unwrap(), 3);
 }
 
 /// Regression: numeric keys must sort numerically. With unqualified ORDER BY
@@ -434,245 +569,6 @@ async fn numeric_keys_of_different_widths_sort_numerically() {
     assert_eq!(back, seen);
 }
 
-/// EXFMT over the bridge: values and indicators go to the job's display,
-/// the operator's input and response indicators come back.
-#[tokio::test]
-async fn bridge_exfmt_round_trip_with_a_display() {
-    let url = require_db!();
-    let (mut client, lib) = setup(&url).await;
-    catalog::create_display_file(
-        &mut client,
-        &lib,
-        "CUSTINQD",
-        include_str!("../../samples/qddssrc/CUSTINQD.dspf"),
-    )
-    .await
-    .unwrap();
-
-    // A fake display: checks the request, then "presses F3".
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<bridge::DisplayRequest>(1);
-    let display = tokio::spawn(async move {
-        let req = rx.recv().await.unwrap();
-        let shown = req.frame.layers.last().unwrap();
-        assert_eq!(shown.format, "PROMPT");
-        assert_eq!(shown.values.get("CUSNUM").map(String::as_str), Some("42"));
-        assert!(shown.ind[30], "*IN30 is passed to the display");
-        assert!(!shown.ind[3]);
-        let mut indicators = std::collections::BTreeMap::new();
-        indicators.insert(3u8, true);
-        indicators.insert(30u8, false);
-        req.reply
-            .send(Ok(as4tainr_core::dspf::Response {
-                aid: "F3".into(),
-                values: Default::default(),
-                indicators,
-                changed: Default::default(),
-            }))
-            .unwrap();
-    });
-
-    let listener = bridge::bind(0).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(bridge::serve(
-        listener,
-        bridge::BridgeConfig {
-            database_url: url.clone(),
-            library_list: vec![lib.clone()],
-            display: Some(tx),
-            job: None,
-            record_wait: None,
-        },
-    ));
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let (rd, mut wr) = stream.into_split();
-    let mut lines = BufReader::new(rd).lines();
-    let mut ind = "0".repeat(99);
-    ind.replace_range(29..30, "1"); // *IN30
-    for req in [
-        json!({"id": 1, "op": "dspf", "file": "CUSTINQD"}),
-        json!({"id": 2, "op": "exfmt", "file": "CUSTINQD", "format": "PROMPT", "fields": {"CUSNUM": "42"}, "indicators": ind}),
-        json!({"id": 3, "op": "exfmt", "file": "CUSTINQD", "format": "NOSUCH", "fields": {}, "indicators": ""}),
-    ] {
-        wr.write_all(format!("{req}\n").as_bytes()).await.unwrap();
-    }
-    let mut resp = Vec::new();
-    for _ in 0..3 {
-        let r: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-        resp.push(r);
-    }
-    display.await.unwrap();
-    server.abort();
-
-    assert_eq!(resp[0]["formats"], json!(["PROMPT", "DETAIL"]));
-    assert!(resp[0]["source"].as_str().unwrap().contains("ERRMSG"));
-    assert_eq!(resp[1]["aid"], "F3");
-    assert_eq!(resp[1]["indicators"]["03"], true);
-    assert_eq!(resp[1]["indicators"]["30"], false);
-    assert_eq!(resp[2]["ok"], false);
-}
-
-/// A subfile over the bridge, as the JVM uses it: the records are written
-/// on one connection and the control record is shown on another (the
-/// runner has one connection for EXFMT, one per display record format).
-/// The operator types an option on record 2; READC returns it, then eof.
-#[tokio::test]
-async fn bridge_subfile_write_exfmt_readc() {
-    let url = require_db!();
-    let (mut client, lib) = setup(&url).await;
-    catalog::create_display_file(
-        &mut client,
-        &lib,
-        "CUSTWRKD",
-        include_str!("../../samples/qddssrc/CUSTWRKD.dspf"),
-    )
-    .await
-    .unwrap();
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<bridge::DisplayRequest>(1);
-    let display = tokio::spawn(async move {
-        let req = rx.recv().await.unwrap();
-        let names: Vec<&str> = req.frame.layers.iter().map(|l| l.format.as_str()).collect();
-        assert_eq!(
-            names,
-            ["FOOTER", "CUSTCTL"],
-            "FOOTER stays: CUSTCTL has OVERLAY"
-        );
-        let sf = req.frame.subfile.as_ref().unwrap();
-        assert!(sf.show);
-        assert_eq!(sf.rows.iter().map(|r| r.rrn).collect::<Vec<_>>(), [1, 2, 3]);
-        let mut changed = std::collections::BTreeMap::new();
-        changed.insert(2u16, [("OPT".to_string(), "5".to_string())].into());
-        req.reply
-            .send(Ok(as4tainr_core::dspf::Response {
-                aid: "ENTER".into(),
-                values: Default::default(),
-                indicators: Default::default(),
-                changed,
-            }))
-            .unwrap();
-    });
-
-    let listener = bridge::bind(0).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(bridge::serve(
-        listener,
-        bridge::BridgeConfig {
-            database_url: url.clone(),
-            library_list: vec![lib.clone()],
-            display: Some(tx),
-            job: None,
-            record_wait: None,
-        },
-    ));
-    async fn conn(
-        addr: std::net::SocketAddr,
-    ) -> (
-        tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
-        tokio::net::tcp::OwnedWriteHalf,
-    ) {
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (rd, wr) = stream.into_split();
-        (BufReader::new(rd).lines(), wr)
-    }
-    async fn call(
-        c: &mut (
-            tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
-            tokio::net::tcp::OwnedWriteHalf,
-        ),
-        req: Value,
-    ) -> Value {
-        c.1.write_all(format!("{req}\n").as_bytes()).await.unwrap();
-        serde_json::from_str(&c.0.next_line().await.unwrap().unwrap()).unwrap()
-    }
-    let mut writer = conn(addr).await;
-    let mut runner = conn(addr).await;
-    let ind = |on: &[usize]| {
-        let mut s = vec![b'0'; 99];
-        for &i in on {
-            s[i - 1] = b'1';
-        }
-        String::from_utf8(s).unwrap()
-    };
-    let r = call(&mut writer, json!({"op": "dspwrite", "file": "CUSTWRKD", "format": "CUSTCTL", "fields": {}, "indicators": ind(&[32])})).await;
-    assert_eq!(r["ok"], true, "{r}");
-    for n in 1..=3 {
-        let r = call(&mut writer, json!({"op": "sflwrite", "file": "CUSTWRKD", "format": "CUSTSFL", "rrn": n,
-            "fields": {"OPT": "", "CUSNO": n.to_string(), "CUSNAM": format!("Customer {n}"), "CUSCTY": ""}, "indicators": ind(&[])})).await;
-        assert_eq!(r["ok"], true, "{r}");
-    }
-    let r = call(&mut writer, json!({"op": "sflwrite", "file": "CUSTWRKD", "format": "CUSTSFL", "rrn": 2, "fields": {}, "indicators": ind(&[])})).await;
-    assert_eq!(r["ok"], false, "record 2 exists already");
-    call(&mut writer, json!({"op": "dspwrite", "file": "CUSTWRKD", "format": "FOOTER", "fields": {}, "indicators": ind(&[])})).await;
-    let r = call(&mut runner, json!({"op": "exfmt", "file": "CUSTWRKD", "format": "CUSTCTL", "fields": {}, "indicators": ind(&[31, 33])})).await;
-    assert_eq!(r["aid"], "ENTER", "{r}");
-    display.await.unwrap();
-    let r = call(
-        &mut writer,
-        json!({"op": "sflreadc", "file": "CUSTWRKD", "format": "CUSTSFL"}),
-    )
-    .await;
-    assert_eq!(
-        (r["found"].clone(), r["rrn"].clone()),
-        (json!(true), json!(2)),
-        "{r}"
-    );
-    assert_eq!(r["record"]["OPT"], "5");
-    assert_eq!(r["record"]["CUSNAM"], "Customer 2");
-    let r = call(&mut writer, json!({"op": "sflupdate", "file": "CUSTWRKD", "format": "CUSTSFL",
-        "fields": {"OPT": "", "CUSNO": "2", "CUSNAM": "Customer 2", "CUSCTY": ""}, "indicators": ind(&[])})).await;
-    assert_eq!(r["ok"], true, "{r}");
-    let r = call(
-        &mut writer,
-        json!({"op": "sflreadc", "file": "CUSTWRKD", "format": "CUSTSFL"}),
-    )
-    .await;
-    assert_eq!(r["eof"], true, "{r}");
-    let r = call(
-        &mut writer,
-        json!({"op": "sflchain", "file": "CUSTWRKD", "format": "CUSTSFL", "rrn": 3}),
-    )
-    .await;
-    assert_eq!(r["record"]["CUSNAM"], "Customer 3");
-    server.abort();
-}
-
-/// Without a display (batch), EXFMT fails with a clear message.
-#[tokio::test]
-async fn exfmt_without_a_display_fails_clearly() {
-    let url = require_db!();
-    let (mut client, lib) = setup(&url).await;
-    catalog::create_display_file(
-        &mut client,
-        &lib,
-        "CUSTINQD",
-        include_str!("../../samples/qddssrc/CUSTINQD.dspf"),
-    )
-    .await
-    .unwrap();
-    let listener = bridge::bind(0).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(bridge::serve(
-        listener,
-        bridge::BridgeConfig {
-            database_url: url.clone(),
-            library_list: vec![lib.clone()],
-            display: None,
-            job: None,
-            record_wait: None,
-        },
-    ));
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let (rd, mut wr) = stream.into_split();
-    let mut lines = BufReader::new(rd).lines();
-    wr.write_all(b"{\"id\":1,\"op\":\"exfmt\",\"file\":\"CUSTINQD\",\"format\":\"PROMPT\"}\n")
-        .await
-        .unwrap();
-    let r: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-    server.abort();
-    assert_eq!(r["ok"], false);
-    assert!(r["error"].as_str().unwrap().contains("no display"), "{r}");
-}
-
 /// DSPPFM reads a member in arrival order (relative record number), not
 /// key order: the CSV loads customer 3 first.
 #[tokio::test]
@@ -698,7 +594,7 @@ async fn member_records_in_arrival_order() {
 async fn user_profiles_create_get_delete() {
     use as4tainr_core::users;
     let url = require_db!();
-    let client = bridge::connect_db(&url).await.unwrap();
+    let client = runtime::connect_db(&url).await.unwrap();
     catalog::init(&client).await.unwrap();
     let name = format!("U{}", std::process::id() % 1_000_000);
     users::delete(&client, &name).await.unwrap();
@@ -754,7 +650,7 @@ async fn user_profiles_create_get_delete() {
 async fn passwords_from_before_qpwdlvl_still_work() {
     use as4tainr_core::users;
     let url = require_db!();
-    let client = bridge::connect_db(&url).await.unwrap();
+    let client = runtime::connect_db(&url).await.unwrap();
     catalog::init(&client).await.unwrap();
     let name = format!("L{}", std::process::id() % 1_000_000);
     users::delete(&client, &name).await.unwrap();
@@ -817,8 +713,6 @@ async fn job_library_list_commands() {
     let (client, lib) = setup(&url).await;
     let env = Environment {
         database_url: url.clone(),
-        runner: String::new(),
-        call_timeout: std::time::Duration::from_secs(5),
     };
     let mut job = Job {
         client: &client,
@@ -1264,7 +1158,7 @@ async fn cl_job_run(
     call: &str,
 ) -> anyhow::Result<Vec<String>> {
     use as4tainr_core::commands::{Environment, Job, Outcome};
-    let mut c = bridge::connect_db(url).await.unwrap();
+    let mut c = runtime::connect_db(url).await.unwrap();
     for (name, src) in pgms {
         as4tainr_core::clpgm::compile(name, src).unwrap();
         catalog::create_cl_program(&mut c, lib, name, "", src, true)
@@ -1273,8 +1167,6 @@ async fn cl_job_run(
     }
     let env = Environment {
         database_url: url.to_string(),
-        runner: "false".into(),
-        call_timeout: std::time::Duration::from_secs(5),
     };
     let mut job = Job {
         client,
@@ -1455,8 +1347,6 @@ async fn job_run(
     use as4tainr_core::commands::{Environment, Job};
     let env = Environment {
         database_url: String::new(),
-        runner: "false".into(),
-        call_timeout: std::time::Duration::from_secs(5),
     };
     let mut job = Job {
         client,
@@ -1568,12 +1458,11 @@ ENDPGM
     assert!(e.to_string().starts_with("CPF1015"), "{e}");
 }
 
-/// RPG IN *LOCK / OUT through the bridge: while one program holds the
-/// data area, CHGDTAARA from another job waits, so a counter is never
-/// changed between a program's IN and its OUT (IBM i: IN *LOCK keeps an
-/// exclusive lock until OUT, UNLOCK or the end of the program).
-#[tokio::test]
-async fn bridge_data_area_in_lock_out() {
+/// RPG data areas on the native engine (ILE RPG Reference, IN and OUT):
+/// `IN *LOCK` holds the data area until OUT; CHGDTAARA in another job
+/// waits for it. IN of a data area that does not exist fails with CPF1015.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpg_data_area_in_lock_out() {
     let url = require_db!();
     let (client, lib) = setup(&url).await;
     as4tainr_core::dtaara::create(
@@ -1588,54 +1477,51 @@ async fn bridge_data_area_in_lock_out() {
     )
     .await
     .unwrap();
-    let listener = bridge::bind(0).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(bridge::serve(
-        listener,
-        bridge::BridgeConfig {
-            database_url: url.clone(),
-            library_list: vec![lib.clone()],
-            display: None,
-            job: None,
-            record_wait: None,
-        },
-    ));
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let (rd, mut wr) = stream.into_split();
-    let mut lines = BufReader::new(rd).lines();
-    let mut ask = async |req: Value| -> Value {
-        wr.write_all(format!("{req}\n").as_bytes()).await.unwrap();
-        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap()
-    };
-    let r = ask(json!({"id": 1, "op": "dtaara_in", "name": "ORDNXT", "lock": true})).await;
-    assert_eq!(r["value"], "1004");
-    assert_eq!(r["type"], "*DEC");
-
-    // Another job changes the data area: it must wait for OUT.
-    let other = bridge::connect_db(&url).await.unwrap();
-    let libl = vec![lib.clone()];
-    let lib2 = lib.clone();
-    let change = tokio::spawn(async move {
-        as4tainr_core::dtaara::change(&other, "ORDNXT", &libl, &lib2, None, "5000")
-            .await
-            .unwrap()
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    assert!(!change.is_finished(), "CHGDTAARA did not wait for the lock");
-
-    let r = ask(json!({"id": 2, "op": "dtaara_out", "name": "ORDNXT", "value": "1005"})).await;
-    assert_eq!(r["ok"], true, "{r}");
-    let after = change.await.unwrap();
-    assert_eq!(after.value, "5000");
-
-    // Without a lock, IN just reads; a value that does not fit is refused.
-    let r = ask(json!({"id": 3, "op": "dtaara_in", "name": "ORDNXT"})).await;
-    assert_eq!(r["value"], "5000");
-    let r = ask(json!({"id": 4, "op": "dtaara_out", "name": "ORDNXT", "value": "123456789"})).await;
-    assert_eq!(r["ok"], false);
-    let r = ask(json!({"id": 5, "op": "dtaara_in", "name": "NOSUCH"})).await;
-    assert!(r["error"].as_str().unwrap().starts_with("CPF1015"), "{r}");
-    server.abort();
+    // While the program waits for the operator (DSPLY with a reply), it
+    // holds the lock: another job's CHGDTAARA must wait.
+    let (url2, lib2) = (url.clone(), lib.clone());
+    let changer: std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<String>>>> =
+        Default::default();
+    let ch = changer.clone();
+    let (tx, seen) = operator(vec![(
+        press("ENTER", &[("REPLY", "y")], &[]),
+        Box::new(move |f| {
+            assert_eq!(f.layers.last().unwrap().format, "DSPLYR");
+            let h = tokio::spawn(async move {
+                let other = runtime::connect_db(&url2).await.unwrap();
+                as4tainr_core::dtaara::change(
+                    &other,
+                    "ORDNXT",
+                    std::slice::from_ref(&lib2),
+                    &lib2,
+                    None,
+                    "5000",
+                )
+                .await
+                .unwrap()
+                .value
+            });
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            assert!(!h.is_finished(), "CHGDTAARA did not wait for the lock");
+            *ch.lock().unwrap() = Some(h);
+        }),
+    )]);
+    let src = "**FREE\ndcl-s nxt packed(7:0) dtaara('ORDNXT');\ndcl-s r char(1);\nin *lock nxt;\ndsply 'Next order?' '' r;\nnxt += 1;\nout nxt;\ndsply %char(nxt);\n*inlr = *on;\n";
+    let r = run_rpg(&url, &lib, "QSECOFR", "DTALOCK", src, Some(tx), None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["1005"]);
+    assert_eq!(seen.await.unwrap(), 1);
+    let h = changer.lock().unwrap().take().unwrap();
+    assert_eq!(
+        h.await.unwrap(),
+        "5000",
+        "CHGDTAARA ran after OUT released the lock"
+    );
+    // IN of a data area that is not there.
+    let src = "**FREE\ndcl-s x char(10) dtaara('NOSUCH');\nin x;\n*inlr = *on;\n";
+    let r = run_rpg(&url, &lib, "QSECOFR", "DTANONE", src, None, None).await;
+    let e = format!("{:#}", r.error.unwrap());
+    assert!(e.contains("CPF1015"), "{e}");
 }
 
 /// Work management: SBMJOB puts a job on QBATCH; the subsystem runs it in
@@ -1652,8 +1538,6 @@ async fn submitted_jobs_run_in_qbatch() {
     let (client, lib) = setup(&url).await;
     let env = Environment {
         database_url: url.clone(),
-        runner: "false".into(),
-        call_timeout: std::time::Duration::from_secs(5),
     };
     let device = format!("D{lib}");
     let id = jobs::start_interactive(
@@ -1807,14 +1691,13 @@ async fn submitted_jobs_run_in_qbatch() {
     assert_eq!(jobs::get(&client, id.number).await.unwrap().status, "OUTQ");
 }
 
-/// Record locks (IBM i record-level access for files opened for update):
-/// a read locks the record found until UPDATE, DELETE, the next read,
-/// UNLOCK or close; another job reading that record for update waits
-/// (WAITRCD), then fails with CPF5027; a read with the N extender, or of a
-/// file opened for input, does not lock and does not wait. Locks belong to
-/// the physical file's record, so a logical file over it sees them too.
+/// Record locks at the record-level access layer the RPG engine uses: a
+/// file opened for update locks the record it reads; another job waits
+/// WAITRCD, then gets CPF5027 naming the holder. N (no lock) and input
+/// files do not lock; a logical file shares the physical file's locks; the
+/// next read, UPDATE, UNLOCK and closing release.
 #[tokio::test]
-async fn bridge_record_locks() {
+async fn record_locks() {
     let url = require_db!();
     let (mut client, lib) = setup(&url).await;
     crtlf(
@@ -1824,126 +1707,87 @@ async fn bridge_record_locks() {
         include_str!("../../samples/qddssrc/CUSTNAME.lf"),
     )
     .await;
-    let listener = bridge::bind(0).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(bridge::serve(
-        listener,
-        bridge::BridgeConfig {
-            database_url: url.clone(),
-            library_list: vec![lib.clone()],
-            display: None,
-            job: Some(format!("000042/QSECOFR/L{lib}")),
-            record_wait: Some(std::time::Duration::from_millis(700)),
-        },
-    ));
-    struct Conn {
-        wr: tokio::net::tcp::OwnedWriteHalf,
-        lines: tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
-    }
-    impl Conn {
-        async fn ask(&mut self, req: Value) -> Value {
-            self.wr
-                .write_all(format!("{req}\n").as_bytes())
-                .await
-                .unwrap();
-            serde_json::from_str(&self.lines.next_line().await.unwrap().unwrap()).unwrap()
-        }
-    }
-    let connect = || async {
-        let (rd, wr) = tokio::net::TcpStream::connect(addr)
+    let wait = std::time::Duration::from_millis(700);
+    let holder = format!("000042/QSECOFR/L{lib}");
+    let a = runtime::connect_db(&url).await.unwrap();
+    runtime::job_session(&a, Some(&holder), wait).await.unwrap();
+    let b = runtime::connect_db(&url).await.unwrap();
+    runtime::job_session(&b, Some("000043/QSECOFR/OTHER"), wait)
+        .await
+        .unwrap();
+    async fn for_update(c: &Client, lib: &str, name: &str) -> rla::OpenFile {
+        let f = catalog::resolve_file(c, &[lib.to_string()], name)
             .await
-            .unwrap()
-            .into_split();
-        Conn {
-            wr,
-            lines: BufReader::new(rd).lines(),
-        }
-    };
-    let mut a = connect().await;
-    let mut b = connect().await;
-    let ha = a
-        .ask(json!({"op": "open", "file": "CUSTMAST", "update": true}))
-        .await["handle"]
-        .clone();
-    let hb = b
-        .ask(json!({"op": "open", "file": "CUSTMAST", "update": true}))
-        .await["handle"]
-        .clone();
-    let hin = b.ask(json!({"op": "open", "file": "CUSTMAST"})).await["handle"].clone();
-    let hlf = b
-        .ask(json!({"op": "open", "file": "CUSTNAME", "update": true}))
-        .await["handle"]
-        .clone();
-    let chain = |h: &Value, k: &str| json!({"op": "chain", "handle": h, "keys": [k]});
+            .unwrap();
+        let (l, pf) = catalog::physical_file_of(c, &f.library, &f.file.name)
+            .await
+            .unwrap();
+        rla::OpenFile::new(f).for_update(format!("{l}/{pf}"))
+    }
+    async fn chain(
+        f: &mut rla::OpenFile,
+        c: &Client,
+        key: &str,
+        lock: bool,
+    ) -> anyhow::Result<rla::ReadResult> {
+        let r = f.chain(c, &[key.to_string()]).await?;
+        f.lock_after_read(c, r, lock, None).await
+    }
+    let mut fa = for_update(&a, &lib, "CUSTMAST").await;
+    let mut fb = for_update(&b, &lib, "CUSTMAST").await;
+    let mut fin = open(&b, &lib, "CUSTMAST").await;
+    let mut flf = for_update(&b, &lib, "CUSTNAME").await;
 
     // A locks customer 1; B waits for it, then gets CPF5027 naming A's job.
-    assert_eq!(a.ask(chain(&ha, "1")).await["found"], true);
+    assert!(chain(&mut fa, &a, "1", true).await.unwrap().found);
     let t0 = std::time::Instant::now();
-    let r = b.ask(chain(&hb, "1")).await;
-    assert_eq!(r["ok"], false);
-    let err = r["error"].as_str().unwrap();
-    assert!(err.starts_with("CPF5027"), "{err}");
-    assert!(err.contains(&format!("000042/QSECOFR/L{lib}")), "{err}");
+    let e = chain(&mut fb, &b, "1", true).await.unwrap_err().to_string();
+    assert!(e.starts_with("CPF5027"), "{e}");
+    assert!(e.contains(&holder), "{e}");
     assert!(
         t0.elapsed() >= std::time::Duration::from_millis(600),
         "did not wait"
     );
     // N extender, and a file opened for input: no lock, no wait.
-    let mut nolock = chain(&hb, "1");
-    nolock["lock"] = json!(false);
-    assert_eq!(b.ask(nolock).await["found"], true);
-    assert_eq!(b.ask(chain(&hin, "1")).await["found"], true);
+    assert!(chain(&mut fb, &b, "1", false).await.unwrap().found);
+    assert!(chain(&mut fin, &b, "1", true).await.unwrap().found);
     // The logical file shares the physical file's record locks.
-    let r = b.ask(chain(&hlf, "Acme Tooling")).await;
-    assert!(
-        r["error"].as_str().unwrap_or("").starts_with("CPF5027"),
-        "{r}"
-    );
+    let e = chain(&mut flf, &b, "Acme Tooling", true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF5027"), "{e}");
 
     // A's next read moves the lock: customer 1 is free, 2 is locked.
-    let r = a.ask(json!({"op": "read", "handle": ha})).await;
-    assert_eq!(r["record"]["CUSNO"], "2");
-    assert_eq!(b.ask(chain(&hb, "1")).await["found"], true);
-    assert!(b.ask(chain(&hb, "2")).await["error"]
-        .as_str()
-        .unwrap()
+    let r = fa.read(&a).await.unwrap();
+    let r = fa.lock_after_read(&a, r, true, None).await.unwrap();
+    assert_eq!(field(&r, "CUSNO"), "2");
+    assert!(chain(&mut fb, &b, "1", true).await.unwrap().found);
+    fb.release(&b).await.unwrap();
+    assert!(chain(&mut fb, &b, "2", true)
+        .await
+        .unwrap_err()
+        .to_string()
         .starts_with("CPF5027"));
     // UPDATE releases (and B, waiting meanwhile, sees A's change).
-    let mut rec = a.ask(chain(&ha, "2")).await["record"].clone();
-    rec["CUSCTY"] = json!("Evanston");
+    let mut rec = chain(&mut fa, &a, "2", true).await.unwrap().record.unwrap();
+    rec.insert("CUSCTY".into(), "Evanston".into());
     let wait_b = tokio::spawn(async move {
-        let r = b
-            .ask(json!({"op": "chain", "handle": hb, "keys": ["2"]}))
-            .await;
-        (b, r)
+        let r = chain(&mut fb, &b, "2", true).await;
+        (fb, b, r)
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert_eq!(
-        a.ask(json!({"op": "update", "handle": ha, "record": rec}))
-            .await["ok"],
-        true
-    );
-    let (mut b, r) = wait_b.await.unwrap();
-    assert_eq!(r["found"], true, "{r}");
-    assert_eq!(r["record"]["CUSCTY"].as_str().unwrap().trim(), "Evanston");
-    // UNLOCK and close release too.
-    assert_eq!(a.ask(chain(&ha, "3")).await["found"], true);
-    assert_eq!(
-        a.ask(json!({"op": "unlock", "handle": ha})).await["ok"],
-        true
-    );
-    let hb2 = b
-        .ask(json!({"op": "open", "file": "CUSTMAST", "update": true}))
-        .await["handle"]
-        .clone();
-    assert_eq!(b.ask(chain(&hb2, "3")).await["found"], true);
-    assert_eq!(a.ask(chain(&ha, "4")).await["found"], true);
-    assert_eq!(
-        a.ask(json!({"op": "close", "handle": ha})).await["ok"],
-        true
-    );
-    assert_eq!(b.ask(chain(&hb2, "4")).await["found"], true);
-    server.abort();
+    fa.update(&a, &rec).await.unwrap();
+    fa.release(&a).await.unwrap();
+    let (mut fb, b, r) = wait_b.await.unwrap();
+    let r = r.unwrap();
+    assert!(r.found);
+    assert_eq!(field(&r, "CUSCTY").trim(), "Evanston");
+    fb.release(&b).await.unwrap();
+    // UNLOCK releases too.
+    assert!(chain(&mut fa, &a, "3", true).await.unwrap().found);
+    fa.release(&a).await.unwrap();
+    assert!(chain(&mut fb, &b, "3", true).await.unwrap().found);
 }
 
 /// Spooled files: lines kept by page and line, WRKSPLF/DSPSPLF/DLTSPLF,
@@ -1951,7 +1795,7 @@ async fn bridge_record_locks() {
 /// batch job that ends abnormally kept as QPJOBLOG (QDFTJOBD has
 /// LOG(4 0 *NOLIST): no job log when the job ends normally). Also the
 /// bridge's splopen/splwrite/splclose.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn spooled_files() {
     use as4tainr_core::commands::{Environment, Job, Outcome};
     use as4tainr_core::{jobs, spool};
@@ -1960,8 +1804,6 @@ async fn spooled_files() {
     let user = format!("U{}", &lib[1..]);
     let env = Environment {
         database_url: url.clone(),
-        runner: "false".into(),
-        call_timeout: std::time::Duration::from_secs(5),
     };
     let id = jobs::start_interactive(
         &client,
@@ -2012,31 +1854,20 @@ async fn spooled_files() {
         (1, 2, "RDY", "MYPGM")
     );
 
-    // The bridge: a program's printer output becomes a spooled file of its job.
-    let listener = bridge::bind(0).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(bridge::serve(
-        listener,
-        bridge::BridgeConfig {
-            database_url: url.clone(),
-            library_list: vec![lib.clone()],
-            display: None,
-            job: Some(id.to_string()),
-            record_wait: None,
-        },
-    ));
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let (rd, mut wr) = stream.into_split();
-    let mut lines = BufReader::new(rd).lines();
-    let mut ask = async |req: Value| -> Value {
-        wr.write_all(format!("{req}\n").as_bytes()).await.unwrap();
-        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap()
-    };
-    let r = ask(json!({"op": "splopen", "file": "QSYSPRT", "user_data": "CUSTPRT"})).await;
-    let n = r["spl"].as_i64().unwrap();
-    ask(json!({"op": "splwrite", "spl": n, "lines": [[1, 1, "Report"], [1, 2, "line 2"]]})).await;
-    ask(json!({"op": "splclose", "spl": n})).await;
-    server.abort();
+    // A program's printer output becomes a spooled file of its job, with
+    // the program's name as user data.
+    let custprt = "     FQSYSPRT   O    F  132        PRINTER\n     C                   EXCEPT    LINES\n     C                   SETON                                        LR\n     OQSYSPRT   E            LINES          1\n     O                                            6 'Report'\n     O          E            LINES          1\n     O                                            6 'line 2'\n";
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "CUSTPRT",
+        custprt,
+        None,
+        Some(id.to_string()),
+    )
+    .await;
+    assert!(r.error.is_none(), "{:?}", r.error);
     let f = spool::find(&client, "QSYSPRT", id.number, None)
         .await
         .unwrap();
@@ -2151,7 +1982,7 @@ async fn spooled_files() {
 /// is *ALLOBJ, else owner (*ALL), else a private authority, else *PUBLIC.
 /// *USE reads, *CHANGE changes, *ALL deletes and manages authority;
 /// anything less fails with CPF9802.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn object_authority() {
     use as4tainr_core::commands::{Environment, Job, Outcome};
     use as4tainr_core::{jobs, users};
@@ -2178,8 +2009,6 @@ async fn object_authority() {
     .unwrap();
     let env = Environment {
         database_url: url.clone(),
-        runner: "false".into(),
-        call_timeout: std::time::Duration::from_secs(5),
     };
     let job_for = |user: &str| Job {
         client: &client,
@@ -2275,63 +2104,43 @@ async fn object_authority() {
     )
     .await
     .unwrap();
-    let listener = bridge::bind(0).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(bridge::serve(
-        listener,
-        bridge::BridgeConfig {
-            database_url: url.clone(),
-            library_list: vec![lib.clone()],
-            display: None,
-            job: Some(id.to_string()),
-            record_wait: None,
-        },
-    ));
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let (rd, mut wr) = stream.into_split();
-    let mut lines = BufReader::new(rd).lines();
-    let mut ask = async |req: Value| -> Value {
-        wr.write_all(format!("{req}\n").as_bytes()).await.unwrap();
-        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap()
+    // RPG programs check the files they open: update needs *CHANGE, input
+    // *USE; WRITE needs *CHANGE (CPF9802 otherwise).
+    let upd = "     FCUSTMAST  UF   E           K DISK\n     C     1             CHAIN     CUSTMAST\n     C                   SETON                                        LR\n";
+    let inp = "     FCUSTMAST  IF   E           K DISK\n     C     1             CHAIN     CUSTMAST\n     C                   IF        %FOUND\n     C     CUSNAM        DSPLY\n     C                   ENDIF\n     C                   SETON                                        LR\n";
+    let add = "     FCUSTMAST  IF A E           K DISK\n     C                   EVAL      CUSNO = 77\n     C                   WRITE     CUSTREC\n     C                   SETON                                        LR\n";
+    let job = Some(id.to_string());
+    let denied_rpg = |r: &as4tainr_core::rpg::CallResult| {
+        r.error
+            .as_ref()
+            .is_some_and(|e| format!("{e:#}").contains("CPF9802"))
     };
     sec.run(&format!(
         "GRTOBJAUT {lib}/CUSTMAST *FILE USER(*PUBLIC) AUT(*USE)"
     ))
     .await
     .unwrap();
-    let r = ask(json!({"op": "open", "file": "CUSTMAST", "update": true})).await;
-    assert!(
-        r["error"].as_str().unwrap_or("").starts_with("CPF9802"),
-        "{r}"
-    );
-    let h = ask(json!({"op": "open", "file": "CUSTMAST"})).await["handle"].clone();
-    assert_eq!(
-        ask(json!({"op": "chain", "handle": h, "keys": ["1"]})).await["found"],
-        true
-    );
-    let r = ask(json!({"op": "write", "handle": h, "record": {"CUSNO": "77"}})).await;
-    assert!(
-        r["error"].as_str().unwrap_or("").starts_with("CPF9802"),
-        "{r}"
-    );
+    let r = run_rpg(&url, &lib, &bob, "UPD", upd, None, job.clone()).await;
+    assert!(denied_rpg(&r), "{:?}", r.error);
+    let r = run_rpg(&url, &lib, &bob, "INP", inp, None, job.clone()).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["Acme Tooling"]);
+    let r = run_rpg(&url, &lib, &bob, "ADD", add, None, job.clone()).await;
+    assert!(denied_rpg(&r), "{:?}", r.error);
     sec.run(&format!(
         "GRTOBJAUT {lib}/CUSTMAST *FILE USER({bob}) AUT(*CHANGE)"
     ))
     .await
     .unwrap();
-    let r = ask(json!({"op": "open", "file": "CUSTMAST", "update": true})).await;
-    assert!(r["handle"].is_number(), "{r}");
+    let r = run_rpg(&url, &lib, &bob, "UPD", upd, None, job.clone()).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
     sec.run(&format!(
         "GRTOBJAUT {lib}/CUSTMAST *FILE USER({bob}) AUT(*EXCLUDE)"
     ))
     .await
     .unwrap();
-    let r = ask(json!({"op": "open", "file": "CUSTMAST"})).await;
-    assert!(
-        r["error"].as_str().unwrap_or("").starts_with("CPF9802"),
-        "{r}"
-    );
-    server.abort();
+    let r = run_rpg(&url, &lib, &bob, "INP", inp, None, job.clone()).await;
+    assert!(denied_rpg(&r), "{:?}", r.error);
     jobs::end(&client, &id, true).await.unwrap();
     users::delete(&client, &bob).await.unwrap();
 }
@@ -2350,8 +2159,6 @@ async fn menus_and_initial_menu() {
     let _ = users::delete(&client, &user).await;
     let env = Environment {
         database_url: url.clone(),
-        runner: "false".into(),
-        call_timeout: std::time::Duration::from_secs(5),
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
     let mut sec = Job {
@@ -2450,8 +2257,6 @@ async fn import_an_application() {
     let (client, lib) = setup(&url).await;
     let env = Environment {
         database_url: url.clone(),
-        runner: "false".into(),
-        call_timeout: std::time::Duration::from_secs(5),
     };
     let mut job = Job {
         client: &client,
@@ -2569,8 +2374,6 @@ async fn native_rpg_engine_runs_a_program() {
     let (client, lib) = setup(&url).await;
     let env = Environment {
         database_url: url.clone(),
-        runner: "false".into(),
-        call_timeout: std::time::Duration::from_secs(5),
     };
     let mut job = Job {
         client: &client,
@@ -2627,7 +2430,7 @@ async fn native_rpg_engine_runs_a_program() {
         .await
         .unwrap()
         .unwrap();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<as4tainr_core::bridge::DisplayRequest>(1);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<as4tainr_core::runtime::DisplayRequest>(1);
     let operator = tokio::spawn(async move {
         let mut shown = Vec::new();
         while let Some(req) = rx.recv().await {
@@ -2708,7 +2511,7 @@ async fn native_rpg_engine_runs_a_program() {
     // start over, a program called with CALL or a prototype gets its
     // parameters by reference, and error indicator 73-74 on CALL catches a
     // program that cannot be called.
-    let mut owner = as4tainr_core::bridge::connect_db(&url).await.unwrap();
+    let mut owner = as4tainr_core::runtime::connect_db(&url).await.unwrap();
     for (name, source) in [
         ("CALLEE", "     C     *ENTRY        PLIST\n     C                   PARM                    NAME             10\n     C                   PARM                    COUNT             5 0\n     C                   EVAL      NAME = 'Changed'\n     C                   EVAL      COUNT = COUNT + 1\n     C                   RETURN\n"),
         ("MAINPGM", "**FREE\nctl-opt main(go);\ndcl-proc go;\n  dcl-pi *n extpgm('MAINPGM');\n    who char(10);\n  end-pi;\n  dsply ('Hi ' + %trim(who));\n  who = 'Back';\nend-proc;\n"),
@@ -2720,6 +2523,13 @@ async fn native_rpg_engine_runs_a_program() {
     for (name, source, want) in [
         ("PROCS", "**FREE\ndcl-s total packed(9:2);\ndcl-ds cust qualified;\n  id zoned(5);\n  name char(20);\nend-ds;\ndcl-pr addTo;\n  amount packed(9:2) const;\n  acc packed(9:2);\nend-pr;\ntotal = 10;\naddTo(5.25: total);\ndsply %char(total);\ndsply %char(double(21));\ndsply greet('Ada');\nfill(cust);\ndsply cust.name;\ndsply %char(fact(5));\ndsply %char(counter());\ndsply %char(counter());\n*inlr = *on;\n\ndcl-proc addTo;\n  dcl-pi *n;\n    amount packed(9:2) const;\n    acc packed(9:2);\n  end-pi;\n  acc += amount;\nend-proc;\n\ndcl-proc double;\n  dcl-pi *n int(10);\n    n int(10) value;\n  end-pi;\n  return n * 2;\nend-proc;\n\ndcl-proc greet;\n  dcl-pi *n varchar(30);\n    who char(10) const;\n  end-pi;\n  return 'Hello, ' + %trim(who);\nend-proc;\n\ndcl-proc fill;\n  dcl-pi *n;\n    c likeds(cust);\n  end-pi;\n  c.name = 'Filled';\nend-proc;\n\ndcl-proc fact;\n  dcl-pi *n packed(15:0);\n    n packed(15:0) value;\n  end-pi;\n  if n <= 1;\n    return 1;\n  endif;\n  return n * fact(n - 1);\nend-proc;\n\ndcl-proc counter;\n  dcl-pi *n int(10) end-pi;\n  dcl-s count int(10) static;\n  dcl-s temp int(10);\n  count += 1;\n  temp += 1;\n  return count * 10 + temp;\nend-proc;\n", vec!["15.25", "42", "Hello, Ada", "Filled", "120", "11", "21"]),
         ("CALLER", "     D N               S             10    INZ('Orig')\n     D C               S              5  0 INZ(41)\n     C                   CALL      'CALLEE'\n     C                   PARM                    N\n     C                   PARM                    C\n     C     N             DSPLY\n     C     C             DSPLY\n     C                   CALL      'NOSUCH'                             99\n     C   99'missing'     DSPLY\n     C                   SETON                                        LR\n", vec!["Changed", "42", "missing"]),
+        // Nested data structures (ILE RPG Reference, LIKEDS on a subfield;
+        // "Qualified data structures"): list.users(i).name is element i of
+        // the users subfield array; a LIKEDS copy of the whole structure
+        // has the same nested subfields; ds(i).x indexes a DS array; a
+        // nested element passed by reference is changed by the callee;
+        // %SIZE of an array is the size of one element (10 + 3 bytes).
+        ("NESTED", "**FREE\ndcl-ds user_t qualified template;\n  name char(10);\n  days zoned(3:0);\nend-ds;\ndcl-ds list qualified;\n  count int(10);\n  users likeds(user_t) dim(3);\nend-ds;\ndcl-ds copy likeds(list);\ndcl-ds pts qualified dim(2);\n  x zoned(3:0);\n  y zoned(3:0);\nend-ds;\ndcl-s i int(10);\nlist.count = 2;\nlist.users(1).name = 'ADA';\nlist.users(1).days = 5;\nlist.users(2).name = 'GRACE';\nlist.users(2).days = 12;\nfor i = 1 to list.count;\n  dsply (%trim(list.users(i).name) + ' ' + %char(list.users(i).days));\nendfor;\ncopy = list;\ndsply copy.users(2).name;\nshow(list.users(2));\ndsply %char(list.users(2).days);\npts(2).x = 7;\npts(1).y = 3;\ndsply %char(pts(2).x + pts(1).y);\ndsply %char(%size(list.users));\n*inlr = *on;\ndcl-proc show;\n  dcl-pi *n;\n    u likeds(user_t);\n  end-pi;\n  dsply ('show ' + %trim(u.name));\n  u.days = 99;\nend-proc;\n", vec!["ADA 5", "GRACE 12", "GRACE", "show GRACE", "99", "10", "13"]),
         // ON-EXIT runs when the procedure returns; its indicator is off
         // for a normal end.
         ("ONEXIT", "**FREE\ndsply %char(t());\n*inlr = *on;\ndcl-proc t;\n  dcl-pi *n int(10) end-pi;\n  dcl-s bad ind inz(*on);\n  return 1;\n  on-exit bad;\n    if not bad;\n      dsply 'clean';\n    endif;\nend-proc;\n", vec!["clean", "1"]),
@@ -2763,8 +2573,6 @@ async fn native_rpg_engine_runs_a_program() {
         Some(rpg::ClContext {
             env: Environment {
                 database_url: url.clone(),
-                runner: "false".into(),
-                call_timeout: std::time::Duration::from_secs(5),
             },
             curlib: None,
             user_libl: vec![lib.clone()],

@@ -1,25 +1,21 @@
 //! Running CL commands for a job. Shared by the 5250 command line and,
 //! later, batch jobs and CL programs.
 
-use anyhow::{anyhow, bail, Context, Result};
-use std::time::Duration;
+use anyhow::{anyhow, bail, Result};
 use tokio_postgres::Client;
 
 use crate::authority::{self, Aut};
-use crate::bridge;
 use crate::catalog;
 use crate::cl::{self, Command};
 use crate::dtaara;
 use crate::jobs;
+use crate::runtime;
 use crate::users;
 
 /// Settings that come from the server, not from the job.
 #[derive(Debug, Clone)]
 pub struct Environment {
     pub database_url: String,
-    /// Command that runs RPG programs (the Jariko runner).
-    pub runner: String,
-    pub call_timeout: Duration,
 }
 
 /// The parts of a job that commands read and change.
@@ -32,7 +28,7 @@ pub struct Job<'a> {
     /// User part of the library list.
     pub libl: Vec<String>,
     /// The job's display, for programs that use display files.
-    pub display: Option<bridge::DisplayHandle>,
+    pub display: Option<runtime::DisplayHandle>,
     /// The job's qualified name, for jobs the system knows about
     /// (interactive sessions, submitted jobs). None for `as4tainr call`.
     pub id: Option<jobs::JobId>,
@@ -570,7 +566,7 @@ impl Job<'_> {
         let lib = lib.to_ascii_uppercase();
         let name = name.to_ascii_uppercase();
         let m = self.source_member(cmd, &name).await?;
-        let mut c = bridge::connect_db(&self.env.database_url).await?;
+        let mut c = runtime::connect_db(&self.env.database_url).await?;
         let msg = match cmd.def.name {
             "CRTPF" => {
                 let pf = crate::dds::parse_pf(&name, &m.source)?;
@@ -611,15 +607,13 @@ impl Job<'_> {
         }
         // CL: includes are part of the program; then it is checked.
         let source = if attribute == "RPGLE" {
-            // The native engine checks the program now, as the compiler
-            // does: syntax, names, types, files (docs/rpg-engine.md).
-            if crate::rpg::native_enabled() {
-                let mut libl = self.library_list();
-                if !libl.contains(&lib) {
-                    libl.insert(0, lib.clone());
-                }
-                crate::rpg::compile(self.client, &libl, &name, &m.source).await?;
+            // The program is checked now, as the compiler does: syntax,
+            // names, types, files (docs/rpg-engine.md).
+            let mut libl = self.library_list();
+            if !libl.contains(&lib) {
+                libl.insert(0, lib.clone());
             }
+            crate::rpg::compile(self.client, &libl, &name, &m.source).await?;
             m.source.clone()
         } else {
             let src =
@@ -642,7 +636,7 @@ impl Job<'_> {
             }
             authority::check(self.client, &self.user, &p.library, &name, "*PGM", Aut::All).await?;
         }
-        let mut c = bridge::connect_db(&self.env.database_url).await?;
+        let mut c = runtime::connect_db(&self.env.database_url).await?;
         catalog::create_program(&mut c, &lib, &name, attribute, &text, &source, replace).await?;
         authority::set_owner(self.client, &lib, &name, "*PGM", &self.user).await?;
         Ok(Outcome::Messages(vec![format!(
@@ -1526,9 +1520,8 @@ impl Job<'_> {
         )]))
     }
 
-    /// CALL: run an RPG program on the runner, with file I/O through a
-    /// bridge that uses this job's library list. DSPLY lines come back as
-    /// messages.
+    /// CALL: run a program with the job's library list. DSPLY lines come
+    /// back as messages.
     async fn call(&mut self, cmd: &Command) -> Result<Outcome> {
         let pgm = cmd.get("PGM").to_string();
         self.call_program(&pgm, cmd.list("PARM")).await
@@ -1552,8 +1545,8 @@ impl Job<'_> {
         Box::pin(self.call_program(pgm, args))
     }
 
-    /// CALL: a CL program found through the library list runs here;
-    /// anything else goes to the RPG runner.
+    /// CALL: a CL program found through the library list runs here; an
+    /// RPG program runs on the RPG engine.
     pub async fn call_program(&mut self, pgm: &str, args: Vec<String>) -> Result<Outcome> {
         let pgm = pgm.to_ascii_uppercase();
         let (libs, name) = match pgm.split_once('/') {
@@ -1585,96 +1578,15 @@ impl Job<'_> {
                     _ => self.call_rpg(&name, Some(&p.library), args).await,
                 }
             }
-            // Not a program object: the runner looks for the source in
-            // AS4TAINR_PGM_PATH (the samples).
+            // Not a program object: the source in AS4TAINR_PGM_PATH (the
+            // samples).
             None => self.call_rpg(&name, None, args).await,
         }
     }
 
-    /// Run an RPG program on the runner. `library`: where the program
-    /// object is (the runner gets its source from the bridge); None: the
-    /// runner looks for PGM.rpgle in AS4TAINR_PGM_PATH.
+    /// Run an RPG program (docs/rpg-engine.md). `library`: where the
+    /// program object is; None: PGM.rpgle in AS4TAINR_PGM_PATH.
     async fn call_rpg(
-        &mut self,
-        pgm: &str,
-        library: Option<&str>,
-        args: Vec<String>,
-    ) -> Result<Outcome> {
-        let pgm = pgm.to_string();
-        if crate::rpg::native_enabled() {
-            return self.call_native(&pgm, library, args).await;
-        }
-        let listener = bridge::bind(0).await?;
-        let addr = listener.local_addr()?;
-        let server = tokio::spawn(bridge::serve(
-            listener,
-            bridge::BridgeConfig {
-                database_url: self.env.database_url.clone(),
-                library_list: self.library_list(),
-                display: self.display.clone(),
-                job: self.id.as_ref().map(|i| i.to_string()),
-                record_wait: None,
-            },
-        ));
-        let mut parts = self.env.runner.split_whitespace();
-        let exe = parts
-            .next()
-            .ok_or_else(|| anyhow!("no runner configured (AS4TAINR_RUNNER)"))?;
-        let child = tokio::process::Command::new(exe)
-            .args(parts)
-            .arg("--bridge")
-            .arg(addr.to_string())
-            .arg(&pgm)
-            .args(&args)
-            .env("AS4TAINR_LIBL", self.library_list().join(","))
-            .env("AS4TAINR_PGM_LIB", library.unwrap_or(""))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("starting runner '{}'", self.env.runner))?;
-        // A batch call has a time limit; an interactive one waits for the
-        // operator as long as it takes.
-        let out = if self.display.is_some() {
-            Ok(child.wait_with_output().await)
-        } else {
-            tokio::time::timeout(self.env.call_timeout, child.wait_with_output()).await
-        };
-        server.abort();
-        let out = match out {
-            Ok(r) => r?,
-            Err(_) => bail!(
-                "Program {pgm} did not end within {}s and was cancelled.",
-                self.env.call_timeout.as_secs()
-            ),
-        };
-        let mut msgs: Vec<String> = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter(|l| !l.starts_with("Picked up JAVA_TOOL_OPTIONS"))
-            .map(|l| format!("DSPLY  {}", l.trim_end()))
-            .collect();
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let reason = stderr
-                .lines()
-                .rev()
-                .find(|l| l.contains("RNQ") || l.contains("CPF") || l.contains("not found"))
-                .or_else(|| stderr.lines().rev().find(|l| !l.trim().is_empty()))
-                .unwrap_or("no details")
-                .trim()
-                .to_string();
-            msgs.push(reason);
-            msgs.push(format!("Program {pgm} ended abnormally."));
-            return Err(anyhow!(msgs.join("\n")));
-        }
-        Ok(Outcome::Messages(msgs))
-    }
-}
-
-impl Job<'_> {
-    /// Run an RPG program on the native engine (docs/rpg-engine.md).
-    async fn call_native(
         &mut self,
         pgm: &str,
         library: Option<&str>,
@@ -1715,7 +1627,6 @@ impl Job<'_> {
         Ok(Outcome::Messages(msgs))
     }
 }
-
 /// A whole number in a command parameter.
 fn number(s: &str, keyword: &str) -> Result<u32> {
     s.trim().parse().map_err(|_| {

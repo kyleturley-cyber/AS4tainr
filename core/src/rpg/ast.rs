@@ -18,6 +18,14 @@ pub enum Expr {
         parts: Vec<String>,
         args: Option<Vec<Expr>>,
     },
+    /// A qualified name with an index before its last part:
+    /// `list.users(i).name`. `idx[k]` is the index of `parts[k]`; `args`
+    /// that of the last part.
+    Path {
+        parts: Vec<String>,
+        idx: Vec<Option<Box<Expr>>>,
+        args: Option<Vec<Expr>>,
+    },
     /// *INxx, *INLR, *INKC...: one indicator.
     Ind(String),
     /// *IN(n), *IN: the indicator array.

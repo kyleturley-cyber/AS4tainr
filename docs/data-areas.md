@@ -39,13 +39,17 @@ The usual fixed-form pattern:
 
 Under the covers, the lock is a PostgreSQL advisory lock on the program's database session. It is released when the session ends, which is how IBM i releases locks at the end of a job.
 
+## The local data area
+
+Each job has a local data area, `*LDA`: 1024 characters, blanks when an interactive job starts; SBMJOB gives the new job a copy of the submitting job's. `CHGDTAARA DTAARA(*LDA (1 10)) VALUE(...)`, `RTVDTAARA DTAARA(*LDA (1 10)) RTNVAR(&X)` and `DSPDTAARA *LDA` work on it, and RPG programs read and write it with a data area data structure (U in position 23 without a name, or `DTAARA(*LDA)`) or `IN`/`OUT`. It is kept as bytes (`as4tainr.local_data_areas`, by job number), so packed and binary subfields keep their exact contents.
+
 ## Storage
 
 Each data area is an object row (`*DTAARA`) plus a row in `as4tainr.data_areas` (type, length, decimals, value). `*DEC` values are stored as exact decimal text, never as floating point.
 
 ## Not yet
 
-- The local data area `*LDA`, the group data area `*GDA` and `*PDA`.
+- The group data area `*GDA` and the program initialization parameter data area `*PDA`: as4tainr has no group jobs or prestart jobs.
 - `UNLOCK *DTAARA`. (`DEFINE` and the `DTAARA` keyword on definitions both work.)
 - `RTVDTAARA` into a `*CHAR` variable from a `*DEC` data area. IBM i allows it in some cases; as4tainr refuses it with a clear message.
 - How long `CHGDTAARA` waits for a lock: it waits until the lock is released, with no time limit.

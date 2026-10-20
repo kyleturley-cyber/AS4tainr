@@ -23,6 +23,8 @@ use tokio_postgres::Client;
 mod bifs;
 #[path = "cycle.rs"]
 mod cycle;
+#[path = "errors.rs"]
+mod errors;
 #[path = "exec_sql.rs"]
 mod exec_sql;
 #[path = "ops.rs"]
@@ -153,6 +155,15 @@ struct Status {
     eof: bool,
     equal: bool,
     error: bool,
+    /// The status code (ILE RPG Reference, "File Status Codes",
+    /// "Program Status Codes"): 0 normal, 11 end of file, 12 not found,
+    /// an error's code.
+    code: u32,
+    /// The message identifier of the error (INFDS 46-52).
+    msgid: String,
+    /// The last operation (INFDS *OPCODE) and record (INFDS *RECORD).
+    opcode: String,
+    record: String,
 }
 
 struct FileState {
@@ -162,6 +173,12 @@ struct FileState {
     /// A display file is open.
     ws_open: bool,
     status: Status,
+    /// I/O feedback: writes, reads and other operations.
+    writes: i64,
+    reads: i64,
+    others: i64,
+    /// A display file: the key that ended the last input.
+    aid: Option<String>,
 }
 
 /// How a program handles null values in externally described database
@@ -257,6 +274,26 @@ pub struct Machine<'a> {
     /// Called again while still active (it ended without LR): no
     /// initialization (*INZSR, first-cycle output) this time.
     reactivated: bool,
+    /// The routine running (*INIT, *DETC, *DETL, *GETIN, *TOTC, *TOTL,
+    /// *OFL, *TERM, a subroutine or a procedure) and the statement, for
+    /// the status data structures.
+    routine: String,
+    line: usize,
+    /// Error subroutines running for errors in themselves.
+    in_handler: u32,
+    /// The file of the last file error.
+    err_file: Option<usize>,
+    /// Printer files whose overflow lines were printed since their
+    /// overflow indicator last came on (ILE RPG Reference, "Overflow
+    /// Routine": not printed again until overflow occurs again).
+    ofl_written: std::collections::HashSet<String>,
+    /// Overflow indicators set on during detail calculations or output:
+    /// the cycle does not set them off at the start of the next cycle.
+    of_late: std::collections::HashSet<String>,
+    /// The cycle is in detail calculations or detail output.
+    in_detail: bool,
+    /// Overflow indicators of the printer files: (indicator, file).
+    ofl_inds: Vec<(String, String)>,
 }
 
 /// One procedure call: its local storage starts at `base` in the
@@ -339,6 +376,10 @@ impl<'a> Machine<'a> {
                     image: None,
                     ws_open: false,
                     status: Status::default(),
+                    writes: 0,
+                    reads: 0,
+                    others: 0,
+                    aid: None,
                 })
                 .collect(),
             last: Status::default(),
@@ -368,6 +409,24 @@ impl<'a> Machine<'a> {
             io_ds: None,
             io_fields: None,
             reactivated: false,
+            routine: "*INIT".into(),
+            line: 0,
+            in_handler: 0,
+            err_file: None,
+            ofl_written: Default::default(),
+            of_late: Default::default(),
+            in_detail: false,
+            ofl_inds: prog
+                .files
+                .iter()
+                .filter(|f| f.decl.device == "PRINTER")
+                .filter_map(|f| {
+                    let k = keyword(&f.decl.keywords, "OFLIND")?;
+                    let a = k.args.first()?.trim().to_ascii_uppercase();
+                    let a = a.strip_prefix("*IN").map(str::to_string).unwrap_or(a);
+                    Some((ind_name(&a), f.decl.name.clone()))
+                })
+                .collect(),
         }
     }
 
@@ -523,7 +582,20 @@ impl<'a> Machine<'a> {
     }
 
     pub fn set_ind(&mut self, n: &str, v: bool) {
-        self.inds.insert(ind_name(n), v);
+        let n = ind_name(n);
+        // An overflow indicator coming on: overflow occurred again, the
+        // file's overflow lines are due.
+        if v && !self.ofl_inds.is_empty() && self.inds.get(&n) != Some(&true) {
+            for (ind, file) in &self.ofl_inds {
+                if *ind == n {
+                    self.ofl_written.remove(file);
+                    if self.in_detail {
+                        self.of_late.insert(n.clone());
+                    }
+                }
+            }
+        }
+        self.inds.insert(n, v);
     }
 
     // ---- storage ------------------------------------------------------
@@ -753,8 +825,7 @@ impl<'a> Machine<'a> {
             Some(Expr::Name { parts, .. }) => {
                 let n = parts.join(".");
                 let i = self
-                    .prog
-                    .file_index(&n)
+                    .file_idx(&n)
                     .ok_or_else(|| anyhow!("{n} is not a file"))?;
                 Ok(self.files[i].status.clone())
             }
@@ -1239,6 +1310,13 @@ impl<'a> Machine<'a> {
     // ---- files ----------------------------------------------------------
 
     fn open_file(&mut self, i: usize) -> Result<()> {
+        self.open_file_inner(i)?;
+        self.infds_open(i);
+        self.infds_update(i);
+        Ok(())
+    }
+
+    fn open_file_inner(&mut self, i: usize) -> Result<()> {
         let fi = &self.prog.files[i];
         if let Some(d) = &fi.display {
             self.block(crate::authority::check(
@@ -1428,7 +1506,7 @@ impl<'a> Machine<'a> {
         Ok(out)
     }
 
-    fn file_op(
+    fn file_op_inner(
         &mut self,
         op: FileOp,
         file: &str,
@@ -1437,8 +1515,7 @@ impl<'a> Machine<'a> {
         ind: &ResultInd,
     ) -> Result<()> {
         let i = self
-            .prog
-            .file_index(file)
+            .file_idx(file)
             .ok_or_else(|| anyhow!("{file} is not a file of this program"))?;
         let device = self.prog.files[i].decl.device.clone();
         if device == "WORKSTN" {
@@ -1518,15 +1595,10 @@ impl<'a> Machine<'a> {
         let result = match result {
             Ok(r) => r,
             Err(err) if ext.error || ind.lo.is_some() => {
-                self.last = Status {
-                    error: true,
-                    ..Status::default()
-                };
-                self.files[i].status.error = true;
+                self.file_failed(i, &err);
                 if let Some(lo) = &ind.lo {
                     self.set_ind(lo, true);
                 }
-                let _ = err;
                 return Ok(());
             }
             Err(err) => return Err(err),
@@ -1539,6 +1611,7 @@ impl<'a> Machine<'a> {
                     equal: op == FileOp::SetLL && r.found,
                     eof: false,
                     error: false,
+                    ..Status::default()
                 };
                 self.files[i].status = st.clone();
                 self.last = st;
@@ -1560,11 +1633,7 @@ impl<'a> Machine<'a> {
                         // operation: the E extender or the error
                         // indicator takes it.
                         if ext.error || ind.lo.is_some() {
-                            self.last = Status {
-                                error: true,
-                                ..Status::default()
-                            };
-                            self.files[i].status.error = true;
+                            self.file_failed(i, &e);
                             if let Some(lo) = &ind.lo {
                                 self.set_ind(lo, true);
                             }
@@ -1579,6 +1648,7 @@ impl<'a> Machine<'a> {
                         eof: false,
                         equal: false,
                         error: false,
+                        ..Status::default()
                     }
                 } else {
                     Status {
@@ -1586,6 +1656,7 @@ impl<'a> Machine<'a> {
                         eof: r.eof,
                         equal: false,
                         error: false,
+                        ..Status::default()
                     }
                 };
                 self.files[i].status = st.clone();
@@ -1658,14 +1729,10 @@ impl<'a> Machine<'a> {
                         };
                     }
                     Err(err) if ext.error || ind.lo.is_some() => {
-                        self.last = Status {
-                            error: true,
-                            ..Status::default()
-                        };
+                        self.file_failed(i, &err);
                         if let Some(lo) = &ind.lo {
                             self.set_ind(lo, true);
                         }
-                        let _ = err;
                     }
                     Err(err) => return Err(err),
                 }
@@ -1696,6 +1763,15 @@ impl<'a> Machine<'a> {
             .get(field)
             .cloned()
             .ok_or_else(|| anyhow!("{field} is not defined as a data area (DEFINE *DTAARA)"))?;
+        if name == "*LDA" {
+            return self.local_data_area(input, field);
+        }
+        if name == "*GDA" || name == "*PDA" {
+            // A group data area exists only in a group job, a program
+            // initialization parameter data area only in a prestart job
+            // (status 00402 for *PDA).
+            bail!("RNX0402: Data area {name} is not available: this job is not a group or prestart job.");
+        }
         let libl = self.io.libl.clone();
         let cur = crate::commands::DEFAULT_CURRENT_LIBRARY;
         let client = self.io.client;
@@ -1746,6 +1822,51 @@ impl<'a> Machine<'a> {
             };
             self.block(crate::dtaara::write(client, &d, &text, held))?;
             self.dtaara_locks.retain(|k| *k != key);
+        }
+        Ok(())
+    }
+
+    /// Data areas this program holds locked go free (it ended in error).
+    fn release_dtaaras(&mut self) {
+        for (lib, name) in std::mem::take(&mut self.dtaara_locks) {
+            let libl = vec![lib.clone()];
+            let client = self.io.client;
+            if let Ok(d) = self.block(crate::dtaara::resolve(client, &name, &libl, &lib)) {
+                let _ = self.block(crate::dtaara::unlock(client, &d));
+            }
+        }
+    }
+
+    /// IN and OUT of the local data area: its bytes into the field or data
+    /// structure (as long as it is), or the field's bytes over the start
+    /// of the local data area.
+    fn local_data_area(&mut self, input: bool, field: &str) -> Result<()> {
+        let l = self.loc_of(&Expr::name(field))?;
+        let job = self.io.job.as_ref().map(|j| j.number);
+        let client = self.io.client;
+        let mut lda = self.block(crate::dtaara::lda_read(client, job))?;
+        let n = l.size.min(lda.len());
+        if input {
+            self.bufs[l.buf][l.off..l.off + n].copy_from_slice(&lda[..n]);
+        } else {
+            lda[..n].copy_from_slice(&self.bufs[l.buf][l.off..l.off + n]);
+            self.block(crate::dtaara::lda_write(client, job, &lda))?;
+        }
+        Ok(())
+    }
+
+    /// Data area data structures (U in position 23, DTAARA(*AUTO)): read,
+    /// and locked when they are data area objects, as the program starts
+    /// (ILE RPG Reference, "Detailed RPG IV Object Program Cycle", step 3);
+    /// written and unlocked when it ends with LR (steps 35-36).
+    pub(super) fn auto_dtaaras(&mut self, start: bool) -> Result<()> {
+        let prog = self.prog;
+        for (ds, name) in &prog.auto_dtaaras {
+            if name == "*LDA" {
+                self.local_data_area(start, ds)?;
+            } else {
+                self.data_area(start, start, ds)?;
+            }
         }
         Ok(())
     }
@@ -1917,6 +2038,7 @@ impl<'a> Machine<'a> {
                         .map_err(|e| anyhow!(e))
                 })?;
                 self.ws.apply(&file, &format, &resp);
+                self.files[i].aid = Some(resp.aid.clone());
                 self.ws_fill(d, &format, &resp.values)?;
                 for (n, v) in &resp.indicators {
                     self.ws_set_ind(d, *n, *v);
@@ -2380,6 +2502,12 @@ impl<'a> Machine<'a> {
                 )?;
             }
             "DEFINE" | "COMMIT" | "ROLBK" | "FORCE" | "DUMP" | "DEALLOC" => {}
+            // CALLP(E): the call, its errors taken by the extender.
+            "CALLP" => {
+                if let Some(x) = f2 {
+                    self.stmt(&Stmt::CallP(x.clone()))?;
+                }
+            }
             "SND-MSG" => {
                 // *INFO (and the other informational types) to the job
                 // log; *ESCAPE ends the procedure with the message, which
@@ -2445,7 +2573,13 @@ impl<'a> Machine<'a> {
     }
 
     fn run_code(&mut self, code: &Code) -> Result<Flow> {
-        let mut pc = 0usize;
+        self.run_code_at(code, 0)
+    }
+
+    /// Run code from an instruction on (after a GOTO from an error
+    /// subroutine).
+    fn run_code_at(&mut self, code: &Code, start: usize) -> Result<Flow> {
+        let mut pc = start;
         // Active MONITOR groups: (handlers, end of body, end).
         let mut monitors: Vec<MonitorGroup> = Vec::new();
         while pc < code.len() {
@@ -2454,10 +2588,11 @@ impl<'a> Machine<'a> {
                 pc += 1;
                 continue;
             }
+            self.line = i.line;
             let step: Result<Option<usize>> = (|| -> Result<Option<usize>> {
                 Ok(match &i.ins {
                     Ins::Stmt(s) => {
-                        self.stmt(s)?;
+                        self.stmt_e(s)?;
                         None
                     }
                     Ins::Jump(t) => Some(*t),
@@ -2535,7 +2670,11 @@ impl<'a> Machine<'a> {
                             .and_then(|f| f.proc.routines.subroutines.get(name))
                             .or_else(|| prog.routines.subroutines.get(name))
                             .ok_or_else(|| anyhow!("subroutine {name} is not defined"))?;
-                        match self.run_code(sub)? {
+                        let saved = std::mem::replace(&mut self.routine, name.clone());
+                        let r = self.run_code(sub);
+                        self.routine = saved;
+                        self.line = i.line;
+                        match r? {
                             Flow::Return(v) => return Err(ReturnSignal(v).into()),
                             _ => None,
                         }
@@ -2554,6 +2693,7 @@ impl<'a> Machine<'a> {
                         f2,
                         to,
                         ind,
+                        out,
                     } => {
                         let x = self.eval(f1)?;
                         let y = self.eval(f2)?;
@@ -2574,6 +2714,11 @@ impl<'a> Machine<'a> {
                             Some(BinOp::Ge) => o != Ordering::Less,
                             _ => false,
                         };
+                        if hit {
+                            if let Some(t) = out {
+                                return Err(GotoSignal(t.clone()).into());
+                            }
+                        }
                         if hit && *to != usize::MAX {
                             Some(*to)
                         } else {
@@ -2592,7 +2737,26 @@ impl<'a> Machine<'a> {
                         monitors.pop();
                         Some(*end)
                     }
-                    Ins::Nop => None,
+                    Ins::Nop | Ins::Label(_) => None,
+                    Ins::GotoOut(t) => return Err(GotoSignal(t.clone()).into()),
+                    Ins::EndSr(p) => {
+                        // The return point, then the field is blank again
+                        // (ILE RPG Reference, INFSR: "after the ENDSR
+                        // operation, factor 2 is reset to blanks").
+                        let point = a(&self.eval(p)?.chars()?).trim().to_ascii_uppercase();
+                        if matches!(p, Expr::Name { .. }) {
+                            self.assign(
+                                p,
+                                &Value::str(""),
+                                Fit::Truncate { half_adjust: false },
+                                false,
+                            )?;
+                        }
+                        if !point.is_empty() {
+                            return Err(ReturnPointSignal(point).into());
+                        }
+                        None
+                    }
                 })
             })();
             match step {
@@ -2605,23 +2769,35 @@ impl<'a> Machine<'a> {
                     if err.downcast_ref::<LeaveSrSignal>().is_some() {
                         return Ok(Flow::LeaveSr);
                     }
+                    // GOTO from a subroutine to a TAG here.
+                    if let Some(GotoSignal(t)) = err.downcast_ref::<GotoSignal>() {
+                        let to = code
+                            .iter()
+                            .position(|x| matches!(&x.ins, Ins::Label(l) if l == t));
+                        if let Some(to) = to {
+                            monitors.retain(|m| to < m.1);
+                            pc = to;
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                    if err.downcast_ref::<ReturnPointSignal>().is_some() {
+                        return Err(err);
+                    }
                     // An error inside a monitored body goes to the first
                     // ON-ERROR that lists its status (or *ALL / nothing).
                     let mut handled = None;
+                    let code = errors::status_code(&err);
+                    let id = errors::message_id(&err);
                     while let Some((handlers, end_body, _)) = monitors.last().cloned() {
                         if pc < end_body {
-                            let status = error_status(&err);
                             handled = handlers
                                 .iter()
                                 .find(|(codes, _)| {
                                     codes.is_empty()
                                         || codes.iter().any(|c| {
-                                            c.strip_prefix("MSG:")
-                                                .is_some_and(|id| err.to_string().starts_with(id))
-                                                || c == "*ALL"
-                                                || c == &status
-                                                || (c == "*PROGRAM" && status != "*FILE")
-                                                || (c == "*FILE" && status == "*FILE")
+                                            c.strip_prefix("MSG:").is_some_and(|m| m == id)
+                                                || errors::on_error_takes(c, code)
                                         })
                                 })
                                 .map(|h| h.1);
@@ -2631,9 +2807,10 @@ impl<'a> Machine<'a> {
                     }
                     match handled {
                         Some(h) => {
-                            self.last.error = true;
+                            self.note_error(&err);
                             pc = h;
                         }
+                        None if i.line == 0 => return Err(err),
                         None => return Err(err.context(format!("line {}", i.line))),
                     }
                 }
@@ -2707,14 +2884,18 @@ impl<'a> Machine<'a> {
                 self.set_ind("RT", false);
             }
             _ => {
+                // Global files without USROPN open with the program; a
+                // procedure's own files when it is called.
                 for i in 0..self.prog.files.len() {
-                    if keyword(&self.prog.files[i].decl.keywords, "USROPN").is_none() {
+                    let d = &self.prog.files[i].decl;
+                    if keyword(&d.keywords, "USROPN").is_none() && d.proc.is_none() {
                         self.open_file(i)?;
                     }
                 }
             }
         }
         self.parms_passed = parms.len();
+        self.psds_start();
         // Exported data: the bound modules' initial values, then this
         // module's view of it.
         if !self.reactivated {
@@ -2723,6 +2904,9 @@ impl<'a> Machine<'a> {
         self.share_seed();
         self.share_in();
         let prog = self.prog;
+        if !self.reactivated {
+            self.auto_dtaaras(true)?;
+        }
         let r = match &prog.main {
             // ctl-opt main: the main procedure, with no cycle.
             Some(m) => {
@@ -2762,6 +2946,15 @@ impl<'a> Machine<'a> {
                 r
             }
         };
+        // Data area data structures go back when the program ends with LR
+        // (a linear main procedure: when it returns).
+        let r = match r {
+            Ok(()) if prog.main.is_some() || self.ind("LR") => self.auto_dtaaras(false),
+            other => other,
+        };
+        if r.is_err() {
+            self.release_dtaaras();
+        }
         self.share_out();
         let closed = self.close_printers();
         for f in self.files.iter_mut() {
@@ -3446,7 +3639,11 @@ impl<'a> Machine<'a> {
             passed,
             omitted,
         });
+        let saved_routine = std::mem::replace(&mut self.routine, pi.name.clone());
+        let saved_line = self.line;
+        let opened = self.open_local_files(pi);
         let mut r = (|| -> Result<Option<Value>> {
+            opened?;
             for (n, v) in values {
                 self.assign(
                     &Expr::name(&n),
@@ -3455,7 +3652,7 @@ impl<'a> Machine<'a> {
                     false,
                 )?;
             }
-            Ok(match self.run_code(&pi.routines.detail)? {
+            Ok(match self.guarded(&pi.routines.detail)? {
                 Flow::Return(v) => v,
                 _ => None,
             })
@@ -3484,8 +3681,11 @@ impl<'a> Machine<'a> {
                 Err(e) => r = Err(e),
             }
         }
+        self.close_local_files(pi);
         self.frames.pop();
         self.bufs.truncate(base);
+        self.routine = saved_routine;
+        self.line = saved_line;
         let v = r?;
         Ok(match (pi.returns, v) {
             (Some(t), Some(v)) => {
@@ -3712,21 +3912,51 @@ impl Machine<'_> {
     /// printer whose overflow indicator was on has it set off afterwards.
     fn output(&mut self, kinds: &[char]) -> Result<()> {
         let prog = self.prog;
-        let mut used: Vec<String> = Vec::new();
         for r in &prog.outputs {
-            if kinds.contains(&r.kind) {
-                if !used.contains(&r.file) {
-                    used.push(r.file.clone());
-                }
-                if self.out_cond(&r.cond) {
-                    self.print_record(r)?;
-                }
+            // A line conditioned by the overflow indicator while it is
+            // on is an overflow line: the overflow routine prints it.
+            if kinds.contains(&r.kind) && !self.overflow_line(r) && self.out_cond(&r.cond) {
+                self.print_record(r)?;
             }
         }
-        if kinds.contains(&'D') {
-            for f in used {
-                if let Some(of) = self.overflow_ind(&f) {
-                    self.set_ind(&of, false);
+        Ok(())
+    }
+
+    /// A heading, detail or total line conditioned by its printer's
+    /// overflow indicator, which is on.
+    fn overflow_line(&self, r: &OutRec) -> bool {
+        if !matches!(r.kind, 'H' | 'D' | 'T') {
+            return false;
+        }
+        let Some(of) = self.overflow_ind(&r.file).map(|o| ind_name(&o)) else {
+            return false;
+        };
+        self.ind(&of)
+            && r.cond
+                .iter()
+                .any(|g| g.iter().any(|(neg, i)| !neg && ind_name(i) == of))
+    }
+
+    /// The overflow routine (ILE RPG Reference, "Overflow Routine"): for
+    /// each printer file (or the one given, for fetch overflow) whose
+    /// overflow indicator is on, the heading, detail and total lines
+    /// conditioned by it whose conditions are met; once each time
+    /// overflow occurs.
+    pub(super) fn overflow_routine(&mut self, only: Option<&str>) -> Result<()> {
+        let prog = self.prog;
+        let files: Vec<String> = self
+            .ofl_inds
+            .iter()
+            .filter(|(ind, f)| {
+                self.ind(ind) && !self.ofl_written.contains(f) && only.is_none_or(|o| o == f)
+            })
+            .map(|(_, f)| f.clone())
+            .collect();
+        for f in files {
+            self.ofl_written.insert(f.clone());
+            for r in &prog.outputs {
+                if r.file == f && self.overflow_line(r) && self.out_cond(&r.cond) {
+                    self.print_line(r)?;
                 }
             }
         }
@@ -3797,6 +4027,25 @@ impl Machine<'_> {
     /// `spool::PAGE_LENGTH` lines; printing on or spacing past
     /// `spool::OVERFLOW_LINE` sets the overflow indicator.
     fn print_record(&mut self, r: &OutRec) -> Result<()> {
+        // Fetch overflow (F in position 18): the overflow lines first,
+        // when overflow has occurred (not on a line conditioned by the
+        // overflow indicator itself).
+        if r.fetch_overflow {
+            let of = self.overflow_ind(&r.file).map(|o| ind_name(&o));
+            let on_of = of.as_ref().is_some_and(|of| {
+                r.cond
+                    .iter()
+                    .any(|g| g.iter().any(|(_, i)| ind_name(i) == *of))
+            });
+            if !on_of {
+                let file = r.file.clone();
+                self.overflow_routine(Some(&file))?;
+            }
+        }
+        self.print_line(r)
+    }
+
+    fn print_line(&mut self, r: &OutRec) -> Result<()> {
         use crate::spool::{OVERFLOW_LINE as DEFAULT_OFL, PAGE_LENGTH as DEFAULT_LEN};
         let i = self
             .prog
@@ -3992,6 +4241,31 @@ impl std::fmt::Display for ReturnSignal {
 
 impl std::error::Error for ReturnSignal {}
 
+/// A GOTO to a TAG outside the subroutine running.
+#[derive(Debug)]
+pub(super) struct GotoSignal(pub String);
+
+impl std::fmt::Display for GotoSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GOTO {}: TAG not found", self.0)
+    }
+}
+
+impl std::error::Error for GotoSignal {}
+
+/// ENDSR with a return point (*DETL, *GETIN, *TOTC, *TOTL, *OFL, *DETC,
+/// *CANCL): where the cycle goes on.
+#[derive(Debug)]
+pub(super) struct ReturnPointSignal(pub String);
+
+impl std::fmt::Display for ReturnPointSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ENDSR return point {}", self.0)
+    }
+}
+
+impl std::error::Error for ReturnPointSignal {}
+
 #[derive(Debug)]
 struct LeaveSrSignal;
 
@@ -4002,29 +4276,6 @@ impl std::fmt::Display for LeaveSrSignal {
 }
 
 impl std::error::Error for LeaveSrSignal {}
-
-/// The status code an error stands for (ON-ERROR): 01211 file not open,
-/// 00100 string, 00102 divide by zero, 00103 too small, 00121 array
-/// index, 00907 decimal data; *FILE for file errors.
-fn error_status(err: &anyhow::Error) -> String {
-    let t = err.to_string();
-    let code = |s: &str| s.to_string();
-    if t.starts_with("MCH1211") {
-        code("00102")
-    } else if t.starts_with("RNQ0103") {
-        code("00103")
-    } else if t.starts_with("RNQ0100") {
-        code("00100")
-    } else if t.starts_with("RNQ0121") {
-        code("00121")
-    } else if t.starts_with("RNQ0907") {
-        code("00907")
-    } else if t.starts_with("CPF") {
-        code("*FILE")
-    } else {
-        code("*PROGRAM")
-    }
-}
 
 /// Edit codes 1-4, A-D, J-Q, X, Y, Z (ILE RPG Reference, "Edit Codes"):
 /// commas, a decimal point, zero suppression, sign display.

@@ -130,6 +130,12 @@ enum Dir {
 }
 
 impl OpenFile {
+    /// The relative record number of the record last read, positioned
+    /// on or written (the file information data structure shows it).
+    pub fn current_rrn(&self) -> Option<i64> {
+        self.current_rrn
+    }
+
     pub fn new(file: FileRef) -> Self {
         OpenFile {
             file,

@@ -66,7 +66,10 @@ pub struct FileInfo {
     /// Where each field of the database record is in the record image
     /// (type in the record, offset), and the record length.
     pub layout: Vec<(DType, usize)>,
+    /// The record length (database files: the fields in their stored
+    /// form), and the length of the key.
     pub record_len: usize,
+    pub key_len: usize,
     /// The input specifications for this file's records.
     pub inputs: Vec<InputRec>,
 }
@@ -240,6 +243,12 @@ pub struct Program {
     pub data_exports: Vec<(String, String)>,
     /// Imported data (IMPORT): (symbol, program name).
     pub data_imports: Vec<(String, String)>,
+    /// The program status data structure (PSDS, S in position 23).
+    pub psds: Option<String>,
+    /// Data area data structures read when the program starts and
+    /// written when it ends with LR (U in position 23, DTAARA(*AUTO)):
+    /// (data structure, data area: a name or *LDA).
+    pub auto_dtaaras: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -335,17 +344,60 @@ fn data_areas(src: &Source) -> HashMap<String, String> {
         }
     }
     for d in &src.defs {
-        if let Some(k) = keyword(&d.keywords, "DTAARA") {
-            let name = k
-                .args
-                .iter()
-                .map(|a| a.trim().trim_matches('\'').to_ascii_uppercase())
-                .find(|a| !a.starts_with('*'))
-                .unwrap_or_else(|| d.name.clone());
-            out.insert(d.name.clone(), name);
+        if keyword(&d.keywords, "DTAARA").is_some() || keyword(&d.keywords, "UDS").is_some() {
+            out.insert(ds_key(d), dtaara_name(d));
         }
     }
     out
+}
+
+/// The name a data structure is known by (an unnamed one: *DSn, its
+/// place among the definitions).
+fn ds_key(d: &Def) -> String {
+    if d.name.is_empty() || d.name == "*N" {
+        format!("*DS{}", d.line)
+    } else {
+        d.name.clone()
+    }
+}
+
+/// The data area a definition names (ILE RPG Reference, DTAARA keyword
+/// and data area data structures): the DTAARA name (*LDA, *GDA, *PDA or a
+/// data area), else the definition's own name; an unnamed data area data
+/// structure is the local data area.
+fn dtaara_name(d: &Def) -> String {
+    keyword(&d.keywords, "DTAARA")
+        .and_then(|k| {
+            k.args
+                .iter()
+                .map(|a| a.trim().trim_matches('\'').to_ascii_uppercase())
+                .find(|a| !matches!(a.as_str(), "*AUTO" | "*USRCTL" | "*VAR" | ""))
+        })
+        .unwrap_or_else(|| {
+            if d.name.is_empty() || d.name == "*N" {
+                "*LDA".into()
+            } else {
+                d.name.clone()
+            }
+        })
+}
+
+/// Data area data structures the program reads at start and writes at
+/// its end: U in position 23, or DTAARA(*AUTO).
+fn auto_dtaaras(src: &Source) -> Vec<(String, String)> {
+    src.defs
+        .iter()
+        .filter(|d| d.kind == DefKind::Ds)
+        .filter(|d| {
+            keyword(&d.keywords, "UDS").is_some()
+                || keyword(&d.keywords, "DTAARA").is_some_and(|k| {
+                    k.args
+                        .iter()
+                        .any(|a| a.trim().eq_ignore_ascii_case("*AUTO"))
+                })
+        })
+        .map(|d| (ds_key(d), dtaara_name(d)))
+        .collect()
 }
 
 impl Program {
@@ -549,6 +601,8 @@ struct Binder<'a> {
     /// Record formats of the program's files (for LIKEREC): the fields
     /// (program names, types) and the key fields.
     formats: HashMap<String, RecordFormat>,
+    /// File information data structures (INFDS on a file).
+    infds: Vec<String>,
 }
 
 /// A multiple-occurrence data structure (OCCURS keyword): its storage
@@ -1038,8 +1092,32 @@ impl Binder<'_> {
             }
             next = o.size;
         }
+        let psds = keyword(&d.keywords, "PSDS").is_some();
+        let infds = self.infds.contains(&name);
         while j < defs.len() && defs[j].kind == DefKind::Subfield {
             let s = &defs[j];
+            // *STATUS, *ROUTINE...: a subfield at its place in the program
+            // status or file information data structure.
+            if let Some(k) = s.keywords.iter().find(|k| k.name.starts_with('*')) {
+                let (off, t) = special_subfield(&k.name, psds, infds).ok_or_else(|| {
+                    anyhow!(
+                        "subfield {}: {} is not a keyword of a {} data structure",
+                        s.name,
+                        k.name,
+                        if psds {
+                            "program status"
+                        } else if infds {
+                            "file information"
+                        } else {
+                            "plain"
+                        }
+                    )
+                })?;
+                next = next.max(off + t.size());
+                subs.push((s.name.clone(), t, off, 0, s));
+                j += 1;
+                continue;
+            }
             let mut t = self.resolve_type(s)?;
             if t.is_none() {
                 if let Some(k) = keyword(&s.keywords, "LIKEDS") {
@@ -1235,11 +1313,7 @@ impl Binder<'_> {
                 }),
             );
         }
-        let ds_name = if name.is_empty() {
-            format!("*DS{i}")
-        } else {
-            name.clone()
-        };
+        let ds_name = ds_key(d);
         if occurs > 0 {
             self.occurs.push(Occurs {
                 name: ds_name.clone(),
@@ -1264,6 +1338,32 @@ impl Binder<'_> {
     }
 }
 
+/// Where a special subfield is (offset) and its type: the program status
+/// data structure's *PROC (1-10), *STATUS (11-15), *ROUTINE (29-36) and
+/// *PARMS (37-39); the file information data structure's *FILE (1-8),
+/// *STATUS (11-15), *OPCODE (16-21), *ROUTINE (22-29), *RECORD (38-45),
+/// *SIZE (67-70), *INP (71-72), *OUT (73-74) and *MODE (75-76) (ILE RPG
+/// Reference, "Program Status Data Structure" and "File Feedback
+/// Information").
+fn special_subfield(k: &str, psds: bool, infds: bool) -> Option<(usize, DType)> {
+    Some(match (k, psds, infds) {
+        ("*PROC", true, _) => (0, DType::Char(10)),
+        ("*STATUS", true, _) => (10, DType::Zoned(5, 0)),
+        ("*ROUTINE", true, _) => (28, DType::Char(8)),
+        ("*PARMS", true, _) => (36, DType::Zoned(3, 0)),
+        ("*FILE", _, true) => (0, DType::Char(8)),
+        ("*STATUS", _, true) => (10, DType::Zoned(5, 0)),
+        ("*OPCODE", _, true) => (15, DType::Char(6)),
+        ("*ROUTINE", _, true) => (21, DType::Char(8)),
+        ("*RECORD", _, true) => (37, DType::Char(8)),
+        ("*SIZE", _, true) => (66, DType::Zoned(4, 0)),
+        ("*INP", _, true) => (70, DType::Zoned(2, 0)),
+        ("*OUT", _, true) => (72, DType::Zoned(2, 0)),
+        ("*MODE", _, true) => (74, DType::Zoned(2, 0)),
+        _ => return None,
+    })
+}
+
 /// Bind a parsed source. `externals`: descriptions of the external files
 /// (by file name), from the catalog.
 pub fn bind(
@@ -1286,6 +1386,13 @@ pub fn bind(
         statics: vec![],
         occurs: vec![],
         formats: HashMap::new(),
+        infds: src
+            .files
+            .iter()
+            .filter_map(|f| keyword(&f.keywords, "INFDS"))
+            .filter_map(|k| k.args.first())
+            .map(|a| a.trim().to_ascii_uppercase())
+            .collect(),
     };
     // Files and their record fields.
     let mut files = Vec::new();
@@ -1299,6 +1406,7 @@ pub fn bind(
             program_described: false,
             layout: vec![],
             record_len: 0,
+            key_len: 0,
             inputs: vec![],
         };
         if f.device == "WORKSTN" && f.external {
@@ -1321,9 +1429,11 @@ pub fn bind(
                         Some(p) => format!("{p}{}", fd.name),
                         None => fd.name.to_ascii_uppercase(),
                     };
-                    b.file_fields
-                        .entry(pname.clone())
-                        .or_insert_with(|| display_type(fd));
+                    if f.proc.is_none() {
+                        b.file_fields
+                            .entry(pname.clone())
+                            .or_insert_with(|| display_type(fd));
+                    }
                     fields.push((pname, fd.name.clone()));
                 }
                 formats.push((r.name.to_ascii_uppercase(), fields));
@@ -1394,9 +1504,15 @@ pub fn bind(
                     .find(|x| x.external.as_deref() == Some(fd.name.as_str()))
                     .map(|x| x.name.clone())
                     .unwrap_or(pname);
-                b.file_fields.entry(pname.clone()).or_insert_with(|| {
-                    program_type(fd, false, b.extbinint).unwrap_or(DType::Char(1))
-                });
+                // A file declared in a procedure has no fields of its
+                // own in the program: its records are read into and
+                // written from data structures (ILE RPG Reference, "File
+                // Considerations", local files).
+                if f.proc.is_none() {
+                    b.file_fields.entry(pname.clone()).or_insert_with(|| {
+                        program_type(fd, false, b.extbinint).unwrap_or(DType::Char(1))
+                    });
+                }
                 info.fields.push(pname);
             }
             // The record format for LIKEREC.
@@ -1422,6 +1538,17 @@ pub fn bind(
                 })
                 .collect();
             b.formats.insert(info.format.clone(), (fmt_fields, keys));
+            let stored = |fd: &crate::dds::FieldDef| {
+                program_type(fd, true, false).map(|t| t.size()).unwrap_or(0)
+            };
+            info.record_len = fr.file.fields.iter().map(stored).sum();
+            info.key_len = fr
+                .file
+                .keys
+                .iter()
+                .filter_map(|k| fr.file.fields.iter().find(|fd| &fd.name == k))
+                .map(stored)
+                .sum();
             // The input specifications for the record format: record
             // identifying indicator, control levels, matching fields and
             // field indicators by program field.
@@ -1637,6 +1764,7 @@ pub fn bind(
             extbinint: b.extbinint,
             occurs: vec![],
             formats: b.formats.clone(),
+            infds: b.infds.clone(),
         };
         let pi = pb
             .defs(&pr.defs, &mut protos)
@@ -1832,6 +1960,12 @@ pub fn bind(
         outputs: src.outputs.clone(),
         control: src.control.clone(),
         dtaaras: data_areas(src),
+        psds: src
+            .defs
+            .iter()
+            .find(|d| d.kind == DefKind::Ds && keyword(&d.keywords, "PSDS").is_some())
+            .map(ds_key),
+        auto_dtaaras: auto_dtaaras(src),
         protos,
         procs,
         main,

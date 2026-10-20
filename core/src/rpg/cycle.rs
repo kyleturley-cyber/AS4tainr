@@ -14,6 +14,36 @@ type InputValues = (usize, Vec<(String, Value)>);
 /// A record's control field values by level, and its matching value.
 type ControlValues = (Vec<(u8, String)>, Option<String>);
 
+/// Where the cycle is (ILE RPG Reference, "Detailed RPG IV Object
+/// Program Cycle"); the ENDSR return points name these.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Phase {
+    /// *INIT: *INZSR and first-cycle output.
+    Init,
+    /// *GETIN: indicators off, the next record, control breaks.
+    GetIn,
+    /// *TOTC: total calculations (from an instruction on).
+    TotC(usize),
+    /// *TOTL: total output and overflow lines.
+    TotL,
+    /// *OFL: overflow lines, then the record's fields into the program.
+    Ofl,
+    /// *DETC: detail calculations (from an instruction on).
+    DetC(usize),
+    /// *DETL: heading and detail output.
+    Detl,
+}
+
+/// What one cycle carries to the next steps.
+pub(super) struct CycleState {
+    data_seen: bool,
+    first_record: bool,
+    chosen: Option<(usize, Record)>,
+    passes: u64,
+    /// The match value of the last record taken from each file.
+    last_match: Vec<Option<String>>,
+}
+
 /// A record read ahead by the cycle and not processed yet.
 pub(super) struct Ahead {
     pub record: Record,
@@ -274,16 +304,22 @@ impl Machine<'_> {
         Ok(())
     }
 
-    /// The RPG cycle (ILE RPG Reference, "Detailed RPG Program Cycle"):
-    /// first-cycle (1P) output; then each cycle: heading and detail
-    /// output, record identifying and control level indicators off, the
-    /// next record (primary first, then secondary files; with matching
+    /// The RPG cycle (ILE RPG Reference, "Detailed RPG IV Object Program
+    /// Cycle"): first-cycle (1P) output; then each cycle: record
+    /// identifying and control level indicators off, overflow indicators
+    /// off (unless detail calculations or output set them on), the next
+    /// record (primary first, then secondary files; with matching
     /// fields, the file whose record is lowest, MR on when records of
     /// several files match), control breaks (a change in a control field
     /// sets on its level and those below; the first record sets them on
-    /// without total time), total calculations and output, end at LR
-    /// (end of file: LR and L1-L9 on), fields moved into the program,
-    /// field indicators, detail calculations.
+    /// without total time), total calculations and output, the overflow
+    /// lines, end at LR (end of file: LR and L1-L9 on), fields moved into
+    /// the program, field indicators, detail calculations, heading and
+    /// detail output.
+    ///
+    /// An error the program does not handle goes to *PSSR (or the file's
+    /// INFSR); its ENDSR return point says where the cycle goes on: *GETIN,
+    /// *TOTC, *TOTL, *OFL, *DETC, *DETL, or *CANCL to end the program.
     pub(super) fn cycle(&mut self) -> Result<()> {
         let prog = self.prog;
         let cycle_files: Vec<usize> = prog
@@ -297,162 +333,325 @@ impl Machine<'_> {
             .iter()
             .copied()
             .find(|&i| prog.files[i].decl.designation == 'P');
-        // Initialization and first-cycle output: not when the program is
-        // called again while still active.
-        if !self.reactivated {
-            if let Some(inz) = prog.routines.subroutines.get("*INZSR") {
-                self.run_code(inz)?;
-            }
-            self.set_ind("1P", true);
-            self.output(&['H', 'D'])?;
-            self.set_ind("1P", false);
-        }
-        let mut data_seen = false;
-        let mut passes = 0u64;
         let uses_matching = cycle_files.iter().any(|&i| {
             prog.files[i]
                 .inputs
                 .iter()
                 .any(|r| r.fields.iter().any(|f| f.matching.is_some()))
         });
-        // The match value of the last record taken from each file.
-        let mut last_match: Vec<Option<String>> = vec![None; prog.files.len()];
+        let mut st = CycleState {
+            data_seen: false,
+            first_record: false,
+            chosen: None,
+            passes: 0,
+            last_match: vec![None; prog.files.len()],
+        };
+        // Initialization and first-cycle output: not when the program is
+        // called again while still active.
+        let mut phase = if self.reactivated {
+            Phase::GetIn
+        } else {
+            Phase::Init
+        };
         loop {
-            passes += 1;
-            // Record identifying and control level indicators go off.
-            for &i in &cycle_files {
-                for r in &prog.files[i].inputs {
-                    if let Some(ri) = &r.record_ind {
-                        self.set_ind(ri, false);
-                    }
-                }
+            let r = self.cycle_phase(phase, &mut st, &cycle_files, primary, uses_matching);
+            match r {
+                Ok(Some(next)) => phase = next,
+                Ok(None) => break,
+                Err(err) => match self.cycle_error(err)? {
+                    Some(next) => phase = next,
+                    None => break,
+                },
             }
-            for l in 1..=9 {
-                self.set_ind(&format!("L{l}"), false);
+        }
+        self.in_detail = false;
+        self.routine = "*TERM".into();
+        Ok(())
+    }
+
+    /// One step of the cycle; the next one (None: the cycle ends).
+    fn cycle_phase(
+        &mut self,
+        phase: Phase,
+        st: &mut CycleState,
+        cycle_files: &[usize],
+        primary: Option<usize>,
+        uses_matching: bool,
+    ) -> Result<Option<Phase>> {
+        let prog = self.prog;
+        Ok(Some(match phase {
+            Phase::Init => {
+                self.routine = "*INIT".into();
+                if let Some(inz) = prog.routines.subroutines.get("*INZSR") {
+                    self.routine = "*INZSR".into();
+                    self.run_code(inz)?;
+                }
+                self.routine = "*DETL".into();
+                self.set_ind("1P", true);
+                self.output(&['H', 'D'])?;
+                self.set_ind("1P", false);
+                Phase::GetIn
             }
-            self.set_ind("MR", false);
-            let mut chosen: Option<(usize, Record)> = None;
-            if !self.ind("LR") && primary.is_some() {
-                for &i in &cycle_files {
-                    self.cycle_read(i)?;
+            Phase::GetIn => {
+                st.passes += 1;
+                // A program that never sets LR runs until it is
+                // cancelled, as on IBM i; stop runaway loops at a large
+                // bound.
+                if st.passes > 10_000_000 {
+                    bail!("the program does not set on LR and keeps running");
                 }
-                // Which file's record comes next.
-                let mut best: Option<(usize, Option<String>)> = None;
-                for &i in &cycle_files {
-                    let Some(ah) = &self.ahead[i] else { continue };
-                    if !uses_matching {
-                        // No matching fields: the primary file to its
-                        // end, then each secondary file in turn.
-                        best = Some((i, None));
-                        break;
-                    }
-                    let (_, m) = self.control_and_match(i, &ah.record)?;
-                    let better = match (&best, &m) {
-                        (None, _) => true,
-                        (Some((_, None)), Some(_)) => false,
-                        (Some((_, Some(_))), None) => true,
-                        (Some((_, Some(b))), Some(x)) => x < b,
-                        (Some((_, None)), None) => false,
-                    };
-                    if better {
-                        best = Some((i, m));
+                self.routine = "*GETIN".into();
+                self.in_detail = false;
+                // Record identifying and control level indicators go
+                // off; overflow indicators too, unless detail
+                // calculations or output set them on.
+                for &i in cycle_files {
+                    for r in &prog.files[i].inputs {
+                        if let Some(ri) = &r.record_ind {
+                            self.set_ind(ri, false);
+                        }
                     }
                 }
-                match best {
-                    Some((i, m)) => {
-                        let rec = self.ahead[i].take().unwrap().record;
-                        // MR: the record matches a record of another file
-                        // (taken before it, or waiting).
-                        if let Some(mv) = &m {
-                            let mut matched = false;
-                            for &j in &cycle_files {
-                                if j == i {
-                                    continue;
-                                }
-                                if last_match[j].as_ref() == Some(mv) {
-                                    matched = true;
-                                }
-                                if let Some(ah) = &self.ahead[j] {
-                                    let (_, mj) = self.control_and_match(j, &ah.record)?;
-                                    if mj.as_ref() == Some(mv) {
-                                        matched = true;
-                                    }
-                                }
+                for l in 1..=9 {
+                    self.set_ind(&format!("L{l}"), false);
+                }
+                self.set_ind("MR", false);
+                let late = std::mem::take(&mut self.of_late);
+                let ofl: Vec<String> = self.ofl_inds.iter().map(|x| x.0.clone()).collect();
+                for of in ofl {
+                    if !late.contains(&of) {
+                        self.set_ind(&of, false);
+                    }
+                }
+                // RT: back to the caller (the program stays active).
+                if self.ind("RT") {
+                    return Ok(None);
+                }
+                st.chosen = None;
+                st.first_record = false;
+                if self.ind("LR") {
+                    for l in 1..=9 {
+                        self.set_ind(&format!("L{l}"), true);
+                    }
+                } else if primary.is_some() {
+                    self.next_record(st, cycle_files, uses_matching)?;
+                }
+                // Control breaks.
+                if let Some((i, rec)) = st.chosen.clone() {
+                    let (levels, _) = self.control_and_match(i, &rec)?;
+                    if !levels.is_empty() {
+                        let highest_changed = levels
+                            .iter()
+                            .filter(|(l, v)| self.control.get(l) != Some(v))
+                            .map(|(l, _)| *l)
+                            .max();
+                        if self.control.is_empty() {
+                            st.first_record = true;
+                            let top = levels.iter().map(|x| x.0).max().unwrap_or(0);
+                            for l in 1..=top {
+                                self.set_ind(&format!("L{l}"), true);
                             }
-                            self.set_ind("MR", matched);
+                        } else if let Some(h) = highest_changed {
+                            for l in 1..=h {
+                                self.set_ind(&format!("L{l}"), true);
+                            }
                         }
-                        last_match[i] = m;
-                        chosen = Some((i, rec));
-                    }
-                    None => {
-                        // Every file at its end: LR, and all control
-                        // levels for the last totals.
-                        self.set_ind("LR", true);
-                        for l in 1..=9 {
-                            self.set_ind(&format!("L{l}"), true);
+                        for (l, v) in levels {
+                            self.control.insert(l, v);
                         }
                     }
                 }
+                Phase::TotC(0)
             }
-            // Control breaks.
-            let mut first_record = false;
-            if let Some((i, rec)) = &chosen {
-                let (levels, _) = self.control_and_match(*i, rec)?;
-                if !levels.is_empty() {
-                    let highest_changed = levels
-                        .iter()
-                        .filter(|(l, v)| self.control.get(l) != Some(v))
-                        .map(|(l, _)| *l)
-                        .max();
-                    if self.control.is_empty() {
-                        first_record = true;
-                        let top = levels.iter().map(|x| x.0).max().unwrap_or(0);
-                        for l in 1..=top {
-                            self.set_ind(&format!("L{l}"), true);
-                        }
-                    } else if let Some(h) = highest_changed {
-                        for l in 1..=h {
-                            self.set_ind(&format!("L{l}"), true);
-                        }
+            Phase::TotC(start) => {
+                // Total time: not before the first record.
+                if st.data_seen && !st.first_record || self.ind("LR") {
+                    self.routine = "*TOTC".into();
+                    if let Flow::Return(_) = self.run_code_at(&prog.routines.total, start)? {
+                        return Ok(None);
                     }
-                    for (l, v) in levels {
-                        self.control.insert(l, v);
-                    }
+                    Phase::TotL
+                } else if self.ind("LR") {
+                    return Ok(None);
+                } else {
+                    Phase::Ofl
                 }
             }
-            // Total time: not before the first record.
-            if data_seen && !first_record || self.ind("LR") {
-                self.run_code(&prog.routines.total)?;
+            Phase::TotL => {
+                self.routine = "*TOTL".into();
                 self.output(&['T'])?;
+                // Overflow lines with the total output.
+                self.routine = "*OFL".into();
+                self.overflow_routine(None)?;
+                if self.ind("LR") {
+                    return Ok(None);
+                }
+                Phase::Ofl
             }
-            if self.ind("LR") {
+            Phase::Ofl => {
+                self.routine = "*OFL".into();
+                self.overflow_routine(None)?;
+                // The record's fields into the program, MR.
+                if let Some((i, rec)) = st.chosen.take() {
+                    self.move_input(i, &rec)?;
+                    st.data_seen = true;
+                }
+                Phase::DetC(0)
+            }
+            Phase::DetC(start) => {
+                self.routine = "*DETC".into();
+                self.in_detail = true;
+                if let Flow::Return(_) = self.run_code_at(&prog.routines.detail, start)? {
+                    return Ok(None);
+                }
+                Phase::Detl
+            }
+            Phase::Detl => {
+                self.routine = "*DETL".into();
+                self.in_detail = true;
+                self.output(&['H', 'D'])?;
+                self.in_detail = false;
+                // No primary file: totals from the second cycle on.
+                if primary.is_none() {
+                    st.data_seen = true;
+                }
+                Phase::GetIn
+            }
+        }))
+    }
+
+    /// The next record for the cycle (steps 14-28): the file whose
+    /// record comes next, MR, or LR when every file is at its end.
+    fn next_record(
+        &mut self,
+        st: &mut CycleState,
+        cycle_files: &[usize],
+        uses_matching: bool,
+    ) -> Result<()> {
+        for &i in cycle_files {
+            // The cycle's implicit READ: its status and the INFDS, as for
+            // an explicit one (position 21 of *OPCODE: I).
+            let r = self.cycle_read(i);
+            if let Err(e) = &r {
+                self.file_failed(i, e);
+            } else {
+                let st = &mut self.files[i].status;
+                st.error = false;
+                st.code = if self.cycle_eof[i] { 11 } else { 0 };
+                st.eof = self.cycle_eof[i];
+            }
+            self.files[i].reads += 1;
+            self.files[i].status.opcode = "READ I".into();
+            self.files[i].status.record = self.prog.files[i].format.clone();
+            self.infds_update(i);
+            r?;
+        }
+        // Which file's record comes next.
+        let mut best: Option<(usize, Option<String>)> = None;
+        for &i in cycle_files {
+            let Some(ah) = &self.ahead[i] else { continue };
+            if !uses_matching {
+                // No matching fields: the primary file to its end, then
+                // each secondary file in turn.
+                best = Some((i, None));
                 break;
             }
-            if let Some((i, rec)) = &chosen {
-                self.move_input(*i, rec)?;
-                data_seen = true;
+            let (_, m) = self.control_and_match(i, &ah.record)?;
+            let better = match (&best, &m) {
+                (None, _) => true,
+                (Some((_, None)), Some(_)) => false,
+                (Some((_, Some(_))), None) => true,
+                (Some((_, Some(b))), Some(x)) => x < b,
+                (Some((_, None)), None) => false,
+            };
+            if better {
+                best = Some((i, m));
             }
-            let flow = self.run_code(&prog.routines.detail)?;
-            if matches!(flow, Flow::Return(_)) {
-                break;
+        }
+        match best {
+            Some((i, m)) => {
+                let rec = self.ahead[i].take().unwrap().record;
+                // MR: the record matches a record of another file (taken
+                // before it, or waiting).
+                if let Some(mv) = &m {
+                    let mut matched = false;
+                    for &j in cycle_files {
+                        if j == i {
+                            continue;
+                        }
+                        if st.last_match[j].as_ref() == Some(mv) {
+                            matched = true;
+                        }
+                        if let Some(ah) = &self.ahead[j] {
+                            let (_, mj) = self.control_and_match(j, &ah.record)?;
+                            if mj.as_ref() == Some(mv) {
+                                matched = true;
+                            }
+                        }
+                    }
+                    self.set_ind("MR", matched);
+                }
+                st.last_match[i] = m;
+                st.chosen = Some((i, rec));
             }
-            self.output(&['H', 'D'])?;
-            if self.ind("RT") {
-                break;
-            }
-            // No primary file: the cycle starts over until LR is set. A
-            // program that never sets LR runs until it is cancelled, as
-            // on IBM i; stop runaway loops in tests at a large bound.
-            if passes > 10_000_000 {
-                bail!("the program does not set on LR and keeps running");
-            }
-            if primary.is_none() && !data_seen {
-                data_seen = true;
+            None => {
+                // Every file at its end: LR, and all control levels for
+                // the last totals.
+                self.set_ind("LR", true);
+                for l in 1..=9 {
+                    self.set_ind(&format!("L{l}"), true);
+                }
             }
         }
         Ok(())
     }
 
+    /// An error in the cycle: a return point from ENDSR, a GOTO, or an
+    /// error for the error subroutine. The phase to go on with (None: the
+    /// program returns), or the error for the default handler.
+    fn cycle_error(&mut self, err: anyhow::Error) -> Result<Option<Phase>> {
+        let to_label = |code: &Code, t: &str| {
+            code.iter()
+                .position(|x| matches!(&x.ins, Ins::Label(l) if l == t))
+        };
+        let prog = self.prog;
+        let goto = |t: &str| -> Result<Option<Phase>> {
+            if let Some(at) = to_label(&prog.routines.detail, t) {
+                return Ok(Some(Phase::DetC(at)));
+            }
+            if let Some(at) = to_label(&prog.routines.total, t) {
+                return Ok(Some(Phase::TotC(at)));
+            }
+            bail!("GOTO {t}: TAG not found")
+        };
+        let point = |p: &str| -> Result<Option<Phase>> {
+            Ok(Some(match p {
+                "*DETL" => Phase::Detl,
+                "*GETIN" => Phase::GetIn,
+                "*TOTC" => Phase::TotC(0),
+                "*TOTL" => Phase::TotL,
+                "*OFL" => Phase::Ofl,
+                "*DETC" => Phase::DetC(0),
+                // *CANCL: the program ends (abnormally).
+                "*CANCL" => bail!("The program was canceled by ENDSR *CANCL."),
+                other => bail!("ENDSR return point {other} is not valid"),
+            }))
+        };
+        if let Some(ReturnPointSignal(p)) = err.downcast_ref::<ReturnPointSignal>() {
+            return point(p);
+        }
+        if let Some(GotoSignal(t)) = err.downcast_ref::<GotoSignal>() {
+            return goto(t);
+        }
+        match self.recover(err) {
+            Ok(errors::Recovery::Goto(t)) => goto(&t),
+            Ok(errors::Recovery::Return(_)) => Ok(None),
+            Err(e) => match e.downcast_ref::<ReturnPointSignal>() {
+                Some(ReturnPointSignal(p)) => point(p),
+                None => Err(e),
+            },
+        }
+    }
     /// Output specifications for a database file (ILE RPG Reference,
     /// "Output Specifications"): ADD writes a new record, DEL deletes the
     /// record last read, otherwise the record last read is updated. An

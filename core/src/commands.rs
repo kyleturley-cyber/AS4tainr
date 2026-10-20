@@ -2587,6 +2587,11 @@ impl Job<'_> {
             }
             _ => bail!("DTAARA takes a data area name and, optionally, (start length)."),
         };
+        if name.eq_ignore_ascii_case("*LDA") {
+            let job = self.id.as_ref().map(|j| j.number);
+            dtaara::lda_change(self.client, job, part, cmd.get("VALUE")).await?;
+            return Ok(Outcome::Messages(vec!["Local data area changed.".into()]));
+        }
         let found = dtaara::resolve(
             self.client,
             &name,
@@ -2619,22 +2624,27 @@ impl Job<'_> {
     }
 
     async fn dspdtaara(&mut self, cmd: &Command) -> Result<Outcome> {
-        let d = dtaara::resolve(
-            self.client,
-            cmd.get("DTAARA"),
-            &self.library_list(),
-            &self.current_library(),
-        )
-        .await?;
-        authority::check(
-            self.client,
-            &self.user,
-            &d.library,
-            &d.name,
-            "*DTAARA",
-            Aut::Use,
-        )
-        .await?;
+        let d = if cmd.get("DTAARA").eq_ignore_ascii_case("*LDA") {
+            dtaara::lda_area(self.client, self.id.as_ref().map(|j| j.number)).await?
+        } else {
+            let d = dtaara::resolve(
+                self.client,
+                cmd.get("DTAARA"),
+                &self.library_list(),
+                &self.current_library(),
+            )
+            .await?;
+            authority::check(
+                self.client,
+                &self.user,
+                &d.library,
+                &d.name,
+                "*DTAARA",
+                Aut::Use,
+            )
+            .await?;
+            d
+        };
         // Character values a line of 50 at a time, with their offsets.
         let rows: Vec<String> = match d.ty {
             dtaara::Type::Char => d

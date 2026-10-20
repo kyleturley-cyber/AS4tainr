@@ -33,7 +33,106 @@ CREATE TABLE IF NOT EXISTS as4tainr.data_areas (
     value    text NOT NULL,
     PRIMARY KEY (library, name)
 );
+CREATE TABLE IF NOT EXISTS as4tainr.local_data_areas (
+    job   bigint PRIMARY KEY,
+    value bytea NOT NULL
+);
 "#;
+
+/// The local data area (*LDA): 1024 characters each job has, blanks when
+/// the job starts; a job submitted with SBMJOB starts with a copy of the
+/// submitting job's (CL Programming, "Local data area").
+pub const LDA_LENGTH: usize = 1024;
+
+/// The local data area of `as4tainr call` and the tests (no job).
+static NO_JOB_LDA: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+/// The bytes (EBCDIC) of a job's local data area.
+pub async fn lda_read<C: GenericClient>(client: &C, job: Option<i64>) -> Result<Vec<u8>> {
+    let blank = || vec![0x40u8; LDA_LENGTH];
+    let Some(job) = job else {
+        return Ok(NO_JOB_LDA
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_else(blank));
+    };
+    let row = client
+        .query_opt(
+            "SELECT value FROM as4tainr.local_data_areas WHERE job=$1",
+            &[&job],
+        )
+        .await?;
+    Ok(row.map(|r| r.get::<_, Vec<u8>>(0)).unwrap_or_else(blank))
+}
+
+/// Replace a job's local data area (padded or cut to 1024 bytes).
+pub async fn lda_write<C: GenericClient>(client: &C, job: Option<i64>, value: &[u8]) -> Result<()> {
+    let mut v = value.to_vec();
+    v.resize(LDA_LENGTH, 0x40);
+    let Some(job) = job else {
+        if let Ok(mut g) = NO_JOB_LDA.lock() {
+            *g = Some(v);
+        }
+        return Ok(());
+    };
+    client
+        .execute(
+            "INSERT INTO as4tainr.local_data_areas (job, value) VALUES ($1, $2)
+             ON CONFLICT (job) DO UPDATE SET value = EXCLUDED.value",
+            &[&job, &v],
+        )
+        .await?;
+    Ok(())
+}
+
+/// The local data area as CL sees it (CHGDTAARA, RTVDTAARA, DSPDTAARA
+/// with DTAARA(*LDA)): a *CHAR data area of 1024.
+pub async fn lda_area<C: GenericClient>(client: &C, job: Option<i64>) -> Result<DataArea> {
+    let b = lda_read(client, job).await?;
+    Ok(DataArea {
+        library: String::new(),
+        name: "*LDA".into(),
+        ty: Type::Char,
+        length: LDA_LENGTH as u32,
+        decimals: 0,
+        value: crate::rpg::data::a(&b),
+        text: String::new(),
+    })
+}
+
+/// CHGDTAARA DTAARA(*LDA [(start length)]) VALUE(...).
+pub async fn lda_change<C: GenericClient>(
+    client: &C,
+    job: Option<i64>,
+    part: Option<(u32, u32)>,
+    value: &str,
+) -> Result<()> {
+    let d = lda_area(client, job).await?;
+    let new = d.changed(part, value)?;
+    lda_write(client, job, &crate::rpg::data::e(&new)).await
+}
+
+/// A new job's local data area: blanks, or a copy of another job's
+/// (SBMJOB).
+pub async fn lda_start<C: GenericClient>(client: &C, job: i64, copy_of: Option<i64>) -> Result<()> {
+    client
+        .execute(
+            "DELETE FROM as4tainr.local_data_areas WHERE job=$1",
+            &[&job],
+        )
+        .await?;
+    if let Some(from) = copy_of {
+        client
+            .execute(
+                "INSERT INTO as4tainr.local_data_areas (job, value)
+                 SELECT $1, value FROM as4tainr.local_data_areas WHERE job=$2",
+                &[&job, &from],
+            )
+            .await?;
+    }
+    Ok(())
+}
 
 /// Longest *CHAR data area (CRTDTAARA LEN).
 pub const MAX_CHAR: u32 = 2000;

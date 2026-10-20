@@ -542,7 +542,7 @@ pub static COMMANDS: &[CommandDef] = &[
     CommandDef {
         name: "DSPDTAARA",
         description: "Display Data Area",
-        params: &[p("DTAARA", Kind::Qualified, true, None, "Data area").ch("Name")],
+        params: &[p("DTAARA", Kind::Qualified, true, None, "Data area").ch("Name, *LDA")],
     },
     CommandDef {
         name: "DLTDTAARA",

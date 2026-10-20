@@ -273,7 +273,9 @@ pub enum Line {
     Leave,
     LeaveSr,
     BegSr(String),
-    EndSr,
+    /// ENDSR with its return point (factor 2): a field or literal
+    /// holding *DETL, *GETIN, *TOTC, *TOTL, *OFL, *DETC or *CANCL.
+    EndSr(Option<Expr>),
     ExSr(String),
     Return(Option<Expr>),
     Goto(String),
@@ -321,6 +323,10 @@ pub struct FileDecl {
     pub device: String,
     pub keywords: Vec<Keyword>,
     pub line: usize,
+    /// Declared inside this procedure: a local file (ILE RPG Reference,
+    /// "File Considerations": opened when the procedure is called and
+    /// closed when it returns, unless STATIC).
+    pub proc: Option<String>,
 }
 
 /// A keyword with its arguments as written: `DIM(10)`, `INZ('X')`.

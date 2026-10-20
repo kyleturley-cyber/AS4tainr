@@ -1769,22 +1769,27 @@ async fn command(
                 vars,
             )?;
             let (qualified, part) = crate::dtaara::split_dtaara_param(&raw)?;
-            let d = crate::dtaara::resolve(
-                job.client,
-                &qualified,
-                &job.library_list(),
-                &job.current_library(),
-            )
-            .await?;
-            crate::authority::check(
-                job.client,
-                &job.user,
-                &d.library,
-                &d.name,
-                "*DTAARA",
-                crate::authority::Aut::Use,
-            )
-            .await?;
+            let d = if qualified.eq_ignore_ascii_case("*LDA") {
+                crate::dtaara::lda_area(job.client, job.id.as_ref().map(|j| j.number)).await?
+            } else {
+                let d = crate::dtaara::resolve(
+                    job.client,
+                    &qualified,
+                    &job.library_list(),
+                    &job.current_library(),
+                )
+                .await?;
+                crate::authority::check(
+                    job.client,
+                    &job.user,
+                    &d.library,
+                    &d.name,
+                    "*DTAARA",
+                    crate::authority::Aut::Use,
+                )
+                .await?;
+                d
+            };
             let target = p
                 .get("RTNVAR")
                 .ok_or_else(|| anyhow!("line {}: RTVDTAARA needs RTNVAR", st.line))?

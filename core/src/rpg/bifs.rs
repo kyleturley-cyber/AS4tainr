@@ -637,19 +637,18 @@ impl Machine<'_> {
                     _ => bail!("%OPEN needs a file name"),
                 };
                 let i = self
-                    .prog
-                    .file_index(&name)
+                    .file_idx(&name)
                     .ok_or_else(|| anyhow!("{name} is not a file"))?;
                 Value::Ind(self.files[i].open.is_some() || self.files[i].ws_open)
             }
             "STATUS" => {
-                // The status code of the last error: 0 when none; 1299
-                // (other I/O error) for file errors here.
+                // The most recent program or file status code; with a
+                // file, that file's (ILE RPG Reference, %STATUS).
                 let st = match args.first() {
                     None => self.last.clone(),
                     Some(_) => self.file_status(args)?,
                 };
-                num(if st.error { 1299 } else { 0 })
+                num(st.code as i128)
             }
             "OCCUR" => num(self.occurrence(&args[0])? as i128),
             "SHTDN" => Value::Ind(false),

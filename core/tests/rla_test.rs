@@ -3961,6 +3961,10 @@ async fn rpg_fixed_to_free_conversion_runs_the_same() {
     for (name, src, all_free) in [
         ("FIXEDOPS", include_str!("rpg/fixedops.rpgle").to_string(), false),
         ("RPG3TEST", rpg4(include_str!("rpg/rpg3test.rpg")), false),
+        ("PSSRFIX", include_str!("rpg/pssrfix.rpgle").to_string(), false),
+        ("PSSRCYC", include_str!("rpg/pssrcyc.rpgle").to_string(), false),
+        ("OFLCYC", include_str!("rpg/oflcyc.rpgle").to_string(), false),
+        ("OFLFETCH", include_str!("rpg/oflfetch.rpgle").to_string(), false),
         ("DSPFREE", "     DX                S              5P 2 INZ(1.5)\n     C     X             ADD       2             X\n     C     X             DSPLY\n     C                   EVAL      *INLR = *ON\n".to_string(), true),
     ] {
         let before = run_rpg(&url, &lib, "QSECOFR", name, &src, None, None).await;
@@ -4259,4 +4263,257 @@ async fn ile_cl_module_callprc() {
         .await
         .unwrap();
     assert!(out.iter().any(|m| m.contains("15.50 31.00")), "{out:?}");
+}
+
+#[tokio::test]
+async fn rpg_status_data_structures_and_status_codes() {
+    // ILE RPG Reference: the program status data structure (*PROC: the
+    // program; *PARMS: parameters passed; position 358: the current
+    // user), the file information data structure (*STATUS, *OPCODE,
+    // *RECORD, open and end-of-file flags in 9 and 10, the relative
+    // record number in 397, the record length in 283, the read count in
+    // 247), and the status codes of "File Status Codes" and "Program
+    // Status Codes": 00012 no record found on CHAIN, 00011 end of file,
+    // 01021 duplicate key on WRITE, 00102 divide by zero (exception
+    // MCH1211). Customer 2 is the fourth record written (setup); a
+    // CUSTMAST record is 5P 0 + 30 + 20 + 9P 2 = 3 + 30 + 20 + 5 bytes.
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "PSDS",
+        include_str!("rpg/psds.rpgle"),
+        None,
+        None,
+    )
+    .await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "PSDS",
+            "0",
+            "QSECOFR",
+            "12 12",
+            "CHAIN CUSTREC  1CUSTMAST",
+            "0 4 58",
+            "11 1 3",
+            "1 1021 1021",
+            "divide 102 0 MCH1211",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn rpg_pssr_infsr_and_return_points() {
+    // ILE RPG Reference, "Program Exception/Error Subroutine" and "File
+    // Exception/Error Subroutine (INFSR)": an error no operation handles
+    // goes to *PSSR (a divide by zero: status 00102; *ROUTINE is the
+    // routine the error happened in, *DETC: detail calculations); a
+    // GOTO from it goes back into the calculations. A file error goes to
+    // the file's INFSR (a duplicate key: 01021). In the cycle, ENDSR's
+    // return point *GETIN goes on with the next record, and the return
+    // point field is blank after ENDSR. In a subprocedure, RETURN in
+    // *PSSR gives the procedure's value; ENDSR without RETURN makes the
+    // procedure fail (ILE RPG Programmer's Guide, "Using a Program Error
+    // Subroutine"). CALLP(E): %ERROR on, %STATUS the error's status.
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let run = |name: &'static str, src: &'static str| {
+        let (url, lib) = (url.clone(), lib.clone());
+        async move { run_rpg(&url, &lib, "QSECOFR", name, src, None, None).await }
+    };
+    let r = run("PSSRFIX", include_str!("rpg/pssrfix.rpgle")).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["102", "*DETC", "5"]);
+    let r = run("INFSR", include_str!("rpg/infsr.rpgle")).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["1021", "Y"]);
+    let r = run("PSSRCYC", include_str!("rpg/pssrcyc.rpgle")).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["1", "2", "3", "4", "skip", "*GETIN"]);
+    let r = run("PSSRPROC", include_str!("rpg/pssrproc.rpgle")).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        ["-1", "2", "in pssr", "fails failed", "in pssr", "1 102"]
+    );
+    // ENDSR *CANCL ends the program; ENDSR without a return point after an
+    // error: the default error handler (the program ends abnormally).
+    let cancl = include_str!("rpg/pssrcyc.rpgle").replace("INZ('*GETIN')", "INZ('*CANCL')");
+    let r = run_rpg(&url, &lib, "QSECOFR", "PSSRCAN", &cancl, None, None).await;
+    assert!(r.error.is_some());
+    assert_eq!(r.messages, ["1", "2", "3", "4", "skip", "*CANCL"]);
+    let blank = include_str!("rpg/pssrcyc.rpgle").replace("INZ('*GETIN')", "");
+    let r = run_rpg(&url, &lib, "QSECOFR", "PSSRBLK", &blank, None, None).await;
+    let e = r.error.expect("the error goes on");
+    assert!(format!("{e:#}").contains("MCH1211"), "{e:#}");
+}
+
+#[tokio::test]
+async fn rpg_files_in_procedures() {
+    // ILE RPG Reference, "File Considerations": a file declared in a
+    // procedure is opened when the procedure is called and closed when
+    // it returns, so each call reads from the start; with STATIC it stays
+    // open and goes on. Its records are read into data structures.
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "LOCALF",
+        include_str!("rpg/localf.rpgle"),
+        None,
+        None,
+    )
+    .await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["Midwest Fasteners", "?", "1 2", "1 1"]);
+}
+
+#[tokio::test]
+async fn rpg_overflow_and_fetch_overflow() {
+    // ILE RPG Reference, "Overflow Routine" and "Fetch Overflow Routine":
+    // printing on or past the overflow line sets the overflow indicator;
+    // the lines conditioned by it print once, in the cycle after total
+    // output (before the next detail line), or, with fetch overflow (F
+    // in position 18), just before the line that fetches them. A skip to
+    // a line before the current one starts a new page.
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "OFLCYC",
+        include_str!("rpg/oflcyc.rpgle"),
+        None,
+        None,
+    )
+    .await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let r2 = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "OFLFETCH",
+        include_str!("rpg/oflfetch.rpgle"),
+        None,
+        None,
+    )
+    .await;
+    assert!(r2.error.is_none(), "{:?}", r2.error);
+    assert_eq!(
+        r.printed,
+        [
+            "   HEADING",
+            "    1",
+            "    2",
+            "\u{c}",
+            "   HEADING",
+            "    3",
+            "    4",
+            "\u{c}",
+            "   HEADING",
+            "    5"
+        ]
+    );
+    assert_eq!(
+        r2.printed,
+        [
+            "    1",
+            "    2",
+            "    3",
+            "\u{c}",
+            "   HEADING",
+            "    4",
+            "    5"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn rpg_local_data_area() {
+    // CL Programming, "Local data area": each job has one of 1024
+    // characters; CHGDTAARA, RTVDTAARA and DSPDTAARA take DTAARA(*LDA).
+    // ILE RPG Reference: an unnamed data area data structure (U in
+    // position 23) is the local data area, read at the start and written
+    // back at LR. A submitted job starts with a copy of the submitter's.
+    use as4tainr_core::commands::Outcome;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    job_run(&client, &lib, "CHGDTAARA DTAARA(*LDA) VALUE(' ')")
+        .await
+        .unwrap();
+    // A local data area starts as blanks: a packed subfield over blanks
+    // is a decimal data error (status 00907) when the program uses it.
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "LDA",
+        include_str!("rpg/lda.rpgle"),
+        None,
+        None,
+    )
+    .await;
+    assert!(format!("{:#}", r.error.unwrap()).contains("RNQ0907"));
+    // Positions 6-10 as packed zero (X'000000000F').
+    let mut bytes = as4tainr_core::rpg::data::e("FIRST");
+    bytes.extend([0, 0, 0, 0, 0x0F]);
+    as4tainr_core::dtaara::lda_write(&client, None, &bytes)
+        .await
+        .unwrap();
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "LDA",
+        include_str!("rpg/lda.rpgle"),
+        None,
+        None,
+    )
+    .await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["FIRST", ".00"]);
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "LDA",
+        include_str!("rpg/lda.rpgle"),
+        None,
+        None,
+    )
+    .await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["NEXT", "1.25"]);
+    let lda = as4tainr_core::dtaara::lda_area(&client, None)
+        .await
+        .unwrap();
+    assert_eq!(&lda.value[..5], "NEXT ");
+    let Outcome::Display(d) = job_run(&client, &lib, "DSPDTAARA *LDA").await.unwrap() else {
+        panic!()
+    };
+    assert!(d.rows[0].contains("NEXT"), "{:?}", d.rows);
+    let pgm = "PGM\n DCL &K *CHAR 5\n RTVDTAARA DTAARA(*LDA (1 5)) RTNVAR(&K)\n SNDPGMMSG MSG(&K)\nENDPGM\n";
+    let m = cl_job_run(&client, &url, &lib, &[("LDAPGM", pgm)], "CALL LDAPGM")
+        .await
+        .unwrap();
+    assert!(m.contains(&"NEXT".to_string()), "{m:?}");
+    // SBMJOB: the new job's local data area is a copy.
+    as4tainr_core::dtaara::lda_write(&client, Some(990001), &[0xC1; 4])
+        .await
+        .unwrap();
+    as4tainr_core::dtaara::lda_start(&client, 990002, Some(990001))
+        .await
+        .unwrap();
+    let copy = as4tainr_core::dtaara::lda_area(&client, Some(990002))
+        .await
+        .unwrap();
+    assert_eq!(&copy.value[..5], "AAAA ");
+    assert_eq!(copy.value.len(), 1024);
 }

@@ -326,6 +326,12 @@ impl Conv {
         let ds_type = cs[22].to_ascii_uppercase();
         let def = colt(cs, 24, 25).to_ascii_uppercase();
         let from = colt(cs, 26, 32);
+        // A special keyword (*ROUTINE runs into position 33).
+        let from = if from.starts_with('*') {
+            colt(cs, 26, 39)
+        } else {
+            from
+        };
         let to = colt(cs, 33, 39);
         let t = cs[39].to_ascii_uppercase();
         let decs = colt(cs, 41, 42);
@@ -735,7 +741,12 @@ impl Conv {
                     keep_fixed(self, "ENDSR with a label stays fixed");
                     return;
                 }
-                self.free("endsr;");
+                // The return point (factor 2) stays.
+                if lf2.is_empty() {
+                    self.free("endsr;");
+                } else {
+                    self.free(&format!("endsr {lf2};"));
+                }
                 return;
             }
             _ => {}

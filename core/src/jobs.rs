@@ -194,6 +194,7 @@ pub async fn start_interactive(
             &[&number, &device, &user, &INTERACTIVE_SUBSYSTEM, &curlib, &libl],
         )
         .await?;
+    crate::dtaara::lda_start(client, number, None).await?;
     Ok(JobId {
         number,
         user: user.to_string(),
@@ -310,6 +311,8 @@ pub async fn submit(client: &Client, s: &Submit) -> Result<JobId> {
             ],
         )
         .await?;
+    // The submitted job's local data area: a copy of the submitter's.
+    crate::dtaara::lda_start(client, number, s.submitter).await?;
     Ok(JobId {
         number,
         user: s.user.clone(),

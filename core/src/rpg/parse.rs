@@ -816,6 +816,7 @@ fn fixed_f(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
         device: colt(cs, 36, 42).to_ascii_uppercase(),
         keywords: kw,
         line: lineno,
+        proc: ctx.proc.as_ref().map(|p| p.name.clone()),
     });
     Ok(())
 }
@@ -835,11 +836,36 @@ fn fixed_d(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
         .unwrap_or(' ')
         .eq_ignore_ascii_case(&'E');
     let dtype_code = colt(cs, 24, 25).to_ascii_uppercase();
-    let from = colt(cs, 26, 32);
-    let to = colt(cs, 33, 39);
+    let mut from = colt(cs, 26, 32);
+    let mut to = colt(cs, 33, 39);
     let tchar = cs.get(39).copied().unwrap_or(' ');
     let decs = colt(cs, 41, 42);
     let mut kws = keywords(&col(cs, 44, 80))?;
+    // Position 23 of a DS line: S, the program status data structure; U,
+    // a data area data structure (ILE RPG Reference, definition
+    // specifications position 23).
+    match cs.get(22).copied().unwrap_or(' ').to_ascii_uppercase() {
+        'S' if dtype_code == "DS" => kws.push(Keyword {
+            name: "PSDS".into(),
+            args: vec![],
+        }),
+        'U' if dtype_code == "DS" => kws.push(Keyword {
+            name: "UDS".into(),
+            args: vec![],
+        }),
+        _ => {}
+    }
+    // A special keyword in the from positions of a subfield of a program
+    // status or file information data structure: *STATUS, *ROUTINE...
+    // (*ROUTINE runs into position 33.)
+    if from.starts_with('*') {
+        kws.push(Keyword {
+            name: colt(cs, 26, 39).to_ascii_uppercase(),
+            args: vec![],
+        });
+        from.clear();
+        to.clear();
+    }
     // LIKE with +n or -n in the length positions: a longer or shorter
     // field (ILE RPG Reference, LIKE keyword).
     let to = if (to.starts_with('+') || to.starts_with('-')) && keyword(&kws, "LIKE").is_some() {
@@ -1350,6 +1376,11 @@ fn fixed_c(ctx: &mut Ctx, cs: &[char], ext2: &str, lineno: usize) -> Result<()> 
             Box::new(need(f2(), "factor 2")?),
         ))
     };
+    // ENDSR with a label in factor 1: a GOTO in the subroutine can go to
+    // its end.
+    if op == "ENDSR" && !f1t.is_empty() {
+        ctx.calc(lineno, vec![], None, Line::Tag(f1t.to_ascii_uppercase()));
+    }
     let what = match op.as_str() {
         "" => return Ok(()),
         "EVAL" | "EVALR" => {
@@ -1379,7 +1410,7 @@ fn fixed_c(ctx: &mut Ctx, cs: &[char], ext2: &str, lineno: usize) -> Result<()> 
         "LEAVE" => Line::Leave,
         "LEAVESR" => Line::LeaveSr,
         "BEGSR" => Line::BegSr(f1t.to_ascii_uppercase()),
-        "ENDSR" => Line::EndSr,
+        "ENDSR" => Line::EndSr(f2()?),
         "EXSR" => Line::ExSr(f2t.to_ascii_uppercase()),
         "RETURN" => Line::Return(xf2()?),
         "GOTO" => Line::Goto(f2t.to_ascii_uppercase()),
@@ -1397,6 +1428,14 @@ fn fixed_c(ctx: &mut Ctx, cs: &[char], ext2: &str, lineno: usize) -> Result<()> 
             limit: f2()?,
             index: res()?,
         },
+        "CALLP" if ext.error => Line::Stmt(Stmt::Op {
+            code: "CALLP".into(),
+            f1: None,
+            f2: Some(need(xf2(), "a call")?),
+            result: None,
+            ext: ext.clone(),
+            ind: ResultInd::default(),
+        }),
         "CALLP" => Line::Stmt(Stmt::CallP(need(xf2(), "a call")?)),
         "CALL" => {
             let parms = match res()? {
@@ -2081,6 +2120,7 @@ fn free(ctx: &mut Ctx, text: &str, lineno: usize) -> Result<()> {
                 device,
                 keywords: kws,
                 line: lineno,
+                proc: ctx.proc.as_ref().map(|p| p.name.clone()),
             });
             return Ok(());
         }
@@ -2472,7 +2512,7 @@ fn free_calc(text: &str) -> Result<Line> {
         "LEAVE" => Line::Leave,
         "LEAVESR" => Line::LeaveSr,
         "BEGSR" => Line::BegSr(rest_t.to_ascii_uppercase()),
-        "ENDSR" => Line::EndSr,
+        "ENDSR" => Line::EndSr(e_opt()?),
         "EXSR" => Line::ExSr(rest_t.to_ascii_uppercase()),
         "RETURN" => Line::Return(e_opt()?),
         "MONITOR" => Line::Monitor,
@@ -2509,6 +2549,14 @@ fn free_calc(text: &str) -> Result<Line> {
                 right: op == "EVALR",
             })
         }
+        "CALLP" if ext.error => Line::Stmt(Stmt::Op {
+            code: "CALLP".into(),
+            f1: None,
+            f2: Some(need("a call")?),
+            result: None,
+            ext: ext.clone(),
+            ind: ResultInd::default(),
+        }),
         "CALLP" => Line::Stmt(Stmt::CallP(need("a call")?)),
         "EXEC" => {
             let t = rest_t;

@@ -47,7 +47,17 @@ pub enum Ins {
         f2: Expr,
         to: usize,
         ind: ResultInd,
+        /// The TAG is outside this subroutine (in the calculations it
+        /// was run from).
+        out: Option<String>,
     },
+    /// TAG: where a GOTO from a subroutine lands.
+    Label(String),
+    /// GOTO from a subroutine to a TAG in the calculations it was run
+    /// from (detail or total calculations, or the procedure's body).
+    GotoOut(String),
+    /// ENDSR with a return point.
+    EndSr(Expr),
     /// MONITOR: errors in the instructions up to `end_body` go to the
     /// ON-ERROR handlers.
     Monitor {
@@ -447,7 +457,7 @@ impl Builder {
                 self.gotos.push((j, t.clone()));
             }
             Line::Tag(t) => {
-                let here = self.here();
+                let here = self.push(Ins::Label(t.clone()), line, vec![]);
                 self.tags.insert(t.clone(), here);
             }
             Line::Cab {
@@ -464,6 +474,7 @@ impl Builder {
                         f2: f2.clone(),
                         to: usize::MAX,
                         ind: ind.clone(),
+                        out: None,
                     },
                     line,
                     cond,
@@ -535,7 +546,7 @@ impl Builder {
                     *t = end;
                 }
             }
-            Line::BegSr(_) | Line::EndSr => unreachable!("subroutines are split before"),
+            Line::BegSr(_) | Line::EndSr(_) => unreachable!("subroutines are split before"),
         }
         Ok(())
     }
@@ -568,7 +579,18 @@ impl Builder {
         Ok(())
     }
 
-    fn finish(mut self, what: &str) -> Result<Code> {
+    fn finish(self, what: &str) -> Result<Code> {
+        self.finish_with(what, false)
+    }
+
+    /// A subroutine's code: a GOTO to a TAG outside it goes to the
+    /// calculations it was run from (ILE RPG Reference, GOTO: from a
+    /// subroutine to the detail or total calculations).
+    fn finish_sub(self, what: &str) -> Result<Code> {
+        self.finish_with(what, true)
+    }
+
+    fn finish_with(mut self, what: &str, sub: bool) -> Result<Code> {
         if let Some(o) = self.stack.last() {
             let kind = match o {
                 Open::If { .. } => "IF",
@@ -579,11 +601,14 @@ impl Builder {
             bail!("{what}: an {kind} has no end");
         }
         for (at, tag) in std::mem::take(&mut self.gotos) {
-            let to = *self
-                .tags
-                .get(&tag)
-                .ok_or_else(|| anyhow!("{what}: TAG {tag} not found"))?;
-            self.patch(at, to);
+            match self.tags.get(&tag) {
+                Some(&to) => self.patch(at, to),
+                None if sub => match &mut self.code[at].ins {
+                    Ins::Cab { out, .. } => *out = Some(tag),
+                    other => *other = Ins::GotoOut(tag),
+                },
+                None => bail!("{what}: TAG {tag} not found"),
+            }
         }
         Ok(self.code)
     }
@@ -622,11 +647,14 @@ pub fn build(calcs: &[CalcLine]) -> Result<Routines> {
                 sub = Some((n.clone(), Builder::new()));
                 continue;
             }
-            Line::EndSr => {
-                let (n, b) = sub
+            Line::EndSr(point) => {
+                let (n, mut b) = sub
                     .take()
                     .ok_or_else(|| anyhow!("line {}: ENDSR without BEGSR", cl.line))?;
-                let code = b.finish(&format!("subroutine {n}"))?;
+                if let Some(p) = point {
+                    b.push(Ins::EndSr(p.clone()), cl.line, vec![]);
+                }
+                let code = b.finish_sub(&format!("subroutine {n}"))?;
                 r.subroutines.insert(n, code);
                 continue;
             }

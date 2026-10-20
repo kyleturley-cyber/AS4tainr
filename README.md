@@ -98,15 +98,7 @@ Settings: `AS4TAINR_DATABASE_URL`, `AS4TAINR_QSECOFR_PASSWORD` (initial QSECOFR 
 
 ## Roadmap
 
-| Phase | Scope | Exit gate |
-| --- | --- | --- |
-| 0 · Foundations | Object store, EBCDIC/decimal library, TN5250 sign-on, CL shell | Sign on with tn5250, run `CRTLIB` and `DSPLIB` |
-| 1 · Data | DDS physical and logical files, record-level access, SQL | `CRTPF` from DDS, read it with RLA and SQL |
-| 2 · Programs (v1) | CL compiler, RPG IV (first on Jariko, now as4tainr's own RPG engine), display files | A sample order-entry app runs unmodified (met: [docs/order-entry.md](docs/order-entry.md)) |
-| 3 · Operations | Jobs, subsystems, spool, security | Multi-user interactive and batch workload (met: `tools/gate3_5250.py`) |
-| 4 · Ecosystem | RPG/400, COBOL, host servers, migration tools | ACS and ODBC tools connect |
-
-Spike 01 brings forward part of phase 1 (record-level access) and phase 2 (Jariko integration), because these were the riskiest assumptions.
+Phases 0 to 3 have met their gates: the sample order-entry app runs unmodified, and a multi-user interactive and batch workload passes. Phase 4 (ODBC/JDBC and ACS host servers) is next. See [ROADMAP.md](ROADMAP.md) for the architecture, phases, status and next steps.
 
 ## Contributing
 

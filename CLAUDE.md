@@ -13,6 +13,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 3. **Fidelity changes need tests.** Every behavior change gets a test whose expected value comes from IBM documentation or a real system, not from running the new code. Say where the expected value came from in a comment.
 4. **Document gaps.** If you implement something only partly, add it to `docs/fidelity-gaps.md`.
 5. **Do not weaken tests to make them pass.** If a test looks wrong, explain why instead of editing it.
+6. **Keep ROADMAP.md current.** It is the master roadmap. When a change moves a phase, finishes a next step or adds a capability worth listing, update ROADMAP.md in the same commit. Describe the product as it is now: no history of earlier names or replaced designs.
 
 ## Layout
 

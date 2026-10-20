@@ -201,6 +201,10 @@ pub async fn init(client: &Client) -> Result<()> {
             .await
             .context("creating catalog")?;
         client
+            .batch_execute(crate::ile::DDL)
+            .await
+            .context("creating catalog")?;
+        client
             .batch_execute(crate::dtaara::DDL)
             .await
             .context("creating catalog")?;
@@ -420,6 +424,8 @@ pub struct Program {
     /// Compile options given on the create command, as control keywords
     /// (e.g. `ALWNULL(*USRCTL)`); the source's own control keywords win.
     pub options: String,
+    /// How its modules are bound (CRTPGM, binding directories).
+    pub binding: Option<crate::ile::Binding>,
 }
 
 /// The first program of this name in a list of libraries.
@@ -428,7 +434,7 @@ pub async fn find_program(client: &Client, libs: &[String], name: &str) -> Resul
     for lib in libs {
         if let Some(r) = client
             .query_opt(
-                "SELECT attribute, source, options FROM as4tainr.programs WHERE library=$1 AND name=$2",
+                "SELECT attribute, source, options, binding FROM as4tainr.programs WHERE library=$1 AND name=$2",
                 &[lib, &name],
             )
             .await?
@@ -439,6 +445,9 @@ pub async fn find_program(client: &Client, libs: &[String], name: &str) -> Resul
                 attribute: r.get(0),
                 source: r.get(1),
                 options: r.get(2),
+                binding: r
+                    .get::<_, Option<&str>>(3)
+                    .and_then(|b| serde_json::from_str(b).ok()),
             }));
         }
     }

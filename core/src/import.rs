@@ -85,6 +85,8 @@ pub fn default_source_file(srctype: &str) -> &'static str {
         "CMD" => "QCMDSRC",
         "CBLLE" => "QCBLLESRC",
         "SQL" => "QSQLSRC",
+        "BND" => "QSRVSRC",
+        "BNDDIR" => "QBNDDIRSRC",
         _ => "QTXTSRC",
     }
 }
@@ -97,6 +99,8 @@ struct Found {
     srctype: String,
     text: String,
     path: PathBuf,
+    /// The object type part of a TOBi name (`pgm` in X.pgm.rpgle).
+    objtype: Option<String>,
 }
 
 /// What the import did, line by line, and whether everything was built.
@@ -135,6 +139,36 @@ struct Scan {
     includes: Vec<(String, PathBuf)>,
     /// Same member twice: (member, the path kept, the path left out).
     duplicates: Vec<(String, PathBuf, PathBuf)>,
+    /// Build rules from TOBi Rules.mk files: object name -> (object type,
+    /// what it is built from).
+    rules: BTreeMap<String, (String, Vec<String>)>,
+}
+
+/// TOBi build rules (`Rules.mk`): lines like `CONVSRV.SRVPGM: CONVSRV.bnd
+/// CONVSRV.MODULE`.
+fn read_rules(text: &str, out: &mut BTreeMap<String, (String, Vec<String>)>) {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((target, deps)) = line.split_once(':') else {
+            continue;
+        };
+        let Some((name, kind)) = target.trim().rsplit_once('.') else {
+            continue;
+        };
+        if name.contains(' ') || name.contains('$') || name.contains('=') {
+            continue;
+        }
+        out.insert(
+            name.to_ascii_uppercase(),
+            (
+                kind.to_ascii_uppercase(),
+                deps.split_whitespace().map(|d| d.to_string()).collect(),
+            ),
+        );
+    }
 }
 
 /// Walk DIR and its folders. A folder named like a source file
@@ -166,6 +200,12 @@ fn scan(dir: &Path) -> Result<Scan> {
         }
         for p in entries.iter().filter(|p| p.is_file()) {
             let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if fname.eq_ignore_ascii_case("Rules.mk") {
+                if let Ok(t) = std::fs::read_to_string(p) {
+                    read_rules(&t, &mut out.rules);
+                }
+                continue;
+            }
             let ext = fname
                 .rsplit_once('.')
                 .map(|x| x.1.to_ascii_lowercase())
@@ -200,12 +240,18 @@ fn scan(dir: &Path) -> Result<Scan> {
                 out.duplicates.push((name, first.path.clone(), p.clone()));
                 continue;
             }
+            let objtype = fname
+                .rsplit_once('.')
+                .and_then(|(stem, _)| stem.rsplit_once('.'))
+                .map(|(_, k)| k.to_ascii_lowercase())
+                .filter(|k| k.chars().all(|c| c.is_ascii_alphabetic()));
             out.members.push(Found {
                 file,
                 member: name,
                 srctype: srctype.to_string(),
                 text,
                 path: p.clone(),
+                objtype,
             });
         }
     }
@@ -247,6 +293,7 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         data,
         includes,
         duplicates,
+        rules,
     } = scan(dir)?;
     if members.is_empty() {
         bail!(
@@ -458,7 +505,104 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
             step(job, &mut report, &m.member, &cmd).await;
         }
     }
-    // 4. Programs (replaced: they are built from the source just added).
+    // 4. ILE: modules (TOBi rules X.MODULE, X.module.rpgle, or source with
+    // ctl-opt NOMAIN), service programs from binder source (.bnd, with the
+    // modules its rule names), binding directories (.bnddir scripts).
+    let mut is_module = std::collections::BTreeSet::new();
+    for m in members
+        .iter()
+        .filter(|m| matches!(m.srctype.as_str(), "RPGLE" | "SQLRPGLE"))
+    {
+        let rule = rules.get(&m.member).map(|r| r.0.as_str());
+        let nomain = std::fs::read_to_string(&m.path)
+            .map(|t| {
+                let u = t.to_ascii_uppercase();
+                u.lines().any(|l| {
+                    let l = l.trim_start();
+                    (l.starts_with("CTL-OPT") || l.starts_with('H') || u.starts_with("**FREE"))
+                        && l.contains("NOMAIN")
+                })
+            })
+            .unwrap_or(false);
+        let module = match (rule, m.objtype.as_deref()) {
+            (Some("PGM"), _) | (_, Some("pgm")) => false,
+            (Some("MODULE"), _) | (_, Some("module")) => true,
+            _ => nomain,
+        };
+        if !module {
+            continue;
+        }
+        is_module.insert((m.file.clone(), m.member.clone()));
+        let cmd = if m.srctype == "SQLRPGLE" {
+            format!(
+                "CRTSQLRPGI OBJ({lib}/{}) SRCFILE({lib}/{}) SRCMBR({}) OBJTYPE(*MODULE)",
+                m.member, m.file, m.member
+            )
+        } else {
+            format!(
+                "CRTRPGMOD MODULE({lib}/{}) SRCFILE({lib}/{}) SRCMBR({})",
+                m.member, m.file, m.member
+            )
+        };
+        step(job, &mut report, &m.member, &cmd).await;
+    }
+    for m in of_type("BND") {
+        let modules: Vec<String> = match rules.get(&m.member) {
+            Some((kind, deps)) if kind == "SRVPGM" => deps
+                .iter()
+                .filter_map(|d| {
+                    d.to_ascii_uppercase()
+                        .strip_suffix(".MODULE")
+                        .map(String::from)
+                })
+                .map(|d| format!("{lib}/{d}"))
+                .collect(),
+            _ => vec![format!("{lib}/{}", m.member)],
+        };
+        let cmd = format!(
+            "CRTSRVPGM SRVPGM({lib}/{}) MODULE({}) SRCFILE({lib}/{}) SRCMBR({})",
+            m.member,
+            modules.join(" "),
+            m.file,
+            m.member
+        );
+        step(job, &mut report, &m.member, &cmd).await;
+    }
+    for m in of_type("BNDDIR") {
+        // A TOBi binding directory script: CL commands with &O (the
+        // library) and &N (the object); a line starting with ! may fail.
+        let text = std::fs::read_to_string(&m.path)?;
+        let mut ok = true;
+        for line in text.lines() {
+            let l = line.trim();
+            if l.is_empty() || l.starts_with("/*") {
+                continue;
+            }
+            let (may_fail, l) = match l.strip_prefix('!') {
+                Some(r) => (true, r.trim()),
+                None => (false, l),
+            };
+            let c = l.replace("&O", &lib).replace("&N", &m.member);
+            if let Err(e) = job.run(&c).await {
+                if !may_fail {
+                    ok = false;
+                    report.failed += 1;
+                    report
+                        .lines
+                        .push(format!("  {}: FAILED: {c}: {e:#}", m.member));
+                    break;
+                }
+            }
+        }
+        if ok {
+            report.lines.push(format!(
+                "  {}: binding directory created in {lib}.",
+                m.member
+            ));
+        }
+    }
+
+    // 5. Programs (replaced: they are built from the source just added).
     for (t, command) in [
         ("CLLE", "CRTBNDCL"),
         ("CLP", "CRTCLPGM"),
@@ -466,6 +610,9 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         ("SQLRPGLE", "CRTSQLRPGI"),
     ] {
         for m in of_type(t) {
+            if is_module.contains(&(m.file.clone(), m.member.clone())) {
+                continue;
+            }
             let target = if command == "CRTSQLRPGI" {
                 "OBJ"
             } else {
@@ -481,7 +628,16 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
     for m in members.iter().filter(|m| {
         !matches!(
             m.srctype.as_str(),
-            "PF" | "LF" | "DSPF" | "CLLE" | "CLP" | "RPGLE" | "SQLRPGLE" | "SQL" | "TXT"
+            "PF" | "LF"
+                | "DSPF"
+                | "CLLE"
+                | "CLP"
+                | "RPGLE"
+                | "SQLRPGLE"
+                | "SQL"
+                | "TXT"
+                | "BND"
+                | "BNDDIR"
         )
     }) {
         report.lines.push(format!(

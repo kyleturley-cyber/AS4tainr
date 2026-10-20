@@ -715,6 +715,33 @@ pub static COMMANDS: &[CommandDef] = &[
             .ch("Name"),
             p("SRCMBR", Kind::Name, false, Some("*PGM"), "Source member").ch("Name, *PGM"),
             p(
+                "DFTACTGRP",
+                Kind::Name,
+                false,
+                Some("*YES"),
+                "Default activation group",
+            )
+            .ch("*YES, *NO")
+            .keyword_only(),
+            p(
+                "BNDDIR",
+                Kind::List,
+                false,
+                Some("*NONE"),
+                "Binding directory",
+            )
+            .ch("Name, *NONE")
+            .keyword_only(),
+            p(
+                "ACTGRP",
+                Kind::Name,
+                false,
+                Some("QILE"),
+                "Activation group",
+            )
+            .ch("Name, *CALLER, *NEW")
+            .keyword_only(),
+            p(
                 "ALWNULL",
                 Kind::Name,
                 false,
@@ -741,6 +768,257 @@ pub static COMMANDS: &[CommandDef] = &[
             .ch("*YES, *NO")
             .keyword_only(),
         ],
+    },
+    CommandDef {
+        name: "CRTRPGMOD",
+        description: "Create RPG Module",
+        params: &[
+            p("MODULE", Kind::Qualified, true, None, "Module").ch("Name"),
+            p(
+                "SRCFILE",
+                Kind::Qualified,
+                false,
+                Some("QRPGLESRC"),
+                "Source file",
+            )
+            .ch("Name"),
+            p(
+                "SRCMBR",
+                Kind::Name,
+                false,
+                Some("*MODULE"),
+                "Source member",
+            )
+            .ch("Name, *MODULE"),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*SRCMBRTXT"),
+                "Text 'description'",
+            )
+            .keyword_only(),
+            p("REPLACE", Kind::Name, false, Some("*YES"), "Replace module")
+                .ch("*YES, *NO")
+                .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CRTSRVPGM",
+        description: "Create Service Program",
+        params: &[
+            p("SRVPGM", Kind::Qualified, true, None, "Service program").ch("Name"),
+            p("MODULE", Kind::List, false, Some("*SRVPGM"), "Module").ch("Name, *SRVPGM"),
+            p("EXPORT", Kind::Name, false, Some("*SRCFILE"), "Export")
+                .ch("*SRCFILE, *ALL")
+                .keyword_only(),
+            p(
+                "SRCFILE",
+                Kind::Qualified,
+                false,
+                Some("QSRVSRC"),
+                "Export source file",
+            )
+            .ch("Name")
+            .keyword_only(),
+            p(
+                "SRCMBR",
+                Kind::Name,
+                false,
+                Some("*SRVPGM"),
+                "Export source member",
+            )
+            .ch("Name, *SRVPGM")
+            .keyword_only(),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*BLANK"),
+                "Text 'description'",
+            )
+            .keyword_only(),
+            p(
+                "BNDSRVPGM",
+                Kind::List,
+                false,
+                Some("*NONE"),
+                "Bind service program",
+            )
+            .ch("Name, *NONE")
+            .keyword_only(),
+            p(
+                "BNDDIR",
+                Kind::List,
+                false,
+                Some("*NONE"),
+                "Binding directory",
+            )
+            .ch("Name, *NONE")
+            .keyword_only(),
+            p(
+                "ACTGRP",
+                Kind::Name,
+                false,
+                Some("*CALLER"),
+                "Activation group",
+            )
+            .ch("Name, *CALLER")
+            .keyword_only(),
+            p(
+                "REPLACE",
+                Kind::Name,
+                false,
+                Some("*YES"),
+                "Replace service program",
+            )
+            .ch("*YES, *NO")
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CRTPGM",
+        description: "Create Program",
+        params: &[
+            p("PGM", Kind::Qualified, true, None, "Program").ch("Name"),
+            p("MODULE", Kind::List, false, Some("*PGM"), "Module").ch("Name, *PGM"),
+            p(
+                "ENTMOD",
+                Kind::Text,
+                false,
+                Some("*FIRST"),
+                "Program entry procedure module",
+            )
+            .ch("Name, *FIRST")
+            .keyword_only(),
+            p(
+                "BNDSRVPGM",
+                Kind::List,
+                false,
+                Some("*NONE"),
+                "Bind service program",
+            )
+            .ch("Name, *NONE")
+            .keyword_only(),
+            p(
+                "BNDDIR",
+                Kind::List,
+                false,
+                Some("*NONE"),
+                "Binding directory",
+            )
+            .ch("Name, *NONE")
+            .keyword_only(),
+            p(
+                "ACTGRP",
+                Kind::Name,
+                false,
+                Some("*ENTMOD"),
+                "Activation group",
+            )
+            .ch("Name, *ENTMOD, *NEW, *CALLER")
+            .keyword_only(),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*ENTMODTXT"),
+                "Text 'description'",
+            )
+            .keyword_only(),
+            p(
+                "REPLACE",
+                Kind::Name,
+                false,
+                Some("*YES"),
+                "Replace program",
+            )
+            .ch("*YES, *NO")
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CRTBNDDIR",
+        description: "Create Binding Directory",
+        params: &[
+            p("BNDDIR", Kind::Qualified, true, None, "Binding directory").ch("Name"),
+            p("TEXT", Kind::Text, false, Some(""), "Text 'description'").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "ADDBNDDIRE",
+        description: "Add Binding Directory Entry",
+        params: &[
+            p("BNDDIR", Kind::Qualified, true, None, "Binding directory").ch("Name"),
+            p("OBJ", Kind::Command, true, None, "Object specifications")
+                .ch("(Name *SRVPGM|*MODULE)..."),
+        ],
+    },
+    CommandDef {
+        name: "RMVBNDDIRE",
+        description: "Remove Binding Directory Entry",
+        params: &[
+            p("BNDDIR", Kind::Qualified, true, None, "Binding directory").ch("Name"),
+            p("OBJ", Kind::Command, true, None, "Object specifications")
+                .ch("(Name *SRVPGM|*MODULE|*ALL)..."),
+        ],
+    },
+    CommandDef {
+        name: "DSPBNDDIR",
+        description: "Display Binding Directory",
+        params: &[p("BNDDIR", Kind::Qualified, true, None, "Binding directory").ch("Name")],
+    },
+    CommandDef {
+        name: "DLTMOD",
+        description: "Delete Module",
+        params: &[p("MODULE", Kind::Qualified, true, None, "Module").ch("Name")],
+    },
+    CommandDef {
+        name: "DLTSRVPGM",
+        description: "Delete Service Program",
+        params: &[p("SRVPGM", Kind::Qualified, true, None, "Service program").ch("Name")],
+    },
+    CommandDef {
+        name: "DLTBNDDIR",
+        description: "Delete Binding Directory",
+        params: &[p("BNDDIR", Kind::Qualified, true, None, "Binding directory").ch("Name")],
+    },
+    CommandDef {
+        name: "RCLACTGRP",
+        description: "Reclaim Activation Group",
+        params: &[p("ACTGRP", Kind::Name, true, None, "Activation group").ch("Name, *ELIGIBLE")],
+    },
+    // Binder language (source type BND): read by CRTSRVPGM, not run.
+    CommandDef {
+        name: "STRPGMEXP",
+        description: "Start Program Export List",
+        params: &[
+            p(
+                "PGMLVL",
+                Kind::Name,
+                false,
+                Some("*CURRENT"),
+                "Program level",
+            )
+            .ch("*CURRENT, *PRV")
+            .keyword_only(),
+            p("LVLCHK", Kind::Name, false, Some("*YES"), "Level check")
+                .ch("*YES, *NO")
+                .keyword_only(),
+            p("SIGNATURE", Kind::Text, false, Some("*GEN"), "Signature")
+                .ch("*GEN, 'value'")
+                .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "EXPORT",
+        description: "Export a Program Symbol",
+        params: &[p("SYMBOL", Kind::Text, true, None, "Exported symbol name")],
+    },
+    CommandDef {
+        name: "ENDPGMEXP",
+        description: "End Program Export List",
+        params: &[],
     },
     CommandDef {
         name: "CRTSQLRPGI",
@@ -874,7 +1152,23 @@ pub static GROUPS: &[Group] = &[
             "CRTCLPGM",
             "CRTBNDRPG",
             "CRTSQLRPGI",
+            "CRTRPGMOD",
+            "CRTSRVPGM",
+            "CRTPGM",
+            "CRTBNDDIR",
+            "ADDBNDDIRE",
+            "RMVBNDDIRE",
+            "DSPBNDDIR",
+            "DLTMOD",
+            "DLTSRVPGM",
+            "DLTBNDDIR",
+            "RCLACTGRP",
         ],
+    },
+    Group {
+        item: "Binder language",
+        title: "Binder Language Commands",
+        commands: &["STRPGMEXP", "EXPORT", "ENDPGMEXP"],
     },
     Group {
         item: "Menu commands",

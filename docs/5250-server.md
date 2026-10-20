@@ -160,6 +160,12 @@ DSPLIB:
 | `RUNSQL SQL('...')` | Runs one INSERT, UPDATE or DELETE (not SELECT) and reports the rows changed, or a data definition statement such as CREATE TABLE. |
 | `RUNSQLSTM SRCFILE(LIB/QSQLSRC) SRCMBR(NAME)` | Runs the SQL statements in a source member ([sql.md](sql.md)). |
 | `DLTF FILE(LIB/NAME)` | Deletes a database or display file (not a physical file with logical files over it: CPF3203). |
+| `CRTRPGMOD MODULE(LIB/NAME)` | Creates a module from QRPGLESRC (checked like CRTBNDRPG; `NOMAIN` modules have only procedures). |
+| `CRTSRVPGM SRVPGM(LIB/NAME) MODULE(...) EXPORT(*SRCFILE\|*ALL) SRCFILE SRCMBR BNDSRVPGM BNDDIR` | Creates a service program from modules; its exports come from binder language (`STRPGMEXP`/`EXPORT`/`ENDPGMEXP` in QSRVSRC) or all exported procedures. |
+| `CRTPGM PGM(LIB/NAME) MODULE(...) ENTMOD BNDSRVPGM BNDDIR` | Binds modules and service programs into a program. |
+| `CRTBNDDIR`, `ADDBNDDIRE`, `RMVBNDDIRE`, `DSPBNDDIR` | Binding directories: lists of modules and service programs searched for imports by CRTPGM, CRTSRVPGM and CRTBNDRPG (`BNDDIR`, or `ctl-opt bnddir`). |
+| `DLTMOD`, `DLTSRVPGM`, `DLTBNDDIR` | Delete ILE objects. |
+| `RCLACTGRP ACTGRP(*ELIGIBLE\|name)` | Ends the job's service program activations: their storage starts over at the next call. |
 | `DSPPFM FILE(lib/name)` | Shows a physical file's records in arrival order, one line each with the field names above. F19/F20 shift left/right on wide files. |
 
 Keyword and positional forms both work (`CRTLIB MYLIB` = `CRTLIB LIB(MYLIB)`). Unquoted values are folded to upper case; quoted values keep their case, with `''` for an apostrophe.

@@ -3342,3 +3342,112 @@ async fn sql_float_binary_graphic_lob() {
     // The update changed RATE and NOTE; the large objects are as they were.
     assert_eq!(rows, vec![vec!["30.75", "Bern", "a long text", "0102"]]);
 }
+
+/// ILE: modules, service programs, binding directories (IBM ILE Concepts).
+/// A NOMAIN module's EXPORTed procedures are bound into a service program
+/// (CRTSRVPGM; EXPORT(*SRCFILE) takes the binder language's EXPORT
+/// SYMBOLs); a program created with ctl-opt BNDDIR finds them through the
+/// binding directory; its calls run them, parameters by reference come
+/// back changed. A service program's global storage lives in its
+/// activation for the rest of the job (the call count goes 1, then 2), and
+/// RCLACTGRP *ELIGIBLE ends it. CRTPGM binds modules into one program. A
+/// symbol nobody exports stops the creation (CPD5D02); an export the
+/// modules do not have stops CRTSRVPGM (CPD5D03).
+#[tokio::test]
+async fn ile_modules_service_programs_bnddir() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+    };
+    for f in ["QRPGLESRC", "QSRVSRC"] {
+        source::create_file(&client, &lib, f, "").await.unwrap();
+    }
+    let put = |file: &str, name: &str, srctype: &str, text: &str| source::Member {
+        library: lib.clone(),
+        file: file.into(),
+        name: name.into(),
+        srctype: srctype.into(),
+        text: String::new(),
+        source: text.into(),
+    };
+    let members = [
+        put("QRPGLESRC", "MATHMOD", "RPGLE", "**FREE\nctl-opt nomain;\ndcl-s calls int(10);\ndcl-proc addTwo export;\n  dcl-pi *n packed(9:2);\n    a packed(9:2) const;\n    b packed(9:2) const;\n  end-pi;\n  calls += 1;\n  return a + b;\nend-proc;\ndcl-proc callCount export;\n  dcl-pi *n int(10) end-pi;\n  return calls;\nend-proc;\ndcl-proc double export;\n  dcl-pi *n;\n    v packed(9:2);\n  end-pi;\n  v = v * 2;\nend-proc;\n"),
+        put("QSRVSRC", "MATHSRV", "BND", "STRPGMEXP PGMLVL(*CURRENT) SIGNATURE('MATH V1')\n  EXPORT SYMBOL(ADDTWO)\n  EXPORT SYMBOL(CALLCOUNT)\n  EXPORT SYMBOL(DOUBLE)\nENDPGMEXP\n"),
+        put("QSRVSRC", "BADSRV", "BND", "STRPGMEXP PGMLVL(*CURRENT)\n  EXPORT SYMBOL(NOSUCH)\nENDPGMEXP\n"),
+        put("QRPGLESRC", "USEMATH", "RPGLE", "**FREE\nctl-opt bnddir('MATHDIR');\ndcl-pr addTwo packed(9:2);\n  a packed(9:2) const;\n  b packed(9:2) const;\nend-pr;\ndcl-pr callCount int(10) end-pr;\ndcl-pr double;\n  v packed(9:2);\nend-pr;\ndcl-s x packed(9:2) inz(5);\ndsply %char(addTwo(1.25: 2));\ndouble(x);\ndsply %char(x);\ndsply %char(callCount());\n*inlr = *on;\n"),
+        put("QRPGLESRC", "NOBIND", "RPGLE", "**FREE\nctl-opt dftactgrp(*no);\ndcl-pr missing end-pr;\nmissing();\n*inlr = *on;\n"),
+        put("QRPGLESRC", "MAIN1", "RPGLE", "**FREE\ndcl-pr addTwo packed(9:2);\n  a packed(9:2) const;\n  b packed(9:2) const;\nend-pr;\ndsply %char(addTwo(40: 2));\n*inlr = *on;\n"),
+    ];
+    for m in &members {
+        source::put_member(&client, m, false).await.unwrap();
+    }
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/MATHMOD)"),
+        format!("CRTSRVPGM SRVPGM({lib}/MATHSRV) MODULE({lib}/MATHMOD) SRCFILE({lib}/QSRVSRC)"),
+        format!("CRTBNDDIR BNDDIR({lib}/MATHDIR)"),
+        format!("ADDBNDDIRE BNDDIR({lib}/MATHDIR) OBJ(({lib}/MATHSRV *SRVPGM))"),
+        format!("CRTBNDRPG PGM({lib}/USEMATH)"),
+        format!("CRTRPGMOD MODULE({lib}/MAIN1)"),
+        format!("CRTPGM PGM({lib}/BOUND1) MODULE({lib}/MAIN1 {lib}/MATHMOD)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    let call = format!("CALL PGM({lib}/USEMATH)");
+    assert_eq!(
+        cl_cmd(&mut job, call.clone()).await.unwrap(),
+        ["DSPLY  3.25", "DSPLY  10.00", "DSPLY  1"]
+    );
+    assert_eq!(
+        cl_cmd(&mut job, call.clone()).await.unwrap(),
+        ["DSPLY  3.25", "DSPLY  10.00", "DSPLY  2"]
+    );
+    cl_cmd(&mut job, "RCLACTGRP ACTGRP(*ELIGIBLE)".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        cl_cmd(&mut job, call).await.unwrap(),
+        ["DSPLY  3.25", "DSPLY  10.00", "DSPLY  1"]
+    );
+    assert_eq!(
+        cl_cmd(&mut job, format!("CALL PGM({lib}/BOUND1)"))
+            .await
+            .unwrap(),
+        ["DSPLY  42.00"]
+    );
+    let e = cl_cmd(&mut job, format!("CRTBNDRPG PGM({lib}/NOBIND)"))
+        .await
+        .unwrap_err();
+    assert!(e.contains("CPD5D02") && e.contains("MISSING"), "{e}");
+    let e = cl_cmd(
+        &mut job,
+        format!("CRTSRVPGM SRVPGM({lib}/BADSRV) MODULE({lib}/MATHMOD) SRCFILE({lib}/QSRVSRC)"),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("CPD5D03"), "{e}");
+}
+
+/// Run a CL command; its messages, or the error.
+async fn cl_cmd(
+    job: &mut as4tainr_core::commands::Job<'_>,
+    c: String,
+) -> Result<Vec<String>, String> {
+    use as4tainr_core::commands::Outcome;
+    match job.run(&c).await {
+        Ok(Outcome::Messages(m)) => Ok(m),
+        Ok(other) => Ok(vec![format!("{other:?}")]),
+        Err(e) => Err(format!("{c}: {e:#}")),
+    }
+}

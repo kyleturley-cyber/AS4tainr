@@ -151,13 +151,27 @@ pub async fn call(
         display,
         cl,
         name,
-        (source, String::new()),
+        ProgramCode {
+            source,
+            options: String::new(),
+            binding: None,
+        },
         args,
     )
     .await
 }
 
-/// `call` of a program object: (source, compile options).
+/// A program object's code: its (entry module's) source, the create
+/// command's options, and how its modules are bound (CRTPGM, binding
+/// directories).
+#[derive(Clone, Debug, Default)]
+pub struct ProgramCode {
+    pub source: String,
+    pub options: String,
+    pub binding: Option<crate::ile::Binding>,
+}
+
+/// `call` of a program object.
 #[allow(clippy::too_many_arguments)]
 pub async fn call_with(
     database_url: &str,
@@ -167,9 +181,14 @@ pub async fn call_with(
     display: Option<crate::runtime::DisplayHandle>,
     cl: Option<ClContext>,
     name: String,
-    (source, options): (String, String),
+    code: ProgramCode,
     args: Vec<String>,
 ) -> Result<CallResult> {
+    let ProgramCode {
+        source,
+        options,
+        binding,
+    } = code;
     let rt = tokio::runtime::Handle::current();
     let url = database_url.to_string();
     tokio::task::spawn_blocking(move || -> Result<CallResult> {
@@ -206,6 +225,12 @@ pub async fn call_with(
                 cl,
                 callers: vec![],
                 database_url: url.clone(),
+                job_key: job
+                    .clone()
+                    .unwrap_or_else(|| format!("PID{}", std::process::id())),
+                binding: binding.map(std::sync::Arc::new),
+                unit: None,
+                modules: Default::default(),
             },
         );
         let r = m.run(&args);

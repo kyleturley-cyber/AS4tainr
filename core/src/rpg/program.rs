@@ -132,6 +132,8 @@ pub struct ProcInfo {
     /// ON-EXIT: its indicator variable (on when the procedure ends
     /// abnormally) and its code, run however the procedure ends.
     pub on_exit: Option<(Option<String>, Routines)>,
+    /// EXPORT: other modules and programs can call it.
+    pub export: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -155,6 +157,11 @@ pub struct Program {
     pub procs: HashMap<String, ProcInfo>,
     /// `ctl-opt main(name)`: the program runs that procedure, no cycle.
     pub main: Option<String>,
+    /// Procedures called that are not in this module (bound in by CRTPGM,
+    /// CRTSRVPGM or a binding directory).
+    pub imports: Vec<String>,
+    /// `ctl-opt nomain`: only procedures, no main procedure.
+    pub nomain: bool,
     /// Embedded SQL cursors (DECLARE name CURSOR FOR ...): the SELECT as
     /// written, or the name of a prepared statement.
     pub cursors: HashMap<String, Cursor>,
@@ -387,6 +394,23 @@ fn num_arg(a: &str, syms: &HashMap<String, Sym>) -> Result<u32> {
     }
 }
 
+/// Procedures the system provides (not imports to resolve).
+pub const SYSTEM_PROCEDURES: &[&str] = &["QP0ZLPRINTF"];
+
+impl Program {
+    /// Procedures this module exports.
+    pub fn exports(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .procs
+            .values()
+            .filter(|p| p.export)
+            .map(|p| p.name.clone())
+            .collect();
+        v.sort();
+        v
+    }
+}
+
 /// External field type as the program sees it outside a data structure:
 /// zoned and packed fields are packed (ILE RPG Reference: numeric fields
 /// of externally described files are packed in the program).
@@ -431,7 +455,9 @@ struct Binder<'a> {
     /// Types of external file fields, by name.
     file_fields: HashMap<String, DType>,
     /// Pending INZ values: (variable, value).
-    inz: Vec<(String, Value)>,
+    /// Pending INZ values: (variable, value, or its text when it refers to
+    /// a name defined later, as %SIZE of a later subfield can).
+    inz: Vec<(String, Result<Value, String>)>,
     /// Binding a procedure's local storage.
     local: bool,
     /// Local buffers of STATIC variables (moved to global storage).
@@ -658,6 +684,10 @@ impl Binder<'_> {
     /// Store the pending INZ values.
     fn apply_inz(&mut self) -> Result<()> {
         for (name, v) in std::mem::take(&mut self.inz) {
+            let v = match v {
+                Ok(v) => v,
+                Err(text) => literal_value(&text, &self.syms)?,
+            };
             if let Some(Sym::Var(var)) = self.syms.get(&name).cloned() {
                 for k in 0..var.dim.max(1) as usize {
                     let at = var.off + k * var.stride;
@@ -738,7 +768,9 @@ impl Binder<'_> {
     fn inz(&mut self, name: &str, d: &Def) -> Result<()> {
         if let Some(k) = keyword(&d.keywords, "INZ") {
             if let Some(a) = k.args.first().filter(|a| !a.is_empty()) {
-                let v = literal_value(a, &self.syms)?;
+                // A value that names something not defined yet is worked
+                // out once all definitions are in.
+                let v = literal_value(a, &self.syms).map_err(|_| a.clone());
                 self.inz.push((name.to_string(), v));
             }
         }
@@ -1330,6 +1362,7 @@ pub fn bind(
                 returns,
                 routines: code::build(body).map_err(|e| anyhow!("procedure {}: {e}", pr.name))?,
                 on_exit,
+                export: pr.export,
             },
         );
     }
@@ -1356,7 +1389,30 @@ pub fn bind(
         }
     }
     let routines = code::build(&src.calcs)?;
+    // Imports: procedures the code calls through a prototype that no
+    // procedure here defines (ILE: resolved when the module is bound).
+    let calls = format!(
+        "{:?}{:?}",
+        src.calcs,
+        src.procs.iter().map(|p| &p.calcs).collect::<Vec<_>>()
+    );
+    let mut imports: Vec<String> = protos
+        .values()
+        .filter(|p| p.extpgm.is_none())
+        .filter(|p| calls.contains(&format!("parts: [{:?}]", p.name)))
+        .filter_map(|p| p.extproc.clone())
+        .map(|t| t.to_ascii_uppercase())
+        .filter(|t| !procs.contains_key(t) && !SYSTEM_PROCEDURES.contains(&t.as_str()))
+        .collect();
+    imports.sort();
+    imports.dedup();
+    let nomain = keyword(&src.control, "NOMAIN").is_some();
+    if nomain && !src.calcs.is_empty() {
+        bail!("ctl-opt NOMAIN: a module without a main procedure has no calculations outside procedures (RNF3788)");
+    }
     Ok(Program {
+        imports,
+        nomain,
         name: name.to_ascii_uppercase(),
         syms: b.syms,
         globals: b.bufs,

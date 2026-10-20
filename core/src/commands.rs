@@ -142,6 +142,24 @@ impl Job<'_> {
             "STRSQL" => Ok(Outcome::StartSql),
             "RUNSQL" => self.runsql(&cmd).await,
             "RUNSQLSTM" => self.runsqlstm(&cmd).await,
+            "CRTRPGMOD" => self.crtrpgmod(&cmd).await,
+            "CRTSRVPGM" => self.crtsrvpgm(&cmd).await,
+            "CRTPGM" => self.crtpgm_bound(&cmd).await,
+            "CRTBNDDIR" => self.crtbnddir(&cmd).await,
+            "ADDBNDDIRE" | "RMVBNDDIRE" => self.bnddire(&cmd).await,
+            "DSPBNDDIR" => self.dspbnddir(&cmd).await,
+            "DLTMOD" | "DLTSRVPGM" | "DLTBNDDIR" => self.dlt_ile(&cmd).await,
+            "RCLACTGRP" => {
+                let key = self
+                    .id
+                    .as_ref()
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| format!("PID{}", std::process::id()));
+                crate::ile::end_activations(&key);
+                Ok(Outcome::Messages(vec![
+                    "Activation groups reclaimed.".into()
+                ]))
+            }
             "DLTF" => self.dltf(&cmd).await,
             "WRKOBJ" => self.wrkobj(&cmd).await,
             "DSPPFM" => self.dsppfm(&cmd).await,
@@ -475,6 +493,357 @@ impl Job<'_> {
         Ok(lines)
     }
 
+    /// Module copies named on CRTPGM/CRTSRVPGM MODULE (`*PGM`/`*SRVPGM`:
+    /// the module named like the object, in its library).
+    async fn module_list(
+        &self,
+        cmd: &Command,
+        lib: &str,
+        name: &str,
+    ) -> Result<Vec<crate::ile::ModuleCopy>> {
+        let mut out = Vec::new();
+        for m in cmd.list("MODULE") {
+            let (l, n) = match m.as_str() {
+                "*PGM" | "*SRVPGM" => (lib.to_string(), name.to_string()),
+                other => match other.split_once('/') {
+                    Some(("*LIBL", n)) => ("*LIBL".to_string(), n.to_string()),
+                    Some(("*CURLIB", n)) => (self.current_library(), n.to_string()),
+                    Some((l, n)) => (l.to_string(), n.to_string()),
+                    None => ("*LIBL".to_string(), other.to_string()),
+                },
+            };
+            let n = n.to_ascii_uppercase();
+            let copy = crate::ile::find_module(
+                self.client,
+                &self.library_list(),
+                &l.to_ascii_uppercase(),
+                &n,
+            )
+            .await?;
+            let found_lib = if l == "*LIBL" {
+                let mut found = String::new();
+                for x in self.library_list() {
+                    if catalog::object_exists(self.client, std::slice::from_ref(&x), &n, "*MODULE")
+                        .await?
+                    {
+                        found = x;
+                        break;
+                    }
+                }
+                found
+            } else {
+                l.to_ascii_uppercase()
+            };
+            authority::check(self.client, &self.user, &found_lib, &n, "*MODULE", Aut::Use).await?;
+            out.push(copy);
+        }
+        Ok(out)
+    }
+
+    /// (library, name) pairs of BNDSRVPGM, and BNDDIR names.
+    fn bind_lists(cmd: &Command) -> (Vec<(String, String)>, Vec<String>) {
+        let srv = cmd
+            .list("BNDSRVPGM")
+            .into_iter()
+            .filter(|x| x != "*NONE")
+            .map(|x| match x.split_once('/') {
+                Some((l, n)) => (l.to_ascii_uppercase(), n.to_ascii_uppercase()),
+                None => ("*LIBL".to_string(), x.to_ascii_uppercase()),
+            })
+            .collect();
+        let dirs = cmd
+            .list("BNDDIR")
+            .into_iter()
+            .filter(|x| x != "*NONE")
+            .collect();
+        (srv, dirs)
+    }
+
+    /// CRTRPGMOD: a module from a source member, checked as the compiler
+    /// does.
+    async fn crtrpgmod(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = self.create_target(cmd.get("MODULE"));
+        let (lib, name) = (lib.to_ascii_uppercase(), name.to_ascii_uppercase());
+        let m = self.source_member(cmd, &name).await?;
+        let mut libl = self.library_list();
+        if !libl.contains(&lib) {
+            libl.insert(0, lib.clone());
+        }
+        crate::rpg::compile(self.client, &libl, &name, &m.source).await?;
+        if cmd.get("REPLACE") == "*NO"
+            && catalog::object_exists(self.client, std::slice::from_ref(&lib), &name, "*MODULE")
+                .await?
+        {
+            bail!("CPF5D0B: Module {name} in library {lib} already exists (REPLACE(*NO)).");
+        }
+        let text = match cmd.get("TEXT") {
+            "*SRCMBRTXT" => m.text.clone(),
+            "*BLANK" => String::new(),
+            t => t.to_string(),
+        };
+        let mut c = runtime::connect_db(&self.env.database_url).await?;
+        crate::ile::store(
+            &mut c, &lib, &name, "*MODULE", "RPGLE", &text, &m.source, "",
+        )
+        .await?;
+        authority::set_owner(self.client, &lib, &name, "*MODULE", &self.user).await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Module {name} created in library {lib}."
+        )]))
+    }
+
+    /// CRTSRVPGM: modules bound into a service program; EXPORT(*ALL) exports
+    /// every exported procedure, EXPORT(*SRCFILE) the binder language's.
+    async fn crtsrvpgm(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = self.create_target(cmd.get("SRVPGM"));
+        let (lib, name) = (lib.to_ascii_uppercase(), name.to_ascii_uppercase());
+        let modules = self.module_list(cmd, &lib, &name).await?;
+        let (srv, dirs) = Self::bind_lists(cmd);
+        let mut libl = self.library_list();
+        if !libl.contains(&lib) {
+            libl.insert(0, lib.clone());
+        }
+        let not_created = |e: anyhow::Error| {
+            anyhow::anyhow!("CPF5D11: Service program {name} not created. {e:#}")
+        };
+        let (mut binding, infos) = crate::ile::bind(self.client, &libl, modules, &srv, &dirs)
+            .await
+            .map_err(not_created)?;
+        let all: Vec<String> = infos.iter().flat_map(|i| i.exports.clone()).collect();
+        let (exports, signature) = if cmd.get("EXPORT") == "*ALL" {
+            (all.clone(), None)
+        } else {
+            let (libs, file) = self.search(cmd.get("SRCFILE"));
+            let member = match cmd.get("SRCMBR") {
+                "*SRVPGM" => name.clone(),
+                m => m.to_string(),
+            };
+            let src = crate::source::find_member(self.client, &libs, &file, &member).await?;
+            crate::ile::binder_language(&src.source).map_err(not_created)?
+        };
+        for e in &exports {
+            if !all.contains(e) {
+                return Err(not_created(anyhow::anyhow!(
+                    "CPD5D03: Symbol {e} named for export is not exported by any of the modules."
+                )));
+            }
+        }
+        binding.signature = signature.unwrap_or_else(|| crate::ile::generated_signature(&exports));
+        binding.exports = exports;
+        if cmd.get("REPLACE") == "*NO"
+            && catalog::object_exists(self.client, std::slice::from_ref(&lib), &name, "*SRVPGM")
+                .await?
+        {
+            bail!(
+                "CPF5D0B: Service program {name} in library {lib} already exists (REPLACE(*NO))."
+            );
+        }
+        let text = match cmd.get("TEXT") {
+            "*BLANK" => String::new(),
+            t => t.to_string(),
+        };
+        let json = serde_json::to_string(&binding)?;
+        let mut c = runtime::connect_db(&self.env.database_url).await?;
+        crate::ile::store(&mut c, &lib, &name, "*SRVPGM", "RPGLE", &text, &json, "").await?;
+        authority::set_owner(self.client, &lib, &name, "*SRVPGM", &self.user).await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Service program {name} created in library {lib}."
+        )]))
+    }
+
+    /// CRTPGM: a program from modules; its entry module (ENTMOD, or the
+    /// first with a main procedure) is what CALL runs.
+    async fn crtpgm_bound(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = self.create_target(cmd.get("PGM"));
+        let (lib, name) = (lib.to_ascii_uppercase(), name.to_ascii_uppercase());
+        let mut modules = self.module_list(cmd, &lib, &name).await?;
+        let (srv, dirs) = Self::bind_lists(cmd);
+        let mut libl = self.library_list();
+        if !libl.contains(&lib) {
+            libl.insert(0, lib.clone());
+        }
+        let not_created =
+            |e: anyhow::Error| anyhow::anyhow!("CPF5D04: Program {name} not created. {e:#}");
+        // The entry module first.
+        let mut infos = Vec::new();
+        for m in &modules {
+            infos.push(
+                crate::ile::module_info(self.client, &libl, m)
+                    .await
+                    .map_err(not_created)?,
+            );
+        }
+        let entry = match cmd.get("ENTMOD") {
+            "*FIRST" => infos.iter().position(|i| i.has_main),
+            e => {
+                let e = e.rsplit('/').next().unwrap_or(e).to_ascii_uppercase();
+                infos.iter().position(|i| i.name == e)
+            }
+        };
+        let Some(entry) = entry.filter(|k| infos[*k].has_main) else {
+            return Err(not_created(anyhow::anyhow!(
+                "CPD5D11: No module has a program entry procedure (all are NOMAIN)."
+            )));
+        };
+        let first = modules.remove(entry);
+        modules.insert(0, first);
+        let (mut binding, _) = crate::ile::bind(self.client, &libl, modules.clone(), &srv, &dirs)
+            .await
+            .map_err(not_created)?;
+        let entry = modules[0].clone();
+        binding.modules.retain(|m| m.name != entry.name);
+        if cmd.get("REPLACE") == "*NO"
+            && catalog::object_exists(self.client, std::slice::from_ref(&lib), &name, "*PGM")
+                .await?
+        {
+            bail!("CPF5D0B: Program {name} in library {lib} already exists (REPLACE(*NO)).");
+        }
+        let text = match cmd.get("TEXT") {
+            "*ENTMODTXT" | "*BLANK" => String::new(),
+            t => t.to_string(),
+        };
+        let mut c = runtime::connect_db(&self.env.database_url).await?;
+        catalog::create_program(&mut c, &lib, &name, "RPGLE", &text, &entry.source, true).await?;
+        catalog::set_program_options(self.client, &lib, &name, &entry.options).await?;
+        crate::ile::set_program_binding(self.client, &lib, &name, Some(&binding)).await?;
+        authority::set_owner(self.client, &lib, &name, "*PGM", &self.user).await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Program {name} created in library {lib}."
+        )]))
+    }
+
+    async fn crtbnddir(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = self.create_target(cmd.get("BNDDIR"));
+        let (lib, name) = (lib.to_ascii_uppercase(), name.to_ascii_uppercase());
+        crate::ile::create_bnddir(self.client, &lib, &name, cmd.get("TEXT")).await?;
+        authority::set_owner(self.client, &lib, &name, "*BNDDIR", &self.user).await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Binding directory {name} created in library {lib}."
+        )]))
+    }
+
+    /// The binding directory a command names (found through the library
+    /// list), after checking the user may change it.
+    async fn bnddir_of(&self, q: &str, need: Aut) -> Result<(String, String)> {
+        let (libs, name) = self.search(q);
+        let name = name.to_ascii_uppercase();
+        for l in &libs {
+            if catalog::object_exists(self.client, std::slice::from_ref(l), &name, "*BNDDIR")
+                .await?
+            {
+                authority::check(self.client, &self.user, l, &name, "*BNDDIR", need).await?;
+                return Ok((l.clone(), name));
+            }
+        }
+        bail!("CPF5D07: Binding directory {name} not found.")
+    }
+
+    /// ADDBNDDIRE and RMVBNDDIRE: OBJ((LIB/NAME *SRVPGM) (NAME *MODULE) ...).
+    async fn bnddire(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, dir) = self.bnddir_of(cmd.get("BNDDIR"), Aut::Change).await?;
+        let raw = cmd.get("OBJ");
+        let groups: Vec<Vec<String>> = if raw.trim_start().starts_with('(') {
+            raw.split(')')
+                .map(|g| g.trim().trim_start_matches('(').trim())
+                .filter(|g| !g.is_empty())
+                .map(|g| {
+                    g.split_whitespace()
+                        .map(|w| w.to_ascii_uppercase())
+                        .collect()
+                })
+                .collect()
+        } else {
+            vec![raw
+                .split_whitespace()
+                .map(|w| w.to_ascii_uppercase())
+                .collect()]
+        };
+        let mut entries = Vec::new();
+        for g in groups {
+            let obj = g.first().cloned().unwrap_or_default();
+            let t = g.get(1).cloned().unwrap_or_else(|| "*SRVPGM".into());
+            if cmd.def.name == "ADDBNDDIRE" && !matches!(t.as_str(), "*SRVPGM" | "*MODULE") {
+                bail!("CPF5D10: Object type {t} is not valid in a binding directory (*SRVPGM or *MODULE).");
+            }
+            entries.push((obj, t));
+        }
+        if cmd.def.name == "ADDBNDDIRE" {
+            let rows: Vec<(String, String, String)> = entries
+                .iter()
+                .map(|(o, t)| match o.split_once('/') {
+                    Some((l, n)) => (l.to_string(), n.to_string(), t.clone()),
+                    None => ("*LIBL".to_string(), o.clone(), t.clone()),
+                })
+                .collect();
+            for (l, n, _) in &rows {
+                catalog::validate_name("object", n)?;
+                if l != "*LIBL" {
+                    catalog::validate_name("library", l)?;
+                }
+            }
+            let n = crate::ile::add_bnddir_entries(self.client, &lib, &dir, &rows).await?;
+            Ok(Outcome::Messages(vec![format!(
+                "{n} entries added to binding directory {dir} in {lib}."
+            )]))
+        } else {
+            let n = crate::ile::remove_bnddir_entries(self.client, &lib, &dir, &entries).await?;
+            if n == 0 {
+                bail!("CPF5D08: Object not found in binding directory {dir}.");
+            }
+            Ok(Outcome::Messages(vec![format!(
+                "{n} entries removed from binding directory {dir} in {lib}."
+            )]))
+        }
+    }
+
+    async fn dspbnddir(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, dir) = self.bnddir_of(cmd.get("BNDDIR"), Aut::Use).await?;
+        let rows = crate::ile::bnddir_entries(
+            self.client,
+            std::slice::from_ref(&lib),
+            &format!("{lib}/{dir}"),
+        )
+        .await?;
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display Binding Directory".into(),
+            info: vec![
+                ("Binding directory".into(), dir.clone()),
+                ("Library".into(), lib.clone()),
+            ],
+            heading: format!("{:<10}  {:<10}  {:<8}", "Object", "Library", "Type"),
+            rows: rows
+                .iter()
+                .map(|(l, n, t)| format!("{n:<10}  {l:<10}  {t:<8}"))
+                .collect(),
+            ..Default::default()
+        }))
+    }
+
+    /// DLTMOD, DLTSRVPGM, DLTBNDDIR.
+    async fn dlt_ile(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (kw, objtype, what) = match cmd.def.name {
+            "DLTMOD" => ("MODULE", "*MODULE", "Module"),
+            "DLTSRVPGM" => ("SRVPGM", "*SRVPGM", "Service program"),
+            _ => ("BNDDIR", "*BNDDIR", "Binding directory"),
+        };
+        let (libs, name) = self.search(cmd.get(kw));
+        let name = name.to_ascii_uppercase();
+        for l in &libs {
+            if catalog::object_exists(self.client, std::slice::from_ref(l), &name, objtype).await? {
+                if authority::effective(self.client, &self.user, l, &name, objtype).await?
+                    < Aut::All
+                {
+                    bail!("CPF2189: Not authorized to delete {name} in {l} type {objtype}.");
+                }
+                crate::ile::delete_object(self.client, l, &name, objtype).await?;
+                return Ok(Outcome::Messages(vec![format!(
+                    "{what} {name} in library {l} deleted."
+                )]));
+            }
+        }
+        bail!("CPF2105: {what} {name} not found.")
+    }
+
     /// DLTF: delete a file (not a physical file that logical files are
     /// built over: CPF3203).
     async fn dltf(&mut self, cmd: &Command) -> Result<Outcome> {
@@ -651,7 +1020,7 @@ impl Job<'_> {
     async fn source_member(&self, cmd: &Command, object: &str) -> Result<crate::source::Member> {
         let (libs, file) = self.search(cmd.get("SRCFILE"));
         let member = match cmd.get("SRCMBR") {
-            "*FILE" | "*PGM" | "*OBJ" => object.to_string(),
+            "*FILE" | "*PGM" | "*OBJ" | "*MODULE" => object.to_string(),
             m => m.to_string(),
         };
         let m = crate::source::find_member(self.client, &libs, &file, &member).await?;
@@ -741,9 +1110,34 @@ impl Job<'_> {
     /// program is checked (compiled) first.
     async fn crtpgm(&mut self, cmd: &Command) -> Result<Outcome> {
         let sql = cmd.def.name == "CRTSQLRPGI";
+        if sql && cmd.get("OBJTYPE") == "*MODULE" {
+            // A module with embedded SQL, for CRTPGM or CRTSRVPGM.
+            let (lib, name) = self.create_target(cmd.get("OBJ"));
+            let (lib, name) = (lib.to_ascii_uppercase(), name.to_ascii_uppercase());
+            let m = self.source_member(cmd, &name).await?;
+            let mut libl = self.library_list();
+            if !libl.contains(&lib) {
+                libl.insert(0, lib.clone());
+            }
+            crate::rpg::compile(self.client, &libl, &name, &m.source).await?;
+            let text = match cmd.get("TEXT") {
+                "*SRCMBRTXT" => m.text.clone(),
+                "*BLANK" => String::new(),
+                t => t.to_string(),
+            };
+            let mut c = runtime::connect_db(&self.env.database_url).await?;
+            crate::ile::store(
+                &mut c, &lib, &name, "*MODULE", "SQLRPGLE", &text, &m.source, "",
+            )
+            .await?;
+            authority::set_owner(self.client, &lib, &name, "*MODULE", &self.user).await?;
+            return Ok(Outcome::Messages(vec![format!(
+                "Module {name} created in library {lib}."
+            )]));
+        }
         if sql && cmd.get("OBJTYPE") != "*PGM" {
             bail!(
-                "CRTSQLRPGI OBJTYPE({}): only *PGM can be created yet.",
+                "CRTSQLRPGI OBJTYPE({}): service programs are created from modules with CRTSRVPGM.",
                 cmd.get("OBJTYPE")
             );
         }
@@ -763,6 +1157,7 @@ impl Job<'_> {
                 m.name
             );
         }
+        let mut binding: Option<crate::ile::Binding> = None;
         // Compile options from the command (CRTBNDRPG ALWNULL).
         let options = match cmd.def.name {
             "CRTBNDRPG" if cmd.get("ALWNULL") != "*NO" => {
@@ -778,7 +1173,48 @@ impl Job<'_> {
             if !libl.contains(&lib) {
                 libl.insert(0, lib.clone());
             }
-            crate::rpg::compile_with(self.client, &libl, &name, &m.source, &options).await?;
+            let prog =
+                crate::rpg::compile_with(self.client, &libl, &name, &m.source, &options).await?;
+            // Procedures the program calls that are elsewhere: bound from
+            // the binding directories (BNDDIR, ctl-opt BNDDIR).
+            if !prog.imports.is_empty() {
+                let mut dirs: Vec<String> = cmd
+                    .list("BNDDIR")
+                    .into_iter()
+                    .filter(|d| d != "*NONE")
+                    .collect();
+                if let Some(k) = crate::rpg::ast::keyword(&prog.control, "BNDDIR") {
+                    dirs.extend(
+                        k.args
+                            .iter()
+                            .map(|a| a.trim().trim_matches('\'').to_ascii_uppercase()),
+                    );
+                }
+                // DFTACTGRP(*YES) programs cannot bind; ctl-opt BNDDIR or
+                // ACTGRP implies DFTACTGRP(*NO) (ILE RPG Reference).
+                let ctl = |k: &str| crate::rpg::ast::keyword(&prog.control, k);
+                let dft = match ctl("DFTACTGRP").and_then(|k| k.args.first()) {
+                    Some(a) => a.trim().eq_ignore_ascii_case("*YES"),
+                    None if ctl("BNDDIR").is_some() || ctl("ACTGRP").is_some() => false,
+                    None => cmd.def.name == "CRTBNDRPG" && cmd.get("DFTACTGRP") == "*YES",
+                };
+                if dft {
+                    bail!(
+                        "CPF5D04: Program {name} not created: it calls procedures that are not in it ({}), and a program in the default activation group (DFTACTGRP(*YES)) cannot be bound to them; specify DFTACTGRP(*NO) and BNDDIR.",
+                        prog.imports.join(", ")
+                    );
+                }
+                let entry = crate::ile::ModuleCopy {
+                    name: name.clone(),
+                    source: m.source.clone(),
+                    options: options.clone(),
+                };
+                let (mut b, _) = crate::ile::bind(self.client, &libl, vec![entry], &[], &dirs)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("CPF5D04: Program {name} not created. {e:#}"))?;
+                b.modules.retain(|x| x.name != name);
+                binding = Some(b);
+            }
             m.source.clone()
         } else {
             let src =
@@ -804,6 +1240,7 @@ impl Job<'_> {
         let mut c = runtime::connect_db(&self.env.database_url).await?;
         catalog::create_program(&mut c, &lib, &name, attribute, &text, &source, replace).await?;
         catalog::set_program_options(self.client, &lib, &name, &options).await?;
+        crate::ile::set_program_binding(self.client, &lib, &name, binding.as_ref()).await?;
         authority::set_owner(self.client, &lib, &name, "*PGM", &self.user).await?;
         Ok(Outcome::Messages(vec![format!(
             "Program {name} created in library {lib}."
@@ -1780,8 +2217,15 @@ impl Job<'_> {
         let source = match library {
             Some(lib) => catalog::find_program(self.client, &[lib.to_string()], pgm)
                 .await?
-                .map(|p| (p.source, p.options)),
-            None => crate::rpg::source_from_path(pgm).map(|s| (s, String::new())),
+                .map(|p| crate::rpg::ProgramCode {
+                    source: p.source,
+                    options: p.options,
+                    binding: p.binding,
+                }),
+            None => crate::rpg::source_from_path(pgm).map(|s| crate::rpg::ProgramCode {
+                source: s,
+                ..Default::default()
+            }),
         }
         .ok_or_else(|| anyhow!("CPF4101: Program {pgm} not found."))?;
         let r = crate::rpg::call_with(

@@ -41,7 +41,20 @@ pub struct Io<'a> {
     pub callers: Vec<String>,
     /// The database, for the embedded SQL session.
     pub database_url: String,
+    /// The job, as service program activations know it.
+    pub job_key: String,
+    /// How the running object's modules are bound: where its imported
+    /// procedures are.
+    pub binding: Option<std::sync::Arc<crate::ile::Binding>>,
+    /// A service program's module being run: its activation (LIB/SRVPGM/MODULE).
+    pub unit: Option<String>,
+    /// The storage of the other modules of the running program, shared by
+    /// the calls into them while it runs.
+    pub modules: ModuleStorage,
 }
+
+/// Global storage of bound modules, by module.
+pub type ModuleStorage = std::sync::Arc<std::sync::Mutex<HashMap<String, Vec<Vec<u8>>>>>;
 
 /// Status of the last operation on a file (%FOUND, %EOF, %EQUAL, %ERROR).
 #[derive(Clone, Debug, Default)]
@@ -2756,10 +2769,162 @@ impl<'a> Machine<'a> {
                 self.job_log(&text);
                 Ok(Some(Value::Num(Dec::from_i64(text.len() as i64))))
             }
-            None => bail!(
-                "procedure {target} is not in this program (service programs and binding directories come with milestone R6)"
-            ),
+            None => {
+                let sym = target.to_ascii_uppercase();
+                let bound = self
+                    .io
+                    .binding
+                    .as_ref()
+                    .and_then(|b| b.imports.get(&sym))
+                    .cloned();
+                let Some(t) = bound else {
+                    bail!(
+                        "CPD5D02: Definition for procedure {target} not found: it is not in this module, and the program is not bound to a module or service program that exports it (CRTPGM, CRTSRVPGM, BNDDIR)."
+                    );
+                };
+                let a = self.args_for(name, &pr.params, args)?;
+                self.call_bound(&sym, &t, a)
+            }
         }
+    }
+
+    /// Call a procedure of another module: one bound into this program, or
+    /// one exported by a bound service program. The module runs on its own
+    /// global storage (a service program's is kept in the job's
+    /// activation); parameters by reference are passed in and come back.
+    fn call_bound(
+        &mut self,
+        sym: &str,
+        target: &crate::ile::Target,
+        args: Vec<Arg>,
+    ) -> Result<Option<Value>> {
+        use crate::ile::Target;
+        let client = self.io.client;
+        let libl = self.io.libl.clone();
+        let (code, unit, binding) = match target {
+            Target::Module(m) => {
+                let b = self.io.binding.clone().unwrap_or_default();
+                let code = b
+                    .modules
+                    .iter()
+                    .find(|x| &x.name == m)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("module {m} is not bound into the program"))?;
+                (code, format!("MODULE {m}"), b)
+            }
+            Target::SrvPgm { library, name } => {
+                let (lib, b) = self.block(crate::ile::find_srvpgm(client, &libl, library, name))?;
+                self.block(crate::authority::check(
+                    client,
+                    &self.io.user,
+                    &lib,
+                    name,
+                    "*SRVPGM",
+                    crate::authority::Aut::Use,
+                ))?;
+                // The module that exports the procedure.
+                let mut found = None;
+                for m in &b.modules {
+                    let p = self.block(super::compile_with(
+                        client, &libl, &m.name, &m.source, &m.options,
+                    ))?;
+                    if p.procs.get(sym).is_some_and(|pi| pi.export) {
+                        found = Some(m.clone());
+                        break;
+                    }
+                }
+                let code = found.ok_or_else(|| {
+                    anyhow!("CPD5D02: Service program {lib}/{name} does not export {sym}.")
+                })?;
+                let unit = format!("{lib}/{name}/{}", code.name);
+                (code, unit, std::sync::Arc::new(b))
+            }
+        };
+        let prog = self.block(super::compile_with(
+            client,
+            &libl,
+            &code.name,
+            &code.source,
+            &code.options,
+        ))?;
+        let pi = prog
+            .procs
+            .get(sym)
+            .filter(|pi| pi.export)
+            .ok_or_else(|| anyhow!("CPD5D02: Module {} does not export {sym}.", code.name))?;
+        let srvpgm = matches!(target, Target::SrvPgm { .. });
+        // The module's global storage: its activation, or its first use.
+        let storage = if srvpgm {
+            crate::ile::activation(&self.io.job_key, &unit)
+        } else {
+            self.io
+                .modules
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&unit).cloned())
+        };
+        let mut m = Machine::new(
+            &prog,
+            Io {
+                rt: self.io.rt.clone(),
+                client,
+                user: self.io.user.clone(),
+                job_number: self.io.job_number,
+                libl: libl.clone(),
+                job: self.io.job.clone(),
+                display: self.io.display.clone(),
+                cl: self.io.cl.clone(),
+                callers: self.io.callers.clone(),
+                database_url: self.io.database_url.clone(),
+                job_key: self.io.job_key.clone(),
+                binding: Some(binding),
+                unit: srvpgm.then(|| unit.clone()),
+                modules: if srvpgm {
+                    Default::default()
+                } else {
+                    self.io.modules.clone()
+                },
+            },
+        );
+        if let Some(s) = storage {
+            m.bufs = s;
+        }
+        let globals = m.bufs.len();
+        // Parameters by reference: the callee works on a copy that comes
+        // back when it returns.
+        let mut back = Vec::new();
+        let args: Vec<Arg> = args
+            .into_iter()
+            .map(|a| match a {
+                Arg::Ref(l) => {
+                    let idx = m.bufs.len();
+                    m.bufs
+                        .push(self.bufs[l.buf][l.off..l.off + l.size].to_vec());
+                    back.push((idx, l));
+                    Arg::Ref(Loc {
+                        buf: idx,
+                        off: 0,
+                        size: l.size,
+                        dtype: l.dtype,
+                    })
+                }
+                other => other,
+            })
+            .collect();
+        let r = m.call_proc(pi, args);
+        self.messages.append(&mut m.messages);
+        self.printed.append(&mut m.printed);
+        for (idx, l) in &back {
+            let bytes = m.bufs[*idx].clone();
+            self.bufs[l.buf][l.off..l.off + l.size].copy_from_slice(&bytes[..l.size]);
+        }
+        let kept: Vec<Vec<u8>> = m.bufs[..globals].to_vec();
+        if srvpgm {
+            crate::ile::keep_activation(&self.io.job_key, &unit, kept);
+        } else if let Ok(mut g) = self.io.modules.lock() {
+            g.insert(unit, kept);
+        }
+        r
     }
 
     /// Call a procedure of this program: a new frame of local storage,
@@ -2878,7 +3043,7 @@ impl<'a> Machine<'a> {
                     "*PGM",
                     crate::authority::Aut::Use,
                 ))?;
-                (p.source, p.options)
+                (p.source, p.options, p.binding)
             }
             Some(p) if p.attribute == "CLLE" || p.attribute == "CLP" => {
                 // A CL program runs in the job; parameters go in as
@@ -2906,9 +3071,10 @@ impl<'a> Machine<'a> {
                 super::source_from_path(name)
                     .ok_or_else(|| anyhow!("CPF4101: Program {name} not found."))?,
                 String::new(),
+                None,
             ),
         };
-        let (source, options) = source;
+        let (source, options, binding) = source;
         let callee = self.block(super::compile_with(client, &libl, name, &source, &options))?;
         let mut parms: Vec<Vec<u8>> = locs
             .iter()
@@ -2932,6 +3098,10 @@ impl<'a> Machine<'a> {
                         c
                     },
                     database_url: self.io.database_url.clone(),
+                    job_key: self.io.job_key.clone(),
+                    binding: binding.map(std::sync::Arc::new),
+                    unit: None,
+                    modules: Default::default(),
                 },
             );
             let r = m.run_bytes(&mut parms);

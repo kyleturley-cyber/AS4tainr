@@ -51,6 +51,8 @@ pub fn type_for_extension(ext: &str) -> Option<&'static str> {
         "cmd" => "CMD",
         "cbl" | "cblle" => "CBLLE",
         "sql" | "table" | "view" | "index" => "SQL",
+        "bnd" => "BND",
+        "bnddir" => "BNDDIR",
         "txt" => "TXT",
         _ => return None,
     })

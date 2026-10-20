@@ -25,6 +25,7 @@ pub mod ddl;
 pub mod dds;
 pub mod dspf;
 pub mod dtaara;
+pub mod ile;
 pub mod import;
 pub mod jobs;
 pub mod menus;

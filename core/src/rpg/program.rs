@@ -60,6 +60,67 @@ pub struct FileInfo {
     pub fields: Vec<String>,
     /// The display file, for WORKSTN files.
     pub display: Option<Display>,
+    /// A program-described DISK file: its records are byte images read
+    /// by the positions on the input specifications.
+    pub program_described: bool,
+    /// Where each field of the database record is in the record image
+    /// (type in the record, offset), and the record length.
+    pub layout: Vec<(DType, usize)>,
+    pub record_len: usize,
+    /// The input specifications for this file's records.
+    pub inputs: Vec<InputRec>,
+}
+
+/// A record type (program-described) or record format (externally
+/// described) as the input specifications describe it.
+#[derive(Clone, Debug)]
+pub struct InputRec {
+    pub record_ind: Option<String>,
+    pub codes: Vec<Vec<RecCode>>,
+    pub fields: Vec<InputField>,
+}
+
+#[derive(Clone, Debug)]
+pub struct InputField {
+    /// The program field.
+    pub name: String,
+    /// Program-described: positions in the record and their format.
+    pub from: usize,
+    pub to: usize,
+    pub dtype: Option<DType>,
+    pub level: Option<String>,
+    pub matching: Option<String>,
+    pub plus: Option<String>,
+    pub minus: Option<String>,
+    pub zero: Option<String>,
+}
+
+/// The type of a program-described input field as stored in the record
+/// (ILE RPG Reference, input specifications position 36).
+fn input_type(f: &InField) -> Result<DType> {
+    let len = f.to + 1 - f.from;
+    Ok(match (f.format, f.decimals) {
+        ('P', d) => DType::Packed(len * 2 - 1, d.unwrap_or(0)),
+        ('B', d) => DType::Binary(if len <= 2 { 4 } else { 9 }, d.unwrap_or(0)),
+        ('I', _) => DType::Int(match len {
+            1 => 3,
+            2 => 5,
+            4 => 10,
+            _ => 20,
+        }),
+        ('U', _) => DType::Uns(match len {
+            1 => 3,
+            2 => 5,
+            4 => 10,
+            _ => 20,
+        }),
+        (' ' | 'S', Some(d)) => DType::Zoned(len, d),
+        (' ' | 'A', None) => DType::Char(len),
+        (c, _) => bail!(
+            "input field {}: data format {c} is not supported yet",
+            f.name
+        ),
+    })
 }
 
 /// A display (WORKSTN) file as the program sees it.
@@ -165,6 +226,10 @@ pub struct Program {
     /// Embedded SQL cursors (DECLARE name CURSOR FOR ...): the SELECT as
     /// written, or the name of a prepared statement.
     pub cursors: HashMap<String, Cursor>,
+    /// Multiple-occurrence data structures.
+    pub occurs: Vec<Occurs>,
+    /// Arrays and tables in sequence: 'A' (ASCEND) or 'D' (DESCEND).
+    pub sequence: HashMap<String, char>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -294,7 +359,7 @@ pub fn external_files(src: &Source) -> Vec<String> {
     let mut out: Vec<String> = src
         .files
         .iter()
-        .filter(|f| f.external && f.device == "DISK")
+        .filter(|f| f.device == "DISK")
         .map(|f| {
             keyword(&f.keywords, "EXTDESC")
                 .and_then(|k| k.args.first())
@@ -466,6 +531,18 @@ struct Binder<'a> {
     globals: Vec<Vec<u8>>,
     /// EXTBININT(*YES): external binary fields are integers.
     extbinint: bool,
+    /// Multiple-occurrence data structures (OCCURS).
+    occurs: Vec<Occurs>,
+}
+
+/// A multiple-occurrence data structure (OCCURS keyword): its storage
+/// holds every occurrence; names refer to the current one (OCCUR).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Occurs {
+    pub name: String,
+    pub buf: usize,
+    pub size: usize,
+    pub count: u32,
 }
 
 /// What a definitions list declared besides storage: its procedure
@@ -512,6 +589,7 @@ impl Binder<'_> {
         // parameter's LIKEDS may name a data structure defined after them.
         let mut order: Vec<usize> = Vec::new();
         let mut later: Vec<usize> = Vec::new();
+        let mut like: Vec<usize> = Vec::new();
         {
             let mut k = 0;
             while k < defs.len() {
@@ -532,10 +610,35 @@ impl Binder<'_> {
                 }
                 if defs[start].kind == DefKind::Proto {
                     later.push(start);
+                } else if defs[start].kind == DefKind::Field
+                    && keyword(&defs[start].keywords, "LIKE").is_some()
+                {
+                    like.push(start);
                 } else {
                     order.push(start);
                 }
             }
+        }
+        // Fields LIKE another field (D specs, *LIKE DEFINE) come after the
+        // fields they are like, which may be defined anywhere in the
+        // source.
+        let target = |i: usize| {
+            keyword(&defs[i].keywords, "LIKE")
+                .and_then(|k| k.args.first())
+                .map(|a| a.trim().to_ascii_uppercase())
+                .unwrap_or_default()
+        };
+        while !like.is_empty() {
+            let pending: Vec<String> = like.iter().map(|&i| defs[i].name.clone()).collect();
+            let (ready, wait): (Vec<usize>, Vec<usize>) = like
+                .iter()
+                .partition(|&&i| !pending.contains(&target(i)) || target(i) == defs[i].name);
+            if ready.is_empty() {
+                order.extend(wait);
+                break;
+            }
+            order.extend(ready);
+            like = wait;
         }
         order.extend(later);
         for &i0 in &order {
@@ -945,7 +1048,16 @@ impl Binder<'_> {
         // A DS starts as blanks, unless INZ: then each subfield gets its
         // type's initial value (ILE RPG Reference, INZ keyword).
         let has_inz = keyword(&d.keywords, "INZ").is_some();
-        let total = size * dim.max(1) as usize;
+        let occurs = keyword(&d.keywords, "OCCURS")
+            .and_then(|k| k.args.first())
+            .map(|a| num_arg(a, &self.syms))
+            .transpose()?
+            .unwrap_or(0);
+        if occurs > 0 && dim > 0 {
+            bail!("a data structure cannot have both DIM and OCCURS");
+        }
+        let reps = dim.max(occurs).max(1);
+        let total = size * reps as usize;
         let buf = self.new_buf(total, data::BLANK);
         let mut names = Vec::new();
         for (sname, t, off, sdim, sdef) in &subs {
@@ -963,7 +1075,7 @@ impl Binder<'_> {
                 local: self.local,
             };
             if has_inz || keyword(&sdef.keywords, "INZ").is_some() && !std::ptr::eq(*sdef, d) {
-                for e in 0..dim.max(1) as usize {
+                for e in 0..reps as usize {
                     for k in 0..(*sdim).max(1) as usize {
                         let at = e * size + off + k * t.size();
                         self.bufs[buf][at..at + t.size()].copy_from_slice(&t.initial());
@@ -1032,7 +1144,7 @@ impl Binder<'_> {
                 &self.bufs
             };
             let src = from[o.buf][o.off..o.off + o.size].to_vec();
-            for e in 0..dim.max(1) as usize {
+            for e in 0..reps as usize {
                 for n in 0..(*sdim).max(1) as usize {
                     let at = e * size + off + n * o.size;
                     self.bufs[buf][at..at + o.size].copy_from_slice(&src);
@@ -1059,6 +1171,14 @@ impl Binder<'_> {
         } else {
             name.clone()
         };
+        if occurs > 0 {
+            self.occurs.push(Occurs {
+                name: ds_name.clone(),
+                buf,
+                size,
+                count: occurs,
+            });
+        }
         self.syms.insert(
             ds_name,
             Sym::Ds(DsInfo {
@@ -1095,6 +1215,7 @@ pub fn bind(
             .is_some_and(|a| a.trim().eq_ignore_ascii_case("*YES")),
         local: false,
         statics: vec![],
+        occurs: vec![],
     };
     // Files and their record fields.
     let mut files = Vec::new();
@@ -1105,6 +1226,10 @@ pub fn bind(
             format: f.name.clone(),
             fields: vec![],
             display: None,
+            program_described: false,
+            layout: vec![],
+            record_len: 0,
+            inputs: vec![],
         };
         if f.device == "WORKSTN" && f.external {
             let ext = keyword(&f.keywords, "EXTDESC")
@@ -1190,10 +1315,98 @@ pub fn bind(
                     Some(p) => format!("{p}{base}"),
                     None => base,
                 };
+                // A field line of the input specifications renames it.
+                let pname = src
+                    .inputs
+                    .iter()
+                    .filter(|r| r.file == info.format || r.file == fr.file.format)
+                    .flat_map(|r| &r.fields)
+                    .find(|x| x.external.as_deref() == Some(fd.name.as_str()))
+                    .map(|x| x.name.clone())
+                    .unwrap_or(pname);
                 b.file_fields.entry(pname.clone()).or_insert_with(|| {
                     program_type(fd, false, b.extbinint).unwrap_or(DType::Char(1))
                 });
                 info.fields.push(pname);
+            }
+            // The input specifications for the record format: record
+            // identifying indicator, control levels, matching fields and
+            // field indicators by program field.
+            for r in src
+                .inputs
+                .iter()
+                .filter(|r| r.file == info.format || r.file == fr.file.format)
+            {
+                info.inputs.push(InputRec {
+                    record_ind: r.record_ind.clone(),
+                    codes: vec![],
+                    fields: r
+                        .fields
+                        .iter()
+                        .map(|x| InputField {
+                            name: x.name.clone(),
+                            from: 0,
+                            to: 0,
+                            dtype: None,
+                            level: x.level.clone(),
+                            matching: x.matching.clone(),
+                            plus: x.plus.clone(),
+                            minus: x.minus.clone(),
+                            zero: x.zero.clone(),
+                        })
+                        .collect(),
+                });
+            }
+            info.fref = Some(fr);
+        }
+        if f.device == "DISK" && !f.external {
+            // A program-described file over a database file: the record
+            // image is the fields of its record format, each in its
+            // stored form (zoned, packed, binary, characters).
+            let fr = externals
+                .get(&f.name)
+                .ok_or_else(|| anyhow!("file {} is not described (not found)", f.name))?
+                .clone();
+            let mut at = 0usize;
+            for fd in &fr.file.fields {
+                let t = program_type(fd, true, false).unwrap_or(DType::Char(0));
+                info.layout.push((t, at));
+                at += t.size();
+            }
+            info.record_len = at;
+            info.program_described = true;
+            info.format = fr.file.format.clone();
+            for r in src.inputs.iter().filter(|r| r.file == f.name) {
+                let mut fields = Vec::new();
+                for x in &r.fields {
+                    let t = input_type(x).map_err(|e| anyhow!("line {}: {e}", r.line))?;
+                    // The program field: packed for numbers (characters
+                    // as they are), unless defined elsewhere.
+                    let pt = match t {
+                        DType::Char(n) => DType::Char(n),
+                        other => {
+                            let (n, d) = other.precision();
+                            DType::Packed(n, d)
+                        }
+                    };
+                    b.file_fields.entry(x.name.clone()).or_insert(pt);
+                    fields.push(InputField {
+                        name: x.name.clone(),
+                        from: x.from as usize,
+                        to: x.to as usize,
+                        dtype: Some(t),
+                        level: x.level.clone(),
+                        matching: x.matching.clone(),
+                        plus: x.plus.clone(),
+                        minus: x.minus.clone(),
+                        zero: x.zero.clone(),
+                    });
+                }
+                info.inputs.push(InputRec {
+                    record_ind: r.record_ind.clone(),
+                    codes: r.codes.clone(),
+                    fields,
+                });
             }
             info.fref = Some(fr);
         }
@@ -1236,7 +1449,11 @@ pub fn bind(
     }
     // INZ values.
     b.apply_inz()?;
-    // Compile-time arrays (CTDATA).
+    // Compile-time arrays and tables (CTDATA). An alternating array
+    // (ALT) takes its entries from the same records, each entry after
+    // the main array's (ILE RPG Reference, "Arrays and Tables"). Numeric
+    // entries are written as digits, the decimal point implied, the sign
+    // in the zone of the last digit.
     let mut unnamed = src.ctdata.iter().filter(|c| c.0.is_none());
     for d in defs
         .iter()
@@ -1249,35 +1466,65 @@ pub fn bind(
             .or_else(|| unnamed.next())
             .map(|c| c.1.clone())
             .unwrap_or_default();
-        if let Some(Sym::Var(v)) = b.syms.get(&d.name).cloned() {
-            let per = keyword(&d.keywords, "PERRCD")
-                .and_then(|k| k.args.first())
-                .and_then(|a| a.trim().parse::<usize>().ok())
-                .unwrap_or(1);
-            let mut n = 0usize;
-            for row in rows {
-                let chars: Vec<char> = row.chars().collect();
-                for k in 0..per {
-                    if n >= v.dim as usize {
-                        break;
-                    }
-                    let w = v.dtype.len() as usize;
-                    let piece: String = chars.iter().skip(k * w).take(w).collect();
-                    let val = if v.dtype.is_numeric() {
-                        Value::Num(Dec::parse(&piece).unwrap_or_default())
+        let Some(Sym::Var(v)) = b.syms.get(&d.name).cloned() else {
+            continue;
+        };
+        let alt = defs
+            .iter()
+            .find(|x| {
+                keyword(&x.keywords, "ALT")
+                    .and_then(|k| k.args.first())
+                    .is_some_and(|a| a.trim().eq_ignore_ascii_case(&d.name))
+            })
+            .and_then(|x| match b.syms.get(&x.name) {
+                Some(Sym::Var(av)) => Some(av.clone()),
+                _ => None,
+            });
+        let per = keyword(&d.keywords, "PERRCD")
+            .and_then(|k| k.args.first())
+            .and_then(|a| a.trim().parse::<usize>().ok())
+            .unwrap_or(1);
+        let width = |t: &DType| -> usize {
+            if t.is_numeric() {
+                t.precision().0 as usize
+            } else {
+                t.len() as usize
+            }
+        };
+        let mut n = 0usize;
+        for row in rows {
+            let chars: Vec<char> = row.chars().collect();
+            let mut at = 0usize;
+            for _ in 0..per {
+                if n >= v.dim as usize {
+                    break;
+                }
+                for (var, w) in std::iter::once((&v, width(&v.dtype)))
+                    .chain(alt.as_ref().map(|a| (a, width(&a.dtype))))
+                {
+                    let piece: String = chars.iter().skip(at).take(w).collect();
+                    at += w;
+                    let piece = format!("{piece:<w$}");
+                    let val = if var.dtype.is_numeric() {
+                        let (digits, decs) = var.dtype.precision();
+                        let zoned: Vec<u8> = data::e(&piece)
+                            .iter()
+                            .map(|c| if *c == data::BLANK { 0xF0 } else { *c })
+                            .collect();
+                        Value::Num(data::decode_num(&DType::Zoned(digits, decs), &zoned)?)
                     } else {
                         Value::str(&piece)
                     };
-                    let at = v.off + n * v.stride;
+                    let off = var.off + n * var.stride;
                     data::store(
-                        &v.dtype,
+                        &var.dtype,
                         &val,
-                        &mut b.bufs[v.buf][at..at + v.dtype.size()],
+                        &mut b.bufs[var.buf][off..off + var.dtype.size()],
                         data::Fit::Strict { half_adjust: false },
                         false,
                     )?;
-                    n += 1;
                 }
+                n += 1;
             }
         }
     }
@@ -1295,6 +1542,7 @@ pub fn bind(
             statics: vec![],
             globals: b.bufs.clone(),
             extbinint: b.extbinint,
+            occurs: vec![],
         };
         let pi = pb
             .defs(&pr.defs, &mut protos)
@@ -1410,7 +1658,30 @@ pub fn bind(
     if nomain && !src.calcs.is_empty() {
         bail!("ctl-opt NOMAIN: a module without a main procedure has no calculations outside procedures (RNF3788)");
     }
+    // Every occurrence of a multiple-occurrence data structure starts as
+    // the first one was set up (blanks, INZ values).
+    for o in &b.occurs {
+        let first = b.bufs[o.buf][..o.size].to_vec();
+        for k in 1..o.count as usize {
+            b.bufs[o.buf][k * o.size..(k + 1) * o.size].copy_from_slice(&first);
+        }
+    }
+    let sequence: HashMap<String, char> = src
+        .defs
+        .iter()
+        .filter_map(|d| {
+            if keyword(&d.keywords, "DESCEND").is_some() {
+                Some((d.name.clone(), 'D'))
+            } else if keyword(&d.keywords, "ASCEND").is_some() {
+                Some((d.name.clone(), 'A'))
+            } else {
+                None
+            }
+        })
+        .collect();
     Ok(Program {
+        sequence,
+        occurs: b.occurs.clone(),
         imports,
         nomain,
         name: name.to_ascii_uppercase(),

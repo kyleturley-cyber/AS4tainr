@@ -1,0 +1,30 @@
+     H
+     FQPRINT  OF        132            PRINTER
+     E                    TABM    3   3  2 0 TABN    9
+     E                    ARR         5  3 0
+     I            DS
+     I                                        1   80DATE
+     I                                        1   40YEAR
+     I                                        5   60MONTH
+     I                                        7   80DAY
+     I              'MONTH IS'            C         MSG
+     C* RPG III: a table lookup, arrays, a data structure
+     C                     Z-ADD20261020  DATE
+     C           MONTH     LOKUPTABM      TABN           50
+     C   50      MSG       CAT  TABN:1    OUT    20
+     C   50      OUT       DSPLY
+     C                     DO   5         I       30
+     C           I         MULT 10        ARR,I
+     C                     END
+     C                     XFOOTARR       SUM     50
+     C           SUM       DSPLY
+     C                     SETON                     1020
+     C   10 20N30'ALL3'    DSPLY
+     C                     Z-ADD-1234.5   AMT     72
+     C                     EXCPTLINE
+     C                     SETON                     LR
+     OQPRINT  E                LINE
+     O                         AMT       20 '  ,   .  -'
+     O                                   30 'DONE'
+**
+08AUGUST   09SEPTEMBER10OCTOBER  

@@ -160,6 +160,8 @@ DSPLIB:
 | `RUNSQL SQL('...')` | Runs one INSERT, UPDATE or DELETE (not SELECT) and reports the rows changed, or a data definition statement such as CREATE TABLE. |
 | `RUNSQLSTM SRCFILE(LIB/QSQLSRC) SRCMBR(NAME)` | Runs the SQL statements in a source member ([sql.md](sql.md)). |
 | `DLTF FILE(LIB/NAME)` | Deletes a database or display file (not a physical file with logical files over it: CPF3203). |
+| `CRTRPGPGM PGM(LIB/NAME)` | Creates a program from RPG/400 (RPG III) source in QRPGSRC: converted to RPG IV as CVTRPGSRC does, then compiled. |
+| `CVTRPGSRC FROMFILE(LIB/QRPGSRC) FROMMBR(name\|generic*\|*ALL) TOFILE(LIB/QRPGLESRC)` | Converts RPG III members to RPG IV members (type RPGLE) and lists the conversion messages. |
 | `CRTRPGMOD MODULE(LIB/NAME)` | Creates a module from QRPGLESRC (checked like CRTBNDRPG; `NOMAIN` modules have only procedures). |
 | `CRTSRVPGM SRVPGM(LIB/NAME) MODULE(...) EXPORT(*SRCFILE\|*ALL) SRCFILE SRCMBR BNDSRVPGM BNDDIR` | Creates a service program from modules; its exports come from binder language (`STRPGMEXP`/`EXPORT`/`ENDPGMEXP` in QSRVSRC) or all exported procedures. |
 | `CRTPGM PGM(LIB/NAME) MODULE(...) ENTMOD BNDSRVPGM BNDDIR` | Binds modules and service programs into a program. |

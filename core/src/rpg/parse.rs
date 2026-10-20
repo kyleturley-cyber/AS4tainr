@@ -6,7 +6,7 @@
 //! Layout of each specification: ILE RPG Reference, "Specifications".
 
 use super::ast::*;
-use super::data::{e, DType};
+use super::data::{e, DType, Fig};
 use super::expr::{self, Parser, Tok};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashSet;
@@ -636,6 +636,12 @@ struct Ctx {
     list: Option<(bool, String)>,
     /// The CALL whose PARMs follow.
     call: Option<usize>,
+    /// Conditioning indicators of lines with no operation, continued by
+    /// AN/OR lines (positions 7-8) up to the line with the operation:
+    /// (control level of the first line, conditions so far).
+    pending_cond: Option<(Option<String>, Conditions)>,
+    /// A CASxx group is open (its lines became SELECT/WHEN/EXSR).
+    cas_open: bool,
 }
 
 impl Ctx {
@@ -697,6 +703,8 @@ pub fn parse(source: &str, includes: &dyn Fn(&str) -> Option<String>) -> Result<
         free_block: None,
         list: None,
         call: None,
+        pending_cond: None,
+        cas_open: false,
     };
     ctx.src.ctdata = lines.ctdata;
     let units = std::mem::take(&mut lines.units);
@@ -822,7 +830,18 @@ fn fixed_d(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
     let to = colt(cs, 33, 39);
     let tchar = cs.get(39).copied().unwrap_or(' ');
     let decs = colt(cs, 41, 42);
-    let kws = keywords(&col(cs, 44, 80))?;
+    let mut kws = keywords(&col(cs, 44, 80))?;
+    // LIKE with +n or -n in the length positions: a longer or shorter
+    // field (ILE RPG Reference, LIKE keyword).
+    let to = if (to.starts_with('+') || to.starts_with('-')) && keyword(&kws, "LIKE").is_some() {
+        if let Some(k) = kws.iter_mut().find(|k| k.name == "LIKE") {
+            k.args.truncate(1);
+            k.args.push(to.clone());
+        }
+        String::new()
+    } else {
+        to
+    };
     // A keyword continuation line (nothing in positions 7-43).
     if name.is_empty()
         && dtype_code.is_empty()
@@ -874,6 +893,15 @@ fn fixed_d(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
         _ => 0,
     };
     let in_ds = kind == DefKind::Subfield || kind == DefKind::Ds;
+    // An array subfield by positions: from-to is the whole array, each
+    // element is its share (ILE RPG Reference, positions 26-32).
+    let len = match keyword(&kws, "DIM").and_then(|k| k.args.first()) {
+        Some(n) if by_positions && kind == DefKind::Subfield => match n.trim().parse::<u32>() {
+            Ok(n) if n > 0 => len / n,
+            _ => len,
+        },
+        _ => len,
+    };
     let dtype = if kind == DefKind::Const || kind == DefKind::Ds && len == 0 {
         None
     } else {
@@ -932,6 +960,35 @@ fn indicator(s: &str) -> Option<String> {
     }
 }
 
+/// Joins two groups of conditioning indicators (OR lines).
+pub const OR_MARK: &str = "|";
+
+/// Conditioning indicators as an expression (for a CASxx line).
+fn cond_expr(c: &Conditions) -> Expr {
+    let mut groups: Vec<Expr> = Vec::new();
+    let mut cur: Option<Expr> = None;
+    for (neg, i) in c {
+        if i == OR_MARK {
+            groups.extend(cur.take());
+            continue;
+        }
+        let one = if *neg {
+            Expr::Unary(UnOp::Not, Box::new(Expr::Ind(i.clone())))
+        } else {
+            Expr::Ind(i.clone())
+        };
+        cur = Some(match cur {
+            None => one,
+            Some(p) => Expr::Bin(BinOp::And, Box::new(p), Box::new(one)),
+        });
+    }
+    groups.extend(cur);
+    groups
+        .into_iter()
+        .reduce(|a, b| Expr::Bin(BinOp::Or, Box::new(a), Box::new(b)))
+        .unwrap_or(Expr::Fig(Fig::On))
+}
+
 /// Conditioning indicators in positions 9-11 (N and an indicator).
 fn conditions(cs: &[char], from: usize) -> Conditions {
     let n = cs
@@ -943,6 +1000,37 @@ fn conditions(cs: &[char], from: usize) -> Conditions {
         Some(i) => vec![(n, i)],
         None => vec![],
     }
+}
+
+/// Pseudo built-in for a fixed-form factor written `a:b`.
+pub const PAIR: &str = "*PAIR";
+
+/// A factor that may be two values separated by a colon (outside
+/// literals and parentheses): `%PAIR(a, b)` then.
+fn pair_expr(s: &str) -> Result<Option<Expr>> {
+    let t = s.trim();
+    let mut quoted = false;
+    let mut depth = 0i32;
+    for (i, c) in t.char_indices() {
+        match c {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => depth -= 1,
+            ':' if !quoted && depth == 0 => {
+                let a = opt_expr(&t[..i])?;
+                let b = opt_expr(&t[i + 1..])?;
+                return Ok(Some(Expr::Bif(
+                    PAIR.into(),
+                    vec![
+                        a.unwrap_or(Expr::Fig(Fig::Blanks)),
+                        b.ok_or_else(|| anyhow!("a value is needed after ':' in {t}"))?,
+                    ],
+                )));
+            }
+            _ => {}
+        }
+    }
+    opt_expr(t)
 }
 
 fn opt_expr(s: &str) -> Result<Option<Expr>> {
@@ -968,11 +1056,35 @@ fn cmp_code(s: &str) -> Result<BinOp> {
 }
 
 fn fixed_c(ctx: &mut Ctx, cs: &[char], ext2: &str, lineno: usize) -> Result<()> {
-    let level = indicator(&col(cs, 7, 8));
-    let level = level.filter(|l| l != "AN" && l != "OR");
+    let join = colt(cs, 7, 8).to_ascii_uppercase();
+    let mut level = indicator(&col(cs, 7, 8));
+    level = level.filter(|l| l != "AN" && l != "OR");
     let mut cond = conditions(cs, 9);
     let f1t = colt(cs, 12, 25);
     let op_full = colt(cs, 26, 35).to_ascii_uppercase();
+    // A line with only conditioning indicators: the next lines (AN: and,
+    // OR: or) continue them up to the line with the operation (ILE RPG
+    // Reference, calculation specifications, positions 7-8 and 9-11).
+    if op_full.is_empty() && f1t.is_empty() && colt(cs, 36, 80).is_empty() && !cond.is_empty() {
+        match ctx.pending_cond.as_mut() {
+            None => ctx.pending_cond = Some((level, cond)),
+            Some((_, c)) => {
+                if join == "OR" {
+                    c.push((false, OR_MARK.to_string()));
+                }
+                c.extend(cond);
+            }
+        }
+        return Ok(());
+    }
+    if let Some((first_level, mut c)) = ctx.pending_cond.take() {
+        if join == "OR" {
+            c.push((false, OR_MARK.to_string()));
+        }
+        c.extend(cond);
+        cond = c;
+        level = first_level;
+    }
     // Opcodes with an extended factor 2 use positions 36-80 for it.
     let extended = is_extended(&op_full);
     let f2t = if extended {
@@ -1005,6 +1117,78 @@ fn fixed_c(ctx: &mut Ctx, cs: &[char], ext2: &str, lineno: usize) -> Result<()> 
         None => (op_full.clone(), String::new()),
     };
     let ext = Ext::parse(&extender);
+    // CASxx: a CASxx group (up to END or ENDCS) runs the subroutine of the
+    // first line whose comparison is true; CAS without a comparison is
+    // the default (ILE RPG Reference, CASxx). Built as SELECT/WHEN/EXSR.
+    if let Some(code) = op.strip_prefix("CAS") {
+        if !ctx.cas_open {
+            ctx.calc(lineno, vec![], level.clone(), Line::Select);
+            ctx.cas_open = true;
+        }
+        let when = if code.is_empty() {
+            Line::Other
+        } else {
+            Line::When(Expr::Bin(
+                cmp_code(code)?,
+                Box::new(opt_expr(&f1t)?.ok_or_else(|| anyhow!("{op}: factor 1 is needed"))?),
+                Box::new(
+                    opt_expr(&colt(cs, 36, 49))?
+                        .ok_or_else(|| anyhow!("{op}: factor 2 is needed"))?,
+                ),
+            ))
+        };
+        let mut when_cond = cond.clone();
+        if !when_cond.is_empty() {
+            // A conditioned CASxx line: its indicators join the test.
+            let test = cond_expr(&when_cond);
+            when_cond.clear();
+            let when = match when {
+                Line::When(e) => Line::When(Expr::Bin(BinOp::And, Box::new(test), Box::new(e))),
+                _ => Line::When(test),
+            };
+            ctx.calc(lineno, when_cond, None, when);
+        } else {
+            ctx.calc(lineno, when_cond, None, when);
+        }
+        ctx.calc(
+            lineno,
+            vec![],
+            None,
+            Line::ExSr(colt(cs, 50, 63).to_ascii_uppercase()),
+        );
+        return Ok(());
+    }
+    if ctx.cas_open {
+        ctx.cas_open = false;
+        if op == "END" || op == "ENDCS" {
+            ctx.calc(lineno, vec![], None, Line::EndSl);
+            return Ok(());
+        }
+        bail!("a CASxx group ends with END or ENDCS");
+    }
+    // *LIKE DEFINE: a field like another, its length changed by +n or -n
+    // in the length positions (ILE RPG Reference, DEFINE).
+    if op == "DEFINE" && f1t.eq_ignore_ascii_case("*LIKE") {
+        let mut args = vec![colt(cs, 36, 49).to_ascii_uppercase()];
+        let lent = colt(cs, 64, 68);
+        if !lent.is_empty() {
+            args.push(lent);
+        }
+        ctx.add_def(Def {
+            name: colt(cs, 50, 63).to_ascii_uppercase(),
+            kind: DefKind::Field,
+            dtype: None,
+            from: None,
+            to: None,
+            external: false,
+            keywords: vec![Keyword {
+                name: "LIKE".into(),
+                args,
+            }],
+            line: lineno,
+        });
+        return Ok(());
+    }
     // A result field with a length defines it.
     if !lent.is_empty() && !rt.is_empty() {
         let len: u32 = lent.parse().map_err(|_| anyhow!("field length '{lent}'"))?;
@@ -1302,12 +1486,22 @@ fn fixed_c(ctx: &mut Ctx, cs: &[char], ext2: &str, lineno: usize) -> Result<()> 
             ind: ind.clone(),
         }),
         "CAT" | "SUBST" | "SCAN" | "CHECK" | "CHECKR" | "XLATE" | "LOOKUP" | "TIME" | "IN"
-        | "OUT" | "MOVEA" | "XFOOT" | "SQRT" | "TESTN" | "TESTB" | "BITON" | "BITOFF"
-        | "EXCEPT" | "OCCUR" | "SORTA" | "DEALLOC" => {
-            let f2v = if op == "EXCEPT" { None } else { f2()? };
+        | "OUT" | "MOVEA" | "XFOOT" | "SQRT" | "TESTN" | "TESTZ" | "TESTB" | "BITON" | "BITOFF"
+        | "EXCEPT" | "OCCUR" | "SORTA" | "DEALLOC" | "MHHZO" | "MHLZO" | "MLHZO" | "MLLZO"
+        | "SHTDN" => {
+            // Factors written `value:value` (SCAN 'ab':2, SUBST base:start,
+            // XLATE from:to, CAT text:blanks).
+            let f2v = if op == "EXCEPT" {
+                None
+            } else if is_extended(&op) {
+                // SORTA and the like take an extended factor 2.
+                xf2()?
+            } else {
+                pair_expr(&f2t)?
+            };
             Line::Stmt(Stmt::Op {
                 code: op.clone(),
-                f1: f1()?,
+                f1: pair_expr(&f1t)?,
                 f2: f2v,
                 result: res()?,
                 ext: ext.clone(),
@@ -1515,6 +1709,8 @@ fn fixed_o(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
             file,
             kind,
             fetch_overflow: ch(18) == 'F',
+            add: colt(cs, 18, 20).eq_ignore_ascii_case("ADD"),
+            del: colt(cs, 18, 20).eq_ignore_ascii_case("DEL"),
             cond: vec![cond],
             name: indicator(&col(cs, 30, 39)),
             space_before: num(40, 42),
@@ -1559,8 +1755,11 @@ fn fixed_o(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
             None
         }
     };
+    // An edit word: quoted, or the name of a named constant.
     let edit_word = if !name.is_empty() && constant.trim().starts_with('\'') {
         Some(constant.trim().trim_matches('\'').to_string())
+    } else if !name.is_empty() && !constant.trim().is_empty() {
+        Some(format!("\u{1}{}", constant.trim().to_ascii_uppercase()))
     } else {
         None
     };
@@ -1577,17 +1776,62 @@ fn fixed_o(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
         end,
         relative,
         edit_word,
+        format: ch(52),
     });
     Ok(())
 }
 
-fn fixed_i(ctx: &mut Ctx, cs: &[char], _lineno: usize) -> Result<()> {
-    let file = colt(cs, 7, 16).to_ascii_uppercase();
-    if !file.is_empty() {
+fn fixed_i(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
+    let ch = |p: usize| cs.get(p - 1).copied().unwrap_or(' ').to_ascii_uppercase();
+    let name = colt(cs, 7, 16).to_ascii_uppercase();
+    let and_or = colt(cs, 16, 18).to_ascii_uppercase();
+    // Record identification codes: positions 23-30, 31-38, 39-46.
+    let codes = |cs: &[char]| -> Result<Vec<RecCode>> {
+        let mut out = Vec::new();
+        for g in [23usize, 31, 39] {
+            let pos = colt(cs, g, g + 4);
+            if pos.is_empty() {
+                continue;
+            }
+            out.push(RecCode {
+                position: pos
+                    .parse()
+                    .map_err(|_| anyhow!("record identification position '{pos}'"))?,
+                not: ch(g + 5) == 'N',
+                part: match ch(g + 6) {
+                    ' ' => 'C',
+                    c => c,
+                },
+                ch: cs.get(g + 6).copied().unwrap_or(' '),
+            });
+        }
+        Ok(out)
+    };
+    if and_or == "AND" || and_or == "OR" {
+        let more = codes(cs)?;
+        let rec = ctx
+            .src
+            .inputs
+            .last_mut()
+            .ok_or_else(|| anyhow!("{and_or} needs a record line before it"))?;
+        if and_or == "OR" || rec.codes.is_empty() {
+            rec.codes.push(more);
+        } else if let Some(g) = rec.codes.last_mut() {
+            g.extend(more);
+        }
+        return Ok(());
+    }
+    if !name.is_empty() {
+        let c = codes(cs)?;
         ctx.src.inputs.push(InRec {
-            file,
+            file: name,
+            sequence: colt(cs, 17, 18).to_ascii_uppercase(),
+            number: ch(19),
+            option: ch(20),
             record_ind: indicator(&col(cs, 21, 22)),
+            codes: if c.is_empty() { vec![] } else { vec![c] },
             fields: vec![],
+            line: lineno,
         });
         return Ok(());
     }
@@ -1596,19 +1840,42 @@ fn fixed_i(ctx: &mut Ctx, cs: &[char], _lineno: usize) -> Result<()> {
         .inputs
         .last_mut()
         .ok_or_else(|| anyhow!("an input field needs a record line first"))?;
-    let name = colt(cs, 49, 62).to_ascii_uppercase();
-    if name.is_empty() {
+    let fname = colt(cs, 49, 62).to_ascii_uppercase();
+    let external = colt(cs, 21, 30).to_ascii_uppercase();
+    if fname.is_empty() && external.is_empty() {
         return Ok(());
     }
-    let from: u32 = colt(cs, 37, 41)
-        .parse()
-        .map_err(|_| anyhow!("input field from position"))?;
-    let to: u32 = colt(cs, 42, 46)
-        .parse()
-        .map_err(|_| anyhow!("input field to position"))?;
+    let num = |a: usize, b: usize| -> Result<u32> {
+        let t = colt(cs, a, b);
+        if t.is_empty() {
+            return Ok(0);
+        }
+        t.parse()
+            .map_err(|_| anyhow!("input field position '{t}' is not a number"))
+    };
     let decs = colt(cs, 47, 48).parse().ok();
-    let fmt = cs.get(35).copied().unwrap_or(' ').to_ascii_uppercase();
-    rec.fields.push((name, from, to, decs, fmt));
+    rec.fields.push(InField {
+        name: if fname.is_empty() {
+            external.clone()
+        } else {
+            fname
+        },
+        external: if external.is_empty() {
+            None
+        } else {
+            Some(external)
+        },
+        from: num(37, 41)?,
+        to: num(42, 46)?,
+        decimals: decs,
+        format: ch(36),
+        level: indicator(&col(cs, 63, 64)),
+        matching: indicator(&col(cs, 65, 66)),
+        relation: indicator(&col(cs, 67, 68)),
+        plus: indicator(&col(cs, 69, 70)),
+        minus: indicator(&col(cs, 71, 72)),
+        zero: indicator(&col(cs, 73, 74)),
+    });
     Ok(())
 }
 

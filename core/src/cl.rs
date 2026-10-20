@@ -1021,6 +1021,83 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[],
     },
     CommandDef {
+        name: "CRTRPGPGM",
+        description: "Create RPG/400 Program",
+        params: &[
+            p("PGM", Kind::Qualified, true, None, "Program").ch("Name"),
+            p(
+                "SRCFILE",
+                Kind::Qualified,
+                false,
+                Some("QRPGSRC"),
+                "Source file",
+            )
+            .ch("Name"),
+            p("SRCMBR", Kind::Name, false, Some("*PGM"), "Source member").ch("Name, *PGM"),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*SRCMBRTXT"),
+                "Text 'description'",
+            )
+            .keyword_only(),
+            p(
+                "REPLACE",
+                Kind::Name,
+                false,
+                Some("*YES"),
+                "Replace program",
+            )
+            .ch("*YES, *NO")
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CVTRPGSRC",
+        description: "Convert RPG Source",
+        params: &[
+            p("FROMFILE", Kind::Qualified, true, None, "From file").ch("Name"),
+            p("FROMMBR", Kind::Name, true, None, "From member").ch("Name, generic*, *ALL"),
+            p(
+                "TOFILE",
+                Kind::Qualified,
+                false,
+                Some("QRPGLESRC"),
+                "To file",
+            )
+            .ch("Name, *NONE"),
+            p("TOMBR", Kind::Name, false, Some("*FROMMBR"), "To member").ch("Name, *FROMMBR"),
+            p(
+                "EXPCPY",
+                Kind::Name,
+                false,
+                Some("*NO"),
+                "Expand copy member",
+            )
+            .ch("*NO, *YES")
+            .keyword_only(),
+            p(
+                "CVTRPT",
+                Kind::Name,
+                false,
+                Some("*YES"),
+                "Conversion report",
+            )
+            .ch("*YES, *NO")
+            .keyword_only(),
+            p(
+                "LOGFILE",
+                Kind::Qualified,
+                false,
+                Some("QRNCVTLG"),
+                "Log file",
+            )
+            .ch("Name, *NONE")
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
         name: "CRTSQLRPGI",
         description: "Create SQL ILE RPG Object",
         params: &[
@@ -1152,6 +1229,8 @@ pub static GROUPS: &[Group] = &[
             "CRTCLPGM",
             "CRTBNDRPG",
             "CRTSQLRPGI",
+            "CRTRPGPGM",
+            "CVTRPGSRC",
             "CRTRPGMOD",
             "CRTSRVPGM",
             "CRTPGM",

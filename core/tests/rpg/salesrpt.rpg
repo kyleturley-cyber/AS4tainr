@@ -1,0 +1,17 @@
+     FSALES   IP  E                    DISK
+     FQPRINT  OF        132            PRINTER
+     ISALESR      01
+     I              REGION                          REGIONL1
+     C   01      AMOUNT    ADD  REGTOT    REGTOT  72
+     CL1         REGTOT    ADD  GRAND     GRAND   92
+     OQPRINT  D  1     01
+     O                         REGION     5
+     O                         CUST      12
+     O                         AMOUNT1   25
+     OQPRINT  T  2     L1
+     O                         REGION     5
+     O                                   15 'TOTAL'
+     O                         REGTOT1B  25
+     OQPRINT  T  1     LR
+     O                                   15 'GRAND'
+     O                         GRAND 1   30

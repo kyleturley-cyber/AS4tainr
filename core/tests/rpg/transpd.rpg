@@ -1,0 +1,16 @@
+     FTRANS   IP  F      20            DISK                      A
+     ITRANS   NS  01   1 CH
+     I                                        2  20 NAME
+     ITRANS   NS  02   1 CD
+     I                                        2   40QTY
+     I                                        5   92PRICE           50
+     C   01      NAME      DSPLY
+     C   02      QTY       MULT PRICE     EXT     92
+     C   02      EXT       DSPLY
+     C   02      EXT       ADD  TOT       TOT     92
+     C   50      'ZERO'    DSPLY
+     CLR         TOT       DSPLY
+     CLR                   EXCPTADDREC
+     OTRANS   EADD             ADDREC
+     O                                    1 'T'
+     O                         TOT       10

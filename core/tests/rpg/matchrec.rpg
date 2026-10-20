@@ -1,0 +1,10 @@
+     FCUSTS   IP  E                    DISK
+     FORDS    IS  E                    DISK
+     ICUSTR       01
+     I              CUST                            CUST    M1
+     IORDR        02
+     I              CUST                            OCUST   M1
+     C   01      NAME      DSPLY
+     C   01 MR   'CUST MR' DSPLY
+     C   02 MR   AMT       DSPLY
+     C   02NMR   'NO CUST' DSPLY

@@ -20,7 +20,7 @@
 //! 4. CRTBNDCL (CLLE) and CRTCLPGM (CLP), CRTBNDRPG (RPGLE), CRTSQLRPGI
 //!    (SQLRPGLE).
 //!
-//! Members as4tainr cannot build yet (PRTF, RPG III, COBOL, CMD)
+//! Members as4tainr cannot build yet (PRTF, COBOL, CMD)
 //! are kept as source and reported.
 
 use anyhow::{bail, Context, Result};
@@ -608,6 +608,7 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         ("CLP", "CRTCLPGM"),
         ("RPGLE", "CRTBNDRPG"),
         ("SQLRPGLE", "CRTSQLRPGI"),
+        ("RPG", "CRTRPGPGM"),
     ] {
         for m in of_type(t) {
             if is_module.contains(&(m.file.clone(), m.member.clone())) {
@@ -634,6 +635,7 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
                 | "CLP"
                 | "RPGLE"
                 | "SQLRPGLE"
+                | "RPG"
                 | "SQL"
                 | "TXT"
                 | "BND"

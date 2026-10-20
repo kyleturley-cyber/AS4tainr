@@ -14,6 +14,7 @@ pub mod expr;
 pub mod interp;
 pub mod parse;
 pub mod program;
+pub mod rpg3;
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -65,6 +66,47 @@ pub async fn load_includes(
         }
     }
     out
+}
+
+/// The /COPY members an RPG III source names (and theirs), by the id
+/// `rpg3::convert` asks for: `FILE,MEMBER` or `LIB/FILE,MEMBER`.
+async fn rpg3_copies(client: &Client, libl: &[String], source: &str) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    let mut todo: Vec<String> = rpg3::copy_ids(source);
+    while let Some(id) = todo.pop() {
+        if out.contains_key(&id) {
+            continue;
+        }
+        let (libs, rest) = match id.split_once('/') {
+            Some((l, r)) => (vec![l.to_string()], r.to_string()),
+            None => (libl.to_vec(), id.clone()),
+        };
+        let Some((file, member)) = rest.split_once(',') else {
+            continue;
+        };
+        if let Ok(m) = crate::source::find_member(client, &libs, file, member).await {
+            todo.extend(rpg3::copy_ids(&m.source));
+            out.insert(id, m.source);
+        }
+    }
+    out
+}
+
+/// Convert an RPG III (RPG/400) member to RPG IV: with its /COPY members
+/// in it when `expand` (CRTRPGPGM always; CVTRPGSRC EXPCPY(*YES)).
+pub async fn convert_rpg3(
+    client: &Client,
+    libl: &[String],
+    source: &str,
+    expand: bool,
+) -> Result<rpg3::Converted> {
+    if expand {
+        let copies = rpg3_copies(client, libl, source).await;
+        let f = |id: &str| copies.get(id).cloned();
+        rpg3::convert(source, Some(&f))
+    } else {
+        rpg3::convert(source, None)
+    }
 }
 
 /// Parse and bind a program: what CRTBNDRPG checks, and what CALL runs.

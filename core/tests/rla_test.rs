@@ -3451,3 +3451,396 @@ async fn cl_cmd(
         Err(e) => Err(format!("{c}: {e:#}")),
     }
 }
+
+#[tokio::test]
+async fn rpg_fixed_form_string_array_and_bit_operations() {
+    // Expected values from the ILE RPG Reference, operation codes: SCAN
+    // (positions relative to the base string; an array result gets every
+    // occurrence, 0 after), CHECK/CHECKR (first character not in the
+    // comparator), SUBST and XLATE (left-adjusted, P pads), CAT (with
+    // :n trailing blanks of factor 1 go), LOOKUP (index set to the
+    // element found, or 1; a table's related table follows), XFOOT, SQRT
+    // (H rounds), MOVEA, SORTA, OCCUR, TESTN, TESTB/BITON, *LIKE DEFINE,
+    // AN/OR conditioning lines, CASxx.
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = include_str!("rpg/fixedops.rpgle");
+    let r = run_rpg(&url, &lib, "QSECOFR", "FIXEDOPS", src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "3",
+            "3",
+            "8",
+            "0",
+            "8",
+            "0",
+            "NOTFOUND",
+            "3",
+            "2",
+            "BCDXX",
+            "BCD",
+            "AABBxC",
+            "aaBBxC",
+            "ABC DEF",
+            "ABC  DEF",
+            "3",
+            "FOUND CC",
+            "1",
+            "NO ZZ",
+            "2",
+            "6.75",
+            "3.16",
+            "1.41",
+            "EF",
+            "AB",
+            "AB",
+            "EF",
+            "XY",
+            "TWO",
+            "2",
+            "NUMERIC",
+            "LEADING",
+            "BITS ON",
+            "BITS MIXED",
+            "123456.78",
+            "OR YES",
+            "SR2",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn rpg3_crtrpgpgm_and_cvtrpgsrc() {
+    // RPG/400 source (RPG/400 Reference positions): an E-spec table with
+    // its alternate table loaded from compile-time data (**), an I-spec
+    // data structure and named constant, LOKUP, CAT, an array indexed
+    // ARR,I, three conditioning indicators on one line, EXCPT with an edit
+    // word. CRTRPGPGM converts it as CVTRPGSRC does (ILE RPG Programmer's
+    // Guide, conversion aid) and creates the program.
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+    };
+    for f in ["QRPGSRC", "QRPGLESRC"] {
+        source::create_file(&client, &lib, f, "").await.unwrap();
+    }
+    let src = include_str!("rpg/rpg3test.rpg");
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QRPGSRC".into(),
+            name: "RPG3TEST".into(),
+            srctype: "RPG".into(),
+            text: "RPG III test".into(),
+            source: src.into(),
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    // CRTBNDRPG does not take RPG III source.
+    let e = cl_cmd(
+        &mut job,
+        format!("CRTBNDRPG PGM({lib}/RPG3TEST) SRCFILE({lib}/QRPGSRC)"),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("CRTRPGPGM"), "{e}");
+    cl_cmd(&mut job, format!("CRTRPGPGM PGM({lib}/RPG3TEST)"))
+        .await
+        .unwrap();
+    assert_eq!(
+        cl_cmd(&mut job, format!("CALL PGM({lib}/RPG3TEST)"))
+            .await
+            .unwrap(),
+        // The printed line: the amount edited by the edit word
+        // '  ,   .  -' (a minus for a negative value) ends in position 20.
+        [
+            "DSPLY  MONTH IS OCTOBER",
+            "DSPLY  150",
+            "DSPLY  ALL3",
+            "           1,234.50-      DONE"
+        ]
+    );
+    // CVTRPGSRC: an RPGLE member; it does not replace one that exists.
+    let m = cl_cmd(
+        &mut job,
+        format!("CVTRPGSRC FROMFILE({lib}/QRPGSRC) FROMMBR(RPG3TEST) TOFILE({lib}/QRPGLESRC)"),
+    )
+    .await
+    .unwrap();
+    assert!(m.iter().any(|x| x.contains("converted")), "{m:?}");
+    let conv = source::find_member(&client, std::slice::from_ref(&lib), "QRPGLESRC", "RPG3TEST")
+        .await
+        .unwrap();
+    assert_eq!(conv.srctype, "RPGLE");
+    assert!(
+        conv.source.contains("DIM(3) CTDATA PERRCD(3)"),
+        "{}",
+        conv.source
+    );
+    assert!(conv.source.contains("**CTDATA TABM"), "{}", conv.source);
+    assert!(cl_cmd(
+        &mut job,
+        format!("CVTRPGSRC FROMFILE({lib}/QRPGSRC) FROMMBR(RPG3TEST) TOFILE({lib}/QRPGLESRC)"),
+    )
+    .await
+    .is_err());
+    // The converted member is RPG IV: CRTBNDRPG creates it.
+    cl_cmd(
+        &mut job,
+        format!("CRTBNDRPG PGM({lib}/RPG4TEST) SRCMBR(RPG3TEST)"),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn rpg_cycle_control_levels_and_program_described_files() {
+    // The RPG cycle (ILE RPG Reference, "Detailed RPG Program Cycle"):
+    // a primary file read by the cycle; the L1 control field REGION; on
+    // a change (and at end of file) the total calculations and total
+    // output run before the new record's fields are moved in, so a total
+    // line shows the group that ended; LR at end of file sets L1 on too.
+    // Program-described input (record identification codes in position
+    // 1, fields by position, zoned with decimals, a field indicator for
+    // zero) and output (EXCPT with ADD: a record image).
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    for (name, dds, rows) in [
+        (
+            "SALES",
+            "     A          R SALESR\n     A            REGION         2A\n     A            CUST           5A\n     A            AMOUNT         7P 2\n",
+            vec![
+                vec![("REGION", "N1"), ("CUST", "C1"), ("AMOUNT", "10.00")],
+                vec![("REGION", "N1"), ("CUST", "C2"), ("AMOUNT", "5.50")],
+                vec![("REGION", "S1"), ("CUST", "C3"), ("AMOUNT", "7.25")],
+                vec![("REGION", "S1"), ("CUST", "C4"), ("AMOUNT", "1.00")],
+                vec![("REGION", "W1"), ("CUST", "C5"), ("AMOUNT", "20.00")],
+            ],
+        ),
+        (
+            "TRANS",
+            "     A          R TRANSR\n     A            TYPE           1A\n     A            DATA          19A\n",
+            vec![
+                vec![("TYPE", "H"), ("DATA", "ACME")],
+                vec![("TYPE", "D"), ("DATA", "00301250")],
+                vec![("TYPE", "D"), ("DATA", "01000050")],
+                vec![("TYPE", "D"), ("DATA", "00500000")],
+            ],
+        ),
+    ] {
+        let pf = dds::parse_pf(name, dds).unwrap();
+        catalog::create_physical_file(&mut client, &lib, &pf)
+            .await
+            .unwrap();
+        let mut f = open(&client, &lib, name).await;
+        for r in rows {
+            let rec: rla::Record = r
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            f.write(&client, &rec).await.unwrap();
+        }
+    }
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+    };
+    source::create_file(&client, &lib, "QRPGSRC", "")
+        .await
+        .unwrap();
+    for (name, src) in [
+        ("SALESRPT", include_str!("rpg/salesrpt.rpg")),
+        ("TRANSPD", include_str!("rpg/transpd.rpg")),
+    ] {
+        source::put_member(
+            &client,
+            &source::Member {
+                library: lib.clone(),
+                file: "QRPGSRC".into(),
+                name: name.into(),
+                srctype: "RPG".into(),
+                text: String::new(),
+                source: src.into(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        cl_cmd(&mut job, format!("CRTRPGPGM PGM({lib}/{name})"))
+            .await
+            .unwrap();
+    }
+    let out = cl_cmd(&mut job, format!("CALL PGM({lib}/SALESRPT)"))
+        .await
+        .unwrap();
+    let printed: Vec<&str> = out
+        .iter()
+        .map(|l| l.trim_end())
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        printed,
+        [
+            "   N1  C1           10.00",
+            "   N1  C2            5.50",
+            "   N1     TOTAL     15.50",
+            "   S1  C3            7.25",
+            "   S1  C4            1.00",
+            "   S1     TOTAL      8.25",
+            "   W1  C5           20.00",
+            "   W1     TOTAL     20.00",
+            "          GRAND          43.75",
+        ],
+        "{out:#?}"
+    );
+    let out = cl_cmd(&mut job, format!("CALL PGM({lib}/TRANSPD)"))
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        [
+            "DSPLY  ACME",
+            "DSPLY  37.50",
+            "DSPLY  5.00",
+            "DSPLY  .00",
+            "DSPLY  ZERO",
+            "DSPLY  42.50"
+        ]
+    );
+    // The record added at LR: 'T' in position 1, the total as 9 zoned
+    // digits ending in position 10.
+    let mut f = open(&client, &lib, "TRANS").await;
+    let mut last = None;
+    loop {
+        let r = f.read(&client).await.unwrap();
+        match r.record {
+            Some(rec) => last = Some(rec),
+            None => break,
+        }
+    }
+    let last = last.unwrap();
+    assert_eq!(last["TYPE"], "T");
+    assert_eq!(last["DATA"].trim_end(), "000004250");
+}
+
+#[tokio::test]
+async fn rpg_cycle_matching_records() {
+    // Matching fields (ILE RPG Reference, "Match Fields"): records of the
+    // primary and secondary files are processed in ascending order of
+    // their M1 fields, a primary record before secondary records with
+    // the same value; MR is on for a record that matches a record of the
+    // other file.
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    for (name, dds, rows) in [
+        (
+            "CUSTS",
+            "     A          R CUSTR\n     A            CUST           2A\n     A            NAME          10A\n",
+            vec![
+                vec![("CUST", "A1"), ("NAME", "Alpha")],
+                vec![("CUST", "B2"), ("NAME", "Beta")],
+                vec![("CUST", "C3"), ("NAME", "Gamma")],
+            ],
+        ),
+        (
+            "ORDS",
+            "     A          R ORDR\n     A            CUST           2A\n     A            AMT            5S 0\n",
+            vec![
+                vec![("CUST", "A1"), ("AMT", "100")],
+                vec![("CUST", "A1"), ("AMT", "50")],
+                vec![("CUST", "C3"), ("AMT", "70")],
+                vec![("CUST", "D4"), ("AMT", "10")],
+            ],
+        ),
+    ] {
+        let pf = dds::parse_pf(name, dds).unwrap();
+        catalog::create_physical_file(&mut client, &lib, &pf)
+            .await
+            .unwrap();
+        let mut f = open(&client, &lib, name).await;
+        for r in rows {
+            let rec: rla::Record = r
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            f.write(&client, &rec).await.unwrap();
+        }
+    }
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+    };
+    source::create_file(&client, &lib, "QRPGSRC", "")
+        .await
+        .unwrap();
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QRPGSRC".into(),
+            name: "MATCHREC".into(),
+            srctype: "RPG".into(),
+            text: String::new(),
+            source: include_str!("rpg/matchrec.rpg").into(),
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    cl_cmd(&mut job, format!("CRTRPGPGM PGM({lib}/MATCHREC)"))
+        .await
+        .unwrap();
+    assert_eq!(
+        cl_cmd(&mut job, format!("CALL PGM({lib}/MATCHREC)"))
+            .await
+            .unwrap(),
+        [
+            "DSPLY  Alpha",
+            "DSPLY  CUST MR",
+            "DSPLY  100",
+            "DSPLY  50",
+            "DSPLY  Beta",
+            "DSPLY  Gamma",
+            "DSPLY  CUST MR",
+            "DSPLY  70",
+            "DSPLY  NO CUST"
+        ]
+    );
+}

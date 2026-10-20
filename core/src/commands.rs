@@ -134,7 +134,10 @@ impl Job<'_> {
             "CRTSRCPF" => self.crtsrcpf(&cmd).await,
             "DSPFD" => self.dspfd(&cmd).await,
             "CRTPF" | "CRTLF" | "CRTDSPF" => self.crtfile(&cmd).await,
-            "CRTBNDCL" | "CRTCLPGM" | "CRTBNDRPG" | "CRTSQLRPGI" => self.crtpgm(&cmd).await,
+            "CRTBNDCL" | "CRTCLPGM" | "CRTBNDRPG" | "CRTSQLRPGI" | "CRTRPGPGM" => {
+                self.crtpgm(&cmd).await
+            }
+            "CVTRPGSRC" => self.cvtrpgsrc(&cmd).await,
             "CRTMNU" => self.crtmnu(&cmd).await,
             "DLTMNU" => self.dltmnu(&cmd).await,
             "DLTUSRPRF" => self.dltusrprf(&cmd).await,
@@ -1149,13 +1152,32 @@ impl Job<'_> {
             "CRTBNDCL" => "CLLE",
             "CRTCLPGM" => "CLP",
             "CRTSQLRPGI" => "SQLRPGLE",
+            "CRTRPGPGM" => "RPG",
             _ => "RPGLE",
         };
         if attribute == "RPGLE" && m.srctype == "RPG" {
             bail!(
-                "Member {} is RPG/400 (RPG III) source; RPG III is not supported yet.",
+                "Member {} is RPG/400 (RPG III) source: create it with CRTRPGPGM, or convert it to RPG IV with CVTRPGSRC.",
                 m.name
             );
+        }
+        // RPG/400: converted to RPG IV as CVTRPGSRC does, with its /COPY
+        // members; the program keeps the converted source.
+        let mut m = m;
+        if attribute == "RPG" {
+            if m.srctype != "RPG" && m.srctype != "RPG38" {
+                bail!(
+                    "Member {} has source type {}; CRTRPGPGM creates programs from RPG source.",
+                    m.name,
+                    m.srctype
+                );
+            }
+            let mut libl = self.library_list();
+            if !libl.contains(&lib) {
+                libl.insert(0, lib.clone());
+            }
+            let c = crate::rpg::convert_rpg3(self.client, &libl, &m.source, true).await?;
+            m.source = c.source;
         }
         let mut binding: Option<crate::ile::Binding> = None;
         // Compile options from the command (CRTBNDRPG ALWNULL).
@@ -1166,7 +1188,7 @@ impl Job<'_> {
             _ => String::new(),
         };
         // CL: includes are part of the program; then it is checked.
-        let source = if attribute == "RPGLE" || attribute == "SQLRPGLE" {
+        let source = if attribute == "RPGLE" || attribute == "SQLRPGLE" || attribute == "RPG" {
             // The program is checked now, as the compiler does: syntax,
             // names, types, files (docs/rpg-engine.md).
             let mut libl = self.library_list();
@@ -1245,6 +1267,111 @@ impl Job<'_> {
         Ok(Outcome::Messages(vec![format!(
             "Program {name} created in library {lib}."
         )]))
+    }
+
+    /// CVTRPGSRC: RPG III members to RPG IV members (ILE RPG
+    /// Programmer's Guide, "Using the RPG III to RPG IV Conversion Aid").
+    /// Members of type RPG become RPGLE, SQLRPG become SQLRPGLE; others
+    /// are not converted.
+    async fn cvtrpgsrc(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (libs, file) = self.search(cmd.get("FROMFILE"));
+        let file = file.to_ascii_uppercase();
+        let mut lib = None;
+        for l in &libs {
+            if crate::source::is_source_file(self.client, l, &file).await? {
+                lib = Some(l.clone());
+                break;
+            }
+        }
+        let lib = lib.ok_or_else(|| anyhow!("CPF9812: File {file} not found."))?;
+        authority::check(self.client, &self.user, &lib, &file, "*FILE", Aut::Use).await?;
+        let pattern = cmd.get("FROMMBR").to_ascii_uppercase();
+        let all = crate::source::members(self.client, &lib, &file).await?;
+        let chosen: Vec<_> = all
+            .into_iter()
+            .filter(|(m, _, _)| match pattern.as_str() {
+                "*ALL" => true,
+                p if p.ends_with('*') => m.starts_with(p.trim_end_matches('*')),
+                p => m == p,
+            })
+            .collect();
+        if chosen.is_empty() {
+            bail!("CPF9815: Member {pattern} file {file} in library {lib} not found.");
+        }
+        let to = cmd.get("TOFILE").to_ascii_uppercase();
+        let to_target = if to == "*NONE" {
+            None
+        } else {
+            let (tl, tf) = self.create_target(&to);
+            let tl = tl.to_ascii_uppercase();
+            let tf = tf.to_ascii_uppercase();
+            if !crate::source::is_source_file(self.client, &tl, &tf).await? {
+                bail!("CPF9812: File {tf} in library {tl} not found.");
+            }
+            Some((tl, tf))
+        };
+        if chosen.len() > 1 && cmd.get("TOMBR") != "*FROMMBR" {
+            bail!("TOMBR must be *FROMMBR when more than one member is converted.");
+        }
+        let expand = cmd.get("EXPCPY") == "*YES";
+        let mut libl = self.library_list();
+        if !libl.contains(&lib) {
+            libl.insert(0, lib.clone());
+        }
+        let mut out = Vec::new();
+        let (mut done, mut skipped) = (0, 0);
+        for (name, srctype, text) in chosen {
+            let new_type = match srctype.as_str() {
+                "RPG" | "RPG38" => "RPGLE",
+                "SQLRPG" => "SQLRPGLE",
+                _ => {
+                    out.push(format!(
+                        "Member {name} not converted: source type {srctype} is not RPG or SQLRPG."
+                    ));
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let m =
+                crate::source::find_member(self.client, std::slice::from_ref(&lib), &file, &name)
+                    .await?;
+            let c = crate::rpg::convert_rpg3(self.client, &libl, &m.source, expand).await?;
+            if cmd.get("CVTRPT") != "*NO" {
+                for msg in &c.messages {
+                    out.push(format!("{name}: {msg}"));
+                }
+            }
+            if let Some((tl, tf)) = &to_target {
+                let tm = match cmd.get("TOMBR") {
+                    "*FROMMBR" => name.clone(),
+                    t => t.to_ascii_uppercase(),
+                };
+                crate::source::put_member(
+                    self.client,
+                    &crate::source::Member {
+                        library: tl.clone(),
+                        file: tf.clone(),
+                        name: tm.clone(),
+                        srctype: new_type.into(),
+                        text: text.clone(),
+                        source: c.source,
+                    },
+                    false,
+                )
+                .await
+                .map_err(|e| anyhow!("Member {tm} not converted: {e:#}"))?;
+                out.push(format!(
+                    "Member {name} converted to {tl}/{tf}({tm}), type {new_type}."
+                ));
+            } else {
+                out.push(format!("Member {name} checked (TOFILE(*NONE))."));
+            }
+            done += 1;
+        }
+        out.push(format!(
+            "{done} members converted, {skipped} not converted."
+        ));
+        Ok(Outcome::Messages(out))
     }
 
     /// GO: find the menu; the display shows it.

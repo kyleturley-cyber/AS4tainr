@@ -562,12 +562,30 @@ pub fn build(calcs: &[CalcLine]) -> Result<Routines> {
     let mut detail = Builder::new();
     let mut total = Builder::new();
     let mut sub: Option<(String, Builder)> = None;
+    // Total calculations run when their control level indicator is on:
+    // each run of lines with the same level is one group (L0: every
+    // total time).
+    let mut open_level: Option<(String, usize)> = None;
+    let close = |total: &mut Builder, open: &mut Option<(String, usize)>| -> Result<()> {
+        if let Some((l, line)) = open.take() {
+            if l != "L0" {
+                total.line(&CalcLine {
+                    line,
+                    cond: vec![],
+                    level: None,
+                    what: Line::EndIf,
+                })?;
+            }
+        }
+        Ok(())
+    };
     for cl in calcs {
         match &cl.what {
             Line::BegSr(n) => {
                 if sub.is_some() {
                     bail!("line {}: BEGSR {n} inside another subroutine", cl.line);
                 }
+                close(&mut total, &mut open_level)?;
                 sub = Some((n.clone(), Builder::new()));
                 continue;
             }
@@ -581,18 +599,34 @@ pub fn build(calcs: &[CalcLine]) -> Result<Routines> {
             }
             _ => {}
         }
-        let target = match (&mut sub, cl.level.as_deref()) {
-            (Some((_, b)), _) => b,
-            (None, Some(l))
-                if l == "LR"
-                    || (l.starts_with('L') && l[1..].chars().all(|c| c.is_ascii_digit())) =>
-            {
-                &mut total
+        let total_level = cl.level.as_deref().filter(|l| {
+            *l == "LR" || (l.starts_with('L') && l[1..].chars().all(|c| c.is_ascii_digit()))
+        });
+        match (&mut sub, total_level) {
+            (Some((_, b)), _) => b.line(cl)?,
+            (None, Some(l)) => {
+                if open_level.as_ref().map(|o| o.0.as_str()) != Some(l) {
+                    close(&mut total, &mut open_level)?;
+                    if l != "L0" {
+                        total.line(&CalcLine {
+                            line: cl.line,
+                            cond: vec![],
+                            level: None,
+                            what: Line::If(Expr::Ind(l.to_string())),
+                        })?;
+                    }
+                    open_level = Some((l.to_string(), cl.line));
+                }
+                total.line(cl)?;
             }
-            _ => &mut detail,
-        };
-        target.line(cl)?;
+            (None, None) => {
+                // A detail line ends a group of total lines written
+                // between detail calculations.
+                detail.line(cl)?;
+            }
+        }
     }
+    close(&mut total, &mut open_level)?;
     if let Some((n, _)) = sub {
         bail!("subroutine {n} has no ENDSR");
     }

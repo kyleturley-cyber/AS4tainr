@@ -375,6 +375,10 @@ pub struct OutRec {
     /// H heading, D detail, T total, E exception.
     pub kind: char,
     pub fetch_overflow: bool,
+    /// ADD (a new record) or DEL (delete the record) in positions 18-20,
+    /// for database files.
+    pub add: bool,
+    pub del: bool,
     /// Conditioning indicators: groups joined by OR, the indicators in a
     /// group by AND (record lines with AND/OR in positions 16-18).
     pub cond: Vec<Conditions>,
@@ -402,6 +406,8 @@ pub struct OutField {
     /// '+n': n blanks after the previous field.
     pub relative: Option<u32>,
     pub edit_word: Option<String>,
+    /// Data format in the record (position 52): blank, P, B, L, R.
+    pub format: char,
 }
 
 /// A whole source member, parsed.
@@ -426,9 +432,54 @@ pub struct Source {
     pub klists: Vec<(String, Vec<Expr>)>,
 }
 
+/// Input specifications for a record (ILE RPG Reference, "Input
+/// Specifications"): of a program-described file, a record type and its
+/// fields by position; of an externally described file, a record format
+/// with renamed fields, control levels, matching fields and field
+/// indicators.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InRec {
+    /// File name (program-described) or record format name.
     pub file: String,
+    /// Sequence (positions 17-18), number (19), option (20).
+    pub sequence: String,
+    pub number: char,
+    pub option: char,
     pub record_ind: Option<String>,
-    pub fields: Vec<(String, u32, u32, Option<u32>, char)>,
+    /// Record identification codes: groups joined by OR, codes in a
+    /// group by AND.
+    pub codes: Vec<Vec<RecCode>>,
+    pub fields: Vec<InField>,
+    pub line: usize,
+}
+
+/// One record identification code: the character at a position, all of
+/// it (C), its zone (Z) or its digit portion (D), or NOT that.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecCode {
+    pub position: u32,
+    pub not: bool,
+    pub part: char,
+    pub ch: char,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InField {
+    pub name: String,
+    /// The external field (positions 21-30) a field line renames.
+    pub external: Option<String>,
+    pub from: u32,
+    pub to: u32,
+    pub decimals: Option<u32>,
+    /// Data format (position 36): blank, P, B, I, U, L, R, A, S.
+    pub format: char,
+    /// L1-L9 (63-64), M1-M9 (65-66), field record relation (67-68).
+    pub level: Option<String>,
+    pub matching: Option<String>,
+    pub relation: Option<String>,
+    /// Field indicators: plus (69-70), minus (71-72), zero or blank
+    /// (73-74).
+    pub plus: Option<String>,
+    pub minus: Option<String>,
+    pub zero: Option<String>,
 }

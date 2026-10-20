@@ -8,3 +8,5 @@ gradlew    text eol=lf
 *.lf       text eol=lf
 *.dspf     text eol=lf
 *.clle     text eol=lf
+
+*.rpg      text eol=lf

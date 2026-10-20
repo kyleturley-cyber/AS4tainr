@@ -19,8 +19,12 @@ use std::collections::HashMap;
 use tokio::runtime::Handle;
 use tokio_postgres::Client;
 
+#[path = "cycle.rs"]
+mod cycle;
 #[path = "exec_sql.rs"]
 mod exec_sql;
+#[path = "ops.rs"]
+mod ops;
 
 /// What the program runs with: the database, the job.
 pub struct Io<'a> {
@@ -67,6 +71,8 @@ struct Status {
 
 struct FileState {
     open: Option<OpenFile>,
+    /// A program-described file: the image of the record last read.
+    image: Option<Vec<u8>>,
     /// A display file is open.
     ws_open: bool,
     status: Status,
@@ -142,6 +148,16 @@ pub struct Machine<'a> {
     alwnull: AlwNull,
     /// ALWNULL(*USRCTL): the program fields whose null indicator is on.
     nullind: std::collections::HashSet<String>,
+    /// Multiple-occurrence data structures by buffer: (occurrence size,
+    /// occurrences, current occurrence).
+    occur: HashMap<usize, (usize, u32, u32)>,
+    /// Tables (TABxxx arrays): the current element, set by LOOKUP.
+    table_cur: HashMap<String, i128>,
+    /// The cycle: records read ahead and not processed, by file; files
+    /// at their end; control field values of the last record, by level.
+    ahead: Vec<Option<cycle::Ahead>>,
+    cycle_eof: Vec<bool>,
+    control: HashMap<u8, String>,
 }
 
 /// One procedure call: its local storage starts at `base` in the
@@ -219,6 +235,7 @@ impl<'a> Machine<'a> {
                 .iter()
                 .map(|_| FileState {
                     open: None,
+                    image: None,
                     ws_open: false,
                     status: Status::default(),
                 })
@@ -236,6 +253,15 @@ impl<'a> Machine<'a> {
             sql: Default::default(),
             alwnull: AlwNull::of(prog),
             nullind: Default::default(),
+            occur: prog
+                .occurs
+                .iter()
+                .map(|o| (o.buf, (o.size, o.count, 1)))
+                .collect(),
+            table_cur: HashMap::new(),
+            ahead: prog.files.iter().map(|_| None).collect(),
+            cycle_eof: vec![false; prog.files.len()],
+            control: HashMap::new(),
         }
     }
 
@@ -296,7 +322,32 @@ impl<'a> Machine<'a> {
                 });
             }
         }
-        self.prog.syms.get(name).cloned()
+        // A subfield of a multiple-occurrence data structure: in the
+        // current occurrence.
+        match self.prog.syms.get(name).cloned() {
+            Some(Sym::Var(mut v)) => {
+                if let Some((size, _, cur)) = self.occur.get(&v.buf) {
+                    v.off += (*cur as usize - 1) * size;
+                }
+                Some(Sym::Var(v))
+            }
+            Some(Sym::Ds(mut d)) => {
+                if let Some((size, _, cur)) = self.occur.get(&d.buf) {
+                    d.off += (*cur as usize - 1) * size;
+                }
+                Some(Sym::Ds(d))
+            }
+            other => other,
+        }
+    }
+
+    /// A table name (TABxxx) without an index means its current element.
+    fn table_index(&self, name: &str, v: &VarInfo, i: Option<i128>) -> Option<i128> {
+        if i.is_none() && v.dim > 0 && name.starts_with("TAB") {
+            Some(self.table_cur.get(name).copied().unwrap_or(1))
+        } else {
+            i
+        }
     }
 
     /// The storage a qualified name with indexes names: each index moves
@@ -466,6 +517,7 @@ impl<'a> Machine<'a> {
                 match self.sym(&name) {
                     Some(Sym::Var(v)) => {
                         let i = self.index_of(args)?;
+                        let i = self.table_index(&name, &v, i);
                         if i.is_none() && v.dim > 0 {
                             bail!("{name} is an array: an index is needed here");
                         }
@@ -931,6 +983,7 @@ impl<'a> Machine<'a> {
                 match self.sym(&name) {
                     Some(Sym::Var(v)) => {
                         let i = self.index_of(args)?;
+                        let i = self.table_index(&name, &v, i);
                         self.store_var(&v, i, val, fit, right)?;
                     }
                     Some(Sym::Ds(d)) => {
@@ -1265,7 +1318,7 @@ impl<'a> Machine<'a> {
             FileOp::Chain | FileOp::Read | FileOp::ReadP | FileOp::ReadE | FileOp::ReadPE => {
                 let r = result.unwrap();
                 if let Some(rec) = &r.record {
-                    if let Err(e) = self.fill_fields(i, rec) {
+                    if let Err(e) = self.move_input(i, rec) {
                         // A data mapping error is an error on the
                         // operation: the E extender or the error
                         // indicator takes it.
@@ -1877,9 +1930,16 @@ impl<'a> Machine<'a> {
                 f1,
                 f2,
                 result,
-                ext: _,
+                ext,
                 ind,
-            } => self.misc_op(code, f1, f2, result, ind)?,
+            } => {
+                if !(self.string_op(code, f1, f2, result, ext, ind)?
+                    || self.array_op(code, f1, f2, result, ext, ind)?
+                    || self.bit_op(code, f1, f2, result, ind)?)
+                {
+                    self.misc_op(code, f1, f2, result, ind)?
+                }
+            }
             Stmt::Nop => {}
             Stmt::CallP(e) => match e {
                 Expr::Name { parts, args } => {
@@ -2037,25 +2097,6 @@ impl<'a> Machine<'a> {
             x.clone().ok_or_else(|| anyhow!("{code}: {what} is needed"))
         };
         match code {
-            "CAT" => {
-                // CAT f1:blanks f2 → result. (Blanks count in factor 2
-                // after a colon: not parsed yet, so none.)
-                let a1 = match f1 {
-                    Some(x) => self.eval(x)?.chars()?,
-                    None => self.eval(&need(result, "a result")?)?.chars()?,
-                };
-                let mut s = a1;
-                while s.last() == Some(&data::BLANK) {
-                    s.pop();
-                }
-                s.extend(self.eval(&need(f2, "factor 2")?)?.chars()?);
-                self.assign(
-                    &need(result, "a result")?,
-                    &Value::Char(s),
-                    Fit::Strict { half_adjust: false },
-                    false,
-                )?;
-            }
             "TIME" => {
                 let (h, m, s) = now_hms();
                 let r = need(result, "a result")?;
@@ -2076,10 +2117,6 @@ impl<'a> Machine<'a> {
                     Fit::Truncate { half_adjust: false },
                     false,
                 )?;
-            }
-            "SCAN" | "CHECK" | "CHECKR" | "SUBST" | "XLATE" | "LOOKUP" | "MOVEA" | "XFOOT"
-            | "SQRT" | "TESTN" | "OCCUR" | "SORTA" => {
-                bail!("operation {code} is not supported by the native engine yet")
             }
             "DEFINE" | "COMMIT" | "ROLBK" | "FORCE" | "DUMP" | "DEALLOC" => {}
             "EXCEPT" => {
@@ -2107,8 +2144,11 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
+    /// Conditioning indicators: all of a group must be met; groups joined
+    /// by OR lines are alternatives.
     fn conditions_met(&self, cond: &Conditions) -> bool {
-        cond.iter().all(|(neg, i)| self.ind(i) != *neg)
+        cond.split(|(_, i)| i == crate::rpg::parse::OR_MARK)
+            .any(|g| g.iter().all(|(neg, i)| self.ind(i) != *neg))
     }
 
     fn run_code(&mut self, code: &Code) -> Result<Flow> {
@@ -3034,7 +3074,9 @@ impl<'a> Machine<'a> {
         let libl = self.io.libl.clone();
         let found = self.block(crate::catalog::find_program(client, &libl, name))?;
         let source = match found {
-            Some(p) if p.attribute == "RPGLE" || p.attribute == "SQLRPGLE" => {
+            Some(p)
+                if p.attribute == "RPGLE" || p.attribute == "SQLRPGLE" || p.attribute == "RPG" =>
+            {
                 self.block(crate::authority::check(
                     client,
                     &self.io.user,
@@ -3125,71 +3167,6 @@ fn expr_name(e: &Option<Expr>) -> Option<String> {
 }
 
 impl Machine<'_> {
-    /// The RPG cycle (ILE RPG Reference, "Program Cycle"): first-cycle
-    /// (1P) output, then for each cycle: read a record of the primary
-    /// file (end of file sets LR), total calculations and total output,
-    /// end at LR, detail calculations, detail output.
-    ///
-    /// Simplified (docs/fidelity-gaps.md): no level breaks (L1-L9) or
-    /// matching fields, one primary file and no secondary files, total
-    /// calculations only at LR, record fields are moved in when read.
-    fn cycle(&mut self) -> Result<()> {
-        let prog = self.prog;
-        let primary = prog.files.iter().position(|f| f.decl.designation == 'P');
-        // *INZSR runs first, then the first cycle's output (1P).
-        if let Some(inz) = prog.routines.subroutines.get("*INZSR") {
-            self.run_code(inz)?;
-        }
-        self.set_ind("1P", true);
-        self.output(&['H', 'D'])?;
-        self.set_ind("1P", false);
-        let mut first = true;
-        let mut passes = 0u64;
-        loop {
-            passes += 1;
-            if let Some(i) = primary {
-                let name = prog.files[i].decl.name.clone();
-                self.file_op(
-                    FileOp::Read,
-                    &name,
-                    &None,
-                    &Ext::default(),
-                    &ResultInd::default(),
-                )?;
-                if self.files[i].status.eof {
-                    self.set_ind("LR", true);
-                }
-            }
-            // Total time (not on the first cycle, which has no record
-            // before it).
-            if self.ind("LR") {
-                self.run_code(&prog.routines.total)?;
-            }
-            if !first || self.ind("LR") {
-                self.output(&['T'])?;
-            }
-            if self.ind("LR") {
-                break;
-            }
-            first = false;
-            let flow = self.run_code(&prog.routines.detail)?;
-            if matches!(flow, Flow::Return(_)) {
-                break;
-            }
-            self.output(&['H', 'D'])?;
-            if self.ind("RT") {
-                break;
-            }
-            // No primary file: the cycle starts over until LR is set. A
-            // program that never sets LR runs until it is cancelled, as
-            // on IBM i; stop runaway loops in tests at a large bound.
-            if passes > 10_000_000 {
-                bail!("the program does not set on LR and keeps running");
-            }
-        }
-        Ok(())
-    }
-
     // ---- printer files (O specs, EXCEPT) -------------------------------
 
     fn out_cond(&self, groups: &[Conditions]) -> bool {
@@ -3252,9 +3229,6 @@ impl Machine<'_> {
         if let Some(lit) = &f.literal {
             return Ok(a(lit));
         }
-        if f.edit_word.is_some() {
-            bail!("edit words on O specs are not supported by the native engine yet");
-        }
         let name = f.name.clone().unwrap_or_default();
         let (value, digits, decs) = match name.as_str() {
             "PAGE" | "PAGE1" | "PAGE2" | "PAGE3" | "PAGE4" | "PAGE5" | "PAGE6" | "PAGE7" => {
@@ -3275,6 +3249,17 @@ impl Machine<'_> {
                 (v.num()?, p, s)
             }
         };
+        if let Some(w) = &f.edit_word {
+            // A named constant holds the edit word when it is not quoted.
+            let word = match w.strip_prefix('\u{1}') {
+                Some(n) => match self.sym(n) {
+                    Some(Sym::Const(v)) => a(&v.chars()?),
+                    _ => bail!("edit word {n} is not a named constant"),
+                },
+                None => w.clone(),
+            };
+            return edit_word(&value, digits, decs, &word);
+        }
         Ok(match f.edit_code {
             Some(c) => edit_code(&value, digits, decs, c),
             None => {
@@ -3292,20 +3277,33 @@ impl Machine<'_> {
     /// `spool::PAGE_LENGTH` lines; printing on or spacing past
     /// `spool::OVERFLOW_LINE` sets the overflow indicator.
     fn print_record(&mut self, r: &OutRec) -> Result<()> {
-        use crate::spool::{OVERFLOW_LINE, PAGE_LENGTH};
+        use crate::spool::{OVERFLOW_LINE as DEFAULT_OFL, PAGE_LENGTH as DEFAULT_LEN};
         let i = self
             .prog
             .file_index(&r.file)
             .ok_or_else(|| anyhow!("output to {}: not a file of this program", r.file))?;
         let decl = &self.prog.files[i].decl;
+        if decl.device == "DISK" {
+            return self.disk_output(i, r);
+        }
         if decl.device != "PRINTER" {
             bail!(
-                "output to {} ({}): only printer files are written by O specs in the native engine yet",
+                "output to {} ({}): only printer and database files are written by O specs in the native engine yet",
                 r.file,
                 decl.device
             );
         }
         let width = decl.record_len.unwrap_or(132) as usize;
+        // FORMLEN and FORMOFL: the form length and overflow line (from an
+        // RPG III line counter specification); 66 and 60 otherwise.
+        let form = |k: &str, d: i32| -> i32 {
+            keyword(&decl.keywords, k)
+                .and_then(|k| k.args.first())
+                .and_then(|a| a.trim().parse().ok())
+                .unwrap_or(d)
+        };
+        let page_length = form("FORMLEN", DEFAULT_LEN);
+        let overflow_line = form("FORMOFL", DEFAULT_OFL);
         if !self.printers.contains_key(&r.file) {
             let spl = match &self.io.job {
                 Some(job) => Some(self.block(crate::spool::open(
@@ -3345,7 +3343,7 @@ impl Machine<'_> {
             if let Some(n) = r.space_before.filter(|n| *n > 0) {
                 p.line += n as i32;
             }
-            if p.line > PAGE_LENGTH {
+            if p.line > page_length {
                 new_page(p);
             }
             p.page
@@ -3398,8 +3396,8 @@ impl Machine<'_> {
             p.line += 1;
         }
         let overflow =
-            printed_line >= OVERFLOW_LINE || p.page == printed_page && p.line > OVERFLOW_LINE;
-        if p.line > PAGE_LENGTH {
+            printed_line >= overflow_line || p.page == printed_page && p.line > overflow_line;
+        if p.line > page_length {
             new_page(p);
         }
         let full = p.buffer.len() >= 50;
@@ -3510,6 +3508,108 @@ fn error_status(err: &anyhow::Error) -> String {
 
 /// Edit codes 1-4, A-D, J-Q, X, Y, Z (ILE RPG Reference, "Edit Codes"):
 /// commas, a decimal point, zero suppression, sign display.
+/// Edit a number with an edit word (ILE RPG Reference, "Edit Words"):
+/// the body (blanks and the first 0 or * take digits; zero suppression
+/// runs through the position of that 0 or *, which fills suppressed
+/// positions with asterisks; constants print once a digit has, or after
+/// the 0 or *; `&` is a blank; a `$` just before the 0 or * floats to the
+/// first digit, one in the first position stays), then the status (CR or
+/// a final minus, with what comes before it, printed for negative
+/// values only), then the expansion (constants, `&` as blanks).
+pub fn edit_word(v: &Dec, digits: u32, decs: u32, word: &str) -> Result<String> {
+    let w: Vec<char> = word.chars().collect();
+    let stop = w.iter().position(|c| *c == '0' || *c == '*');
+    let last_blank = w.iter().rposition(|c| *c == ' ');
+    let body_end = match (last_blank, stop) {
+        (Some(b), Some(s)) => b.max(s),
+        (Some(b), None) => b,
+        (None, Some(s)) => s,
+        (None, None) => bail!("the edit word '{word}' has no digit positions"),
+    };
+    let floating = stop.is_some_and(|s| s > 0 && w[s - 1] == '$');
+    let positions = (0..=body_end)
+        .filter(|&i| w[i] == ' ' || Some(i) == stop)
+        .count();
+    if (positions as u32) < digits {
+        bail!("the edit word '{word}' has {positions} digit positions, the field {digits} digits");
+    }
+    let d = v.rescale(decs as u8, false).unwrap_or(*v);
+    let text = format!("{:0>w$}", d.mantissa().unsigned_abs(), w = positions);
+    let mut ds = text.chars().skip(text.len().saturating_sub(positions));
+    let fill = if stop.is_some_and(|s| w[s] == '*') {
+        '*'
+    } else {
+        ' '
+    };
+    let mut out: Vec<char> = Vec::with_capacity(w.len());
+    let mut significant = false;
+    let mut forced = false;
+    let mut first_digit: Option<usize> = None;
+    for (i, &c) in w.iter().enumerate().take(body_end + 1) {
+        // A floating currency symbol takes no position of its own: it
+        // goes in front of the first digit printed, after the body is
+        // built.
+        if floating && Some(i + 1) == stop {
+            continue;
+        }
+        if c == ' ' || Some(i) == stop {
+            let dg = ds.next().unwrap_or('0');
+            if significant || forced || dg != '0' {
+                if !significant && !forced {
+                    first_digit = Some(out.len());
+                }
+                significant = true;
+                out.push(dg);
+            } else {
+                out.push(fill);
+            }
+            if Some(i) == stop {
+                forced = true;
+                if first_digit.is_none() {
+                    first_digit = Some(out.len());
+                }
+            }
+        } else if c == '&' {
+            out.push(' ');
+        } else if c == '$' && i == 0 {
+            out.push('$');
+        } else if significant || forced {
+            out.push(c);
+        } else {
+            out.push(fill);
+        }
+    }
+    if floating {
+        let k = first_digit.unwrap_or(out.len());
+        out.insert(k, '$');
+    }
+    // Status: up to and including the first CR, or a minus that ends the
+    // edit word.
+    let rest: Vec<char> = w[body_end + 1..].to_vec();
+    let rest_s: String = rest.iter().collect();
+    let status_len = match rest_s.find("CR") {
+        Some(p) => p + 2,
+        None if rest.last() == Some(&'-') => rest.len(),
+        None => 0,
+    };
+    let negative = d.is_negative();
+    for &c in &rest[..status_len] {
+        out.push(if negative {
+            if c == '&' {
+                ' '
+            } else {
+                c
+            }
+        } else {
+            ' '
+        });
+    }
+    for &c in &rest[status_len..] {
+        out.push(if c == '&' { ' ' } else { c });
+    }
+    Ok(out.into_iter().collect())
+}
+
 pub fn edit_code(v: &Dec, digits: u32, decs: u32, code: char) -> String {
     let code = code.to_ascii_uppercase();
     let d = v.rescale(decs as u8, false).unwrap_or(*v);
@@ -3648,6 +3748,40 @@ mod tests {
         assert_eq!(char_of_num(&Dec::parse("0.50").unwrap()), ".50");
         assert_eq!(char_of_num(&Dec::parse("5").unwrap()), "5");
         assert_eq!(char_of_num(&Dec::parse("0").unwrap()), "0");
+    }
+
+    #[test]
+    fn edit_words() {
+        // ILE RPG Reference, "Edit Words" (body, status, expansion): the
+        // 0 ends zero suppression at its own position; constants print
+        // after a significant digit or the 0; CR prints for negative
+        // values only. Examples as in the RPG/400 and RPG II edit word
+        // tables (e.g. 'bbAMT0' for 100 prints 10AMT0; for 5, b5).
+        let ew =
+            |v: &str, n: u32, d: u32, w: &str| edit_word(&Dec::parse(v).unwrap(), n, d, w).unwrap();
+        assert_eq!(ew("100", 3, 0, "  AMT0"), "10AMT0");
+        assert_eq!(ew("5", 3, 0, "  AMT0"), "     5");
+        // A 0 that is not the last position: what follows always prints.
+        assert_eq!(ew("5", 3, 0, "  0AMT "), "   AMT5");
+        // Social security number: no suppression before the first digit
+        // position (the 0 is first).
+        assert_eq!(ew("123456789", 9, 0, "0   -  -    "), " 123-45-6789");
+        // Commas and the decimal point.
+        assert_eq!(ew("1000.00", 6, 2, "  ,  0.  "), " 1,000.00");
+        assert_eq!(ew(".05", 6, 2, "  ,  0.  "), "      .05");
+        // Status: CR for negative values, blanks otherwise; asterisks after
+        // it are expansion and always print.
+        assert_eq!(ew("-10", 3, 0, "  0CR*"), " 10CR*");
+        assert_eq!(ew("10", 3, 0, "  0CR*"), " 10  *");
+        assert_eq!(ew("-10", 3, 0, "  0-"), " 10-");
+        // Asterisk protection.
+        assert_eq!(ew(".10", 6, 2, "$  ,  *.  "), "$******.10");
+        assert_eq!(ew("500.00", 6, 2, "$  ,  *.  "), "$***500.00");
+        // Floating currency symbol: just left of the first digit.
+        assert_eq!(ew(".05", 6, 2, "  ,  $0.  "), "      $.05");
+        assert_eq!(ew("1000.00", 6, 2, "  ,  $0.  "), " $1,000.00");
+        // The ampersand is a blank.
+        assert_eq!(ew("12", 2, 0, "  &DOLLARS"), "12 DOLLARS");
     }
 
     #[test]

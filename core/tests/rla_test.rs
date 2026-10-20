@@ -4517,3 +4517,302 @@ async fn rpg_local_data_area() {
     assert_eq!(&copy.value[..5], "AAAA ");
     assert_eq!(copy.value.len(), 1024);
 }
+
+#[tokio::test]
+async fn cl_defined_and_based_storage() {
+    // CL reference, DCL: STG(*DEFINED) DEFVAR(&var start) puts a variable
+    // over part of another's storage (a *DEC one packed, digits / 2 + 1
+    // bytes); STG(*BASED) BASPTR(&ptr) puts it where the pointer points;
+    // ADDRESS and %ADDRESS set a pointer, %OFFSET moves it; CHGVAR %SST
+    // changes part of a variable. TYPE(*PTR) STG(*DEFINED) over a
+    // character variable is the usual way to keep a copyright text.
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let pgm = r#"
+PGM
+  DCL &COPYRIGHT *CHAR 64 VALUE('(C) Example')
+  DCL &COPYRIGHTP *PTR STG(*DEFINED) DEFVAR(&COPYRIGHT)
+  DCL &DATE *CHAR 8 VALUE('20261020')
+  DCL &YEAR *CHAR 4 STG(*DEFINED) DEFVAR(&DATE)
+  DCL &MONTH *CHAR 2 STG(*DEFINED) DEFVAR(&DATE 5)
+  DCL &REC *CHAR 6 VALUE('ABCDEF')
+  DCL &NUM *DEC (5 0) STG(*DEFINED) DEFVAR(&REC 4)
+  DCL &P *PTR ADDRESS(&DATE 6)
+  DCL &B *CHAR 2 STG(*BASED) BASPTR(&P)
+  SNDPGMMSG MSG(&YEAR *CAT '/' *CAT &MONTH)
+  CHGVAR &MONTH '11'
+  SNDPGMMSG MSG(&DATE)
+  SNDPGMMSG MSG(&B)
+  CHGVAR &B 'XY'
+  SNDPGMMSG MSG(&DATE)
+  CHGVAR %OFFSET(&P) 0
+  SNDPGMMSG MSG(&B)
+  CHGVAR &P %ADDRESS(&MONTH)
+  SNDPGMMSG MSG(&B *CAT ' ' *CAT %CHAR(%OFFSET(&P)))
+  CHGVAR &NUM 123
+  SNDPGMMSG MSG(%SST(&REC 1 3))
+  SNDPGMMSG MSG(%CHAR(&NUM))
+  CHGVAR %SST(&REC 1 2) 'ZZ'
+  SNDPGMMSG MSG(%SST(&REC 1 3) *CAT %CHAR(&NUM))
+ENDPGM
+"#;
+    let m = cl_job_run(&client, &url, &lib, &[("DEFPGM", pgm)], "CALL DEFPGM")
+        .await
+        .unwrap();
+    assert_eq!(
+        m,
+        ["2026/10", "20261120", "20", "202611XY", "20", "11 4", "ABC", "123", "ZZC123"]
+    );
+    // DEFVAR must fit in its base.
+    let bad = "PGM\n DCL &A *CHAR 4\n DCL &B *CHAR 3 STG(*DEFINED) DEFVAR(&A 3)\nENDPGM\n";
+    assert!(as4tainr_core::clpgm::compile("BAD", bad).is_err());
+}
+
+#[tokio::test]
+async fn user_commands_crtcmd() {
+    // CL Programming, "Defining commands": CRTCMD makes a command from
+    // definition statements; running it checks the values (MIN(1)
+    // required, RANGE, RSTD) and calls the command processing program
+    // with each parameter in its CPP form: *CHAR padded to LEN, *DEC as a
+    // packed number, a qualified name object first (20 characters), a list
+    // as a 2-byte count and the values; CASE(*MIXED) keeps a quoted value's
+    // case. DLTCMD deletes the command.
+    use as4tainr_core::commands::Outcome;
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    source::create_file(&client, &lib, "QCMDSRC", "")
+        .await
+        .unwrap();
+    let cmdsrc = "             CMD        PROMPT('Say hello')
+             PARM       KWD(NAME) TYPE(*CHAR) LEN(10) MIN(1) CASE(*MIXED) +
+                          PROMPT('Name')
+             PARM       KWD(TIMES) TYPE(*DEC) LEN(3 0) DFT(1) RANGE(1 9)
+             PARM       KWD(OBJ) TYPE(QO)
+QO:          QUAL       TYPE(*NAME) LEN(10) DFT(X)
+             QUAL       TYPE(*NAME) LEN(10) DFT(*LIBL) SPCVAL((*LIBL)) +
+                          PROMPT('Library')
+             PARM       KWD(MODE) TYPE(*CHAR) LEN(4) RSTD(*YES) DFT(*ALL) +
+                          VALUES(*ALL *ONE)
+";
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QCMDSRC".into(),
+            name: "HELLO".into(),
+            srctype: "CMD".into(),
+            text: "Say hello".into(),
+            source: cmdsrc.into(),
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    let cpp = "PGM PARM(&NAME &TIMES &OBJ &MODE)
+ DCL &NAME *CHAR 10
+ DCL &TIMES *DEC (3 0)
+ DCL &OBJ *CHAR 20
+ DCL &MODE *CHAR 4
+ SNDPGMMSG MSG('Hello' *BCAT &NAME *BCAT %CHAR(&TIMES) *BCAT %SST(&OBJ 11 10) *TCAT '/' *CAT %SST(&OBJ 1 10) *BCAT &MODE)
+ENDPGM
+";
+    let m = cl_job_run(
+        &client,
+        &url,
+        &lib,
+        &[("HELLOCPP", cpp)],
+        &format!("CRTCMD CMD({lib}/HELLO) PGM({lib}/HELLOCPP) SRCFILE({lib}/QCMDSRC)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(m, [format!("Command HELLO created in library {lib}.")]);
+    let run = |line: String| {
+        let client = &client;
+        let lib = lib.clone();
+        async move { job_run(client, &lib, &line).await }
+    };
+    let msgs = |o: Outcome| match o {
+        Outcome::Messages(m) => m,
+        other => panic!("unexpected {other:?}"),
+    };
+    let m = msgs(
+        run("HELLO NAME('World') TIMES(3) OBJ(QGPL/FOO)".into())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(m, ["Hello World 3 QGPL/FOO *ALL"]);
+    // Positional, defaults, library qualified command name.
+    let m = msgs(run(format!("{lib}/HELLO 'you' MODE(*ONE)")).await.unwrap());
+    assert_eq!(m, ["Hello you 1 *LIBL/X *ONE"]);
+    for bad in [
+        "HELLO",
+        "HELLO X TIMES(10)",
+        "HELLO X MODE(*TWO)",
+        "HELLO X NOPE(1)",
+    ] {
+        let e = run(bad.into()).await.unwrap_err();
+        assert!(e.to_string().starts_with("CPF0006"), "{bad}: {e}");
+    }
+    // From a CL program, with a variable.
+    let caller = "PGM\n DCL &N *CHAR 10 VALUE('Ada')\n HELLO NAME(&N) TIMES(2)\nENDPGM\n";
+    let m = cl_job_run(&client, &url, &lib, &[("CALLER", caller)], "CALL CALLER")
+        .await
+        .unwrap();
+    assert!(m.contains(&"Hello Ada 2 *LIBL/X *ALL".to_string()), "{m:?}");
+    let Outcome::Display(d) = run("DSPCMD HELLO".into()).await.unwrap() else {
+        panic!()
+    };
+    assert!(d.info.contains(&(
+        "Program to process command".into(),
+        format!("{lib}/HELLOCPP")
+    )));
+    let m = msgs(run("DLTCMD HELLO".into()).await.unwrap());
+    assert_eq!(m, [format!("Command HELLO deleted from library {lib}.")]);
+    assert!(run("HELLO X".into()).await.is_err());
+}
+
+#[tokio::test]
+async fn printer_files_crtprtf_and_rpg() {
+    // CRTPRTF (CL reference): a printer file from DDS, PAGESIZE(12 80),
+    // OVRFLW(5). DDS reference for printer files: SKIPB(1) goes to line 1
+    // (a new page when the printer is past it), SPACEA after the record,
+    // SPACEB before it, positions and '+n' after the field before, PAGNBR
+    // the page number, option indicators on fields. ILE RPG Reference:
+    // WRITE of the record formats; the overflow indicator comes on when a
+    // line is printed on or past the overflow line.
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    source::create_file(&client, &lib, "QDDSSRC", "")
+        .await
+        .unwrap();
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QDDSSRC".into(),
+            name: "CUSTRPT".into(),
+            srctype: "PRTF".into(),
+            text: "Customer balances".into(),
+            source: include_str!("rpg/custrpt.prtf").into(),
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    let m = job_run(
+        &client,
+        &lib,
+        &format!("CRTPRTF FILE({lib}/CUSTRPT) SRCFILE({lib}/QDDSSRC) PAGESIZE(12 80) OVRFLW(5)"),
+    )
+    .await
+    .unwrap();
+    let as4tainr_core::commands::Outcome::Messages(m) = m else {
+        panic!()
+    };
+    assert_eq!(m, [format!("File CUSTRPT created in library {lib}.")]);
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "CUSTRPT",
+        include_str!("rpg/custrpt.rpgle"),
+        None,
+        None,
+    )
+    .await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let head = |page: &str| format!(" Customer balances{}Page {page:>4}", " ".repeat(11));
+    let p = &r.printed;
+    // Page 1: heading on line 1, details from line 3; printing on line 5
+    // (the overflow line) sets the overflow indicator.
+    assert_eq!(p[0], head("1"));
+    assert_eq!(p[1], "");
+    assert!(p[2].starts_with("     1  Acme Tooling          "), "{p:?}");
+    assert!(p[2].contains("1,250.50"), "{p:?}");
+    assert!(p[3].starts_with("     2  Midwest Fasteners"), "{p:?}");
+    assert!(p[4].starts_with("     3  Bluebird Supply"), "{p:?}");
+    // Page 2: the heading again, then the rest; 50 marks a negative
+    // balance; TOTAL spaces one line before it.
+    assert_eq!(p[5], "\u{c}");
+    assert_eq!(p[6], head("2"));
+    assert!(p[8].starts_with("     4  Prairie Freight"), "{p:?}");
+    assert!(
+        p[9].starts_with("     5  Lake, Pine & Co") && p[9].ends_with('*'),
+        "{p:?}"
+    );
+    assert_eq!(p[10], "");
+    assert_eq!(p[11], " Records:   5");
+    assert_eq!(p.len(), 12, "{p:?}");
+    // A program-described printer file takes the object's page size and
+    // overflow line.
+    job_run(
+        &client,
+        &lib,
+        &format!("CRTPRTF FILE({lib}/SMALLPRT) PAGESIZE(4 80) OVRFLW(3)"),
+    )
+    .await
+    .unwrap();
+    // Lines 1-3 fill the page to its overflow line (3): OF on after line
+    // 3 and after line 4; line 5 is on page 2 (the page has 4 lines).
+    let src = concat!(
+        "     FSMALLPRT  OF       80        PRINTER OFLIND(*INOF)\n",
+        "     DI                S              3P 0\n",
+        "     C                   DO        5             I\n",
+        "     C                   EXCEPT    LINE\n",
+        "     C   OFI             DSPLY\n",
+        "     C   OF              SETOFF                                         OF\n",
+        "     C                   ENDDO\n",
+        "     C                   SETON                                          LR\n",
+        "     OSMALLPRT  E            LINE           1\n",
+        "     O                       I             Z      5\n",
+    );
+    let r = run_rpg(&url, &lib, "QSECOFR", "SMALL", src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["3", "4"]);
+    assert_eq!(
+        r.printed,
+        ["    1", "    2", "    3", "    4", "\u{c}", "    5"]
+    );
+}
+
+/// READ of a display file (ILE RPG Reference, READ; EXFMT is a WRITE
+/// then a READ): WRITE puts the record on the display; READ takes the
+/// operator's input into its fields, by its format's name or the file's
+/// (the record with input fields on the display). READ of a record not on
+/// the display fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpg_read_of_a_display_record() {
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    catalog::create_display_file(
+        &mut client,
+        &lib,
+        "CUSTINQD",
+        include_str!("../../samples/qddssrc/CUSTINQD.dspf"),
+    )
+    .await
+    .unwrap();
+    let (tx, seen) = operator(vec![
+        (
+            press("ENTER", &[("CUSNUM", "7")], &[]),
+            Box::new(|f| assert_eq!(f.layers.last().unwrap().format, "PROMPT")),
+        ),
+        (
+            press("ENTER", &[("CUSNUM", "12")], &[]),
+            Box::new(|f| {
+                let l = f.layers.last().unwrap();
+                assert_eq!(l.format, "PROMPT");
+                // The record as written: CUSNUM 8 (7 + 1).
+                assert_eq!(l.values.get("CUSNUM").map(|v| v.trim()), Some("8"));
+            }),
+        ),
+    ]);
+    let src = "**FREE\ndcl-f custinqd workstn;\nwrite prompt;\nread prompt;\ndsply %char(cusnum);\ncusnum += 1;\nwrite prompt;\nread custinqd;\ndsply %char(cusnum);\nread detail;\n*inlr = *on;\n";
+    let r = run_rpg(&url, &lib, "QSECOFR", "READDSP", src, Some(tx), None).await;
+    assert_eq!(r.messages, ["7", "12"]);
+    let e = format!("{:#}", r.error.expect("DETAIL is not on the display"));
+    assert!(e.contains("READ DETAIL"), "{e}");
+    assert_eq!(seen.await.unwrap(), 2);
+}

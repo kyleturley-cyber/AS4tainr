@@ -151,7 +151,20 @@ pub async fn compile_with(
         let parsed = crate::dspf::parse(&f, &text)?;
         displays.insert(f, (library, std::sync::Arc::new(parsed)));
     }
-    program::bind(name, &src, &externals, &displays)
+    // Printer files: the object's page size and overflow line; the record
+    // formats of one described by DDS.
+    let mut printers = HashMap::new();
+    for f in program::printer_files(&src) {
+        if let Some(a) = crate::prtf::resolve(client, libl, &f).await? {
+            let dds = if a.source.trim().is_empty() {
+                None
+            } else {
+                Some(std::sync::Arc::new(crate::prtf::parse(&f, &a.source)?))
+            };
+            printers.insert(f, (a, dds));
+        }
+    }
+    program::bind(name, &src, &externals, &displays, &printers)
 }
 
 /// What CL run from RPG (QCMDEXC, CALL of a CL program) needs of the

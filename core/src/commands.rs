@@ -117,6 +117,9 @@ impl Job<'_> {
     }
 
     pub async fn run(&mut self, line: &str) -> Result<Outcome> {
+        if let Some(d) = self.user_command(line).await? {
+            return self.run_user_command(&d, line).await;
+        }
         let cmd = cl::parse(line)?;
         match cmd.def.name {
             "CRTLIB" => self.crtlib(&cmd).await,
@@ -134,12 +137,16 @@ impl Job<'_> {
             "CRTSRCPF" => self.crtsrcpf(&cmd).await,
             "DSPFD" => self.dspfd(&cmd).await,
             "CRTPF" | "CRTLF" | "CRTDSPF" => self.crtfile(&cmd).await,
+            "CRTPRTF" => self.crtprtf(&cmd).await,
             "CRTBNDCL" | "CRTCLPGM" | "CRTBNDRPG" | "CRTSQLRPGI" | "CRTRPGPGM" => {
                 self.crtpgm(&cmd).await
             }
             "CVTRPGSRC" => self.cvtrpgsrc(&cmd).await,
             "CVTRPGFREE" => self.cvtrpgfree(&cmd).await,
             "CRTMNU" => self.crtmnu(&cmd).await,
+            "CRTCMD" => self.crtcmd(&cmd).await,
+            "DLTCMD" => self.dltcmd(&cmd).await,
+            "DSPCMD" => self.dspcmd(&cmd).await,
             "DLTMNU" => self.dltmnu(&cmd).await,
             "DLTUSRPRF" => self.dltusrprf(&cmd).await,
             "CHGPWD" => Ok(Outcome::ChangePassword),
@@ -1356,7 +1363,7 @@ impl Job<'_> {
     async fn source_member(&self, cmd: &Command, object: &str) -> Result<crate::source::Member> {
         let (libs, file) = self.search(cmd.get("SRCFILE"));
         let member = match cmd.get("SRCMBR") {
-            "*FILE" | "*PGM" | "*OBJ" | "*MODULE" => object.to_string(),
+            "*FILE" | "*PGM" | "*OBJ" | "*MODULE" | "*CMD" => object.to_string(),
             m => m.to_string(),
         };
         let m = crate::source::find_member(self.client, &libs, &file, &member).await?;
@@ -1413,6 +1420,48 @@ impl Job<'_> {
                 .collect(),
             ..Default::default()
         }))
+    }
+
+    /// CRTPRTF: a printer file, described by DDS or not (SRCFILE(*NONE):
+    /// program-described), with its page size and overflow line.
+    async fn crtprtf(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = self.create_target(cmd.get("FILE"));
+        let (lib, name) = (lib.to_ascii_uppercase(), name.to_ascii_uppercase());
+        let (source, mbr_text) = if cmd.get("SRCFILE") == "*NONE" {
+            (String::new(), String::new())
+        } else {
+            let m = self.source_member(cmd, &name).await?;
+            (m.source, m.text)
+        };
+        let size: Vec<String> = cmd
+            .list("PAGESIZE")
+            .iter()
+            .flat_map(|v| v.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+            .collect();
+        let len: i32 = number(size.first().map(String::as_str).unwrap_or("66"), "PAGESIZE")? as i32;
+        let width: i32 =
+            number(size.get(1).map(String::as_str).unwrap_or("132"), "PAGESIZE")? as i32;
+        let ovf: i32 = number(cmd.get("OVRFLW"), "OVRFLW")? as i32;
+        let text = match cmd.get("TEXT") {
+            "*SRCMBRTXT" => mbr_text,
+            "*BLANK" => String::new(),
+            t => t.to_string(),
+        };
+        crate::prtf::create(
+            self.client,
+            &lib,
+            &name,
+            &source,
+            (len, width, ovf),
+            &text,
+            cmd.get("REPLACE") != "*NO",
+        )
+        .await
+        .map_err(|e| anyhow!("CPF7302: File {name} not created in library {lib}. {e:#}"))?;
+        authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
+        Ok(Outcome::Messages(vec![format!(
+            "File {name} created in library {lib}."
+        )]))
     }
 
     /// CRTPF, CRTLF, CRTDSPF from a source member.
@@ -1839,6 +1888,144 @@ impl Job<'_> {
         )]))
     }
 
+    /// A command made with CRTCMD, when the line runs one: a qualified
+    /// name, or a name the system commands do not have, found in the
+    /// library list.
+    pub async fn user_command(&self, line: &str) -> Result<Option<crate::cmd::Definition>> {
+        let first = line
+            .trim()
+            .split(|c: char| c.is_whitespace() || c == '(')
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        let (libs, name) = match first.split_once('/') {
+            Some(("QSYS", n)) if cl::is_system(n) => return Ok(None),
+            Some(_) => self.search(&first),
+            None if cl::is_system(&first) => return Ok(None),
+            None => (self.library_list(), first.clone()),
+        };
+        if name.is_empty() || name.starts_with('*') {
+            return Ok(None);
+        }
+        crate::cmd::find(self.client, &libs, &name).await
+    }
+
+    /// Run a command made with CRTCMD: its parameters checked against its
+    /// definition, then its validity checking program and its command
+    /// processing program called with them.
+    async fn run_user_command(
+        &mut self,
+        d: &crate::cmd::Definition,
+        line: &str,
+    ) -> Result<Outcome> {
+        authority::check(
+            self.client,
+            &self.user,
+            &d.library,
+            &d.name,
+            "*CMD",
+            Aut::Use,
+        )
+        .await?;
+        let args = crate::cmd::call_args(crate::cmd::encode(d, line)?);
+        if let Some(v) = &d.vldckr {
+            self.call_program_boxed(v, args.clone()).await?;
+        }
+        self.call_program_boxed(&d.pgm, args).await
+    }
+
+    /// CRTCMD: a command from command definition source.
+    async fn crtcmd(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = self.create_target(cmd.get("CMD"));
+        let (lib, name) = (lib.to_ascii_uppercase(), name.to_ascii_uppercase());
+        crate::catalog::validate_name("command", &name)?;
+        let m = self.source_member(cmd, &name).await?;
+        let qualified = |q: &str| -> String {
+            let q = q.to_ascii_uppercase();
+            if q.contains('/') {
+                q
+            } else {
+                format!("*LIBL/{q}")
+            }
+        };
+        let pgm = qualified(cmd.get("PGM"));
+        let mut d = crate::cmd::compile(&lib, &name, &pgm, &m.source)
+            .map_err(|e| anyhow!("CPF0201: Command {name} not created in library {lib}. {e:#}"))?;
+        d.vldckr = match cmd.get("VLDCKR") {
+            "*NONE" | "" => None,
+            v => Some(qualified(v)),
+        };
+        d.maxpos = cmd.get("MAXPOS").parse().ok();
+        let text = match cmd.get("TEXT") {
+            "*SRCMBRTXT" => m.text.clone(),
+            "*BLANK" => String::new(),
+            t => t.to_string(),
+        };
+        d.text = text.clone();
+        let mut c = runtime::connect_db(&self.env.database_url).await?;
+        crate::cmd::create(&mut c, &d, &text, cmd.get("REPLACE") != "*NO").await?;
+        authority::set_owner(self.client, &lib, &name, "*CMD", &self.user).await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Command {name} created in library {lib}."
+        )]))
+    }
+
+    async fn dltcmd(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (libs, name) = self.search(cmd.get("CMD"));
+        let name = name.to_ascii_uppercase();
+        let Some(d) = crate::cmd::find(self.client, &libs, &name).await? else {
+            bail!("CPF2105: Object {name} in *LIBL type *CMD not found.");
+        };
+        authority::check(self.client, &self.user, &d.library, &name, "*CMD", Aut::All).await?;
+        crate::cmd::delete(self.client, &d.library, &name).await?;
+        authority::forget(self.client, &d.library, &name, "*CMD").await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Command {name} deleted from library {}.",
+            d.library
+        )]))
+    }
+
+    /// DSPCMD: what a command runs and its parameters.
+    async fn dspcmd(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (libs, name) = self.search(cmd.get("CMD"));
+        let name = name.to_ascii_uppercase();
+        let d = match crate::cmd::find(self.client, &libs, &name).await? {
+            Some(d) => d,
+            None if cl::is_system(&name) => crate::cmd::Definition {
+                library: "QSYS".into(),
+                name: name.clone(),
+                pgm: format!("QSYS/{name}"),
+                prompt: cl::find(&name)
+                    .map(|c| c.description.to_string())
+                    .unwrap_or_default(),
+                ..Default::default()
+            },
+            None => bail!("CPF2105: Object {name} in *LIBL type *CMD not found."),
+        };
+        authority::check(self.client, &self.user, &d.library, &name, "*CMD", Aut::Use).await?;
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display Command".into(),
+            info: vec![
+                ("Command".into(), d.name.clone()),
+                ("Library".into(), d.library.clone()),
+                ("Program to process command".into(), d.pgm.clone()),
+                (
+                    "Validity checker".into(),
+                    d.vldckr.clone().unwrap_or_else(|| "*NONE".into()),
+                ),
+                ("Prompt".into(), d.prompt.clone()),
+                ("Text".into(), d.text.clone()),
+            ],
+            heading: format!("{:<10}  {:<10}  {:>6}  Prompt", "Keyword", "Type", "Length"),
+            rows: d
+                .parms
+                .iter()
+                .map(|p| format!("{:<10}  {:<10}  {:>6}  {}", p.kwd, p.ty, p.len, p.prompt))
+                .collect(),
+            ..Default::default()
+        }))
+    }
+
     async fn dltmnu(&mut self, cmd: &Command) -> Result<Outcome> {
         let (lib, name) = match cmd.get("MENU").split_once('/') {
             Some(("*CURLIB", n)) => (Some(self.current_library()), n.to_string()),
@@ -2079,7 +2266,11 @@ impl Job<'_> {
         let command = cmd.get("CMD").trim().to_string();
         // Check it now, as SBMJOB does: a command that does not parse is
         // never submitted.
-        cl::parse(&command)?;
+        // A system command is checked now; a command made with CRTCMD
+        // when the job runs it.
+        if self.user_command(&command).await?.is_none() {
+            cl::parse(&command)?;
+        }
         let name = match cmd.get("JOB") {
             "*JOBD" => jobs::DEFAULT_BATCH_JOB_NAME.to_string(),
             n => n.to_string(),

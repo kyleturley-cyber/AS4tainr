@@ -211,7 +211,7 @@ impl Record {
 
 // ---------------------------------------------------------------- parsing
 
-fn cols(line: &str, from: usize, to: usize) -> &str {
+pub(crate) fn cols(line: &str, from: usize, to: usize) -> &str {
     let start = from - 1;
     if line.len() <= start {
         return "";
@@ -219,7 +219,7 @@ fn cols(line: &str, from: usize, to: usize) -> &str {
     line.get(start..to.min(line.len())).unwrap_or("")
 }
 
-fn parse_indicators(area: &str) -> Result<Vec<(bool, u8)>> {
+pub(crate) fn parse_indicators(area: &str) -> Result<Vec<(bool, u8)>> {
     // Positions 8-16: three slots of N + two digits.
     let mut out = Vec::new();
     let chars: Vec<char> = format!("{area:<9}").chars().collect();
@@ -243,7 +243,7 @@ fn parse_indicators(area: &str) -> Result<Vec<(bool, u8)>> {
 
 /// Split a keyword area into keywords: NAME or NAME(args), args may
 /// contain quoted strings.
-fn split_keywords(area: &str) -> Result<Vec<(String, Vec<String>)>> {
+pub(crate) fn split_keywords(area: &str) -> Result<Vec<(String, Vec<String>)>> {
     let mut out = Vec::new();
     let cs: Vec<char> = area.chars().collect();
     let mut i = 0;

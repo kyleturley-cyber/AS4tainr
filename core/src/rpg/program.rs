@@ -60,6 +60,11 @@ pub struct FileInfo {
     pub fields: Vec<String>,
     /// The display file, for WORKSTN files.
     pub display: Option<Display>,
+    /// The printer file's DDS, for externally described PRINTER files.
+    pub printer: Option<Arc<crate::prtf::PrinterFile>>,
+    /// The printer file object's page length, width and overflow line
+    /// (CRTPRTF PAGESIZE, OVRFLW), when there is one.
+    pub page: Option<(i32, i32, i32)>,
     /// A program-described DISK file: its records are byte images read
     /// by the positions on the input specifications.
     pub program_described: bool,
@@ -412,6 +417,11 @@ impl Program {
                     .iter()
                     .position(|f| f.display.as_ref().is_some_and(|d| d.fields(name).is_some()))
             })
+            .or_else(|| {
+                self.files
+                    .iter()
+                    .position(|f| f.printer.as_ref().is_some_and(|p| p.record(name).is_some()))
+            })
     }
 }
 
@@ -439,6 +449,27 @@ pub fn external_files(src: &Source) -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+/// A printer file for the program: its attributes and its DDS (none when
+/// it was created without DDS).
+pub type PrinterInfo = (
+    crate::prtf::Attributes,
+    Option<Arc<crate::prtf::PrinterFile>>,
+);
+
+/// The printer files a source uses: (file, the name of the object).
+pub fn printer_files(src: &Source) -> Vec<String> {
+    src.files
+        .iter()
+        .filter(|f| f.device == "PRINTER")
+        .map(|f| {
+            keyword(&f.keywords, "EXTDESC")
+                .and_then(|k| k.args.first())
+                .map(|a| a.trim_matches('\'').to_ascii_uppercase())
+                .unwrap_or_else(|| f.name.clone())
+        })
+        .collect()
 }
 
 /// The display files a source uses (WORKSTN files with E in position 22).
@@ -1371,6 +1402,7 @@ pub fn bind(
     src: &Source,
     externals: &HashMap<String, FileRef>,
     displays: &HashMap<String, (String, Arc<DisplayFile>)>,
+    printers: &HashMap<String, PrinterInfo>,
 ) -> Result<Program> {
     let mut b = Binder {
         syms: HashMap::new(),
@@ -1408,7 +1440,44 @@ pub fn bind(
             record_len: 0,
             key_len: 0,
             inputs: vec![],
+            printer: None,
+            page: None,
         };
+        if f.device == "PRINTER" {
+            let ext = keyword(&f.keywords, "EXTDESC")
+                .and_then(|k| k.args.first())
+                .map(|a| a.trim_matches('\'').to_ascii_uppercase())
+                .unwrap_or_else(|| f.name.clone());
+            match (printers.get(&ext), f.external) {
+                (Some((attrs, dds)), _) => {
+                    info.page = Some((attrs.page_length, attrs.page_width, attrs.overflow));
+                    if f.external {
+                        let dds = dds.clone().ok_or_else(|| {
+                            anyhow!("printer file {} has no record formats (it was created without DDS)", f.name)
+                        })?;
+                        // The record formats' fields become program fields:
+                        // numbers zoned, as in a display file.
+                        for r in &dds.records {
+                            for fd in &r.fields {
+                                if fd.content != crate::prtf::Content::Field || f.proc.is_some() {
+                                    continue;
+                                }
+                                let t = match fd.decimals {
+                                    Some(d) if fd.dtype == 'S' => {
+                                        DType::Zoned(fd.length as u32, d as u32)
+                                    }
+                                    _ => DType::Char(fd.length as u32),
+                                };
+                                b.file_fields.entry(fd.name.clone()).or_insert(t);
+                            }
+                        }
+                        info.printer = Some(dds);
+                    }
+                }
+                (None, true) => bail!("printer file {} is not described (not found)", f.name),
+                (None, false) => {}
+            }
+        }
         if f.device == "WORKSTN" && f.external {
             let ext = keyword(&f.keywords, "EXTDESC")
                 .and_then(|k| k.args.first())

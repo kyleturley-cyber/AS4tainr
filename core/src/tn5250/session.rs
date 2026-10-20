@@ -643,6 +643,10 @@ async fn request(
             let chosen = if typed.is_empty() {
                 command_menu(term).await?
             } else {
+                // A command made with CRTCMD: its prompt.
+                if let Ok(Some(d)) = job.user_command(typed).await {
+                    crate::cmd::prompt_def(&d);
+                }
                 match cl::parse_partial(typed) {
                     Err(e) => {
                         done.message = e.to_string();
@@ -967,6 +971,8 @@ enum PromptResult {
 }
 
 const PROMPT_FIRST_ROW: u8 = 5;
+/// Lines of parameters on one prompt page (5-21).
+const PROMPT_LINES: usize = 17;
 const PROMPT_LABEL_COL: u8 = 2;
 const PROMPT_FIELD_COL: u8 = 37;
 
@@ -1006,12 +1012,26 @@ async fn prompt(
     };
     let mut values = initial();
     let mut message = String::new();
+    // Pages of parameters: lines 5-21, a qualified name takes two; the
+    // Page Down and Page Up keys (Roll Up, Roll Down) move between them.
+    let mut pages: Vec<Vec<&cl::ParamDef>> = vec![vec![]];
+    let mut used = 0;
+    for pd in def.params {
+        let n = if pd.kind == cl::Kind::Qualified { 2 } else { 1 };
+        if used + n > PROMPT_LINES {
+            pages.push(vec![]);
+            used = 0;
+        }
+        pages.last_mut().unwrap().push(pd);
+        used += n;
+    }
+    let mut page = 0usize;
     loop {
         let mut s = Screen::new();
         centered(&mut s, 1, &format!("{} ({})", def.description, def.name));
         s.put(3, 2, "Type choices, press Enter.");
         let mut row = PROMPT_FIRST_ROW;
-        for pd in def.params {
+        for pd in pages[page].iter().copied() {
             let a = if pd.required {
                 attr::HIGH
             } else {
@@ -1042,7 +1062,11 @@ async fn prompt(
                 row += 1;
             }
         }
-        s.put(22, 74, "Bottom");
+        if page + 1 < pages.len() {
+            s.put(22, 73, "More...");
+        } else {
+            s.put(22, 74, "Bottom");
+        }
         keys(&mut s, 23, "F3=Exit   F5=Refresh   F12=Cancel");
         s.message(&message);
         message.clear();
@@ -1055,6 +1079,22 @@ async fn prompt(
             Aid::F(12) => return Ok(PromptResult::Cancel),
             Aid::F(5) => {
                 values = initial();
+                continue;
+            }
+            Aid::RollUp => {
+                if page + 1 < pages.len() {
+                    page += 1;
+                } else {
+                    message = "Already at bottom of area.".into();
+                }
+                continue;
+            }
+            Aid::RollDown => {
+                if page > 0 {
+                    page -= 1;
+                } else {
+                    message = "Already at top of area.".into();
+                }
                 continue;
             }
             Aid::Enter => {}

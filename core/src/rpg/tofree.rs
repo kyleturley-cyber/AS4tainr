@@ -293,7 +293,9 @@ impl Conv {
         };
         let mut s = format!("dcl-f {}", lower(&name));
         let reclen = colt(cs, 23, 27);
-        let program_described = ch(22) == 'F';
+        // Position 22: E externally described; anything else (F, blank)
+        // program-described.
+        let program_described = ch(22) != 'E';
         s.push(' ');
         if program_described {
             s.push_str(&format!("{}({})", lower(&device), reclen));

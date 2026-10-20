@@ -16,7 +16,7 @@
 //!    is added (replacing a member of the same name).
 //! 2. CRTPF for each PF member, and loads its CSV when the file is new
 //!    (an existing file keeps its records);
-//! 3. CRTLF, CRTDSPF;
+//! 3. CRTLF, CRTDSPF, CRTPRTF;
 //! 4. CRTBNDCL (CLLE) and CRTCLPGM (CLP), CRTBNDRPG (RPGLE), CRTSQLRPGI
 //!    (SQLRPGLE).
 //!
@@ -488,7 +488,7 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
     }
 
     // 3. Logical and display files.
-    for (t, command) in [("LF", "CRTLF"), ("DSPF", "CRTDSPF")] {
+    for (t, command) in [("LF", "CRTLF"), ("DSPF", "CRTDSPF"), ("PRTF", "CRTPRTF")] {
         for m in of_type(t) {
             if catalog::object_exists(job.client, std::slice::from_ref(&lib), &m.member, "*FILE")
                 .await?
@@ -626,11 +626,22 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
             step(job, &mut report, &m.member, &cmd).await;
         }
     }
+    // 6. Commands: the command processing program is the program of the
+    // same name (as build tools for IBM i name them by default).
+    for m in of_type("CMD") {
+        let cmd = format!(
+            "CRTCMD CMD({lib}/{}) PGM({lib}/{}) SRCFILE({lib}/{}) SRCMBR({})",
+            m.member, m.member, m.file, m.member
+        );
+        step(job, &mut report, &m.member, &cmd).await;
+    }
     for m in members.iter().filter(|m| {
         !matches!(
             m.srctype.as_str(),
             "PF" | "LF"
+                | "CMD"
                 | "DSPF"
+                | "PRTF"
                 | "CLLE"
                 | "CLP"
                 | "RPGLE"

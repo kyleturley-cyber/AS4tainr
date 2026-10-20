@@ -209,6 +209,14 @@ pub async fn init(client: &Client) -> Result<()> {
             .await
             .context("creating catalog")?;
         client
+            .batch_execute(crate::cmd::DDL)
+            .await
+            .context("creating catalog")?;
+        client
+            .batch_execute(crate::prtf::DDL)
+            .await
+            .context("creating catalog")?;
+        client
             .batch_execute(crate::menus::DDL)
             .await
             .context("creating catalog")?;
@@ -1192,13 +1200,13 @@ pub async fn delete_file(
                 ))
                 .await?;
             }
-            (None, "DSPF") => {}
+            (None, "DSPF") | (None, "PRTF") => {}
             (None, _) => {
                 tx.batch_execute(&format!("DROP TABLE IF EXISTS {qualified} CASCADE"))
                     .await?;
             }
         }
-        for table in ["files", "logical_files", "display_files"] {
+        for table in ["files", "logical_files", "display_files", "printer_files"] {
             tx.execute(
                 &format!("DELETE FROM as4tainr.{table} WHERE library=$1 AND name=$2"),
                 &[l, n],

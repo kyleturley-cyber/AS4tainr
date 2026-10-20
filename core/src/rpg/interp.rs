@@ -29,6 +29,8 @@ mod errors;
 mod exec_sql;
 #[path = "ops.rs"]
 mod ops;
+#[path = "printer.rs"]
+mod printer;
 
 /// What the program runs with: the database, the job.
 pub struct Io<'a> {
@@ -1521,6 +1523,9 @@ impl<'a> Machine<'a> {
         if device == "WORKSTN" {
             return self.workstn_op(op, i, file, key, ind);
         }
+        if device == "PRINTER" {
+            return self.printer_op(op, i, file);
+        }
         if device != "DISK" {
             bail!(
                 "{} files are not supported by the native engine yet ({op:?} {file})",
@@ -1893,6 +1898,47 @@ impl<'a> Machine<'a> {
         out
     }
 
+    /// Show a frame on the job's display and take the operator's input:
+    /// the fields of the format, response indicators, the key pressed.
+    fn ws_interact(
+        &mut self,
+        i: usize,
+        d: &Display,
+        file: &std::sync::Arc<crate::dspf::DisplayFile>,
+        format: &str,
+        frame: crate::workstn::Frame,
+    ) -> Result<()> {
+        let Some(display) = self.io.display.clone() else {
+            bail!(
+                "Display file {} cannot be used here: this job has no display (it is not interactive).",
+                d.file.name
+            );
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let resp = self.block(async move {
+            display
+                .send(crate::runtime::DisplayRequest { frame, reply: tx })
+                .await
+                .map_err(|_| anyhow!("the job's display is gone"))?;
+            rx.await
+                .map_err(|_| anyhow!("the job's display is gone"))?
+                .map_err(|e| anyhow!(e))
+        })?;
+        self.ws.apply(file, format, &resp);
+        self.files[i].aid = Some(resp.aid.clone());
+        self.ws_fill(d, format, &resp.values)?;
+        for (n, v) in &resp.indicators {
+            self.ws_set_ind(d, *n, *v);
+        }
+        // *INKA-*INKY: on for the function key pressed, off for the others
+        // (ILE RPG Reference, function key indicators).
+        for (k, letter) in FKEYS.iter().enumerate() {
+            let on = resp.aid == format!("F{}", k + 1);
+            self.set_ind(&format!("K{}", *letter as char), on);
+        }
+        Ok(())
+    }
+
     fn ws_set_ind(&mut self, d: &Display, n: u8, v: bool) {
         if !(1..=99).contains(&n) {
             return;
@@ -1987,6 +2033,25 @@ impl<'a> Machine<'a> {
         if !self.files[i].ws_open {
             bail!("CPF4135: File {} is not open.", prog.files[i].decl.name);
         }
+        // READ: the record on the display (named, or by the file's name
+        // the one with input fields written last), the operator's input
+        // into its fields (ILE RPG Reference, READ of a WORKSTN file).
+        if op == FileOp::Read {
+            let named = d.fields(name).is_some().then_some(name);
+            let file = d.file.clone();
+            let (frame, format) = self.ws.read_frame(&file, named)?;
+            self.ws_interact(i, d, &file, &format, frame)?;
+            let st = Status {
+                found: true,
+                ..Status::default()
+            };
+            self.files[i].status = st.clone();
+            self.last = st;
+            if let Some(eq) = &ind.eq {
+                self.set_ind(eq, false);
+            }
+            return Ok(());
+        }
         if d.fields(name).is_none() {
             bail!(
                 "{op:?} {name}: name a record format of display file {}",
@@ -2019,36 +2084,15 @@ impl<'a> Machine<'a> {
                 set_status(self, Status::default());
             }
             FileOp::Exfmt => {
-                let Some(display) = self.io.display.clone() else {
+                if self.io.display.is_none() {
                     bail!(
                         "Display file {} cannot be used here: this job has no display (it is not interactive).",
                         d.file.name
                     );
-                };
+                }
                 let values = self.ws_values(d, &format)?;
                 let frame = self.ws.frame(&file, &format, values, inds)?;
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let resp = self.block(async move {
-                    display
-                        .send(crate::runtime::DisplayRequest { frame, reply: tx })
-                        .await
-                        .map_err(|_| anyhow!("the job's display is gone"))?;
-                    rx.await
-                        .map_err(|_| anyhow!("the job's display is gone"))?
-                        .map_err(|e| anyhow!(e))
-                })?;
-                self.ws.apply(&file, &format, &resp);
-                self.files[i].aid = Some(resp.aid.clone());
-                self.ws_fill(d, &format, &resp.values)?;
-                for (n, v) in &resp.indicators {
-                    self.ws_set_ind(d, *n, *v);
-                }
-                // *INKA-*INKY: on for the function key pressed, off for
-                // the others (ILE RPG Reference, function key indicators).
-                for (k, letter) in FKEYS.iter().enumerate() {
-                    let on = resp.aid == format!("F{}", k + 1);
-                    self.set_ind(&format!("K{}", *letter as char), on);
-                }
+                self.ws_interact(i, d, &file, &format, frame)?;
                 set_status(self, Status::default());
             }
             FileOp::ReadC => {
@@ -4064,15 +4108,10 @@ impl Machine<'_> {
         }
         let width = decl.record_len.unwrap_or(132) as usize;
         // FORMLEN and FORMOFL: the form length and overflow line (from an
-        // RPG III line counter specification); 66 and 60 otherwise.
-        let form = |k: &str, d: i32| -> i32 {
-            keyword(&decl.keywords, k)
-                .and_then(|k| k.args.first())
-                .and_then(|a| a.trim().parse().ok())
-                .unwrap_or(d)
-        };
-        let page_length = form("FORMLEN", DEFAULT_LEN);
-        let overflow_line = form("FORMOFL", DEFAULT_OFL);
+        // RPG III line counter specification); otherwise the printer file
+        // object's (CRTPRTF PAGESIZE, OVRFLW); 66 and 60 without one.
+        let (page_length, overflow_line) = self.form_of(i);
+        let _ = (DEFAULT_LEN, DEFAULT_OFL);
         if !self.printers.contains_key(&r.file) {
             let spl = match &self.io.job {
                 Some(job) => Some(self.block(crate::spool::open(

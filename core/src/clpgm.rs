@@ -54,7 +54,7 @@ pub struct Param {
 /// Remove comments and join continuation lines. A line ending in `+`
 /// continues with the next line's first non-blank; `-` keeps the next
 /// line's leading blanks. Returns (line number, text) per statement.
-fn logical_lines(source: &str) -> Result<Vec<(usize, String)>> {
+pub(crate) fn logical_lines(source: &str) -> Result<Vec<(usize, String)>> {
     // Comments first, outside quotes.
     let mut text = String::new();
     let cs: Vec<char> = source.chars().collect();
@@ -181,6 +181,16 @@ fn split_params(text: &str) -> Result<Vec<Param>> {
                 i += 1;
             }
             let w: String = cs[s..i].iter().collect();
+            // A built-in function as a positional value: %SST(&A 1 2).
+            if i < cs.len() && cs[i] == '(' && w.starts_with('%') {
+                let (v, j) = group(i)?;
+                out.push(Param {
+                    keyword: None,
+                    value: format!("{w}({v})"),
+                });
+                i = j;
+                continue;
+            }
             if i < cs.len() && cs[i] == '(' && !w.starts_with('&') {
                 let (v, j) = group(i)?;
                 out.push(Param {
@@ -200,7 +210,7 @@ fn split_params(text: &str) -> Result<Vec<Param>> {
 }
 
 /// Parse one statement's text ("LABEL: CMD params").
-fn parse_statement(line: usize, text: &str) -> Result<Statement> {
+pub(crate) fn parse_statement(line: usize, text: &str) -> Result<Statement> {
     let mut rest = text.trim();
     let mut label = None;
     // A label: a name followed by ':' before the command.
@@ -241,7 +251,7 @@ fn parse_statement(line: usize, text: &str) -> Result<Statement> {
 }
 
 /// Parameter values by keyword, positional ones assigned in `order`.
-fn named(st: &Statement, order: &[&str]) -> Result<HashMap<String, String>> {
+pub(crate) fn named(st: &Statement, order: &[&str]) -> Result<HashMap<String, String>> {
     let mut out = HashMap::new();
     let mut pos = order.iter();
     for p in &st.params {
@@ -286,6 +296,8 @@ pub enum VarType {
     Dec,
     Lgl,
     Int,
+    /// A pointer (TYPE(*PTR)).
+    Ptr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -293,6 +305,9 @@ pub enum Value {
     Char(String),
     Dec(Decimal),
     Lgl(bool),
+    /// A pointer: the variable it addresses and the offset in it (None:
+    /// the null pointer).
+    Ptr(Option<(String, usize)>),
 }
 
 #[derive(Debug, Clone)]
@@ -301,6 +316,14 @@ pub struct Var {
     pub len: u32,
     pub decimals: u32,
     pub value: Value,
+    /// STG(*DEFINED) DEFVAR(&base start): its storage is part of another
+    /// variable's (CL reference, DCL): (base variable, start, 1-based).
+    pub defined: Option<(String, usize)>,
+    /// STG(*BASED) BASPTR(&ptr): its storage is where the pointer points.
+    pub based: Option<String>,
+    /// The value as last taken from its storage (*DEFINED, *BASED): a
+    /// change since is written back.
+    pub shadow: Option<Value>,
 }
 
 /// The text of a *DEC value as CL shows it for %CHAR: no leading zeros,
@@ -342,6 +365,8 @@ impl Value {
             Value::Char(s) => format!("'{s}'"),
             Value::Dec(d) => d.to_string(),
             Value::Lgl(b) => format!("'{}'", if *b { 1 } else { 0 }),
+            Value::Ptr(None) => "*NULL".into(),
+            Value::Ptr(Some((v, o))) => format!("pointer to {v} + {o}"),
         }
     }
 
@@ -351,11 +376,15 @@ impl Value {
         match self {
             Value::Dec(d) => dec_text(d),
             Value::Lgl(b) => format!("'{}'", if *b { 1 } else { 0 }),
+            Value::Ptr(_) => "*NULL".into(),
             Value::Char(s) => {
                 let t = s.trim_end();
+                // A variable's value goes to the command as it is: text
+                // with lower case letters stays as it is (quoted).
                 let plain = !t.is_empty()
-                    && t.chars()
-                        .all(|c| c.is_ascii_alphanumeric() || "*$#@_./".contains(c));
+                    && t.chars().all(|c| {
+                        c.is_ascii_uppercase() || c.is_ascii_digit() || "*$#@_./".contains(c)
+                    });
                 if plain {
                     t.to_string()
                 } else {
@@ -424,6 +453,27 @@ fn expr_tokens(s: &str) -> Result<Vec<ET>> {
             '&' => {
                 out.push(ET::Op("*AND".into()));
                 i += 1;
+            }
+            // X'C1C2': a hexadecimal character constant (CL reference,
+            // "Hexadecimal constants"): its bytes as characters.
+            'X' | 'x' if next == Some('\'') => {
+                let mut j = i + 2;
+                let mut hex = String::new();
+                while j < cs.len() && cs[j] != '\'' {
+                    hex.push(cs[j]);
+                    j += 1;
+                }
+                if j >= cs.len()
+                    || !hex.len().is_multiple_of(2)
+                    || !hex.chars().all(|c| c.is_ascii_hexdigit())
+                {
+                    bail!("X'{hex}' is not a valid hexadecimal constant");
+                }
+                let bytes: Vec<u8> = (0..hex.len() / 2)
+                    .map(|k| u8::from_str_radix(&hex[2 * k..2 * k + 2], 16).unwrap_or(0))
+                    .collect();
+                out.push(ET::Str(crate::rpg::data::a(&bytes)));
+                i = j + 1;
             }
             '\'' => {
                 let mut v = String::new();
@@ -764,6 +814,26 @@ fn eval(e: &Expr, vars: &HashMap<String, Var>) -> Result<Value> {
                     }
                     Value::Char(s[start - 1..start - 1 + len].iter().collect())
                 }
+                // %ADDRESS(&var): a pointer to the variable's storage;
+                // %OFFSET(&ptr): where in it the pointer points.
+                "%ADDRESS" | "%ADDR" => match args.first() {
+                    Some(Expr::Var(v)) => {
+                        let target = vars
+                            .get(v)
+                            .ok_or_else(|| anyhow!("CPD0727: Variable {v} is not declared."))?;
+                        // A defined variable: the pointer is into its base.
+                        match &target.defined {
+                            Some((base, start)) => Value::Ptr(Some((base.clone(), start - 1))),
+                            None => Value::Ptr(Some((v.clone(), 0))),
+                        }
+                    }
+                    _ => bail!("{name} needs a variable"),
+                },
+                "%OFFSET" | "%OFS" => match arg(0)? {
+                    Value::Ptr(Some((_, o))) => Value::Dec(Decimal::from(o as u64)),
+                    Value::Ptr(None) => Value::Dec(Decimal::ZERO),
+                    other => bail!("%OFFSET needs a pointer, not {}", other.describe()),
+                },
                 "%TRIM" => Value::Char(arg(0)?.as_char()?.trim_matches(' ').to_string()),
                 "%TRIML" => Value::Char(arg(0)?.as_char()?.trim_start_matches(' ').to_string()),
                 "%TRIMR" => Value::Char(arg(0)?.as_char()?.trim_end_matches(' ').to_string()),
@@ -820,6 +890,13 @@ fn assign(name: &str, var: &mut Var, v: Value) -> Result<()> {
             Value::Char(s)
         }
         VarType::Lgl => Value::Lgl(v.as_lgl()?),
+        VarType::Ptr => match v {
+            Value::Ptr(p) => Value::Ptr(p),
+            other => bail!(
+                "only a pointer can be stored in {name}, not {}",
+                other.describe()
+            ),
+        },
         VarType::Dec | VarType::Int => {
             let d = match v {
                 Value::Dec(d) => d,
@@ -827,6 +904,7 @@ fn assign(name: &str, var: &mut Var, v: Value) -> Result<()> {
                     anyhow!("MCH1202: '{}' is not a valid number for {name}.", s.trim())
                 })?,
                 Value::Lgl(_) => bail!("a logical value cannot be stored in {name}"),
+                Value::Ptr(_) => bail!("a pointer cannot be stored in {name}"),
             };
             let d = d.trunc_with_scale(var.decimals);
             let int_digits = var.len.saturating_sub(var.decimals);
@@ -856,6 +934,10 @@ enum Ins {
         monitors: Vec<(Vec<String>, usize)>,
     },
     ChgVar(String, Expr),
+    /// CHGVAR %SST(&var start length) value: part of a variable.
+    ChgSst(String, Expr, Expr, Expr),
+    /// CHGVAR %OFFSET(&ptr) value: where a pointer points in its storage.
+    ChgOfs(String, Expr),
     JumpIfFalse(Expr, usize),
     Jump(usize),
     /// Jump to a label (resolved when the program is checked).
@@ -1025,10 +1107,33 @@ impl Compiler<'_> {
                     .get("VALUE")
                     .ok_or_else(|| self.err(st, "VALUE is required"))?;
                 let target = var.trim().to_ascii_uppercase();
+                let e = parse_expr(value).map_err(|e| self.err(st, e))?;
+                // %SST(&var start length) and %OFFSET(&ptr) as targets
+                // (CL reference, CHGVAR).
+                if target.starts_with('%') {
+                    match parse_expr(&target).map_err(|e| self.err(st, e))? {
+                        Expr::Builtin(f, a)
+                            if (f == "%SST" || f == "%SUBSTRING") && a.len() == 3 =>
+                        {
+                            let Expr::Var(v) = &a[0] else {
+                                return Err(self.err(st, "%SST needs a variable here"));
+                            };
+                            self.code
+                                .push(Ins::ChgSst(v.clone(), a[1].clone(), a[2].clone(), e));
+                        }
+                        Expr::Builtin(f, a) if (f == "%OFFSET" || f == "%OFS") && a.len() == 1 => {
+                            let Expr::Var(v) = &a[0] else {
+                                return Err(self.err(st, "%OFFSET needs a variable"));
+                            };
+                            self.code.push(Ins::ChgOfs(v.clone(), e));
+                        }
+                        _ => return Err(self.err(st, format!("{var} is not a variable"))),
+                    }
+                    return Ok(());
+                }
                 if !target.starts_with('&') {
                     return Err(self.err(st, format!("{var} is not a variable")));
                 }
-                let e = parse_expr(value).map_err(|e| self.err(st, e))?;
                 self.code.push(Ins::ChgVar(target, e));
             }
             "IF" => {
@@ -1322,8 +1427,14 @@ fn monmsg(m: &Statement) -> Result<(Vec<String>, Option<String>)> {
 }
 
 fn parse_dcl(st: &Statement) -> Result<(String, Var)> {
-    // Positional order VAR TYPE LEN VALUE; STG only by keyword in practice.
-    let p = named(st, &["VAR", "TYPE", "LEN", "VALUE", "STG"])?;
+    // Positional order VAR TYPE LEN VALUE; STG, BASPTR, DEFVAR and ADDRESS
+    // by keyword in practice.
+    let p = named(
+        st,
+        &[
+            "VAR", "TYPE", "LEN", "VALUE", "STG", "BASPTR", "DEFVAR", "ADDRESS",
+        ],
+    )?;
     let name = p
         .get("VAR")
         .ok_or_else(|| anyhow!("line {}: DCL needs VAR", st.line))?
@@ -1341,6 +1452,7 @@ fn parse_dcl(st: &Statement) -> Result<(String, Var)> {
         Some("*DEC") => VarType::Dec,
         Some("*LGL") => VarType::Lgl,
         Some("*INT") | Some("*UINT") => VarType::Int,
+        Some("*PTR") => VarType::Ptr,
         Some(other) => bail!("line {}: TYPE({other}) is not supported yet", st.line),
         None => bail!("line {}: DCL needs TYPE", st.line),
     };
@@ -1365,6 +1477,8 @@ fn parse_dcl(st: &Statement) -> Result<(String, Var)> {
         ),
         VarType::Lgl => (1, 0),
         VarType::Int => (lens.first().copied().unwrap_or(4), 0),
+        // A pointer: 16 bytes.
+        VarType::Ptr => (16, 0),
     };
     if ty == VarType::Dec && (len == 0 || len > 15 || decimals > len) {
         bail!(
@@ -1386,6 +1500,40 @@ fn parse_dcl(st: &Statement) -> Result<(String, Var)> {
         ),
         _ => (len, decimals, len),
     };
+    // Storage (CL reference, DCL): *AUTO (its own), *DEFINED (part of
+    // DEFVAR's variable, from a start position, 1 by default) or *BASED
+    // (where BASPTR's pointer points).
+    let stg = p
+        .get("STG")
+        .map(|t| t.trim().to_ascii_uppercase())
+        .unwrap_or_else(|| "*AUTO".into());
+    let (defined, based) = match stg.as_str() {
+        "*AUTO" => (None, None),
+        "*DEFINED" => {
+            let d = p
+                .get("DEFVAR")
+                .ok_or_else(|| anyhow!("line {}: STG(*DEFINED) needs DEFVAR", st.line))?;
+            let mut w = d.split_whitespace();
+            let base = w.next().unwrap_or("").to_ascii_uppercase();
+            let start: usize = match w.next() {
+                Some(n) => n.parse().ok().filter(|n| *n >= 1).ok_or_else(|| {
+                    anyhow!("line {}: DEFVAR({d}): the start is not valid", st.line)
+                })?,
+                None => 1,
+            };
+            (Some((base, start)), None)
+        }
+        "*BASED" => {
+            let b = p
+                .get("BASPTR")
+                .ok_or_else(|| anyhow!("line {}: STG(*BASED) needs BASPTR", st.line))?;
+            (None, Some(b.trim().to_ascii_uppercase()))
+        }
+        other => bail!("line {}: STG({other}) is not valid", st.line),
+    };
+    if (defined.is_some() || based.is_some()) && p.contains_key("VALUE") {
+        bail!("line {}: VALUE cannot be given with STG({stg})", st.line);
+    }
     let mut var = Var {
         ty,
         len: digits,
@@ -1393,9 +1541,23 @@ fn parse_dcl(st: &Statement) -> Result<(String, Var)> {
         value: match ty {
             VarType::Char => Value::Char(" ".repeat(len as usize)),
             VarType::Lgl => Value::Lgl(false),
+            VarType::Ptr => Value::Ptr(None),
             _ => Value::Dec(Decimal::ZERO),
         },
+        defined,
+        based,
+        shadow: None,
     };
+    // ADDRESS(&var): a pointer's first value.
+    if let Some(a) = p.get("ADDRESS") {
+        if ty != VarType::Ptr {
+            bail!("line {}: ADDRESS is only for TYPE(*PTR)", st.line);
+        }
+        let mut w = a.split_whitespace();
+        let target = w.next().unwrap_or("").to_ascii_uppercase();
+        let off: usize = w.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+        var.value = Value::Ptr(Some((target, off)));
+    }
     if ty == VarType::Char {
         var.len = len;
     }
@@ -1405,6 +1567,137 @@ fn parse_dcl(st: &Statement) -> Result<(String, Var)> {
         assign(&name, &mut var, val).map_err(|e| anyhow!("line {}: {e}", st.line))?;
     }
     Ok((name, var))
+}
+
+/// How many bytes a variable takes: *CHAR its length, *LGL 1, *DEC packed
+/// (digits / 2 + 1), *INT its length, *PTR 16.
+fn storage_size(v: &Var) -> usize {
+    match v.ty {
+        VarType::Char => v.len as usize,
+        VarType::Lgl => 1,
+        VarType::Dec => v.len as usize / 2 + 1,
+        VarType::Int => match v.len {
+            5 => 2,
+            19 => 8,
+            _ => 4,
+        },
+        VarType::Ptr => 16,
+    }
+}
+
+/// A variable's value from its bytes (EBCDIC as the system keeps them).
+fn from_bytes(v: &Var, b: &[u8]) -> Result<Value> {
+    use crate::rpg::data::{self, DType};
+    Ok(match v.ty {
+        VarType::Char => Value::Char(data::a(b)),
+        VarType::Lgl => Value::Lgl(data::a(b) == "1"),
+        VarType::Dec => {
+            let n = data::load(&DType::Packed(v.len, v.decimals), b)?.num()?;
+            Value::Dec(Decimal::from_str(&n.to_string()).map_err(|e| anyhow!("{e}"))?)
+        }
+        VarType::Int => {
+            let n: i64 = match b.len() {
+                2 => i16::from_be_bytes([b[0], b[1]]) as i64,
+                8 => i64::from_be_bytes(b.try_into().unwrap_or([0; 8])),
+                _ => i32::from_be_bytes(b.try_into().unwrap_or([0; 4])) as i64,
+            };
+            Value::Dec(Decimal::from(n))
+        }
+        VarType::Ptr => v.value.clone(),
+    })
+}
+
+/// A variable's bytes.
+fn to_bytes(v: &Var) -> Result<Vec<u8>> {
+    use crate::rpg::data::{self, DType, Fit};
+    let n = storage_size(v);
+    Ok(match (&v.ty, &v.value) {
+        (VarType::Char, val) => {
+            let mut b = data::e(&val.as_char()?);
+            b.resize(n, 0x40);
+            b
+        }
+        (VarType::Lgl, val) => data::e(if val.as_lgl()? { "1" } else { "0" }),
+        (VarType::Dec, val) => {
+            let t = DType::Packed(v.len, v.decimals);
+            let mut b = t.initial();
+            let d = crate::rpg::dec::Dec::parse(&dec_text(&val.as_dec()?))?;
+            data::store(
+                &t,
+                &data::Value::Num(d),
+                &mut b,
+                Fit::Truncate { half_adjust: false },
+                false,
+            )?;
+            b
+        }
+        (VarType::Int, val) => {
+            let x = val.as_dec()?.trunc().to_i64().unwrap_or(0);
+            match n {
+                2 => (x as i16).to_be_bytes().to_vec(),
+                8 => x.to_be_bytes().to_vec(),
+                _ => (x as i32).to_be_bytes().to_vec(),
+            }
+        }
+        (VarType::Ptr, _) => vec![0; 16],
+    })
+}
+
+/// Variables whose storage is another's (*DEFINED, *BASED), after a step:
+/// a value changed since it was taken from its storage is written there,
+/// then each takes its value from its storage again.
+fn sync_storage(vars: &mut HashMap<String, Var>, overlays: &[String]) -> Result<()> {
+    // Where each lies: (variable with the storage, offset).
+    let place = |vars: &HashMap<String, Var>, n: &str| -> Option<(String, usize)> {
+        let v = vars.get(n)?;
+        if let Some((b, s)) = &v.defined {
+            return Some((b.clone(), s - 1));
+        }
+        match vars.get(v.based.as_ref()?).map(|p| &p.value) {
+            Some(Value::Ptr(Some((t, o)))) => Some((t.clone(), *o)),
+            _ => None,
+        }
+    };
+    for n in overlays {
+        let changed = vars.get(n).is_some_and(|v| {
+            v.ty != VarType::Ptr && v.shadow.as_ref().is_some_and(|s| *s != v.value)
+        });
+        if !changed {
+            continue;
+        }
+        let Some((base, off)) = place(vars, n) else {
+            continue;
+        };
+        let bytes = to_bytes(&vars[n])?;
+        if let Some(b) = vars.get_mut(&base) {
+            let mut all = to_bytes(b)?;
+            if off + bytes.len() > all.len() {
+                bail!("MCH0603: {n} goes past the end of {base}.");
+            }
+            all[off..off + bytes.len()].copy_from_slice(&bytes);
+            b.value = from_bytes(b, &all)?;
+        }
+    }
+    for n in overlays {
+        let Some((base, off)) = place(vars, n) else {
+            continue;
+        };
+        let Some(b) = vars.get(&base) else { continue };
+        let all = to_bytes(b)?;
+        let v = &vars[n];
+        let size = storage_size(v);
+        if off + size > all.len() {
+            continue;
+        }
+        // Bytes that are not a valid number stay as they are: the error
+        // comes when the variable is used (decimal data error).
+        let val = from_bytes(v, &all[off..off + size])
+            .unwrap_or_else(|_| Value::Char(crate::rpg::data::a(&all[off..off + size])));
+        let v = vars.get_mut(n).unwrap();
+        v.value = val.clone();
+        v.shadow = Some(val);
+    }
+    Ok(())
 }
 
 /// Check a CL program and turn it into steps (CRTBNDCL).
@@ -1445,6 +1738,32 @@ pub fn compile(name: &str, source: &str) -> Result<Program> {
     for p in &params {
         if !decls.iter().any(|(d, _)| d == p) {
             bail!("parameter {p} is not declared");
+        }
+    }
+    // A defined variable lies inside its base variable, which is *CHAR;
+    // a based one's pointer is a pointer.
+    for (n, v) in &decls {
+        if let Some((base, start)) = &v.defined {
+            let b = decls
+                .iter()
+                .find(|(d, _)| d == base)
+                .map(|(_, b)| b)
+                .ok_or_else(|| anyhow!("DEFVAR({base}) of {n}: {base} is not declared"))?;
+            if b.ty != VarType::Char || b.defined.is_some() || b.based.is_some() {
+                bail!("DEFVAR({base}) of {n}: the defining variable must be a *CHAR variable with its own storage");
+            }
+            if start - 1 + storage_size(v) > b.len as usize {
+                bail!(
+                    "DEFVAR({base} {start}) of {n}: it does not fit in {base} ({} bytes)",
+                    b.len
+                );
+            }
+        }
+        if let Some(ptr) = &v.based {
+            let ok = decls.iter().any(|(d, x)| d == ptr && x.ty == VarType::Ptr);
+            if !ok {
+                bail!("BASPTR({ptr}) of {n}: {ptr} is not a *PTR variable");
+            }
         }
     }
     // Program-level MONMSGs.
@@ -1578,6 +1897,13 @@ pub async fn run(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Result<Ou
         };
         assign(p, var, v)?;
     }
+    // Variables over others' storage (*DEFINED, *BASED), kept in step.
+    let overlays: Vec<String> = pgm
+        .decls
+        .iter()
+        .filter(|(_, v)| v.defined.is_some() || v.based.is_some())
+        .map(|(n, _)| n.clone())
+        .collect();
     let mut msgs: Vec<String> = Vec::new();
     let mut pc = 0usize;
     let mut steps = 0u64;
@@ -1591,6 +1917,9 @@ pub async fn run(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Result<Ou
         )
     };
     while pc < pgm.code.len() {
+        if !overlays.is_empty() {
+            sync_storage(&mut vars, &overlays)?;
+        }
         steps += 1;
         if steps > MAX_STEPS {
             bail!(
@@ -1620,6 +1949,37 @@ pub async fn run(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Result<Ou
                     .get_mut(name)
                     .ok_or_else(|| anyhow!("CPD0727: Variable {name} is not declared."))?;
                 assign(name, var, v)?;
+                pc += 1;
+            }
+            Ins::ChgSst(name, start, len, e) => {
+                let v = eval(e, &vars)?.as_char()?;
+                let start = eval(start, &vars)?.as_dec()?.to_usize().unwrap_or(0);
+                let len = eval(len, &vars)?.as_dec()?.to_usize().unwrap_or(0);
+                let var = vars
+                    .get_mut(name)
+                    .ok_or_else(|| anyhow!("CPD0727: Variable {name} is not declared."))?;
+                let mut cs: Vec<char> = var.value.as_char()?.chars().collect();
+                if start == 0 || len == 0 || start + len - 1 > cs.len() {
+                    bail!(
+                        "CPD0012: %SST({start} {len}) is outside {name} (length {}).",
+                        cs.len()
+                    );
+                }
+                let piece: Vec<char> = format!("{v:<len$}").chars().take(len).collect();
+                cs.splice(start - 1..start - 1 + len, piece);
+                let text: String = cs.into_iter().collect();
+                assign(name, var, Value::Char(text))?;
+                pc += 1;
+            }
+            Ins::ChgOfs(name, e) => {
+                let off = eval(e, &vars)?.as_dec()?.to_usize().unwrap_or(0);
+                let var = vars
+                    .get_mut(name)
+                    .ok_or_else(|| anyhow!("CPD0727: Variable {name} is not declared."))?;
+                match &mut var.value {
+                    Value::Ptr(Some((_, o))) => *o = off,
+                    _ => bail!("MCH3601: Pointer {name} is not set."),
+                }
                 pc += 1;
             }
             Ins::Cmd { st, monitors } => {
@@ -1853,6 +2213,7 @@ async fn command(
                         )?),
                         Value::Lgl(b) => crate::rpg::data::Value::str(if b { "1" } else { "0" }),
                         Value::Char(s) => crate::rpg::data::Value::str(&s),
+                        Value::Ptr(_) => bail!("pointers cannot be passed to procedures yet"),
                     });
                     targets.push((v.starts_with('&') && !byval).then(|| v.to_ascii_uppercase()));
                 }
@@ -1992,6 +2353,17 @@ mod tests {
         assert_eq!(st.label.as_deref(), Some("TOP"));
         assert_eq!(st.name, "CHGVAR");
         assert_eq!(st.params[0].value, "&A");
+    }
+
+    // CL reference, hexadecimal constants: X'C1C2' is the characters
+    // whose EBCDIC codes those are ("AB"); X'25' is the line feed.
+    #[test]
+    fn hexadecimal_constants() {
+        let p = compile("T", "PGM\nDCL &A *CHAR 2 VALUE(X'C1C2')\nENDPGM").unwrap();
+        let v = vars(&p);
+        assert_eq!(ev("&A", &v), Value::Char("AB".into()));
+        assert_eq!(ev("X'C1' *CAT 'b'", &v), Value::Char("Ab".into()));
+        assert!(compile("T", "PGM\nDCL &A *CHAR 2 VALUE(X'C1C')\nENDPGM").is_err());
     }
 
     // CL reference: *CAT keeps blanks, *TCAT drops the first operand's

@@ -328,6 +328,21 @@ with Tn5250(HOST) as t:
     t.wait_for("Command Entry")
     check("dspusrprf" in t.line(20), "F12 on the prompt returns with the command as typed", t)
     t.fkey(12)
+    # A command with more parameters than one screen holds: Page Down and
+    # Page Up move between the prompt's pages.
+    t.type("crtprtf"); t.fkey(4)
+    t.wait_for("Create Printer File (CRTPRTF)")
+    check("More..." in t.line(22) and "Replace file" not in t.text(),
+          "a long prompt shows More... on its first page", t)
+    t.page_down()
+    t.wait_for("Replace file")
+    check("Bottom" in t.line(22), "Page Down shows the prompt's next page", t)
+    t.page_up()
+    t.wait_for("More...")
+    check("Source file" in t.text(), "Page Up goes back to the first page", t)
+    t.fkey(12)
+    t.wait_for("Command Entry")
+    t.fkey(12)
     t.fkey(4)
     t.wait_for("Command Groups")
     check("4. User profile commands" in t.text() and "Selection or command" in t.text(),

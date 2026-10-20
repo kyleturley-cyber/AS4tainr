@@ -1,0 +1,12 @@
+     A          R HEAD                      SKIPB(1) SPACEA(2)
+     A                                     2'Customer balances'
+     A                                    30'Page'
+     A                                    35PAGNBR EDTCDE(Z)
+     A          R DETAIL                    SPACEA(1)
+     A            CUSNO          5S 0      2EDTCDE(Z)
+     A            CUSNAM        20A       +2
+     A            CUSBAL         9S 2     +1EDTCDE(J)
+     A  50                                +1'*'
+     A          R TOTAL                     SPACEB(1)
+     A                                     2'Records:'
+     A            COUNT          3S 0     +1EDTCDE(Z)

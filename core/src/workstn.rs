@@ -340,17 +340,37 @@ impl Workstation {
                 rec.name
             );
         }
+        let subfile = self.subfile_frame(file, rec, &ind)?;
+        self.place(Layer {
+            file: file.clone(),
+            format: rec.name.clone(),
+            values,
+            ind,
+        });
+        Ok(Frame {
+            layers: self.screen.clone(),
+            subfile,
+        })
+    }
+
+    /// The subfile part of a frame for a control record, when it has one.
+    fn subfile_frame(
+        &mut self,
+        file: &Arc<DisplayFile>,
+        rec: &Record,
+        ind: &[bool; 100],
+    ) -> Result<Option<SflFrame>> {
         let mut subfile = None;
         if let Some(sfl) = rec.subfile_control() {
             if rec.has(|k| *k == Keyword::SflDspCtl)
-                && !rec.active(&ind, |k| *k == Keyword::SflDspCtl)
+                && !rec.active(ind, |k| *k == Keyword::SflDspCtl)
             {
                 bail!(
                     "EXFMT {}: the control record is not displayed (SFLDSPCTL is off).",
                     rec.name
                 );
             }
-            let show = rec.active(&ind, |k| *k == Keyword::SflDsp);
+            let show = rec.active(ind, |k| *k == Keyword::SflDsp);
             let sfl = sfl.to_string();
             let sub = self.subfile(file, &sfl);
             if show && sub.records.is_empty() {
@@ -374,16 +394,47 @@ impl Workstation {
                 rows,
             });
         }
-        self.place(Layer {
-            file: file.clone(),
-            format: rec.name.clone(),
-            values,
-            ind,
-        });
-        Ok(Frame {
-            layers: self.screen.clone(),
-            subfile,
-        })
+        Ok(subfile)
+    }
+
+    /// READ of a display file: the record on the display (the format
+    /// named, or the one with input fields written last), shown again for
+    /// the operator's input without being written.
+    pub fn read_frame(
+        &mut self,
+        file: &Arc<DisplayFile>,
+        format: Option<&str>,
+    ) -> Result<(Frame, String)> {
+        let layer = self
+            .screen
+            .iter()
+            .rev()
+            .find(|l| {
+                l.file.name == file.name
+                    && match format {
+                        Some(f) => l.format.eq_ignore_ascii_case(f),
+                        None => l.record().fields.iter().any(|f| {
+                            matches!(f.usage, crate::dspf::Usage::Input | crate::dspf::Usage::Both)
+                        }),
+                    }
+            })
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "READ {}: no record of display file {} is on the display to read (WRITE it first).",
+                    format.unwrap_or(&file.name),
+                    file.name
+                )
+            })?;
+        let rec = record(file, &layer.format)?;
+        let subfile = self.subfile_frame(file, rec, &layer.ind)?;
+        Ok((
+            Frame {
+                layers: self.screen.clone(),
+                subfile,
+            },
+            layer.format.clone(),
+        ))
     }
 
     /// EXFMT, second half: take in what the operator entered.

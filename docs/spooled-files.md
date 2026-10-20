@@ -78,7 +78,13 @@ What is supported:
 - **Line movement:** space before and after, and skip before and after. With no space or skip, a record spaces one line after.
 - **Fields:** end positions (absolute or `+n`), and constants. Edit codes `1`-`4`, `J`-`M`, `Z` and `Y` (dates). `B` blanks the field after printing.
 - **Special fields:** `PAGE` (this file's page number), `UDATE` and `*DATE`.
-- **Pages:** 66 lines. Printing on or spacing past line 60 turns on the overflow indicator, and skipping to a line above the current one starts a new page.
+- **Pages:** the printer file object's page length and overflow line (CRTPRTF PAGESIZE and OVRFLW; 66 and 60 when there is no object, FORMLEN and FORMOFL on the F spec first). Printing on or spacing past the overflow line turns on the overflow indicator, and skipping to a line above the current one starts a new page. In the cycle, the lines conditioned by the overflow indicator print once each time overflow occurs; fetch overflow (F in position 18) prints them before the line that asks.
+
+## Printer files (CRTPRTF)
+
+`CRTPRTF FILE(LIB/NAME) SRCFILE(LIB/QDDSSRC) PAGESIZE(66 132) OVRFLW(60)` creates a printer file from DDS (`core/src/prtf.rs`); without SRCFILE (`*NONE`) it is a program-described printer file that only gives its page size and overflow line. The DDS has record formats, fields (A, S; usage P is not printed), constants (`'text'`, `DATE`, `TIME`, `PAGNBR`), positions (or `+n` after the field before) and line numbers, `SPACEB`/`SPACEA`/`SKIPB`/`SKIPA` on records and fields, `EDTCDE`, `EDTWRD`, option indicators and `INDARA`.
+
+An RPG program writes the record formats of an externally described printer file (`dcl-f rpt printer oflind(*in99);` or E in position 22): `WRITE HEAD`, `WRITE DETAIL`. The formats' fields are program fields (numbers zoned). The test `printer_files_crtprtf_and_rpg` prints a report over two pages of 12 lines.
 
 ## How it works
 
@@ -86,8 +92,7 @@ The RPG engine (docs/rpg-engine.md) lays out each output record from the program
 
 ## Not yet
 
-- **Fetch overflow** (`F` in position 18).
-- **Formats and editing:** externally described printer files (DDS `*PRTF` with `WRITE`), edit words, data formats `P`/`B`/`L`/`R`, and the overflow indicators `OA`-`OG`.
-- **Printer settings:** `PRTCTL`, form length and overflow line from `OVRPRTF`/`CRTPRTF` (always 66/60).
+- **Formats and editing:** data formats `P`/`B`/`L`/`R` in O specs, the overflow indicators `OA`-`OG`; in DDS, fonts, CPI/LPI, BOX, LINE and barcodes are accepted and not printed.
+- **Printer settings:** `PRTCTL`, `OVRPRTF`.
 - **Output queues:** `WRKOUTQ`, `CHGSPLFA`, `HLDSPLF`/`RLSSPLF`, `CPYSPLF`, and printing to a real printer or to PDF.
 - **Unedited negative numbers** print with a trailing `-`. IBM i shows the sign in the last digit's zone.

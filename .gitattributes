@@ -10,3 +10,5 @@ gradlew    text eol=lf
 *.clle     text eol=lf
 
 *.rpg      text eol=lf
+*.prtf     text eol=lf
+*.cmd      text eol=lf

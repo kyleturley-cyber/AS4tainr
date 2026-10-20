@@ -346,6 +346,213 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "CRTCMD",
+        description: "Create Command",
+        params: &[
+            p("CMD", Kind::Qualified, true, None, "Command").ch("Name"),
+            p(
+                "PGM",
+                Kind::Qualified,
+                true,
+                None,
+                "Program to process command",
+            )
+            .ch("Name, *REXX"),
+            p(
+                "SRCFILE",
+                Kind::Qualified,
+                false,
+                Some("QCMDSRC"),
+                "Source file",
+            )
+            .ch("Name"),
+            p("SRCMBR", Kind::Name, false, Some("*CMD"), "Source member").ch("Name, *CMD"),
+            p(
+                "REXSRCFILE",
+                Kind::Qualified,
+                false,
+                Some("*NONE"),
+                "REXX source file",
+            )
+            .ch("Name, *NONE")
+            .keyword_only(),
+            p(
+                "REXSRCMBR",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "REXX source member",
+            )
+            .ch("Name, *NONE")
+            .keyword_only(),
+            p(
+                "REXCMDENV",
+                Kind::Name,
+                false,
+                Some("*COMMAND"),
+                "REXX command environment",
+            )
+            .keyword_only(),
+            p(
+                "REXEXITPGM",
+                Kind::List,
+                false,
+                Some("*NONE"),
+                "REXX exit programs",
+            )
+            .keyword_only(),
+            p("THDSAFE", Kind::Name, false, Some("*NO"), "Threadsafe")
+                .ch("*NO, *YES, *COND")
+                .keyword_only(),
+            p(
+                "MLTTHDACN",
+                Kind::Name,
+                false,
+                Some("*SYSVAL"),
+                "Multithreaded job action",
+            )
+            .keyword_only(),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*SRCMBRTXT"),
+                "Text 'description'",
+            )
+            .keyword_only(),
+            p(
+                "VLDCKR",
+                Kind::Qualified,
+                false,
+                Some("*NONE"),
+                "Validity checking program",
+            )
+            .ch("Name, *NONE")
+            .keyword_only(),
+            p(
+                "MODE",
+                Kind::List,
+                false,
+                Some("*ALL"),
+                "Mode in which valid",
+            )
+            .keyword_only(),
+            p(
+                "ALLOW",
+                Kind::List,
+                false,
+                Some("*ALL"),
+                "Where allowed to run",
+            )
+            .keyword_only(),
+            p(
+                "ALWLMTUSR",
+                Kind::Name,
+                false,
+                Some("*NO"),
+                "Allow limited users",
+            )
+            .keyword_only(),
+            p(
+                "MAXPOS",
+                Kind::Text,
+                false,
+                Some("*NOMAX"),
+                "Maximum positional parameters",
+            )
+            .keyword_only(),
+            p(
+                "PMTFILE",
+                Kind::List,
+                false,
+                Some("*NONE"),
+                "Message file for prompt text",
+            )
+            .keyword_only(),
+            p(
+                "MSGF",
+                Kind::Qualified,
+                false,
+                Some("QCPFMSG"),
+                "Message file",
+            )
+            .keyword_only(),
+            p(
+                "HLPSHELF",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "Help bookshelf",
+            )
+            .keyword_only(),
+            p(
+                "HLPPNLGRP",
+                Kind::Qualified,
+                false,
+                Some("*NONE"),
+                "Help panel group",
+            )
+            .ch("Name, *NONE")
+            .keyword_only(),
+            p("HLPID", Kind::Name, false, Some("*NONE"), "Help identifier").keyword_only(),
+            p(
+                "HLPSCHIDX",
+                Kind::Qualified,
+                false,
+                Some("*NONE"),
+                "Help search index",
+            )
+            .ch("Name, *NONE")
+            .keyword_only(),
+            p(
+                "CURLIB",
+                Kind::Name,
+                false,
+                Some("*NOCHG"),
+                "Current library",
+            )
+            .keyword_only(),
+            p(
+                "PRDLIB",
+                Kind::Name,
+                false,
+                Some("*NOCHG"),
+                "Product library",
+            )
+            .keyword_only(),
+            p(
+                "PMTOVRPGM",
+                Kind::Qualified,
+                false,
+                Some("*NONE"),
+                "Prompt override program",
+            )
+            .ch("Name, *NONE")
+            .keyword_only(),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority").keyword_only(),
+            p(
+                "REPLACE",
+                Kind::Name,
+                false,
+                Some("*YES"),
+                "Replace command",
+            )
+            .ch("*YES, *NO")
+            .keyword_only(),
+            p("ENBGUI", Kind::Name, false, Some("*NO"), "Enable GUI").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "DLTCMD",
+        description: "Delete Command",
+        params: &[p("CMD", Kind::Qualified, true, None, "Command").ch("Name")],
+    },
+    CommandDef {
+        name: "DSPCMD",
+        description: "Display Command",
+        params: &[p("CMD", Kind::Qualified, true, None, "Command").ch("Name")],
+    },
+    CommandDef {
         name: "DLTMNU",
         description: "Delete Menu",
         params: &[p("MENU", Kind::Qualified, true, None, "Menu").ch("Name")],
@@ -632,6 +839,87 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("Name"),
             p("SRCMBR", Kind::Name, false, Some("*FILE"), "Source member").ch("Name, *FILE"),
+        ],
+    },
+    CommandDef {
+        name: "CRTPRTF",
+        description: "Create Printer File",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "File").ch("Name"),
+            p(
+                "SRCFILE",
+                Kind::Qualified,
+                false,
+                Some("*NONE"),
+                "Source file",
+            )
+            .ch("Name, *NONE"),
+            p("SRCMBR", Kind::Name, false, Some("*FILE"), "Source member").ch("Name, *FILE"),
+            p(
+                "GENLVL",
+                Kind::Text,
+                false,
+                Some("20"),
+                "Generation severity level",
+            )
+            .keyword_only(),
+            p(
+                "FLAG",
+                Kind::Text,
+                false,
+                Some("0"),
+                "Flagging severity level",
+            )
+            .keyword_only(),
+            p("DEV", Kind::Name, false, Some("*JOB"), "Device")
+                .ch("Name, *JOB, *SYSVAL")
+                .keyword_only(),
+            p(
+                "DEVTYPE",
+                Kind::Name,
+                false,
+                Some("*SCS"),
+                "Printer device type",
+            )
+            .ch("*SCS, *IPDS, *AFPDS, *USERASCII...")
+            .keyword_only(),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*SRCMBRTXT"),
+                "Text 'description'",
+            )
+            .keyword_only(),
+            p("PAGESIZE", Kind::List, false, Some("66 132"), "Page size")
+                .ch("Length Width")
+                .keyword_only(),
+            p("LPI", Kind::Text, false, Some("6"), "Lines per inch").keyword_only(),
+            p("CPI", Kind::Text, false, Some("10"), "Characters per inch").keyword_only(),
+            p(
+                "OVRFLW",
+                Kind::Text,
+                false,
+                Some("60"),
+                "Overflow line number",
+            )
+            .ch("1-255")
+            .keyword_only(),
+            p("OUTQ", Kind::Qualified, false, Some("*JOB"), "Output queue")
+                .ch("Name, *JOB, *DEV")
+                .keyword_only(),
+            p("FORMTYPE", Kind::Name, false, Some("*STD"), "Form type").keyword_only(),
+            p("COPIES", Kind::Text, false, Some("1"), "Copies").keyword_only(),
+            p("HOLD", Kind::Name, false, Some("*NO"), "Hold spooled file")
+                .ch("*NO, *YES")
+                .keyword_only(),
+            p("SAVE", Kind::Name, false, Some("*NO"), "Save spooled file")
+                .ch("*NO, *YES")
+                .keyword_only(),
+            p("USRDTA", Kind::Text, false, Some("*SOURCE"), "User data").keyword_only(),
+            p("REPLACE", Kind::Name, false, Some("*YES"), "Replace file")
+                .ch("*YES, *NO")
+                .keyword_only(),
         ],
     },
     CommandDef {
@@ -1337,6 +1625,7 @@ pub static GROUPS: &[Group] = &[
             "CRTPF",
             "CRTLF",
             "CRTDSPF",
+            "CRTPRTF",
             "CRTBNDCL",
             "CRTCLPGM",
             "CRTBNDRPG",
@@ -1364,6 +1653,11 @@ pub static GROUPS: &[Group] = &[
         ],
     },
     Group {
+        item: "Command definition commands",
+        title: "Command Definition Commands",
+        commands: &["CRTCMD", "DLTCMD", "DSPCMD"],
+    },
+    Group {
         item: "Binder language",
         title: "Binder Language Commands",
         commands: &["STRPGMEXP", "EXPORT", "ENDPGMEXP"],
@@ -1384,7 +1678,37 @@ pub static GROUPS: &[Group] = &[
 const LIBRARY_SPECIALS: &[&str] = &["*LIBL", "*CURLIB", "*ALL", "*USRLIBL", "*ALLUSR"];
 
 pub fn find(name: &str) -> Option<&'static CommandDef> {
-    COMMANDS.iter().find(|c| c.name.eq_ignore_ascii_case(name))
+    // A qualified name (QSYS/CRTLIB, MYLIB/MYCMD): the command's name.
+    let name = name.rsplit('/').next().unwrap_or(name);
+    COMMANDS
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(name))
+        .or_else(|| {
+            USER_COMMANDS
+                .lock()
+                .ok()?
+                .as_ref()?
+                .get(&name.to_ascii_uppercase())
+                .copied()
+        })
+}
+
+/// A system command (in the table), not a user-defined one.
+pub fn is_system(name: &str) -> bool {
+    COMMANDS.iter().any(|c| c.name.eq_ignore_ascii_case(name))
+}
+
+/// Commands made with CRTCMD, as the prompter last looked them up.
+static USER_COMMANDS: std::sync::Mutex<
+    Option<std::collections::HashMap<String, &'static CommandDef>>,
+> = std::sync::Mutex::new(None);
+
+/// Make a user command known to the parser and the prompter.
+pub fn register_user(def: &'static CommandDef) {
+    if let Ok(mut g) = USER_COMMANDS.lock() {
+        g.get_or_insert_with(Default::default)
+            .insert(def.name.to_ascii_uppercase(), def);
+    }
 }
 
 /// A parsed value: unquoted text is upper-cased, quoted text is kept.
@@ -1890,19 +2214,20 @@ mod tests {
     }
 
     #[test]
-    fn every_command_fits_one_prompt_screen() {
-        // The prompt shows parameters on lines 5-21; qualified names take two.
+    fn required_parameters_are_on_the_first_prompt_screen() {
+        // The prompt shows parameters on lines 5-21 (qualified names take
+        // two), more on the pages after; the required ones come first.
         for c in COMMANDS {
-            let lines: usize = c
-                .params
-                .iter()
-                .map(|p| if p.kind == Kind::Qualified { 2 } else { 1 })
-                .sum();
-            assert!(
-                lines <= 17,
-                "{} has too many parameters for one screen",
-                c.name
-            );
+            let mut lines = 0;
+            for p in c.params {
+                lines += if p.kind == Kind::Qualified { 2 } else { 1 };
+                assert!(
+                    !p.required || lines <= 17,
+                    "{}: required parameter {} is not on the first screen",
+                    c.name,
+                    p.keyword
+                );
+            }
         }
     }
 

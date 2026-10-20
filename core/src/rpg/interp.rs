@@ -19,6 +19,8 @@ use std::collections::HashMap;
 use tokio::runtime::Handle;
 use tokio_postgres::Client;
 
+#[path = "bifs.rs"]
+mod bifs;
 #[path = "cycle.rs"]
 mod cycle;
 #[path = "exec_sql.rs"]
@@ -158,6 +160,16 @@ pub struct Machine<'a> {
     ahead: Vec<Option<cycle::Ahead>>,
     cycle_eof: Vec<bool>,
     control: HashMap<u8, String>,
+    /// Varying-dimension arrays (DIM(*AUTO) and DIM(*VAR)): elements in
+    /// use, by array name.
+    var_elems: HashMap<String, u32>,
+    /// FOR-EACH loops in progress: (code, EachInit, call depth) → the
+    /// values and the next one.
+    each: HashMap<(usize, usize, usize), (Vec<Value>, usize)>,
+    /// The result data structure and %FIELDS of the file operation
+    /// running.
+    io_ds: Option<String>,
+    io_fields: Option<Vec<String>>,
 }
 
 /// One procedure call: its local storage starts at `base` in the
@@ -169,6 +181,8 @@ struct Frame<'a> {
     /// Local buffer → (absolute buffer, offset) for reference parameters.
     alias: HashMap<usize, (usize, usize)>,
     passed: usize,
+    /// Parameters passed as *OMIT.
+    omitted: Vec<String>,
 }
 
 /// Where an argument passed by reference lives.
@@ -262,6 +276,10 @@ impl<'a> Machine<'a> {
             ahead: prog.files.iter().map(|_| None).collect(),
             cycle_eof: vec![false; prog.files.len()],
             control: HashMap::new(),
+            var_elems: HashMap::new(),
+            each: HashMap::new(),
+            io_ds: None,
+            io_fields: None,
         }
     }
 
@@ -521,6 +539,14 @@ impl<'a> Machine<'a> {
                         if i.is_none() && v.dim > 0 {
                             bail!("{name} is an array: an index is needed here");
                         }
+                        if let Some(k) = i {
+                            if self.prog.varying.contains_key(&name) {
+                                let n = self.elems_in_use(&name, &v);
+                                if k < 1 || k > n as i128 {
+                                    bail!("RNQ0121: An array index is out of range (index {k}, {n} elements in use).");
+                                }
+                            }
+                        }
                         self.load_var(&v, i)?
                     }
                     Some(Sym::Const(c)) => c,
@@ -564,8 +590,17 @@ impl<'a> Machine<'a> {
                 if *op == BinOp::Or {
                     return Ok(Value::Ind(self.eval(l)?.truth()? || self.eval(r)?.truth()?));
                 }
+                if *op == BinOp::In {
+                    return self.eval_in(l, r);
+                }
                 let x = self.eval(l)?;
                 let y = self.eval(r)?;
+                // Date, time and timestamp arithmetic with durations.
+                if matches!(op, BinOp::Add | BinOp::Sub)
+                    && (matches!(y, Value::Dur(..)) || matches!(x, Value::Dur(..)))
+                {
+                    return self.date_arith(*op, x, y);
+                }
                 match op {
                     BinOp::Add => match (&x, &y) {
                         (Value::Char(_), _) | (_, Value::Char(_)) => {
@@ -640,6 +675,11 @@ impl<'a> Machine<'a> {
     }
 
     fn bif(&mut self, b: &str, args: &[Expr]) -> Result<Value> {
+        // Forms of the built-ins handled in bifs.rs (dates for %CHAR and
+        // %DEC, varying arrays for %ELEM...).
+        if let Some(v) = self.bif_override(b, args)? {
+            return Ok(v);
+        }
         let arg = |m: &mut Self, i: usize| -> Result<Value> {
             m.eval(
                 args.get(i)
@@ -820,10 +860,20 @@ impl<'a> Machine<'a> {
                 let from = arg(self, 0)?.chars()?;
                 let to = arg(self, 1)?.chars()?;
                 let s = arg(self, 2)?.chars()?;
+                // %XLATE(from : to : string : start): from the start
+                // position on (ILE RPG Reference, %XLATE).
+                let start = match args.get(3) {
+                    Some(x) => self.eval(x)?.num()?.to_i128()?,
+                    None => 1,
+                };
+                if start < 1 || start as usize > s.len().max(1) {
+                    bail!("RNQ0100: %XLATE start position {start} is outside the string.");
+                }
                 Value::Char(
                     s.iter()
-                        .map(|c| match from.iter().position(|f| f == c) {
-                            Some(p) if p < to.len() => to[p],
+                        .enumerate()
+                        .map(|(k, c)| match from.iter().position(|f| f == c) {
+                            Some(p) if p < to.len() && k + 1 >= start as usize => to[p],
                             _ => *c,
                         })
                         .collect(),
@@ -910,7 +960,10 @@ impl<'a> Machine<'a> {
                 Some(f) => f.passed,
                 None => self.parms_passed,
             } as i64)),
-            other => bail!("%{other} is not supported yet"),
+            other => match self.bif_more(other, args)? {
+                Some(v) => v,
+                None => bail!("%{other} is not supported yet"),
+            },
         })
     }
 
@@ -937,6 +990,35 @@ impl<'a> Machine<'a> {
                     let on = s.get(n - 1) == Some(&0xF1);
                     self.set_ind(&format!("{n:02}"), on);
                 }
+            }
+            Expr::Bif(b, args) if b == "ELEM" => {
+                // %ELEM(array) = n: the elements in use of a varying-
+                // dimension array; new ones get their initial value.
+                let arr = args
+                    .first()
+                    .and_then(|e| self.array_ref(e))
+                    .filter(|a| self.prog.varying.contains_key(&a.name))
+                    .ok_or_else(|| {
+                        anyhow!("%ELEM can only be set for a varying-dimension array")
+                    })?;
+                let n = val.num()?.to_i128()?;
+                if n < 0 || n > arr.var.dim as i128 {
+                    bail!("RNQ0121: %ELEM {n} is outside 0 to {}.", arr.var.dim);
+                }
+                let cur = self.elems_in_use(&arr.name, &arr.var) as usize;
+                for k in cur..n as usize {
+                    let off = arr.var.off + k * arr.var.stride;
+                    self.bufs[arr.var.buf][off..off + arr.var.dtype.size()]
+                        .copy_from_slice(&arr.var.dtype.initial());
+                }
+                self.var_elems.insert(arr.name, n as u32);
+            }
+            Expr::Bif(b, args) if b == "OCCUR" => {
+                let n = val.num()?.to_i128()?;
+                let ds = args
+                    .first()
+                    .ok_or_else(|| anyhow!("%OCCUR needs a data structure"))?;
+                self.set_occurrence(ds, n)?;
             }
             Expr::Bif(b, args) if b == "NULLIND" => {
                 let name = self.nullind_field(args)?;
@@ -982,8 +1064,55 @@ impl<'a> Machine<'a> {
                 let name = parts.join(".");
                 match self.sym(&name) {
                     Some(Sym::Var(v)) => {
-                        let i = self.index_of(args)?;
+                        // A list (%LIST, %SPLIT, another array...) into an
+                        // array: element by element; the elements after
+                        // it are cleared, or for a varying-dimension
+                        // array no longer in use.
+                        if let (Value::List(items), None, true) = (val, args, v.dim > 0) {
+                            if items.len() > v.dim as usize {
+                                bail!(
+                                    "RNQ0121: {} values do not fit in array {name} ({} elements).",
+                                    items.len(),
+                                    v.dim
+                                );
+                            }
+                            for k in 0..v.dim as usize {
+                                let off = v.off + k * v.stride;
+                                match items.get(k) {
+                                    Some(x) => {
+                                        let out = &mut self.bufs[v.buf][off..off + v.dtype.size()];
+                                        data::store(&v.dtype, x, out, fit, right)?;
+                                    }
+                                    None => self.bufs[v.buf][off..off + v.dtype.size()]
+                                        .copy_from_slice(&v.dtype.initial()),
+                                }
+                            }
+                            if self.prog.varying.contains_key(&name) {
+                                self.var_elems.insert(name.clone(), items.len() as u32);
+                            }
+                            return Ok(());
+                        }
+                        let next = matches!(args.as_deref(), Some([Expr::Name { parts, args: None }]) if parts.len() == 1 && parts[0] == "*NEXT");
+                        let i = if next {
+                            Some(self.elems_in_use(&name, &v) as i128 + 1)
+                        } else {
+                            self.index_of(args)?
+                        };
                         let i = self.table_index(&name, &v, i);
+                        // A varying-dimension array: *AUTO grows to the
+                        // index assigned (and *NEXT appends); *VAR only
+                        // takes elements in use (ILE RPG Reference,
+                        // "Varying-dimension arrays").
+                        if let (Some(kind), Some(k)) = (self.prog.varying.get(&name).copied(), i) {
+                            let n = self.elems_in_use(&name, &v);
+                            if k > n as i128 {
+                                if (kind == 'A' || next) && k <= v.dim as i128 {
+                                    self.var_elems.insert(name.clone(), k as u32);
+                                } else {
+                                    bail!("RNQ0121: An array index is out of range (index {k}, {n} elements in use).");
+                                }
+                            }
+                        }
                         self.store_var(&v, i, val, fit, right)?;
                     }
                     Some(Sym::Ds(d)) => {
@@ -1174,6 +1303,22 @@ impl<'a> Machine<'a> {
     }
 
     fn key_values(&mut self, key: &[Expr]) -> Result<Vec<String>> {
+        // %KDS(ds : n): the first n subfields of a data structure.
+        if let [Expr::Bif(b, args)] = key {
+            if b == "KDS" {
+                let ds = match args.first() {
+                    Some(Expr::Name { parts, .. }) => parts.join("."),
+                    _ => bail!("%KDS needs a data structure"),
+                };
+                let mut members = self.ds_members(&ds)?;
+                if let Some(n) = args.get(1) {
+                    let n = self.eval(n)?.num()?.to_i128()? as usize;
+                    members.truncate(n);
+                }
+                let exprs: Vec<Expr> = members.into_iter().map(|(_, k)| Expr::name(&k)).collect();
+                return self.key_values(&exprs);
+            }
+        }
         // A KLIST name stands for its key fields.
         let exprs: Vec<Expr> = match key {
             [Expr::Name { parts, args: None }] => match self.sym(&parts.join(".")) {
@@ -1318,7 +1463,11 @@ impl<'a> Machine<'a> {
             FileOp::Chain | FileOp::Read | FileOp::ReadP | FileOp::ReadE | FileOp::ReadPE => {
                 let r = result.unwrap();
                 if let Some(rec) = &r.record {
-                    if let Err(e) = self.move_input(i, rec) {
+                    let moved = match self.io_ds.clone() {
+                        Some(ds) => self.record_to_ds(i, rec, &ds),
+                        None => self.move_input(i, rec),
+                    };
+                    if let Err(e) = moved {
                         // A data mapping error is an error on the
                         // operation: the E extender or the error
                         // indicator takes it.
@@ -1376,7 +1525,24 @@ impl<'a> Machine<'a> {
                 let rec = if op == FileOp::Delete {
                     Record::new()
                 } else {
-                    self.record_of(i)?
+                    let mut rec = match self.io_ds.clone() {
+                        Some(ds) => self.ds_to_record(i, &ds)?,
+                        None => self.record_of(i)?,
+                    };
+                    if let Some(only) = self.io_fields.clone() {
+                        let fi = &self.prog.files[i];
+                        let fref = fi.fref.as_ref().unwrap();
+                        let keep: Vec<String> = fref
+                            .file
+                            .fields
+                            .iter()
+                            .zip(&fi.fields)
+                            .filter(|(fd, p)| only.contains(p) || only.contains(&fd.name))
+                            .map(|(fd, _)| fd.name.clone())
+                            .collect();
+                        rec.retain(|k, _| keep.contains(k));
+                    }
+                    rec
                 };
                 let f = self.files[i].open.as_mut().unwrap();
                 let r: Result<()> = match op {
@@ -1741,6 +1907,7 @@ impl<'a> Machine<'a> {
             Value::Ind(b) => if *b { "1" } else { "0" }.into(),
             Value::Fig(_) => String::new(),
             Value::Char(c) => a(c),
+            other => bail!("{} cannot be shown", other.describe()),
         })
     }
 
@@ -1801,13 +1968,19 @@ impl<'a> Machine<'a> {
                 file,
                 key,
                 ds,
+                fields,
                 ext,
                 ind,
             } => {
-                if ds.is_some() && matches!(op, FileOp::Write | FileOp::Update) {
-                    bail!("{op:?} with a result data structure is not supported yet");
-                }
-                self.file_op(*op, file, key, ext, ind)?;
+                // A result data structure: the record goes into it (or
+                // comes from it) instead of the program fields; %FIELDS:
+                // an update changes only those fields.
+                self.io_ds = ds.clone();
+                self.io_fields = fields.clone();
+                let r = self.file_op(*op, file, key, ext, ind);
+                self.io_ds = None;
+                self.io_fields = None;
+                r?;
             }
             Stmt::Arith {
                 op,
@@ -2119,6 +2292,38 @@ impl<'a> Machine<'a> {
                 )?;
             }
             "DEFINE" | "COMMIT" | "ROLBK" | "FORCE" | "DUMP" | "DEALLOC" => {}
+            "SND-MSG" => {
+                // *INFO (and the other informational types) to the job
+                // log; *ESCAPE ends the procedure with the message, which
+                // a MONITOR group (ON-EXCP) can handle.
+                let kind = expr_name(f1).unwrap_or_else(|| "*INFO".into());
+                let v = self.eval(&need(f2, "a message")?)?;
+                let (id, text) = match v {
+                    Value::List(parts) => {
+                        let id = match parts.first() {
+                            Some(x) => a(&x.chars()?).trim().to_string(),
+                            None => String::new(),
+                        };
+                        let data = match parts.get(2) {
+                            Some(d) => a(&d.chars()?).trim_end().to_string(),
+                            None => String::new(),
+                        };
+                        (Some(id), data)
+                    }
+                    other => (None, a(&other.chars()?).trim_end().to_string()),
+                };
+                let full = match &id {
+                    Some(i) => format!("{i}: {text}"),
+                    None => text.clone(),
+                };
+                if kind == "*ESCAPE" {
+                    if id.is_some() {
+                        bail!("{full}");
+                    }
+                    bail!("CPF9898: {text}");
+                }
+                self.job_log(&full);
+            }
             "EXCEPT" => {
                 let name = expr_name(f2);
                 self.except(name.as_deref())?;
@@ -2193,6 +2398,30 @@ impl<'a> Machine<'a> {
                                 }
                             }
                             None => None,
+                        }
+                    }
+                    Ins::EachInit { list } => {
+                        let vals = self.list_of(list)?;
+                        let key = (code.as_ptr() as usize, pc, self.frames.len());
+                        self.each.insert(key, (vals, 0));
+                        None
+                    }
+                    Ins::EachNext { var, init, end } => {
+                        let key = (code.as_ptr() as usize, *init, self.frames.len());
+                        let next = self.each.get_mut(&key).and_then(|(v, at)| {
+                            let x = v.get(*at).cloned();
+                            *at += 1;
+                            x
+                        });
+                        match next {
+                            Some(v) => {
+                                self.assign(var, &v, Fit::Strict { half_adjust: false }, false)?;
+                                None
+                            }
+                            None => {
+                                self.each.remove(&key);
+                                Some(*end)
+                            }
                         }
                     }
                     Ins::LoopStep { var, by, down } => {
@@ -2299,7 +2528,9 @@ impl<'a> Machine<'a> {
                                 .find(|(codes, _)| {
                                     codes.is_empty()
                                         || codes.iter().any(|c| {
-                                            c == "*ALL"
+                                            c.strip_prefix("MSG:")
+                                                .is_some_and(|id| err.to_string().starts_with(id))
+                                                || c == "*ALL"
                                                 || c == &status
                                                 || (c == "*PROGRAM" && status != "*FILE")
                                                 || (c == "*FILE" && status == "*FILE")
@@ -2508,6 +2739,7 @@ impl Machine<'_> {
                 Value::Ind(b) => if *b { "1" } else { "0" }.into(),
                 Value::Fig(_) => String::new(),
                 Value::Char(c) => a(c),
+                other => bail!("{} cannot be formatted", other.describe()),
             })
         };
         let fmt = match vals.first() {
@@ -2751,6 +2983,10 @@ impl<'a> Machine<'a> {
         let Some(pr) = prog.protos.get(name) else {
             bail!("{name} is not a procedure or prototype of this program");
         };
+        if !pr.overload.is_empty() {
+            let target = self.overload_target(pr, args)?;
+            return self.call_named(&target, args);
+        }
         if let Some(pgm) = &pr.extpgm {
             // The program name may be a named constant or a variable.
             let pgm = match self.sym(pgm) {
@@ -2978,6 +3214,7 @@ impl<'a> Machine<'a> {
         let mut alias = HashMap::new();
         let mut values = Vec::new();
         let mut passed = 0;
+        let mut omitted = Vec::new();
         for (i, arg) in args.into_iter().enumerate() {
             let p = &pi.params[i];
             match arg {
@@ -2994,6 +3231,7 @@ impl<'a> Machine<'a> {
                 Arg::Omit => {
                     if i < passed || p.omit {
                         passed = passed.max(i + 1);
+                        omitted.push(p.name.clone());
                     }
                 }
             }
@@ -3004,6 +3242,7 @@ impl<'a> Machine<'a> {
             base,
             alias,
             passed,
+            omitted,
         });
         let mut r = (|| -> Result<Option<Value>> {
             for (n, v) in values {

@@ -201,6 +201,41 @@ pub enum Value {
     Num(Dec),
     Ind(bool),
     Fig(Fig),
+    /// A duration (%DAYS, %MONTHS, %YEARS, %HOURS, %MINUTES, %SECONDS,
+    /// %MSECONDS) for date, time and timestamp arithmetic.
+    Dur(DurUnit, i64),
+    /// A list of values: an array, %LIST, %SPLIT, %SUBARR, an enum.
+    List(Vec<Value>),
+}
+
+/// The unit of a duration (ILE RPG Reference, %DIFF and the duration
+/// built-in functions).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DurUnit {
+    Years,
+    Months,
+    Days,
+    Hours,
+    Minutes,
+    Seconds,
+    MSeconds,
+}
+
+impl DurUnit {
+    /// *YEARS or *Y, *MONTHS or *M, *DAYS or *D, *HOURS or *H, *MINUTES
+    /// or *MN, *SECONDS or *S, *MSECONDS or *MS.
+    pub fn parse(s: &str) -> Option<DurUnit> {
+        Some(match s.trim().to_ascii_uppercase().as_str() {
+            "*YEARS" | "*Y" => DurUnit::Years,
+            "*MONTHS" | "*M" => DurUnit::Months,
+            "*DAYS" | "*D" => DurUnit::Days,
+            "*HOURS" | "*H" => DurUnit::Hours,
+            "*MINUTES" | "*MN" => DurUnit::Minutes,
+            "*SECONDS" | "*S" => DurUnit::Seconds,
+            "*MSECONDS" | "*MS" => DurUnit::MSeconds,
+            _ => return None,
+        })
+    }
 }
 
 impl Value {
@@ -245,6 +280,8 @@ impl Value {
             Value::Num(d) => d.to_string(),
             Value::Ind(b) => if *b { "*ON" } else { "*OFF" }.into(),
             Value::Fig(f) => format!("{f:?}"),
+            Value::Dur(u, n) => format!("{n} {u:?}"),
+            Value::List(v) => format!("a list of {} values", v.len()),
         }
     }
 }
@@ -607,6 +644,7 @@ pub fn compare(x: &Value, y: &Value) -> Result<std::cmp::Ordering> {
                 cmp_chars(&fig_char(a, 1), &fig_char(b, 1))
             }
         }
+        (a, b) => bail!("{} and {} cannot be compared", a.describe(), b.describe()),
     })
 }
 

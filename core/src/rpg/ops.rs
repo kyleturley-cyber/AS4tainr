@@ -306,6 +306,54 @@ impl Machine<'_> {
                 s.extend(text);
                 self.put_left(&r, &s, pad)?;
             }
+            "TEST" => {
+                // TEST(D), TEST(T), TEST(Z): is the character or numeric
+                // field a valid date, time or timestamp in the format of
+                // factor 1 (ILE RPG Reference, TEST). An error sets %ERROR
+                // (E) or the indicator in positions 73-74.
+                let r = self.need(result, code, "a field")?;
+                let fmt = match f1 {
+                    Some(Expr::Name { parts, .. }) => parts.join("."),
+                    _ => "*ISO".into(),
+                };
+                let v = self.eval(&r)?;
+                let text = match &v {
+                    Value::Num(d) => d.trunc().mantissa().to_string(),
+                    other => a(&other.chars()?),
+                };
+                let numeric = matches!(v, Value::Num(_));
+                let fmt0 = |f: &str| {
+                    if numeric {
+                        format!("{}0", f.trim_end_matches('0'))
+                    } else {
+                        f.to_string()
+                    }
+                };
+                let o = ext.other.as_str();
+                let ok = if o.contains('Z') {
+                    crate::rpg::dates::parse_ts(&text).is_ok()
+                } else if o.contains('T') {
+                    crate::rpg::dates::TimeFmt::parse(&fmt0(&fmt))
+                        .and_then(|f| crate::rpg::dates::parse_time(&text, &f))
+                        .is_ok()
+                } else {
+                    crate::rpg::dates::DateFmt::parse(&fmt0(&fmt))
+                        .and_then(|f| crate::rpg::dates::parse_date(&text, &f))
+                        .is_ok()
+                };
+                if ext.error {
+                    self.last = Status {
+                        error: !ok,
+                        ..Status::default()
+                    };
+                }
+                if let Some(lo) = &ind.lo {
+                    self.set_ind(lo, !ok);
+                }
+                if !ok && !ext.error && ind.lo.is_none() {
+                    bail!("RNX0112: {text} is not a valid value for {fmt}.");
+                }
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -380,7 +428,7 @@ impl Machine<'_> {
             .array_ref(a)
             .ok_or_else(|| anyhow!("SORTA: an array is needed"))?;
         let mut vals = Vec::new();
-        for k in 1..=arr.var.dim as i128 {
+        for k in 1..=self.elems_in_use(&arr.name, &arr.var) as i128 {
             vals.push(self.load_var(&arr.var, Some(k))?);
         }
         let mut err = None;

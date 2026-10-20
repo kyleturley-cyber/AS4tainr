@@ -9,12 +9,14 @@
 pub mod ast;
 pub mod code;
 pub mod data;
+pub mod dates;
 pub mod dec;
 pub mod expr;
 pub mod interp;
 pub mod parse;
 pub mod program;
 pub mod rpg3;
+pub mod tofree;
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;

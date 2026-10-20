@@ -69,6 +69,8 @@ pub enum BinOp {
     Ge,
     And,
     Or,
+    /// `x IN %RANGE(a:b)`, `x IN %LIST(...)`, `x IN array` (7.5).
+    In,
 }
 
 /// Operation extenders: (H) half adjust, (N) no lock, (E) errors to
@@ -169,6 +171,8 @@ pub enum Stmt {
         key: Option<Vec<Expr>>,
         /// Result data structure (READ file ds).
         ds: Option<String>,
+        /// UPDATE rec %FIELDS(a : b): only these fields change.
+        fields: Option<Vec<String>>,
         ext: Ext,
         ind: ResultInd,
     },
@@ -253,6 +257,11 @@ pub enum Line {
         to: Option<Expr>,
         by: Option<Expr>,
         down: bool,
+    },
+    /// FOR-EACH item IN array or list (7.5): ENDFOR ends it.
+    ForEach {
+        var: Expr,
+        list: Expr,
     },
     EndDo,
     EndFor,

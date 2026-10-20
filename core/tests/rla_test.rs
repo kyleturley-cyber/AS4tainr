@@ -3608,6 +3608,28 @@ async fn rpg3_crtrpgpgm_and_cvtrpgsrc() {
     )
     .await
     .unwrap();
+    // And in free form (CVTRPGFREE), the program does the same.
+    let m = cl_cmd(
+        &mut job,
+        format!("CVTRPGFREE FROMFILE({lib}/QRPGLESRC) FROMMBR(RPG3TEST) TOMBR(RPG3FREE)"),
+    )
+    .await
+    .unwrap();
+    assert!(m.iter().any(|x| x.contains("converted")), "{m:?}");
+    cl_cmd(&mut job, format!("CRTBNDRPG PGM({lib}/RPG3FREE)"))
+        .await
+        .unwrap();
+    assert_eq!(
+        cl_cmd(&mut job, format!("CALL PGM({lib}/RPG3FREE)"))
+            .await
+            .unwrap(),
+        [
+            "DSPLY  MONTH IS OCTOBER",
+            "DSPLY  150",
+            "DSPLY  ALL3",
+            "           1,234.50-      DONE"
+        ]
+    );
 }
 
 #[tokio::test]
@@ -3843,4 +3865,116 @@ async fn rpg_cycle_matching_records() {
             "DSPLY  NO CUST"
         ]
     );
+}
+
+#[tokio::test]
+async fn rpg_free_form_7x_features_and_builtins() {
+    // Expected values from the ILE RPG Reference (7.5): date arithmetic
+    // (January 31 plus one month is February 28; %DIFF counts complete
+    // units), date formats (*USA mm/dd/yyyy, *MDY two-digit years),
+    // %SPLIT (runs of blanks make no empty elements), FOR-EACH, IN with
+    // %RANGE, %LIST and an enumeration (DCL-ENUM), DIM(*AUTO) with *NEXT,
+    // %XFOOT, %LOOKUP, %MAXARR, %MINARR, %SCANR, %SCANRPL, %LEFT, %RIGHT,
+    // %CONCAT, %MAX, %MIN, %EDITW, %SQRT, OVERLOAD, SND-MSG *ESCAPE caught
+    // by ON-EXCP.
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = include_str!("rpg/freeform.rpgle");
+    let r = run_rpg(&url, &lib, "QSECOFR", "FREEFORM", src, None, None).await;
+    assert!(r.error.is_none(), "{:?} {:?}", r.error, r.messages);
+    assert_eq!(
+        r.messages,
+        [
+            "2026-02-28",
+            "02/28/2026",
+            "28",
+            "2026",
+            "00.15.00",
+            "2026-10-21-01.45.30.000000",
+            "2026-10-20",
+            "2026-10-20",
+            "20260228",
+            "8",
+            // %ELEM of a fixed array is its dimension.
+            "5 brown",
+            "a",
+            "b",
+            "c",
+            "in range",
+            "green is a color",
+            "X not listed",
+            "B",
+            "2",
+            "AAA",
+            "BBB",
+            "100",
+            "3",
+            "3",
+            "2",
+            "6",
+            "bANANa",
+            "abef",
+            "x, y, z",
+            "93",
+            " 1,234.50",
+            "4",
+            "number 12.50",
+            "date 31.01.2026",
+            "caught CPF9898",
+            "not a date",
+            "a date",
+            "blue or green",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn rpg_data_structure_io_kds_and_fields() {
+    // ILE RPG Reference: CHAIN with a result data structure fills it, not
+    // the program fields; %KDS gives the key from a data structure;
+    // UPDATE with %FIELDS changes only the fields listed.
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "DSIO",
+        include_str!("rpg/dsio.rpgle"),
+        None,
+        None,
+    )
+    .await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["Acme Tooling", "0", "Acme Tooling", "1.00"]);
+}
+
+#[tokio::test]
+async fn rpg_fixed_to_free_conversion_runs_the_same() {
+    // The conversion to free form must not change what a program does:
+    // each program runs before and after, with the same output. RPG III
+    // sources are first converted to RPG IV (as CVTRPGSRC does).
+    use as4tainr_core::rpg::{rpg3, tofree};
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let rpg4 = |s: &str| rpg3::convert(s, None).unwrap().source;
+    for (name, src, all_free) in [
+        ("FIXEDOPS", include_str!("rpg/fixedops.rpgle").to_string(), false),
+        ("RPG3TEST", rpg4(include_str!("rpg/rpg3test.rpg")), false),
+        ("DSPFREE", "     DX                S              5P 2 INZ(1.5)\n     C     X             ADD       2             X\n     C     X             DSPLY\n     C                   EVAL      *INLR = *ON\n".to_string(), true),
+    ] {
+        let before = run_rpg(&url, &lib, "QSECOFR", name, &src, None, None).await;
+        assert!(before.error.is_none(), "{name}: {:?}", before.error);
+        let c = tofree::convert(&src).unwrap();
+        assert_eq!(
+            c.source.starts_with("**FREE"),
+            all_free,
+            "{name}:\n{}",
+            c.source
+        );
+        let after = run_rpg(&url, &lib, "QSECOFR", name, &c.source, None, None).await;
+        assert!(after.error.is_none(), "{name}: {:?}\n{}", after.error, c.source);
+        assert_eq!(before.messages, after.messages, "{name}:\n{}", c.source);
+        assert_eq!(before.printed, after.printed, "{name}");
+    }
 }

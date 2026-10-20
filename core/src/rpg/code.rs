@@ -27,6 +27,17 @@ pub enum Ins {
         by: Option<Expr>,
         down: bool,
     },
+    /// FOR-EACH: take the list's values (once, as the loop starts).
+    EachInit {
+        list: Expr,
+    },
+    /// FOR-EACH: the next value into the item, or to `end` when there is
+    /// none; `init` is the EachInit instruction.
+    EachNext {
+        var: Expr,
+        init: usize,
+        end: usize,
+    },
     ExSr(String),
     Return(Option<Expr>),
     LeaveSr,
@@ -101,6 +112,7 @@ enum LoopKind {
     Dow,
     Dou,
     For,
+    Each,
 }
 
 struct Builder {
@@ -134,6 +146,7 @@ impl Builder {
             Ins::Jump(t) | Ins::JumpIfNot(_, t) => *t = to,
             Ins::LoopTest { end, .. } => *end = to,
             Ins::Cab { to: t, .. } => *t = to,
+            Ins::EachNext { end, .. } => *end = to,
             _ => {}
         }
     }
@@ -156,7 +169,7 @@ impl Builder {
                 let c = cond.ok_or_else(|| anyhow!("DOU without a condition"))?;
                 self.push(Ins::JumpIfNot(c, start), line, vec![]);
             }
-            LoopKind::Dow => {
+            LoopKind::Dow | LoopKind::Each => {
                 self.push(Ins::Jump(start), line, vec![]);
             }
             LoopKind::For => {
@@ -323,6 +336,26 @@ impl Builder {
                     leaves: vec![],
                     cond: None,
                     var: Some((var, None, false)),
+                });
+            }
+            Line::ForEach { var, list } => {
+                let init = self.push(Ins::EachInit { list: list.clone() }, line, vec![]);
+                let at = self.push(
+                    Ins::EachNext {
+                        var: var.clone(),
+                        init,
+                        end: 0,
+                    },
+                    line,
+                    vec![],
+                );
+                self.stack.push(Open::Loop {
+                    kind: LoopKind::Each,
+                    start: at,
+                    iters: vec![],
+                    leaves: vec![],
+                    cond: None,
+                    var: None,
                 });
             }
             Line::EndDo | Line::EndFor => self.end_loop(line, "ENDDO")?,

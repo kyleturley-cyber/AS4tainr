@@ -176,6 +176,9 @@ pub struct Proto {
     pub extproc: Option<String>,
     pub params: Vec<ParamInfo>,
     pub returns: Option<DType>,
+    /// OVERLOAD(a : b ...): the prototypes a call of this one may mean,
+    /// chosen by the arguments (7.5).
+    pub overload: Vec<String>,
 }
 
 /// A procedure of the program (DCL-PROC / P specs).
@@ -230,6 +233,8 @@ pub struct Program {
     pub occurs: Vec<Occurs>,
     /// Arrays and tables in sequence: 'A' (ASCEND) or 'D' (DESCEND).
     pub sequence: HashMap<String, char>,
+    /// Varying-dimension arrays: 'A' DIM(*AUTO:n), 'V' DIM(*VAR:n).
+    pub varying: HashMap<String, char>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -513,6 +518,9 @@ fn program_type(f: &crate::dds::FieldDef, in_ds: bool, extbinint: bool) -> Optio
     })
 }
 
+/// A record format's fields (program names, types) and key fields.
+type RecordFormat = (Vec<(String, DType)>, Vec<String>);
+
 struct Binder<'a> {
     syms: HashMap<String, Sym>,
     bufs: Vec<Vec<u8>>,
@@ -533,6 +541,9 @@ struct Binder<'a> {
     extbinint: bool,
     /// Multiple-occurrence data structures (OCCURS).
     occurs: Vec<Occurs>,
+    /// Record formats of the program's files (for LIKEREC): the fields
+    /// (program names, types) and the key fields.
+    formats: HashMap<String, RecordFormat>,
 }
 
 /// A multiple-occurrence data structure (OCCURS keyword): its storage
@@ -608,7 +619,9 @@ impl Binder<'_> {
                         k += 1;
                     }
                 }
-                if defs[start].kind == DefKind::Proto {
+                // A procedure interface too: its parameters may be LIKEDS
+                // a data structure defined after it.
+                if defs[start].kind == DefKind::Proto || defs[start].kind == DefKind::Interface {
                     later.push(start);
                 } else if defs[start].kind == DefKind::Field
                     && keyword(&defs[start].keywords, "LIKE").is_some()
@@ -645,6 +658,18 @@ impl Binder<'_> {
             let i = i0;
             let d = &defs[i];
             match d.kind {
+                DefKind::Const if keyword(&d.keywords, "ENUM").is_some() => {
+                    // An enumeration: the list of its constants' values.
+                    let mut vals = Vec::new();
+                    for n in &keyword(&d.keywords, "ENUM").unwrap().args {
+                        match self.syms.get(n) {
+                            Some(Sym::Const(v)) => vals.push(v.clone()),
+                            _ => bail!("line {}: enumeration constant {n} has no value", d.line),
+                        }
+                    }
+                    self.syms
+                        .insert(d.name.clone(), Sym::Const(Value::List(vals)));
+                }
                 DefKind::Const => {
                     let text = keyword(&d.keywords, "CONST")
                         .and_then(|k| k.args.first().cloned())
@@ -770,6 +795,14 @@ impl Binder<'_> {
                                 extproc,
                                 params,
                                 returns,
+                                overload: keyword(&d.keywords, "OVERLOAD")
+                                    .map(|k| {
+                                        k.args
+                                            .iter()
+                                            .map(|a| a.trim().to_ascii_uppercase())
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
                             },
                         );
                     }
@@ -862,7 +895,15 @@ impl Binder<'_> {
     }
 
     fn dim(&self, d: &Def) -> Result<u32> {
-        match keyword(&d.keywords, "DIM").and_then(|k| k.args.first()) {
+        let Some(k) = keyword(&d.keywords, "DIM") else {
+            return Ok(0);
+        };
+        // DIM(*AUTO : n), DIM(*VAR : n): storage for the maximum.
+        let a = match k.args.first().map(|a| a.trim().to_ascii_uppercase()) {
+            Some(f) if f == "*AUTO" || f == "*VAR" => k.args.get(1),
+            _ => k.args.first(),
+        };
+        match a {
             Some(a) => num_arg(a, &self.syms),
             None => Ok(0),
         }
@@ -931,6 +972,29 @@ impl Binder<'_> {
                     (Some(a), true) => a.clone(),
                     _ => fd.name.clone(),
                 };
+                subs.push((n, t, next, 0, d));
+                next += t.size();
+            }
+        }
+        // LIKEREC(format [: *ALL | *KEY ...]): a qualified data structure
+        // with the record format's fields (ILE RPG Reference, LIKEREC).
+        let likerec = keyword(&d.keywords, "LIKEREC").map(|k| {
+            (
+                k.args
+                    .first()
+                    .map(|a| a.trim().to_ascii_uppercase())
+                    .unwrap_or_default(),
+                k.args.get(1).map(|a| a.trim().to_ascii_uppercase()),
+            )
+        });
+        if let Some((fmt, which)) = &likerec {
+            let (fields, keys) = self.formats.get(fmt).cloned().ok_or_else(|| {
+                anyhow!("LIKEREC({fmt}): not a record format of a file of the program")
+            })?;
+            for (n, t) in fields {
+                if which.as_deref() == Some("*KEY") && !keys.contains(&n) {
+                    continue;
+                }
                 subs.push((n, t, next, 0, d));
                 next += t.size();
             }
@@ -1061,7 +1125,7 @@ impl Binder<'_> {
         let buf = self.new_buf(total, data::BLANK);
         let mut names = Vec::new();
         for (sname, t, off, sdim, sdef) in &subs {
-            let key = if qualified || likeds.is_some() {
+            let key = if qualified || likeds.is_some() || likerec.is_some() {
                 format!("{name}.{sname}")
             } else {
                 sname.clone()
@@ -1093,7 +1157,7 @@ impl Binder<'_> {
         // its name: LIST.USERS.NAME.
         for (k, template, o) in &nested {
             let (sname, _, off, sdim, _) = &subs[*k];
-            let prefix = if qualified || likeds.is_some() {
+            let prefix = if qualified || likeds.is_some() || likerec.is_some() {
                 format!("{name}.{sname}")
             } else {
                 sname.clone()
@@ -1186,7 +1250,7 @@ impl Binder<'_> {
                 off: 0,
                 size,
                 dim,
-                qualified: qualified || likeds.is_some(),
+                qualified: qualified || likeds.is_some() || likerec.is_some(),
                 subfields: names,
                 local: self.local,
             }),
@@ -1216,6 +1280,7 @@ pub fn bind(
         local: false,
         statics: vec![],
         occurs: vec![],
+        formats: HashMap::new(),
     };
     // Files and their record fields.
     let mut files = Vec::new();
@@ -1329,6 +1394,29 @@ pub fn bind(
                 });
                 info.fields.push(pname);
             }
+            // The record format for LIKEREC.
+            let mut fmt_fields = Vec::new();
+            for (fd, p) in fr.file.fields.iter().zip(&info.fields) {
+                if p.is_empty() {
+                    continue;
+                }
+                if let Some(t) = program_type(fd, true, b.extbinint) {
+                    fmt_fields.push((p.clone(), t));
+                }
+            }
+            let keys: Vec<String> = fr
+                .file
+                .keys
+                .iter()
+                .filter_map(|k| {
+                    fr.file
+                        .fields
+                        .iter()
+                        .position(|fd| &fd.name == k)
+                        .map(|i| info.fields[i].clone())
+                })
+                .collect();
+            b.formats.insert(info.format.clone(), (fmt_fields, keys));
             // The input specifications for the record format: record
             // identifying indicator, control levels, matching fields and
             // field indicators by program field.
@@ -1543,6 +1631,7 @@ pub fn bind(
             globals: b.bufs.clone(),
             extbinint: b.extbinint,
             occurs: vec![],
+            formats: b.formats.clone(),
         };
         let pi = pb
             .defs(&pr.defs, &mut protos)
@@ -1644,10 +1733,18 @@ pub fn bind(
         src.calcs,
         src.procs.iter().map(|p| &p.calcs).collect::<Vec<_>>()
     );
+    // A call of an OVERLOAD prototype may be a call of any of its
+    // candidates.
+    let called = |n: &str| calls.contains(&format!("parts: [{n:?}]"));
+    let via_overload: Vec<String> = protos
+        .values()
+        .filter(|p| !p.overload.is_empty() && called(&p.name))
+        .flat_map(|p| p.overload.clone())
+        .collect();
     let mut imports: Vec<String> = protos
         .values()
-        .filter(|p| p.extpgm.is_none())
-        .filter(|p| calls.contains(&format!("parts: [{:?}]", p.name)))
+        .filter(|p| p.extpgm.is_none() && p.overload.is_empty())
+        .filter(|p| called(&p.name) || via_overload.contains(&p.name))
         .filter_map(|p| p.extproc.clone())
         .map(|t| t.to_ascii_uppercase())
         .filter(|t| !procs.contains_key(t) && !SYSTEM_PROCEDURES.contains(&t.as_str()))
@@ -1679,7 +1776,20 @@ pub fn bind(
             }
         })
         .collect();
+    let varying: HashMap<String, char> = src
+        .defs
+        .iter()
+        .filter_map(|d| {
+            let k = keyword(&d.keywords, "DIM")?;
+            match k.args.first()?.trim().to_ascii_uppercase().as_str() {
+                "*AUTO" => Some((d.name.clone(), 'A')),
+                "*VAR" => Some((d.name.clone(), 'V')),
+                _ => None,
+            }
+        })
+        .collect();
     Ok(Program {
+        varying,
         sequence,
         occurs: b.occurs.clone(),
         imports,

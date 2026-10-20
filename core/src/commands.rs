@@ -138,6 +138,7 @@ impl Job<'_> {
                 self.crtpgm(&cmd).await
             }
             "CVTRPGSRC" => self.cvtrpgsrc(&cmd).await,
+            "CVTRPGFREE" => self.cvtrpgfree(&cmd).await,
             "CRTMNU" => self.crtmnu(&cmd).await,
             "DLTMNU" => self.dltmnu(&cmd).await,
             "DLTUSRPRF" => self.dltusrprf(&cmd).await,
@@ -1371,6 +1372,89 @@ impl Job<'_> {
         out.push(format!(
             "{done} members converted, {skipped} not converted."
         ));
+        Ok(Outcome::Messages(out))
+    }
+
+    /// CVTRPGFREE (as4tainr's own command; IBM i has none): fixed-form
+    /// RPGLE and SQLRPGLE members to free form (`rpg::tofree`), written as
+    /// new members; what has no free form stays fixed.
+    async fn cvtrpgfree(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (libs, file) = self.search(cmd.get("FROMFILE"));
+        let file = file.to_ascii_uppercase();
+        let pattern = cmd.get("FROMMBR").to_ascii_uppercase();
+        let mut lib = None;
+        for l in &libs {
+            if crate::source::is_source_file(self.client, l, &file).await? {
+                lib = Some(l.clone());
+                break;
+            }
+        }
+        let lib = lib.ok_or_else(|| anyhow!("CPF9812: File {file} not found."))?;
+        authority::check(self.client, &self.user, &lib, &file, "*FILE", Aut::Use).await?;
+        let (tl, tf) = self.create_target(cmd.get("TOFILE"));
+        let (tl, tf) = (tl.to_ascii_uppercase(), tf.to_ascii_uppercase());
+        let chosen: Vec<_> = crate::source::members(self.client, &lib, &file)
+            .await?
+            .into_iter()
+            .filter(|(m, _, _)| match pattern.as_str() {
+                "*ALL" => true,
+                p if p.ends_with('*') => m.starts_with(p.trim_end_matches('*')),
+                p => m == p,
+            })
+            .collect();
+        if chosen.is_empty() {
+            bail!("CPF9815: Member {pattern} file {file} in library {lib} not found.");
+        }
+        let to_mbr = cmd.get("TOMBR").to_ascii_uppercase();
+        if chosen.len() > 1 && to_mbr != "*FROMMBR" {
+            bail!("TOMBR must be *FROMMBR when more than one member is converted.");
+        }
+        let mut out = Vec::new();
+        for (name, srctype, text) in chosen {
+            if !matches!(srctype.as_str(), "RPGLE" | "SQLRPGLE") {
+                out.push(format!(
+                    "Member {name} not converted: source type {srctype} is not RPGLE or SQLRPGLE."
+                ));
+                continue;
+            }
+            let tm = if to_mbr == "*FROMMBR" {
+                name.clone()
+            } else {
+                to_mbr.clone()
+            };
+            if tl == lib && tf == file && tm == name {
+                bail!("Member {name} would replace itself: name another member (TOMBR) or file (TOFILE).");
+            }
+            let m =
+                crate::source::find_member(self.client, std::slice::from_ref(&lib), &file, &name)
+                    .await?;
+            let c = crate::rpg::tofree::convert(&m.source)?;
+            crate::source::put_member(
+                self.client,
+                &crate::source::Member {
+                    library: tl.clone(),
+                    file: tf.clone(),
+                    name: tm.clone(),
+                    srctype: srctype.clone(),
+                    text,
+                    source: c.source,
+                },
+                false,
+            )
+            .await
+            .map_err(|e| anyhow!("Member {tm} not converted: {e:#}"))?;
+            for msg in &c.messages {
+                out.push(format!("{name}: {msg}"));
+            }
+            out.push(if c.fixed_lines == 0 {
+                format!("Member {name} converted to {tl}/{tf}({tm}): all free form (**FREE).")
+            } else {
+                format!(
+                    "Member {name} converted to {tl}/{tf}({tm}); {} lines stay fixed.",
+                    c.fixed_lines
+                )
+            });
+        }
         Ok(Outcome::Messages(out))
     }
 

@@ -172,6 +172,7 @@ fn literal(v: &Value) -> Result<String> {
         Value::Ind(b) => if *b { "'1'" } else { "'0'" }.to_string(),
         Value::Fig(_) => "''".to_string(),
         Value::Char(c) => format!("'{}'", a(c).replace('\0', "").replace('\'', "''")),
+        other => anyhow::bail!("{} cannot be an SQL value", other.describe()),
     })
 }
 

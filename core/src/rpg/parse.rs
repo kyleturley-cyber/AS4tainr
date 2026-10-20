@@ -623,6 +623,9 @@ fn free_decl(text: &str) -> Result<(String, Option<DType>, Vec<Keyword>)> {
 }
 
 /// What the parser is in the middle of.
+/// A DCL-ENUM being declared: name, QUALIFIED, its constants and values.
+type OpenEnum = (String, bool, Vec<(String, String)>);
+
 struct Ctx {
     src: Source,
     /// The open DS, PR or PI (index into defs), for subfields and parms.
@@ -642,6 +645,10 @@ struct Ctx {
     pending_cond: Option<(Option<String>, Conditions)>,
     /// A CASxx group is open (its lines became SELECT/WHEN/EXSR).
     cas_open: bool,
+    /// DCL-ENUM being declared: name, QUALIFIED, its constants.
+    enum_open: Option<OpenEnum>,
+    /// Open SELECT groups and their operand (SELECT x; WHEN-IS; WHEN-IN).
+    selects: Vec<Option<Expr>>,
 }
 
 impl Ctx {
@@ -705,6 +712,8 @@ pub fn parse(source: &str, includes: &dyn Fn(&str) -> Option<String>) -> Result<
         call: None,
         pending_cond: None,
         cas_open: false,
+        enum_open: None,
+        selects: vec![],
     };
     ctx.src.ctdata = lines.ctdata;
     let units = std::mem::take(&mut lines.units);
@@ -1326,6 +1335,7 @@ fn fixed_c(ctx: &mut Ctx, cs: &[char], ext2: &str, lineno: usize) -> Result<()> 
             } else {
                 Some(rt.to_ascii_uppercase())
             },
+            fields: None,
             ext: ext.clone(),
             ind: ind.clone(),
         }))
@@ -1488,7 +1498,7 @@ fn fixed_c(ctx: &mut Ctx, cs: &[char], ext2: &str, lineno: usize) -> Result<()> 
         "CAT" | "SUBST" | "SCAN" | "CHECK" | "CHECKR" | "XLATE" | "LOOKUP" | "TIME" | "IN"
         | "OUT" | "MOVEA" | "XFOOT" | "SQRT" | "TESTN" | "TESTZ" | "TESTB" | "BITON" | "BITOFF"
         | "EXCEPT" | "OCCUR" | "SORTA" | "DEALLOC" | "MHHZO" | "MHLZO" | "MLHZO" | "MLLZO"
-        | "SHTDN" => {
+        | "SHTDN" | "TEST" => {
             // Factors written `value:value` (SCAN 'ab':2, SUBST base:start,
             // XLATE from:to, CAT text:blanks).
             let f2v = if op == "EXCEPT" {
@@ -1588,6 +1598,25 @@ impl ExceptName for Line {
             (l, _) => l,
         }
     }
+}
+
+/// FOR-EACH item IN array, %LIST(...), %SPLIT(...), %SUBARR(...).
+fn free_for_each(text: &str) -> Result<Line> {
+    let up = text.to_ascii_uppercase();
+    let mut quoted = false;
+    let b = up.as_bytes();
+    for i in 0..up.len() {
+        if b[i] == b'\'' {
+            quoted = !quoted;
+        }
+        if !quoted && up[i..].starts_with(" IN ") {
+            return Ok(Line::ForEach {
+                var: expr::parse(&text[..i])?,
+                list: expr::parse(&text[i + 4..])?,
+            });
+        }
+    }
+    bail!("FOR-EACH needs: item IN array or list")
 }
 
 /// `target = value`, or `target += value` and the other compound forms.
@@ -1948,9 +1977,17 @@ const FREE_OPS: &[&str] = &[
     "DATA-INTO",
     "DATA-GEN",
     "SND-MSG",
+    "FOR-EACH",
+    "ON-EXCP",
     "ON-EXIT",
     "ENDON-EXIT",
 ];
+
+/// Whether a name is a free-form operation code (a subfield or parameter
+/// with that name needs DCL-SUBF or DCL-PARM).
+pub fn is_free_op(name: &str) -> bool {
+    FREE_OPS.contains(&name.to_ascii_uppercase().as_str())
+}
 
 /// The first word of a free-form statement and its operation extender:
 /// `CHAIN(N) key file` → ("CHAIN", "N", rest).
@@ -2158,6 +2195,56 @@ fn free(ctx: &mut Ctx, text: &str, lineno: usize) -> Result<()> {
             ctx.free_block = None;
             return Ok(());
         }
+        // DCL-ENUM (7.5): named constants, and the enumeration as the list
+        // of their values (for IN and FOR-EACH); QUALIFIED names them
+        // ENUM.NAME.
+        "DCL-ENUM" => {
+            let (name, _, kws) = free_decl(&rest)?;
+            ctx.enum_open = Some((name, keyword(&kws, "QUALIFIED").is_some(), vec![]));
+            return Ok(());
+        }
+        "END-ENUM" => {
+            let (name, qualified, items) = ctx
+                .enum_open
+                .take()
+                .ok_or_else(|| anyhow!("END-ENUM without DCL-ENUM"))?;
+            let mut names = Vec::new();
+            for (item, value) in items {
+                let full = if qualified {
+                    format!("{name}.{item}")
+                } else {
+                    item
+                };
+                names.push(full.clone());
+                ctx.add_def(Def {
+                    name: full,
+                    kind: DefKind::Const,
+                    dtype: None,
+                    from: None,
+                    to: None,
+                    external: false,
+                    keywords: vec![Keyword {
+                        name: "CONST".into(),
+                        args: vec![value],
+                    }],
+                    line: lineno,
+                });
+            }
+            ctx.add_def(Def {
+                name,
+                kind: DefKind::Const,
+                dtype: None,
+                from: None,
+                to: None,
+                external: false,
+                keywords: vec![Keyword {
+                    name: "ENUM".into(),
+                    args: names,
+                }],
+                line: lineno,
+            });
+            return Ok(());
+        }
         "DCL-SUBF" | "DCL-PARM" => {
             let (name, dtype, kws) = free_decl(&rest)?;
             return sub_def(ctx, name, dtype, kws, lineno);
@@ -2186,10 +2273,56 @@ fn free(ctx: &mut Ctx, text: &str, lineno: usize) -> Result<()> {
         }
         _ => {}
     }
+    // The constants of a DCL-ENUM: NAME value.
+    if let Some((_, _, items)) = ctx.enum_open.as_mut() {
+        let t = text.trim();
+        let (n, v) = t
+            .split_once(char::is_whitespace)
+            .ok_or_else(|| anyhow!("an enumeration constant needs a value: {t}"))?;
+        items.push((n.to_ascii_uppercase(), v.trim().to_string()));
+        return Ok(());
+    }
     // Subfields and parameters inside a free-form DS/PR/PI.
     if ctx.free_block.is_some() && free_op(text).is_none() {
         let (name, dtype, kws) = free_decl(text)?;
         return sub_def(ctx, name, dtype, kws, lineno);
+    }
+    // SELECT with an operand, WHEN-IS value, WHEN-IN list (7.5).
+    match first.as_str() {
+        "SELECT" => {
+            ctx.selects.push(if rest.is_empty() {
+                None
+            } else {
+                Some(expr::parse(&rest)?)
+            });
+            ctx.calc(lineno, vec![], None, Line::Select);
+            return Ok(());
+        }
+        "ENDSL" => {
+            ctx.selects.pop();
+        }
+        "WHEN-IS" | "WHEN-IN" => {
+            let operand = ctx
+                .selects
+                .last()
+                .cloned()
+                .flatten()
+                .ok_or_else(|| anyhow!("{first} needs SELECT with an operand"))?;
+            let v = expr::parse(&rest)?;
+            let op = if first == "WHEN-IS" {
+                BinOp::Eq
+            } else {
+                BinOp::In
+            };
+            ctx.calc(
+                lineno,
+                vec![],
+                None,
+                Line::When(Expr::Bin(op, Box::new(operand), Box::new(v))),
+            );
+            return Ok(());
+        }
+        _ => {}
     }
     let what = free_calc(text)?;
     ctx.calc(lineno, vec![], None, what);
@@ -2290,12 +2423,23 @@ fn free_calc(text: &str) -> Result<Line> {
             Expr::Name { parts, .. } => parts.join("."),
             other => bail!("{op}: a file or record format name is needed, found {other:?}"),
         };
+        let mut fields = None;
         let ds = if p.at_end() {
             None
         } else {
             match p.expr()? {
                 Expr::Name { parts, .. } => Some(parts.join(".")),
-                Expr::Bif(_, _) => None,
+                Expr::Bif(b, args) if b == "FIELDS" => {
+                    fields = Some(
+                        args.iter()
+                            .map(|a| match a {
+                                Expr::Name { parts, .. } => Ok(parts.join(".")),
+                                other => bail!("%FIELDS needs field names, found {other:?}"),
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                    );
+                    None
+                }
                 other => bail!("{op}: a data structure name is needed, found {other:?}"),
             }
         };
@@ -2304,6 +2448,7 @@ fn free_calc(text: &str) -> Result<Line> {
             file,
             key,
             ds,
+            fields,
             ext: ext.clone(),
             ind: ResultInd::default(),
         }))
@@ -2317,6 +2462,7 @@ fn free_calc(text: &str) -> Result<Line> {
         "DOU" => Line::Dou(need("a condition")?),
         "ENDDO" => Line::EndDo,
         "FOR" => free_for(rest_t)?,
+        "FOR-EACH" => free_for_each(rest_t)?,
         "ENDFOR" => Line::EndFor,
         "SELECT" => Line::Select,
         "WHEN" => Line::When(need("a condition")?),
@@ -2335,6 +2481,22 @@ fn free_calc(text: &str) -> Result<Line> {
                 .split(':')
                 .map(|s| s.trim().to_ascii_uppercase())
                 .filter(|s| !s.is_empty())
+                .collect(),
+        ),
+        // ON-EXCP 'CPF9898' : 'MCH1211' (7.5): handles the exception
+        // messages listed.
+        "ON-EXCP" => Line::OnError(
+            rest_t
+                .split(':')
+                .map(|s| s.trim().trim_matches('\'').to_ascii_uppercase())
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    if s == "*ALL" {
+                        "MSG:".to_string()
+                    } else {
+                        format!("MSG:{s}")
+                    }
+                })
                 .collect(),
         ),
         "ENDMON" => Line::EndMon,
@@ -2406,6 +2568,50 @@ fn free_calc(text: &str) -> Result<Line> {
             ext,
             ind: ResultInd::default(),
         }),
+        // SND-MSG [*INFO | *ESCAPE | *COMP | *DIAG | *NOTIFY | *STATUS]
+        // message [%TARGET(...)] (7.5).
+        "SND-MSG" => {
+            let mut t = rest_t.trim();
+            let mut kind = "*INFO".to_string();
+            if t.starts_with('*') {
+                let w: String = t.chars().take_while(|c| !c.is_whitespace()).collect();
+                kind = w.to_ascii_uppercase();
+                t = t[w.len()..].trim();
+            }
+            // %TARGET(...) at the end: where the message goes (the caller
+            // here, always).
+            let up = t.to_ascii_uppercase();
+            if let Some(p) = up.rfind("%TARGET") {
+                t = t[..p].trim();
+            }
+            Line::Stmt(Stmt::Op {
+                code: op.clone(),
+                f1: Some(Expr::name(&kind)),
+                f2: Some(expr::parse(t)?),
+                result: None,
+                ext,
+                ind: ResultInd::default(),
+            })
+        }
+        // TEST(D/T/Z E) [format] field: is the value a valid date, time or
+        // timestamp?
+        "TEST" => {
+            let t = rest_t.trim();
+            let (fmt, field) = if t.starts_with('*') {
+                let w: String = t.chars().take_while(|c| !c.is_whitespace()).collect();
+                (Some(Expr::name(&w)), t[w.len()..].trim())
+            } else {
+                (None, t)
+            };
+            Line::Stmt(Stmt::Op {
+                code: op.clone(),
+                f1: fmt,
+                f2: None,
+                result: Some(expr::parse(field)?),
+                ext,
+                ind: ResultInd::default(),
+            })
+        }
         "IN" | "OUT" => {
             let lock = rest_t.to_ascii_uppercase().starts_with("*LOCK");
             let name = rest_t

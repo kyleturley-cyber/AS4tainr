@@ -1054,6 +1054,23 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "CVTRPGFREE",
+        description: "Convert RPG to Free Form (as4tainr)",
+        params: &[
+            p("FROMFILE", Kind::Qualified, true, None, "From file").ch("Name"),
+            p("FROMMBR", Kind::Name, true, None, "From member").ch("Name, generic*, *ALL"),
+            p(
+                "TOFILE",
+                Kind::Qualified,
+                false,
+                Some("QRPGLESRC"),
+                "To file",
+            )
+            .ch("Name"),
+            p("TOMBR", Kind::Name, true, None, "To member").ch("Name, *FROMMBR"),
+        ],
+    },
+    CommandDef {
         name: "CVTRPGSRC",
         description: "Convert RPG Source",
         params: &[
@@ -1231,6 +1248,7 @@ pub static GROUPS: &[Group] = &[
             "CRTSQLRPGI",
             "CRTRPGPGM",
             "CVTRPGSRC",
+            "CVTRPGFREE",
             "CRTRPGMOD",
             "CRTSRVPGM",
             "CRTPGM",

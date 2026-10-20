@@ -282,6 +282,11 @@ impl Parser {
 
     fn cmp(&mut self) -> Result<Expr> {
         let l = self.add()?;
+        // x IN %RANGE(a:b), x IN %LIST(...), x IN array.
+        if self.eat_word("IN") {
+            let r = self.add()?;
+            return Ok(Expr::Bin(BinOp::In, Box::new(l), Box::new(r)));
+        }
         let op = match self.peek() {
             Some(Tok::Op("=")) => BinOp::Eq,
             Some(Tok::Op("<>")) => BinOp::Ne,

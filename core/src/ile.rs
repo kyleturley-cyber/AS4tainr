@@ -60,6 +60,13 @@ pub struct ModuleCopy {
     pub name: String,
     pub source: String,
     pub options: String,
+    /// RPGLE, SQLRPGLE or CLLE.
+    #[serde(default = "rpgle")]
+    pub attribute: String,
+}
+
+fn rpgle() -> String {
+    "RPGLE".into()
 }
 
 /// Where an imported procedure is.
@@ -84,6 +91,25 @@ pub struct Binding {
     pub srvpgms: Vec<(String, String)>,
     /// A service program's signature (binder language, or generated).
     pub signature: String,
+    /// A service program's earlier signatures (PGMLVL(*PRV) export
+    /// blocks): programs bound to one of them still run.
+    #[serde(default)]
+    pub prv_signatures: Vec<String>,
+    /// The signature of each bound service program when this object was
+    /// bound ("LIB/NAME" → signature), checked when it is activated.
+    #[serde(default)]
+    pub srv_signatures: BTreeMap<String, String>,
+    /// A service program's activation group (CRTSRVPGM ACTGRP): a name,
+    /// or *CALLER.
+    #[serde(default = "caller")]
+    pub actgrp: String,
+    /// A program's entry module (its code is the program's source).
+    #[serde(default)]
+    pub entry_module: String,
+}
+
+fn caller() -> String {
+    "*CALLER".into()
 }
 
 /// What a module defines and needs, from its compiled form.
@@ -100,13 +126,30 @@ pub struct ModuleInfo {
 
 /// Compile a module and say what it exports and imports.
 pub async fn module_info(client: &Client, libl: &[String], m: &ModuleCopy) -> Result<ModuleInfo> {
+    // A CL module: one procedure, named as the module; it imports the
+    // procedures it calls with CALLPRC.
+    if m.attribute == "CLLE" {
+        let p = crate::clpgm::compile(&m.name, &m.source)
+            .map_err(|e| anyhow!("module {}: {e:#}", m.name))?;
+        return Ok(ModuleInfo {
+            name: m.name.clone(),
+            exports: vec![m.name.to_ascii_uppercase()],
+            imports: p.called_procedures(),
+            has_main: true,
+        });
+    }
     let prog = crate::rpg::compile_with(client, libl, &m.name, &m.source, &m.options)
         .await
         .map_err(|e| anyhow!("module {}: {e:#}", m.name))?;
+    // Exported and imported data are symbols too.
+    let mut exports = prog.exports();
+    exports.extend(prog.data_exports.iter().map(|x| x.0.clone()));
+    let mut imports = prog.imports.clone();
+    imports.extend(prog.data_imports.iter().map(|x| x.0.clone()));
     Ok(ModuleInfo {
         name: m.name.clone(),
-        exports: prog.exports(),
-        imports: prog.imports.clone(),
+        exports,
+        imports,
         has_main: !prog.nomain,
     })
 }
@@ -185,7 +228,7 @@ pub async fn find_module(
     for lib in &libs {
         if let Some(r) = client
             .query_opt(
-                "SELECT source, options FROM as4tainr.modules WHERE library=$1 AND name=$2",
+                "SELECT source, options, attribute FROM as4tainr.modules WHERE library=$1 AND name=$2",
                 &[lib, &name],
             )
             .await?
@@ -194,6 +237,7 @@ pub async fn find_module(
                 name: name.to_string(),
                 source: r.get(0),
                 options: r.get(1),
+                attribute: r.get(2),
             });
         }
     }
@@ -303,26 +347,48 @@ pub async fn bind(
         k += 1;
     }
     binding.modules = modules;
+    // The signatures the service programs have now: checked when the
+    // object is activated.
+    binding.srv_signatures = srvpgms
+        .iter()
+        .map(|(l, n, b)| (format!("{l}/{n}"), b.signature.clone()))
+        .collect();
     binding.srvpgms = srvpgms.into_iter().map(|(l, n, _)| (l, n)).collect();
     Ok((binding, infos))
 }
 
+/// What binder language says about a service program.
+#[derive(Debug, Default, PartialEq)]
+pub struct BinderSource {
+    /// The *CURRENT block's exports, in order.
+    pub exports: Vec<String>,
+    /// Its signature (SIGNATURE), None for *GEN.
+    pub signature: Option<String>,
+    /// The signatures of the *PRV blocks (given, or generated from their
+    /// exports).
+    pub previous: Vec<String>,
+}
+
 /// Binder language (ILE Concepts, binder language): the exports of a
-/// service program and its signature.
+/// service program and its signatures.
 ///
 /// ```text
 /// STRPGMEXP PGMLVL(*CURRENT) SIGNATURE('MYSIG')
 ///   EXPORT SYMBOL(PROC1)
 ///   EXPORT SYMBOL('Proc2')
 /// ENDPGMEXP
+/// STRPGMEXP PGMLVL(*PRV)
+///   EXPORT SYMBOL(PROC1)
+/// ENDPGMEXP
 /// ```
 ///
-/// Only the *CURRENT block's exports count (*PRV blocks keep older
-/// signatures valid; as4tainr does not check signatures yet).
-pub fn binder_language(source: &str) -> Result<(Vec<String>, Option<String>)> {
-    let mut exports = Vec::new();
-    let mut signature = None;
-    let mut current = false;
+/// The *CURRENT block's exports are the service program's; each *PRV
+/// block keeps an older signature valid, so programs bound before still
+/// run (ILE Concepts, "Signature").
+pub fn binder_language(source: &str) -> Result<BinderSource> {
+    let mut out = BinderSource::default();
+    // The block being read: *CURRENT or not, its SIGNATURE, its exports.
+    let mut block: Option<(bool, Option<String>, Vec<String>)> = None;
     let mut seen_current = false;
     for raw in source.lines() {
         let line = raw.trim();
@@ -332,32 +398,39 @@ pub fn binder_language(source: &str) -> Result<(Vec<String>, Option<String>)> {
         let cmd = crate::cl::parse(line).map_err(|e| anyhow!("binder language: {e}"))?;
         match cmd.def.name {
             "STRPGMEXP" => {
-                current = cmd.get("PGMLVL") != "*PRV";
+                let current = cmd.get("PGMLVL") != "*PRV";
                 if current {
                     if seen_current {
                         bail!("CPD5D17: Only one PGMLVL(*CURRENT) export block is allowed.");
                     }
                     seen_current = true;
-                    let s = cmd.get("SIGNATURE");
-                    if s != "*GEN" {
-                        signature = Some(s.to_string());
+                }
+                let s = cmd.get("SIGNATURE");
+                block = Some((current, (s != "*GEN").then(|| s.to_string()), vec![]));
+            }
+            "EXPORT" => {
+                if let Some((_, _, ex)) = block.as_mut() {
+                    ex.push(cmd.get("SYMBOL").to_ascii_uppercase());
+                }
+            }
+            "ENDPGMEXP" => {
+                if let Some((current, sig, ex)) = block.take() {
+                    if current {
+                        out.exports = ex;
+                        out.signature = sig;
+                    } else {
+                        out.previous
+                            .push(sig.unwrap_or_else(|| generated_signature(&ex)));
                     }
                 }
             }
-            "EXPORT" => {
-                if current {
-                    let sym = cmd.get("SYMBOL").to_string();
-                    exports.push(sym.to_ascii_uppercase());
-                }
-            }
-            "ENDPGMEXP" => current = false,
             other => bail!("binder language: {other} is not a binder language statement"),
         }
     }
     if !seen_current {
         bail!("CPD5D16: The binder source has no PGMLVL(*CURRENT) export block.");
     }
-    Ok((exports, signature))
+    Ok(out)
 }
 
 /// A generated signature: a digest of the exports in order (ILE: the
@@ -373,39 +446,68 @@ pub fn generated_signature(exports: &[String]) -> String {
     format!("{h:016X}")
 }
 
-/// Global storage of the service programs active in each job (their
-/// activation; kept until the job ends): (job, LIB/SRVPGM/MODULE).
-/// (job, unit) -> the unit's global storage.
-type Activations = HashMap<(String, String), Vec<Vec<u8>>>;
+/// Global storage of the service programs active in each job, by
+/// activation group: (job, activation group, LIB/SRVPGM/MODULE) → the
+/// module's global storage.
+type Activations = HashMap<(String, String, String), Vec<Vec<u8>>>;
 
 static ACTIVATIONS: Mutex<Option<Activations>> = Mutex::new(None);
 
 /// A module's storage in a service program activation, if it was
-/// activated before in the job.
-pub fn activation(job: &str, unit: &str) -> Option<Vec<Vec<u8>>> {
+/// activated before in the activation group.
+pub fn activation(job: &str, group: &str, unit: &str) -> Option<Vec<Vec<u8>>> {
     ACTIVATIONS
         .lock()
         .ok()?
         .as_ref()?
-        .get(&(job.to_string(), unit.to_string()))
+        .get(&(job.to_string(), group.to_string(), unit.to_string()))
         .cloned()
 }
 
-/// Keep a module's storage in the job's activation.
-pub fn keep_activation(job: &str, unit: &str, storage: Vec<Vec<u8>>) {
+/// Keep a module's storage in its activation group.
+pub fn keep_activation(job: &str, group: &str, unit: &str, storage: Vec<Vec<u8>>) {
     if let Ok(mut g) = ACTIVATIONS.lock() {
-        g.get_or_insert_with(HashMap::new)
-            .insert((job.to_string(), unit.to_string()), storage);
+        g.get_or_insert_with(HashMap::new).insert(
+            (job.to_string(), group.to_string(), unit.to_string()),
+            storage,
+        );
     }
 }
 
-/// RCLACTGRP / the end of a job: its activations go.
-pub fn end_activations(job: &str) {
-    if let Ok(mut g) = ACTIVATIONS.lock() {
-        if let Some(m) = g.as_mut() {
-            m.retain(|(j, _), _| j != job);
+/// Which activation groups an end applies to: one by name, every one but
+/// the default activation group (RCLACTGRP *ELIGIBLE), or all (end of
+/// job).
+pub enum Groups<'a> {
+    Named(&'a str),
+    Eligible,
+    All,
+}
+
+impl Groups<'_> {
+    pub fn covers(&self, group: &str) -> bool {
+        match self {
+            Groups::Named(n) => group.eq_ignore_ascii_case(n),
+            Groups::Eligible => group != DEFAULT_GROUP,
+            Groups::All => true,
         }
     }
+}
+
+/// The default activation group (OPM programs, DFTACTGRP(*YES)).
+pub const DEFAULT_GROUP: &str = "*DFTACTGRP";
+
+/// RCLACTGRP, the end of a job: the service program activations of those
+/// groups go (and the programs active in them, `rpg::end_programs`).
+pub fn end_activations(job: &str, groups: &Groups) -> usize {
+    let mut n = 0;
+    if let Ok(mut g) = ACTIVATIONS.lock() {
+        if let Some(m) = g.as_mut() {
+            let before = m.len();
+            m.retain(|(j, grp, _), _| !(j == job && groups.covers(grp)));
+            n = before - m.len();
+        }
+    }
+    n + crate::rpg::interp::end_programs(job, groups)
 }
 
 /// CRTBNDDIR.

@@ -845,6 +845,115 @@ impl Machine<'_> {
         Ok(rec)
     }
 
+    /// Where each exported or imported definition is: (symbol, buffer,
+    /// offset, length, exported).
+    fn shared_places(&self) -> Vec<(String, usize, usize, usize, bool)> {
+        let prog = self.prog;
+        let mut out = Vec::new();
+        for (list, exported) in [(&prog.data_exports, true), (&prog.data_imports, false)] {
+            for (sym, name) in list {
+                match prog.syms.get(name) {
+                    Some(Sym::Var(v)) => out.push((
+                        sym.clone(),
+                        v.buf,
+                        v.off,
+                        v.stride * v.dim.max(1) as usize,
+                        exported,
+                    )),
+                    Some(Sym::Ds(d)) => out.push((
+                        sym.clone(),
+                        d.buf,
+                        d.off,
+                        d.size * d.dim.max(1) as usize,
+                        exported,
+                    )),
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
+    /// Exported data: this module's values to the shared copy.
+    pub(super) fn share_out(&mut self) {
+        let places = self.shared_places();
+        if places.is_empty() {
+            return;
+        }
+        if let Ok(mut s) = self.io.shared.lock() {
+            for (sym, buf, off, len, _) in places {
+                s.insert(sym, self.bufs[buf][off..off + len].to_vec());
+            }
+        }
+    }
+
+    /// Exported data: the shared copy into this module's definitions.
+    pub(super) fn share_in(&mut self) {
+        let places = self.shared_places();
+        if places.is_empty() {
+            return;
+        }
+        let s = self.io.shared.lock().map(|s| s.clone()).unwrap_or_default();
+        for (sym, buf, off, len, _) in places {
+            if let Some(b) = s.get(&sym) {
+                let n = len.min(b.len());
+                self.bufs[buf][off..off + n].copy_from_slice(&b[..n]);
+            }
+        }
+    }
+
+    /// Exported data: this module's exports with their initial values,
+    /// where nothing has set them yet.
+    pub(super) fn share_seed(&mut self) {
+        let places = self.shared_places();
+        if let Ok(mut s) = self.io.shared.lock() {
+            for (sym, buf, off, len, exported) in places {
+                if exported && !s.contains_key(&sym) {
+                    s.insert(sym, self.bufs[buf][off..off + len].to_vec());
+                }
+            }
+        }
+    }
+
+    /// Exported data of the modules bound into the program: their initial
+    /// values (the program's activation initializes all its modules).
+    pub(super) fn seed_bound_modules(&mut self) -> Result<()> {
+        let Some(b) = self.io.binding.clone() else {
+            return Ok(());
+        };
+        let client = self.io.client;
+        let libl = self.io.libl.clone();
+        for m in &b.modules {
+            let p = self.block(super::super::compile_with(
+                client, &libl, &m.name, &m.source, &m.options,
+            ))?;
+            if p.data_exports.is_empty() {
+                continue;
+            }
+            let storage = self
+                .io
+                .modules
+                .lock()
+                .ok()
+                .and_then(|x| x.get(&format!("MODULE {}", m.name)).cloned())
+                .unwrap_or_else(|| p.globals.clone());
+            if let Ok(mut s) = self.io.shared.lock() {
+                for (sym, name) in &p.data_exports {
+                    let place = match p.syms.get(name) {
+                        Some(Sym::Var(v)) => Some((v.buf, v.off, v.stride * v.dim.max(1) as usize)),
+                        Some(Sym::Ds(d)) => Some((d.buf, d.off, d.size * d.dim.max(1) as usize)),
+                        _ => None,
+                    };
+                    if let Some((buf, off, len)) = place {
+                        s.entry(sym.clone())
+                            .or_insert_with(|| storage[buf][off..off + len].to_vec());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Whether a parameter was passed as *OMIT.
     fn omitted(&self, name: &str) -> bool {
         self.frames

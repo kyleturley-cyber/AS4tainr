@@ -3978,3 +3978,285 @@ async fn rpg_fixed_to_free_conversion_runs_the_same() {
         assert_eq!(before.printed, after.printed, "{name}");
     }
 }
+
+#[tokio::test]
+async fn ile_activation_groups_and_signatures() {
+    // ILE RPG Reference ("Program termination"): a program that returns
+    // without LR stays active, its storage kept for the next call, until
+    // its activation group ends (RCLACTGRP; RCLRSC for the default
+    // group); ACTGRP(*NEW) starts each call afresh. ILE Concepts
+    // ("Signature"): a program bound to a service program runs only while
+    // the service program has the signature it was bound to, as its
+    // current or a *PRV one; UPDPGM binds it again.
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+    };
+    for f in ["QRPGLESRC", "QSRVSRC"] {
+        source::create_file(&client, &lib, f, "").await.unwrap();
+    }
+    let counter = |ctl: &str| {
+        format!("**FREE\n{ctl}\ndcl-s n packed(5:0) inz(0);\nn += 1;\ndsply %char(n);\nreturn;\n")
+    };
+    let members = [
+        ("NAMEDGRP", "RPGLE", counter("ctl-opt dftactgrp(*no) actgrp('MYGROUP');")),
+        ("DFTGRP", "RPGLE", counter("")),
+        ("NEWGRP", "RPGLE", counter("ctl-opt dftactgrp(*no) actgrp(*new);")),
+        ("SIGMOD", "RPGLE", "**FREE\nctl-opt nomain;\ndcl-proc hello export;\n  dcl-pi *n varchar(20) end-pi;\n  return 'hello v1';\nend-proc;\n".to_string()),
+        ("SIGSRV", "BND", "STRPGMEXP PGMLVL(*CURRENT) SIGNATURE('V1')\n  EXPORT SYMBOL(HELLO)\nENDPGMEXP\n".to_string()),
+        ("SIGSRV2", "BND", "STRPGMEXP PGMLVL(*CURRENT) SIGNATURE('V2')\n  EXPORT SYMBOL(HELLO)\nENDPGMEXP\n".to_string()),
+        ("SIGSRV3", "BND", "STRPGMEXP PGMLVL(*CURRENT) SIGNATURE('V3')\n  EXPORT SYMBOL(HELLO)\nENDPGMEXP\nSTRPGMEXP PGMLVL(*PRV) SIGNATURE('V2')\n  EXPORT SYMBOL(HELLO)\nENDPGMEXP\n".to_string()),
+        ("SIGUSER", "RPGLE", "**FREE\nctl-opt dftactgrp(*no);\ndcl-pr hello varchar(20) end-pr;\ndsply hello();\n*inlr = *on;\n".to_string()),
+    ];
+    for (name, t, text) in &members {
+        let file = if *t == "BND" { "QSRVSRC" } else { "QRPGLESRC" };
+        source::put_member(
+            &client,
+            &source::Member {
+                library: lib.clone(),
+                file: file.into(),
+                name: (*name).into(),
+                srctype: (*t).into(),
+                text: String::new(),
+                source: text.clone(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    for p in ["NAMEDGRP", "DFTGRP", "NEWGRP"] {
+        cl_cmd(&mut job, format!("CRTBNDRPG PGM({lib}/{p})"))
+            .await
+            .unwrap();
+    }
+    let call = |p: &str| format!("CALL PGM({lib}/{p})");
+    // A named activation group: the count goes on until RCLACTGRP.
+    assert_eq!(
+        cl_cmd(&mut job, call("NAMEDGRP")).await.unwrap(),
+        ["DSPLY  1"]
+    );
+    assert_eq!(
+        cl_cmd(&mut job, call("NAMEDGRP")).await.unwrap(),
+        ["DSPLY  2"]
+    );
+    cl_cmd(&mut job, "RCLACTGRP ACTGRP(MYGROUP)".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        cl_cmd(&mut job, call("NAMEDGRP")).await.unwrap(),
+        ["DSPLY  1"]
+    );
+    // The default activation group: until RCLRSC.
+    assert_eq!(
+        cl_cmd(&mut job, call("DFTGRP")).await.unwrap(),
+        ["DSPLY  1"]
+    );
+    assert_eq!(
+        cl_cmd(&mut job, call("DFTGRP")).await.unwrap(),
+        ["DSPLY  2"]
+    );
+    cl_cmd(&mut job, "RCLACTGRP ACTGRP(*ELIGIBLE)".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        cl_cmd(&mut job, call("DFTGRP")).await.unwrap(),
+        ["DSPLY  3"]
+    );
+    cl_cmd(&mut job, "RCLRSC".into()).await.unwrap();
+    assert_eq!(
+        cl_cmd(&mut job, call("DFTGRP")).await.unwrap(),
+        ["DSPLY  1"]
+    );
+    // *NEW: a new activation group each call.
+    assert_eq!(
+        cl_cmd(&mut job, call("NEWGRP")).await.unwrap(),
+        ["DSPLY  1"]
+    );
+    assert_eq!(
+        cl_cmd(&mut job, call("NEWGRP")).await.unwrap(),
+        ["DSPLY  1"]
+    );
+    // Signatures.
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/SIGMOD)"),
+        format!("CRTSRVPGM SRVPGM({lib}/SIGSRV) MODULE({lib}/SIGMOD) SRCFILE({lib}/QSRVSRC)"),
+        format!("CRTRPGMOD MODULE({lib}/SIGUSER)"),
+        format!("CRTPGM PGM({lib}/SIGUSER) MODULE({lib}/SIGUSER) BNDSRVPGM({lib}/SIGSRV)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    assert_eq!(
+        cl_cmd(&mut job, call("SIGUSER")).await.unwrap(),
+        ["DSPLY  hello v1"]
+    );
+    let d = cl_cmd(&mut job, format!("DSPPGM PGM({lib}/SIGUSER)"))
+        .await
+        .unwrap();
+    assert!(d.iter().any(|l| l.contains("V1")), "{d:?}");
+    // New signature V2: the program bound to V1 no longer runs.
+    cl_cmd(
+        &mut job,
+        format!("CRTSRVPGM SRVPGM({lib}/SIGSRV) MODULE({lib}/SIGMOD) SRCFILE({lib}/QSRVSRC) SRCMBR(SIGSRV2)"),
+    )
+    .await
+    .unwrap();
+    let e = cl_cmd(&mut job, call("SIGUSER")).await.unwrap_err();
+    assert!(e.contains("MCH4431"), "{e}");
+    // UPDPGM binds it again: it runs (bound to V2).
+    cl_cmd(&mut job, format!("UPDPGM PGM({lib}/SIGUSER) MODULE(*NONE)"))
+        .await
+        .unwrap();
+    assert_eq!(
+        cl_cmd(&mut job, call("SIGUSER")).await.unwrap(),
+        ["DSPLY  hello v1"]
+    );
+    // V3 keeps V2 as a previous signature: still runs.
+    cl_cmd(
+        &mut job,
+        format!("CRTSRVPGM SRVPGM({lib}/SIGSRV) MODULE({lib}/SIGMOD) SRCFILE({lib}/QSRVSRC) SRCMBR(SIGSRV3)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        cl_cmd(&mut job, call("SIGUSER")).await.unwrap(),
+        ["DSPLY  hello v1"]
+    );
+    let d = cl_cmd(&mut job, format!("DSPSRVPGM SRVPGM({lib}/SIGSRV)"))
+        .await
+        .unwrap();
+    assert!(
+        d.iter().any(|l| l.contains("V3")) && d.iter().any(|l| l.contains("V2")),
+        "{d:?}"
+    );
+}
+
+#[tokio::test]
+async fn ile_exported_data() {
+    // ILE RPG Reference, EXPORT and IMPORT keywords: a field exported by
+    // one module is the same storage as the field another module of the
+    // program (or a service program) imports.
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+    };
+    source::create_file(&client, &lib, "QRPGLESRC", "")
+        .await
+        .unwrap();
+    for (name, text) in [
+        ("DATAMOD", "**FREE\nctl-opt nomain;\ndcl-s total packed(7:0) export inz(100);\ndcl-proc addIt export;\n  dcl-pi *n;\n    n packed(7:0) const;\n  end-pi;\n  total += n;\nend-proc;\n"),
+        ("DATAMAIN", "**FREE\ndcl-s total packed(7:0) import;\ndcl-pr addIt;\n  n packed(7:0) const;\nend-pr;\ndsply %char(total);\naddIt(5);\ndsply %char(total);\ntotal = 1;\naddIt(1);\ndsply %char(total);\n*inlr = *on;\n"),
+    ] {
+        source::put_member(
+            &client,
+            &source::Member {
+                library: lib.clone(),
+                file: "QRPGLESRC".into(),
+                name: name.into(),
+                srctype: "RPGLE".into(),
+                text: String::new(),
+                source: text.into(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/DATAMOD)"),
+        format!("CRTRPGMOD MODULE({lib}/DATAMAIN)"),
+        format!("CRTPGM PGM({lib}/DATAMAIN) MODULE({lib}/DATAMAIN {lib}/DATAMOD)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    assert_eq!(
+        cl_cmd(&mut job, format!("CALL PGM({lib}/DATAMAIN)"))
+            .await
+            .unwrap(),
+        ["DSPLY  100", "DSPLY  105", "DSPLY  2"]
+    );
+}
+
+#[tokio::test]
+async fn ile_cl_module_callprc() {
+    // ILE CL (CL Programming, "Bound calls"): a CL module (CRTCLMOD)
+    // bound with an RPG module by CRTPGM calls the RPG procedure with
+    // CALLPRC: parameters by reference come back changed, RTNVAL gets the
+    // return value.
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+    };
+    source::create_file(&client, &lib, "QRPGLESRC", "")
+        .await
+        .unwrap();
+    source::create_file(&client, &lib, "QCLSRC", "")
+        .await
+        .unwrap();
+    for (file, name, t, text) in [
+        ("QRPGLESRC", "MATHPRC", "RPGLE", "**FREE\nctl-opt nomain;\ndcl-proc addTo export;\n  dcl-pi *n packed(9:2);\n    total packed(9:2);\n    amount packed(9:2) value;\n  end-pi;\n  total += amount;\n  return total * 2;\nend-proc;\n"),
+        ("QCLSRC", "CLMAIN", "CLLE", "PGM\n  DCL VAR(&TOT) TYPE(*DEC) LEN(9 2) VALUE(10)\n  DCL VAR(&DBL) TYPE(*DEC) LEN(9 2)\n  DCL VAR(&MSG) TYPE(*CHAR) LEN(40)\n  CALLPRC PRC('ADDTO') PARM((&TOT) (5.5 *BYVAL)) RTNVAL(&DBL)\n  CHGVAR VAR(&MSG) VALUE(%CHAR(&TOT) *BCAT %CHAR(&DBL))\n  SNDPGMMSG MSG(&MSG)\nENDPGM\n"),
+    ] {
+        source::put_member(
+            &client,
+            &source::Member {
+                library: lib.clone(),
+                file: file.into(),
+                name: name.into(),
+                srctype: t.into(),
+                text: String::new(),
+                source: text.into(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/MATHPRC)"),
+        format!("CRTCLMOD MODULE({lib}/CLMAIN)"),
+        format!("CRTPGM PGM({lib}/CLMAIN) MODULE({lib}/CLMAIN {lib}/MATHPRC)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    let out = cl_cmd(&mut job, format!("CALL PGM({lib}/CLMAIN)"))
+        .await
+        .unwrap();
+    assert!(out.iter().any(|m| m.contains("15.50 31.00")), "{out:?}");
+}

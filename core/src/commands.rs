@@ -146,23 +146,44 @@ impl Job<'_> {
             "STRSQL" => Ok(Outcome::StartSql),
             "RUNSQL" => self.runsql(&cmd).await,
             "RUNSQLSTM" => self.runsqlstm(&cmd).await,
-            "CRTRPGMOD" => self.crtrpgmod(&cmd).await,
+            "CRTRPGMOD" | "CRTCLMOD" => self.crtrpgmod(&cmd).await,
+            "CALLPRC" => bail!("CALLPRC can only be used in a CL program or procedure."),
             "CRTSRVPGM" => self.crtsrvpgm(&cmd).await,
             "CRTPGM" => self.crtpgm_bound(&cmd).await,
             "CRTBNDDIR" => self.crtbnddir(&cmd).await,
             "ADDBNDDIRE" | "RMVBNDDIRE" => self.bnddire(&cmd).await,
             "DSPBNDDIR" => self.dspbnddir(&cmd).await,
             "DLTMOD" | "DLTSRVPGM" | "DLTBNDDIR" => self.dlt_ile(&cmd).await,
-            "RCLACTGRP" => {
+            "DSPPGM" => self.dsppgm(&cmd).await,
+            "DSPSRVPGM" => self.dspsrvpgm(&cmd).await,
+            "UPDPGM" | "UPDSRVPGM" => self.updpgm(&cmd).await,
+            "RCLACTGRP" | "RCLRSC" => {
                 let key = self
                     .id
                     .as_ref()
                     .map(|i| i.to_string())
                     .unwrap_or_else(|| format!("PID{}", std::process::id()));
-                crate::ile::end_activations(&key);
-                Ok(Outcome::Messages(vec![
+                // RCLRSC: the programs of the default activation group
+                // that ended without LR; RCLACTGRP: an activation group
+                // by name, or *ELIGIBLE (all but the default one).
+                let what = if cmd.def.name == "RCLRSC" {
+                    crate::ile::DEFAULT_GROUP.to_string()
+                } else {
+                    cmd.get("ACTGRP").to_ascii_uppercase()
+                };
+                let groups = match what.as_str() {
+                    "*ELIGIBLE" => crate::ile::Groups::Eligible,
+                    g => crate::ile::Groups::Named(g),
+                };
+                let n = crate::ile::end_activations(&key, &groups);
+                if cmd.def.name == "RCLACTGRP" && n == 0 && what != "*ELIGIBLE" {
+                    bail!("CPF1653: Activation group {what} not found.");
+                }
+                Ok(Outcome::Messages(vec![if cmd.def.name == "RCLRSC" {
+                    "Resources reclaimed.".into()
+                } else {
                     "Activation groups reclaimed.".into()
-                ]))
+                }]))
             }
             "DLTF" => self.dltf(&cmd).await,
             "WRKOBJ" => self.wrkobj(&cmd).await,
@@ -545,6 +566,279 @@ impl Job<'_> {
     }
 
     /// (library, name) pairs of BNDSRVPGM, and BNDDIR names.
+    /// A program or service program named on a command: (library, name).
+    async fn ile_object(&self, q: &str, objtype: &str, aut: Aut) -> Result<(String, String)> {
+        let (libs, name) = self.search(q);
+        let name = name.to_ascii_uppercase();
+        for l in &libs {
+            if catalog::object_exists(self.client, std::slice::from_ref(l), &name, objtype).await? {
+                authority::check(self.client, &self.user, l, &name, objtype, aut).await?;
+                return Ok((l.clone(), name));
+            }
+        }
+        bail!("CPF9801: Object {name} type {objtype} not found.")
+    }
+
+    /// DSPPGM: a program's attributes, modules and bound service
+    /// programs (with the signatures they had when bound).
+    async fn dsppgm(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = self.ile_object(cmd.get("PGM"), "*PGM", Aut::Use).await?;
+        let p = catalog::find_program(self.client, std::slice::from_ref(&lib), &name)
+            .await?
+            .ok_or_else(|| anyhow!("CPF9801: Program {name} not found."))?;
+        let b = p.binding.clone().unwrap_or_default();
+        let ilerpg = matches!(p.attribute.as_str(), "RPGLE" | "SQLRPGLE" | "CLLE");
+        let group = {
+            let up = p.options.to_ascii_uppercase();
+            if !ilerpg {
+                "*DFTACTGRP (OPM program)".to_string()
+            } else if let Some(i) = up.find("ACTGRP(").filter(|_| up.contains("DFTACTGRP(*NO)")) {
+                up[i + 7..].split(')').next().unwrap_or("").to_string()
+            } else if up.contains("DFTACTGRP(*NO)") {
+                "QILE".to_string()
+            } else {
+                "*DFTACTGRP".to_string()
+            }
+        };
+        let mut rows = vec![format!(
+            "{:<10}  {:<10}  {:<10}  {}",
+            "Module", "Library", "Attribute", "Kind"
+        )];
+        let entry = if b.entry_module.is_empty() {
+            name.clone()
+        } else {
+            b.entry_module.clone()
+        };
+        rows.push(format!(
+            "{entry:<10}  {lib:<10}  {:<10}  entry module",
+            p.attribute
+        ));
+        for m in &b.modules {
+            rows.push(format!(
+                "{:<10}  {:<10}  {:<10}  bound module",
+                m.name, lib, "RPGLE"
+            ));
+        }
+        if !b.srvpgms.is_empty() {
+            rows.push(String::new());
+            rows.push(format!(
+                "{:<10}  {:<10}  Signature",
+                "Service program", "Library"
+            ));
+            for (l, n) in &b.srvpgms {
+                let sig = b
+                    .srv_signatures
+                    .get(&format!("{l}/{n}"))
+                    .cloned()
+                    .unwrap_or_default();
+                rows.push(format!("{n:<10}  {l:<10}  {sig}"));
+            }
+        }
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display Program Information".into(),
+            info: vec![
+                ("Program".into(), name.clone()),
+                ("Library".into(), lib.clone()),
+                ("Program attribute".into(), p.attribute.clone()),
+                (
+                    "Type of program".into(),
+                    if ilerpg { "ILE" } else { "OPM" }.into(),
+                ),
+                ("Activation group attribute".into(), group),
+            ],
+            heading: String::new(),
+            rows,
+            ..Default::default()
+        }))
+    }
+
+    /// DSPSRVPGM: a service program's activation group, signatures,
+    /// modules and exports.
+    async fn dspsrvpgm(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = self
+            .ile_object(cmd.get("SRVPGM"), "*SRVPGM", Aut::Use)
+            .await?;
+        let (_, b) =
+            crate::ile::find_srvpgm(self.client, &self.library_list(), &lib, &name).await?;
+        let mut rows = vec![format!("{:<10}  Kind", "Name")];
+        for m in &b.modules {
+            rows.push(format!("{:<10}  module", m.name));
+        }
+        for e in &b.exports {
+            rows.push(format!("{e:<10}  exported procedure"));
+        }
+        for (l, n) in &b.srvpgms {
+            rows.push(format!("{n:<10}  bound service program ({l})"));
+        }
+        let mut info = vec![
+            ("Service program".into(), name.clone()),
+            ("Library".into(), lib.clone()),
+            (
+                "Activation group attribute".into(),
+                if b.actgrp.is_empty() {
+                    "*CALLER".into()
+                } else {
+                    b.actgrp.clone()
+                },
+            ),
+            ("Current signature".into(), b.signature.clone()),
+        ];
+        for s in &b.prv_signatures {
+            info.push(("Previous signature".into(), s.clone()));
+        }
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display Service Program Information".into(),
+            info,
+            heading: String::new(),
+            rows,
+            ..Default::default()
+        }))
+    }
+
+    /// UPDPGM, UPDSRVPGM: replace modules of a program or service program
+    /// with the module objects as they are now, and bind it again (its
+    /// service programs' current signatures are taken). UPDSRVPGM
+    /// EXPORT(*SAME) keeps the exports and signature.
+    async fn updpgm(&mut self, cmd: &Command) -> Result<Outcome> {
+        let srv = cmd.def.name == "UPDSRVPGM";
+        let (objtype, param) = if srv {
+            ("*SRVPGM", "SRVPGM")
+        } else {
+            ("*PGM", "PGM")
+        };
+        let (lib, name) = self
+            .ile_object(cmd.get(param), objtype, Aut::Change)
+            .await?;
+        let mut libl = self.library_list();
+        if !libl.contains(&lib) {
+            libl.insert(0, lib.clone());
+        }
+        // MODULE(*NONE): no module replaced; the object is bound again.
+        let replace = if cmd.list("MODULE").iter().any(|m| m == "*NONE") {
+            Vec::new()
+        } else {
+            self.module_list(cmd, &lib, &name).await?
+        };
+        let (old, entry_source, options) = if srv {
+            let (_, b) = crate::ile::find_srvpgm(self.client, &libl, &lib, &name).await?;
+            (b, None, String::new())
+        } else {
+            let p = catalog::find_program(self.client, std::slice::from_ref(&lib), &name)
+                .await?
+                .ok_or_else(|| anyhow!("CPF9801: Program {name} not found."))?;
+            (
+                p.binding.clone().unwrap_or_default(),
+                Some(p.source.clone()),
+                p.options.clone(),
+            )
+        };
+        // The modules: the entry module (a program), then the others,
+        // replaced where named.
+        let mut modules: Vec<crate::ile::ModuleCopy> = Vec::new();
+        let entry_name = if old.entry_module.is_empty() {
+            name.clone()
+        } else {
+            old.entry_module.clone()
+        };
+        if let Some(src) = &entry_source {
+            let p = catalog::find_program(self.client, std::slice::from_ref(&lib), &name)
+                .await?
+                .ok_or_else(|| anyhow!("CPF9801: Program {name} not found."))?;
+            modules.push(crate::ile::ModuleCopy {
+                name: entry_name.clone(),
+                source: src.clone(),
+                options: String::new(),
+                attribute: if p.attribute == "CLLE" {
+                    "CLLE".into()
+                } else {
+                    "RPGLE".into()
+                },
+            });
+        }
+        modules.extend(old.modules.iter().cloned());
+        let mut updated = Vec::new();
+        for r in replace {
+            match modules.iter_mut().find(|m| m.name == r.name) {
+                Some(m) => {
+                    *m = r.clone();
+                    updated.push(r.name.clone());
+                }
+                None => bail!(
+                    "Module {} is not in {objtype} {name}; it cannot be replaced.",
+                    r.name
+                ),
+            }
+        }
+        let srvpgms = old.srvpgms.clone();
+        let (mut binding, infos) =
+            crate::ile::bind(self.client, &libl, modules.clone(), &srvpgms, &[])
+                .await
+                .map_err(|e| anyhow!("{objtype} {name} not updated. {e:#}"))?;
+        if srv {
+            let all: Vec<String> = infos.iter().flat_map(|i| i.exports.clone()).collect();
+            match cmd.get("EXPORT") {
+                "*ALL" => {
+                    binding.signature = crate::ile::generated_signature(&all);
+                    binding.exports = all;
+                    binding.prv_signatures = old.prv_signatures.clone();
+                }
+                "*SRCFILE" => {
+                    let (libs, file) = self.search(cmd.get("SRCFILE"));
+                    let member = match cmd.get("SRCMBR") {
+                        "*SRVPGM" => name.clone(),
+                        m => m.to_string(),
+                    };
+                    let src =
+                        crate::source::find_member(self.client, &libs, &file, &member).await?;
+                    let bs = crate::ile::binder_language(&src.source)?;
+                    for e in &bs.exports {
+                        if !all.contains(e) {
+                            bail!("CPD5D03: Symbol {e} named for export is not exported by any of the modules.");
+                        }
+                    }
+                    binding.signature = bs
+                        .signature
+                        .unwrap_or_else(|| crate::ile::generated_signature(&bs.exports));
+                    binding.exports = bs.exports;
+                    binding.prv_signatures = bs.previous;
+                }
+                _ => {
+                    for e in &old.exports {
+                        if !all.contains(e) {
+                            bail!("CPD5D03: Symbol {e} is exported by {name} but no module defines it any more.");
+                        }
+                    }
+                    binding.exports = old.exports.clone();
+                    binding.signature = old.signature.clone();
+                    binding.prv_signatures = old.prv_signatures.clone();
+                }
+            }
+            binding.actgrp = old.actgrp.clone();
+            let json = serde_json::to_string(&binding)?;
+            client_update_srvpgm(self.client, &lib, &name, &json).await?;
+        } else {
+            let entry = binding.modules.remove(0);
+            binding.entry_module = entry.name.clone();
+            let mut c = runtime::connect_db(&self.env.database_url).await?;
+            let p = catalog::find_program(self.client, std::slice::from_ref(&lib), &name)
+                .await?
+                .unwrap();
+            catalog::create_program(&mut c, &lib, &name, &p.attribute, "", &entry.source, true)
+                .await?;
+            catalog::set_program_options(self.client, &lib, &name, &options).await?;
+            crate::ile::set_program_binding(self.client, &lib, &name, Some(&binding)).await?;
+        }
+        Ok(Outcome::Messages(vec![format!(
+            "{} {name} in library {lib} updated{}.",
+            if srv { "Service program" } else { "Program" },
+            if updated.is_empty() {
+                String::new()
+            } else {
+                format!(" (modules {})", updated.join(", "))
+            }
+        )]))
+    }
+
     fn bind_lists(cmd: &Command) -> (Vec<(String, String)>, Vec<String>) {
         let srv = cmd
             .list("BNDSRVPGM")
@@ -573,7 +867,12 @@ impl Job<'_> {
         if !libl.contains(&lib) {
             libl.insert(0, lib.clone());
         }
-        crate::rpg::compile(self.client, &libl, &name, &m.source).await?;
+        let cl = cmd.def.name == "CRTCLMOD";
+        if cl {
+            crate::clpgm::compile(&name, &m.source)?;
+        } else {
+            crate::rpg::compile(self.client, &libl, &name, &m.source).await?;
+        }
         if cmd.get("REPLACE") == "*NO"
             && catalog::object_exists(self.client, std::slice::from_ref(&lib), &name, "*MODULE")
                 .await?
@@ -587,7 +886,14 @@ impl Job<'_> {
         };
         let mut c = runtime::connect_db(&self.env.database_url).await?;
         crate::ile::store(
-            &mut c, &lib, &name, "*MODULE", "RPGLE", &text, &m.source, "",
+            &mut c,
+            &lib,
+            &name,
+            "*MODULE",
+            if cl { "CLLE" } else { "RPGLE" },
+            &text,
+            &m.source,
+            "",
         )
         .await?;
         authority::set_owner(self.client, &lib, &name, "*MODULE", &self.user).await?;
@@ -614,8 +920,11 @@ impl Job<'_> {
             .await
             .map_err(not_created)?;
         let all: Vec<String> = infos.iter().flat_map(|i| i.exports.clone()).collect();
-        let (exports, signature) = if cmd.get("EXPORT") == "*ALL" {
-            (all.clone(), None)
+        let src = if cmd.get("EXPORT") == "*ALL" {
+            crate::ile::BinderSource {
+                exports: all.clone(),
+                ..Default::default()
+            }
         } else {
             let (libs, file) = self.search(cmd.get("SRCFILE"));
             let member = match cmd.get("SRCMBR") {
@@ -625,6 +934,13 @@ impl Job<'_> {
             let src = crate::source::find_member(self.client, &libs, &file, &member).await?;
             crate::ile::binder_language(&src.source).map_err(not_created)?
         };
+        let crate::ile::BinderSource {
+            exports,
+            signature,
+            previous,
+        } = src;
+        binding.prv_signatures = previous;
+        binding.actgrp = cmd.get("ACTGRP").to_ascii_uppercase();
         for e in &exports {
             if !all.contains(e) {
                 return Err(not_created(anyhow::anyhow!(
@@ -696,6 +1012,7 @@ impl Job<'_> {
             .map_err(not_created)?;
         let entry = modules[0].clone();
         binding.modules.retain(|m| m.name != entry.name);
+        binding.entry_module = entry.name.clone();
         if cmd.get("REPLACE") == "*NO"
             && catalog::object_exists(self.client, std::slice::from_ref(&lib), &name, "*PGM")
                 .await?
@@ -707,8 +1024,23 @@ impl Job<'_> {
             t => t.to_string(),
         };
         let mut c = runtime::connect_db(&self.env.database_url).await?;
-        catalog::create_program(&mut c, &lib, &name, "RPGLE", &text, &entry.source, true).await?;
-        catalog::set_program_options(self.client, &lib, &name, &entry.options).await?;
+        // A CL entry module makes a CL program.
+        let attr = if entry.attribute == "CLLE" {
+            "CLLE"
+        } else {
+            "RPGLE"
+        };
+        catalog::create_program(&mut c, &lib, &name, attr, &text, &entry.source, true).await?;
+        // ACTGRP(*ENTMOD): QILE for an RPG entry module (ILE Concepts,
+        // CRTPGM).
+        let actgrp = match cmd.get("ACTGRP").to_ascii_uppercase().as_str() {
+            "*ENTMOD" => "QILE".to_string(),
+            g => g.to_string(),
+        };
+        let options = format!("{} DFTACTGRP(*NO) ACTGRP({actgrp})", entry.options)
+            .trim()
+            .to_string();
+        catalog::set_program_options(self.client, &lib, &name, &options).await?;
         crate::ile::set_program_binding(self.client, &lib, &name, Some(&binding)).await?;
         authority::set_owner(self.client, &lib, &name, "*PGM", &self.user).await?;
         Ok(Outcome::Messages(vec![format!(
@@ -1182,12 +1514,19 @@ impl Job<'_> {
         }
         let mut binding: Option<crate::ile::Binding> = None;
         // Compile options from the command (CRTBNDRPG ALWNULL).
-        let options = match cmd.def.name {
+        let mut options = match cmd.def.name {
             "CRTBNDRPG" if cmd.get("ALWNULL") != "*NO" => {
                 format!("ALWNULL({})", cmd.get("ALWNULL"))
             }
             _ => String::new(),
         };
+        // CRTBNDRPG DFTACTGRP(*NO) ACTGRP(...): the activation group the
+        // program runs in (the source's control keywords win).
+        if cmd.def.name == "CRTBNDRPG" && cmd.get("DFTACTGRP") == "*NO" {
+            options = format!("{options} DFTACTGRP(*NO) ACTGRP({})", cmd.get("ACTGRP"))
+                .trim()
+                .to_string();
+        }
         // CL: includes are part of the program; then it is checked.
         let source = if attribute == "RPGLE" || attribute == "SQLRPGLE" || attribute == "RPG" {
             // The program is checked now, as the compiler does: syntax,
@@ -1200,7 +1539,7 @@ impl Job<'_> {
                 crate::rpg::compile_with(self.client, &libl, &name, &m.source, &options).await?;
             // Procedures the program calls that are elsewhere: bound from
             // the binding directories (BNDDIR, ctl-opt BNDDIR).
-            if !prog.imports.is_empty() {
+            if !prog.imports.is_empty() || !prog.data_imports.is_empty() {
                 let mut dirs: Vec<String> = cmd
                     .list("BNDDIR")
                     .into_iter()
@@ -1231,6 +1570,7 @@ impl Job<'_> {
                     name: name.clone(),
                     source: m.source.clone(),
                     options: options.clone(),
+                    attribute: attribute.to_string(),
                 };
                 let (mut b, _) = crate::ile::bind(self.client, &libl, vec![entry], &[], &dirs)
                     .await
@@ -2405,7 +2745,30 @@ impl Job<'_> {
                     .await?;
                 match p.attribute.as_str() {
                     "CLLE" | "CLP" => {
-                        let program = crate::clpgm::compile(&name, &p.source)?;
+                        let mut program = crate::clpgm::compile(&name, &p.source)?;
+                        // An ILE CL program bound to modules and service
+                        // programs: for CALLPRC.
+                        program.object = format!("{}/{}", p.library, name);
+                        program.binding = p.binding.clone();
+                        let up = p.options.to_ascii_uppercase();
+                        if let (true, Some(i)) = (
+                            up.contains("DFTACTGRP(*NO)"),
+                            up.find(" ACTGRP(")
+                                .or_else(|| up.find("ACTGRP(").filter(|i| *i == 0)),
+                        ) {
+                            let rest = &up[i..];
+                            let start = rest.find('(').unwrap_or(0) + 1;
+                            let g = rest[start..]
+                                .split(')')
+                                .next()
+                                .unwrap_or("QILE")
+                                .to_string();
+                            program.actgrp = if g == "*NEW" {
+                                format!("*NEW{}", std::process::id())
+                            } else {
+                                g
+                            };
+                        }
                         crate::clpgm::run(self, &program, &args).await
                     }
                     _ => self.call_rpg(&name, Some(&p.library), args).await,
@@ -2429,6 +2792,7 @@ impl Job<'_> {
             Some(lib) => catalog::find_program(self.client, &[lib.to_string()], pgm)
                 .await?
                 .map(|p| crate::rpg::ProgramCode {
+                    library: Some(p.library.clone()),
                     source: p.source,
                     options: p.options,
                     binding: p.binding,
@@ -2472,4 +2836,20 @@ fn number(s: &str, keyword: &str) -> Result<u32> {
     s.trim().parse().map_err(|_| {
         anyhow!("CPF0006: Errors occurred in command. {keyword} value '{s}' is not a number.")
     })
+}
+
+/// A service program's binding replaced (UPDSRVPGM).
+async fn client_update_srvpgm(
+    client: &tokio_postgres::Client,
+    lib: &str,
+    name: &str,
+    json: &str,
+) -> Result<()> {
+    client
+        .execute(
+            "UPDATE as4tainr.service_programs SET binding=$3 WHERE library=$1 AND name=$2",
+            &[&lib, &name, &json],
+        )
+        .await?;
+    Ok(())
 }

@@ -736,10 +736,10 @@ pub static COMMANDS: &[CommandDef] = &[
                 "ACTGRP",
                 Kind::Name,
                 false,
-                Some("QILE"),
+                Some("*STGMDL"),
                 "Activation group",
             )
-            .ch("Name, *CALLER, *NEW")
+            .ch("Name, *STGMDL, *CALLER, *NEW")
             .keyword_only(),
             p(
                 "ALWNULL",
@@ -767,6 +767,49 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*YES, *NO")
             .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CRTCLMOD",
+        description: "Create CL Module",
+        params: &[
+            p("MODULE", Kind::Qualified, true, None, "Module").ch("Name"),
+            p(
+                "SRCFILE",
+                Kind::Qualified,
+                false,
+                Some("QCLSRC"),
+                "Source file",
+            )
+            .ch("Name"),
+            p(
+                "SRCMBR",
+                Kind::Name,
+                false,
+                Some("*MODULE"),
+                "Source member",
+            )
+            .ch("Name, *MODULE"),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*SRCMBRTXT"),
+                "Text 'description'",
+            )
+            .keyword_only(),
+            p("REPLACE", Kind::Name, false, Some("*YES"), "Replace module")
+                .ch("*YES, *NO")
+                .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CALLPRC",
+        description: "Call Bound Procedure",
+        params: &[
+            p("PRC", Kind::Text, true, None, "Procedure").ch("Name"),
+            p("PARM", Kind::Text, false, None, "Parameters"),
+            p("RTNVAL", Kind::Text, false, Some("*NONE"), "Return value").ch("&variable, *NONE"),
         ],
     },
     CommandDef {
@@ -808,7 +851,7 @@ pub static COMMANDS: &[CommandDef] = &[
         description: "Create Service Program",
         params: &[
             p("SRVPGM", Kind::Qualified, true, None, "Service program").ch("Name"),
-            p("MODULE", Kind::List, false, Some("*SRVPGM"), "Module").ch("Name, *SRVPGM"),
+            p("MODULE", Kind::List, false, Some("*SRVPGM"), "Module").ch("Name, *SRVPGM, *NONE"),
             p("EXPORT", Kind::Name, false, Some("*SRCFILE"), "Export")
                 .ch("*SRCFILE, *ALL")
                 .keyword_only(),
@@ -982,6 +1025,58 @@ pub static COMMANDS: &[CommandDef] = &[
         name: "DLTBNDDIR",
         description: "Delete Binding Directory",
         params: &[p("BNDDIR", Kind::Qualified, true, None, "Binding directory").ch("Name")],
+    },
+    CommandDef {
+        name: "DSPPGM",
+        description: "Display Program",
+        params: &[p("PGM", Kind::Qualified, true, None, "Program").ch("Name")],
+    },
+    CommandDef {
+        name: "DSPSRVPGM",
+        description: "Display Service Program",
+        params: &[p("SRVPGM", Kind::Qualified, true, None, "Service program").ch("Name")],
+    },
+    CommandDef {
+        name: "UPDPGM",
+        description: "Update Program",
+        params: &[
+            p("PGM", Kind::Qualified, true, None, "Program").ch("Name"),
+            p("MODULE", Kind::List, false, Some("*PGM"), "Module").ch("Name, *PGM, *NONE"),
+        ],
+    },
+    CommandDef {
+        name: "UPDSRVPGM",
+        description: "Update Service Program",
+        params: &[
+            p("SRVPGM", Kind::Qualified, true, None, "Service program").ch("Name"),
+            p("MODULE", Kind::List, false, Some("*SRVPGM"), "Module").ch("Name, *SRVPGM"),
+            p("EXPORT", Kind::Name, false, Some("*SAME"), "Export")
+                .ch("*SAME, *SRCFILE, *ALL")
+                .keyword_only(),
+            p(
+                "SRCFILE",
+                Kind::Qualified,
+                false,
+                Some("QSRVSRC"),
+                "Export source file",
+            )
+            .ch("Name")
+            .keyword_only(),
+            p(
+                "SRCMBR",
+                Kind::Name,
+                false,
+                Some("*SRVPGM"),
+                "Export source member",
+            )
+            .ch("Name, *SRVPGM")
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "RCLRSC",
+        description: "Reclaim Resources",
+        params: &[p("LVL", Kind::Name, false, Some("*"), "Level").ch("*, *CALLER")],
     },
     CommandDef {
         name: "RCLACTGRP",
@@ -1213,7 +1308,7 @@ pub static GROUPS: &[Group] = &[
     Group {
         item: "Program commands",
         title: "Program Commands",
-        commands: &["CALL"],
+        commands: &["CALL", "CALLPRC"],
     },
     Group {
         item: "Job and message commands",
@@ -1246,6 +1341,7 @@ pub static GROUPS: &[Group] = &[
             "CRTCLPGM",
             "CRTBNDRPG",
             "CRTSQLRPGI",
+            "CRTCLMOD",
             "CRTRPGPGM",
             "CVTRPGSRC",
             "CVTRPGFREE",
@@ -1260,6 +1356,11 @@ pub static GROUPS: &[Group] = &[
             "DLTSRVPGM",
             "DLTBNDDIR",
             "RCLACTGRP",
+            "RCLRSC",
+            "DSPPGM",
+            "DSPSRVPGM",
+            "UPDPGM",
+            "UPDSRVPGM",
         ],
     },
     Group {

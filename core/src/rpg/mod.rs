@@ -196,6 +196,7 @@ pub async fn call(
         cl,
         name,
         ProgramCode {
+            library: None,
             source,
             options: String::new(),
             binding: None,
@@ -210,6 +211,8 @@ pub async fn call(
 /// directories).
 #[derive(Clone, Debug, Default)]
 pub struct ProgramCode {
+    /// The program object's library (None: a source not in a library).
+    pub library: Option<String>,
     pub source: String,
     pub options: String,
     pub binding: Option<crate::ile::Binding>,
@@ -229,6 +232,7 @@ pub async fn call_with(
     args: Vec<String>,
 ) -> Result<CallResult> {
     let ProgramCode {
+        library,
         source,
         options,
         binding,
@@ -256,6 +260,8 @@ pub async fn call_with(
             })
         });
         let prog = rt.block_on(compile_with(&client, &libl, &name, &source, &options))?;
+        // Called from CL: the caller is in the default activation group.
+        let actgrp = interp::program_group(&prog, crate::ile::DEFAULT_GROUP);
         let mut m = interp::Machine::new(
             &prog,
             interp::Io {
@@ -275,6 +281,13 @@ pub async fn call_with(
                 binding: binding.map(std::sync::Arc::new),
                 unit: None,
                 modules: Default::default(),
+                actgrp,
+                program: format!(
+                    "{}/{}",
+                    library.as_deref().unwrap_or("*NONE"),
+                    name.to_ascii_uppercase()
+                ),
+                shared: Default::default(),
             },
         );
         let r = m.run(&args);
@@ -283,6 +296,110 @@ pub async fn call_with(
             printed: std::mem::take(&mut m.printed),
             error: r.err(),
         })
+    })
+    .await?
+}
+
+/// CALLPRC from a CL procedure: an RPG procedure the CL program is bound
+/// to (a module bound into it, or a service program), with values;
+/// returns the parameters' values after the call and the return value.
+#[allow(clippy::too_many_arguments)]
+pub async fn call_procedure(
+    database_url: &str,
+    libl: Vec<String>,
+    user: String,
+    job: Option<String>,
+    program: String,
+    binding: crate::ile::Binding,
+    group: String,
+    sym: String,
+    args: Vec<data::Value>,
+) -> Result<(Vec<data::Value>, Option<data::Value>, Vec<String>)> {
+    use crate::ile::Target;
+    let rt = tokio::runtime::Handle::current();
+    let url = database_url.to_string();
+    tokio::task::spawn_blocking(move || {
+        let client = rt.block_on(crate::runtime::connect_db(&url))?;
+        let target = binding.imports.get(&sym).cloned().ok_or_else(|| {
+            anyhow!("CPD5D02: Procedure {sym} is not bound to program {program}.")
+        })?;
+        let (code, unit, b, group) = match &target {
+            Target::Module(m) => {
+                let code = binding
+                    .modules
+                    .iter()
+                    .find(|x| &x.name == m)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("module {m} is not bound into the program"))?;
+                (code, format!("{program}/MODULE {m}"), binding.clone(), group.clone())
+            }
+            Target::SrvPgm { library, name } => {
+                let (lib, sb) = rt.block_on(crate::ile::find_srvpgm(&client, &libl, library, name))?;
+                if let Some(sig) = binding.srv_signatures.get(&format!("{lib}/{name}")) {
+                    if *sig != sb.signature && !sb.prv_signatures.contains(sig) {
+                        anyhow::bail!("MCH4431: Program signature violation: service program {lib}/{name} no longer has the signature {sig} the caller was bound to.");
+                    }
+                }
+                let mut found = None;
+                for m in &sb.modules {
+                    let p = rt.block_on(compile_with(&client, &libl, &m.name, &m.source, &m.options))?;
+                    if p.procs.get(&sym).is_some_and(|pi| pi.export) {
+                        found = Some(m.clone());
+                        break;
+                    }
+                }
+                let code = found.ok_or_else(|| {
+                    anyhow!("CPD5D02: Service program {lib}/{name} does not export {sym}.")
+                })?;
+                let g = if sb.actgrp.is_empty() || sb.actgrp == "*CALLER" {
+                    group.clone()
+                } else {
+                    sb.actgrp.clone()
+                };
+                (code.clone(), format!("{lib}/{name}/{}", code.name), sb, g)
+            }
+        };
+        let prog = rt.block_on(compile_with(&client, &libl, &code.name, &code.source, &code.options))?;
+        let job_key = job
+            .clone()
+            .unwrap_or_else(|| format!("PID{}", std::process::id()));
+        let job_id = job.as_deref().and_then(|j| {
+            let mut parts = j.split('/');
+            Some(crate::jobs::JobId {
+                number: parts.next()?.parse().ok()?,
+                user: parts.next()?.to_string(),
+                name: parts.next()?.to_string(),
+            })
+        });
+        let mut m = interp::Machine::new(
+            &prog,
+            interp::Io {
+                rt: rt.clone(),
+                client: &client,
+                user,
+                job_number: job_id.as_ref().map(|j| j.number),
+                libl: libl.clone(),
+                job: job_id,
+                display: None,
+                cl: None,
+                callers: vec![],
+                database_url: url.clone(),
+                job_key: job_key.clone(),
+                binding: Some(std::sync::Arc::new(b)),
+                unit: Some(unit.clone()),
+                modules: Default::default(),
+                actgrp: group.clone(),
+                program: format!("*BOUND/{}", code.name),
+                shared: Default::default(),
+            },
+        );
+        if let Some(s) = crate::ile::activation(&job_key, &group, &unit) {
+            m.set_storage(s);
+        }
+        let globals = prog.globals.len();
+        let (back, ret) = m.call_exported(&sym, args)?;
+        crate::ile::keep_activation(&job_key, &group, &unit, m.storage(globals));
+        Ok((back, ret, std::mem::take(&mut m.messages)))
     })
     .await?
 }

@@ -297,12 +297,16 @@ impl Machine<'_> {
             .iter()
             .copied()
             .find(|&i| prog.files[i].decl.designation == 'P');
-        if let Some(inz) = prog.routines.subroutines.get("*INZSR") {
-            self.run_code(inz)?;
+        // Initialization and first-cycle output: not when the program is
+        // called again while still active.
+        if !self.reactivated {
+            if let Some(inz) = prog.routines.subroutines.get("*INZSR") {
+                self.run_code(inz)?;
+            }
+            self.set_ind("1P", true);
+            self.output(&['H', 'D'])?;
+            self.set_ind("1P", false);
         }
-        self.set_ind("1P", true);
-        self.output(&['H', 'D'])?;
-        self.set_ind("1P", false);
         let mut data_seen = false;
         let mut passes = 0u64;
         let uses_matching = cycle_files.iter().any(|&i| {

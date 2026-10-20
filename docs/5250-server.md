@@ -168,7 +168,11 @@ DSPLIB:
 | `CRTPGM PGM(LIB/NAME) MODULE(...) ENTMOD BNDSRVPGM BNDDIR` | Binds modules and service programs into a program. |
 | `CRTBNDDIR`, `ADDBNDDIRE`, `RMVBNDDIRE`, `DSPBNDDIR` | Binding directories: lists of modules and service programs searched for imports by CRTPGM, CRTSRVPGM and CRTBNDRPG (`BNDDIR`, or `ctl-opt bnddir`). |
 | `DLTMOD`, `DLTSRVPGM`, `DLTBNDDIR` | Delete ILE objects. |
-| `RCLACTGRP ACTGRP(*ELIGIBLE\|name)` | Ends the job's service program activations: their storage starts over at the next call. |
+| `RCLACTGRP ACTGRP(*ELIGIBLE\|name)` | Ends an activation group of the job (*ELIGIBLE: all but the default one): its service programs and the programs active in it start over at their next call. |
+| `RCLRSC` | Ends the programs of the default activation group that are still active (they ended without LR). |
+| `DSPPGM PGM(LIB/NAME)`, `DSPSRVPGM SRVPGM(LIB/NAME)` | Show a program's or service program's modules, bound service programs, signatures and activation group. |
+| `UPDPGM PGM(LIB/NAME) MODULE(names\|*NONE)`, `UPDSRVPGM` | Replace modules and bind again (taking the service programs' current signatures). |
+| `CRTCLMOD MODULE(LIB/NAME)` | Creates a CL module (QCLSRC); bound by CRTPGM, it calls RPG procedures with CALLPRC. |
 | `DSPPFM FILE(lib/name)` | Shows a physical file's records in arrival order, one line each with the field names above. F19/F20 shift left/right on wide files. |
 
 Keyword and positional forms both work (`CRTLIB MYLIB` = `CRTLIB LIB(MYLIB)`). Unquoted values are folded to upper case; quoted values keep their case, with `''` for an apostrophe.

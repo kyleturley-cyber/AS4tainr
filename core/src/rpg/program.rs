@@ -235,6 +235,11 @@ pub struct Program {
     pub sequence: HashMap<String, char>,
     /// Varying-dimension arrays: 'A' DIM(*AUTO:n), 'V' DIM(*VAR:n).
     pub varying: HashMap<String, char>,
+    /// Exported data (EXPORT on a field or data structure): (symbol,
+    /// program name).
+    pub data_exports: Vec<(String, String)>,
+    /// Imported data (IMPORT): (symbol, program name).
+    pub data_imports: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1788,7 +1793,30 @@ pub fn bind(
             }
         })
         .collect();
+    // EXPORT and IMPORT on definitions (ILE RPG Reference): data shared
+    // between the modules of a program and its service programs, by
+    // symbol (the keyword's name, or the definition's).
+    let shared = |k: &str| -> Vec<(String, String)> {
+        src.defs
+            .iter()
+            .filter(|d| matches!(d.kind, DefKind::Field | DefKind::Ds))
+            .filter_map(|d| {
+                let kw = keyword(&d.keywords, k)?;
+                let sym = kw
+                    .args
+                    .first()
+                    .map(|a| a.trim().trim_matches('\'').to_ascii_uppercase())
+                    .filter(|a| !a.is_empty())
+                    .unwrap_or_else(|| d.name.clone());
+                Some((sym, d.name.clone()))
+            })
+            .collect()
+    };
+    let data_exports = shared("EXPORT");
+    let data_imports = shared("IMPORT");
     Ok(Program {
+        data_exports,
+        data_imports,
         varying,
         sequence,
         occurs: b.occurs.clone(),

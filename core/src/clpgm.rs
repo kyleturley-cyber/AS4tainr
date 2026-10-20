@@ -875,6 +875,33 @@ pub struct Program {
     labels: HashMap<String, usize>,
     /// Program-level MONMSG: (IDs, EXEC start).
     global: Vec<(Vec<String>, usize)>,
+    /// An ILE CL program bound to modules and service programs (CRTPGM):
+    /// how, its object (LIB/NAME) and its activation group — for
+    /// CALLPRC.
+    pub binding: Option<crate::ile::Binding>,
+    pub object: String,
+    pub actgrp: String,
+}
+
+impl Program {
+    /// The procedures the program calls with CALLPRC (named by a literal).
+    pub fn called_procedures(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for ins in &self.code {
+            if let Ins::Cmd { st, .. } = ins {
+                if st.name == "CALLPRC" {
+                    if let Ok(p) = named(st, &["PRC", "PARM", "RTNVAL"]) {
+                        if let Some(prc) = p.get("PRC") {
+                            out.push(prc.trim().trim_matches('\'').to_ascii_uppercase());
+                        }
+                    }
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
 }
 
 fn is_msgid(s: &str) -> bool {
@@ -1468,6 +1495,9 @@ pub fn compile(name: &str, source: &str) -> Result<Program> {
         labels: c.labels,
         code: c.code,
         global,
+        binding: None,
+        object: String::new(),
+        actgrp: crate::ile::DEFAULT_GROUP.into(),
     })
 }
 
@@ -1593,7 +1623,7 @@ pub async fn run(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Result<Ou
                 pc += 1;
             }
             Ins::Cmd { st, monitors } => {
-                let result = command(job, st, &mut vars, &mut msgs).await;
+                let result = command(job, pgm, st, &mut vars, &mut msgs).await;
                 match result {
                     Ok(Some(o)) => return Ok(o),
                     Ok(None) => pc += 1,
@@ -1627,6 +1657,7 @@ pub async fn run(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Result<Ou
 /// Run one command of a program. Ok(Some(..)) ends the program (SIGNOFF).
 async fn command(
     job: &mut Job<'_>,
+    pgm: &Program,
     st: &Statement,
     vars: &mut HashMap<String, Var>,
     msgs: &mut Vec<String>,
@@ -1782,6 +1813,91 @@ async fn command(
                 ),
             };
             assign(&target, var, v)?;
+            Ok(None)
+        }
+        // CALLPRC (ILE CL): a bound procedure, parameters by reference
+        // (*BYVAL: by value), RTNVAL its return value.
+        "CALLPRC" => {
+            let p = named(st, &["PRC", "PARM", "RTNVAL"])?;
+            let prc = p
+                .get("PRC")
+                .ok_or_else(|| anyhow!("line {}: CALLPRC needs PRC", st.line))?
+                .trim()
+                .trim_matches('\'')
+                .to_ascii_uppercase();
+            let binding = pgm.binding.clone().ok_or_else(|| {
+                anyhow!("CPD5D02: Procedure {prc} is not bound to program {} (create it with CRTCLMOD and CRTPGM).", pgm.name)
+            })?;
+            let mut args = Vec::new();
+            let mut targets = Vec::new();
+            if let Some(parm) = p.get("PARM") {
+                for tok in split_params(parm)? {
+                    let text = tok
+                        .value
+                        .trim()
+                        .trim_start_matches('(')
+                        .trim_end_matches(')')
+                        .to_string();
+                    let mut words = text.split_whitespace();
+                    let v = words.next().unwrap_or("").to_string();
+                    let byval = words.any(|w| w.eq_ignore_ascii_case("*BYVAL"));
+                    let val = eval(&parse_expr(&v)?, vars)?;
+                    args.push(match val {
+                        Value::Dec(d) => crate::rpg::data::Value::Num(crate::rpg::dec::Dec::parse(
+                            &dec_text(&d),
+                        )?),
+                        Value::Lgl(b) => crate::rpg::data::Value::str(if b { "1" } else { "0" }),
+                        Value::Char(s) => crate::rpg::data::Value::str(&s),
+                    });
+                    targets.push((v.starts_with('&') && !byval).then(|| v.to_ascii_uppercase()));
+                }
+            }
+            let job_name = job.id.as_ref().map(|i| i.to_string());
+            let (back, ret, messages) = crate::rpg::call_procedure(
+                &job.env.database_url,
+                job.library_list(),
+                job.user.clone(),
+                job_name,
+                pgm.object.clone(),
+                binding,
+                pgm.actgrp.clone(),
+                prc,
+                args,
+            )
+            .await?;
+            msgs.extend(messages);
+            let to_cl = |v: crate::rpg::data::Value, var: &Var| -> Result<Value> {
+                Ok(match v {
+                    crate::rpg::data::Value::Num(d) => {
+                        Value::Dec(Decimal::from_str(&d.to_string()).map_err(|e| anyhow!("{e}"))?)
+                    }
+                    crate::rpg::data::Value::Ind(b) => Value::Lgl(b),
+                    other => {
+                        let s = crate::rpg::data::a(&other.chars()?);
+                        if var.ty == VarType::Lgl {
+                            Value::Lgl(s.starts_with('1'))
+                        } else {
+                            Value::Char(s)
+                        }
+                    }
+                })
+            };
+            for (t, v) in targets.into_iter().zip(back) {
+                if let Some(name) = t {
+                    if let Some(var) = vars.get_mut(&name) {
+                        let cv = to_cl(v, var)?;
+                        assign(&name, var, cv)?;
+                    }
+                }
+            }
+            if let (Some(r), Some(v)) = (p.get("RTNVAL"), ret) {
+                let name = r.trim().to_ascii_uppercase();
+                let var = vars
+                    .get_mut(&name)
+                    .ok_or_else(|| anyhow!("CPD0727: Variable {name} is not declared."))?;
+                let cv = to_cl(v, var)?;
+                assign(&name, var, cv)?;
+            }
             Ok(None)
         }
         "CALL" => {

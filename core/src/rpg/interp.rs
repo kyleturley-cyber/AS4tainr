@@ -57,6 +57,90 @@ pub struct Io<'a> {
     /// The storage of the other modules of the running program, shared by
     /// the calls into them while it runs.
     pub modules: ModuleStorage,
+    /// The activation group the program runs in (ILE Concepts,
+    /// "Activation groups"): *DFTACTGRP, a name, or *NEWn.
+    pub actgrp: String,
+    /// The program object running: LIB/NAME.
+    pub program: String,
+    /// Exported data (EXPORT/IMPORT) of the program's modules and service
+    /// programs, by symbol.
+    pub shared: SharedData,
+}
+
+/// Exported data by symbol: the bytes of the exporting definition.
+pub type SharedData = std::sync::Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>;
+
+/// A program that ended without LR (ILE RPG Reference, "Program
+/// termination"): what its next call in the activation group finds — its
+/// storage, indicators, open files and the storage of its bound modules.
+struct Active {
+    bufs: Vec<Vec<u8>>,
+    inds: HashMap<String, bool>,
+    files: Vec<Option<OpenFile>>,
+    modules: HashMap<String, Vec<Vec<u8>>>,
+    occur: HashMap<usize, (usize, u32, u32)>,
+    table_cur: HashMap<String, i128>,
+    var_elems: HashMap<String, u32>,
+    shared: HashMap<String, Vec<u8>>,
+}
+
+/// Programs active in each job's activation groups: (job, group,
+/// program) → its state.
+type ActivePrograms = HashMap<(String, String, String), Active>;
+
+static PROGRAMS: std::sync::Mutex<Option<ActivePrograms>> = std::sync::Mutex::new(None);
+
+/// RCLACTGRP, RCLRSC, the end of a job: the programs active in those
+/// activation groups end (their files close; the next call starts them
+/// anew). The number ended.
+pub fn end_programs(job: &str, groups: &crate::ile::Groups) -> usize {
+    let mut n = 0;
+    if let Ok(mut g) = PROGRAMS.lock() {
+        if let Some(m) = g.as_mut() {
+            let before = m.len();
+            m.retain(|(j, grp, _), _| !(j == job && groups.covers(grp)));
+            n = before - m.len();
+        }
+    }
+    n
+}
+
+/// Whether a program is active (ended without LR) in a job.
+pub fn program_active(job: &str, group: &str, program: &str) -> bool {
+    PROGRAMS
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref()
+                .map(|m| m.contains_key(&(job.into(), group.into(), program.into())))
+        })
+        .unwrap_or(false)
+}
+
+/// The activation group a program runs in (ILE RPG Reference, DFTACTGRP
+/// and ACTGRP keywords; CRTBNDRPG, CRTPGM): DFTACTGRP(*YES), the
+/// default for a program without ACTGRP or BNDDIR, is the default
+/// activation group; ACTGRP(*CALLER) the caller's; *NEW a new one each
+/// call; *STGMDL (the default with DFTACTGRP(*NO)) QILE.
+pub fn program_group(prog: &Program, caller: &str) -> String {
+    let ctl = |k: &str| keyword(&prog.control, k).and_then(|k| k.args.first().cloned());
+    let dft = ctl("DFTACTGRP").map(|a| a.trim().eq_ignore_ascii_case("*YES"));
+    let actgrp = ctl("ACTGRP").map(|a| a.trim().trim_matches('\'').to_ascii_uppercase());
+    let bnddir = keyword(&prog.control, "BNDDIR").is_some();
+    match (dft, actgrp) {
+        (Some(true), _) => crate::ile::DEFAULT_GROUP.into(),
+        (None, None) if !bnddir => crate::ile::DEFAULT_GROUP.into(),
+        (_, Some(a)) if a == "*CALLER" => caller.into(),
+        (_, Some(a)) if a == "*NEW" => {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            format!(
+                "*NEW{}",
+                N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            )
+        }
+        (_, Some(a)) if a != "*STGMDL" && a != "*ENTMOD" => a,
+        _ => "QILE".into(),
+    }
 }
 
 /// Global storage of bound modules, by module.
@@ -170,6 +254,9 @@ pub struct Machine<'a> {
     /// running.
     io_ds: Option<String>,
     io_fields: Option<Vec<String>>,
+    /// Called again while still active (it ended without LR): no
+    /// initialization (*INZSR, first-cycle output) this time.
+    reactivated: bool,
 }
 
 /// One procedure call: its local storage starts at `base` in the
@@ -280,6 +367,7 @@ impl<'a> Machine<'a> {
             each: HashMap::new(),
             io_ds: None,
             io_fields: None,
+            reactivated: false,
         }
     }
 
@@ -2587,12 +2675,53 @@ impl<'a> Machine<'a> {
     /// another program): each is the bytes of the caller's variable, and
     /// gets the parameter's value back when the program ends.
     pub fn run_bytes(&mut self, parms: &mut [Vec<u8>]) -> Result<()> {
-        for i in 0..self.prog.files.len() {
-            if keyword(&self.prog.files[i].decl.keywords, "USROPN").is_none() {
-                self.open_file(i)?;
+        // Still active in its activation group (it ended without LR): its
+        // storage, indicators and files as it left them.
+        let key = (
+            self.io.job_key.clone(),
+            self.io.actgrp.clone(),
+            self.io.program.clone(),
+        );
+        let active = PROGRAMS
+            .lock()
+            .ok()
+            .and_then(|mut g| g.as_mut().and_then(|m| m.remove(&key)));
+        match active {
+            Some(a) if a.bufs.len() == self.prog.globals.len() => {
+                self.bufs = a.bufs;
+                self.inds = a.inds;
+                for (f, o) in self.files.iter_mut().zip(a.files) {
+                    f.open = o;
+                }
+                if let Ok(mut m) = self.io.modules.lock() {
+                    m.extend(a.modules);
+                }
+                self.occur = a.occur;
+                self.table_cur = a.table_cur;
+                self.var_elems = a.var_elems;
+                if let Ok(mut s) = self.io.shared.lock() {
+                    s.extend(a.shared);
+                }
+                self.reactivated = true;
+                // RT or RETURN ended it: the next cycle starts afresh.
+                self.set_ind("RT", false);
+            }
+            _ => {
+                for i in 0..self.prog.files.len() {
+                    if keyword(&self.prog.files[i].decl.keywords, "USROPN").is_none() {
+                        self.open_file(i)?;
+                    }
+                }
             }
         }
         self.parms_passed = parms.len();
+        // Exported data: the bound modules' initial values, then this
+        // module's view of it.
+        if !self.reactivated {
+            self.seed_bound_modules()?;
+        }
+        self.share_seed();
+        self.share_in();
         let prog = self.prog;
         let r = match &prog.main {
             // ctl-opt main: the main procedure, with no cycle.
@@ -2633,10 +2762,52 @@ impl<'a> Machine<'a> {
                 r
             }
         };
+        self.share_out();
         let closed = self.close_printers();
         for f in self.files.iter_mut() {
-            if let Some(mut o) = f.open.take() {
+            if let Some(o) = f.open.as_mut() {
                 let _ = self.io.rt.block_on(o.release(self.io.client));
+            }
+        }
+        // Ended without LR (a cycle program by RETURN or RT; a program
+        // with a linear main procedure always): the program stays active
+        // in its activation group, its files open, until the group ends.
+        // An activation group *NEW ends with the program.
+        // (A source run outside a library, by `as4tainr call` or the
+        // tests, is not a program object: nothing stays active.)
+        let keep = r.is_ok()
+            && (prog.main.is_some() || !self.ind("LR"))
+            && !self.io.actgrp.starts_with("*NEW")
+            && !self.io.program.starts_with("*NONE/");
+        if self.io.actgrp.starts_with("*NEW") {
+            crate::ile::end_activations(
+                &self.io.job_key,
+                &crate::ile::Groups::Named(&self.io.actgrp),
+            );
+        }
+        if keep {
+            let globals = self.prog.globals.len();
+            let a = Active {
+                bufs: self.bufs[..globals].to_vec(),
+                inds: self.inds.clone(),
+                files: self.files.iter_mut().map(|f| f.open.take()).collect(),
+                modules: self
+                    .io
+                    .modules
+                    .lock()
+                    .map(|m| m.clone())
+                    .unwrap_or_default(),
+                occur: self.occur.clone(),
+                table_cur: self.table_cur.clone(),
+                var_elems: self.var_elems.clone(),
+                shared: self.io.shared.lock().map(|s| s.clone()).unwrap_or_default(),
+            };
+            if let Ok(mut g) = PROGRAMS.lock() {
+                g.get_or_insert_with(HashMap::new).insert(key, a);
+            }
+        } else {
+            for f in self.files.iter_mut() {
+                f.open = None;
             }
         }
         r?;
@@ -3090,6 +3261,20 @@ impl<'a> Machine<'a> {
             }
             Target::SrvPgm { library, name } => {
                 let (lib, b) = self.block(crate::ile::find_srvpgm(client, &libl, library, name))?;
+                // Signature checking (ILE Concepts, "Service program
+                // activation"): the service program must still have the
+                // signature it had when the caller was bound, as its
+                // current or a previous (*PRV) signature.
+                let bound_sig = self
+                    .io
+                    .binding
+                    .as_ref()
+                    .and_then(|x| x.srv_signatures.get(&format!("{lib}/{name}")).cloned());
+                if let Some(sig) = bound_sig {
+                    if sig != b.signature && !b.prv_signatures.contains(&sig) {
+                        bail!("MCH4431: Program signature violation: service program {lib}/{name} no longer has the signature {sig} the caller was bound to; bind the caller again (CRTPGM, UPDPGM).");
+                    }
+                }
                 self.block(crate::authority::check(
                     client,
                     &self.io.user,
@@ -3129,9 +3314,16 @@ impl<'a> Machine<'a> {
             .filter(|pi| pi.export)
             .ok_or_else(|| anyhow!("CPD5D02: Module {} does not export {sym}.", code.name))?;
         let srvpgm = matches!(target, Target::SrvPgm { .. });
+        // A service program runs in its activation group: the caller's
+        // (*CALLER) or the one it names.
+        let group = if srvpgm && !binding.actgrp.is_empty() && binding.actgrp != "*CALLER" {
+            binding.actgrp.clone()
+        } else {
+            self.io.actgrp.clone()
+        };
         // The module's global storage: its activation, or its first use.
         let storage = if srvpgm {
-            crate::ile::activation(&self.io.job_key, &unit)
+            crate::ile::activation(&self.io.job_key, &group, &unit)
         } else {
             self.io
                 .modules
@@ -3160,11 +3352,19 @@ impl<'a> Machine<'a> {
                 } else {
                     self.io.modules.clone()
                 },
+                actgrp: group.clone(),
+                program: format!("*BOUND/{}", code.name),
+                shared: self.io.shared.clone(),
             },
         );
         if let Some(s) = storage {
             m.bufs = s;
         }
+        // Exported data: the caller's changes go to the shared copy, the
+        // callee sees them.
+        self.share_out();
+        m.share_seed();
+        m.share_in();
         let globals = m.bufs.len();
         // Parameters by reference: the callee works on a copy that comes
         // back when it returns.
@@ -3188,6 +3388,8 @@ impl<'a> Machine<'a> {
             })
             .collect();
         let r = m.call_proc(pi, args);
+        m.share_out();
+        self.share_in();
         self.messages.append(&mut m.messages);
         self.printed.append(&mut m.printed);
         for (idx, l) in &back {
@@ -3196,7 +3398,7 @@ impl<'a> Machine<'a> {
         }
         let kept: Vec<Vec<u8>> = m.bufs[..globals].to_vec();
         if srvpgm {
-            crate::ile::keep_activation(&self.io.job_key, &unit, kept);
+            crate::ile::keep_activation(&self.io.job_key, &group, &unit, kept);
         } else if let Ok(mut g) = self.io.modules.lock() {
             g.insert(unit, kept);
         }
@@ -3300,6 +3502,77 @@ impl<'a> Machine<'a> {
     /// list, or a program source in AS4TAINR_PGM_PATH. Parameters are
     /// passed by reference: the callee works on copies that come back
     /// when it returns.
+    /// The module's global storage (kept in its activation).
+    pub fn storage(&self, globals: usize) -> Vec<Vec<u8>> {
+        self.bufs[..globals].to_vec()
+    }
+
+    /// The module's global storage as its activation left it.
+    pub fn set_storage(&mut self, s: Vec<Vec<u8>>) {
+        self.bufs = s;
+    }
+
+    /// Call an exported procedure of this module with values (CALLPRC
+    /// from a CL procedure): parameters passed by reference come back with
+    /// what the procedure left in them; the return value.
+    pub fn call_exported(
+        &mut self,
+        sym: &str,
+        args: Vec<Value>,
+    ) -> Result<(Vec<Value>, Option<Value>)> {
+        let prog: &'a Program = self.prog;
+        let pi = prog
+            .procs
+            .get(sym)
+            .filter(|p| p.export)
+            .ok_or_else(|| anyhow!("CPD5D02: Module {} does not export {sym}.", prog.name))?;
+        if args.len() > pi.params.len() {
+            bail!(
+                "CPF0001: Procedure {sym} takes {} parameters, {} were passed.",
+                pi.params.len(),
+                args.len()
+            );
+        }
+        let base = self.bufs.len();
+        let mut call_args = Vec::new();
+        let mut refs = Vec::new();
+        for (v, p) in args.iter().zip(&pi.params) {
+            if p.by_value || p.konst {
+                call_args.push(Arg::Val(v.clone()));
+                refs.push(None);
+            } else {
+                let mut b = p.dtype.initial();
+                data::store(
+                    &p.dtype,
+                    v,
+                    &mut b,
+                    Fit::Strict { half_adjust: false },
+                    false,
+                )?;
+                let idx = self.bufs.len();
+                let size = b.len();
+                self.bufs.push(b);
+                call_args.push(Arg::Ref(Loc {
+                    buf: idx,
+                    off: 0,
+                    size,
+                    dtype: p.dtype,
+                }));
+                refs.push(Some(idx));
+            }
+        }
+        let r = self.call_proc(pi, call_args);
+        let mut back = Vec::new();
+        for ((r_idx, p), v) in refs.iter().zip(&pi.params).zip(&args) {
+            back.push(match r_idx {
+                Some(idx) => data::load(&p.dtype, &self.bufs[*idx])?,
+                None => v.clone(),
+            });
+        }
+        self.bufs.truncate(base);
+        Ok((back, r?))
+    }
+
     fn call_program(&mut self, name: &str, locs: &[Loc]) -> Result<()> {
         if self.system_program(name, locs)? {
             return Ok(());
@@ -3312,6 +3585,10 @@ impl<'a> Machine<'a> {
         let client = self.io.client;
         let libl = self.io.libl.clone();
         let found = self.block(crate::catalog::find_program(client, &libl, name))?;
+        let program_lib = found
+            .as_ref()
+            .map(|p| p.library.clone())
+            .unwrap_or_else(|| "*NONE".into());
         let source = match found {
             Some(p)
                 if p.attribute == "RPGLE" || p.attribute == "SQLRPGLE" || p.attribute == "RPG" =>
@@ -3357,6 +3634,7 @@ impl<'a> Machine<'a> {
         };
         let (source, options, binding) = source;
         let callee = self.block(super::compile_with(client, &libl, name, &source, &options))?;
+        let group = program_group(&callee, &self.io.actgrp);
         let mut parms: Vec<Vec<u8>> = locs
             .iter()
             .map(|l| self.bufs[l.buf][l.off..l.off + l.size].to_vec())
@@ -3383,6 +3661,9 @@ impl<'a> Machine<'a> {
                     binding: binding.map(std::sync::Arc::new),
                     unit: None,
                     modules: Default::default(),
+                    actgrp: group,
+                    program: format!("{}/{name}", program_lib),
+                    shared: Default::default(),
                 },
             );
             let r = m.run_bytes(&mut parms);

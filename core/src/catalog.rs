@@ -74,6 +74,10 @@ BEGIN
     ALTER TABLE as4tainr.file_keys ADD COLUMN descending boolean NOT NULL DEFAULT false;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='file_fields' AND column_name='flt_double') THEN
+    ALTER TABLE as4tainr.file_fields ADD COLUMN IF NOT EXISTS flt_double boolean NOT NULL DEFAULT false;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
                  WHERE table_schema='as4tainr' AND table_name='file_fields' AND column_name='identity') THEN
     ALTER TABLE as4tainr.file_fields ADD COLUMN IF NOT EXISTS identity text;
   END IF;
@@ -593,29 +597,7 @@ pub async fn create_physical_file(
     )
     .await?;
     for (i, f) in pf.fields.iter().enumerate() {
-        let seq = i as i32;
-        let len = f.length as i32;
-        let dec = f.decimals as i32;
-        tx.execute(
-            "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
-            &[
-                &lib,
-                &name,
-                &seq,
-                &f.name,
-                &f.data_type.code(),
-                &len,
-                &dec,
-                &f.text,
-                &f.varlen,
-                &f.null_capable,
-                &f.default.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
-                &f.alias,
-                &f.identity.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
-            ],
-        )
-        .await?;
+        insert_field(&tx, &lib, &name, i as i32, f).await?;
     }
     for (i, k) in pf.keys.iter().enumerate() {
         let seq = i as i32;
@@ -959,27 +941,7 @@ pub async fn create_logical_file(
     )
     .await?;
     for (i, f) in fields.iter().enumerate() {
-        let (seq, len, dec) = (i as i32, f.length as i32, f.decimals as i32);
-        tx.execute(
-            "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
-            &[
-                &lib,
-                &name,
-                &seq,
-                &f.name,
-                &f.data_type.code(),
-                &len,
-                &dec,
-                &f.text,
-                &f.varlen,
-                &f.null_capable,
-                &f.default.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
-                &f.alias,
-                &f.identity.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
-            ],
-        )
-        .await?;
+        insert_field(&tx, &lib, &name, i as i32, f).await?;
     }
     for (i, k) in lf.keys.iter().enumerate() {
         let (seq, desc) = (i as i32, lf.descending.contains(k));
@@ -1077,7 +1039,7 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
         let Some(row) = row else { continue };
         let fields = client
             .query(
-                "SELECT name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity FROM as4tainr.file_fields
+                "SELECT name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity, flt_double FROM as4tainr.file_fields
                  WHERE library=$1 AND file=$2 ORDER BY seq",
                 &[lib, &name],
             )
@@ -1099,6 +1061,7 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
                     identity: r
                         .get::<_, Option<&str>>(9)
                         .and_then(|d| serde_json::from_str(d).ok()),
+                    double: r.get(10),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1473,6 +1436,9 @@ pub async fn register_view(
                 scale.unwrap_or(0) as u32,
                 false,
             ),
+            "real" => (DataType::Float, 9, 0, false),
+            "double precision" => (DataType::Float, 17, 0, false),
+            "bytea" => (DataType::Hex, 32740, 0, true),
             "date" => (DataType::Date, 10, 0, false),
             "time without time zone" => (DataType::Time, 8, 0, false),
             "timestamp without time zone" => (DataType::Timestamp, 26, 0, false),
@@ -1494,6 +1460,7 @@ pub async fn register_view(
         };
         let mut f = FieldDef::new(&sys, t, l, d);
         f.varlen = varlen;
+        f.double = t == DataType::Float && l > 9;
         f.null_capable = true;
         f.alias = alias;
         fields.push(f);
@@ -1511,13 +1478,7 @@ pub async fn register_view(
     )
     .await?;
     for (i, f) in fields.iter().enumerate() {
-        let (seq, len, dec) = (i as i32, f.length as i32, f.decimals as i32);
-        tx.execute(
-            "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,'',$8,$9,NULL,$10)",
-            &[&lib, &name, &seq, &f.name, &f.data_type.code(), &len, &dec, &f.varlen, &f.null_capable, &f.alias],
-        )
-        .await?;
+        insert_field(&tx, &lib, &name, i as i32, f).await?;
     }
     tx.commit().await?;
     Ok(())
@@ -1579,4 +1540,36 @@ pub async fn views_over(
     let v = sql_views_over(&tx, library, name).await?;
     tx.commit().await?;
     Ok(v)
+}
+
+/// Describe one field of a file in the catalog.
+pub async fn insert_field(
+    c: &impl tokio_postgres::GenericClient,
+    library: &str,
+    file: &str,
+    seq: i32,
+    f: &FieldDef,
+) -> Result<()> {
+    c.execute(
+        "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity, flt_double)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+        &[
+            &library,
+            &file,
+            &seq,
+            &f.name,
+            &f.data_type.code(),
+            &(f.length as i32),
+            &(f.decimals as i32),
+            &f.text,
+            &f.varlen,
+            &f.null_capable,
+            &f.default.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
+            &f.alias,
+            &f.identity.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
+            &f.double,
+        ],
+    )
+    .await?;
+    Ok(())
 }

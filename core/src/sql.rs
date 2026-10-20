@@ -254,6 +254,20 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
     if toks.iter().any(|t| matches!(t, Tok::Punct(p) if p == ";")) {
         bail!("SQL0104: Only one statement can be run at a time.");
     }
+    // Binary string constants BX'C1C2' and hexadecimal constants X'C1C2':
+    // bytes, as PostgreSQL bytea constants.
+    let mut i = 0;
+    while i + 1 < toks.len() {
+        let hex = matches!(&toks[i], Tok::Word(w) if w.eq_ignore_ascii_case("BX") || w.eq_ignore_ascii_case("X"));
+        if let (true, Tok::Str(h)) = (hex, &toks[i + 1]) {
+            if h.len() % 2 != 0 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+                bail!("SQL0110: {h} is not a valid hexadecimal constant.");
+            }
+            let lit = format!("'\\x{h}'::bytea");
+            toks.splice(i..i + 2, [Tok::Punct(lit)]);
+        }
+        i += 1;
+    }
     let first = toks
         .iter()
         .find_map(word)
@@ -630,10 +644,7 @@ async fn run_in_transaction(
                 }
             })
             .collect();
-        let stamps: Vec<bool> = cols
-            .iter()
-            .map(|c| c.type_().name() == "timestamp")
-            .collect();
+        let types: Vec<&str> = cols.iter().map(|c| c.type_().name()).collect();
         let mut rows = Vec::new();
         for m in tx
             .simple_query(text)
@@ -648,8 +659,7 @@ async fn run_in_transaction(
                     (0..r.len())
                         .filter(|&j| keep.get(j).copied().unwrap_or(true))
                         .map(|j| match r.get(j) {
-                            Some(v) if stamps.get(j) == Some(&true) => db2_timestamp(v),
-                            Some(v) => v.to_string(),
+                            Some(v) => db2_text(types.get(j).copied().unwrap_or(""), v),
                             None => "-".to_string(),
                         })
                         .collect(),
@@ -669,6 +679,16 @@ async fn run_in_transaction(
         Outcome::Count(t.kind, n)
     };
     Ok(outcome)
+}
+
+/// A value of a PostgreSQL type as Db2 for i shows it: timestamps in
+/// the Db2 form, binary data as hex digits.
+fn db2_text(pg_type: &str, v: &str) -> String {
+    match pg_type {
+        "timestamp" => db2_timestamp(v),
+        "bytea" => v.trim_start_matches("\\x").to_ascii_uppercase(),
+        _ => v.to_string(),
+    }
 }
 
 /// A timestamp as Db2 for i shows it: `YYYY-MM-DD-HH.MM.SS.ffffff`

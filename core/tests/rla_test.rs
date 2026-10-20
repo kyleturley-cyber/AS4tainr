@@ -3237,3 +3237,108 @@ async fn sql_views_identity_and_alter() {
             .unwrap()
     );
 }
+
+/// More data types (Db2 for i SQL Reference, data types and their DDS
+/// equivalents; ILE RPG Reference, data types): DOUBLE and REAL are
+/// floats (DDS F); BINARY, VARBINARY and FOR BIT DATA are bytes that are
+/// not translated (DDS H), shown by SQL as hex digits; GRAPHIC and
+/// VARGRAPHIC are UCS-2 (DDS G); CLOB and BLOB are large objects that an
+/// RPG program's record leaves out (RNF7575) while SQL reads them. A float
+/// shows in its external display form, +1.230000000000000E+002 for an
+/// 8-byte float (IBM support, "Floating point numbers"). With
+/// EXTBININT(*YES) an INTEGER column is an int(10) in the program and holds
+/// 2147483647.
+#[tokio::test]
+async fn sql_float_binary_graphic_lob() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+    };
+    let script = "
+        CREATE TABLE MEASURE (
+          ID INTEGER NOT NULL,
+          RATE DOUBLE NOT NULL WITH DEFAULT,
+          SCORE REAL NOT NULL WITH DEFAULT,
+          TAG BINARY(4) NOT NULL WITH DEFAULT,
+          RAW VARCHAR(8) FOR BIT DATA NOT NULL WITH DEFAULT,
+          NAME GRAPHIC(5) NOT NULL WITH DEFAULT,
+          NOTE VARGRAPHIC(20) NOT NULL WITH DEFAULT,
+          DOC CLOB(1M),
+          PIC BLOB(10K)) RCDFMT MEASUREF;
+        INSERT INTO MEASURE VALUES (2147483647, 123, 0.5, BX'C1C2C3C4', BX'00FF', 'Grüß', 'Zürich', 'a long text', BX'0102');
+    ";
+    let lines = job
+        .run_sql_script(script, "test", 10, None, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        lines.last().unwrap(),
+        "2 statements run from test; 0 with errors."
+    );
+    let rows = match as4tainr_core::sql::run(
+        &client,
+        &url,
+        std::slice::from_ref(&lib),
+        "SELECT TAG, RAW, NAME, DOC FROM MEASURE",
+    )
+    .await
+    .unwrap()
+    {
+        as4tainr_core::sql::Outcome::Rows { rows, .. } => rows,
+        other => panic!("{other:?}"),
+    };
+    // GRAPHIC(5) is fixed length: four characters and a blank.
+    assert_eq!(rows, vec![vec!["C1C2C3C4", "00FF", "Grüß ", "a long text"]]);
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        None,
+        "TYPES".into(),
+        "**FREE\nctl-opt extbinint(*yes);\ndcl-f measure usage(*update);\nread measure;\ndsply %char(id);\ndsply %char(%size(id));\ndsply rate;\ndsply score;\ndsply tag;\ndsply %trim(note);\nrate = rate / 4;\nnote = 'Bern';\nupdate measuref;\n*inlr = *on;\n".into(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    // C1C2C3C4 is 'ABCD' in EBCDIC; the program gets the bytes as they are.
+    assert_eq!(
+        r.messages,
+        [
+            "2147483647",
+            "4",
+            "+1.230000000000000E+002",
+            "+5.000000E-001",
+            "ABCD",
+            "Zürich"
+        ]
+    );
+    let rows = match as4tainr_core::sql::run(
+        &client,
+        &url,
+        std::slice::from_ref(&lib),
+        "SELECT RATE, NOTE, DOC, PIC FROM MEASURE",
+    )
+    .await
+    .unwrap()
+    {
+        as4tainr_core::sql::Outcome::Rows { rows, .. } => rows,
+        other => panic!("{other:?}"),
+    };
+    // The update changed RATE and NOTE; the large objects are as they were.
+    assert_eq!(rows, vec![vec!["30.75", "Bern", "a long text", "0102"]]);
+}

@@ -487,7 +487,27 @@ fn fixed_type(
                 DType::Uns(d)
             }
         }
+        // UCS-2 (C) and graphic (G): the length is in characters; by
+        // positions, two bytes each.
+        'C' | 'G' => {
+            let n = if by_positions {
+                (if varying { len.saturating_sub(2) } else { len }) / 2
+            } else {
+                len
+            };
+            if varying {
+                DType::VarUcs2(n)
+            } else {
+                DType::Ucs2(n)
+            }
+        }
         'N' => DType::Ind,
+        'F' => {
+            if len != 4 && len != 8 {
+                bail!("a float field is 4 or 8 bytes long");
+            }
+            DType::Float(len)
+        }
         'D' => DType::Date,
         'T' => DType::Time,
         'Z' => DType::Timestamp,
@@ -522,6 +542,15 @@ fn free_type(word: &str, args: &[String]) -> Result<Option<DType>> {
         "BINDEC" => DType::Binary(n(0)?, dec(1)?),
         "INT" => DType::Int(n(0)?),
         "UNS" => DType::Uns(n(0)?),
+        "UCS2" | "GRAPH" => DType::Ucs2(n(0)?),
+        "VARUCS2" | "VARGRAPH" => DType::VarUcs2(n(0)?),
+        "FLOAT" => {
+            let b = n(0)?;
+            if b != 4 && b != 8 {
+                bail!("FLOAT({b}): a float is 4 or 8 bytes long");
+            }
+            DType::Float(b)
+        }
         "IND" => DType::Ind,
         "DATE" => DType::Date,
         "TIME" => DType::Time,
@@ -537,6 +566,11 @@ const FREE_TYPES: &[&str] = &[
     "PACKED",
     "ZONED",
     "BINDEC",
+    "FLOAT",
+    "UCS2",
+    "VARUCS2",
+    "GRAPH",
+    "VARGRAPH",
     "INT",
     "UNS",
     "IND",

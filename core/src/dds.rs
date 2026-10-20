@@ -43,6 +43,26 @@ pub enum DataType {
     /// Timestamp (DDS Z), `YYYY-MM-DD-HH.MM.SS.ffffff`.
     #[serde(rename = "Z")]
     Timestamp,
+    /// Floating point (DDS F): single precision, or double with
+    /// FLTPCN(*DOUBLE) (`FieldDef::double`).
+    #[serde(rename = "F")]
+    Float,
+    /// Graphic (DDS G; SQL GRAPHIC, VARGRAPHIC, NCHAR): UCS-2 characters
+    /// (CCSID 13488/1200); the length is in characters.
+    #[serde(rename = "G")]
+    Graphic,
+    /// Hexadecimal (DDS H; SQL BINARY, VARBINARY, FOR BIT DATA): bytes the
+    /// system does not translate. Records carry it as hex digits.
+    #[serde(rename = "H")]
+    Hex,
+    /// SQL large objects. A program's externally described record leaves
+    /// them out (ILE RPG: RNF7575); SQL reads and writes them.
+    #[serde(rename = "CLOB")]
+    Clob,
+    #[serde(rename = "BLOB")]
+    Blob,
+    #[serde(rename = "DBCLOB")]
+    Dbclob,
 }
 
 impl DataType {
@@ -55,6 +75,12 @@ impl DataType {
             DataType::Date => "L",
             DataType::Time => "T",
             DataType::Timestamp => "Z",
+            DataType::Float => "F",
+            DataType::Hex => "H",
+            DataType::Graphic => "G",
+            DataType::Clob => "CLOB",
+            DataType::Blob => "BLOB",
+            DataType::Dbclob => "DBCLOB",
         }
     }
 
@@ -67,14 +93,28 @@ impl DataType {
             "L" => DataType::Date,
             "T" => DataType::Time,
             "Z" => DataType::Timestamp,
+            "F" => DataType::Float,
+            "H" => DataType::Hex,
+            "G" => DataType::Graphic,
+            "CLOB" => DataType::Clob,
+            "BLOB" => DataType::Blob,
+            "DBCLOB" => DataType::Dbclob,
             other => {
-                bail!("unsupported DDS data type '{other}' (supported: A, P, S, B, L, T, Z)")
+                bail!("unsupported DDS data type '{other}' (supported: A, P, S, B, F, H, L, T, Z)")
             }
         })
     }
 
     pub fn is_numeric(self) -> bool {
-        matches!(self, DataType::Packed | DataType::Zoned | DataType::Binary)
+        matches!(
+            self,
+            DataType::Packed | DataType::Zoned | DataType::Binary | DataType::Float
+        )
+    }
+
+    /// An SQL large object (CLOB, BLOB, DBCLOB).
+    pub fn is_lob(self) -> bool {
+        matches!(self, DataType::Clob | DataType::Blob | DataType::Dbclob)
     }
 
     /// Date, time or timestamp.
@@ -133,6 +173,9 @@ pub struct FieldDef {
     /// An identity column (SQL GENERATED ... AS IDENTITY).
     #[serde(default)]
     pub identity: Option<Identity>,
+    /// A float of double precision (DDS FLTPCN(*DOUBLE); SQL DOUBLE).
+    #[serde(default)]
+    pub double: bool,
 }
 
 /// An identity column's generation (Db2 for i, CREATE TABLE).
@@ -192,6 +235,7 @@ impl FieldDef {
             default: None,
             alias: None,
             identity: None,
+            double: false,
         }
     }
 
@@ -213,8 +257,10 @@ impl FieldDef {
     /// PostgreSQL column type used to store this field.
     pub fn sql_type(&self) -> String {
         match self.data_type {
-            DataType::Char if self.varlen => format!("varchar({})", self.length),
-            DataType::Char => format!("char({})", self.length),
+            DataType::Char | DataType::Graphic if self.varlen => {
+                format!("varchar({})", self.length)
+            }
+            DataType::Char | DataType::Graphic => format!("char({})", self.length),
             DataType::Packed | DataType::Zoned => {
                 format!("numeric({},{})", self.length, self.decimals)
             }
@@ -230,6 +276,10 @@ impl FieldDef {
             DataType::Date => "date".into(),
             DataType::Time => "time(0)".into(),
             DataType::Timestamp => "timestamp(6)".into(),
+            DataType::Float if self.double => "double precision".into(),
+            DataType::Float => "real".into(),
+            DataType::Hex | DataType::Blob => "bytea".into(),
+            DataType::Clob | DataType::Dbclob => "text".into(),
         }
     }
 
@@ -238,9 +288,12 @@ impl FieldDef {
     /// in the external form records use.
     pub fn blank_value(&self) -> String {
         match self.data_type {
-            DataType::Char if self.varlen => String::new(),
-            DataType::Char => " ".repeat(self.length as usize),
-            DataType::Packed | DataType::Zoned | DataType::Binary => "0".into(),
+            DataType::Char | DataType::Graphic if self.varlen => String::new(),
+            DataType::Char | DataType::Graphic => " ".repeat(self.length as usize),
+            DataType::Packed | DataType::Zoned | DataType::Binary | DataType::Float => "0".into(),
+            // Hexadecimal blanks (X'40').
+            DataType::Hex if !self.varlen => "40".repeat(self.length as usize),
+            DataType::Hex | DataType::Clob | DataType::Blob | DataType::Dbclob => String::new(),
             DataType::Date => "0001-01-01".into(),
             DataType::Time => "00.00.00".into(),
             DataType::Timestamp => "0001-01-01-00.00.00.000000".into(),
@@ -253,13 +306,16 @@ impl FieldDef {
     pub fn to_db(&self, v: &str) -> String {
         let t = v.trim();
         match self.data_type {
-            DataType::Packed | DataType::Zoned | DataType::Binary => {
+            DataType::Packed | DataType::Zoned | DataType::Binary | DataType::Float => {
                 if t.is_empty() {
                     "0".into()
                 } else {
                     t.to_string()
                 }
             }
+            // Hex digits as a bytea constant.
+            DataType::Hex | DataType::Blob => format!("\\x{t}"),
+            DataType::Clob | DataType::Dbclob | DataType::Graphic => v.to_string(),
             DataType::Date if t.is_empty() => "0001-01-01".into(),
             DataType::Date => t.to_string(),
             DataType::Time => {
@@ -297,10 +353,15 @@ impl FieldDef {
     pub fn read_expr(&self, col: &str) -> String {
         let e = match self.data_type {
             // bpchar::text drops trailing blanks; programs expect them.
-            DataType::Char if !self.varlen => format!("rpad({col}::text, {})", self.length),
+            DataType::Char | DataType::Graphic if !self.varlen => {
+                format!("rpad({col}::text, {})", self.length)
+            }
             DataType::Date => format!("to_char({col}, 'YYYY-MM-DD')"),
             DataType::Time => format!("to_char({col}, 'HH24.MI.SS')"),
             DataType::Timestamp => format!("to_char({col}, 'YYYY-MM-DD-HH24.MI.SS.US')"),
+            // A float as a plain decimal number (no exponent).
+            DataType::Float => format!("({col})::numeric::text"),
+            DataType::Hex | DataType::Blob => format!("upper(encode({col}, 'hex'))"),
             _ => format!("{col}::text"),
         };
         if self.null_capable {
@@ -329,18 +390,24 @@ impl FieldDef {
         }
     }
 
-    fn system_default(&self) -> &'static str {
+    fn system_default(&self) -> String {
+        if self.data_type == DataType::Hex && !self.varlen {
+            return format!("'\\x{}'::bytea", "40".repeat(self.length as usize));
+        }
         match self.data_type {
+            DataType::Hex | DataType::Blob => "''::bytea",
+            DataType::Clob | DataType::Dbclob => "''",
             // Db2 for i: the default for a date, time or timestamp is
             // the current one when the record is added (CREATE TABLE,
             // WITH DEFAULT; DDS DFT not given).
             DataType::Date => "CURRENT_DATE",
             DataType::Time => "LOCALTIME(0)",
             DataType::Timestamp => "LOCALTIMESTAMP(6)",
-            DataType::Char if self.varlen => "''",
-            DataType::Char => "' '",
+            DataType::Char | DataType::Graphic if self.varlen => "''",
+            DataType::Char | DataType::Graphic => "' '",
             _ => "0",
         }
+        .to_string()
     }
 }
 
@@ -794,6 +861,16 @@ pub fn parse_pf(file_name: &str, source: &str) -> Result<PhysicalFile> {
                 if data_type.is_numeric() && (length == 0 || length > 63 || decimals > length) {
                     bail!("line {lineno}: invalid numeric size {length},{decimals}");
                 }
+                // Float: single precision has 1-9 digits, FLTPCN(*DOUBLE)
+                // 1-17 (DDS reference, data type F).
+                let double = keyword_arg(keywords, "FLTPCN")
+                    .is_some_and(|a| a.trim().eq_ignore_ascii_case("*DOUBLE"));
+                if data_type == DataType::Float && (length > if double { 17 } else { 9 }) {
+                    bail!(
+                        "line {lineno}: a float field has 1 to {} digits",
+                        if double { 17 } else { 9 }
+                    );
+                }
                 if data_type == DataType::Binary && (length > 18 || decimals > length) {
                     bail!("line {lineno}: binary fields have 1 to 18 digits");
                 }
@@ -812,13 +889,19 @@ pub fn parse_pf(file_name: &str, source: &str) -> Result<PhysicalFile> {
                     bail!("line {lineno}: duplicate field '{name}'");
                 }
                 let varlen = has_keyword(keywords, "VARLEN");
-                if varlen && data_type != DataType::Char {
+                if varlen
+                    && !matches!(
+                        data_type,
+                        DataType::Char | DataType::Graphic | DataType::Hex
+                    )
+                {
                     bail!("line {lineno}: VARLEN is only valid for character fields");
                 }
                 let mut f = FieldDef::new(&name, data_type, length, decimals);
                 f.text = keyword_arg(keywords, "TEXT").unwrap_or_default();
                 f.varlen = varlen;
                 f.null_capable = has_keyword(keywords, "ALWNULL");
+                f.double = double;
                 // ALIAS(name): the field's alternative name (what SQL uses).
                 if let Some(a) = keyword_arg(keywords, "ALIAS") {
                     let a = a.trim().to_ascii_uppercase();
@@ -1027,5 +1110,30 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("1 to 18"), "{e}");
+    }
+
+    #[test]
+    fn float_hex_graphic_fields() {
+        // DDS reference, position 35: F is single-precision float unless
+        // FLTPCN(*DOUBLE); H is hexadecimal; G is graphic (UCS-2).
+        let src = "     A          R REC
+     A            AMT           15F 2       FLTPCN(*DOUBLE)
+     A            SMALL          7F
+     A            CODE           4H
+     A            NAME          10G         VARLEN
+";
+        let pf = parse_pf("X", src).unwrap();
+        assert!(pf.fields[0].double && pf.fields[0].sql_type() == "double precision");
+        assert_eq!(pf.fields[1].sql_type(), "real");
+        assert_eq!(pf.fields[2].sql_type(), "bytea");
+        assert_eq!(pf.fields[2].blank_value(), "40404040");
+        assert_eq!(pf.fields[3].sql_type(), "varchar(10)");
+        let e = parse_pf(
+            "X",
+            "     A          R REC\n     A            F1            12F\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("1 to 9"), "{e}");
     }
 }

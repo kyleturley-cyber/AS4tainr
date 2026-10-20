@@ -471,6 +471,62 @@ fn data_type(p: &mut P) -> Result<(DataType, u32, u32, bool)> {
             let (d, s) = precision(p)?;
             (DataType::Zoned, d, s, false)
         }
+        // REAL is a single-precision float, DOUBLE a double-precision one;
+        // FLOAT(n) is single for n up to 24 (Db2 for i SQL Reference).
+        "REAL" => (DataType::Float, 9, 0, false),
+        "DOUBLE" => {
+            let _ = p.eat("PRECISION");
+            (DataType::Float, 17, 0, false)
+        }
+        "FLOAT" => {
+            let n = size(p, 53)?;
+            if n == 0 || n > 53 {
+                bail!("SQL0604: FLOAT({n}) is not valid.");
+            }
+            (DataType::Float, if n <= 24 { 9 } else { 17 }, 0, false)
+        }
+        "BINARY" => {
+            if p.eat("VARYING") {
+                (DataType::Hex, size(p, 0)?, 0, true)
+            } else {
+                (DataType::Hex, size(p, 1)?, 0, false)
+            }
+        }
+        "VARBINARY" => (DataType::Hex, size(p, 0)?, 0, true),
+        // Graphic strings (UCS-2): GRAPHIC, VARGRAPHIC, NCHAR, NVARCHAR.
+        "GRAPHIC" | "NCHAR" => {
+            if p.eat("VARYING") {
+                (DataType::Graphic, size(p, 0)?, 0, true)
+            } else {
+                (DataType::Graphic, size(p, 1)?, 0, false)
+            }
+        }
+        "VARGRAPHIC" | "NVARCHAR" => (DataType::Graphic, size(p, 0)?, 0, true),
+        "NATIONAL" => {
+            if !(p.eat("CHARACTER") || p.eat("CHAR")) {
+                bail!("SQL0104: NATIONAL CHARACTER expected.");
+            }
+            if p.eat("VARYING") {
+                (DataType::Graphic, size(p, 0)?, 0, true)
+            } else {
+                (DataType::Graphic, size(p, 1)?, 0, false)
+            }
+        }
+        "CLOB" | "BLOB" | "DBCLOB" => {
+            let n = if p.punct("(") {
+                let n = lob_size(p)?;
+                p.expect_punct(")")?;
+                n
+            } else {
+                1024 * 1024
+            };
+            let t = match w.as_str() {
+                "CLOB" => DataType::Clob,
+                "BLOB" => DataType::Blob,
+                _ => DataType::Dbclob,
+            };
+            (t, n, 0, true)
+        }
         "DATE" => (DataType::Date, 10, 0, false),
         "TIME" => (DataType::Time, 8, 0, false),
         "TIMESTAMP" => {
@@ -483,26 +539,59 @@ fn data_type(p: &mut P) -> Result<(DataType, u32, u32, bool)> {
         other => bail!("SQL0084: data type {other} is not supported yet."),
     };
     match t {
-        (DataType::Char, n, _, _) if n == 0 || n > 32740 => {
-            bail!("SQL0604: Length {n} is not valid for a character column.")
+        (DataType::Char | DataType::Hex, n, _, _) if n == 0 || n > 32740 => {
+            bail!("SQL0604: Length {n} is not valid for a character or binary column.")
         }
         (DataType::Packed | DataType::Zoned, d, s, _) if d == 0 || d > 63 || s > d => {
             bail!("SQL0604: Precision {d},{s} is not valid.")
         }
         _ => {}
     }
-    // CCSID and FOR BIT DATA: character data is kept as text.
+    // CCSID: character data is kept as text. FOR BIT DATA: bytes that are
+    // not translated (CCSID 65535), as BINARY.
+    let mut t = t;
     loop {
         if p.eat("CCSID") {
-            p.number()?;
+            let ccsid = p.number()?;
+            if ccsid == 65535 && t.0 == DataType::Char {
+                t.0 = DataType::Hex;
+            }
         } else if p.eat("FOR") {
+            if p.eat("COLUMN") || p.eat("SYSTEM") {
+                // FOR COLUMN belongs to the column name, before the type.
+                bail!("SQL0104: FOR COLUMN comes before the data type.");
+            }
             p.expect("BIT")?;
             p.expect("DATA")?;
+            if t.0 == DataType::Char {
+                t.0 = DataType::Hex;
+            }
         } else {
             break;
         }
     }
     Ok(t)
+}
+
+/// A large object's length: n, nK, nM or nG.
+fn lob_size(p: &mut P) -> Result<u32> {
+    let Some(Tok::Number(t)) = p.next() else {
+        bail!("SQL0104: a length is expected.");
+    };
+    let (digits, mult) = match t.chars().last() {
+        Some('K') | Some('k') => (&t[..t.len() - 1], 1024u64),
+        Some('M') | Some('m') => (&t[..t.len() - 1], 1024 * 1024),
+        Some('G') | Some('g') => (&t[..t.len() - 1], 1024 * 1024 * 1024),
+        _ => (t.as_str(), 1),
+    };
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| anyhow!("SQL0104: {t} is not a valid length."))?;
+    let bytes = n * mult;
+    if bytes == 0 || bytes > 2_147_483_647 {
+        bail!("SQL0604: Length {t} is not valid for a large object.");
+    }
+    Ok(bytes as u32)
 }
 
 /// A default value: a constant, NULL, or a special register.
@@ -791,6 +880,7 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
                 }
                 let (t, len, dec, varlen) = data_type(p)?;
                 let mut f = FieldDef::new(&sys, t, len, dec);
+                f.double = t == DataType::Float && len > 9;
                 if sys != fname {
                     f.alias = Some(fname.clone());
                 }
@@ -1990,25 +2080,7 @@ async fn alter(ctx: &mut Ctx<'_>, table: &Name, action: &Alter) -> Result<String
             }
             let tx = ctx.client.transaction().await?;
             let seq = fields.len() as i32;
-            tx.execute(
-                "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,'',$8,$9,$10,$11,$12)",
-                &[
-                    &lib,
-                    &sys,
-                    &seq,
-                    &new.name,
-                    &new.data_type.code(),
-                    &(new.length as i32),
-                    &(new.decimals as i32),
-                    &new.varlen,
-                    &new.null_capable,
-                    &new.default.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
-                    &new.alias,
-                    &new.identity.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
-                ],
-            )
-            .await?;
+            catalog::insert_field(&tx, &lib, &sys, seq, &new).await?;
             let coll = if new.data_type == DataType::Char {
                 " COLLATE \"C\""
             } else {
@@ -2209,6 +2281,7 @@ async fn alter(ctx: &mut Ctx<'_>, table: &Name, action: &Alter) -> Result<String
                     nf.length = *l;
                     nf.decimals = *d;
                     nf.varlen = *v;
+                    nf.double = *t == DataType::Float && *l > 9;
                     if fd.data_type.is_numeric() != t.is_numeric() && fd.data_type != *t {
                         // Character and number columns do not convert.
                         if fd.data_type == DataType::Char || *t == DataType::Char {
@@ -2423,7 +2496,7 @@ mod tests {
     #[test]
     fn unsupported_definitions_say_so() {
         for sql in [
-            "CREATE TABLE T (A FLOAT)",
+            "CREATE TABLE T (A DECFLOAT(16))",
             "CREATE TABLE T (A INT GENERATED ALWAYS AS (B + 1))",
             "CREATE VIEW V AS SELECT 1 FROM T WITH LOCAL CHECK OPTION",
             "ALTER TABLE T ADD COLUMN B INT BEFORE A",

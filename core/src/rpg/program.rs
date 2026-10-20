@@ -390,10 +390,25 @@ fn num_arg(a: &str, syms: &HashMap<String, Sym>) -> Result<u32> {
 /// External field type as the program sees it outside a data structure:
 /// zoned and packed fields are packed (ILE RPG Reference: numeric fields
 /// of externally described files are packed in the program).
-fn program_type(f: &crate::dds::FieldDef, in_ds: bool) -> DType {
-    match f.data_type {
+/// With EXTBININT(*YES), binary fields with no decimal places are
+/// integers (5, 10 or 20 digits). Large objects have no program type
+/// (None): the program's record leaves them out (RNF7575).
+fn program_type(f: &crate::dds::FieldDef, in_ds: bool, extbinint: bool) -> Option<DType> {
+    Some(match f.data_type {
         DataType::Char if f.varlen => DType::Varchar(f.length),
         DataType::Char => DType::Char(f.length),
+        // Hexadecimal: character data the program gets byte for byte.
+        DataType::Hex if f.varlen => DType::Varchar(f.length),
+        DataType::Hex => DType::Char(f.length),
+        DataType::Float => DType::Float(if f.double { 8 } else { 4 }),
+        DataType::Graphic if f.varlen => DType::VarUcs2(f.length),
+        DataType::Graphic => DType::Ucs2(f.length),
+        DataType::Clob | DataType::Blob | DataType::Dbclob => return None,
+        DataType::Binary if extbinint && f.decimals == 0 => DType::Int(match f.length {
+            0..=4 => 5,
+            5..=9 => 10,
+            _ => 20,
+        }),
         DataType::Binary => DType::Binary(f.length, f.decimals),
         DataType::Date => DType::Date,
         DataType::Time => DType::Time,
@@ -406,7 +421,7 @@ fn program_type(f: &crate::dds::FieldDef, in_ds: bool) -> DType {
                 DType::Packed(f.length, f.decimals)
             }
         }
-    }
+    })
 }
 
 struct Binder<'a> {
@@ -423,6 +438,8 @@ struct Binder<'a> {
     statics: Vec<usize>,
     /// Global storage, seen (for templates) while binding a procedure.
     globals: Vec<Vec<u8>>,
+    /// EXTBININT(*YES): external binary fields are integers.
+    extbinint: bool,
 }
 
 /// What a definitions list declared besides storage: its procedure
@@ -772,7 +789,9 @@ impl Binder<'_> {
             // names where they have one (ILE RPG Reference, ALIAS).
             let alias = keyword(&d.keywords, "ALIAS").is_some();
             for fd in &fr.file.fields {
-                let t = program_type(fd, true);
+                let Some(t) = program_type(fd, true, self.extbinint) else {
+                    continue;
+                };
                 let n = match (&fd.alias, alias) {
                     (Some(a), true) => a.clone(),
                     _ => fd.name.clone(),
@@ -1039,6 +1058,9 @@ pub fn bind(
         file_fields: HashMap::new(),
         inz: vec![],
         globals: vec![],
+        extbinint: keyword(&src.control, "EXTBININT")
+            .and_then(|k| k.args.first())
+            .is_some_and(|a| a.trim().eq_ignore_ascii_case("*YES")),
         local: false,
         statics: vec![],
     };
@@ -1123,6 +1145,11 @@ pub fn bind(
             // files).
             let alias = keyword(&f.keywords, "ALIAS").is_some();
             for fd in &fr.file.fields {
+                // Large objects are not in the program's record.
+                if fd.data_type.is_lob() {
+                    info.fields.push(String::new());
+                    continue;
+                }
                 let base = match (&fd.alias, alias) {
                     (Some(a), true) => a.clone(),
                     _ => fd.name.clone(),
@@ -1131,9 +1158,9 @@ pub fn bind(
                     Some(p) => format!("{p}{base}"),
                     None => base,
                 };
-                b.file_fields
-                    .entry(pname.clone())
-                    .or_insert_with(|| program_type(fd, false));
+                b.file_fields.entry(pname.clone()).or_insert_with(|| {
+                    program_type(fd, false, b.extbinint).unwrap_or(DType::Char(1))
+                });
                 info.fields.push(pname);
             }
             info.fref = Some(fr);
@@ -1235,6 +1262,7 @@ pub fn bind(
             local: true,
             statics: vec![],
             globals: b.bufs.clone(),
+            extbinint: b.extbinint,
         };
         let pi = pb
             .defs(&pr.defs, &mut protos)

@@ -590,6 +590,36 @@ impl<'a> Machine<'a> {
                 let name = self.nullind_field(args)?;
                 Value::Ind(self.nullind.contains(&name))
             }
+            // %EDITFLT, and %CHAR of a float: the external display form
+            // (ILE RPG Reference, float format).
+            "EDITFLT" => {
+                let n = match args.first().and_then(|a| self.type_of(a)) {
+                    Some(DType::Float(4)) => 4,
+                    _ => 8,
+                };
+                let x = arg(self, 0)?.num()?;
+                Value::str(&data::float_text(x.to_string().parse().unwrap_or(0.0), n))
+            }
+            "CHAR"
+                if matches!(
+                    args.first().and_then(|a| self.type_of(a)),
+                    Some(DType::Float(_))
+                ) =>
+            {
+                let Some(DType::Float(n)) = args.first().and_then(|a| self.type_of(a)) else {
+                    unreachable!()
+                };
+                let x = arg(self, 0)?.num()?;
+                Value::str(&data::float_text(x.to_string().parse().unwrap_or(0.0), n))
+            }
+            // %UCS2 and %GRAPH: UCS-2 and graphic values are converted to
+            // and from character data when they are used (see data.rs).
+            "UCS2" | "GRAPH" => Value::Char(arg(self, 0)?.chars()?),
+            // %FLOAT: the value as a float (8 bytes).
+            "FLOAT" => {
+                let x: f64 = arg(self, 0)?.num()?.to_string().parse().unwrap_or(0.0);
+                Value::Num(data::float_dec(x)?)
+            }
             "CHAR" => {
                 let v = arg(self, 0)?;
                 match v {
@@ -984,9 +1014,17 @@ impl<'a> Machine<'a> {
             .ok_or_else(|| anyhow!("{} is not a database file", fi.decl.name))?;
         let mut rec = Record::new();
         for (fd, pname) in fref.file.fields.iter().zip(&fi.fields) {
+            if pname.is_empty() {
+                continue;
+            }
             let v = self.eval(&Expr::name(pname))?;
             let text = match v {
+                Value::Num(d) if fd.data_type == crate::dds::DataType::Float => d.to_string(),
                 Value::Num(d) => d.rescale(fd.decimals as u8, false)?.to_string(),
+                // Hexadecimal fields: the bytes as hex digits, untranslated.
+                other if fd.data_type == crate::dds::DataType::Hex => {
+                    other.chars()?.iter().map(|b| format!("{b:02X}")).collect()
+                }
                 other => a(&other.chars()?),
             };
             rec.insert(fd.name.clone(), text);
@@ -1011,7 +1049,17 @@ impl<'a> Machine<'a> {
     fn fill_fields(&mut self, i: usize, rec: &Record) -> Result<()> {
         let fi = self.prog.files[i].clone();
         let fref = fi.fref.as_ref().unwrap();
-        let nulls = crate::rla::null_fields(rec);
+        // Null values in fields the program has (large objects are left
+        // out of its record).
+        let nulls: Vec<String> = crate::rla::null_fields(rec)
+            .into_iter()
+            .filter(|n| {
+                fref.file
+                    .fields
+                    .iter()
+                    .any(|f| &f.name == n && !f.data_type.is_lob())
+            })
+            .collect();
         if !nulls.is_empty() && self.alwnull == AlwNull::No {
             // ALWNULL(*NO): none of the record is available to the program.
             bail!(
@@ -1032,11 +1080,20 @@ impl<'a> Machine<'a> {
             }
         }
         for (fd, pname) in fref.file.fields.iter().zip(&fi.fields) {
+            if pname.is_empty() {
+                continue;
+            }
             let Some(text) = rec.get(&fd.name) else {
                 continue;
             };
             let v = if fd.data_type.is_numeric() {
                 Value::Num(Dec::parse(text)?)
+            } else if fd.data_type == crate::dds::DataType::Hex {
+                Value::Char(
+                    (0..text.len() / 2)
+                        .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap_or(0))
+                        .collect(),
+                )
             } else {
                 Value::str(text)
             };
@@ -1647,6 +1704,14 @@ impl<'a> Machine<'a> {
             }
             Stmt::Dsply { message, response } => {
                 let text = match message {
+                    // A float shows in its external display form.
+                    Some(m) if matches!(self.type_of(m), Some(DType::Float(_))) => {
+                        let Some(DType::Float(n)) = self.type_of(m) else {
+                            unreachable!()
+                        };
+                        let x = self.eval(m)?.num()?;
+                        data::float_text(x.to_string().parse().unwrap_or(0.0), n)
+                    }
                     Some(m) => {
                         let v = self.eval(m)?;
                         self.text_of(&v)?

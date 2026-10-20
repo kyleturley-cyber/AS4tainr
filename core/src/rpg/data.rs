@@ -53,6 +53,14 @@ pub enum DType {
     Timestamp,
     /// Pointer (*): 16 bytes, opaque here.
     Pointer,
+    /// Float (F): 4 or 8 bytes, IEEE binary floating point.
+    Float(u32),
+    /// UCS-2 (C) and graphic (G) data: this many characters of 2 bytes
+    /// (UTF-16BE, CCSID 13488/1200).
+    Ucs2(u32),
+    /// Varying UCS-2 or graphic: a 2-byte length in characters, then the
+    /// characters.
+    VarUcs2(u32),
 }
 
 impl DType {
@@ -62,13 +70,20 @@ impl DType {
             DType::Varchar(n) => n as usize + 2,
             DType::Zoned(d, _) => d as usize,
             DType::Packed(d, _) => d as usize / 2 + 1,
+            // ILE RPG Reference, binary format: 1-4 digits in 2 bytes,
+            // 5-9 in 4, 10-18 in 8.
             DType::Binary(d, _) => {
                 if d <= 4 {
                     2
-                } else {
+                } else if d <= 9 {
                     4
+                } else {
+                    8
                 }
             }
+            DType::Float(n) => n as usize,
+            DType::Ucs2(n) => 2 * n as usize,
+            DType::VarUcs2(n) => 2 * n as usize + 2,
             DType::Int(d) | DType::Uns(d) => match d {
                 3 => 1,
                 5 => 2,
@@ -91,13 +106,20 @@ impl DType {
                 | DType::Binary(..)
                 | DType::Int(_)
                 | DType::Uns(_)
+                | DType::Float(_)
         )
     }
 
     pub fn is_char(&self) -> bool {
         matches!(
             self,
-            DType::Char(_) | DType::Varchar(_) | DType::Date | DType::Time | DType::Timestamp
+            DType::Char(_)
+                | DType::Varchar(_)
+                | DType::Date
+                | DType::Time
+                | DType::Timestamp
+                | DType::Ucs2(_)
+                | DType::VarUcs2(_)
         )
     }
 
@@ -114,7 +136,7 @@ impl DType {
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> u32 {
         match *self {
-            DType::Char(n) | DType::Varchar(n) => n,
+            DType::Char(n) | DType::Varchar(n) | DType::Ucs2(n) | DType::VarUcs2(n) => n,
             DType::Ind => 1,
             DType::Date => 10,
             DType::Time => 8,
@@ -139,6 +161,15 @@ impl DType {
                 encode_num(self, &Dec::ZERO, &mut b).expect("zero fits");
             }
             DType::Ind => b[0] = 0xF0,
+            // Float: all zero bytes are 0.0.
+            DType::Float(_) => {}
+            // UCS-2 blanks (U+0020); a varying field starts empty.
+            DType::Ucs2(_) => {
+                for pair in b.chunks_mut(2) {
+                    pair.copy_from_slice(&[0x00, 0x20]);
+                }
+            }
+            DType::VarUcs2(_) => {}
             DType::Date => b.copy_from_slice(&e("0001-01-01")),
             DType::Time => b.copy_from_slice(&e("00.00.00")),
             DType::Timestamp => b.copy_from_slice(&e("0001-01-01-00.00.00.000000")),
@@ -231,6 +262,19 @@ pub enum Fit {
 
 /// Store a number in a numeric field's bytes.
 pub fn encode_num(t: &DType, v: &Dec, out: &mut [u8]) -> Result<()> {
+    if let DType::Float(n) = *t {
+        // A float field holds a binary approximation of the value.
+        let x: f64 = v
+            .to_string()
+            .parse()
+            .map_err(|_| anyhow!("{v} is not a number"))?;
+        if n == 4 {
+            out.copy_from_slice(&(x as f32).to_be_bytes());
+        } else {
+            out.copy_from_slice(&x.to_be_bytes());
+        }
+        return Ok(());
+    }
     let (digits, decimals) = t.precision();
     let d = v.rescale(decimals as u8, false)?;
     match *t {
@@ -273,6 +317,9 @@ pub fn encode_num(t: &DType, v: &Dec, out: &mut [u8]) -> Result<()> {
 /// Read a number from a numeric field's bytes. Invalid digits are an
 /// error (RNQ0907, decimal data error).
 pub fn decode_num(t: &DType, b: &[u8]) -> Result<Dec> {
+    if let DType::Float(n) = *t {
+        return float_dec(float_of(n, b));
+    }
     let (_, decimals) = t.precision();
     let bad = || anyhow!("RNQ0907: Decimal-data error occurred (field contains invalid digits).");
     let m: i128 = match *t {
@@ -365,11 +412,80 @@ pub fn store(t: &DType, v: &Value, out: &mut [u8], fit: Fit, right: bool) -> Res
         DType::Ind => {
             out[0] = if v.truth()? { 0xF1 } else { 0xF0 };
         }
+        DType::Ucs2(_) | DType::VarUcs2(_) => {
+            let text: String = match v {
+                Value::Fig(Fig::Blanks) | Value::Fig(Fig::Null) => String::new(),
+                Value::Fig(f) => {
+                    let n = t.len() as usize;
+                    let mut tmp = vec![0u8; n];
+                    fill_fig(&DType::Char(n as u32), f, &mut tmp)?;
+                    a(&tmp)
+                }
+                Value::Num(_) => bail!("A numeric value cannot be assigned to a character field."),
+                other => a(&other.chars()?),
+            };
+            let units: Vec<u16> = text.encode_utf16().collect();
+            match t {
+                DType::Ucs2(n) => {
+                    let n = *n as usize;
+                    let mut u: Vec<u16> = if right && units.len() < n {
+                        let mut v = vec![0x20u16; n - units.len()];
+                        v.extend(&units);
+                        v
+                    } else if right {
+                        units[units.len() - n..].to_vec()
+                    } else {
+                        units.iter().copied().take(n).collect()
+                    };
+                    u.resize(n, 0x20);
+                    for (i, x) in u.iter().enumerate() {
+                        out[2 * i..2 * i + 2].copy_from_slice(&x.to_be_bytes());
+                    }
+                }
+                _ => {
+                    let n = units.len().min(t.len() as usize);
+                    out[0..2].copy_from_slice(&(n as u16).to_be_bytes());
+                    for (i, x) in units.iter().take(n).enumerate() {
+                        out[2 + 2 * i..4 + 2 * i].copy_from_slice(&x.to_be_bytes());
+                    }
+                }
+            }
+        }
         DType::Pointer => {
             if !matches!(v, Value::Fig(Fig::Null)) {
                 bail!("pointers can only be set to *NULL here");
             }
             out.fill(0);
+        }
+        DType::Float(n) => {
+            let x = match v {
+                Value::Fig(Fig::Zeros) => Dec::ZERO,
+                Value::Fig(Fig::HiVal) | Value::Fig(Fig::LoVal) => {
+                    // The largest float (ILE RPG: *HIVAL/*LOVAL for float).
+                    let m = if *n == 4 { f32::MAX as f64 } else { f64::MAX };
+                    out.copy_from_slice(&if *n == 4 {
+                        let x = if matches!(v, Value::Fig(Fig::HiVal)) {
+                            m
+                        } else {
+                            -m
+                        } as f32;
+                        x.to_be_bytes().to_vec()
+                    } else {
+                        let x = if matches!(v, Value::Fig(Fig::HiVal)) {
+                            m
+                        } else {
+                            -m
+                        };
+                        x.to_be_bytes().to_vec()
+                    });
+                    return Ok(());
+                }
+                Value::Char(_) | Value::Fig(Fig::Blanks) => {
+                    bail!("Character data cannot be assigned to a numeric field.")
+                }
+                other => other.num()?,
+            };
+            encode_num(t, &x, out)?;
         }
         _ => {
             let n = match v {
@@ -413,6 +529,13 @@ pub fn load(t: &DType, b: &[u8]) -> Result<Value> {
         DType::Varchar(max) => {
             let n = (u16::from_be_bytes([b[0], b[1]]) as usize).min(*max as usize);
             Value::Char(b[2..2 + n].to_vec())
+        }
+        // UCS-2 and graphic data are converted to the job's character set
+        // (CCSID 37) when used with character data.
+        DType::Ucs2(_) => Value::Char(e(&utf16_text(b))),
+        DType::VarUcs2(max) => {
+            let n = (u16::from_be_bytes([b[0], b[1]]) as usize).min(*max as usize);
+            Value::Char(e(&utf16_text(&b[2..2 + 2 * n])))
         }
         DType::Ind => Value::Ind(b[0] == 0xF1),
         DType::Pointer => Value::Fig(Fig::Null),
@@ -618,5 +741,87 @@ mod tests {
             compare(&Value::str("AB"), &Value::str("AB  ")).unwrap(),
             std::cmp::Ordering::Equal
         );
+    }
+}
+
+/// The value of a float field's bytes.
+pub fn float_of(n: u32, b: &[u8]) -> f64 {
+    if n == 4 {
+        f32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64
+    } else {
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&b[..8]);
+        f64::from_be_bytes(a)
+    }
+}
+
+/// A float as an exact decimal (its shortest decimal form); values that do
+/// not fit 38 digits are an error.
+pub fn float_dec(x: f64) -> Result<Dec> {
+    if !x.is_finite() {
+        bail!("RNQ0103: The float value is not a finite number.");
+    }
+    let text = format!("{x}");
+    // Shortest form, without an exponent (Rust's Display): very small
+    // values are rounded to 31 decimal places.
+    Dec::parse(&text).or_else(|_| {
+        let short = format!("{x:.31}");
+        Dec::parse(short.trim_end_matches('0'))
+    })
+}
+
+/// The external display representation of a float (ILE RPG Reference):
+/// a sign, one digit, a decimal point, 15 digits (8-byte) or 6 digits
+/// (4-byte), E, and a signed three-digit exponent: +1.230000000000000E+002.
+pub fn float_text(x: f64, bytes: u32) -> String {
+    let digits = if bytes == 4 { 6 } else { 15 };
+    let s = format!("{:.*e}", digits, x.abs());
+    let (mant, exp) = s.split_once('e').unwrap_or((&s, "0"));
+    let e: i32 = exp.parse().unwrap_or(0);
+    format!(
+        "{}{mant}E{}{:03}",
+        if x.is_sign_negative() && x != 0.0 {
+            '-'
+        } else {
+            '+'
+        },
+        if e < 0 { '-' } else { '+' },
+        e.abs()
+    )
+}
+
+/// UTF-16BE bytes as text.
+pub fn utf16_text(b: &[u8]) -> String {
+    let units: Vec<u16> = b
+        .chunks(2)
+        .filter(|c| c.len() == 2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+#[cfg(test)]
+mod float_tests {
+    use super::*;
+
+    #[test]
+    fn float_display_form() {
+        // External display representation (IBM support, "Floating point
+        // numbers"): +1.230000000000000E+002 for 123 in an 8-byte float.
+        assert_eq!(float_text(123.0, 8), "+1.230000000000000E+002");
+        assert_eq!(float_text(-0.00125, 8), "-1.250000000000000E-003");
+        assert_eq!(float_text(0.5, 4), "+5.000000E-001");
+        assert_eq!(float_text(0.0, 8), "+0.000000000000000E+000");
+        // Stored and read back through the field's bytes.
+        let mut b = vec![0u8; 8];
+        encode_num(&DType::Float(8), &Dec::parse("1234.5678").unwrap(), &mut b).unwrap();
+        assert_eq!(
+            decode_num(&DType::Float(8), &b).unwrap().to_string(),
+            "1234.5678"
+        );
+        // BINDEC of 10-18 digits takes 8 bytes (ILE RPG Reference).
+        assert_eq!(DType::Binary(18, 0).size(), 8);
+        // UCS-2: two bytes a character, blanks are U+0020.
+        assert_eq!(DType::Ucs2(2).initial(), vec![0, 0x20, 0, 0x20]);
     }
 }

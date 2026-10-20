@@ -129,7 +129,8 @@ pub async fn module_info(client: &Client, libl: &[String], m: &ModuleCopy) -> Re
     // A CL module: one procedure, named as the module; it imports the
     // procedures it calls with CALLPRC.
     if m.attribute == "CLLE" {
-        let p = crate::clpgm::compile(&m.name, &m.source)
+        let p = crate::clpgm::compile_in(client, libl, &m.name, &m.source)
+            .await
             .map_err(|e| anyhow!("module {}: {e:#}", m.name))?;
         return Ok(ModuleInfo {
             name: m.name.clone(),

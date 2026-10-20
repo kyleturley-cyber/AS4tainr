@@ -32,6 +32,10 @@ pub struct Job<'a> {
     /// The job's qualified name, for jobs the system knows about
     /// (interactive sessions, submitted jobs). None for `as4tainr call`.
     pub id: Option<jobs::JobId>,
+    /// The job's call stack as CL sees it: each CL program's message
+    /// queue, the escape message being raised, file overrides by call
+    /// level.
+    pub calls: crate::pgmmsg::CallStack,
 }
 
 /// A list shown on its own screen (DSPLIB, DSPLIBL, ...).
@@ -147,6 +151,17 @@ impl Job<'_> {
             "CRTCMD" => self.crtcmd(&cmd).await,
             "DLTCMD" => self.dltcmd(&cmd).await,
             "DSPCMD" => self.dspcmd(&cmd).await,
+            "CRTMSGF" => self.crtmsgf(&cmd).await,
+            "OVRDBF" => self.override_file(&cmd, crate::ovr::Kind::Db),
+            "OVRPRTF" => self.override_file(&cmd, crate::ovr::Kind::Printer),
+            "DLTOVR" => self.dltovr(&cmd),
+            "CLRPFM" => self.clrpfm(&cmd).await,
+            "DLYJOB" => self.dlyjob(&cmd).await,
+            "DLTMSGF" => self.dltmsgf(&cmd).await,
+            "ADDMSGD" => self.addmsgd(&cmd, false).await,
+            "CHGMSGD" => self.addmsgd(&cmd, true).await,
+            "RMVMSGD" => self.rmvmsgd(&cmd).await,
+            "DSPMSGD" => self.dspmsgd(&cmd).await,
             "DLTMNU" => self.dltmnu(&cmd).await,
             "DLTUSRPRF" => self.dltusrprf(&cmd).await,
             "CHGPWD" => Ok(Outcome::ChangePassword),
@@ -876,7 +891,7 @@ impl Job<'_> {
         }
         let cl = cmd.def.name == "CRTCLMOD";
         if cl {
-            crate::clpgm::compile(&name, &m.source)?;
+            crate::clpgm::compile_in(self.client, &libl, &name, &m.source).await?;
         } else {
             crate::rpg::compile(self.client, &libl, &name, &m.source).await?;
         }
@@ -1632,7 +1647,11 @@ impl Job<'_> {
             let src =
                 crate::source::expand_cl_includes(self.client, &self.library_list(), &m.source)
                     .await?;
-            crate::clpgm::compile(&name, &src)?;
+            let mut libl = self.library_list();
+            if !libl.contains(&lib) {
+                libl.insert(0, lib.clone());
+            }
+            crate::clpgm::compile_in(self.client, &libl, &name, &src).await?;
             src
         };
         let text = match cmd.get("TEXT") {
@@ -2021,6 +2040,315 @@ impl Job<'_> {
                 .parms
                 .iter()
                 .map(|p| format!("{:<10}  {:<10}  {:>6}  {}", p.kwd, p.ty, p.len, p.prompt))
+                .collect(),
+            ..Default::default()
+        }))
+    }
+
+    /// OVRDBF and OVRPRTF: at the current call level (OVRSCOPE(*JOB):
+    /// for the whole job, as the command line's are).
+    fn override_file(&mut self, cmd: &Command, kind: crate::ovr::Kind) -> Result<Outcome> {
+        let file = crate::catalog::validate_name("file", cmd.get("FILE")).or_else(|e| {
+            if cmd.get("FILE") == "*PRTF" {
+                Ok("*PRTF".to_string())
+            } else {
+                Err(e)
+            }
+        })?;
+        let tofile = match cmd.get("TOFILE") {
+            "*FILE" | "" => None,
+            t => Some(t.to_ascii_uppercase()),
+        };
+        let num = |k: &str| -> Result<Option<i32>> {
+            match cmd.get(k) {
+                "*NONE" | "" => Ok(None),
+                v => v.trim().parse().map(Some).map_err(|_| {
+                    anyhow!("CPF0006: Errors occurred in command. {k}({v}) is not a number.")
+                }),
+            }
+        };
+        let pagesize = match cmd.list("PAGESIZE").as_slice() {
+            [l, w, ..] => Some((
+                l.parse().map_err(|_| {
+                    anyhow!(
+                        "CPF0006: Errors occurred in command. PAGESIZE length {l} is not a number."
+                    )
+                })?,
+                w.parse().map_err(|_| {
+                    anyhow!(
+                        "CPF0006: Errors occurred in command. PAGESIZE width {w} is not a number."
+                    )
+                })?,
+            )),
+            _ => None,
+        };
+        let level = if cmd.get("OVRSCOPE") == "*JOB" {
+            0
+        } else {
+            self.calls.level()
+        };
+        crate::ovr::add(
+            &mut self.calls.overrides,
+            crate::ovr::Override {
+                level,
+                kind,
+                file,
+                tofile,
+                pagesize,
+                ovrflw: num("OVRFLW")?,
+                no_lvlchk: cmd.get("LVLCHK") == "*NO",
+            },
+        );
+        Ok(Outcome::Messages(vec![]))
+    }
+
+    /// DLTOVR: overrides of the current call level (LVL(*JOB): those for
+    /// the whole job).
+    fn dltovr(&mut self, cmd: &Command) -> Result<Outcome> {
+        let level = if cmd.get("LVL") == "*JOB" {
+            0
+        } else {
+            self.calls.level()
+        };
+        let files = cmd.list("FILE");
+        self.calls.overrides.retain(|o| {
+            o.level != level
+                || !files.iter().any(|f| {
+                    f == "*ALL"
+                        || (f == "*PRTF" && o.kind == crate::ovr::Kind::Printer)
+                        || f.eq_ignore_ascii_case(&o.file)
+                })
+        });
+        Ok(Outcome::Messages(vec![]))
+    }
+
+    /// CLRPFM: every record removed; the next record written is record 1.
+    async fn clrpfm(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (libs, name) = self.search(cmd.get("FILE"));
+        let lib_label = cmd
+            .get("FILE")
+            .split_once('/')
+            .map(|(l, _)| l)
+            .unwrap_or("*LIBL");
+        let name = name.to_ascii_uppercase();
+        let q = match libs.as_slice() {
+            [one] if cmd.get("FILE").contains('/') => format!("{one}/{name}"),
+            _ => name.clone(),
+        };
+        let fr = crate::catalog::resolve_file(self.client, &self.library_list(), &q)
+            .await
+            .map_err(|_| anyhow!("CPF3142: File {name} in library {lib_label} not found."))?;
+        if fr.file.view.is_some()
+            || !catalog::object_exists(
+                self.client,
+                std::slice::from_ref(&fr.library),
+                &name,
+                "*FILE",
+            )
+            .await?
+        {
+            bail!("CPF3142: File {name} in library {lib_label} not found.");
+        }
+        let lf: bool = self
+            .client
+            .query_opt(
+                "SELECT 1 FROM as4tainr.logical_files WHERE library=$1 AND name=$2",
+                &[&fr.library, &name],
+            )
+            .await?
+            .is_some();
+        if lf {
+            bail!(
+                "File {name} in library {} is not a physical file; CLRPFM clears physical files.",
+                fr.library
+            );
+        }
+        authority::check(
+            self.client,
+            &self.user,
+            &fr.library,
+            &name,
+            "*FILE",
+            Aut::Change,
+        )
+        .await?;
+        self.client
+            .batch_execute(&format!(
+                "TRUNCATE TABLE {}.{} RESTART IDENTITY",
+                catalog::ident(&fr.library),
+                catalog::ident(&name)
+            ))
+            .await?;
+        let mbr = match cmd.get("MBR") {
+            "*FIRST" | "*LAST" | "" => name.clone(),
+            m => m.to_ascii_uppercase(),
+        };
+        Ok(Outcome::Messages(vec![format!(
+            "Member {mbr} of file {name} in library {} cleared.",
+            fr.library
+        )]))
+    }
+
+    /// DLYJOB: wait a number of seconds, or until a time of day (RSMTIME
+    /// hhmmss, today or, when that time is past, tomorrow; times in UTC).
+    async fn dlyjob(&mut self, cmd: &Command) -> Result<Outcome> {
+        let secs: u64 = match (cmd.get("DLY"), cmd.get("RSMTIME")) {
+            (d, _) if d != "*NONE" && !d.is_empty() => d.trim().parse().map_err(|_| {
+                anyhow!("CPF0006: Errors occurred in command. DLY({d}) is not a number of seconds.")
+            })?,
+            (_, t) if t != "*NONE" && !t.is_empty() => {
+                let t: String = t.chars().filter(|c| c.is_ascii_digit()).collect();
+                if t.len() != 6 {
+                    bail!(
+                        "CPF0006: Errors occurred in command. RSMTIME({t}) is not a time hhmmss."
+                    );
+                }
+                let target = t[0..2].parse::<u64>()? * 3600
+                    + t[2..4].parse::<u64>()? * 60
+                    + t[4..6].parse::<u64>()?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() % 86400)
+                    .unwrap_or(0);
+                (target + 86400 - now) % 86400
+            }
+            _ => bail!("CPF0006: Errors occurred in command. DLY or RSMTIME is needed."),
+        };
+        if let Some(id) = &self.id {
+            jobs::set_function(self.client, id, "DLYJOB", "DLY").await;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        Ok(Outcome::Messages(vec![]))
+    }
+
+    /// CRTMSGF.
+    async fn crtmsgf(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = self.create_target(cmd.get("MSGF"));
+        let (lib, name) = (lib.to_ascii_uppercase(), name.to_ascii_uppercase());
+        let text = match cmd.get("TEXT") {
+            "*BLANK" => "",
+            t => t,
+        };
+        crate::msgf::create(self.client, &lib, &name, text).await?;
+        authority::set_owner(self.client, &lib, &name, "*MSGF", &self.user).await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Message file {name} created in library {lib}."
+        )]))
+    }
+
+    /// The library of a message file named on a command (CPF2407 when
+    /// there is none).
+    async fn message_file(&self, q: &str) -> Result<(String, String)> {
+        let (libs, name) = self.search(q);
+        let name = name.to_ascii_uppercase();
+        match crate::msgf::locate(self.client, &libs, &name).await? {
+            Some(lib) => Ok((lib, name)),
+            None => {
+                let lib = q.split_once('/').map(|(l, _)| l).unwrap_or("*LIBL");
+                bail!("CPF2407: Message file {name} in {lib} not found.")
+            }
+        }
+    }
+
+    /// DLTMSGF.
+    async fn dltmsgf(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = self.message_file(cmd.get("MSGF")).await?;
+        authority::check(self.client, &self.user, &lib, &name, "*MSGF", Aut::All).await?;
+        crate::msgf::delete(self.client, &lib, &name).await?;
+        authority::forget(self.client, &lib, &name, "*MSGF").await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Message file {name} deleted from library {lib}."
+        )]))
+    }
+
+    /// ADDMSGD, and CHGMSGD (`change`: *SAME keeps a value).
+    async fn addmsgd(&mut self, cmd: &Command, change: bool) -> Result<Outcome> {
+        let msgid = crate::msgf::check_msgid(cmd.get("MSGID"))?;
+        let (lib, name) = self.message_file(cmd.get("MSGF")).await?;
+        authority::check(self.client, &self.user, &lib, &name, "*MSGF", Aut::Change).await?;
+        let old = if change {
+            let all = crate::msgf::list(self.client, &lib, &name).await?;
+            Some(all.into_iter().find(|d| d.msgid == msgid).ok_or_else(|| {
+                anyhow!("CPF2419: Message identifier {msgid} not found in message file {name} in {lib}.")
+            })?)
+        } else {
+            None
+        };
+        let same = |v: &str| change && v == "*SAME";
+        let msg = match cmd.get("MSG") {
+            v if same(v) => old.as_ref().map(|d| d.msg.clone()).unwrap_or_default(),
+            v => v.to_string(),
+        };
+        let seclvl = match cmd.get("SECLVL") {
+            v if same(v) => old.as_ref().map(|d| d.seclvl.clone()).unwrap_or_default(),
+            "*NONE" => String::new(),
+            v => v.to_string(),
+        };
+        let sev = match cmd.get("SEV") {
+            v if same(v) => old.as_ref().map(|d| d.sev).unwrap_or(0),
+            v => match v.trim().parse::<i32>() {
+                Ok(n) if (0..=99).contains(&n) => n,
+                _ => bail!("CPF0006: Errors occurred in command. SEV({v}) is not 0-99."),
+            },
+        };
+        let fmt_vals = cmd.list("FMT");
+        let fmt = if fmt_vals.first().is_some_and(|v| same(v)) {
+            old.as_ref().map(|d| d.fmt.clone()).unwrap_or_default()
+        } else if fmt_vals.iter().any(|v| v.starts_with('(')) {
+            crate::msgf::parse_fmt(&fmt_vals)?
+        } else {
+            // FMT(*CHAR 10): one field written without its parentheses.
+            crate::msgf::parse_fmt(&[fmt_vals.join(" ")])?
+        };
+        let d = crate::msgf::Description {
+            library: lib.clone(),
+            msgf: name.clone(),
+            msgid: msgid.clone(),
+            msg,
+            seclvl,
+            sev,
+            fmt,
+        };
+        crate::msgf::add(self.client, &d, change).await?;
+        Ok(Outcome::Messages(vec![]))
+    }
+
+    /// RMVMSGD.
+    async fn rmvmsgd(&mut self, cmd: &Command) -> Result<Outcome> {
+        let msgid = crate::msgf::check_msgid(cmd.get("MSGID"))?;
+        let (lib, name) = self.message_file(cmd.get("MSGF")).await?;
+        authority::check(self.client, &self.user, &lib, &name, "*MSGF", Aut::Change).await?;
+        crate::msgf::remove(self.client, &lib, &name, &msgid).await?;
+        Ok(Outcome::Messages(vec![]))
+    }
+
+    /// DSPMSGD: the descriptions in a range of identifiers.
+    async fn dspmsgd(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = self.message_file(cmd.get("MSGF")).await?;
+        authority::check(self.client, &self.user, &lib, &name, "*MSGF", Aut::Use).await?;
+        let range = cmd.list("RANGE");
+        let (from, to) = match range.as_slice() {
+            [] => ("*FIRST".to_string(), "*LAST".to_string()),
+            [a] if a == "*ALL" || a == "*FIRST" => ("*FIRST".into(), "*LAST".into()),
+            [a] => (a.clone(), a.clone()),
+            [a, b, ..] => (a.clone(), b.clone()),
+        };
+        let ds: Vec<_> = crate::msgf::list(self.client, &lib, &name)
+            .await?
+            .into_iter()
+            .filter(|d| from == "*FIRST" || d.msgid >= from)
+            .filter(|d| to == "*LAST" || d.msgid <= to)
+            .collect();
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display Message Descriptions".into(),
+            info: vec![
+                ("Message file".into(), name.clone()),
+                ("Library".into(), lib.clone()),
+            ],
+            heading: format!("{:<7}  {:>3}  Message text", "Msg ID", "Sev"),
+            rows: ds
+                .iter()
+                .map(|d| format!("{:<7}  {:>3}  {}", d.msgid, format!("{:02}", d.sev), d.msg))
                 .collect(),
             ..Default::default()
         }))
@@ -2946,7 +3274,13 @@ impl Job<'_> {
                     .await?;
                 match p.attribute.as_str() {
                     "CLLE" | "CLP" => {
-                        let mut program = crate::clpgm::compile(&name, &p.source)?;
+                        let mut program = crate::clpgm::compile_in(
+                            self.client,
+                            &self.library_list(),
+                            &name,
+                            &p.source,
+                        )
+                        .await?;
                         // An ILE CL program bound to modules and service
                         // programs: for CALLPRC.
                         program.object = format!("{}/{}", p.library, name);
@@ -3014,6 +3348,7 @@ impl Job<'_> {
                 env: self.env.clone(),
                 curlib: self.curlib.clone(),
                 user_libl: self.libl.clone(),
+                overrides: self.calls.overrides.clone(),
             }),
             pgm.to_string(),
             source,

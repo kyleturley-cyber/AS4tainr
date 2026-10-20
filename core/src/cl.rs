@@ -553,6 +553,469 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[p("CMD", Kind::Qualified, true, None, "Command").ch("Name")],
     },
     CommandDef {
+        name: "OVRDBF",
+        description: "Override with Data Base File",
+        params: &[
+            p("FILE", Kind::Name, true, None, "File being overridden").ch("Name"),
+            p(
+                "TOFILE",
+                Kind::Qualified,
+                false,
+                Some("*FILE"),
+                "Overriding to data base file",
+            )
+            .ch("Name, *FILE"),
+            p(
+                "MBR",
+                Kind::Name,
+                false,
+                Some("*FIRST"),
+                "Overriding member",
+            )
+            .ch("Name, *FIRST, *LAST, *ALL"),
+            p(
+                "POSITION",
+                Kind::List,
+                false,
+                Some("*NONE"),
+                "Starting position in file",
+            )
+            .ch("*NONE, *START, *END, *RRN, *KEYB..."),
+            p(
+                "RCDFMTLCK",
+                Kind::List,
+                false,
+                Some("*NONE"),
+                "Record format lock",
+            )
+            .keyword_only(),
+            p(
+                "FRCRATIO",
+                Kind::Text,
+                false,
+                Some("*NONE"),
+                "Records retrieved at once",
+            )
+            .keyword_only(),
+            p(
+                "WAITFILE",
+                Kind::Text,
+                false,
+                Some("*IMMED"),
+                "Maximum file wait time",
+            )
+            .keyword_only(),
+            p(
+                "WAITRCD",
+                Kind::Text,
+                false,
+                Some("*NOMAX"),
+                "Maximum record wait time",
+            )
+            .keyword_only(),
+            p(
+                "NBRRCDS",
+                Kind::Text,
+                false,
+                Some("*NONE"),
+                "Records retrieved at once",
+            )
+            .keyword_only(),
+            p(
+                "EOFDLY",
+                Kind::Text,
+                false,
+                Some("*NONE"),
+                "EOF retry delay in seconds",
+            )
+            .keyword_only(),
+            p(
+                "LVLCHK",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "Record format level check",
+            )
+            .keyword_only(),
+            p(
+                "EXPCHK",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "Expiration date check",
+            )
+            .keyword_only(),
+            p("INHWRT", Kind::Name, false, Some("*NONE"), "Inhibit write").keyword_only(),
+            p(
+                "SECURE",
+                Kind::Name,
+                false,
+                Some("*NO"),
+                "Secure from other overrides",
+            )
+            .keyword_only(),
+            p(
+                "OVRSCOPE",
+                Kind::Name,
+                false,
+                Some("*ACTGRPDFN"),
+                "Override scope",
+            )
+            .ch("*ACTGRPDFN, *CALLLVL, *JOB")
+            .keyword_only(),
+            p(
+                "SHARE",
+                Kind::Name,
+                false,
+                Some("*NO"),
+                "Share open data path",
+            )
+            .keyword_only(),
+            p("OPNSCOPE", Kind::Name, false, Some("*NONE"), "Open scope").keyword_only(),
+            p(
+                "SEQONLY",
+                Kind::List,
+                false,
+                Some("*NONE"),
+                "Limit to sequential only",
+            )
+            .keyword_only(),
+            p(
+                "DSTDTA",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "Distribute data",
+            )
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "OVRPRTF",
+        description: "Override with Printer File",
+        params: &[
+            p("FILE", Kind::Name, true, None, "File being overridden").ch("Name, *PRTF"),
+            p(
+                "TOFILE",
+                Kind::Qualified,
+                false,
+                Some("*FILE"),
+                "Overriding to printer file",
+            )
+            .ch("Name, *FILE"),
+            p("DEV", Kind::Name, false, Some("*NONE"), "Device").keyword_only(),
+            p("PAGESIZE", Kind::List, false, Some("*NONE"), "Page size")
+                .ch("length width")
+                .keyword_only(),
+            p("LPI", Kind::Text, false, Some("*NONE"), "Lines per inch").keyword_only(),
+            p(
+                "CPI",
+                Kind::Text,
+                false,
+                Some("*NONE"),
+                "Characters per inch",
+            )
+            .keyword_only(),
+            p(
+                "OVRFLW",
+                Kind::Text,
+                false,
+                Some("*NONE"),
+                "Overflow line number",
+            )
+            .keyword_only(),
+            p(
+                "OUTQ",
+                Kind::Qualified,
+                false,
+                Some("*NONE"),
+                "Output queue",
+            )
+            .keyword_only(),
+            p("FORMTYPE", Kind::List, false, Some("*NONE"), "Form type").keyword_only(),
+            p("COPIES", Kind::Text, false, Some("*NONE"), "Copies").keyword_only(),
+            p(
+                "HOLD",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "Hold spooled file",
+            )
+            .keyword_only(),
+            p(
+                "SAVE",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "Save spooled file",
+            )
+            .keyword_only(),
+            p(
+                "SPLFNAME",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "Spooled file name",
+            )
+            .keyword_only(),
+            p("USRDTA", Kind::Text, false, Some("*NONE"), "User data").keyword_only(),
+            p(
+                "SECURE",
+                Kind::Name,
+                false,
+                Some("*NO"),
+                "Secure from other overrides",
+            )
+            .keyword_only(),
+            p(
+                "OVRSCOPE",
+                Kind::Name,
+                false,
+                Some("*ACTGRPDFN"),
+                "Override scope",
+            )
+            .ch("*ACTGRPDFN, *CALLLVL, *JOB")
+            .keyword_only(),
+            p(
+                "SHARE",
+                Kind::Name,
+                false,
+                Some("*NO"),
+                "Share open data path",
+            )
+            .keyword_only(),
+            p("OPNSCOPE", Kind::Name, false, Some("*NONE"), "Open scope").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "DLTOVR",
+        description: "Delete Override",
+        params: &[
+            p("FILE", Kind::List, true, None, "Overridden file").ch("Name, *ALL, *PRTF"),
+            p("LVL", Kind::Name, false, Some("*"), "Call level").ch("*, *ACTGRPDFN, *JOB"),
+        ],
+    },
+    CommandDef {
+        name: "CLRPFM",
+        description: "Clear Physical File Member",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "Physical file").ch("Name"),
+            p("MBR", Kind::Name, false, Some("*FIRST"), "Member").ch("Name, *FIRST, *LAST"),
+        ],
+    },
+    CommandDef {
+        name: "DLYJOB",
+        description: "Delay Job",
+        params: &[
+            p("DLY", Kind::Text, false, Some("*NONE"), "Delay time, or").ch("Seconds"),
+            p("RSMTIME", Kind::Text, false, Some("*NONE"), "Resume time").ch("Time, *NONE"),
+        ],
+    },
+    CommandDef {
+        name: "CRTMSGF",
+        description: "Create Message File",
+        params: &[
+            p("MSGF", Kind::Qualified, true, None, "Message file").ch("Name"),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*BLANK"),
+                "Text 'description'",
+            ),
+            p(
+                "SIZE",
+                Kind::List,
+                false,
+                Some("*NOMAX"),
+                "Initial storage size",
+            )
+            .keyword_only(),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority").keyword_only(),
+            p(
+                "CCSID",
+                Kind::Text,
+                false,
+                Some("*HEX"),
+                "Coded character set ID",
+            )
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "DLTMSGF",
+        description: "Delete Message File",
+        params: &[p("MSGF", Kind::Qualified, true, None, "Message file").ch("Name")],
+    },
+    CommandDef {
+        name: "ADDMSGD",
+        description: "Add Message Description",
+        params: &[
+            p("MSGID", Kind::Name, true, None, "Message identifier").ch("Name"),
+            p("MSGF", Kind::Qualified, true, None, "Message file").ch("Name"),
+            p("MSG", Kind::Text, true, None, "First-level message text"),
+            p(
+                "SECLVL",
+                Kind::Text,
+                false,
+                Some("*NONE"),
+                "Second-level message text",
+            ),
+            p("SEV", Kind::Text, false, Some("00"), "Severity code").ch("0-99"),
+            p(
+                "FMT",
+                Kind::List,
+                false,
+                Some("*NONE"),
+                "Message data fields formats",
+            )
+            .keyword_only(),
+            p("TYPE", Kind::Name, false, Some("*NONE"), "Reply type").keyword_only(),
+            p(
+                "LEN",
+                Kind::List,
+                false,
+                Some("*TYPE"),
+                "Maximum reply length",
+            )
+            .keyword_only(),
+            p(
+                "VALUES",
+                Kind::List,
+                false,
+                Some("*NONE"),
+                "Valid reply values",
+            )
+            .keyword_only(),
+            p(
+                "DFT",
+                Kind::Text,
+                false,
+                Some("*NONE"),
+                "Default reply value",
+            )
+            .keyword_only(),
+            p("ALROPT", Kind::List, false, Some("*NO"), "Alert options").keyword_only(),
+            p("LOGPRB", Kind::Name, false, Some("*NO"), "Log problem").keyword_only(),
+            p(
+                "CCSID",
+                Kind::Text,
+                false,
+                Some("*JOB"),
+                "Coded character set ID",
+            )
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CHGMSGD",
+        description: "Change Message Description",
+        params: &[
+            p("MSGID", Kind::Name, true, None, "Message identifier").ch("Name"),
+            p("MSGF", Kind::Qualified, true, None, "Message file").ch("Name"),
+            p(
+                "MSG",
+                Kind::Text,
+                false,
+                Some("*SAME"),
+                "First-level message text",
+            ),
+            p(
+                "SECLVL",
+                Kind::Text,
+                false,
+                Some("*SAME"),
+                "Second-level message text",
+            ),
+            p("SEV", Kind::Text, false, Some("*SAME"), "Severity code").ch("0-99, *SAME"),
+            p(
+                "FMT",
+                Kind::List,
+                false,
+                Some("*SAME"),
+                "Message data fields formats",
+            )
+            .keyword_only(),
+            p("TYPE", Kind::Name, false, Some("*SAME"), "Reply type").keyword_only(),
+            p(
+                "LEN",
+                Kind::List,
+                false,
+                Some("*SAME"),
+                "Maximum reply length",
+            )
+            .keyword_only(),
+            p(
+                "VALUES",
+                Kind::List,
+                false,
+                Some("*SAME"),
+                "Valid reply values",
+            )
+            .keyword_only(),
+            p(
+                "DFT",
+                Kind::Text,
+                false,
+                Some("*SAME"),
+                "Default reply value",
+            )
+            .keyword_only(),
+            p("ALROPT", Kind::List, false, Some("*SAME"), "Alert options").keyword_only(),
+            p("LOGPRB", Kind::Name, false, Some("*SAME"), "Log problem").keyword_only(),
+            p(
+                "CCSID",
+                Kind::Text,
+                false,
+                Some("*SAME"),
+                "Coded character set ID",
+            )
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "RMVMSGD",
+        description: "Remove Message Description",
+        params: &[
+            p("MSGID", Kind::Name, true, None, "Message identifier").ch("Name"),
+            p("MSGF", Kind::Qualified, true, None, "Message file").ch("Name"),
+        ],
+    },
+    CommandDef {
+        name: "DSPMSGD",
+        description: "Display Message Description",
+        params: &[
+            p(
+                "RANGE",
+                Kind::List,
+                false,
+                Some("*FIRST"),
+                "Range of message identifiers",
+            )
+            .ch("Name, *FIRST, *ALL"),
+            p(
+                "MSGF",
+                Kind::Qualified,
+                false,
+                Some("QCPFMSG"),
+                "Message file",
+            )
+            .ch("Name"),
+            p("DETAIL", Kind::Name, false, Some("*FULL"), "Detail").ch("*FULL, *BASIC"),
+            p(
+                "FMTTXT",
+                Kind::Name,
+                false,
+                Some("*YES"),
+                "Format message text",
+            )
+            .keyword_only(),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output")
+                .ch("*, *PRINT")
+                .keyword_only(),
+        ],
+    },
+    CommandDef {
         name: "DLTMNU",
         description: "Delete Menu",
         params: &[p("MENU", Kind::Qualified, true, None, "Menu").ch("Name")],
@@ -1609,6 +2072,7 @@ pub static GROUPS: &[Group] = &[
             "ENDJOB",
             "SNDMSG",
             "DSPMSG",
+            "DLYJOB",
         ],
     },
     Group {
@@ -1656,6 +2120,18 @@ pub static GROUPS: &[Group] = &[
         item: "Command definition commands",
         title: "Command Definition Commands",
         commands: &["CRTCMD", "DLTCMD", "DSPCMD"],
+    },
+    Group {
+        item: "File override commands",
+        title: "File Override Commands",
+        commands: &["OVRDBF", "OVRPRTF", "DLTOVR", "CLRPFM"],
+    },
+    Group {
+        item: "Message file commands",
+        title: "Message File Commands",
+        commands: &[
+            "CRTMSGF", "DLTMSGF", "ADDMSGD", "CHGMSGD", "RMVMSGD", "DSPMSGD",
+        ],
     },
     Group {
         item: "Binder language",

@@ -217,6 +217,10 @@ pub async fn init(client: &Client) -> Result<()> {
             .await
             .context("creating catalog")?;
         client
+            .batch_execute(crate::msgf::DDL)
+            .await
+            .context("creating catalog")?;
+        client
             .batch_execute(crate::menus::DDL)
             .await
             .context("creating catalog")?;

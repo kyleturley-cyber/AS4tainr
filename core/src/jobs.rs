@@ -592,6 +592,7 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
         libl: info.libl.clone(),
         display: None,
         id: Some(id.clone()),
+        calls: Default::default(),
     };
     let first = info
         .command

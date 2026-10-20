@@ -43,7 +43,8 @@ async fn setup(url: &str) -> (Client, String) {
             "DROP SCHEMA IF EXISTS {} CASCADE; DELETE FROM as4tainr.objects WHERE library='{lib}' OR name='{lib}';
              DELETE FROM as4tainr.files WHERE library='{lib}'; DELETE FROM as4tainr.file_fields WHERE library='{lib}';
              DELETE FROM as4tainr.file_keys WHERE library='{lib}';
-             DELETE FROM as4tainr.data_areas WHERE library='{lib}';",
+             DELETE FROM as4tainr.data_areas WHERE library='{lib}';
+             DELETE FROM as4tainr.message_descriptions WHERE library='{lib}';",
             catalog::ident(&lib)
         ))
         .await
@@ -722,6 +723,7 @@ async fn job_library_list_commands() {
         libl: vec!["QGPL".into(), "QTEMP".into()],
         display: None,
         id: None,
+        calls: Default::default(),
     };
     let types = |job: &Job| -> Vec<String> {
         job.library_list_entries()
@@ -1160,7 +1162,9 @@ async fn cl_job_run(
     use as4tainr_core::commands::{Environment, Job, Outcome};
     let mut c = runtime::connect_db(url).await.unwrap();
     for (name, src) in pgms {
-        as4tainr_core::clpgm::compile(name, src).unwrap();
+        as4tainr_core::clpgm::compile_in(client, &[lib.to_string()], name, src)
+            .await
+            .unwrap();
         catalog::create_cl_program(&mut c, lib, name, "", src, true)
             .await
             .unwrap();
@@ -1176,11 +1180,401 @@ async fn cl_job_run(
         libl: vec![lib.to_string()],
         display: None,
         id: None,
+        calls: Default::default(),
     };
     match job.run(call).await? {
         Outcome::Messages(m) => Ok(m),
         other => panic!("unexpected {other:?}"),
     }
+}
+
+/// Message files and program messages (IBM CL reference: CRTMSGF,
+/// ADDMSGD, SNDPGMMSG, RCVMSG, RTVMSG, MONMSG). ADDMSGD FMT: *CHAR data
+/// without trailing blanks, *DEC with its decimal positions; a second
+/// ADDMSGD of the same identifier fails with CPF2412. SNDPGMMSG sends to
+/// the caller's queue (TOPGMQ(*PRV)) by default; *SAME stays on the
+/// sender's own queue; an *ESCAPE to the caller ends the sender and is an
+/// exception the caller's MONMSG handles, then RCVMSG MSGTYPE(*EXCP)
+/// receives it with RTNTYPE '15' (escape); a *DIAG has RTNTYPE '02'. With
+/// no message, RCVMSG sets the variables to blanks. RMV(*NO) leaves an
+/// old message, which *ANY does not receive again but its key does.
+#[tokio::test]
+async fn cl_message_files_and_program_messages() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let setup_pgm = format!(
+        "PGM
+  CRTMSGF MSGF({lib}/APPMSG) TEXT('App messages')
+  ADDMSGD MSGID(APP0001) MSGF(APPMSG) MSG('Customer &1 owes &2.') SEV(30) +
+    FMT((*CHAR 10) (*DEC 7 2))
+  ADDMSGD MSGID(APP0002) MSGF(APPMSG) MSG('Order &1 cannot be filled.') +
+    SECLVL('Check the stock of order &1.') SEV(40) FMT((*CHAR 5))
+  ADDMSGD MSGID(APP0002) MSGF(APPMSG) MSG('again')
+  MONMSG CPF2412 EXEC(SNDPGMMSG MSG('duplicate refused'))
+ENDPGM"
+    );
+    let m = cl_job_run(
+        &client,
+        &url,
+        &lib,
+        &[("MSGSETUP", &setup_pgm)],
+        "CALL MSGSETUP",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        m,
+        [
+            format!("Message file APPMSG created in library {lib}."),
+            "duplicate refused".to_string()
+        ]
+    );
+    let sender = "PGM
+  DCL &DATA *CHAR 14
+  DCL &NAME *CHAR 10 STG(*DEFINED) DEFVAR(&DATA 1)
+  DCL &AMT *DEC (7 2) STG(*DEFINED) DEFVAR(&DATA 11)
+  CHGVAR &NAME 'ACME'
+  CHGVAR &AMT 128.5
+  SNDPGMMSG MSGID(APP0001) MSGF(APPMSG) MSGDTA(&DATA) MSGTYPE(*DIAG)
+  SNDPGMMSG MSG('kept here') TOPGMQ(*SAME)
+  SNDPGMMSG MSGID(APP0002) MSGF(APPMSG) MSGDTA('ORD42') MSGTYPE(*ESCAPE)
+  SNDPGMMSG MSG('not reached')
+ENDPGM";
+    let main = "PGM
+  DCL &MSG *CHAR 80
+  DCL &ID *CHAR 7
+  DCL &DTA *CHAR 20
+  DCL &F *CHAR 10
+  DCL &FL *CHAR 10
+  DCL &SEV *DEC (2 0)
+  DCL &RT *CHAR 2
+  DCL &LEN *DEC (5 0)
+  DCL &KEY *CHAR 4
+  DCL &SL *CHAR 80
+  CALL MSGSEND
+  MONMSG APP0000 EXEC(DO)
+    RCVMSG MSGTYPE(*EXCP) MSG(&MSG) MSGID(&ID) MSGDTA(&DTA) MSGF(&F) +
+      MSGFLIB(&FL) SEV(&SEV) RTNTYPE(&RT) SECLVL(&SL)
+    SNDPGMMSG MSG('excp' *BCAT &ID *BCAT &RT *BCAT %CHAR(&SEV) *BCAT &F *BCAT +
+      %TRIM(&DTA) *BCAT %TRIM(&MSG) *BCAT %TRIM(&SL))
+    IF (&FL *NE ' ') THEN(SNDPGMMSG MSG('library known'))
+  ENDDO
+  RCVMSG MSGTYPE(*DIAG) MSG(&MSG) MSGLEN(&LEN) SEV(&SEV) RTNTYPE(&RT)
+  SNDPGMMSG MSG('diag' *BCAT &RT *BCAT %CHAR(&SEV) *BCAT %CHAR(&LEN) *BCAT %TRIM(&MSG))
+  RCVMSG MSGTYPE(*ANY) MSGID(&ID) MSG(&MSG) KEYVAR(&KEY) SEV(&SEV)
+  IF ((&KEY *EQ ' ') *AND (&SEV *EQ 0)) THEN(SNDPGMMSG MSG('queue empty'))
+  RTVMSG MSGID(APP0002) MSGF(APPMSG) MSGDTA('X1   ') MSG(&MSG) SEV(&SEV)
+  SNDPGMMSG MSG(%TRIM(&MSG) *BCAT %CHAR(&SEV))
+  SNDPGMMSG MSG('one') TOPGMQ(*SAME) KEYVAR(&KEY)
+  RCVMSG MSGTYPE(*ANY) RMV(*NO) MSG(&MSG)
+  RCVMSG MSGTYPE(*ANY) MSG(&MSG)
+  IF (&MSG *EQ ' ') THEN(SNDPGMMSG MSG('old not received'))
+  RCVMSG MSGKEY(&KEY) MSG(&MSG)
+  SNDPGMMSG MSG('by key' *BCAT &MSG)
+  CHKOBJ OBJ(NOSUCH) OBJTYPE(*FILE)
+  MONMSG CPF9801 EXEC(DO)
+    RCVMSG MSGTYPE(*EXCP) MSGID(&ID) MSGF(&F)
+    SNDPGMMSG MSG('chk' *BCAT &ID *BCAT &F)
+  ENDDO
+ENDPGM";
+    let m = cl_job_run(
+        &client,
+        &url,
+        &lib,
+        &[("MSGSEND", sender), ("MSGMAIN", main)],
+        "CALL MSGMAIN",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        m,
+        [
+            "excp APP0002 15 40 APPMSG ORD42 Order ORD42 cannot be filled. Check the stock of order ORD42.",
+            "library known",
+            "diag 02 30 26 Customer ACME owes 128.50.",
+            "queue empty",
+            "Order X1 cannot be filled. 40",
+            "old not received",
+            "by key one",
+            "chk CPF9801 QCPFMSG",
+        ]
+    );
+    // An exception received and resent as an escape keeps its text.
+    let resend = "PGM
+  DCL &ID *CHAR 7
+  DCL &D *CHAR 100
+  DCL &F *CHAR 10
+  DCL &FL *CHAR 10
+  CHKOBJ OBJ(NOSUCH) OBJTYPE(*FILE)
+  MONMSG CPF0000 EXEC(DO)
+    RCVMSG MSGTYPE(*EXCP) MSGID(&ID) MSGDTA(&D) MSGF(&F) MSGFLIB(&FL)
+    SNDPGMMSG MSGID(&ID) MSGF(&FL/&F) MSGDTA(&D) MSGTYPE(*ESCAPE)
+  ENDDO
+ENDPGM";
+    let e = cl_job_run(
+        &client,
+        &url,
+        &lib,
+        &[("MSGRESND", resend)],
+        "CALL MSGRESND",
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        e.starts_with("CPF9801: Object NOSUCH in library *LIBL not found."),
+        "{e}"
+    );
+    // A message file that does not exist.
+    let e = cl_job_run(
+        &client,
+        &url,
+        &lib,
+        &[(
+            "MSGNOF",
+            "PGM\n SNDPGMMSG MSGID(APP0001) MSGF(NOSUCHF) MSGTYPE(*INFO)\nENDPGM",
+        )],
+        "CALL MSGNOF",
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("CPF2407"), "{e}");
+}
+
+/// Files in CL programs (IBM CL reference: DCLF, RCVF, SNDRCVF, CLOSE).
+/// DCLF declares a CL variable for each field (with OPNID, named
+/// &OPNID_FIELD); RCVF reads the next record in the file's access path
+/// (CUSTMAST is keyed by CUSNO); at the end of the file RCVF sends
+/// CPF0864 and the variables keep the last record's values; CLOSE lets
+/// the next RCVF start again at the first record. A display file's
+/// fields and indicators &IN01-&IN99 are variables: SNDRCVF shows a
+/// record format with them and takes back what was typed and the
+/// response indicators (CA03 sets 03).
+#[tokio::test]
+async fn cl_files_dclf_rcvf_sndrcvf() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let reader = "PGM
+  DCLF FILE(CUSTMAST)
+  DCLF FILE(CUSTMAST) OPNID(SECOND)
+  DCL &N *DEC (3 0)
+  DCL &T *DEC (11 2)
+LOOP:
+  RCVF
+  MONMSG CPF0864 EXEC(GOTO DONE)
+  CHGVAR &N (&N + 1)
+  CHGVAR &T (&T + &CUSBAL)
+  GOTO LOOP
+DONE:
+  SNDPGMMSG MSG(%CHAR(&N) *BCAT %CHAR(&T) *BCAT %TRIM(&CUSNAM))
+  RCVF OPNID(SECOND)
+  SNDPGMMSG MSG(%CHAR(&SECOND_CUSNO) *BCAT %TRIM(&SECOND_CUSCTY))
+  CLOSE
+  RCVF
+  SNDPGMMSG MSG('again' *BCAT %CHAR(&CUSNO))
+ENDPGM";
+    let m = cl_job_run(&client, &url, &lib, &[("CLREAD", reader)], "CALL CLREAD")
+        .await
+        .unwrap();
+    // 0 + 1250.50 - 75.25 + 310.00 + 9999999.99 (samples/data/CUSTMAST.csv).
+    assert_eq!(
+        m,
+        ["5 10001485.24 Lake, Pine & Co", "1 Des Moines", "again 1"]
+    );
+    // A file that is not there: the program is not created.
+    let e = as4tainr_core::clpgm::compile_in(
+        &client,
+        std::slice::from_ref(&lib),
+        "CLNOF",
+        "PGM\n DCLF NOSUCHF\nENDPGM",
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("NOSUCHF"), "{e}");
+
+    // A display file.
+    let mut c = runtime::connect_db(&url).await.unwrap();
+    catalog::create_display_file(
+        &mut c,
+        &lib,
+        "CUSTINQD",
+        include_str!("../../samples/qddssrc/CUSTINQD.dspf"),
+    )
+    .await
+    .unwrap();
+    let inq = "PGM
+  DCLF FILE(CUSTINQD)
+  DCLF FILE(CUSTMAST) OPNID(C)
+  CHGVAR &IN30 '1'
+  SNDRCVF RCDFMT(PROMPT)
+  CHGVAR &IN30 '0'
+LOOP:
+  RCVF OPNID(C)
+  IF COND(&C_CUSNO *NE &CUSNUM) THEN(GOTO LOOP)
+  CHGVAR &CUSNAM &C_CUSNAM
+  CHGVAR &CUSCTY &C_CUSCTY
+  CHGVAR &CUSBAL &C_CUSBAL
+  SNDRCVF RCDFMT(DETAIL)
+  IF COND(&IN03) THEN(SNDPGMMSG MSG('F3 pressed for' *BCAT %TRIM(&CUSNAM)))
+ENDPGM";
+    catalog::create_cl_program(&mut c, &lib, "CLINQ", "", inq, true)
+        .await
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<runtime::DisplayRequest>(1);
+    let screens = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        while let Some(req) = rx.recv().await {
+            let top = req.frame.layers.last().unwrap();
+            seen.push((
+                top.format.clone(),
+                top.ind[30],
+                top.values.get("CUSNAM").map(|v| v.trim_end().to_string()),
+                top.values.get("CUSBAL").cloned(),
+            ));
+            let mut r = as4tainr_core::dspf::Response {
+                aid: "ENTER".into(),
+                values: Default::default(),
+                indicators: Default::default(),
+                changed: Default::default(),
+            };
+            if top.format == "PROMPT" {
+                r.values.insert("CUSNUM".into(), "2".into());
+            } else {
+                r.aid = "F3".into();
+                r.indicators.insert(3, true);
+            }
+            let _ = req.reply.send(Ok(r));
+        }
+        seen
+    });
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: None,
+        libl: vec![lib.clone()],
+        display: Some(tx),
+        id: None,
+        calls: Default::default(),
+    };
+    let out = job.run("CALL CLINQ").await.unwrap();
+    drop(job);
+    let seen = screens.await.unwrap();
+    match out {
+        Outcome::Messages(m) => assert_eq!(m, ["F3 pressed for Midwest Fasteners"]),
+        other => panic!("unexpected {other:?}"),
+    }
+    assert_eq!(
+        seen,
+        [
+            ("PROMPT".to_string(), true, None, None),
+            (
+                "DETAIL".to_string(),
+                false,
+                Some("Midwest Fasteners".to_string()),
+                Some("310.00".to_string())
+            ),
+        ]
+    );
+}
+
+/// File overrides and small job commands (IBM CL reference: OVRDBF,
+/// DLTOVR, CLRPFM, RTVSYSVAL, DLYJOB). OVRDBF TOFILE makes the programs
+/// of its call level and those it calls open the other file (an RPG
+/// program called after it, a CL RCVF opened after it); DLTOVR removes
+/// it; an override ends when the program that made it returns. CLRPFM
+/// removes every record. A file of another record format is refused with
+/// CPF4131 (level check) unless LVLCHK(*NO). RTVSYSVAL returns the
+/// shipped values: QDATFMT MDY, QCCSID 65535; QDAYOFWEEK is *xxx.
+#[tokio::test]
+async fn cl_overrides_clrpfm_rtvsysval() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let (_, lib2) = setup(&url).await;
+    let mut c = runtime::connect_db(&url).await.unwrap();
+    let counter = "**FREE
+dcl-f CUSTMAST keyed;
+dcl-s n packed(5:0);
+read CUSTMAST;
+dow not %eof(CUSTMAST);
+  n += 1;
+  read CUSTMAST;
+enddo;
+dsply ('count ' + %char(n));
+*inlr = *on;
+";
+    catalog::create_program(&mut c, &lib, "CNTCUST", "RPGLE", "", counter, true)
+        .await
+        .unwrap();
+    let inner = format!(
+        "PGM
+  OVRDBF FILE(CUSTMAST) TOFILE({lib2}/CUSTMAST)
+  CALL CNTCUST
+ENDPGM"
+    );
+    let main = format!(
+        "PGM
+  DCLF FILE(CUSTMAST)
+  DCL &FMT *CHAR 3
+  DCL &CC *DEC (5 0)
+  DCL &DOW *CHAR 4
+  CLRPFM FILE({lib2}/CUSTMAST)
+  CALL OVRINNER
+  CALL CNTCUST
+  OVRDBF FILE(CUSTMAST) TOFILE({lib2}/CUSTMAST)
+  RCVF
+  MONMSG CPF0864 EXEC(SNDPGMMSG MSG('overridden file is empty'))
+  CALL CNTCUST
+  DLTOVR FILE(CUSTMAST)
+  CLOSE
+  RCVF
+  SNDPGMMSG MSG('back to' *BCAT %CHAR(&CUSNO))
+  CALL CNTCUST
+  OVRDBF FILE(CUSTMAST) TOFILE({lib}/ORDLIN)
+  CLOSE
+  RCVF
+  MONMSG CPF4131 EXEC(SNDPGMMSG MSG('level check'))
+  RTVSYSVAL QDATFMT &FMT
+  RTVSYSVAL SYSVAL(QCCSID) RTNVAR(&CC)
+  RTVSYSVAL QDAYOFWEEK &DOW
+  SNDPGMMSG MSG(&FMT *BCAT %CHAR(&CC) *BCAT %SST(&DOW 1 1))
+  RTVSYSVAL QNOSUCH &FMT
+  MONMSG CPF1028 EXEC(SNDPGMMSG MSG('no such system value'))
+  DLYJOB DLY(1)
+ENDPGM"
+    );
+    let started = std::time::Instant::now();
+    let m = cl_job_run(
+        &client,
+        &url,
+        &lib,
+        &[("OVRINNER", &inner), ("OVRMAIN", &main)],
+        "CALL OVRMAIN",
+    )
+    .await
+    .unwrap();
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    assert_eq!(
+        m,
+        [
+            format!("Member CUSTMAST of file CUSTMAST in library {lib2} cleared."),
+            "DSPLY  count 0".to_string(),
+            "DSPLY  count 5".to_string(),
+            "overridden file is empty".to_string(),
+            "DSPLY  count 0".to_string(),
+            "back to 1".to_string(),
+            "DSPLY  count 5".to_string(),
+            "level check".to_string(),
+            "MDY 65535 *".to_string(),
+            "no such system value".to_string(),
+        ]
+    );
 }
 
 /// CL programs (IBM CL reference): loops with LEAVE and ITERATE, DOUNTIL
@@ -1356,6 +1750,7 @@ async fn job_run(
         libl: vec![lib.to_string()],
         display: None,
         id: None,
+        calls: Default::default(),
     };
     job.run(line).await
 }
@@ -1557,6 +1952,7 @@ async fn submitted_jobs_run_in_qbatch() {
         libl: vec![lib.clone()],
         display: None,
         id: Some(id.clone()),
+        calls: Default::default(),
     };
     let msg = |o: Outcome| match o {
         Outcome::Messages(m) => m.join("\n"),
@@ -1822,6 +2218,7 @@ async fn spooled_files() {
         libl: vec![lib.clone()],
         display: None,
         id: Some(id.clone()),
+        calls: Default::default(),
     };
 
     // Pages: lines land where they were printed; gaps are blank lines.
@@ -2018,6 +2415,7 @@ async fn object_authority() {
         libl: vec![lib.clone()],
         display: None,
         id: None,
+        calls: Default::default(),
     };
     let mut sec = job_for("QSECOFR");
     let mut b = job_for(&bob);
@@ -2169,6 +2567,7 @@ async fn menus_and_initial_menu() {
         libl: vec![lib.clone()],
         display: Some(tx.clone()),
         id: None,
+        calls: Default::default(),
     };
 
     sec.run(&format!("CRTUSRPRF {user} PASSWORD(*NONE)"))
@@ -2220,6 +2619,7 @@ async fn menus_and_initial_menu() {
         libl: vec![lib.clone()],
         display: Some(tx.clone()),
         id: None,
+        calls: Default::default(),
     };
     let e = u.run("GO ORDERS").await.unwrap_err().to_string();
     assert!(e.starts_with("CPF9802"), "{e}");
@@ -2232,6 +2632,7 @@ async fn menus_and_initial_menu() {
         libl: vec![lib.clone()],
         display: None,
         id: None,
+        calls: Default::default(),
     };
     assert!(batch.run("GO MAIN").await.is_err());
     assert!(batch.run("CALL QCMD").await.is_err());
@@ -2266,6 +2667,7 @@ async fn import_an_application() {
         libl: vec![],
         display: None,
         id: None,
+        calls: Default::default(),
     };
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../samples/apps/contacts");
     let report = import::import(&mut job, &dir, &lib).await.unwrap();
@@ -2383,6 +2785,7 @@ async fn native_rpg_engine_runs_a_program() {
         libl: vec![],
         display: None,
         id: None,
+        calls: Default::default(),
     };
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../samples/apps/contacts");
     import::import(&mut job, &dir, &lib).await.unwrap();
@@ -2586,6 +2989,7 @@ async fn native_rpg_engine_runs_a_program() {
             },
             curlib: None,
             user_libl: vec![lib.clone()],
+            overrides: vec![],
         }),
         "SYSAPI".into(),
         "**FREE\ndcl-pr qcmdexc extpgm('QCMDEXC');\n  cmd char(3000) const;\n  len packed(15:5) const;\nend-pr;\ndcl-pr xlate extpgm('QDCXLATE');\n  len packed(5:0) const;\n  data char(10);\n  table char(10) const;\nend-pr;\ndcl-pr printf int(10) extproc('Qp0zLprintf');\n  fmt pointer value options(*string);\n  a1 pointer value options(*string:*nopass);\n  a2 int(10) value options(*nopass);\nend-pr;\ndcl-s d char(2) inz('AB');\nqcmdexc('CRTLIB LIB(RPGLIB1)': 19);\nmonitor;\n  qcmdexc('CRTLIB LIB(RPGLIB1)': 19);\non-error;\n  dsply 'CRTLIB failed';\nendmon;\nxlate(2: d: 'QTCPASC');\nif d = x'4142';\n  dsply 'ascii';\nendif;\nxlate(2: d: 'QTCPEBC');\ndsply d;\nprintf('%s has %d items' + x'25': 'cart': 3);\n*inlr = *on;\n".into(),
@@ -2724,6 +3128,7 @@ async fn sql_tables_indexes_and_runsqlstm() {
         libl: vec![lib.clone()],
         display: None,
         id: None,
+        calls: Default::default(),
     };
     let script = "
         -- People; the index reads them by name, last first.
@@ -2968,6 +3373,7 @@ async fn sql_long_names() {
         libl: vec![lib.clone()],
         display: None,
         id: None,
+        calls: Default::default(),
     };
     let lines = job
         .run_sql_script(
@@ -3107,6 +3513,7 @@ async fn sql_views_identity_and_alter() {
         libl: vec![lib.clone()],
         display: None,
         id: None,
+        calls: Default::default(),
     };
     let script = "
         CREATE TABLE ORDERS (
@@ -3265,6 +3672,7 @@ async fn sql_float_binary_graphic_lob() {
         libl: vec![lib.clone()],
         display: None,
         id: None,
+        calls: Default::default(),
     };
     let script = "
         CREATE TABLE MEASURE (
@@ -3370,6 +3778,7 @@ async fn ile_modules_service_programs_bnddir() {
         libl: vec![lib.clone()],
         display: None,
         id: None,
+        calls: Default::default(),
     };
     for f in ["QRPGLESRC", "QSRVSRC"] {
         source::create_file(&client, &lib, f, "").await.unwrap();
@@ -3534,6 +3943,7 @@ async fn rpg3_crtrpgpgm_and_cvtrpgsrc() {
         libl: vec![lib.clone()],
         display: None,
         id: None,
+        calls: Default::default(),
     };
     for f in ["QRPGSRC", "QRPGLESRC"] {
         source::create_file(&client, &lib, f, "").await.unwrap();
@@ -3693,6 +4103,7 @@ async fn rpg_cycle_control_levels_and_program_described_files() {
         libl: vec![lib.clone()],
         display: None,
         id: None,
+        calls: Default::default(),
     };
     source::create_file(&client, &lib, "QRPGSRC", "")
         .await
@@ -3828,6 +4239,7 @@ async fn rpg_cycle_matching_records() {
         libl: vec![lib.clone()],
         display: None,
         id: None,
+        calls: Default::default(),
     };
     source::create_file(&client, &lib, "QRPGSRC", "")
         .await
@@ -4007,6 +4419,7 @@ async fn ile_activation_groups_and_signatures() {
         libl: vec![lib.clone()],
         display: None,
         id: None,
+        calls: Default::default(),
     };
     for f in ["QRPGLESRC", "QSRVSRC"] {
         source::create_file(&client, &lib, f, "").await.unwrap();
@@ -4167,6 +4580,7 @@ async fn ile_exported_data() {
         libl: vec![lib.clone()],
         display: None,
         id: None,
+        calls: Default::default(),
     };
     source::create_file(&client, &lib, "QRPGLESRC", "")
         .await
@@ -4226,6 +4640,7 @@ async fn ile_cl_module_callprc() {
         libl: vec![lib.clone()],
         display: None,
         id: None,
+        calls: Default::default(),
     };
     source::create_file(&client, &lib, "QRPGLESRC", "")
         .await

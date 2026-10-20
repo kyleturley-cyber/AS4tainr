@@ -241,6 +241,7 @@ pub async fn run(stream: tokio::net::TcpStream, cfg: &ServerConfig, device: &str
             libl: cfg.libl.clone(),
             display: Some(display_tx),
             id: Some(id.clone()),
+            calls: Default::default(),
         };
         let ended = workstation(&mut term, &mut job, cfg, &mut display_rx, &profile).await;
         // The job ends however the session ends (sign-off, F3, the
@@ -856,12 +857,33 @@ async fn menu(
     items: &[String],
     message: &mut String,
 ) -> Result<MenuChoice> {
+    // Lines 5-17 hold the options; a longer menu pages (More... on line
+    // 18, Page Down and Page Up).
+    const MENU_LINES: usize = 13;
+    let pages = items.len().div_ceil(MENU_LINES).max(1);
+    let mut page = 0usize;
     loop {
         let mut s = Screen::new();
         centered(&mut s, 1, title);
         s.put(3, 2, "Select one of the following:");
-        for (i, item) in items.iter().enumerate() {
-            s.put(5 + i as u8, 6, &format!("{:>2}. {item}", i + 1));
+        for (i, item) in items
+            .iter()
+            .enumerate()
+            .skip(page * MENU_LINES)
+            .take(MENU_LINES)
+        {
+            s.put(
+                5 + (i - page * MENU_LINES) as u8,
+                6,
+                &format!("{:>2}. {item}", i + 1),
+            );
+        }
+        if pages > 1 {
+            if page + 1 < pages {
+                s.put(18, 73, "More...");
+            } else {
+                s.put(18, 74, "Bottom");
+            }
         }
         s.put(19, 2, "Selection or command");
         s.text(20, 2, attr::HIGH, "===>");
@@ -875,6 +897,22 @@ async fn menu(
             Aid::F(3) => return Ok(MenuChoice::Exit),
             Aid::F(12) => return Ok(MenuChoice::Back),
             Aid::Enter | Aid::F(4) => {}
+            Aid::RollUp => {
+                if page + 1 < pages {
+                    page += 1;
+                } else {
+                    *message = "Already at bottom of area.".into();
+                }
+                continue;
+            }
+            Aid::RollDown => {
+                if page > 0 {
+                    page -= 1;
+                } else {
+                    *message = "Already at top of area.".into();
+                }
+                continue;
+            }
             _ => {
                 *message = "That key is not valid on this display.".into();
                 continue;

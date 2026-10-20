@@ -1,0 +1,331 @@
+//! Program message queues: the messages CL programs send each other.
+//!
+//! Written from IBM's public CL documentation (SNDPGMMSG, RCVMSG, RTVMSG,
+//! MONMSG) and the message handling topics. Every program running in a
+//! job has its own program message queue. SNDPGMMSG puts a message on
+//! the queue of the program itself (TOPGMQ(*SAME)) or of its caller
+//! (TOPGMQ(*PRV), the default); an *ESCAPE message to the caller ends the
+//! sending program and is an exception in the caller, which a MONMSG can
+//! handle. RCVMSG takes messages off the program's own queue: new
+//! messages by type, first in first out, except *EXCP, which receives the
+//! last exception; RMV(*NO) keeps a received message as an old message,
+//! which only *FIRST, *LAST, *NEXT, *PRV or its key receive again.
+//!
+//! The queues live in the job ([`CallStack`]): one per CL program
+//! running, innermost last.
+
+use anyhow::{bail, Result};
+use std::collections::HashMap;
+use tokio_postgres::Client;
+
+/// A message on a program message queue.
+#[derive(Debug, Clone, Default)]
+pub struct QMsg {
+    pub key: u32,
+    /// Blank for an impromptu message (SNDPGMMSG MSG).
+    pub msgid: String,
+    pub msgf: String,
+    pub msgflib: String,
+    /// The library the sender named (*LIBL when it did not name one).
+    pub sndmsgflib: String,
+    /// Message data, as stored (EBCDIC).
+    pub data: Vec<u8>,
+    pub text: String,
+    pub seclvl: String,
+    pub sev: i32,
+    /// *INFO, *COMP, *DIAG, *ESCAPE, *NOTIFY, *INQ, *RQS, *STATUS.
+    pub ty: String,
+    /// Received with RMV(*NO).
+    pub old: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct CallStack {
+    /// One program message queue per CL program running, innermost last.
+    stack: Vec<Vec<QMsg>>,
+    /// The escape message being raised, for the caller's MONMSG and
+    /// RCVMSG MSGTYPE(*EXCP).
+    pub escape: Option<QMsg>,
+    /// The escape was sent to the caller: the sender's own MONMSGs do
+    /// not see it.
+    pub escape_to_caller: bool,
+    next_key: u32,
+    /// The text system messages had in this job, by identifier: system
+    /// message files have no descriptions here, so a message resent
+    /// with the identifier and data RCVMSG returned keeps its text.
+    texts: HashMap<String, String>,
+    /// File overrides (OVRDBF, OVRPRTF), with the call level of each.
+    pub overrides: Vec<crate::ovr::Override>,
+}
+
+impl CallStack {
+    /// A program starts: its queue.
+    pub fn enter(&mut self) {
+        self.stack.push(Vec::new());
+    }
+
+    /// A program ends: its queue and the overrides it made go with it.
+    pub fn leave(&mut self) {
+        let level = self.stack.len();
+        self.overrides.retain(|o| o.level < level);
+        self.stack.pop();
+    }
+
+    /// The current call level: 0 on the command line, 1 in a CL program
+    /// called from it, and so on.
+    pub fn level(&self) -> usize {
+        self.stack.len()
+    }
+
+    fn key(&mut self) -> u32 {
+        self.next_key = self.next_key.wrapping_add(1).max(1);
+        self.next_key
+    }
+
+    /// Put a message on the running program's queue (`caller`: its
+    /// caller's); returns the message key. A program called from the
+    /// command line has no CL caller: the message is only shown.
+    pub fn put(&mut self, mut m: QMsg, caller: bool) -> u32 {
+        let k = self.key();
+        m.key = k;
+        if !m.msgid.is_empty() && !m.text.is_empty() {
+            self.texts.insert(m.msgid.clone(), m.text.clone());
+        }
+        let n = self.stack.len();
+        let at = if caller {
+            n.checked_sub(2)
+        } else {
+            n.checked_sub(1)
+        };
+        if let Some(q) = at.and_then(|i| self.stack.get_mut(i)) {
+            q.push(m);
+        }
+        k
+    }
+
+    /// The text a system message had in this job.
+    pub fn known_text(&self, msgid: &str) -> Option<&String> {
+        self.texts.get(msgid)
+    }
+
+    /// RCVMSG on the running program's queue: the message, removed
+    /// (`rmv`) or kept as old.
+    pub fn receive(&mut self, msgtype: &str, key: Option<u32>, rmv: &str) -> Option<QMsg> {
+        let q = self.stack.last_mut()?;
+        let i = select(q, msgtype, key)?;
+        let exception = matches!(q[i].ty.as_str(), "*ESCAPE" | "*NOTIFY");
+        let remove = match rmv {
+            "*NO" => false,
+            "*KEEPEXCP" => !exception,
+            _ => true,
+        };
+        if remove {
+            Some(q.remove(i))
+        } else {
+            q[i].old = true;
+            Some(q[i].clone())
+        }
+    }
+}
+
+/// Which message RCVMSG receives (RCVMSG MSGTYPE and MSGKEY).
+pub fn select(q: &[QMsg], msgtype: &str, key: Option<u32>) -> Option<usize> {
+    let pos = key.map(|k| q.iter().position(|m| m.key == k));
+    let new = |ty: &[&str]| q.iter().position(|m| !m.old && ty.contains(&m.ty.as_str()));
+    match (msgtype, pos) {
+        // A key that is not on the queue: nothing.
+        (_, Some(None)) => None,
+        ("*NEXT", Some(Some(p))) => (p + 1 < q.len()).then_some(p + 1),
+        ("*PRV", Some(Some(p))) => p.checked_sub(1),
+        ("*ANY", Some(Some(p))) => Some(p),
+        ("*EXCP", Some(Some(p))) => matches!(q[p].ty.as_str(), "*ESCAPE" | "*NOTIFY").then_some(p),
+        (t, Some(Some(p))) => (q[p].ty == t).then_some(p),
+        ("*FIRST" | "*NEXT", None) => (!q.is_empty()).then_some(0),
+        ("*LAST" | "*PRV", None) => q.len().checked_sub(1),
+        ("*ANY", None) => q.iter().position(|m| !m.old),
+        // The last exception (last in, first out).
+        ("*EXCP", None) => q
+            .iter()
+            .rposition(|m| !m.old && matches!(m.ty.as_str(), "*ESCAPE" | "*NOTIFY")),
+        (t, None) => new(&[t]),
+    }
+}
+
+/// RCVMSG RTNTYPE: the two-digit code of a message type.
+pub fn rtntype(ty: &str) -> &'static str {
+    match ty {
+        "*COMP" => "01",
+        "*DIAG" => "02",
+        "*INFO" => "04",
+        "*INQ" => "05",
+        "*COPY" => "06",
+        "*RQS" => "08",
+        "*NOTIFY" => "14",
+        "*ESCAPE" => "15",
+        _ => "",
+    }
+}
+
+/// A message key as RCVMSG KEYVAR and SNDPGMMSG KEYVAR return it: four
+/// characters (printable here; see docs/fidelity-gaps.md).
+pub fn key_text(k: u32) -> String {
+    const D: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut n = k % 36u32.pow(4);
+    let mut out = [b'0'; 4];
+    for c in out.iter_mut().rev() {
+        *c = D[(n % 36) as usize];
+        n /= 36;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+pub fn parse_key(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if s.len() != 4 {
+        return None;
+    }
+    s.chars()
+        .try_fold(0u32, |acc, c| c.to_digit(36).map(|d| acc * 36 + d))
+}
+
+/// The exception message for an error a program caught: its identifier
+/// and its text (without the identifier).
+pub fn from_error(e: &anyhow::Error, id: &str) -> QMsg {
+    let s = format!("{e:#}");
+    let line = s
+        .lines()
+        .find(|l| l.starts_with(id))
+        .or_else(|| s.lines().next())
+        .unwrap_or("");
+    let text = line
+        .strip_prefix(id)
+        .map(|t| t.trim_start_matches(':').trim())
+        .unwrap_or(line)
+        .to_string();
+    QMsg {
+        msgid: id.to_string(),
+        msgf: crate::msgf::system_msgf(id).into(),
+        msgflib: "QSYS".into(),
+        sndmsgflib: "*LIBL".into(),
+        text,
+        sev: if id == "CPF9898" { 40 } else { 0 },
+        ty: "*ESCAPE".into(),
+        ..Default::default()
+    }
+}
+
+/// The message files of the system: they have no descriptions here.
+fn is_system_msgf(name: &str) -> bool {
+    matches!(
+        name,
+        "QCPFMSG" | "QRNXMSG" | "QSQLMSG" | "QCPFMSGL" | "QCPFMSGU"
+    )
+}
+
+/// The text of a predefined message: from its message description (MSGF
+/// qualified `LIB/NAME` or just `NAME`, found through the library list),
+/// with the message data substituted. A system message file has no
+/// descriptions here: the text is the message data (CPF9898, whose text
+/// is its data, with a period), or the text the message had when this job
+/// last saw it.
+pub async fn describe(
+    client: &Client,
+    libs: &[String],
+    state: &CallStack,
+    msgid: &str,
+    msgf: &str,
+    data: &[u8],
+) -> Result<QMsg> {
+    let msgid = crate::msgf::check_msgid(msgid)?;
+    let msgf = msgf.trim().trim_matches('\'').to_ascii_uppercase();
+    let (lib, name) = match msgf.split_once('/') {
+        Some((l, n)) => (l.to_string(), n.to_string()),
+        None => ("*LIBL".to_string(), msgf.clone()),
+    };
+    let search = if lib == "*LIBL" {
+        libs.to_vec()
+    } else {
+        vec![lib.clone()]
+    };
+    let mut m = QMsg {
+        msgid: msgid.clone(),
+        msgf: name.clone(),
+        sndmsgflib: lib.clone(),
+        data: data.to_vec(),
+        ..Default::default()
+    };
+    match crate::msgf::locate(client, &search, &name).await? {
+        Some(found) => {
+            let Some(d) =
+                crate::msgf::find(client, std::slice::from_ref(&found), &name, &msgid).await?
+            else {
+                bail!("CPF2419: Message identifier {msgid} not found in message file {name} in {found}.");
+            };
+            let (text, seclvl) = d.format(data);
+            m.msgflib = found;
+            m.text = text;
+            m.seclvl = seclvl;
+            m.sev = d.sev;
+        }
+        None if is_system_msgf(&name) && (lib == "*LIBL" || lib == "QSYS") => {
+            let given = crate::rpg::data::a(data).trim_end().to_string();
+            m.msgflib = "QSYS".into();
+            m.text = match (msgid.as_str(), state.known_text(&msgid)) {
+                ("CPF9898", _) if !given.is_empty() => {
+                    if given.ends_with('.') {
+                        given
+                    } else {
+                        format!("{given}.")
+                    }
+                }
+                (_, Some(t)) if given.is_empty() || data.iter().all(|b| *b == 0x40) => t.clone(),
+                _ if !given.is_empty() => given,
+                _ => format!("Message {msgid} from {name}."),
+            };
+            m.sev = if msgid == "CPF9898" { 40 } else { 0 };
+        }
+        None => bail!("CPF2407: Message file {name} in {lib} not found."),
+    }
+    Ok(m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn m(ty: &str, old: bool) -> QMsg {
+        QMsg {
+            ty: ty.into(),
+            old,
+            ..Default::default()
+        }
+    }
+
+    // RCVMSG MSGTYPE (CL reference): *ANY the first new message, *EXCP
+    // the last exception, *FIRST/*LAST new or old; *NEXT/*PRV from a key.
+    #[test]
+    fn selection() {
+        let mut q = vec![
+            m("*INFO", true),
+            m("*COMP", false),
+            m("*ESCAPE", false),
+            m("*DIAG", false),
+            m("*ESCAPE", false),
+        ];
+        for (i, x) in q.iter_mut().enumerate() {
+            x.key = i as u32 + 10;
+        }
+        assert_eq!(select(&q, "*ANY", None), Some(1));
+        assert_eq!(select(&q, "*EXCP", None), Some(4));
+        assert_eq!(select(&q, "*DIAG", None), Some(3));
+        assert_eq!(select(&q, "*INFO", None), None);
+        assert_eq!(select(&q, "*FIRST", None), Some(0));
+        assert_eq!(select(&q, "*LAST", None), Some(4));
+        assert_eq!(select(&q, "*NEXT", Some(12)), Some(3));
+        assert_eq!(select(&q, "*PRV", Some(12)), Some(1));
+        assert_eq!(select(&q, "*ANY", Some(10)), Some(0));
+        assert_eq!(select(&q, "*ANY", Some(99)), None);
+        assert_eq!(parse_key(&key_text(1234)), Some(1234));
+        assert_eq!(rtntype("*ESCAPE"), "15");
+    }
+}

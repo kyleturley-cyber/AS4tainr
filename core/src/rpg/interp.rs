@@ -3114,8 +3114,16 @@ impl Machine<'_> {
             libl: ctx.user_libl.clone(),
             display: self.io.display.clone(),
             id: self.io.job.clone(),
+            calls: Default::default(),
         };
-        let out = self.io.rt.block_on(job.run(cmd))?;
+        // Overrides in effect for this program, and those QCMDEXC makes
+        // (OVRDBF), for the programs it calls next.
+        job.calls.overrides = ctx.overrides.clone();
+        let out = self.io.rt.block_on(job.run(cmd));
+        if let Some(c) = self.io.cl.as_mut() {
+            c.overrides = job.calls.overrides.clone();
+        }
+        let out = out?;
         if let crate::commands::Outcome::Messages(msgs) = out {
             for m in msgs {
                 self.job_log(&m);
@@ -3877,7 +3885,15 @@ impl<'a> Machine<'a> {
             ),
         };
         let (source, options, binding) = source;
-        let callee = self.block(super::compile_with(client, &libl, name, &source, &options))?;
+        let ovr = self
+            .io
+            .cl
+            .as_ref()
+            .map(|c| c.overrides.clone())
+            .unwrap_or_default();
+        let callee = self.block(super::compile_ovr(
+            client, &libl, name, &source, &options, &ovr,
+        ))?;
         let group = program_group(&callee, &self.io.actgrp);
         let mut parms: Vec<Vec<u8>> = locs
             .iter()

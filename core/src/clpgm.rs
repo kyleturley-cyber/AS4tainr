@@ -26,10 +26,11 @@
 
 use anyhow::{anyhow, bail, Result};
 use rust_decimal::prelude::*;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::catalog;
 use crate::commands::{Job, Outcome};
+use crate::jobs;
 
 // ------------------------------------------------------------ source
 
@@ -517,7 +518,11 @@ fn expr_tokens(s: &str) -> Result<Vec<ET>> {
                     "*ON" => out.push(ET::Str("1".into())),
                     "*OFF" => out.push(ET::Str("0".into())),
                     "*BLANK" | "*BLANKS" => out.push(ET::Str(" ".into())),
-                    _ => out.push(ET::Op(w)),
+                    "*EQ" | "*NE" | "*GT" | "*LT" | "*GE" | "*LE" | "*NG" | "*NL" | "*AND"
+                    | "*OR" | "*NOT" | "*CAT" | "*BCAT" | "*TCAT" => out.push(ET::Op(w)),
+                    // Any other special value is a character constant
+                    // (&OPT *EQ *YES).
+                    _ => out.push(ET::Str(w)),
                 }
             }
             '%' => {
@@ -673,13 +678,14 @@ impl ExprParser {
                     bail!("{name} needs its arguments in parentheses");
                 }
                 let mut args = Vec::new();
-                // One-argument functions take any expression.
-                if ["%CHAR", "%TRIM", "%TRIML", "%TRIMR", "%DEC", "%INT"].contains(&name.as_str()) {
+                // These take any expression first (more arguments may
+                // follow).
+                if [
+                    "%CHAR", "%TRIM", "%TRIML", "%TRIMR", "%DEC", "%INT", "%UPPER", "%LOWER",
+                ]
+                .contains(&name.as_str())
+                {
                     args.push(self.expr(0)?);
-                    if self.next() != Some(ET::Close) {
-                        bail!("{name} takes one argument");
-                    }
-                    return Ok(Expr::Builtin(name, args));
                 }
                 loop {
                     if self.peek() == Some(&ET::Close) {
@@ -834,9 +840,122 @@ fn eval(e: &Expr, vars: &HashMap<String, Var>) -> Result<Value> {
                     Value::Ptr(None) => Value::Dec(Decimal::ZERO),
                     other => bail!("%OFFSET needs a pointer, not {}", other.describe()),
                 },
-                "%TRIM" => Value::Char(arg(0)?.as_char()?.trim_matches(' ').to_string()),
-                "%TRIML" => Value::Char(arg(0)?.as_char()?.trim_start_matches(' ').to_string()),
-                "%TRIMR" => Value::Char(arg(0)?.as_char()?.trim_end_matches(' ').to_string()),
+                // %TRIM(string [characters]): blanks, or the characters
+                // given, from both ends (left, right).
+                "%TRIM" | "%TRIML" | "%TRIMR" => {
+                    let s = arg(0)?.as_char()?;
+                    let set: Vec<char> = match args.get(1) {
+                        Some(_) => arg(1)?.as_char()?.chars().collect(),
+                        None => vec![' '],
+                    };
+                    let f = |c: char| set.contains(&c);
+                    Value::Char(match name.as_str() {
+                        "%TRIML" => s.trim_start_matches(f).to_string(),
+                        "%TRIMR" => s.trim_end_matches(f).to_string(),
+                        _ => s.trim_matches(f).to_string(),
+                    })
+                }
+                // %SCAN(search source [start]): where the search argument
+                // first is in the source, from the start; 0 when it is not.
+                "%SCAN" => {
+                    let pat: Vec<char> = arg(0)?.as_char()?.chars().collect();
+                    let src: Vec<char> = arg(1)?.as_char()?.chars().collect();
+                    let start = match args.get(2) {
+                        Some(_) => arg(2)?.as_dec()?.to_usize().unwrap_or(0),
+                        None => 1,
+                    };
+                    if start == 0 || start > src.len() + 1 {
+                        bail!(
+                            "CPD0012: %SCAN start {start} is not valid for a string of length {}.",
+                            src.len()
+                        );
+                    }
+                    let found = if pat.is_empty() {
+                        None
+                    } else {
+                        (start - 1..=src.len().saturating_sub(pat.len())).find(|&i| {
+                            i + pat.len() <= src.len() && src[i..i + pat.len()] == pat[..]
+                        })
+                    };
+                    Value::Dec(Decimal::from(found.map(|i| i + 1).unwrap_or(0) as u64))
+                }
+                // %CHECK(comparator base [start]): the first character of the
+                // base not in the comparator; %CHECKR from the right.
+                "%CHECK" | "%CHECKR" => {
+                    let cmp: Vec<char> = arg(0)?.as_char()?.chars().collect();
+                    let base: Vec<char> = arg(1)?.as_char()?.chars().collect();
+                    let start = match args.get(2) {
+                        Some(_) => arg(2)?.as_dec()?.to_usize().unwrap_or(0),
+                        None if name == "%CHECK" => 1,
+                        None => base.len(),
+                    };
+                    if start == 0 || start > base.len() {
+                        bail!(
+                            "CPD0012: {name} start {start} is not valid for a string of length {}.",
+                            base.len()
+                        );
+                    }
+                    let found = if name == "%CHECK" {
+                        (start - 1..base.len()).find(|&i| !cmp.contains(&base[i]))
+                    } else {
+                        (0..start).rev().find(|&i| !cmp.contains(&base[i]))
+                    };
+                    Value::Dec(Decimal::from(found.map(|i| i + 1).unwrap_or(0) as u64))
+                }
+                "%UPPER" => Value::Char(arg(0)?.as_char()?.to_uppercase()),
+                "%LOWER" => Value::Char(arg(0)?.as_char()?.to_lowercase()),
+                // %LEN: a character variable's length, a decimal one's
+                // digits; %SIZE: the bytes it takes.
+                "%LEN" | "%LENGTH" | "%SIZE" => {
+                    let n = match args.first() {
+                        Some(Expr::Var(v)) => {
+                            let var = vars
+                                .get(v)
+                                .ok_or_else(|| anyhow!("CPD0727: Variable {v} is not declared."))?;
+                            if name == "%SIZE" {
+                                storage_size(var)
+                            } else {
+                                var.len as usize
+                            }
+                        }
+                        Some(_) => arg(0)?.as_char()?.chars().count(),
+                        None => bail!("{name} needs a variable"),
+                    };
+                    Value::Dec(Decimal::from(n as u64))
+                }
+                // %PARMS(): how many parameters were passed.
+                "%PARMS" => vars
+                    .get(PARMS_VAR)
+                    .map(|v| v.value.clone())
+                    .unwrap_or(Value::Dec(Decimal::ZERO)),
+                // %BIN(&var [start length]): the bytes of a character
+                // variable as a binary integer (2 or 4 bytes).
+                "%BIN" | "%BINARY" => {
+                    let Some(Expr::Var(v)) = args.first() else {
+                        bail!("{name} needs a character variable");
+                    };
+                    let var = vars
+                        .get(v)
+                        .ok_or_else(|| anyhow!("CPD0727: Variable {v} is not declared."))?;
+                    let bytes = to_bytes(var)?;
+                    let (start, len) = match (args.get(1), args.get(2)) {
+                        (Some(_), Some(_)) => (
+                            arg(1)?.as_dec()?.to_usize().unwrap_or(0),
+                            arg(2)?.as_dec()?.to_usize().unwrap_or(0),
+                        ),
+                        _ => (1, bytes.len()),
+                    };
+                    if start == 0 || !matches!(len, 2 | 4) || start + len - 1 > bytes.len() {
+                        bail!("CPD0012: %BIN({v} {start} {len}) is not valid: the length is 2 or 4 inside the variable.");
+                    }
+                    let b = &bytes[start - 1..start - 1 + len];
+                    let n: i64 = if len == 2 {
+                        i16::from_be_bytes([b[0], b[1]]) as i64
+                    } else {
+                        i32::from_be_bytes([b[0], b[1], b[2], b[3]]) as i64
+                    };
+                    Value::Dec(Decimal::from(n))
+                }
                 "%CHAR" => Value::Char(match arg(0)? {
                     Value::Dec(d) => dec_text(&d),
                     other => other.as_char()?,
@@ -938,6 +1057,9 @@ enum Ins {
     ChgSst(String, Expr, Expr, Expr),
     /// CHGVAR %OFFSET(&ptr) value: where a pointer points in its storage.
     ChgOfs(String, Expr),
+    /// CHGVAR %BIN(&var start length) value: a binary integer in part of a
+    /// character variable.
+    ChgBin(String, Option<(Expr, Expr)>, Expr),
     JumpIfFalse(Expr, usize),
     Jump(usize),
     /// Jump to a label (resolved when the program is checked).
@@ -963,6 +1085,8 @@ pub struct Program {
     pub binding: Option<crate::ile::Binding>,
     pub object: String,
     pub actgrp: String,
+    /// The files DCLF declares, in order.
+    pub files: Vec<DeclaredFile>,
 }
 
 impl Program {
@@ -1120,6 +1244,16 @@ impl Compiler<'_> {
                             };
                             self.code
                                 .push(Ins::ChgSst(v.clone(), a[1].clone(), a[2].clone(), e));
+                        }
+                        Expr::Builtin(f, a)
+                            if (f == "%BIN" || f == "%BINARY")
+                                && (a.len() == 1 || a.len() == 3) =>
+                        {
+                            let Expr::Var(v) = &a[0] else {
+                                return Err(self.err(st, "%BIN needs a variable"));
+                            };
+                            let part = (a.len() == 3).then(|| (a[1].clone(), a[2].clone()));
+                            self.code.push(Ins::ChgBin(v.clone(), part, e));
                         }
                         Expr::Builtin(f, a) if (f == "%OFFSET" || f == "%OFS") && a.len() == 1 => {
                             let Expr::Var(v) = &a[0] else {
@@ -1569,6 +1703,9 @@ fn parse_dcl(st: &Statement) -> Result<(String, Var)> {
     Ok((name, var))
 }
 
+/// The hidden variable holding how many parameters were passed (%PARMS).
+const PARMS_VAR: &str = "%PARMS";
+
 /// How many bytes a variable takes: *CHAR its length, *LGL 1, *DEC packed
 /// (digits / 2 + 1), *INT its length, *PTR 16.
 fn storage_size(v: &Var) -> usize {
@@ -1702,6 +1839,172 @@ fn sync_storage(vars: &mut HashMap<String, Var>, overlays: &[String]) -> Result<
 
 /// Check a CL program and turn it into steps (CRTBNDCL).
 pub fn compile(name: &str, source: &str) -> Result<Program> {
+    compile_with(name, source, &HashMap::new())
+}
+
+/// Compile a program in a job: the files its DCLF statements declare are
+/// found through the library list first.
+pub async fn compile_in(
+    client: &tokio_postgres::Client,
+    libl: &[String],
+    name: &str,
+    source: &str,
+) -> Result<Program> {
+    let files = resolve_files(client, libl, source).await?;
+    compile_with(name, source, &files)
+}
+
+/// The FILE values of a program's DCLF statements, as written.
+pub fn declared_file_names(source: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for (line, text) in logical_lines(source)? {
+        let st = parse_statement(line, &text)?;
+        if st.name == "DCLF" {
+            if let Some(f) = named(&st, DCLF_KEYWORDS)?.get("FILE") {
+                out.push(f.trim().to_ascii_uppercase());
+            }
+        }
+    }
+    Ok(out)
+}
+
+const DCLF_KEYWORDS: &[&str] = &[
+    "FILE",
+    "RCDFMT",
+    "OPNID",
+    "ALWVARLEN",
+    "ALWNULL",
+    "ALWGRAPHIC",
+    "DCLBINFLD",
+];
+
+/// Find the files a program declares: a database file (physical or
+/// logical) or a display file.
+pub async fn resolve_files(
+    client: &tokio_postgres::Client,
+    libl: &[String],
+    source: &str,
+) -> Result<HashMap<String, (String, ClFile)>> {
+    let mut out = HashMap::new();
+    for f in declared_file_names(source)? {
+        let q = f.strip_prefix("*LIBL/").unwrap_or(&f).to_string();
+        let found = match crate::catalog::resolve_file(client, libl, &q).await {
+            Ok(r) => (r.library.clone(), ClFile::Db(r)),
+            Err(_) => match crate::catalog::resolve_display_file(client, libl, &q).await {
+                Ok((library, text)) => {
+                    let name = q.rsplit('/').next().unwrap_or(&q).to_string();
+                    let d = crate::dspf::parse(&name, &text)?;
+                    (library, ClFile::Dsp(std::sync::Arc::new(d)))
+                }
+                Err(_) => continue,
+            },
+        };
+        out.insert(f, found);
+    }
+    Ok(out)
+}
+
+/// The variables DCLF declares for a file: one per field of its record
+/// formats (`&OPNID_FIELD` with an open identifier), numbers as *DEC, and
+/// for a display file the indicators &IN01-&IN99 (*LGL).
+fn file_variables(f: &DeclaredFile, formats: &[String]) -> Result<Vec<(String, Var)>> {
+    let prefix = f
+        .opnid
+        .as_ref()
+        .map(|o| format!("{o}_"))
+        .unwrap_or_default();
+    let mut out: Vec<(String, Var)> = Vec::new();
+    let mut add = |n: &str, ty: VarType, len: u32, dec: u32| {
+        let name = format!("&{prefix}{}", n.to_ascii_uppercase());
+        if !out.iter().any(|(x, _)| *x == name) {
+            out.push((name, new_var(ty, len, dec)));
+        }
+    };
+    let wanted =
+        |fmt: &str| formats.is_empty() || formats.iter().any(|w| w.eq_ignore_ascii_case(fmt));
+    match &f.kind {
+        ClFile::Db(r) => {
+            if !wanted(&r.file.format) {
+                bail!(
+                    "DCLF {}: record format {} is not in the file",
+                    f.name,
+                    formats.join(" ")
+                );
+            }
+            for fd in &r.file.fields {
+                use crate::dds::DataType as T;
+                match fd.data_type {
+                    T::Packed | T::Zoned | T::Binary => {
+                        add(&fd.name, VarType::Dec, fd.length, fd.decimals)
+                    }
+                    T::Float => bail!(
+                        "DCLF {}: field {} is a floating point field, which CL cannot declare",
+                        f.name,
+                        fd.name
+                    ),
+                    _ => add(&fd.name, VarType::Char, fd.length.max(1), 0),
+                }
+            }
+        }
+        ClFile::Dsp(d) => {
+            for rec in d.records.iter().filter(|r| wanted(&r.name)) {
+                for fd in &rec.fields {
+                    match fd.decimals {
+                        Some(dec) => add(&fd.name, VarType::Dec, fd.length as u32, dec as u32),
+                        None => add(&fd.name, VarType::Char, fd.length.max(1) as u32, 0),
+                    }
+                }
+            }
+            for n in 1..=99 {
+                add(&format!("IN{n:02}"), VarType::Lgl, 1, 0);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn new_var(ty: VarType, len: u32, decimals: u32) -> Var {
+    Var {
+        ty,
+        len,
+        decimals,
+        value: match ty {
+            VarType::Char => Value::Char(" ".repeat(len as usize)),
+            VarType::Lgl => Value::Lgl(false),
+            VarType::Ptr => Value::Ptr(None),
+            _ => Value::Dec(Decimal::ZERO),
+        },
+        defined: None,
+        based: None,
+        shadow: None,
+    }
+}
+
+/// A file a CL program declares.
+#[derive(Debug, Clone)]
+pub enum ClFile {
+    Db(crate::catalog::FileRef),
+    Dsp(std::sync::Arc<crate::dspf::DisplayFile>),
+}
+
+#[derive(Debug, Clone)]
+pub struct DeclaredFile {
+    /// The file's name (without its library).
+    pub name: String,
+    pub library: String,
+    /// OPNID: the prefix of its variables and the name RCVF, SNDF,
+    /// SNDRCVF and CLOSE use for it.
+    pub opnid: Option<String>,
+    pub kind: ClFile,
+}
+
+/// Compile with the files DCLF names already found (`files`: by FILE
+/// value as written).
+pub fn compile_with(
+    name: &str,
+    source: &str,
+    files: &HashMap<String, (String, ClFile)>,
+) -> Result<Program> {
     let mut sts = Vec::new();
     for (line, text) in logical_lines(source)? {
         sts.push(parse_statement(line, &text)?);
@@ -1722,8 +2025,50 @@ pub fn compile(name: &str, source: &str) -> Result<Program> {
     let mut decls = Vec::new();
     // DCLPRCOPT (compile options) and COPYRIGHT (text kept in the
     // program) belong with the declarations; they change nothing here.
-    let is_declare = |n: &str| matches!(n, "DCL" | "DCLPRCOPT" | "COPYRIGHT");
+    let is_declare = |n: &str| matches!(n, "DCL" | "DCLF" | "DCLPRCOPT" | "COPYRIGHT");
+    let mut declared_files: Vec<DeclaredFile> = Vec::new();
+    let mut file_vars: Vec<(String, Var)> = Vec::new();
     while i < sts.len() && is_declare(&sts[i].name) {
+        if sts[i].name == "DCLF" {
+            let st = &sts[i];
+            let p = named(st, DCLF_KEYWORDS)?;
+            let file = p
+                .get("FILE")
+                .map(|f| f.trim().to_ascii_uppercase())
+                .ok_or_else(|| anyhow!("line {}: DCLF needs FILE", st.line))?;
+            let (library, kind) = files.get(&file).cloned().ok_or_else(|| {
+                anyhow!("line {}: DCLF FILE({file}): the file is not found (CL needs it when the program is created)", st.line)
+            })?;
+            let opnid = p
+                .get("OPNID")
+                .map(|o| o.trim().to_ascii_uppercase())
+                .filter(|o| o != "*NONE");
+            if declared_files.iter().any(|d| d.opnid == opnid) {
+                bail!("line {}: a file with OPNID({}) is already declared; each DCLF needs its own OPNID", st.line, opnid.as_deref().unwrap_or("*NONE"));
+            }
+            if declared_files.len() == 5 {
+                bail!("line {}: a CL program declares at most 5 files", st.line);
+            }
+            let formats: Vec<String> = p
+                .get("RCDFMT")
+                .map(|r| {
+                    r.split_whitespace()
+                        .map(|x| x.to_ascii_uppercase())
+                        .filter(|x| x != "*ALL")
+                        .collect()
+                })
+                .unwrap_or_default();
+            let d = DeclaredFile {
+                name: file.rsplit('/').next().unwrap_or(&file).to_string(),
+                library,
+                opnid,
+                kind,
+            };
+            file_vars.extend(file_variables(&d, &formats)?);
+            declared_files.push(d);
+            i += 1;
+            continue;
+        }
         if sts[i].name != "DCL" {
             i += 1;
             continue;
@@ -1734,6 +2079,12 @@ pub fn compile(name: &str, source: &str) -> Result<Program> {
         }
         decls.push((n, v));
         i += 1;
+    }
+    // The file's variables; a variable the program declares itself wins.
+    for (n, v) in file_vars {
+        if !decls.iter().any(|(d, _)| *d == n) {
+            decls.push((n, v));
+        }
     }
     for p in &params {
         if !decls.iter().any(|(d, _)| d == p) {
@@ -1817,6 +2168,7 @@ pub fn compile(name: &str, source: &str) -> Result<Program> {
         binding: None,
         object: String::new(),
         actgrp: crate::ile::DEFAULT_GROUP.into(),
+        files: declared_files,
     })
 }
 
@@ -1877,6 +2229,14 @@ fn substitute_text(text: &str, vars: &HashMap<String, Var>) -> Result<String> {
 /// Run a CL program in a job, with CALL's parameter values. Returns the
 /// messages it sent (and those of the commands it ran).
 pub async fn run(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Result<Outcome> {
+    // The program's own message queue, for as long as it runs.
+    job.calls.enter();
+    let r = run_program(job, pgm, args).await;
+    job.calls.leave();
+    r
+}
+
+async fn run_program(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Result<Outcome> {
     let mut vars: HashMap<String, Var> = pgm.decls.iter().cloned().collect();
     if args.len() > pgm.params.len() {
         bail!(
@@ -1886,6 +2246,18 @@ pub async fn run(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Result<Ou
             args.len()
         );
     }
+    vars.insert(
+        PARMS_VAR.into(),
+        Var {
+            ty: VarType::Dec,
+            len: 3,
+            decimals: 0,
+            value: Value::Dec(Decimal::from(args.len() as u64)),
+            defined: None,
+            based: None,
+            shadow: None,
+        },
+    );
     for (p, a) in pgm.params.iter().zip(args) {
         let var = vars.get_mut(p).expect("checked at compile time");
         let v = match var.ty {
@@ -1905,6 +2277,7 @@ pub async fn run(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Result<Ou
         .map(|(n, _)| n.clone())
         .collect();
     let mut msgs: Vec<String> = Vec::new();
+    let mut io = FileIo::default();
     let mut pc = 0usize;
     let mut steps = 0u64;
     let mut resume_at: Option<usize> = None;
@@ -1971,6 +2344,32 @@ pub async fn run(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Result<Ou
                 assign(name, var, Value::Char(text))?;
                 pc += 1;
             }
+            Ins::ChgBin(name, part, e) => {
+                let n = eval(e, &vars)?.as_dec()?.trunc().to_i64().unwrap_or(0);
+                let (start, len) = match part {
+                    Some((a, b)) => (
+                        eval(a, &vars)?.as_dec()?.to_usize().unwrap_or(0),
+                        eval(b, &vars)?.as_dec()?.to_usize().unwrap_or(0),
+                    ),
+                    None => (1, vars.get(name).map(storage_size).unwrap_or(0)),
+                };
+                let var = vars
+                    .get_mut(name)
+                    .ok_or_else(|| anyhow!("CPD0727: Variable {name} is not declared."))?;
+                let mut bytes = to_bytes(var)?;
+                if start == 0 || !matches!(len, 2 | 4) || start + len - 1 > bytes.len() {
+                    bail!("CPD0012: %BIN({name} {start} {len}) is not valid: the length is 2 or 4 inside the variable.");
+                }
+                let b: Vec<u8> = if len == 2 {
+                    (n as i16).to_be_bytes().to_vec()
+                } else {
+                    (n as i32).to_be_bytes().to_vec()
+                };
+                bytes[start - 1..start - 1 + len].copy_from_slice(&b);
+                let v = from_bytes(var, &bytes)?;
+                var.value = v;
+                pc += 1;
+            }
             Ins::ChgOfs(name, e) => {
                 let off = eval(e, &vars)?.as_dec()?.to_usize().unwrap_or(0);
                 let var = vars
@@ -1983,12 +2382,42 @@ pub async fn run(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Result<Ou
                 pc += 1;
             }
             Ins::Cmd { st, monitors } => {
-                let result = command(job, pgm, st, &mut vars, &mut msgs).await;
+                job.calls.escape = None;
+                job.calls.escape_to_caller = false;
+                let result = command(job, pgm, st, &mut vars, &mut msgs, &mut io).await;
                 match result {
                     Ok(Some(o)) => return Ok(o),
                     Ok(None) => pc += 1,
+                    // An escape message sent to the caller ends this
+                    // program; its own MONMSGs do not see it.
+                    Err(e) if job.calls.escape_to_caller && st.name == "SNDPGMMSG" => {
+                        job.calls.escape_to_caller = false;
+                        let mut lines = msgs.clone();
+                        lines.push(format!("{e:#}"));
+                        bail!(lines.join("\n"));
+                    }
                     Err(e) => {
-                        let id = error_id(&e);
+                        let id = job
+                            .calls
+                            .escape
+                            .as_ref()
+                            .map(|m| m.msgid.clone())
+                            .filter(|i| !i.is_empty())
+                            .unwrap_or_else(|| error_id(&e));
+                        let monitored = monitors
+                            .iter()
+                            .chain(pgm.global.iter())
+                            .any(|(ids, _)| ids.iter().any(|m| msgid_matches(m, &id)));
+                        if monitored {
+                            // The handled exception goes on the program's
+                            // queue, for RCVMSG MSGTYPE(*EXCP).
+                            let m = job
+                                .calls
+                                .escape
+                                .take()
+                                .unwrap_or_else(|| crate::pgmmsg::from_error(&e, &id));
+                            job.calls.put(m, false);
+                        }
                         if let Some((_, start)) = monitors
                             .iter()
                             .find(|(ids, _)| ids.iter().any(|m| msgid_matches(m, &id)))
@@ -2014,6 +2443,330 @@ pub async fn run(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Result<Ou
     Ok(Outcome::Messages(msgs))
 }
 
+/// The files of one program call: database files open for RCVF, the
+/// display's records.
+#[derive(Default)]
+struct FileIo {
+    open: HashMap<usize, crate::rla::OpenFile>,
+    ws: crate::workstn::Workstation,
+}
+
+/// The declared file a file command names with OPNID (or the one
+/// declared without an open identifier).
+fn file_for<'p>(
+    pgm: &'p Program,
+    st: &Statement,
+    opnid: Option<&String>,
+) -> Result<(usize, &'p DeclaredFile)> {
+    let want = opnid
+        .map(|o| o.trim().to_ascii_uppercase())
+        .filter(|o| o != "*NONE");
+    pgm.files
+        .iter()
+        .enumerate()
+        .find(|(_, f)| f.opnid == want)
+        .ok_or_else(|| match &want {
+            Some(o) => anyhow!(
+                "line {}: {}: no file is declared with OPNID({o})",
+                st.line,
+                st.name
+            ),
+            None => anyhow!("line {}: {}: no file is declared (DCLF)", st.line, st.name),
+        })
+}
+
+fn var_name(f: &DeclaredFile, field: &str) -> String {
+    match &f.opnid {
+        Some(o) => format!("&{o}_{}", field.to_ascii_uppercase()),
+        None => format!("&{}", field.to_ascii_uppercase()),
+    }
+}
+
+/// A record's values into the file's variables.
+fn fill_vars(
+    vars: &mut HashMap<String, Var>,
+    f: &DeclaredFile,
+    values: &BTreeMap<String, String>,
+) -> Result<()> {
+    for (k, v) in values {
+        let name = var_name(f, k);
+        let Some(var) = vars.get_mut(&name) else {
+            continue;
+        };
+        let val = match var.ty {
+            VarType::Dec | VarType::Int => {
+                Value::Dec(Decimal::from_str(v.trim()).map_err(|_| {
+                    anyhow!("MCH1202: '{}' is not a valid number for {name}.", v.trim())
+                })?)
+            }
+            _ => Value::Char(v.clone()),
+        };
+        assign(&name, var, val)?;
+    }
+    Ok(())
+}
+
+/// The record format a display file command names (RCDFMT(*FILE): the
+/// file's first record format that is not a subfile record).
+fn display_format(
+    d: &crate::dspf::DisplayFile,
+    f: &DeclaredFile,
+    rcdfmt: Option<&String>,
+) -> Result<String> {
+    match rcdfmt.map(|r| r.trim().to_ascii_uppercase()) {
+        Some(r) if r != "*FILE" => Ok(r),
+        _ => d
+            .records
+            .iter()
+            .find(|r| !r.is_subfile())
+            .map(|r| r.name.clone())
+            .ok_or_else(|| anyhow!("display file {} has no record format", f.name)),
+    }
+}
+
+/// The values and indicators a display record format shows, from the
+/// file's variables.
+fn display_values(
+    vars: &HashMap<String, Var>,
+    d: &crate::dspf::DisplayFile,
+    f: &DeclaredFile,
+    format: &str,
+) -> Result<(BTreeMap<String, String>, [bool; 100])> {
+    let rec = d.record(format).ok_or_else(|| {
+        anyhow!(
+            "CPF4131: Record format {format} is not in display file {}.",
+            f.name
+        )
+    })?;
+    let mut values = BTreeMap::new();
+    for fd in &rec.fields {
+        if let Some(var) = vars.get(&var_name(f, &fd.name)) {
+            let text = match &var.value {
+                Value::Dec(n) => {
+                    let mut n = *n;
+                    n.rescale(fd.decimals.unwrap_or(0) as u32);
+                    n.to_string()
+                }
+                other => other.as_char()?,
+            };
+            values.insert(fd.name.clone(), text);
+        }
+    }
+    let mut ind = [false; 100];
+    for (n, slot) in ind.iter_mut().enumerate().skip(1) {
+        if let Some(Value::Lgl(true)) = vars
+            .get(&var_name(f, &format!("IN{n:02}")))
+            .map(|v| &v.value)
+        {
+            *slot = true;
+        }
+    }
+    Ok((values, ind))
+}
+
+/// Show a frame on the job's display and wait for the operator.
+async fn interact(
+    job: &Job<'_>,
+    f: &DeclaredFile,
+    frame: crate::workstn::Frame,
+) -> Result<crate::dspf::Response> {
+    let Some(display) = job.display.clone() else {
+        bail!(
+            "Display file {} cannot be used here: this job has no display (it is not interactive).",
+            f.name
+        );
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    display
+        .send(crate::runtime::DisplayRequest { frame, reply: tx })
+        .await
+        .map_err(|_| anyhow!("the job's display is gone"))?;
+    rx.await
+        .map_err(|_| anyhow!("the job's display is gone"))?
+        .map_err(|e| anyhow!(e))
+}
+
+/// What the operator entered into the file's variables and indicators.
+fn take_response(
+    vars: &mut HashMap<String, Var>,
+    f: &DeclaredFile,
+    resp: &crate::dspf::Response,
+) -> Result<()> {
+    fill_vars(vars, f, &resp.values)?;
+    for (n, on) in &resp.indicators {
+        let name = var_name(f, &format!("IN{n:02}"));
+        if let Some(v) = vars.get_mut(&name) {
+            v.value = Value::Lgl(*on);
+        }
+    }
+    Ok(())
+}
+
+/// RCVF, SNDF, SNDRCVF and CLOSE.
+async fn file_command(
+    job: &mut Job<'_>,
+    pgm: &Program,
+    st: &Statement,
+    vars: &mut HashMap<String, Var>,
+    io: &mut FileIo,
+) -> Result<()> {
+    let p = named(st, &["DEV", "RCDFMT", "OPNID", "WAIT"])?;
+    let (i, f) = file_for(pgm, st, p.get("OPNID"))?;
+    match (&f.kind, st.name.as_str()) {
+        (_, "CLOSE") => {
+            // The next RCVF opens the file again, at its first record.
+            io.open.remove(&i);
+        }
+        (ClFile::Db(r), "RCVF") => {
+            if let std::collections::hash_map::Entry::Vacant(slot) = io.open.entry(i) {
+                // The file is opened at the first RCVF: an override made
+                // before then (OVRDBF TOFILE) names the file opened.
+                let ovr =
+                    crate::ovr::effective(&job.calls.overrides, crate::ovr::Kind::Db, &f.name)
+                        .cloned();
+                let fr = match ovr.as_ref().and_then(|o| o.tofile.clone()) {
+                    Some(t) => {
+                        let t = t.strip_prefix("*LIBL/").unwrap_or(&t).to_string();
+                        let to = crate::catalog::resolve_file(job.client, &job.library_list(), &t)
+                            .await?;
+                        // The record format must be the one the program
+                        // was created with, unless LVLCHK(*NO).
+                        let shape = |p: &crate::dds::PhysicalFile| {
+                            p.fields
+                                .iter()
+                                .map(|x| (x.name.clone(), x.data_type, x.length, x.decimals))
+                                .collect::<Vec<_>>()
+                        };
+                        let same =
+                            to.file.format == r.file.format && shape(&to.file) == shape(&r.file);
+                        if !same && !ovr.as_ref().is_some_and(|o| o.no_lvlchk) {
+                            bail!(
+                                "CPF4131: Level check on file {} in library {} with member {}.",
+                                to.file.name,
+                                to.library,
+                                to.file.name
+                            );
+                        }
+                        to
+                    }
+                    None => r.clone(),
+                };
+                slot.insert(crate::rla::OpenFile::new(fr));
+            }
+            let of = io.open.get_mut(&i).expect("opened above");
+            let got = of.read(job.client).await?;
+            match got.record {
+                Some(rec) if got.found => fill_vars(vars, f, &rec)?,
+                _ => bail!(
+                    "CPF0864: End of file detected for file {} in {}.",
+                    f.name,
+                    f.library
+                ),
+            }
+        }
+        (ClFile::Db(_), other) => bail!(
+            "line {}: {other} is for display files; {} is a database file",
+            st.line,
+            f.name
+        ),
+        (ClFile::Dsp(d), cmd) => {
+            let format = display_format(d, f, p.get("RCDFMT"))?;
+            match cmd {
+                "SNDF" => {
+                    let (values, ind) = display_values(vars, d, f, &format)?;
+                    io.ws.write(d, &format, values, ind)?;
+                }
+                "SNDRCVF" => {
+                    let (values, ind) = display_values(vars, d, f, &format)?;
+                    let frame = io.ws.frame(d, &format, values, ind)?;
+                    let resp = interact(job, f, frame).await?;
+                    io.ws.apply(d, &format, &resp);
+                    take_response(vars, f, &resp)?;
+                }
+                _ => {
+                    let (frame, format) = io.ws.read_frame(
+                        d,
+                        p.get("RCDFMT")
+                            .filter(|r| !r.trim().eq_ignore_ascii_case("*FILE"))
+                            .map(|r| r.trim()),
+                    )?;
+                    let resp = interact(job, f, frame).await?;
+                    io.ws.apply(d, &format, &resp);
+                    take_response(vars, f, &resp)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A system value (RTVSYSVAL): the values IBM ships, the date and time
+/// from the clock.
+fn system_value(name: &str) -> Result<Value> {
+    let ((y, mo, d), (h, mi, sec), us) = crate::rpg::dates::now();
+    let c = |s: String| Value::Char(s);
+    // A list of libraries: ten characters each.
+    let list = |libs: &[&str], len: usize| {
+        let s: String = libs.iter().map(|l| format!("{l:<10}")).collect();
+        format!("{s:<len$}")
+    };
+    Ok(match name {
+        "QDATE" => c(format!("{mo:02}{d:02}{:02}", y % 100)),
+        "QYEAR" => c(format!("{:02}", y % 100)),
+        "QMONTH" => c(format!("{mo:02}")),
+        "QDAY" => c(format!("{d:02}")),
+        "QCENTURY" => c(if y >= 2000 { "1" } else { "0" }.into()),
+        "QTIME" => c(format!("{h:02}{mi:02}{sec:02}{:03}", us / 1000)),
+        "QHOUR" => c(format!("{h:02}")),
+        "QMINUTE" => c(format!("{mi:02}")),
+        "QSECOND" => c(format!("{sec:02}")),
+        "QDAYOFWEEK" => {
+            let n = crate::rpg::dates::days((y, mo, d));
+            // 1970-01-01 was a Thursday.
+            let names = ["*THU", "*FRI", "*SAT", "*SUN", "*MON", "*TUE", "*WED"];
+            let base = crate::rpg::dates::days((1970, 1, 1));
+            c(names[((n - base).rem_euclid(7)) as usize].into())
+        }
+        "QDATFMT" => c("MDY".into()),
+        "QDATSEP" => c("/".into()),
+        "QTIMSEP" => c(":".into()),
+        "QDECFMT" => c(" ".into()),
+        "QCURSYM" => c("$".into()),
+        "QLANGID" => c("ENU".into()),
+        "QCNTRYID" => c("US".into()),
+        "QCCSID" => Value::Dec(Decimal::from(65535)),
+        "QUTCOFFSET" => c("+0000".into()),
+        "QTIMZON" => c("Q0000UTC".into()),
+        "QSECURITY" => c("40".into()),
+        "QSYSLIBL" => c(list(crate::commands::SYSTEM_LIBRARY_LIST, 150)),
+        "QUSRLIBL" => c(list(crate::commands::USER_LIBRARY_LIST, 250)),
+        "QMODEL" => c("0000".into()),
+        "QSRLNBR" => c("00000000".into()),
+        other => bail!("CPF1028: System value {other} not found."),
+    })
+}
+
+/// Store a value in a return variable (`&NAME` as written)./// Store a value in a return variable (`&NAME` as written).
+fn set_var(vars: &mut HashMap<String, Var>, target: &str, v: Value) -> Result<()> {
+    let name = target.trim().to_ascii_uppercase();
+    let var = vars
+        .get_mut(&name)
+        .ok_or_else(|| anyhow!("CPD0727: Variable {name} is not declared."))?;
+    assign(&name, var, v)
+}
+
+/// Message data (SNDPGMMSG and RTVMSG MSGDTA): a variable's storage as it
+/// is, or a character expression.
+fn message_data(d: &str, vars: &HashMap<String, Var>) -> Result<Vec<u8>> {
+    let name = d.to_ascii_uppercase();
+    if let Some(v) = vars.get(&name) {
+        return to_bytes(v);
+    }
+    Ok(crate::rpg::data::e(
+        &eval(&parse_expr(d)?, vars)?.as_char()?,
+    ))
+}
+
 /// Run one command of a program. Ok(Some(..)) ends the program (SIGNOFF).
 async fn command(
     job: &mut Job<'_>,
@@ -2021,13 +2774,19 @@ async fn command(
     st: &Statement,
     vars: &mut HashMap<String, Var>,
     msgs: &mut Vec<String>,
+    io: &mut FileIo,
 ) -> Result<Option<Outcome>> {
     match st.name.as_str() {
+        "RCVF" | "SNDF" | "SNDRCVF" | "CLOSE" => {
+            file_command(job, pgm, st, vars, io).await?;
+            Ok(None)
+        }
         "SNDPGMMSG" => {
             let p = named(
                 st,
                 &[
-                    "MSG", "MSGID", "MSGF", "MSGDTA", "TOPGMQ", "TOMSGQ", "MSGTYPE", "KEYVAR",
+                    "MSG", "MSGID", "MSGF", "MSGDTA", "TOPGMQ", "TOMSGQ", "MSGTYPE", "RPYMSGQ",
+                    "KEYVAR", "CCSID",
                 ],
             )?;
             let text = |s: &str| -> Result<String> {
@@ -2036,35 +2795,290 @@ async fn command(
                     .trim_end()
                     .to_string())
             };
-            let msg = match (p.get("MSG"), p.get("MSGID")) {
-                (Some(m), _) => text(m)?,
-                (None, Some(id)) => {
-                    let data = p
-                        .get("MSGDTA")
-                        .map(|d| text(d))
-                        .transpose()?
-                        .unwrap_or_default();
-                    format!("{}: {data}", id.trim().to_ascii_uppercase())
-                }
-                (None, None) => bail!("line {}: SNDPGMMSG needs MSG or MSGID", st.line),
-            };
             let kind = p
                 .get("MSGTYPE")
                 .map(|t| t.trim().to_ascii_uppercase())
                 .unwrap_or_else(|| "*INFO".into());
-            match kind.as_str() {
-                "*ESCAPE" => {
-                    // Ends the program; the caller may monitor for it.
-                    let with_id = if is_msgid(msg.split(':').next().unwrap_or("")) {
-                        msg
-                    } else {
-                        format!("CPF9898: {msg}")
+            let mut m = match (p.get("MSG"), p.get("MSGID")) {
+                (Some(t), _) => crate::pgmmsg::QMsg {
+                    text: text(t)?,
+                    ..Default::default()
+                },
+                (None, Some(id)) => {
+                    let id = substitute_text(id, vars)?
+                        .trim()
+                        .trim_matches('\'')
+                        .to_string();
+                    let msgf = match p.get("MSGF") {
+                        Some(f) => substitute_text(f, vars)?.replace(' ', ""),
+                        None => bail!("line {}: SNDPGMMSG MSGID needs MSGF", st.line),
                     };
-                    bail!(with_id)
+                    let data = match p.get("MSGDTA").map(|d| d.trim()) {
+                        None => Vec::new(),
+                        Some(d) if d.eq_ignore_ascii_case("*NONE") => Vec::new(),
+                        Some(d) => message_data(d, vars)?,
+                    };
+                    crate::pgmmsg::describe(
+                        job.client,
+                        &job.library_list(),
+                        &job.calls,
+                        &id,
+                        &msgf,
+                        &data,
+                    )
+                    .await?
                 }
-                "*INFO" | "*COMP" | "*DIAG" | "*NOTIFY" | "*STATUS" => msgs.push(msg),
-                other => bail!("line {}: MSGTYPE({other}) is not supported", st.line),
+                (None, None) => bail!("line {}: SNDPGMMSG needs MSG or MSGID", st.line),
+            };
+            m.ty = kind.clone();
+            // TOPGMQ: (*PRV *) by default, (*SAME *), *EXT. TOMSGQ: a
+            // user's message queue instead.
+            let topgmq = p
+                .get("TOPGMQ")
+                .map(|t| t.trim().trim_start_matches('(').trim().to_ascii_uppercase())
+                .unwrap_or_else(|| "*PRV".into());
+            let to = topgmq
+                .split_whitespace()
+                .next()
+                .unwrap_or("*PRV")
+                .to_string();
+            if let Some(q) = p.get("TOMSGQ") {
+                let q = substitute_text(q, vars)?
+                    .trim()
+                    .trim_matches('\'')
+                    .to_ascii_uppercase();
+                if q != "*TOPGMQ" {
+                    let queue = q.rsplit('/').next().unwrap_or(&q).to_string();
+                    let from_job = job.id.as_ref().map(|i| i.to_string()).unwrap_or_default();
+                    let line = if m.msgid.is_empty() {
+                        m.text.clone()
+                    } else {
+                        format!("{}: {}", m.msgid, m.text)
+                    };
+                    let kind_q = if kind == "*INQ" { "*INQ" } else { "*INFO" };
+                    jobs::send_message(job.client, &queue, &job.user, &from_job, kind_q, &line)
+                        .await?;
+                    return Ok(None);
+                }
             }
+            let key = match (kind.as_str(), to.as_str()) {
+                ("*ESCAPE", _) => {
+                    // Ends the program; the caller may monitor for it.
+                    let id = if m.msgid.is_empty() {
+                        "CPF9898".to_string()
+                    } else {
+                        m.msgid.clone()
+                    };
+                    let line = format!("{id}: {}", m.text);
+                    if m.msgid.is_empty() {
+                        m.msgid = id;
+                        m.msgf = "QCPFMSG".into();
+                        m.msgflib = "QSYS".into();
+                        m.sev = 40;
+                    }
+                    job.calls.escape_to_caller = to != "*SAME";
+                    job.calls.escape = Some(m);
+                    bail!(line)
+                }
+                ("*INFO" | "*COMP" | "*DIAG" | "*NOTIFY" | "*STATUS" | "*RQS", "*SAME") => {
+                    job.calls.put(m, false)
+                }
+                ("*STATUS", _) => {
+                    msgs.push(m.text.clone());
+                    0
+                }
+                ("*INFO" | "*COMP" | "*DIAG" | "*NOTIFY", "*EXT") => {
+                    msgs.push(m.text.clone());
+                    0
+                }
+                ("*INFO" | "*COMP" | "*DIAG" | "*NOTIFY", _) => {
+                    msgs.push(m.text.clone());
+                    job.calls.put(m, true)
+                }
+                (other, _) => bail!("line {}: MSGTYPE({other}) is not supported", st.line),
+            };
+            if let Some(k) = p.get("KEYVAR") {
+                set_var(vars, k, Value::Char(crate::pgmmsg::key_text(key)))?;
+            }
+            Ok(None)
+        }
+        // RCVMSG: a message from the program's own queue into variables;
+        // with no message, character variables are blank and numbers zero.
+        "RCVMSG" => {
+            let p = named(
+                st,
+                &[
+                    "PGMQ",
+                    "MSGQ",
+                    "MSGTYPE",
+                    "MSGKEY",
+                    "WAIT",
+                    "RMV",
+                    "CCSID",
+                    "KEYVAR",
+                    "MSG",
+                    "MSGLEN",
+                    "SECLVL",
+                    "SECLVLLEN",
+                    "MSGDTA",
+                    "MSGDTALEN",
+                    "MSGID",
+                    "SEV",
+                    "SENDER",
+                    "SENDERFMT",
+                    "RTNTYPE",
+                    "ALROPT",
+                    "MSGF",
+                    "MSGFLIB",
+                    "SNDMSGFLIB",
+                    "TEXTCCSID",
+                    "MSGDTACCSID",
+                ],
+            )?;
+            let up = |k: &str, d: &str| -> String {
+                p.get(k)
+                    .map(|v| {
+                        v.trim()
+                            .trim_start_matches('(')
+                            .trim_end_matches(')')
+                            .trim()
+                            .to_ascii_uppercase()
+                    })
+                    .unwrap_or_else(|| d.to_string())
+            };
+            let pgmq = up("PGMQ", "*SAME");
+            if !pgmq.starts_with("*SAME") {
+                bail!("line {}: RCVMSG PGMQ({pgmq}) is not supported yet: only the program's own queue", st.line);
+            }
+            let msgq = up("MSGQ", "*PGMQ");
+            if msgq != "*PGMQ" {
+                bail!("line {}: RCVMSG MSGQ({msgq}) is not supported yet: only the program's own queue", st.line);
+            }
+            let msgtype = up("MSGTYPE", "*ANY");
+            let key = match p.get("MSGKEY") {
+                None => None,
+                Some(k) => {
+                    let v = eval(&parse_expr(k.trim())?, vars)?.as_char()?;
+                    if v.trim().eq_ignore_ascii_case("*NONE") {
+                        None
+                    } else {
+                        Some(crate::pgmmsg::parse_key(&v).unwrap_or(0))
+                    }
+                }
+            };
+            let rmv = up("RMV", "*YES");
+            let got = job.calls.receive(&msgtype, key, &rmv);
+            let m = got.clone().unwrap_or_default();
+            let found = got.is_some();
+            let n = |x: usize| Value::Dec(Decimal::from(x as u64));
+            let c = |s: &str| Value::Char(s.to_string());
+            for (k, target) in &p {
+                let v = match k.as_str() {
+                    "KEYVAR" => c(&if found {
+                        crate::pgmmsg::key_text(m.key)
+                    } else {
+                        String::new()
+                    }),
+                    "MSG" => c(&m.text),
+                    "MSGLEN" => n(m.text.len()),
+                    "SECLVL" => c(&m.seclvl),
+                    "SECLVLLEN" => n(m.seclvl.len()),
+                    "MSGDTA" => c(&crate::rpg::data::a(&m.data)),
+                    "MSGDTALEN" => n(m.data.len()),
+                    "MSGID" => c(&m.msgid),
+                    "SEV" => Value::Dec(Decimal::from(m.sev)),
+                    "RTNTYPE" => c(crate::pgmmsg::rtntype(&m.ty)),
+                    "MSGF" => c(&m.msgf),
+                    "MSGFLIB" => c(&m.msgflib),
+                    "SNDMSGFLIB" => c(&m.sndmsgflib),
+                    "SENDER" => c(""),
+                    "ALROPT" => c(""),
+                    "CCSID" | "TEXTCCSID" | "MSGDTACCSID" => {
+                        Value::Dec(Decimal::from(if found { 37 } else { 0 }))
+                    }
+                    _ => continue,
+                };
+                set_var(vars, target, v)?;
+            }
+            Ok(None)
+        }
+        // RTVMSG: a message description's text, with data substituted.
+        "RTVMSG" => {
+            let p = named(
+                st,
+                &[
+                    "MSGID",
+                    "MSGF",
+                    "MSGDTA",
+                    "MSG",
+                    "MSGLEN",
+                    "SECLVL",
+                    "SECLVLLEN",
+                    "SEV",
+                    "ALROPT",
+                    "LOGPRB",
+                    "CCSID",
+                    "TEXTCCSID",
+                ],
+            )?;
+            let id = substitute_text(
+                p.get("MSGID")
+                    .ok_or_else(|| anyhow!("line {}: RTVMSG needs MSGID", st.line))?,
+                vars,
+            )?
+            .trim()
+            .trim_matches('\'')
+            .to_string();
+            let msgf = substitute_text(
+                p.get("MSGF")
+                    .ok_or_else(|| anyhow!("line {}: RTVMSG needs MSGF", st.line))?,
+                vars,
+            )?
+            .replace(' ', "");
+            let data = match p.get("MSGDTA").map(|d| d.trim()) {
+                None => Vec::new(),
+                Some(d) if d.eq_ignore_ascii_case("*NONE") => Vec::new(),
+                Some(d) => message_data(d, vars)?,
+            };
+            let m = crate::pgmmsg::describe(
+                job.client,
+                &job.library_list(),
+                &job.calls,
+                &id,
+                &msgf,
+                &data,
+            )
+            .await?;
+            for (k, target) in &p {
+                let v = match k.as_str() {
+                    "MSG" => Value::Char(m.text.clone()),
+                    "MSGLEN" => Value::Dec(Decimal::from(m.text.len() as u64)),
+                    "SECLVL" => Value::Char(m.seclvl.clone()),
+                    "SECLVLLEN" => Value::Dec(Decimal::from(m.seclvl.len() as u64)),
+                    "SEV" => Value::Dec(Decimal::from(m.sev)),
+                    "ALROPT" => Value::Char("*NO".into()),
+                    "LOGPRB" => Value::Char("*NO".into()),
+                    "CCSID" | "TEXTCCSID" => Value::Dec(Decimal::from(37)),
+                    _ => continue,
+                };
+                set_var(vars, target, v)?;
+            }
+            Ok(None)
+        }
+        // RTVSYSVAL: system values as shipped (date and time ones from
+        // the clock, in UTC).
+        "RTVSYSVAL" => {
+            let p = named(st, &["SYSVAL", "RTNVAR"])?;
+            let name = p
+                .get("SYSVAL")
+                .ok_or_else(|| anyhow!("line {}: RTVSYSVAL needs SYSVAL", st.line))?
+                .trim()
+                .to_ascii_uppercase();
+            let target = p
+                .get("RTNVAR")
+                .ok_or_else(|| anyhow!("line {}: RTVSYSVAL needs RTNVAR", st.line))?;
+            let v = system_value(&name)?;
+            set_var(vars, target, v)?;
             Ok(None)
         }
         "CHKOBJ" => {
@@ -2309,7 +3323,36 @@ async fn command(
         _ => {
             let line = substitute(st, vars)?;
             match job.run_boxed(&line).await? {
-                Outcome::Messages(m) => msgs.extend(m),
+                Outcome::Messages(m) => {
+                    // The command's messages go on the program's queue
+                    // (completion messages, for RCVMSG).
+                    for t in &m {
+                        let (id, text) = match t.split_once(": ") {
+                            Some((i, x)) if is_msgid(i) => (i.to_string(), x.to_string()),
+                            _ => (String::new(), t.clone()),
+                        };
+                        job.calls.put(
+                            crate::pgmmsg::QMsg {
+                                msgf: if id.is_empty() {
+                                    String::new()
+                                } else {
+                                    crate::msgf::system_msgf(&id).into()
+                                },
+                                msgflib: if id.is_empty() {
+                                    String::new()
+                                } else {
+                                    "QSYS".into()
+                                },
+                                msgid: id,
+                                text,
+                                ty: "*COMP".into(),
+                                ..Default::default()
+                            },
+                            false,
+                        );
+                    }
+                    msgs.extend(m)
+                }
                 Outcome::SignOff => return Ok(Some(Outcome::SignOff)),
                 Outcome::Display(_)
                 | Outcome::ChangePassword
@@ -2355,6 +3398,36 @@ mod tests {
         assert_eq!(st.params[0].value, "&A");
     }
 
+    // CL reference, built-in functions: %SCAN gives the position of the
+    // search argument (0 when absent, from a start position); %CHECK the
+    // first character not in the comparator, %CHECKR the last; %TRIM with
+    // characters to trim; %UPPER, %LOWER; %LEN a variable's length (digits
+    // for *DEC), %SIZE its bytes (a *DEC (7 2) is packed in 4); %BIN the
+    // bytes of part of a character variable as a binary number.
+    #[test]
+    fn builtins() {
+        let p = compile(
+            "T",
+            "PGM\nDCL &S *CHAR 10 VALUE('ab,cd,ef')\nDCL &D *DEC (7 2)\nDCL &B *CHAR 4 VALUE(X'0001FFFE')\nENDPGM",
+        )
+        .unwrap();
+        let v = vars(&p);
+        let n = |x: i64| Value::Dec(Decimal::from(x));
+        assert_eq!(ev("%SCAN(',' &S)", &v), n(3));
+        assert_eq!(ev("%SCAN(',' &S 4)", &v), n(6));
+        assert_eq!(ev("%SCAN('x' &S)", &v), n(0));
+        assert_eq!(ev("%CHECK('abc' &S)", &v), n(3));
+        assert_eq!(ev("%CHECKR(' ' &S)", &v), n(8));
+        assert_eq!(ev("%TRIM(&S 'abf ')", &v), Value::Char(",cd,e".into()));
+        assert_eq!(ev("%UPPER(&S)", &v), Value::Char("AB,CD,EF  ".into()));
+        assert_eq!(ev("%LEN(&S)", &v), n(10));
+        assert_eq!(ev("%LEN(&D)", &v), n(7));
+        assert_eq!(ev("%SIZE(&D)", &v), n(4));
+        assert_eq!(ev("%BIN(&B 1 2)", &v), n(1));
+        assert_eq!(ev("%BIN(&B 3 2)", &v), n(-2));
+        assert_eq!(ev("%BIN(&B)", &v), n(0x0001FFFE));
+    }
+
     // CL reference, hexadecimal constants: X'C1C2' is the characters
     // whose EBCDIC codes those are ("AB"); X'25' is the line feed.
     #[test]
@@ -2396,6 +3469,11 @@ mod tests {
         );
         assert_eq!(ev("*ON", &v), Value::Char("1".into()));
         assert!(eval(&parse_expr("1 / 0").unwrap(), &v).is_err());
+        // A special value in an expression is a character constant.
+        assert_eq!(
+            ev("'*YES' *EQ *YES *AND *NO *NE *YES", &v),
+            Value::Lgl(true)
+        );
     }
 
     // CL reference: *DEC results are truncated (not rounded) to the

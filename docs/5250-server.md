@@ -189,7 +189,7 @@ Keys on the command entry screen:
 | F12 | Clear the command line |
 | F4 | Prompt the command typed (what was typed so far fills the prompt); on an empty line, show the command menu |
 
-**Command menu (F4 on an empty line).** A numbered menu of command groups (Library, Object, File, User profile, Program, Session). Type a number and press Enter to open a group's menu of commands, then a number to prompt that command. The "Selection or command" line also takes a command name: Enter runs it, F4 prompts it. F12 goes back one menu, F3 returns to the command line. The groups are `cl::GROUPS`; a unit test checks that every command is in exactly one.
+**Command menu (F4 on an empty line).** A numbered menu of command groups (Library, Object, File, User profile, Program, Session). Type a number and press Enter to open a group's menu of commands, then a number to prompt that command. The "Selection or command" line also takes a command name: Enter runs it, F4 prompts it. F12 goes back one menu, F3 returns to the command line. A menu longer than one screen shows More... and pages with Page Down and Page Up. The groups are `cl::GROUPS`; a unit test checks that every command is in exactly one.
 
 **Prompting (F4).** The prompt has one line per parameter with its current value or default and the allowed values; required parameters are highlighted, qualified names get a separate Library line. Enter builds the command (parameters left at their default are left out), checks it, and runs it; the command as built appears in the log, so F9 retrieves it. F5 resets the values, F12 returns to the command line with what was typed, F3 returns to an empty command line. The prompt comes from the same command table (`cl::COMMANDS`) as parsing.
 

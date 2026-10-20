@@ -188,8 +188,10 @@ async fn run(cli: Cli) -> Result<u8> {
             let (lib, name) = split_lib_file(&program)?;
             let source = std::fs::read_to_string(&src)
                 .with_context(|| format!("reading {}", src.display()))?;
-            let pgm = as4tainr_core::clpgm::compile(&name, &source)?;
             let mut client = runtime::connect_db(&cli.database_url).await?;
+            let mut libl = vec![lib.to_ascii_uppercase()];
+            libl.extend(commands::USER_LIBRARY_LIST.iter().map(|l| l.to_string()));
+            let pgm = as4tainr_core::clpgm::compile_in(&client, &libl, &name, &source).await?;
             catalog::create_cl_program(&mut client, &lib, &name, &text, &source, true).await?;
             println!(
                 "Program {} created in library {} ({} parameters, {} variables).",
@@ -326,6 +328,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 libl: libl.clone(),
                 display: None,
                 id: None,
+                calls: Default::default(),
             };
             let report = as4tainr_core::import::import(&mut job, &dir, &lib).await?;
             println!(
@@ -356,6 +359,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 libl: libl.clone(),
                 display: None,
                 id: None,
+                calls: Default::default(),
             };
             match job.run(&command).await {
                 Ok(commands::Outcome::Messages(m)) => {
@@ -473,6 +477,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 libl: libl.clone(),
                 display: None,
                 id: None,
+                calls: Default::default(),
             };
             match job.call_program(&program, args).await {
                 Ok(commands::Outcome::Messages(m)) => {

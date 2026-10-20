@@ -13,7 +13,6 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 3. **Fidelity changes need tests.** Every behavior change gets a test whose expected value comes from IBM documentation or a real system, not from running the new code. Say where the expected value came from in a comment.
 4. **Document gaps.** If you implement something only partly, add it to `docs/fidelity-gaps.md`.
 5. **Do not weaken tests to make them pass.** If a test looks wrong, explain why instead of editing it.
-6. **Keep ROADMAP.md current.** It is the master roadmap. When a change moves a phase, finishes a next step or adds a capability worth listing, update ROADMAP.md in the same commit. Describe the product as it is now: no history of earlier names or replaced designs.
 
 ## Layout
 
@@ -32,7 +31,10 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/web/` | Browser 5250 terminal: HTTP + WebSocket (`mod.rs`, `ws.rs`, dependency-free), a 5250 display station that talks TN5250 to this process's server (`display.rs`), the page (`static/`). See `docs/web-terminal.md` |
 | `core/src/cl.rs` | CL parser and the command definition table (add new commands here first) |
 | `core/src/commands.rs` | CL command implementations for a job |
-| `core/src/clpgm.rs` | CL programs: parse/check (CRTBNDCL), expressions (exact decimals), run in the calling job with MONMSG, *DEFINED and *BASED storage |
+| `core/src/clpgm.rs` | CL programs: parse/check (CRTBNDCL), expressions (exact decimals), run in the calling job with MONMSG, *DEFINED and *BASED storage, program messages (SNDPGMMSG, RCVMSG, RTVMSG), files (DCLF, RCVF, SNDF, SNDRCVF, CLOSE), RTVSYSVAL |
+| `core/src/msgf.rs` | Message files (*MSGF) and message descriptions (`as4tainr.message_descriptions`): CRTMSGF, ADDMSGD, CHGMSGD, RMVMSGD, substitution of message data (&1-&99 by FMT) |
+| `core/src/pgmmsg.rs` | The job's CL call stack (`Job.calls`): program message queues (SNDPGMMSG, RCVMSG), the escape message being raised, file overrides by call level |
+| `core/src/ovr.rs` | File overrides (OVRDBF, OVRPRTF, DLTOVR): which override counts, the file a program opens |
 | `core/src/cmd.rs` | Commands made with CRTCMD (*CMD): command definition statements, checking what was typed, CPP parameters (docs/commands.md) |
 | `core/src/prtf.rs` | Printer files (CRTPRTF): page size and overflow line, DDS record formats and their layout |
 | `core/src/dtaara.rs` | Data areas: CRTDTAARA/CHGDTAARA/RTVDTAARA values, RPG `IN *LOCK`/`OUT` (PostgreSQL advisory locks), the local data area `*LDA` (`as4tainr.local_data_areas`) |

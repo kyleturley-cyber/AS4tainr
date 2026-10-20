@@ -49,5 +49,5 @@ They are on the F4 menu under "Job and message commands".
 - Ending an active job (`ENDJOB` of a running job, `*IMMED`/`*CNTRLD`), holding and releasing jobs or job queues, job priorities, scheduled jobs (`SCDDATE`), `WRKJOBQ`, `WRKSBS`.
 - Other job queues and subsystems, subsystem descriptions, job descriptions (`JOBD` is always `QDFTJOBD`), routing entries.
 - Job logs are kept in the catalog for every job. As on IBM i, a batch job's log becomes spooled file `QPJOBLOG` only when the job ends abnormally (or with `DSPJOBLOG OUTPUT(*PRINT)`, `SIGNOFF LOG(*LIST)`); see [spooled-files.md](spooled-files.md).
-- Message replies (`*INQ` messages), break messages, message files, `RCVMSG`, the `QSYSOPR` operator's console. `DSPMSG` is a plain list.
+- Message replies (`*INQ` messages), break messages, `RCVMSG` from a message queue (CL programs receive from their program message queue, see cl-programs.md), the `QSYSOPR` operator's console. `DSPMSG` is a plain list.
 - Object authority (next in Phase 3). Record locks: see [record-locks.md](record-locks.md).

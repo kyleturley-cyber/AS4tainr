@@ -131,6 +131,21 @@ pub async fn compile_with(
     source: &str,
     options: &str,
 ) -> Result<program::Program> {
+    compile_ovr(client, libl, name, source, options, &[]).await
+}
+
+/// Compile with the job's file overrides in effect (OVRDBF TOFILE,
+/// OVRPRTF TOFILE, PAGESIZE and OVRFLW): the program opens the files they
+/// name.
+pub async fn compile_ovr(
+    client: &Client,
+    libl: &[String],
+    name: &str,
+    source: &str,
+    options: &str,
+    ovr: &[crate::ovr::Override],
+) -> Result<program::Program> {
+    use crate::ovr::{self, Kind};
     let includes = load_includes(client, libl, source).await;
     let mut src = parse::parse(source, &|id| includes.get(id).cloned())?;
     if !options.trim().is_empty() {
@@ -138,7 +153,7 @@ pub async fn compile_with(
     }
     let mut externals = HashMap::new();
     for f in program::external_files(&src) {
-        let fr = crate::catalog::resolve_file(client, libl, &f)
+        let fr = crate::catalog::resolve_file(client, libl, &ovr::file_name(ovr, Kind::Db, &f))
             .await
             .map_err(|e| anyhow!("file {f} for the program: {e}"))?;
         externals.insert(f, fr);
@@ -155,7 +170,18 @@ pub async fn compile_with(
     // formats of one described by DDS.
     let mut printers = HashMap::new();
     for f in program::printer_files(&src) {
-        if let Some(a) = crate::prtf::resolve(client, libl, &f).await? {
+        if let Some(mut a) =
+            crate::prtf::resolve(client, libl, &ovr::file_name(ovr, Kind::Printer, &f)).await?
+        {
+            if let Some(o) = ovr::effective(ovr, Kind::Printer, &f) {
+                if let Some((len, width)) = o.pagesize {
+                    a.page_length = len;
+                    a.page_width = width;
+                }
+                if let Some(of) = o.ovrflw {
+                    a.overflow = of;
+                }
+            }
             let dds = if a.source.trim().is_empty() {
                 None
             } else {
@@ -175,6 +201,8 @@ pub struct ClContext {
     pub curlib: Option<String>,
     /// The user part of the library list.
     pub user_libl: Vec<String>,
+    /// The file overrides in effect for the call.
+    pub overrides: Vec<crate::ovr::Override>,
 }
 
 /// What a call produced: DSPLY output, and an error if it ended
@@ -272,7 +300,8 @@ pub async fn call_with(
                 name: parts.next()?.to_string(),
             })
         });
-        let prog = rt.block_on(compile_with(&client, &libl, &name, &source, &options))?;
+        let ovr = cl.as_ref().map(|c| c.overrides.clone()).unwrap_or_default();
+        let prog = rt.block_on(compile_ovr(&client, &libl, &name, &source, &options, &ovr))?;
         // Called from CL: the caller is in the default activation group.
         let actgrp = interp::program_group(&prog, crate::ile::DEFAULT_GROUP);
         let mut m = interp::Machine::new(

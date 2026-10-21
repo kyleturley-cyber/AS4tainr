@@ -225,6 +225,21 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
     Ok(Some(ddl))
 }
 
+/// A data type as SQL writes it (`DECIMAL(9, 2)`, `VARCHAR(50)`): the
+/// field it describes (SQL routines' parameters and variables).
+pub fn parse_type(text: &str) -> Result<FieldDef> {
+    let toks: Vec<Tok> = tokenize(text)?
+        .into_iter()
+        .filter(|t| !matches!(t, Tok::Space(_)))
+        .collect();
+    let mut p = P { t: toks, i: 0 };
+    let (t, len, dec, varlen) = data_type(&mut p)?;
+    let mut f = FieldDef::new("V", t, len, dec);
+    f.double = t == DataType::Float && len > 9;
+    f.varlen = varlen;
+    Ok(f)
+}
+
 /// An SQL name (Db2 for i: up to 128 characters). Names with lower case
 /// letters or special characters (quoted names) are not supported yet.
 fn sql_name(kind: &str, n: &str) -> Result<String> {
@@ -1830,6 +1845,32 @@ pub async fn try_run(
     schema: &mut Option<String>,
     stmt: &str,
 ) -> Result<Option<String>> {
+    // SQL procedures and functions.
+    if let Some((replace, r)) = crate::sqlpl::parse_create(stmt)? {
+        let client = crate::runtime::connect_db(database_url).await?;
+        let target = schema
+            .clone()
+            .or_else(|| curlib.clone())
+            .unwrap_or_else(|| "QGPL".into());
+        let search = match schema {
+            Some(s) => vec![s.clone()],
+            None => libl.to_vec(),
+        };
+        return crate::sqlpl::create(&client, database_url, &search, target, r, replace)
+            .await
+            .map(Some);
+    }
+    if let Some((kind, lib, name, if_exists)) = crate::sqlpl::parse_drop(stmt)? {
+        let client = crate::runtime::connect_db(database_url).await?;
+        let search = match (&lib, schema) {
+            (Some(_), _) => vec![],
+            (None, Some(s)) => vec![s.clone()],
+            (None, None) => libl.to_vec(),
+        };
+        return crate::sqlpl::drop_routine(&client, &search, &kind, lib, &name, if_exists)
+            .await
+            .map(Some);
+    }
     let Some(ddl) = parse(stmt)? else {
         return Ok(None);
     };
@@ -1855,6 +1896,8 @@ pub fn split_statements(script: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut i = 0;
+    let mut blocks = 0i32;
+    let mut cases = 0i32;
     while i < cs.len() {
         let c = cs[i];
         if c == '-' && cs.get(i + 1) == Some(&'-') {
@@ -1891,7 +1934,46 @@ pub fn split_statements(script: &str) -> Vec<String> {
             }
             continue;
         }
-        if c == ';' {
+        // Words: BEGIN ... END of compound statements (routine bodies)
+        // keep their semicolons.
+        if c.is_ascii_alphabetic() || c == '_' {
+            let s0 = i;
+            while i < cs.len() && (cs[i].is_ascii_alphanumeric() || "_$#@".contains(cs[i])) {
+                i += 1;
+            }
+            let w: String = cs[s0..i].iter().collect::<String>().to_ascii_uppercase();
+            let prev_ok =
+                s0 == 0 || !(cs[s0 - 1].is_ascii_alphanumeric() || "_$#@.".contains(cs[s0 - 1]));
+            if prev_ok {
+                match w.as_str() {
+                    "BEGIN" => blocks += 1,
+                    "CASE" => cases += 1,
+                    "END" => {
+                        // The word after END.
+                        let mut j = i;
+                        while j < cs.len() && cs[j].is_whitespace() {
+                            j += 1;
+                        }
+                        let k0 = j;
+                        while j < cs.len() && cs[j].is_ascii_alphanumeric() {
+                            j += 1;
+                        }
+                        let next: String =
+                            cs[k0..j].iter().collect::<String>().to_ascii_uppercase();
+                        match next.as_str() {
+                            "IF" | "WHILE" | "LOOP" | "REPEAT" | "FOR" => {}
+                            "CASE" => cases = (cases - 1).max(0),
+                            _ if cases > 0 => cases -= 1,
+                            _ => blocks = (blocks - 1).max(0),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            cur.extend(&cs[s0..i]);
+            continue;
+        }
+        if c == ';' && blocks == 0 {
             if !cur.trim().is_empty() {
                 out.push(cur.trim().to_string());
             }

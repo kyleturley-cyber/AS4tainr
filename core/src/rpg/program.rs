@@ -220,6 +220,10 @@ pub struct Program {
     pub plists: Vec<(String, Vec<Parm>)>,
     pub outputs: Vec<OutRec>,
     pub control: Vec<Keyword>,
+    /// The commit level embedded SQL runs with: SET OPTION COMMIT, else
+    /// the CRTSQLRPGI COMMIT parameter (kept as the SQLCOMMIT option),
+    /// else *NONE: *NONE, *CHG, *CS, *ALL or *RR.
+    pub sql_commit: String,
     /// Data areas: program field → data area name (DEFINE *DTAARA, or
     /// the DTAARA keyword).
     pub dtaaras: HashMap<String, String>,
@@ -292,6 +296,41 @@ fn sql_statements(calcs: &[CalcLine]) -> impl Iterator<Item = &str> {
         Line::Stmt(Stmt::Sql(s)) => Some(s.as_str()),
         _ => None,
     })
+}
+
+/// The commit level of a program's embedded SQL (Db2 for i SQL Reference,
+/// SET OPTION COMMIT: *NONE or *NC, *CHG or *UR, *CS, *ALL or *RS, *RR).
+fn sql_commit(src: &Source) -> String {
+    let norm = |v: &str| -> String {
+        match v.trim().trim_end_matches(';').to_ascii_uppercase().as_str() {
+            "*CHG" | "*UR" => "*CHG",
+            "*CS" => "*CS",
+            "*ALL" | "*RS" => "*ALL",
+            "*RR" => "*RR",
+            _ => "*NONE",
+        }
+        .to_string()
+    };
+    for s in
+        sql_statements(&src.calcs).chain(src.procs.iter().flat_map(|p| sql_statements(&p.calcs)))
+    {
+        let up = s.to_ascii_uppercase();
+        let w: Vec<&str> = up.split_whitespace().collect();
+        if w.len() >= 2 && w[0] == "SET" && w[1] == "OPTION" {
+            let rest = up.split_once("OPTION").map(|x| x.1).unwrap_or("");
+            for opt in rest.split(',') {
+                if let Some((k, v)) = opt.split_once('=') {
+                    if k.trim() == "COMMIT" {
+                        return norm(v);
+                    }
+                }
+            }
+        }
+    }
+    match keyword(&src.control, "SQLCOMMIT").and_then(|k| k.args.first()) {
+        Some(v) => norm(v),
+        None => "*NONE".into(),
+    }
 }
 
 /// DECLARE c CURSOR [WITH HOLD...] FOR select | statement-name.
@@ -2028,6 +2067,7 @@ pub fn bind(
         plists: src.plists.clone(),
         outputs: src.outputs.clone(),
         control: src.control.clone(),
+        sql_commit: sql_commit(src),
         dtaaras: data_areas(src),
         psds: src
             .defs

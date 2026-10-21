@@ -553,6 +553,68 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[p("CMD", Kind::Qualified, true, None, "Command").ch("Name")],
     },
     CommandDef {
+        name: "STRCMTCTL",
+        description: "Start Commitment Control",
+        params: &[
+            p("LCKLVL", Kind::Name, true, None, "Lock level").ch("*CHG, *CS, *ALL"),
+            p(
+                "CMTSCOPE",
+                Kind::Name,
+                false,
+                Some("*ACTGRP"),
+                "Commitment definition scope",
+            )
+            .ch("*ACTGRP, *JOB"),
+            p("NFYOBJ", Kind::List, false, Some("*NONE"), "Notify object").keyword_only(),
+            p(
+                "DFTJRN",
+                Kind::Qualified,
+                false,
+                Some("*NONE"),
+                "Default journal",
+            )
+            .ch("Name, *NONE")
+            .keyword_only(),
+            p(
+                "OMTJRNE",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "Omit journal entry",
+            )
+            .keyword_only(),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*DFT"),
+                "Text 'description'",
+            )
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "ENDCMTCTL",
+        description: "End Commitment Control",
+        params: &[],
+    },
+    CommandDef {
+        name: "COMMIT",
+        description: "Commit",
+        params: &[p(
+            "CMTID",
+            Kind::Text,
+            false,
+            Some("*NONE"),
+            "Commit identification",
+        )],
+    },
+    CommandDef {
+        name: "ROLLBACK",
+        description: "Rollback",
+        params: &[],
+    },
+    CommandDef {
         name: "OVRDBF",
         description: "Override with Data Base File",
         params: &[
@@ -2122,9 +2184,18 @@ pub static GROUPS: &[Group] = &[
         commands: &["CRTCMD", "DLTCMD", "DSPCMD"],
     },
     Group {
-        item: "File override commands",
-        title: "File Override Commands",
-        commands: &["OVRDBF", "OVRPRTF", "DLTOVR", "CLRPFM"],
+        item: "File override and commitment commands",
+        title: "File Override and Commitment Commands",
+        commands: &[
+            "OVRDBF",
+            "OVRPRTF",
+            "DLTOVR",
+            "CLRPFM",
+            "STRCMTCTL",
+            "ENDCMTCTL",
+            "COMMIT",
+            "ROLLBACK",
+        ],
     },
     Group {
         item: "Message file commands",

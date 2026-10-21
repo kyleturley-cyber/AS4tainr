@@ -181,6 +181,9 @@ struct FileState {
     others: i64,
     /// A display file: the key that ended the last input.
     aid: Option<String>,
+    /// Opened under commitment control (the COMMIT keyword): its I/O runs
+    /// in the commitment definition.
+    cmt: Option<std::sync::Arc<crate::cmtctl::Definition>>,
 }
 
 /// How a program handles null values in externally described database
@@ -382,6 +385,7 @@ impl<'a> Machine<'a> {
                     reads: 0,
                     others: 0,
                     aid: None,
+                    cmt: None,
                 })
                 .collect(),
             last: Status::default(),
@@ -1355,6 +1359,33 @@ impl<'a> Machine<'a> {
             "*FILE",
             need,
         ))?;
+        // The COMMIT keyword (with a condition: when it is on at open):
+        // the file is opened under the commitment definition of the
+        // program's activation group or job (ILE RPG Reference, COMMIT
+        // keyword); none: the open fails (CPF4326).
+        let commit = match crate::rpg::ast::keyword(&fi.decl.keywords, "COMMIT") {
+            None => false,
+            Some(k) => match k.args.first() {
+                None => true,
+                Some(a) => {
+                    let name = a.clone();
+                    let v = self.eval(&Expr::name(&name))?;
+                    matches!(v, Value::Ind(true))
+                        || v.chars().map(|c| c.first() == Some(&0xF1)).unwrap_or(false)
+                }
+            },
+        };
+        let fi = &self.prog.files[i];
+        self.files[i].cmt = None;
+        if commit {
+            match crate::cmtctl::find(&self.io.job_key, &self.io.actgrp) {
+                Some(d) => self.files[i].cmt = Some(d),
+                None => bail!(
+                    "CPF4326: File {} cannot be opened under commitment control: no commitment definition is active.",
+                    fi.decl.name
+                ),
+            }
+        }
         let mut open = OpenFile::new(fref.clone());
         if update {
             let (lib, pf) = self.block(crate::catalog::physical_file_of(
@@ -1536,7 +1567,11 @@ impl<'a> Machine<'a> {
             bail!("CPF4135: File {file} is not open.");
         }
         let lock = !ext.no_lock;
-        let client = self.io.client;
+        let cmt = self.files[i].cmt.clone();
+        let client: &tokio_postgres::Client = match &cmt {
+            Some(d) => &d.client,
+            None => self.io.client,
+        };
         let job = self.io.job_number;
         // *LOVAL/*START and *HIVAL/*END positioning.
         let special = match key.as_deref() {
@@ -1679,7 +1714,7 @@ impl<'a> Machine<'a> {
             FileOp::Write | FileOp::Update | FileOp::Delete => {
                 let fref = self.prog.files[i].fref.clone().unwrap();
                 self.block(crate::authority::check(
-                    client,
+                    self.io.client,
                     &self.io.user,
                     &fref.library,
                     &fref.file.name,
@@ -1728,6 +1763,9 @@ impl<'a> Machine<'a> {
                 };
                 match r {
                     Ok(()) => {
+                        if let Some(d) = &cmt {
+                            d.changed();
+                        }
                         self.last = Status {
                             found: true,
                             ..Status::default()
@@ -2545,7 +2583,28 @@ impl<'a> Machine<'a> {
                     false,
                 )?;
             }
-            "DEFINE" | "COMMIT" | "ROLBK" | "FORCE" | "DUMP" | "DEALLOC" => {}
+            // COMMIT and ROLBK: the pending changes of the commitment
+            // definition the program uses (ILE RPG Reference); none:
+            // status 00802.
+            "COMMIT" | "ROLBK" => {
+                let Some(d) = crate::cmtctl::find(&self.io.job_key, &self.io.actgrp) else {
+                    bail!("RNQ0802: Commitment control is not active.");
+                };
+                let rt = self.io.rt.clone();
+                let r = if code == "COMMIT" {
+                    rt.block_on(d.commit())
+                } else {
+                    rt.block_on(d.rollback())
+                };
+                r.map_err(|e| {
+                    anyhow!(
+                        "RNQ080{}: {} failed: {e}",
+                        if code == "COMMIT" { 4 } else { 5 },
+                        code
+                    )
+                })?;
+            }
+            "DEFINE" | "FORCE" | "DUMP" | "DEALLOC" => {}
             // CALLP(E): the call, its errors taken by the extender.
             "CALLP" => {
                 if let Some(x) = f2 {

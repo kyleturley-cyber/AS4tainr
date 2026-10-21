@@ -33,7 +33,7 @@ struct OpenCursor {
 /// How a statement ended: SQLCODE, SQLSTATE, rows (SQLERRD(3)), message.
 struct Outcome {
     code: i64,
-    state: &'static str,
+    state: String,
     rows: i64,
     text: String,
 }
@@ -42,7 +42,7 @@ impl Outcome {
     fn ok(rows: i64) -> Outcome {
         Outcome {
             code: 0,
-            state: "00000",
+            state: "00000".into(),
             rows,
             text: String::new(),
         }
@@ -50,7 +50,7 @@ impl Outcome {
     fn not_found() -> Outcome {
         Outcome {
             code: 100,
-            state: "02000",
+            state: "02000".into(),
             rows: 0,
             text: String::new(),
         }
@@ -58,7 +58,7 @@ impl Outcome {
     fn error(code: i64, text: impl Into<String>) -> Outcome {
         Outcome {
             code,
-            state: sqlstate(code),
+            state: sqlstate(code).into(),
             rows: 0,
             text: text.into(),
         }
@@ -224,7 +224,7 @@ impl Machine<'_> {
             )
         };
         set(self, "SQLCODE", Value::Num(Dec::from_i64(out.code)))?;
-        set(self, "SQLSTATE", Value::str(out.state))?;
+        set(self, "SQLSTATE", Value::str(&out.state))?;
         set(self, "SQLERRMC", Value::str(&out.text))?;
         let errd3 = Expr::Name {
             parts: vec!["SQLERRD".into()],
@@ -241,11 +241,36 @@ impl Machine<'_> {
 
     fn session(&mut self) -> Result<&Session> {
         if self.sql.session.is_none() {
-            let s = self.block(Session::open(
-                self.io.client,
-                &self.io.database_url,
-                &self.io.libl,
-            ))?;
+            // A commit level other than *NONE: the statements run under
+            // the commitment definition of the program's activation group
+            // or job, which SQL starts (at the activation group) when
+            // there is none.
+            let level = self.prog.sql_commit.clone();
+            let s = if level == "*NONE" {
+                self.block(Session::open(
+                    self.io.client,
+                    &self.io.database_url,
+                    &self.io.libl,
+                ))?
+            } else {
+                let d = match crate::cmtctl::find(&self.io.job_key, &self.io.actgrp) {
+                    Some(d) => d,
+                    None => self.block(crate::cmtctl::start(
+                        self.io.client,
+                        &self.io.database_url,
+                        &self.io.job_key,
+                        &self.io.actgrp,
+                        &level,
+                        false,
+                    ))?,
+                };
+                self.block(Session::open_in(
+                    self.io.client,
+                    &self.io.database_url,
+                    &self.io.libl,
+                    d,
+                ))?
+            };
             self.sql.session = Some(s);
         }
         Ok(self.sql.session.as_ref().unwrap())
@@ -488,8 +513,26 @@ impl Machine<'_> {
             {
                 return Ok(Outcome::ok(0))
             }
-            // Each statement is committed when it ends (COMMIT(*NONE)).
-            "COMMIT" | "ROLLBACK" => return Ok(Outcome::ok(0)),
+            // COMMIT and ROLLBACK: the unit of work of the commitment
+            // definition the program uses (with COMMIT(*NONE) each
+            // statement was committed when it ended: nothing to do).
+            "COMMIT" | "ROLLBACK" => {
+                let d = match self.sql.session.as_ref().and_then(|s| s.commitment()) {
+                    Some(d) => Some(d.clone()),
+                    None => crate::cmtctl::find(&self.io.job_key, &self.io.actgrp),
+                };
+                if let Some(d) = d {
+                    let r = if first == "COMMIT" {
+                        self.block(d.commit())
+                    } else {
+                        self.block(d.rollback())
+                    };
+                    if let Err(e) = r {
+                        return Ok(Outcome::error(-901, format!("SQL0901: {e}")));
+                    }
+                }
+                return Ok(Outcome::ok(0));
+            }
             "OPEN" => return self.sql_open(sql),
             "FETCH" => return self.sql_fetch(sql),
             "CLOSE" => {
@@ -560,7 +603,8 @@ impl Machine<'_> {
                     return Ok(Outcome::ok(0));
                 }
             }
-            "GET" | "CALL" | "ALTER" | "GRANT" | "REVOKE" | "RENAME" | "LOCK" | "MERGE" => {
+            "CALL" => return self.sql_call(sql),
+            "GET" | "ALTER" | "GRANT" | "REVOKE" | "RENAME" | "LOCK" | "MERGE" => {
                 return Ok(Outcome::error(
                     -84,
                     format!("SQL0084: {first} statements are not supported in embedded SQL yet."),
@@ -617,6 +661,74 @@ impl Machine<'_> {
     }
 
     /// SELECT INTO, VALUES INTO, SET: exactly one row.
+    /// CALL of an SQL procedure: arguments are host variables (OUT and
+    /// INOUT parameters come back into them) or expressions.
+    fn sql_call(&mut self, sql: &str) -> Result<Outcome> {
+        let Some((name, args)) = crate::sqlpl::parse_call(sql)? else {
+            return Ok(Outcome::error(-104, "SQL0104: CALL statement not valid."));
+        };
+        let mut exprs = Vec::new();
+        let mut targets: Vec<Option<(String, Option<String>)>> = Vec::new();
+        for a in &args {
+            let t = a.trim();
+            if let Some(rest) = t.strip_prefix(':') {
+                // :hv, :hv :ind, :hv INDICATOR :ind
+                let parts: Vec<&str> = rest
+                    .split_whitespace()
+                    .filter(|w| !w.eq_ignore_ascii_case("INDICATOR"))
+                    .collect();
+                let hv = parts.first().copied().unwrap_or("").to_string();
+                let ind = parts.get(1).map(|i| i.trim_start_matches(':').to_string());
+                exprs.push(self.host_literal(&hv, ind.as_deref())?);
+                targets.push(Some((hv, ind)));
+            } else {
+                exprs.push(t.to_string());
+                targets.push(None);
+            }
+        }
+        let curlib = self.io.cl.as_ref().and_then(|c| c.curlib.clone());
+        let client = self.io.client;
+        let url = self.io.database_url.clone();
+        let libl = self.io.libl.clone();
+        let user = self.io.user.clone();
+        let rt = self.io.rt.clone();
+        self.session()?;
+        let session = self.sql.session.as_ref().expect("opened above");
+        let env = crate::sqlpl::Env {
+            session,
+            catalog: client,
+            database_url: &url,
+            libl: &libl,
+            user: &user,
+            curlib,
+        };
+        let r = rt.block_on(crate::sqlpl::call_exprs(&env, &name, &exprs));
+        let (routine, out) = match r {
+            Ok(x) => x,
+            Err(e) => {
+                let (code, state, text) = crate::sqlpl::condition_of(&e);
+                let mut o = Outcome::error(code, text);
+                if code == -438 {
+                    o.state = state;
+                }
+                return Ok(o);
+            }
+        };
+        for ((p, t), v) in routine.parms.iter().zip(&targets).zip(&out.values) {
+            if p.mode == "IN" {
+                continue;
+            }
+            if let Some((hv, ind)) = t {
+                if let Some(o) =
+                    self.assign_hosts(&[(hv.clone(), ind.clone())], std::slice::from_ref(v))?
+                {
+                    return Ok(o);
+                }
+            }
+        }
+        Ok(Outcome::ok(0))
+    }
+
     fn single_row(&mut self, query: &str, hosts: &[(String, Option<String>)]) -> Result<Outcome> {
         let Exec::Rows { rows, .. } = self.run_sql(query)? else {
             bail!("SQL0104: INTO needs a query");

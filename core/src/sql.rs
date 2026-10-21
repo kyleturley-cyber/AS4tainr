@@ -80,7 +80,7 @@ pub async fn init(client: &Client) -> Result<()> {
 }
 
 /// A connection that logs in as the SQL role, to the same database.
-async fn connect_as_sql_role(client: &Client, database_url: &str) -> Result<Client> {
+pub(crate) async fn connect_as_sql_role(client: &Client, database_url: &str) -> Result<Client> {
     let password: String = client
         .query_opt("SELECT password FROM as4tainr.sql_login WHERE id = 1", &[])
         .await?
@@ -506,6 +506,8 @@ pub enum Outcome {
     },
     /// INSERT/UPDATE/DELETE: rows affected.
     Count(Kind, u64),
+    /// CALL of a procedure without result sets: what happened.
+    Message(String),
 }
 
 /// The most rows one SELECT returns to a display.
@@ -540,6 +542,20 @@ pub(crate) fn map_error(e: &tokio_postgres::Error, sql: &str) -> anyhow::Error {
         "23502" => anyhow!("SQL0407: Null value not allowed in a NOT NULL column: {msg}."),
         "42501" => anyhow!("SQL0551: Not authorized to an object in the statement."),
         "22P02" | "22003" => anyhow!("SQL0302: A value does not fit its column: {msg}."),
+        "22012" => anyhow!("SQL0802: Division by zero: {msg}."),
+        // An SQLSTATE an SQL function signaled (user-defined classes 7-9
+        // and I-Z; 20000 CASE not found): SQLCODE -438.
+        c if c.starts_with(['7', '8', '9'])
+            || c.chars()
+                .next()
+                .is_some_and(|x| ('I'..='Z').contains(&x) && !matches!(x, 'P' | 'X'))
+            || c == "20000" =>
+        {
+            anyhow::Error::new(crate::sqlpl::Signaled {
+                state: c.to_string(),
+                text: msg,
+            })
+        }
         _ => {
             let _ = sql;
             anyhow!("SQL0901: {msg}.")
@@ -555,6 +571,74 @@ pub async fn run(
     libl: &[String],
     sql: &str,
 ) -> Result<Outcome> {
+    run_as(client, database_url, libl, "QSECOFR", None, sql).await
+}
+
+/// `run` for a user (data definition in SQL procedures is done for them)
+/// with a current library. CALL runs a procedure: its first result set
+/// is the outcome's rows.
+pub async fn run_as(
+    client: &Client,
+    database_url: &str,
+    libl: &[String],
+    user: &str,
+    curlib: Option<String>,
+    sql: &str,
+) -> Result<Outcome> {
+    // A dynamic compound statement (BEGIN ... END).
+    if crate::sqlpl::is_compound(sql) {
+        let session = Session::open(client, database_url, libl).await?;
+        let env = crate::sqlpl::Env {
+            session: &session,
+            catalog: client,
+            database_url,
+            libl,
+            user,
+            curlib: curlib.clone(),
+        };
+        if crate::sqlpl::run_dynamic(&env, sql).await?.is_some() {
+            return Ok(Outcome::Message("Compound statement ran.".into()));
+        }
+    }
+    if let Some((name, args)) = crate::sqlpl::parse_call(sql)? {
+        let session = Session::open(client, database_url, libl).await?;
+        let env = crate::sqlpl::Env {
+            session: &session,
+            catalog: client,
+            database_url,
+            libl,
+            user,
+            curlib,
+        };
+        let (r, out) = crate::sqlpl::call_exprs(&env, &name, &args).await?;
+        if let Some((columns, rows)) = out.result_sets.into_iter().next() {
+            let numeric = columns.iter().map(|_| false).collect();
+            return Ok(Outcome::Rows {
+                columns,
+                numeric,
+                rows: rows
+                    .into_iter()
+                    .map(|r| {
+                        r.into_iter()
+                            .map(|v| v.unwrap_or_else(|| "-".into()))
+                            .collect()
+                    })
+                    .collect(),
+            });
+        }
+        let outs: Vec<String> = r
+            .parms
+            .iter()
+            .zip(&out.values)
+            .filter(|(p, _)| p.mode != "IN")
+            .map(|(p, v)| format!("{} = {}", p.name, v.as_deref().unwrap_or("NULL")))
+            .collect();
+        return Ok(Outcome::Message(if outs.is_empty() {
+            format!("Procedure {} ran.", r.name)
+        } else {
+            format!("Procedure {} ran: {}.", r.name, outs.join(", "))
+        }));
+    }
     let libraries = catalog::list_libraries(client).await?;
     let t = translate(sql, &|n| libraries.iter().any(|l| l == n))?;
     let mut text = t.sql.clone();
@@ -877,11 +961,32 @@ pub enum Exec {
 /// statement committed when it succeeds (COMMIT(*NONE)).
 pub struct Session {
     client: Client,
+    /// Run under commitment control: statements run in the commitment
+    /// definition's unit of work, not committed when they end.
+    cmt: Option<std::sync::Arc<crate::cmtctl::Definition>>,
     libraries: Vec<String>,
     libl: Vec<String>,
 }
 
 impl Session {
+    /// A session whose statements run under a commitment definition (a
+    /// program with a commit level other than *NONE).
+    pub async fn open_in(
+        client: &Client,
+        database_url: &str,
+        libl: &[String],
+        cmt: std::sync::Arc<crate::cmtctl::Definition>,
+    ) -> Result<Session> {
+        let mut s = Session::open(client, database_url, libl).await?;
+        s.cmt = Some(cmt);
+        Ok(s)
+    }
+
+    /// The commitment definition the session runs under, if any.
+    pub fn commitment(&self) -> Option<&std::sync::Arc<crate::cmtctl::Definition>> {
+        self.cmt.as_ref()
+    }
+
     pub async fn open(client: &Client, database_url: &str, libl: &[String]) -> Result<Session> {
         let sql_client = connect_as_sql_role(client, database_url).await?;
         let path: Vec<String> = libl.iter().map(|l| ident(l)).collect();
@@ -897,6 +1002,7 @@ impl Session {
             .await?;
         Ok(Session {
             client: sql_client,
+            cmt: None,
             libraries: catalog::list_libraries(client).await?,
             libl: libl.to_vec(),
         })
@@ -922,9 +1028,42 @@ impl Session {
             let cols: Vec<String> = f.file.fields.iter().map(|fd| fd.column()).collect();
             text.insert_str(*at, &format!(" ({})", cols.join(", ")));
         }
+        // Under commitment control: on the definition's session, inside a
+        // savepoint, so that a statement that fails takes back only its
+        // own changes.
+        let Some(d) = &self.cmt else {
+            return self.exec_on(&self.client, &t, text).await;
+        };
+        let path: Vec<String> = self.libl.iter().map(|l| ident(l)).collect();
+        d.client
+            .batch_execute(&format!(
+                "SAVEPOINT as4tainr_stmt; SET LOCAL search_path TO {}",
+                if path.is_empty() {
+                    "\"qgpl\"".to_string()
+                } else {
+                    path.join(", ")
+                }
+            ))
+            .await?;
+        let r = self.exec_on(&d.client, &t, text).await;
+        match &r {
+            Ok(_) => {
+                d.client
+                    .batch_execute("RELEASE SAVEPOINT as4tainr_stmt")
+                    .await?
+            }
+            Err(_) => {
+                d.client
+                    .batch_execute("ROLLBACK TO SAVEPOINT as4tainr_stmt")
+                    .await?
+            }
+        }
+        r
+    }
+
+    async fn exec_on(&self, client: &Client, t: &Translated, text: String) -> Result<Exec> {
         if t.kind == Kind::Query {
-            let stmt = self
-                .client
+            let stmt = client
                 .prepare(&text)
                 .await
                 .map_err(|e| map_error(&e, &text))?;
@@ -946,8 +1085,7 @@ impl Session {
                 .map(|c| c.type_().name() == "timestamp")
                 .collect();
             let mut rows = Vec::new();
-            for m in self
-                .client
+            for m in client
                 .simple_query(&text)
                 .await
                 .map_err(|e| map_error(&e, &text))?
@@ -971,11 +1109,15 @@ impl Session {
             }
             Ok(Exec::Rows { columns, rows })
         } else {
-            let n = self
-                .client
+            let n = client
                 .execute(&text, &[])
                 .await
                 .map_err(|e| map_error(&e, &text))?;
+            if n > 0 {
+                if let Some(d) = &self.cmt {
+                    d.changed();
+                }
+            }
             Ok(Exec::Count(t.kind, n))
         }
     }
@@ -1054,6 +1196,36 @@ pub async fn create_view(
         .batch_execute(&format!("REVOKE CREATE ON SCHEMA {schema} FROM {SQL_ROLE}"))
         .await;
     r.map_err(|e| map_error(&e, &text))?;
+    revoke?;
+    Ok(())
+}
+
+/// Run data definition that as4tainr wrote (a function from an SQL
+/// routine) as the SQL role, which may create objects in the library only
+/// while it runs.
+pub(crate) async fn define_as_sql_role(
+    client: &Client,
+    database_url: &str,
+    libl: &[String],
+    library: &str,
+    text: &str,
+) -> Result<()> {
+    let session = Session::open(client, database_url, libl).await?;
+    let schema = ident(library);
+    client
+        .batch_execute(&format!("GRANT CREATE ON SCHEMA {schema} TO {SQL_ROLE}"))
+        .await?;
+    let r = session
+        .client
+        .batch_execute(&format!("BEGIN; {text}; COMMIT;"))
+        .await;
+    if r.is_err() {
+        let _ = session.client.batch_execute("ROLLBACK").await;
+    }
+    let revoke = client
+        .batch_execute(&format!("REVOKE CREATE ON SCHEMA {schema} FROM {SQL_ROLE}"))
+        .await;
+    r.map_err(|e| map_error(&e, text))?;
     revoke?;
     Ok(())
 }

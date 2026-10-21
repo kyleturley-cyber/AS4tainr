@@ -205,6 +205,8 @@ pub async fn start_interactive(
 /// The job ends: interactive jobs at sign-off, batch jobs when their
 /// command ends. Ended jobs keep their row and job log (status OUTQ).
 pub async fn end(client: &Client, id: &JobId, normal: bool) -> Result<()> {
+    // Its commitment definitions end: what is pending is rolled back.
+    crate::cmtctl::end_job(&id.to_string()).await;
     client
         .execute(
             "UPDATE as4tainr.jobs SET status='OUTQ', ended=now(), function='', activity='',

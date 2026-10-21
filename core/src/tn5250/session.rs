@@ -1258,7 +1258,16 @@ async fn sql_session(term: &mut Term, job: &mut Job<'_>) -> Result<()> {
             Some(s) => vec![s.clone()],
             None => job.library_list(),
         };
-        match crate::sql::run(job.client, &job.env.database_url, &libl, &stmt).await {
+        match crate::sql::run_as(
+            job.client,
+            &job.env.database_url,
+            &libl,
+            &job.user,
+            Some(job.current_library()),
+            &stmt,
+        )
+        .await
+        {
             Ok(crate::sql::Outcome::Rows {
                 columns,
                 numeric,
@@ -1287,6 +1296,7 @@ async fn sql_session(term: &mut Term, job: &mut Job<'_>) -> Result<()> {
             Ok(crate::sql::Outcome::Count(kind, n)) => {
                 message = crate::sql::count_message(kind, n);
             }
+            Ok(crate::sql::Outcome::Message(m)) => message = m,
             Err(e) => {
                 message = e.to_string();
                 prefill = stmt;

@@ -1577,6 +1577,439 @@ ENDPGM"
     );
 }
 
+/// A customer's city, as another job sees it.
+async fn cusnos_city(client: &Client, lib: &str, cusno: i32) -> String {
+    client
+        .query_one(
+            &format!(
+                "SELECT trim(cuscty) FROM {}.custmast WHERE cusno = $1::int",
+                catalog::ident(lib)
+            ),
+            &[&cusno],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// The customer numbers above 6, as another job sees them.
+async fn cusnos_above_6(client: &Client, lib: &str) -> Vec<String> {
+    client
+        .query(
+            &format!(
+                "SELECT cusno::text FROM {}.custmast c WHERE c.cusno > 6 ORDER BY c.cusno",
+                catalog::ident(lib)
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect()
+}
+
+/// Commitment control (IBM CL reference STRCMTCTL, ENDCMTCTL, COMMIT,
+/// ROLLBACK; ILE RPG Reference COMMIT and ROLBK operations and the COMMIT
+/// file keyword; Db2 for i SQL Reference COMMIT, ROLLBACK and SET OPTION
+/// COMMIT; "Ending commitment control"). Records an RPG program writes to
+/// a file opened under commitment control are pending until COMMIT makes
+/// them permanent or ROLBK removes them; other jobs do not see pending
+/// records. ENDCMTCTL rolls back what is pending (CPF8356 in a batch
+/// job). A file with COMMIT cannot be opened without a commitment
+/// definition (CPF4326); COMMIT with none is CPF8350 in CL and status
+/// 00802 in RPG; a second STRCMTCTL for the same scope is CPF8351. SQL
+/// with a commit level other than *NONE starts commitment control itself;
+/// the job ending rolls back its pending changes.
+#[tokio::test]
+async fn commitment_control() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::jobs;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let mut c = runtime::connect_db(&url).await.unwrap();
+    let rpg = "**FREE
+dcl-f CUSTMAST usage(*update:*output) keyed commit;
+cusno = 7;
+cusnam = 'Rolled back';
+cuscty = 'X';
+cusbal = 0;
+write custrec;
+rolbk;
+cusno = 8;
+cusnam = 'Committed';
+write custrec;
+commit;
+cusno = 9;
+cusnam = 'Pending';
+write custrec;
+*inlr = *on;
+";
+    catalog::create_program(&mut c, &lib, "CMTRPG", "RPGLE", "", rpg, true)
+        .await
+        .unwrap();
+    let nocmt = "**FREE
+monitor;
+  commit;
+on-error;
+  dsply %char(%status);
+endmon;
+*inlr = *on;
+";
+    catalog::create_program(&mut c, &lib, "CMTNONE", "RPGLE", "", nocmt, true)
+        .await
+        .unwrap();
+    let sqlpgm = "**FREE
+exec sql set option commit = *chg;
+exec sql insert into custmast (cusno, cusnam, cuscty, cusbal) values (20, 'Undone', 'Y', 0);
+exec sql rollback;
+exec sql insert into custmast (cusno, cusnam, cuscty, cusbal) values (21, 'Kept', 'Y', 0);
+exec sql commit;
+exec sql insert into custmast (cusno, cusnam, cuscty, cusbal) values (22, 'Left pending', 'Y', 0);
+*inlr = *on;
+";
+    catalog::create_program(&mut c, &lib, "CMTSQL", "SQLRPGLE", "", sqlpgm, true)
+        .await
+        .unwrap();
+    let cl = "PGM
+  COMMIT
+  MONMSG CPF8350 EXEC(SNDPGMMSG MSG('no commitment definition'))
+  CALL CMTNONE
+  STRCMTCTL LCKLVL(*CHG) CMTSCOPE(*JOB)
+  STRCMTCTL LCKLVL(*CHG) CMTSCOPE(*JOB)
+  MONMSG CPF8351 EXEC(SNDPGMMSG MSG('already started'))
+  CALL CMTRPG
+ENDPGM";
+    catalog::create_cl_program(&mut c, &lib, "CMTCL", "", cl, true)
+        .await
+        .unwrap();
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let id = jobs::start_interactive(
+        &client,
+        &format!("C{}", &lib[1..]),
+        "QSECOFR",
+        None,
+        std::slice::from_ref(&lib),
+    )
+    .await
+    .unwrap();
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: None,
+        libl: vec![lib.clone()],
+        display: None,
+        id: Some(id.clone()),
+        calls: Default::default(),
+    };
+    let msgs = |o: Outcome| match o {
+        Outcome::Messages(m) => m,
+        other => panic!("unexpected {other:?}"),
+    };
+    let m = msgs(job.run("CALL CMTCL").await.unwrap());
+    assert_eq!(
+        m,
+        ["no commitment definition", "DSPLY  802", "already started"]
+    );
+    // Another job sees the committed record only.
+    assert_eq!(cusnos_above_6(&client, &lib).await, ["8"]);
+    let m = msgs(job.run("ENDCMTCTL").await.unwrap());
+    assert!(m[0].starts_with("CPF8356"), "{m:?}");
+    assert_eq!(cusnos_above_6(&client, &lib).await, ["8"]);
+    // No definition now: the file cannot be opened under commitment
+    // control.
+    let e = job.run("CALL CMTRPG").await.unwrap_err().to_string();
+    assert!(e.contains("CPF4326"), "{e}");
+    let e = job.run("ROLLBACK").await.unwrap_err().to_string();
+    assert!(e.starts_with("CPF8350"), "{e}");
+
+    // SQL starts commitment control by itself.
+    job.run("CALL CMTSQL").await.unwrap();
+    assert_eq!(cusnos_above_6(&client, &lib).await, ["8", "21"]);
+    // The pending insert is there for the job: a COMMIT in CL commits it.
+    job.run("COMMIT").await.unwrap();
+    assert_eq!(cusnos_above_6(&client, &lib).await, ["8", "21", "22"]);
+    // A change left pending when the job ends is rolled back: the record
+    // is not there, and its key is free at once (no lock held).
+    let pend = "**FREE
+exec sql set option commit = *chg;
+exec sql insert into custmast (cusno, cusnam, cuscty, cusbal) values (23, 'Never', 'Y', 0);
+*inlr = *on;
+";
+    catalog::create_program(&mut c, &lib, "CMTPEND", "SQLRPGLE", "", pend, true)
+        .await
+        .unwrap();
+    job.run("CALL CMTPEND").await.unwrap();
+    assert_eq!(cusnos_above_6(&client, &lib).await, ["8", "21", "22"]);
+    jobs::end(&client, &id, true).await.unwrap();
+    assert_eq!(cusnos_above_6(&client, &lib).await, ["8", "21", "22"]);
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {}.custmast (cusno, cusnam, cuscty, cusbal) VALUES (23, 'Free', 'Z', 0)",
+                catalog::ident(&lib)
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+}
+
+/// SQL procedures and functions (Db2 for i SQL Reference: CREATE
+/// PROCEDURE (SQL), CREATE FUNCTION (SQL scalar), CALL, compound
+/// statements, DECLARE HANDLER, SIGNAL, GET DIAGNOSTICS, FOR, LOOP,
+/// LEAVE, ITERATE, cursors). A CONTINUE handler for NOT FOUND lets a
+/// FETCH loop end and a SELECT INTO with no row go on; an EXIT handler
+/// ends the compound statement that declared it; SIGNAL raises a
+/// user-defined SQLSTATE (SQLCODE -438), which a handler for the
+/// condition catches; GET DIAGNOSTICS returns MESSAGE_TEXT. OUT
+/// parameters come back to the caller (host variables in embedded SQL).
+/// RUNSQLSTM keeps a routine's body together although it has semicolons.
+/// Expected values from samples/data/CUSTMAST.csv.
+#[tokio::test]
+async fn sql_procedures_and_functions() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::sql::Outcome as SqlOut;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let script = format!(
+        "CREATE OR REPLACE PROCEDURE {lib}.ADJUST (IN P_CUSNO DECIMAL(5, 0), IN P_AMOUNT DECIMAL(9, 2),
+    OUT P_NEWBAL DECIMAL(9, 2), OUT P_STATUS CHAR(10))
+  LANGUAGE SQL
+  MODIFIES SQL DATA
+BEGIN
+  DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    SET P_STATUS = 'FAILED';
+  DECLARE CONTINUE HANDLER FOR NOT FOUND
+    SET P_STATUS = 'NOTFOUND';
+  SET P_STATUS = 'OK';
+  SELECT CUSBAL INTO P_NEWBAL FROM CUSTMAST WHERE CUSNO = P_CUSNO;
+  IF P_STATUS = 'OK' THEN
+    UPDATE CUSTMAST SET CUSBAL = CUSBAL + P_AMOUNT WHERE CUSNO = P_CUSNO;
+    SET P_NEWBAL = P_NEWBAL + P_AMOUNT;
+  END IF;
+END;
+
+CREATE PROCEDURE {lib}.STATS (OUT P_TOTAL DECIMAL(11, 2), OUT P_NAMES VARCHAR(200),
+    OUT P_EVENS INTEGER)
+BEGIN
+  DECLARE V_BAL DECIMAL(9, 2);
+  DECLARE V_NAME CHAR(30);
+  DECLARE V_EOF INTEGER DEFAULT 0;
+  DECLARE I INTEGER DEFAULT 0;
+  DECLARE C1 CURSOR FOR SELECT CUSBAL, CUSNAM FROM CUSTMAST ORDER BY CUSNO;
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET V_EOF = 1;
+  SET P_TOTAL = 0;
+  OPEN C1;
+  FETCH C1 INTO V_BAL, V_NAME;
+  WHILE V_EOF = 0 DO
+    SET P_TOTAL = P_TOTAL + V_BAL;
+    FETCH C1 INTO V_BAL, V_NAME;
+  END WHILE;
+  CLOSE C1;
+  SET P_NAMES = '';
+  FOR R AS SELECT CUSNO, CUSCTY FROM CUSTMAST WHERE CUSNO <= 3 ORDER BY CUSNO DO
+    SET P_NAMES = P_NAMES CONCAT TRIM(R.CUSCTY) CONCAT ';';
+  END FOR;
+  SET P_EVENS = 0;
+  L1: LOOP
+    SET I = I + 1;
+    IF I > 10 THEN LEAVE L1; END IF;
+    IF MOD(I, 2) = 1 THEN ITERATE L1; END IF;
+    SET P_EVENS = P_EVENS + 1;
+  END LOOP L1;
+END;
+
+CREATE PROCEDURE {lib}.CHECKAMT (IN P_AMT DECIMAL(9, 2))
+BEGIN
+  IF P_AMT < 0 THEN
+    SIGNAL SQLSTATE '75001' SET MESSAGE_TEXT = 'Amount must not be negative';
+  END IF;
+END;
+
+CREATE PROCEDURE {lib}.TRYAMT (IN P_AMT DECIMAL(9, 2), OUT P_MSG VARCHAR(100))
+BEGIN
+  DECLARE BAD CONDITION FOR SQLSTATE '75001';
+  DECLARE EXIT HANDLER FOR BAD
+  BEGIN
+    GET DIAGNOSTICS EXCEPTION 1 P_MSG = MESSAGE_TEXT;
+  END;
+  SET P_MSG = 'accepted';
+  CALL CHECKAMT(P_AMT);
+END;
+
+CREATE FUNCTION {lib}.DOUBLED (P_AMT DECIMAL(9, 2)) RETURNS DECIMAL(11, 2)
+  LANGUAGE SQL DETERMINISTIC
+  RETURN P_AMT * 2;
+
+CREATE FUNCTION {lib}.GRADE (P_BAL DECIMAL(9, 2)) RETURNS CHAR(4)
+BEGIN
+  DECLARE G CHAR(4);
+  IF P_BAL > 1000 THEN SET G = 'HIGH';
+  ELSEIF P_BAL > 0 THEN SET G = 'LOW';
+  ELSE SET G = 'NONE';
+  END IF;
+  RETURN G;
+END;
+"
+    );
+    let lines = job
+        .run_sql_script(&script, "test script", 0, None, true)
+        .await
+        .unwrap();
+    assert_eq!(lines.len(), 7, "{lines:?}");
+    assert!(lines[6].contains("0 with errors"), "{lines:?}");
+
+    let run = |s: String| {
+        let client = &client;
+        let url = url.clone();
+        let lib = lib.clone();
+        async move {
+            let libl = vec![lib.clone()];
+            as4tainr_core::sql::run_as(client, &url, &libl, "QSECOFR", Some(lib), &s).await
+        }
+    };
+    let msg = |o: SqlOut| match o {
+        SqlOut::Message(m) => m,
+        other => panic!("unexpected {other:?}"),
+    };
+    // 310.00 + 10.50 (customer 2).
+    assert_eq!(
+        msg(run("CALL ADJUST(2, 10.50, ?, ?)".into()).await.unwrap()),
+        "Procedure ADJUST ran: P_NEWBAL = 320.50, P_STATUS = OK        ."
+    );
+    assert_eq!(
+        msg(run("CALL ADJUST(99, 1, ?, ?)".into()).await.unwrap()),
+        "Procedure ADJUST ran: P_NEWBAL = NULL, P_STATUS = NOTFOUND  ."
+    );
+    // 0 + 1250.50 + 320.50 - 75.25 + 9999999.99 (after the adjustment).
+    assert_eq!(
+        msg(run("CALL STATS(?, ?, ?)".into()).await.unwrap()),
+        "Procedure STATS ran: P_TOTAL = 10001495.74, P_NAMES = Des Moines;Chicago;Omaha;, P_EVENS = 5."
+    );
+    assert_eq!(
+        msg(run("CALL TRYAMT(-1, ?)".into()).await.unwrap()),
+        "Procedure TRYAMT ran: P_MSG = Amount must not be negative."
+    );
+    assert_eq!(
+        msg(run("CALL TRYAMT(5, ?)".into()).await.unwrap()),
+        "Procedure TRYAMT ran: P_MSG = accepted."
+    );
+    let e = run("CALL CHECKAMT(-1)".into())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(e, "SQL0438: Amount must not be negative");
+    // Functions, in a query.
+    match run(format!(
+        "SELECT CUSNO, DOUBLED(CUSBAL), GRADE(CUSBAL) FROM {lib}.CUSTMAST ORDER BY CUSNO"
+    ))
+    .await
+    .unwrap()
+    {
+        SqlOut::Rows { rows, .. } => {
+            let got: Vec<String> = rows.iter().map(|r| r.join(" ")).collect();
+            assert_eq!(
+                got,
+                [
+                    "1 2501.00 HIGH",
+                    // CHAR(4): blank padded.
+                    "2 641.00 LOW ",
+                    "3 0.00 NONE",
+                    "4 19999999.98 HIGH",
+                    "5 -150.50 NONE"
+                ]
+            );
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // CALL from embedded SQL: OUT parameters into host variables; a
+    // signaled SQLSTATE in the SQLCA.
+    let rpg = "**FREE
+dcl-s newbal packed(9:2);
+dcl-s status char(10);
+exec sql set option commit = *none;
+exec sql call ADJUST(3, 5, :newbal, :status);
+dsply (%trim(status) + ' ' + %char(newbal));
+exec sql call CHECKAMT(-2);
+dsply sqlstate;
+dsply %char(sqlcode);
+*inlr = *on;
+";
+    let r = run_rpg(&url, &lib, "QSECOFR", "CALLSP", rpg, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["OK 5.00", "75001", "-438"]);
+
+    // A compound statement by itself (a dynamic compound statement): its
+    // handler takes the SQLSTATE 42704 of the DROP of a table that is not
+    // there, and the script goes on.
+    let lines = job
+        .run_sql_script(
+            &format!(
+                "BEGIN
+  DECLARE CONTINUE HANDLER FOR SQLSTATE '42704' BEGIN END;
+  DROP TABLE {lib}.NOSUCHTBL;
+  UPDATE {lib}.CUSTMAST SET CUSCTY = 'Lincoln NE' WHERE CUSNO = 4;
+END;
+UPDATE {lib}.CUSTMAST SET CUSBAL = CUSBAL WHERE CUSNO = 4;"
+            ),
+            "compound script",
+            0,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(lines.last().unwrap().contains("0 with errors"), "{lines:?}");
+    assert_eq!(cusnos_city(&client, &lib, 4).await, "Lincoln NE");
+
+    // A result set: a cursor declared WITH RETURN left open.
+    job.run(&format!(
+        "RUNSQL SQL('CREATE PROCEDURE {lib}.OWING () DYNAMIC RESULT SETS 1 BEGIN DECLARE C CURSOR WITH RETURN FOR SELECT CUSNO, CUSBAL FROM CUSTMAST WHERE CUSBAL > 1000 ORDER BY CUSNO; OPEN C; END')"
+    ))
+    .await
+    .unwrap();
+    match run("CALL OWING()".into()).await.unwrap() {
+        SqlOut::Rows { rows, .. } => {
+            assert_eq!(rows, [["1", "1250.50"], ["4", "9999999.99"]]);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // DROP: the procedure is gone (SQL0440).
+    job.run("RUNSQL SQL('DROP PROCEDURE CHECKAMT')")
+        .await
+        .unwrap();
+    let e = run("CALL CHECKAMT(1)".into())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("SQL0440"), "{e}");
+    job.run("RUNSQL SQL('DROP FUNCTION GRADE')").await.unwrap();
+    let e = run(format!("SELECT GRADE(CUSBAL) FROM {lib}.CUSTMAST"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("SQL"), "{e}");
+}
+
 /// CL programs (IBM CL reference): loops with LEAVE and ITERATE, DOUNTIL
 /// running its body at least once, nested DOFOR, variables in command
 /// parameters, CALL between CL programs with parameters.

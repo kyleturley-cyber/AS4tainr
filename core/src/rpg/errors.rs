@@ -54,7 +54,7 @@ pub(super) fn status_code(err: &anyhow::Error) -> u32 {
         // an implicit open that failed.
         "CPF4135" => 1211,
         "CPF4161" => 1215,
-        "CPF9812" => 1216,
+        "CPF9812" | "CPF4326" => 1216,
         // Record in use; duplicate key; a constraint not satisfied;
         // UPDATE or DELETE without a record read before.
         "CPF5027" => 1218,
@@ -488,7 +488,33 @@ impl<'a> Machine<'a> {
             self.last = Status::default();
         }
         self.files[i].status.error = false;
+        // A file under commitment control: the operation runs in a
+        // savepoint of the unit of work, so that one that fails takes
+        // back only its own changes.
+        let cmt = self.files[i].cmt.clone();
+        if let Some(d) = &cmt {
+            self.block(async {
+                d.client
+                    .batch_execute("SAVEPOINT as4tainr_rla")
+                    .await
+                    .map_err(anyhow::Error::from)
+            })?;
+        }
         let r = self.file_op_inner(op, file, key, ext, ind);
+        if let Some(d) = &cmt {
+            self.block(async {
+                if d.client
+                    .batch_execute("RELEASE SAVEPOINT as4tainr_rla")
+                    .await
+                    .is_err()
+                {
+                    d.client
+                        .batch_execute("ROLLBACK TO SAVEPOINT as4tainr_rla")
+                        .await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
+        }
         let by_name = self.prog.files[i].decl.name == file;
         let record = if self.prog.files[i].fref.is_some() || self.prog.files[i].display.is_some() {
             if by_name {

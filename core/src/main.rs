@@ -232,6 +232,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 as4tainr_core::sql::Outcome::Count(kind, n) => {
                     println!("{}", as4tainr_core::sql::count_message(kind, n))
                 }
+                as4tainr_core::sql::Outcome::Message(m) => println!("{m}"),
             }
         }
         Cmd::Crtlf { file, src } => {

@@ -27,7 +27,33 @@ Written from IBM's public DB2 for i SQL reference.
 | Unnamed result columns | Named by their position (1, 2, ...) |
 | Errors | `SQL0204` not found, `SQL0206` unknown column, `SQL0104` statement not valid, `SQL0803` duplicate key, `SQL0551` not authorized, `SQL0084` statement not supported, `SQL0302` value does not fit, `SQL0901` other |
 
-Each statement is committed on its own (`COMMIT(*NONE)`). Timestamps are shown as Db2 does (`2026-10-19-14.05.30.000000`); dates as `YYYY-MM-DD` and times as `HH:MM:SS`.
+Outside commitment control each statement is committed on its own (`COMMIT(*NONE)`). Timestamps are shown as Db2 does (`2026-10-19-14.05.30.000000`); dates as `YYYY-MM-DD` and times as `HH:MM:SS`.
+
+## Procedures and functions
+
+Written from the Db2 for i SQL Reference (CREATE PROCEDURE (SQL), CREATE FUNCTION (SQL scalar), CALL, and the SQL control statements).
+
+| Statement | Supported |
+| --- | --- |
+| `CREATE [OR REPLACE] PROCEDURE name ([IN\|OUT\|INOUT] p type [DEFAULT x], ...) options body` | Options: LANGUAGE SQL, SPECIFIC, [NOT] DETERMINISTIC, MODIFIES/READS SQL DATA, CONTAINS SQL, DYNAMIC RESULT SETS n, COMMIT ON RETURN, SET OPTION, PROGRAM TYPE, and the other options Db2 for i takes (accepted). The body is one statement, usually `BEGIN ... END` |
+| `CREATE [OR REPLACE] FUNCTION name (p type, ...) RETURNS type options body` | Scalar functions: `RETURN expression`, or `BEGIN ... END` with DECLARE, SET, IF, CASE, WHILE, REPEAT, LOOP, LEAVE, ITERATE, SELECT INTO, VALUES INTO, SIGNAL and RETURN. Used in any statement like a built-in function |
+| `CALL name (arguments)` | From STRSQL, RUNSQL, RUNSQLSTM, `as4tainr sql`, embedded SQL (host variables receive OUT and INOUT parameters) and from other procedures. `?` (or any argument) for an OUT parameter, `DEFAULT` for a parameter's default; parameters left out at the end take their defaults. STRSQL shows a procedure's first result set, or its OUT parameters |
+| `DROP PROCEDURE\|FUNCTION [IF EXISTS] name` | |
+| `BEGIN ... END` by itself | A dynamic compound statement: runs like a procedure body without parameters, from STRSQL, RUNSQL and RUNSQLSTM |
+| Compound statement | `BEGIN [NOT] ATOMIC ... END` with `DECLARE` variables (with DEFAULT; SQLSTATE and SQLCODE variables are kept up to date), conditions (`FOR SQLSTATE`), cursors (`WITH RETURN`: left open, a result set), handlers (`CONTINUE`, `EXIT`, `UNDO` for SQLEXCEPTION, SQLWARNING, NOT FOUND, an SQLSTATE or a condition; the most specific one runs) |
+| Control statements | `SET` (also `SET (a, b) = (x, y)`), `IF ... ELSEIF ... ELSE ... END IF`, `CASE` (simple and searched; no WHEN true and no ELSE is SQLSTATE 20000), `WHILE`, `REPEAT ... UNTIL`, `LOOP`, `FOR v AS query DO ... END FOR` (columns as `v.col` or `col`), labels with `LEAVE` and `ITERATE`, `RETURN`, `SIGNAL`/`RESIGNAL` with `MESSAGE_TEXT` (SQLCODE -438 with that SQLSTATE), `GET DIAGNOSTICS` (ROW_COUNT; EXCEPTION 1 MESSAGE_TEXT, RETURNED_SQLSTATE, DB2_RETURNED_SQLCODE), `OPEN`, `FETCH ... INTO`, `CLOSE`, `CALL`, `COMMIT`, `ROLLBACK`, data definition, and every other statement |
+
+A procedure runs in as4tainr, one statement at a time: each SQL statement in it is run like any other, as the restricted SQL login, with the routine's variables and parameters put into it as typed values, on the session of the statement that called it (so a procedure called under commitment control is part of the unit of work). A function is a PostgreSQL function that as4tainr writes from the parsed body, with every expression translated as statements are, and defined by the restricted SQL login (as views are). Routines live in the library named, else the default schema, else the current library. RUNSQLSTM keeps a routine's `BEGIN ... END` together although its statements end with semicolons.
+
+## Commitment control
+
+Written from the CL reference (STRCMTCTL, ENDCMTCTL, COMMIT, ROLLBACK), the ILE RPG Reference (COMMIT keyword, COMMIT and ROLBK) and the Db2 for i SQL Reference (COMMIT, ROLLBACK, the COMMIT precompiler option).
+
+- `STRCMTCTL LCKLVL(*CHG|*CS|*ALL) CMTSCOPE(*ACTGRP|*JOB)` starts a commitment definition for the activation group (CL and the command line run in the default activation group) or for the job; a second one for the same scope is CPF8351. `ENDCMTCTL` ends it, rolling back what is pending (CPF8356 says how many changes). `COMMIT` and `ROLLBACK` (CL) without a definition are CPF8350.
+- RPG files with the `COMMIT` keyword, and embedded SQL run with a commit level other than *NONE (CRTSQLRPGI `COMMIT`, *CHG by default, or `SET OPTION COMMIT`), make their changes in the definition of the program's activation group, else the job's. SQL starts one at the activation group when there is none. The changes are pending, and the rows changed stay locked, until COMMIT (CL, RPG `COMMIT`, SQL `COMMIT`) makes them permanent or ROLLBACK (`ROLBK`, SQL `ROLLBACK`) removes them. A statement or file operation that fails takes back only its own changes.
+- When the job ends, pending changes are rolled back.
+
+PostgreSQL never shows uncommitted data to other sessions, so other jobs (and the same job's files that are not under commitment control) see the rows as they were before the pending changes; see fidelity-gaps.md.
 
 ## Embedded SQL in RPG
 
@@ -55,7 +81,7 @@ Written from the Db2 for i SQL Reference. A table is a physical file and an inde
 
 New objects go to the library named, else the default schema, else the current library, else QGPL (system naming). Names can be SQL names of up to 128 characters. An SQL name that is not a valid system name (longer than 10 characters) gets a system name, as Db2 for i gives one: its first five characters and a five-digit number unique in the library (a table COUNTRY_LIST is COUNT00001) or in the table for a column (COUNTRY_CODE is COUNT00001, COUNTRY_NAME COUNT00002), unless FOR SYSTEM NAME or FOR COLUMN names it. CL commands (DSPPFM, DLTF, CRTLF PFILE) and RPG use the system names; SQL statements use the SQL names, and the table's system name too. An RPG program uses the SQL column names with the ALIAS keyword on the file or on an EXTNAME data structure. Tables get the owner and authorities CRTPF gives a file; DROP needs *ALL authority to the file (SQL0551).
 
-The statements are parsed by as4tainr and the PostgreSQL objects built from the parsed description; no part of the statement text is passed on. Not supported yet: quoted names with lower case or special characters, several ALTER TABLE actions in one statement, ADD COLUMN ... BEFORE, generated columns other than identity columns, FOREIGN KEY, the other data types (DECFLOAT, XML, BOOLEAN, ROWID, DATALINK, arrays), TIMESTAMP precisions other than 6, procedures, functions, triggers, sequences and compound statements (BEGIN ... END). See fidelity-gaps.md.
+The statements are parsed by as4tainr and the PostgreSQL objects built from the parsed description; no part of the statement text is passed on. Procedures and functions are described above. Not supported yet: quoted names with lower case or special characters, several ALTER TABLE actions in one statement, ADD COLUMN ... BEFORE, generated columns other than identity columns, FOREIGN KEY, the other data types (DECFLOAT, XML, BOOLEAN, ROWID, DATALINK, arrays), TIMESTAMP precisions other than 6, external procedures and functions, table functions, triggers and sequences. See fidelity-gaps.md.
 
 ## Security
 
@@ -65,4 +91,4 @@ User SQL never runs as the database user as4tainr itself uses. `as4tainr init` c
 
 ## Not supported yet
 
-The data definition listed above as not supported yet, commitment control (COMMIT, ROLLBACK, `COMMIT(*CHG)`), the QSYS2 catalog views, `SELECT *` in `INSERT ... SELECT` (it includes the record number; list the columns), DB2-only scalar functions beyond the ones above, and special registers other than the dates and times. Object authority is not checked: anyone who can sign on can read and change every file with SQL, as with record-level access. See [fidelity-gaps.md](fidelity-gaps.md).
+The data definition listed above as not supported yet, the QSYS2 catalog views, `SELECT *` in `INSERT ... SELECT` (it includes the record number; list the columns), DB2-only scalar functions beyond the ones above, and special registers other than the dates and times. Object authority is not checked: anyone who can sign on can read and change every file with SQL, as with record-level access. See [fidelity-gaps.md](fidelity-gaps.md).

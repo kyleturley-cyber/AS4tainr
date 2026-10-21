@@ -153,6 +153,9 @@ impl Job<'_> {
             "DSPCMD" => self.dspcmd(&cmd).await,
             "CRTMSGF" => self.crtmsgf(&cmd).await,
             "OVRDBF" => self.override_file(&cmd, crate::ovr::Kind::Db),
+            "STRCMTCTL" => self.strcmtctl(&cmd).await,
+            "ENDCMTCTL" => self.endcmtctl().await,
+            "COMMIT" | "ROLLBACK" => self.commit(cmd.def.name == "COMMIT").await,
             "OVRPRTF" => self.override_file(&cmd, crate::ovr::Kind::Printer),
             "DLTOVR" => self.dltovr(&cmd),
             "CLRPFM" => self.clrpfm(&cmd).await,
@@ -417,14 +420,18 @@ impl Job<'_> {
         {
             return Ok(Outcome::Messages(vec![msg]));
         }
-        let t = crate::sql::translate(stmt, &|_| false)?;
-        if t.kind == crate::sql::Kind::Query {
-            bail!("SQL0084: RUNSQL cannot run a SELECT; use STRSQL to see rows.");
+        if crate::sqlpl::parse_call(stmt)?.is_none() && !crate::sqlpl::is_compound(stmt) {
+            let t = crate::sql::translate(stmt, &|_| false)?;
+            if t.kind == crate::sql::Kind::Query {
+                bail!("SQL0084: RUNSQL cannot run a SELECT; use STRSQL to see rows.");
+            }
         }
-        match crate::sql::run(
+        match crate::sql::run_as(
             self.client,
             &self.env.database_url,
             &self.library_list(),
+            &self.user,
+            Some(self.current_library()),
             stmt,
         )
         .await?
@@ -432,6 +439,7 @@ impl Job<'_> {
             crate::sql::Outcome::Count(kind, n) => {
                 Ok(Outcome::Messages(vec![crate::sql::count_message(kind, n)]))
             }
+            crate::sql::Outcome::Message(m) => Ok(Outcome::Messages(vec![m])),
             crate::sql::Outcome::Rows { .. } => Ok(Outcome::Messages(vec![])),
         }
     }
@@ -505,12 +513,20 @@ impl Job<'_> {
                             "SQL0084: SELECT is not valid in RUNSQLSTM."
                         ))
                     } else {
-                        match crate::sql::run(self.client, &self.env.database_url, &libl, stmt)
-                            .await
+                        match crate::sql::run_as(
+                            self.client,
+                            &self.env.database_url,
+                            &libl,
+                            &self.user,
+                            Some(self.current_library()),
+                            stmt,
+                        )
+                        .await
                         {
                             Ok(crate::sql::Outcome::Count(kind, n)) => {
                                 Ok(crate::sql::count_message(kind, n))
                             }
+                            Ok(crate::sql::Outcome::Message(m)) => Ok(m),
                             Ok(crate::sql::Outcome::Rows { .. }) => Ok(String::new()),
                             Err(e) => Err(e),
                         }
@@ -1527,7 +1543,14 @@ impl Job<'_> {
             };
             let mut c = runtime::connect_db(&self.env.database_url).await?;
             crate::ile::store(
-                &mut c, &lib, &name, "*MODULE", "SQLRPGLE", &text, &m.source, "",
+                &mut c,
+                &lib,
+                &name,
+                "*MODULE",
+                "SQLRPGLE",
+                &text,
+                &m.source,
+                &format!("SQLCOMMIT({})", cmd.get("COMMIT")),
             )
             .await?;
             authority::set_owner(self.client, &lib, &name, "*MODULE", &self.user).await?;
@@ -1582,6 +1605,9 @@ impl Job<'_> {
             "CRTBNDRPG" if cmd.get("ALWNULL") != "*NO" => {
                 format!("ALWNULL({})", cmd.get("ALWNULL"))
             }
+            // CRTSQLRPGI COMMIT: the commit level of its SQL statements
+            // (SET OPTION COMMIT in the source wins).
+            "CRTSQLRPGI" => format!("SQLCOMMIT({})", cmd.get("COMMIT")),
             _ => String::new(),
         };
         // CRTBNDRPG DFTACTGRP(*NO) ACTGRP(...): the activation group the
@@ -2043,6 +2069,63 @@ impl Job<'_> {
                 .collect(),
             ..Default::default()
         }))
+    }
+
+    /// The job's name for its commitment definitions (and record locks):
+    /// `000123/USER/NAME`, or the process for a job the system does not
+    /// know.
+    pub fn job_key(&self) -> String {
+        self.id
+            .as_ref()
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| format!("PID{}", std::process::id()))
+    }
+
+    /// STRCMTCTL. A CL program and the command line run in the default
+    /// activation group.
+    async fn strcmtctl(&mut self, cmd: &Command) -> Result<Outcome> {
+        let lcklvl = cmd.get("LCKLVL").to_ascii_uppercase();
+        if !matches!(lcklvl.as_str(), "*CHG" | "*CS" | "*ALL") {
+            bail!(
+                "CPF0006: Errors occurred in command. LCKLVL({lcklvl}) is not *CHG, *CS or *ALL."
+            );
+        }
+        crate::cmtctl::start(
+            self.client,
+            &self.env.database_url,
+            &self.job_key(),
+            crate::ile::DEFAULT_GROUP,
+            &lcklvl,
+            cmd.get("CMTSCOPE") == "*JOB",
+        )
+        .await?;
+        Ok(Outcome::Messages(vec![]))
+    }
+
+    /// ENDCMTCTL: pending changes are rolled back (as in a batch job; an
+    /// interactive job is not asked first).
+    async fn endcmtctl(&mut self) -> Result<Outcome> {
+        let n = crate::cmtctl::end(&self.job_key(), crate::ile::DEFAULT_GROUP).await?;
+        Ok(Outcome::Messages(if n > 0 {
+            vec![format!(
+                "CPF8356: Commitment control ended; {n} pending changes were rolled back."
+            )]
+        } else {
+            vec![]
+        }))
+    }
+
+    /// COMMIT and ROLLBACK (CL): CPF8350 without a commitment definition.
+    async fn commit(&mut self, commit: bool) -> Result<Outcome> {
+        let Some(d) = crate::cmtctl::find(&self.job_key(), crate::ile::DEFAULT_GROUP) else {
+            bail!("CPF8350: Commitment definition not found.");
+        };
+        if commit {
+            d.commit().await?;
+        } else {
+            d.rollback().await?;
+        }
+        Ok(Outcome::Messages(vec![]))
     }
 
     /// OVRDBF and OVRPRTF: at the current call level (OVRSCOPE(*JOB):

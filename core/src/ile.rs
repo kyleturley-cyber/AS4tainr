@@ -166,6 +166,16 @@ pub async fn bnddir_entries(
         Some((_, n)) => (libl.to_vec(), n.to_ascii_uppercase()),
         None => (libl.to_vec(), bnddir.to_ascii_uppercase()),
     };
+    // The system's binding directories (QC2LE, the C runtime; QUSAPIBD,
+    // the system APIs): their procedures are the ones as4tainr provides
+    // (SYSTEM_PROCEDURES), so they bind nothing here.
+    if SYSTEM_BNDDIRS.contains(&name.as_str())
+        && (libs.iter().any(|l| l == "QSYS")
+            || !bnddir.contains('/')
+            || bnddir.starts_with("*LIBL/"))
+    {
+        return Ok(vec![]);
+    }
     for lib in &libs {
         if crate::catalog::object_exists(client, std::slice::from_ref(lib), &name, "*BNDDIR")
             .await?
@@ -185,6 +195,12 @@ pub async fn bnddir_entries(
     }
     bail!("CPF5D07: Binding directory {name} not found.")
 }
+
+/// Binding directories in QSYS.
+pub const SYSTEM_BNDDIRS: &[&str] = &["QC2LE", "QUSAPIBD"];
+
+/// Procedures of the system's service programs that as4tainr provides.
+pub const SYSTEM_PROCEDURES: &[&str] = &["QP0ZLPRINTF"];
 
 /// A service program's binding, found through the library list (or in
 /// the library named).
@@ -337,6 +353,11 @@ pub async fn bind(
                     }
                     _ => {}
                 }
+            }
+            // System procedures as4tainr provides itself (the C runtime's
+            // Qp0zLprintf): resolved without a binding.
+            if !found && SYSTEM_PROCEDURES.contains(&sym.as_str()) {
+                found = true;
             }
             if !found {
                 bail!(

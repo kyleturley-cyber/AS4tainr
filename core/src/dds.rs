@@ -63,6 +63,17 @@ pub enum DataType {
     Blob,
     #[serde(rename = "DBCLOB")]
     Dbclob,
+    /// SQL DECFLOAT(16) and DECFLOAT(34): decimal floating point, kept as
+    /// an exact PostgreSQL numeric (the length is 16 or 34 digits). Like
+    /// the large objects, SQL only.
+    #[serde(rename = "DECFLOAT")]
+    Decfloat,
+    /// SQL BOOLEAN (Db2 for i 7.5). SQL only.
+    #[serde(rename = "BOOLEAN")]
+    Boolean,
+    /// SQL XML, kept as text. SQL only.
+    #[serde(rename = "XML")]
+    Xml,
 }
 
 impl DataType {
@@ -81,6 +92,9 @@ impl DataType {
             DataType::Clob => "CLOB",
             DataType::Blob => "BLOB",
             DataType::Dbclob => "DBCLOB",
+            DataType::Decfloat => "DECFLOAT",
+            DataType::Boolean => "BOOLEAN",
+            DataType::Xml => "XML",
         }
     }
 
@@ -99,6 +113,9 @@ impl DataType {
             "CLOB" => DataType::Clob,
             "BLOB" => DataType::Blob,
             "DBCLOB" => DataType::Dbclob,
+            "DECFLOAT" => DataType::Decfloat,
+            "BOOLEAN" => DataType::Boolean,
+            "XML" => DataType::Xml,
             other => {
                 bail!("unsupported DDS data type '{other}' (supported: A, P, S, B, F, H, L, T, Z)")
             }
@@ -113,8 +130,18 @@ impl DataType {
     }
 
     /// An SQL large object (CLOB, BLOB, DBCLOB).
+    /// Columns only SQL uses: large objects, DECFLOAT, BOOLEAN, XML (a
+    /// program's externally described record leaves them out).
     pub fn is_lob(self) -> bool {
-        matches!(self, DataType::Clob | DataType::Blob | DataType::Dbclob)
+        matches!(
+            self,
+            DataType::Clob
+                | DataType::Blob
+                | DataType::Dbclob
+                | DataType::Decfloat
+                | DataType::Boolean
+                | DataType::Xml
+        )
     }
 
     /// Date, time or timestamp.
@@ -275,7 +302,14 @@ impl FieldDef {
             DataType::Binary => format!("numeric({},{})", self.length, self.decimals),
             DataType::Date => "date".into(),
             DataType::Time => "time(0)".into(),
-            DataType::Timestamp => "timestamp(6)".into(),
+            // TIMESTAMP(p): 26 characters for 6 fractional digits, 19 for
+            // none; PostgreSQL keeps at most 6.
+            DataType::Timestamp => format!("timestamp({})", self.length.saturating_sub(20).min(6)),
+            // Exact decimal, as DECFLOAT is decimal (never binary floating
+            // point).
+            DataType::Decfloat => "numeric".into(),
+            DataType::Boolean => "boolean".into(),
+            DataType::Xml => "text".into(),
             DataType::Float if self.double => "double precision".into(),
             DataType::Float => "real".into(),
             DataType::Hex | DataType::Blob => "bytea".into(),
@@ -293,7 +327,11 @@ impl FieldDef {
             DataType::Packed | DataType::Zoned | DataType::Binary | DataType::Float => "0".into(),
             // Hexadecimal blanks (X'40').
             DataType::Hex if !self.varlen => "40".repeat(self.length as usize),
-            DataType::Hex | DataType::Clob | DataType::Blob | DataType::Dbclob => String::new(),
+            DataType::Hex | DataType::Clob | DataType::Blob | DataType::Dbclob | DataType::Xml => {
+                String::new()
+            }
+            DataType::Decfloat => "0".into(),
+            DataType::Boolean => "false".into(),
             DataType::Date => "0001-01-01".into(),
             DataType::Time => "00.00.00".into(),
             DataType::Timestamp => "0001-01-01-00.00.00.000000".into(),
@@ -306,7 +344,11 @@ impl FieldDef {
     pub fn to_db(&self, v: &str) -> String {
         let t = v.trim();
         match self.data_type {
-            DataType::Packed | DataType::Zoned | DataType::Binary | DataType::Float => {
+            DataType::Packed
+            | DataType::Zoned
+            | DataType::Binary
+            | DataType::Float
+            | DataType::Decfloat => {
                 if t.is_empty() {
                     "0".into()
                 } else {
@@ -315,7 +357,8 @@ impl FieldDef {
             }
             // Hex digits as a bytea constant.
             DataType::Hex | DataType::Blob => format!("\\x{t}"),
-            DataType::Clob | DataType::Dbclob | DataType::Graphic => v.to_string(),
+            DataType::Clob | DataType::Dbclob | DataType::Graphic | DataType::Xml => v.to_string(),
+            DataType::Boolean => t.to_string(),
             DataType::Date if t.is_empty() => "0001-01-01".into(),
             DataType::Date => t.to_string(),
             DataType::Time => {

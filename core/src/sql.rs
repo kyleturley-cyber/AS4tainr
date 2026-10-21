@@ -469,19 +469,30 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
         let idx: Vec<usize> = (0..out.len())
             .filter(|&j| !matches!(out[j], Tok::Space(_)))
             .collect();
-        if idx.len() >= 4
+        // The table name: NAME, or LIB.NAME (LIB/NAME is already
+        // LIB.NAME here).
+        let qualified = idx.len() >= 6 && matches!(&out[idx[3]], Tok::Punct(p) if p == ".");
+        let last = if qualified { 4 } else { 2 };
+        if idx.len() > last + 1
             && word(&out[idx[1]]).as_deref() == Some("INTO")
             && matches!(
-                word(&out[idx[3]]).as_deref(),
+                word(&out[idx[last + 1]]).as_deref(),
                 Some("VALUES" | "SELECT" | "WITH")
             )
         {
-            let target = match &out[idx[2]] {
-                Tok::Word(w) => w.clone(),
-                Tok::Quoted(q) => q.clone(),
-                _ => bail!("SQL0104: A table name is expected after INSERT INTO."),
+            let part = |t: &Tok| -> Result<String> {
+                Ok(match t {
+                    Tok::Word(w) => w.clone(),
+                    Tok::Quoted(q) => q.clone(),
+                    _ => bail!("SQL0104: A table name is expected after INSERT INTO."),
+                })
             };
-            let before: String = render(&out[..=idx[2]]);
+            let target = if qualified {
+                format!("{}.{}", part(&out[idx[2]])?, part(&out[idx[4]])?)
+            } else {
+                part(&out[idx[2]])?
+            };
+            let before: String = render(&out[..=idx[last]]);
             insert_needs_columns = Some((target, before.len()));
         }
     }
@@ -729,6 +740,25 @@ async fn run_in_transaction(
             })
             .collect();
         let types: Vec<&str> = cols.iter().map(|c| c.type_().name()).collect();
+        // A timestamp column's precision (TIMESTAMP(p): p fractional
+        // digits shown), when it comes from a table.
+        let mut precisions: Vec<Option<i32>> = Vec::new();
+        for c in cols.iter() {
+            let p = match (c.type_().name(), c.table_oid(), c.column_id()) {
+                ("timestamp", Some(oid), Some(col)) => tx
+                    .query_opt(
+                        "SELECT atttypmod FROM pg_catalog.pg_attribute WHERE attrelid = $1 AND attnum = $2",
+                        &[&oid, &col],
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|r| r.get::<_, i32>(0))
+                    .filter(|m| *m >= 0),
+                _ => None,
+            };
+            precisions.push(p);
+        }
         let mut rows = Vec::new();
         for m in tx
             .simple_query(text)
@@ -743,7 +773,10 @@ async fn run_in_transaction(
                     (0..r.len())
                         .filter(|&j| keep.get(j).copied().unwrap_or(true))
                         .map(|j| match r.get(j) {
-                            Some(v) => db2_text(types.get(j).copied().unwrap_or(""), v),
+                            Some(v) => match precisions.get(j).copied().flatten() {
+                                Some(p) => db2_timestamp_p(v, p as usize),
+                                None => db2_text(types.get(j).copied().unwrap_or(""), v),
+                            },
                             None => "-".to_string(),
                         })
                         .collect(),
@@ -770,6 +803,8 @@ async fn run_in_transaction(
 fn db2_text(pg_type: &str, v: &str) -> String {
     match pg_type {
         "timestamp" => db2_timestamp(v),
+        // BOOLEAN as Db2 shows it.
+        "bool" => if v == "t" { "TRUE" } else { "FALSE" }.into(),
         "bytea" => v.trim_start_matches("\\x").to_ascii_uppercase(),
         _ => v.to_string(),
     }
@@ -783,6 +818,20 @@ pub fn db2_timestamp(v: &str) -> String {
     };
     let (hms, frac) = t.split_once('.').unwrap_or((t, ""));
     format!("{d}-{}.{frac:0<6}", hms.replace(':', "."))
+}
+
+/// A timestamp with `p` fractional digits (TIMESTAMP(p); none: no
+/// fraction).
+pub fn db2_timestamp_p(v: &str, p: usize) -> String {
+    let full = db2_timestamp(v);
+    match full.rsplit_once('.') {
+        Some((head, frac)) if p == 0 => {
+            let _ = frac;
+            head.to_string()
+        }
+        Some((head, frac)) => format!("{head}.{:0<p$}", &frac[..frac.len().min(p)]),
+        None => full,
+    }
 }
 
 /// A completion message like IBM i's for INSERT/UPDATE/DELETE.
@@ -1152,6 +1201,35 @@ pub async fn create_view(
         .await?
         .get(0);
     let schema = ident(library);
+    client.batch_execute(catalog::ROLE_DDL_LOCK).await?;
+    let r = create_view_locked(
+        client,
+        &session,
+        &schema,
+        name,
+        alias,
+        columns,
+        &t,
+        check_option,
+        &me,
+    )
+    .await;
+    let _ = client.batch_execute(catalog::ROLE_DDL_UNLOCK).await;
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_view_locked(
+    client: &Client,
+    session: &Session,
+    schema: &str,
+    name: &str,
+    alias: Option<&str>,
+    columns: &[String],
+    t: &Translated,
+    check_option: bool,
+    me: &str,
+) -> Result<()> {
     client
         .batch_execute(&format!("GRANT CREATE ON SCHEMA {schema} TO {SQL_ROLE}"))
         .await?;
@@ -1177,12 +1255,12 @@ pub async fn create_view(
             ""
         }
     );
-    text.push_str(&format!(" GRANT SELECT ON {view} TO {};", ident_role(&me)));
+    text.push_str(&format!(" GRANT SELECT ON {view} TO {};", ident_role(me)));
     if let Some(a) = alias {
         let second = format!("{schema}.{}", ident(a));
         text.push_str(&format!(
             " CREATE VIEW {second} AS SELECT * FROM {view}; GRANT SELECT ON {second} TO {};",
-            ident_role(&me)
+            ident_role(me)
         ));
     }
     let r = session
@@ -1212,9 +1290,14 @@ pub(crate) async fn define_as_sql_role(
 ) -> Result<()> {
     let session = Session::open(client, database_url, libl).await?;
     let schema = ident(library);
-    client
+    client.batch_execute(catalog::ROLE_DDL_LOCK).await?;
+    let granted = client
         .batch_execute(&format!("GRANT CREATE ON SCHEMA {schema} TO {SQL_ROLE}"))
-        .await?;
+        .await;
+    if let Err(e) = granted {
+        let _ = client.batch_execute(catalog::ROLE_DDL_UNLOCK).await;
+        return Err(e.into());
+    }
     let r = session
         .client
         .batch_execute(&format!("BEGIN; {text}; COMMIT;"))
@@ -1225,9 +1308,56 @@ pub(crate) async fn define_as_sql_role(
     let revoke = client
         .batch_execute(&format!("REVOKE CREATE ON SCHEMA {schema} FROM {SQL_ROLE}"))
         .await;
+    let _ = client.batch_execute(catalog::ROLE_DDL_UNLOCK).await;
     r.map_err(|e| map_error(&e, text))?;
     revoke?;
     Ok(())
+}
+
+/// The columns a query returns, as fields (CREATE TABLE AS): the query
+/// is translated, defined as a temporary view by the SQL role, and its
+/// columns read from information_schema.
+pub(crate) async fn query_fields(
+    client: &Client,
+    database_url: &str,
+    libl: &[String],
+    query: &str,
+) -> Result<Vec<crate::dds::FieldDef>> {
+    let libraries = catalog::list_libraries(client).await?;
+    let t = translate(query, &|n| libraries.iter().any(|l| l == n))?;
+    if t.kind != Kind::Query {
+        bail!("SQL0104: a query (SELECT) is expected after AS.");
+    }
+    let session = Session::open(client, database_url, libl).await?;
+    let c = &session.client;
+    client.batch_execute(catalog::ROLE_DDL_LOCK).await?;
+    let made = c
+        .batch_execute(&format!(
+            "CREATE TEMP VIEW as4tainr_ctas AS {}",
+            t.sql.trim().trim_end_matches(';')
+        ))
+        .await;
+    if let Err(e) = made {
+        let _ = client.batch_execute(catalog::ROLE_DDL_UNLOCK).await;
+        return Err(map_error(&e, &t.sql));
+    }
+    let cols = c
+        .query(
+            "SELECT column_name::text, data_type::text, character_maximum_length, numeric_precision, numeric_scale
+               FROM information_schema.columns
+              WHERE table_schema = pg_my_temp_schema()::regnamespace::text AND table_name = 'as4tainr_ctas'
+              ORDER BY ordinal_position",
+            &[],
+        )
+        .await;
+    let _ = c.batch_execute("DROP VIEW as4tainr_ctas").await;
+    let _ = client.batch_execute(catalog::ROLE_DDL_UNLOCK).await;
+    let cols = cols?;
+    let (fields, _) = catalog::fields_of_columns(&cols)?;
+    if fields.is_empty() {
+        bail!("SQL0104: the query has no columns.");
+    }
+    Ok(fields)
 }
 
 /// A role name quoted as is (role names are not IBM i names).

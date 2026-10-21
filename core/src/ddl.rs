@@ -98,6 +98,18 @@ pub enum Ddl {
         table: Name,
         texts: Vec<(String, String)>,
     },
+    /// CREATE TABLE ... AS (query) WITH [NO] DATA: a table whose columns
+    /// are the query's.
+    CreateTableAs {
+        name: Name,
+        system: Option<String>,
+        replace: bool,
+        /// Column names given after the table name.
+        columns: Vec<String>,
+        query: String,
+        with_data: bool,
+        format: Option<String>,
+    },
     /// COMMENT ON: accepted, not kept.
     Comment,
     /// SET SCHEMA: the default library for unqualified names.
@@ -124,6 +136,13 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
             let unique = p.eat("UNIQUE");
             match p.word().as_deref() {
                 Some("TABLE") if !unique => {
+                    // CREATE TABLE name [(columns)] AS (query) WITH DATA.
+                    let words = top_words(sql);
+                    if let Some(k) = words.iter().position(|(_, w)| w == "TABLE") {
+                        if words[k + 1..].iter().any(|(_, w)| w == "AS") {
+                            return create_table_as(sql, replace, k, &words).map(Some);
+                        }
+                    }
                     p.i += 1;
                     create_table(&mut p, replace)?
                 }
@@ -544,13 +563,29 @@ fn data_type(p: &mut P) -> Result<(DataType, u32, u32, bool)> {
         }
         "DATE" => (DataType::Date, 10, 0, false),
         "TIME" => (DataType::Time, 8, 0, false),
+        // TIMESTAMP(p), 0-12 fractional digits: 19 characters, or 20 + p.
         "TIMESTAMP" => {
             let n = size(p, 6)?;
-            if n != 6 {
-                bail!("SQL0084: TIMESTAMP({n}): only 6 fractional digits are supported yet.");
+            if n > 12 {
+                bail!("SQL0604: TIMESTAMP({n}): the precision is 0 to 12.");
             }
-            (DataType::Timestamp, 26, 0, false)
+            (
+                DataType::Timestamp,
+                if n == 0 { 19 } else { 20 + n },
+                0,
+                false,
+            )
         }
+        // DECFLOAT(16) or DECFLOAT(34) (the default).
+        "DECFLOAT" => {
+            let n = size(p, 34)?;
+            if n != 16 && n != 34 {
+                bail!("SQL0604: DECFLOAT({n}): the precision is 16 or 34.");
+            }
+            (DataType::Decfloat, n, 0, false)
+        }
+        "BOOLEAN" => (DataType::Boolean, 1, 0, false),
+        "XML" => (DataType::Xml, 0, 0, true),
         other => bail!("SQL0084: data type {other} is not supported yet."),
     };
     match t {
@@ -1268,6 +1303,113 @@ fn top_words(sql: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// CREATE [OR REPLACE] TABLE name [FOR SYSTEM NAME s] [(columns)] AS
+/// (query) WITH [NO] DATA [RCDFMT name] (Db2 for i SQL Reference, CREATE
+/// TABLE, as-result-table).
+fn create_table_as(sql: &str, replace: bool, k: usize, words: &[(usize, String)]) -> Result<Ddl> {
+    let as_at = words[k + 1..]
+        .iter()
+        .position(|(_, w)| w == "AS")
+        .map(|j| j + k + 1)
+        .expect("checked by the caller");
+    let head = &sql[words[k].0 + 5..words[as_at].0];
+    let toks: Vec<Tok> = tokenize(head)?
+        .into_iter()
+        .filter(|t| !matches!(t, Tok::Space(_)))
+        .collect();
+    let mut p = P { t: toks, i: 0 };
+    let name = p.name()?;
+    let system = if p.eat("FOR") {
+        p.expect("SYSTEM")?;
+        p.expect("NAME")?;
+        Some(p.system_name("table")?)
+    } else {
+        None
+    };
+    let mut columns = Vec::new();
+    if p.punct("(") {
+        loop {
+            columns.push(p.field()?);
+            if !p.punct(",") {
+                break;
+            }
+        }
+        p.expect_punct(")")?;
+    }
+    if let Some(t) = p.t.get(p.i) {
+        bail!("SQL0104: Token {} not valid here.", show(t));
+    }
+    // The query in parentheses right after AS.
+    let rest = &sql[words[as_at].0 + 2..];
+    let open = rest
+        .find(|c: char| !c.is_whitespace())
+        .filter(|i| rest[*i..].starts_with('('))
+        .ok_or_else(|| anyhow!("SQL0104: ( expected after AS."))?;
+    let cs: Vec<(usize, char)> = rest.char_indices().collect();
+    let (mut depth, mut close, mut q) = (0i32, None, false);
+    for &(i, c) in cs.iter().filter(|(i, _)| *i >= open) {
+        match c {
+            '\'' => q = !q,
+            '(' if !q => depth += 1,
+            ')' if !q => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close.ok_or_else(|| anyhow!("SQL0104: ) expected after the query."))?;
+    let query = rest[open + 1..close].trim().to_string();
+    let tail = rest[close + 1..].trim().trim_end_matches(';');
+    let toks: Vec<Tok> = tokenize(tail)?
+        .into_iter()
+        .filter(|t| !matches!(t, Tok::Space(_)))
+        .collect();
+    let mut p = P { t: toks, i: 0 };
+    let mut with_data = None;
+    let mut format = None;
+    while p.i < p.t.len() {
+        if p.eat("WITH") {
+            let no = p.eat("NO");
+            p.expect("DATA")?;
+            with_data = Some(!no);
+        } else if p.eat("RCDFMT") {
+            format = Some(p.system_name("record format")?);
+        } else if p.eat("NOT") {
+            p.expect("LOGGED")?;
+            p.expect("INITIALLY")?;
+        } else if p.eat("INCLUDING") || p.eat("EXCLUDING") {
+            // IDENTITY / COLUMN DEFAULTS / IMPLICITLY HIDDEN...: the copy
+            // options; columns are made from the query either way.
+            while p.i < p.t.len()
+                && !matches!(
+                    p.word().as_deref(),
+                    Some("WITH" | "RCDFMT" | "INCLUDING" | "EXCLUDING")
+                )
+            {
+                p.i += 1;
+            }
+        } else {
+            bail!("SQL0104: Token {} not valid here.", show(&p.t[p.i]));
+        }
+    }
+    let Some(with_data) = with_data else {
+        bail!("SQL0104: WITH DATA or WITH NO DATA is expected after the query.");
+    };
+    Ok(Ddl::CreateTableAs {
+        name,
+        system,
+        replace,
+        columns,
+        query,
+        with_data,
+        format,
+    })
+}
+
 /// CREATE [OR REPLACE] VIEW name [FOR SYSTEM NAME s] [(columns)] AS query
 /// [WITH [CASCADED | LOCAL] CHECK OPTION] [RCDFMT name].
 fn create_view(sql: &str, replace: bool) -> Result<Ddl> {
@@ -1780,6 +1922,80 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
             } else {
                 format!("View {} created in {lib} (system name {sys}).", name.name)
             })
+        }
+        Ddl::CreateTableAs {
+            name,
+            system,
+            replace,
+            columns,
+            query,
+            with_data,
+            format,
+        } => {
+            // The query's columns (names and types, as a view's are).
+            let libl = match &ctx.schema {
+                Some(s) => vec![s.clone()],
+                None => ctx.libl.to_vec(),
+            };
+            let mut fields =
+                crate::sql::query_fields(ctx.client, &ctx.database_url, &libl, query).await?;
+            // The query's own column names, to select them by.
+            let source: Vec<String> = fields
+                .iter()
+                .map(|f| f.alias.clone().unwrap_or_else(|| f.name.clone()))
+                .collect();
+            if !columns.is_empty() {
+                if columns.len() != fields.len() {
+                    bail!(
+                        "SQL0117: {} column names for a query with {} columns.",
+                        columns.len(),
+                        fields.len()
+                    );
+                }
+                for (f, c) in fields.iter_mut().zip(columns) {
+                    let sys = if validate_name("column", c).is_ok() {
+                        c.clone()
+                    } else {
+                        f.name.clone()
+                    };
+                    f.alias = (sys != *c).then(|| c.clone());
+                    f.name = sys;
+                }
+            }
+            let file = PhysicalFile {
+                name: name.name.clone(),
+                format: format.clone().unwrap_or_default(),
+                text: String::new(),
+                unique: false,
+                fields: fields.clone(),
+                keys: Vec::new(),
+                descending: Vec::new(),
+                view: None,
+            };
+            let create = Ddl::CreateTable {
+                name: name.clone(),
+                system: system.clone(),
+                replace: *replace,
+                file,
+                uniques: vec![],
+                checks: vec![],
+            };
+            let msg = Box::pin(run(ctx, &create)).await?;
+            if *with_data {
+                let lib = ctx.target(name);
+                let cols: Vec<String> = fields
+                    .iter()
+                    .map(|f| f.alias.clone().unwrap_or_else(|| f.name.clone()))
+                    .collect();
+                let target = format!("{lib}.{}", name.name);
+                let insert = format!(
+                    "INSERT INTO {target} ({}) SELECT {} FROM ({query}) AS AS4TAINR_Q",
+                    cols.join(", "),
+                    source.join(", ")
+                );
+                crate::sql::run(ctx.client, &ctx.database_url, &libl, &insert).await?;
+            }
+            Ok(msg)
         }
         Ddl::AlterTable { table, action } => alter(ctx, table, action).await,
         Ddl::Drop {
@@ -2578,7 +2794,6 @@ mod tests {
     #[test]
     fn unsupported_definitions_say_so() {
         for sql in [
-            "CREATE TABLE T (A DECFLOAT(16))",
             "CREATE TABLE T (A INT GENERATED ALWAYS AS (B + 1))",
             "CREATE VIEW V AS SELECT 1 FROM T WITH LOCAL CHECK OPTION",
             "ALTER TABLE T ADD COLUMN B INT BEFORE A",

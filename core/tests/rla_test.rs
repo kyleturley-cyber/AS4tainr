@@ -2227,6 +2227,91 @@ ENDPGM";
     assert!(as4tainr_core::clpgm::compile("X", "PGM\n CALLSUBR SUBR(NOPE)\nENDPGM").is_err());
 }
 
+/// More SQL data definition (Db2 for i SQL Reference, CREATE TABLE):
+/// DECFLOAT(16)/(34) keeps decimal values exactly; BOOLEAN; XML;
+/// TIMESTAMP(0) has no fractional seconds; CREATE TABLE ... AS (query)
+/// WITH DATA copies the query's rows, WITH NO DATA makes the table
+/// empty, with the query's columns. A program's record leaves out
+/// DECFLOAT, BOOLEAN and XML columns, as it does large objects. A program
+/// created with BNDDIR('QC2LE') (the system's C runtime binding
+/// directory) binds and calls Qp0zLprintf.
+#[tokio::test]
+async fn sql_types_create_table_as_and_qc2le() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let script = format!(
+        "CREATE TABLE {lib}.TYPES (K INTEGER NOT NULL, D16 DECFLOAT(16), D34 DECFLOAT, \
+           B BOOLEAN, X XML, T0 TIMESTAMP(0), C CHAR(5));
+INSERT INTO {lib}.TYPES VALUES (1, 0.1, 12345678901234567890.123456789, TRUE, '<a/>', '2026-01-02 03:04:05', 'ab');
+CREATE TABLE {lib}.OWING AS (SELECT CUSNO, CUSNAM, CUSBAL FROM {lib}.CUSTMAST WHERE CUSBAL > 0) WITH DATA;
+CREATE TABLE {lib}.EMPTYCOPY (NO, NAME) AS (SELECT CUSNO, CUSNAM FROM {lib}.CUSTMAST) WITH NO DATA;"
+    );
+    let lines = job
+        .run_sql_script(&script, "types script", 0, None, true)
+        .await
+        .unwrap();
+    assert!(lines.last().unwrap().contains("0 with errors"), "{lines:?}");
+    let rows = |sql: String| {
+        let client = &client;
+        let url = url.clone();
+        let lib = lib.clone();
+        async move {
+            match as4tainr_core::sql::run(client, &url, &[lib], &sql)
+                .await
+                .unwrap()
+            {
+                as4tainr_core::sql::Outcome::Rows { rows, .. } => {
+                    rows.into_iter().map(|r| r.join("|")).collect::<Vec<_>>()
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    };
+    assert_eq!(
+        rows(format!("SELECT D16, D34, B, X, T0 FROM {lib}.TYPES")).await,
+        // BOOLEAN shows as TRUE; TIMESTAMP(0) without fractional seconds.
+        ["0.1|12345678901234567890.123456789|TRUE|<a/>|2026-01-02-03.04.05"]
+    );
+    // Balances above zero: customers 1, 2 and 4 (samples/data/CUSTMAST.csv).
+    assert_eq!(
+        rows(format!("SELECT CUSNO FROM {lib}.OWING ORDER BY CUSNO")).await,
+        ["1", "2", "4"]
+    );
+    assert!(rows(format!("SELECT NO, NAME FROM {lib}.EMPTYCOPY"))
+        .await
+        .is_empty());
+    // The program's record has K and C only.
+    let rpg = "**FREE
+ctl-opt dftactgrp(*no) bnddir('QC2LE');
+dcl-pr printf int(10) extproc('Qp0zLprintf');
+  fmt pointer value options(*string);
+end-pr;
+dcl-f TYPES;
+read TYPES;
+dsply (%char(K) + ' ' + C);
+printf('printed' + x'25');
+*inlr = *on;
+";
+    let r = run_rpg(&url, &lib, "QSECOFR", "TYPESRPG", rpg, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    // The job log line has no line end (as in the SYSAPI test).
+    assert_eq!(r.messages, ["1 ab", "printed"]);
+}
+
 /// CL programs (IBM CL reference): loops with LEAVE and ITERATE, DOUNTIL
 /// running its body at least once, nested DOFOR, variables in command
 /// parameters, CALL between CL programs with parameters.

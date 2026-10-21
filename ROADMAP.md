@@ -120,12 +120,12 @@ The gates were met with the project's own sample apps, so real legacy code is th
 - **RPG:** RPG IV in fixed, mixed and free form up to IBM i 7.5 (date built-ins, FOR-EACH, IN, DCL-ENUM, OVERLOAD, SND-MSG). RPG/400 (RPG III) builds with CRTRPGPGM and converts with CVTRPGSRC. The full RPG cycle runs: control levels, matching records, program-described files, edit words. CVTRPGFREE converts fixed form to free.
 - **RPG runtime:** status codes, the program status and file information data structures, \*PSSR, INFSR and ENDSR return points, overflow and fetch overflow, the local data area (\*LDA), and files declared in procedures.
 - **ILE:** modules, service programs and binding directories (CRTRPGMOD, CRTSRVPGM, CRTPGM, binder language); activation groups, signature checking, exported data, and CL modules (CALLPRC).
-- **SQL:** embedded SQL (SQLRPGLE, CRTSQLRPGI) with cursors, prepared statements, host structures and null indicators. SQL DDL (CREATE TABLE, CREATE INDEX, ALTER TABLE, DROP, LABEL ON) and RUNSQLSTM create real files that RPG reads and writes, with long names, views, identity columns and the SQL data types. SQL procedures and functions (CREATE PROCEDURE, CREATE FUNCTION, compound statements with handlers, cursors and loops), CALL from STRSQL, RUNSQL, RUNSQLSTM and embedded SQL, dynamic compound statements, and external procedures over RPG and CL programs.
+- **SQL:** embedded SQL (SQLRPGLE, CRTSQLRPGI) with cursors, prepared statements, host structures and null indicators. SQL DDL (CREATE TABLE, CREATE INDEX, ALTER TABLE, DROP, LABEL ON) and RUNSQLSTM create real files that RPG reads and writes, with long names, views, identity columns, CREATE TABLE AS, and the SQL data types including DECFLOAT, BOOLEAN, XML and TIMESTAMP(p). SQL procedures and functions (CREATE PROCEDURE, CREATE FUNCTION, compound statements with handlers, cursors and loops), CALL from STRSQL, RUNSQL, RUNSQLSTM and embedded SQL, dynamic compound statements, and external procedures over RPG and CL programs.
 - **Commitment control:** STRCMTCTL, ENDCMTCTL, COMMIT and ROLLBACK in CL, RPG files with the COMMIT keyword and COMMIT/ROLBK, and embedded SQL under its commit level; pending changes roll back when the job ends.
 - **CL:** program message queues (SNDPGMMSG, RCVMSG from the program's, its caller's and user message queues with WAIT, RTVMSG) and message files (CRTMSGF, ADDMSGD), files in CL (DCLF, RCVF, SNDF, SNDRCVF), overrides (OVRDBF, OVRPRTF, DLTOVR), subroutines (SUBR, CALLSUBR), parameters passed by reference between CL and RPG programs, RTVOBJD, RTVMBRD, CLRPFM, DLYJOB, RTVSYSVAL and the newer CL built-ins.
 - **System:** commands made with CRTCMD, DDS printer files (CRTPRTF), READ of a display record, and CL defined and based storage.
 
-47 corpus programs and 6 commands build. Known gaps are listed in [docs/fidelity-gaps.md](docs/fidelity-gaps.md).
+49 corpus objects (42 programs, 4 modules, 3 service programs) and 6 commands build; most remaining corpus failures would fail on IBM i too (see docs/import.md). Known gaps are listed in [docs/fidelity-gaps.md](docs/fidelity-gaps.md).
 
 ## Risks
 
@@ -154,7 +154,8 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [ ] Get licensed access to a real system (for example PUB400) and capture golden outputs. Until then, expected values come from IBM's documentation.
 - [ ] Pick three legacy-style apps (fixed-form RPG, DDS, CL) as the target corpus, run them and fix what they need. The CL they were expected to need (DCLF, SNDRCVF, RCVF, message files, OVRDBF, RTVSYSVAL) is done.
 - [x] Close the SQL gaps: commitment control, compound statements, routines.
-- [ ] Remaining SQL: external functions, table functions, triggers, sequences, CREATE TABLE AS, the QSYS2 catalog views.
+- [ ] Remaining SQL: external functions, table functions (QSYS2.OBJECT_STATISTICS), triggers, sequences, the QSYS2 catalog views.
+- [ ] C runtime and IFS procedures (open, read, write, close) for RPG, with pointers.
 - [ ] Packaging: TLS on port 992, SAVLIB and RSTLIB with a portable archive format, multi-arch images (amd64, arm64).
 - [ ] Get a trademark opinion on the name before the public launch.
 - [ ] Phase 4: ODBC/JDBC and ACS host servers, so existing tools connect.

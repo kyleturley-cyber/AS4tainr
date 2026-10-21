@@ -1122,6 +1122,14 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
     )
 }
 
+/// Data definition that changes what the SQL role owns or may use (its
+/// views and functions, grants to it, dropping them) takes this lock:
+/// PostgreSQL records those dependencies in shared catalog rows, and two
+/// such statements at once can fail with "tuple concurrently updated".
+pub const ROLE_DDL_XACT_LOCK: &str = "SELECT pg_advisory_xact_lock(1095979828, 1)";
+pub const ROLE_DDL_LOCK: &str = "SELECT pg_advisory_lock(1095979828, 1)";
+pub const ROLE_DDL_UNLOCK: &str = "SELECT pg_advisory_unlock(1095979828, 1)";
+
 /// Delete a database or display file: its description, its authorities
 /// and its data. A physical file with logical files over it is deleted
 /// only with `dependents` (SQL DROP TABLE drops the indexes and views
@@ -1135,6 +1143,7 @@ pub async fn delete_file(
     let lib = validate_name("library", library)?;
     let name = validate_name("file", name)?;
     let tx = client.transaction().await?;
+    tx.batch_execute(ROLE_DDL_XACT_LOCK).await?;
     let Some(row) = tx
         .query_opt(
             "SELECT attribute FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
@@ -1435,9 +1444,33 @@ pub async fn register_view(
             &[&lib, &name],
         )
         .await?;
+    let (fields, has_rrn) = fields_of_columns(&cols)?;
+    let tx = client.transaction().await?;
+    tx.execute(
+        "INSERT INTO as4tainr.objects (library, name, objtype, attribute, text) VALUES ($1,$2,'*FILE','LF','')",
+        &[&lib, &name],
+    )
+    .await?;
+    let view = if has_rrn { "RRN" } else { "NORRN" };
+    tx.execute(
+        "INSERT INTO as4tainr.files (library, name, format, is_unique, view, view_def) VALUES ($1,$2,$3,false,$4,$5)",
+        &[&lib, &name, &format, &view, &serde_json::to_string(def)?],
+    )
+    .await?;
+    for (i, f) in fields.iter().enumerate() {
+        insert_field(&tx, &lib, &name, i as i32, f).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Fields for the columns information_schema describes (a view's, or a
+/// query's): PostgreSQL types as the SQL types they stand for. Also
+/// whether there is a record number column.
+pub fn fields_of_columns(cols: &[tokio_postgres::Row]) -> Result<(Vec<FieldDef>, bool)> {
     let mut fields: Vec<FieldDef> = Vec::new();
     let mut has_rrn = false;
-    for c in &cols {
+    for c in cols {
         let col: String = c.get(0);
         if col == "rrn" {
             has_rrn = true;
@@ -1467,7 +1500,8 @@ pub async fn register_view(
             "date" => (DataType::Date, 10, 0, false),
             "time without time zone" => (DataType::Time, 8, 0, false),
             "timestamp without time zone" => (DataType::Timestamp, 26, 0, false),
-            other => bail!("SQL0084: a view column of type {other} ({col}) is not supported yet."),
+            "boolean" => (DataType::Boolean, 1, 0, false),
+            other => bail!("SQL0084: a column of type {other} ({col}) is not supported yet."),
         };
         // A column name that is not a valid system name gets a generated
         // one (Db2 for i: first five characters and a number).
@@ -1490,23 +1524,7 @@ pub async fn register_view(
         f.alias = alias;
         fields.push(f);
     }
-    let tx = client.transaction().await?;
-    tx.execute(
-        "INSERT INTO as4tainr.objects (library, name, objtype, attribute, text) VALUES ($1,$2,'*FILE','LF','')",
-        &[&lib, &name],
-    )
-    .await?;
-    let view = if has_rrn { "RRN" } else { "NORRN" };
-    tx.execute(
-        "INSERT INTO as4tainr.files (library, name, format, is_unique, view, view_def) VALUES ($1,$2,$3,false,$4,$5)",
-        &[&lib, &name, &format, &view, &serde_json::to_string(def)?],
-    )
-    .await?;
-    for (i, f) in fields.iter().enumerate() {
-        insert_field(&tx, &lib, &name, i as i32, f).await?;
-    }
-    tx.commit().await?;
-    Ok(())
+    Ok((fields, has_rrn))
 }
 
 /// The SQL views (catalog files) that use a column of a table, also

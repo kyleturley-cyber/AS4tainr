@@ -750,6 +750,12 @@ pub fn parse(source: &str, includes: &dyn Fn(&str) -> Option<String>) -> Result<
                     'O' => fixed_o(&mut ctx, cs, *lineno),
                     'I' => fixed_i(&mut ctx, cs, *lineno),
                     'P' => fixed_p(&mut ctx, cs, *lineno),
+                    ' ' => Err(anyhow!(
+                        "specification type (column 6) is blank but column 7 is not: a \
+                         free-form statement in column-limited source starts in column 8 or \
+                         later (an included member is column-limited unless its first line \
+                         is **FREE)"
+                    )),
                     other => Err(anyhow!("specification type {other} is not valid")),
                 };
                 r.with_context(|| format!("line {lineno}"))?;
@@ -2712,6 +2718,23 @@ mod tests {
         assert!(
             matches!(&s.calcs[2].what, Line::Stmt(Stmt::SetInd { on: true, inds }) if inds == &vec!["LR".to_string()])
         );
+    }
+
+    #[test]
+    fn include_is_column_limited_unless_free() {
+        // ILE RPG Reference, "Fully free-form statements": a /COPY or
+        // /INCLUDE file is column-limited unless it begins with **FREE,
+        // even when the including source is **FREE; in column-limited
+        // source a free-form statement goes in columns 8-80, with columns
+        // 6 and 7 blank.
+        let main = "**free\n/include inc\ndsply 'x';\n*inlr = *on;\n";
+        let col7 = "      dcl-c K 1;\n".to_string();
+        let err = parse(main, &|_| Some(col7.clone())).unwrap_err();
+        assert!(format!("{err:#}").contains("column 8"), "{err:#}");
+        let col8 = "       dcl-c K 1;\n".to_string();
+        assert!(parse(main, &|_| Some(col8.clone())).is_ok());
+        let free = "**free\ndcl-c K 1;\n".to_string();
+        assert!(parse(main, &|_| Some(free.clone())).is_ok());
     }
 
     #[test]

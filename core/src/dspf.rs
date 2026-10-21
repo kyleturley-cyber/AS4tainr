@@ -220,6 +220,16 @@ pub(crate) fn cols(line: &str, from: usize, to: usize) -> &str {
 }
 
 pub(crate) fn parse_indicators(area: &str) -> Result<Vec<(bool, u8)>> {
+    // A display size condition name (*DS3: the 24 x 80 display, *DS4:
+    // 27 x 132). Displays here are 24 x 80: indicator 0 is never on, so
+    // *DS3 is "not 0" (true) and *DS4 is "0" (false).
+    match area.trim().to_ascii_uppercase().as_str() {
+        "*DS3" => return Ok(vec![(true, 0)]),
+        "*DS4" => return Ok(vec![(false, 0)]),
+        "N*DS3" => return Ok(vec![(false, 0)]),
+        "N*DS4" => return Ok(vec![(true, 0)]),
+        _ => {}
+    }
     // Positions 8-16: three slots of N + two digits.
     let mut out = Vec::new();
     let chars: Vec<char> = format!("{area:<9}").chars().collect();
@@ -414,7 +424,9 @@ pub fn parse(name: &str, source: &str) -> Result<DisplayFile> {
         let line = raw.trim_end_matches('\r').to_string();
         if let Some(prev) = lines.last_mut() {
             let t = prev.trim_end();
-            if t.len() > 44 && (t.ends_with('-') || t.ends_with('+')) {
+            // A comment line (* in position 7) does not continue.
+            let comment = cols(t, 7, 7) == "*";
+            if !comment && t.len() > 44 && (t.ends_with('-') || t.ends_with('+')) {
                 let plus = t.ends_with('+');
                 let keep = t.len() - 1;
                 prev.truncate(keep);
@@ -424,6 +436,23 @@ pub fn parse(name: &str, source: &str) -> Result<DisplayFile> {
             }
         }
         lines.push(line);
+    }
+
+    // The display sizes the file is for (DSPSIZ: 24 x 80, and 27 x 132):
+    // positions may go to the largest.
+    let (mut max_r, mut max_c) = (24u8, 80u8);
+    for line in &lines {
+        let up = line.to_ascii_uppercase();
+        if cols(&up, 7, 7) == "*" {
+            continue;
+        }
+        if let Some(at) = up.find("DSPSIZ(") {
+            let inner: String = up[at + 7..].chars().take_while(|c| *c != ')').collect();
+            if inner.contains("*DS4") || inner.split_whitespace().any(|w| w == "132") {
+                max_r = 27;
+                max_c = 132;
+            }
+        }
     }
 
     for (idx, line) in lines.iter().enumerate() {
@@ -482,8 +511,8 @@ pub fn parse(name: &str, source: &str) -> Result<DisplayFile> {
             let c: u8 = col
                 .parse()
                 .map_err(|_| anyhow::anyhow!("line {lineno}: bad position '{col}'"))?;
-            if !(1..=24).contains(&r) || !(1..=80).contains(&c) {
-                bail!("line {lineno}: location {r},{c} is outside a 24x80 display");
+            if !(1..=max_r).contains(&r) || !(1..=max_c).contains(&c) {
+                bail!("line {lineno}: location {r},{c} is outside a {max_r}x{max_c} display");
             }
             Some((r, c))
         };
@@ -513,9 +542,36 @@ pub fn parse(name: &str, source: &str) -> Result<DisplayFile> {
             let Some(rec) = f.records.last_mut() else {
                 bail!("line {lineno}: field {name} before any record format")
             };
-            let length: u16 = length
-                .parse()
-                .map_err(|_| anyhow::anyhow!("line {lineno}: field {name} needs a length"))?;
+            // Date, time and timestamp fields (L, T, Z) take their length
+            // from their format (DDS for display files: DATFMT *ISO, *USA,
+            // *EUR, *JIS 10, *MDY, *DMY, *YMD 8, *JUL 6; times 8;
+            // timestamps 26).
+            let implied: Option<u16> = match dtype.as_str() {
+                "L" => {
+                    let k = kwarea.to_ascii_uppercase();
+                    Some(
+                        if ["*MDY", "*DMY", "*YMD"]
+                            .iter()
+                            .any(|f| k.contains(&format!("DATFMT({f}")))
+                        {
+                            8
+                        } else if k.contains("DATFMT(*JUL") {
+                            6
+                        } else {
+                            10
+                        },
+                    )
+                }
+                "T" => Some(8),
+                "Z" => Some(26),
+                _ => None,
+            };
+            let length: u16 = match (implied, length.is_empty()) {
+                (Some(n), true) => n,
+                _ => length
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("line {lineno}: field {name} needs a length"))?,
+            };
             let decimals: Option<u16> = if decimals.is_empty() {
                 None
             } else {
@@ -526,7 +582,7 @@ pub fn parse(name: &str, source: &str) -> Result<DisplayFile> {
                 ("", None) => 'A',
                 (d, _) => d.chars().next().unwrap(),
             };
-            if !"AYSNXW".contains(dtype) {
+            if !"AYSNXWLTZ".contains(dtype) {
                 bail!("line {lineno}: data type {dtype} is not supported");
             }
             let usage = match usage.as_str() {
@@ -1266,6 +1322,50 @@ mod tests {
     use super::*;
 
     pub const CUSTINQD: &str = include_str!("../../samples/qddssrc/CUSTINQD.dspf");
+
+    // DDS for display files (IBM DDS reference): DSPSIZ(27 132 *DS4)
+    // allows positions up to line 27, position 132; a date field (L)
+    // takes its length from DATFMT (*ISO 10, *MDY 8), a time (T) is 8 and
+    // a timestamp (Z) 26. Without DSPSIZ, 24 x 80.
+    #[test]
+    fn display_sizes_and_date_fields() {
+        let line = |name: &str, len: &str, t: char, use_: char, r: u8, c: u8, kw: &str| {
+            format!("     A            {name:<10} {len:>5}{t}  {use_}{r:>3}{c:>3}{kw}")
+        };
+        let src = [
+            "     A                                      DSPSIZ(24 80 *DS3 27 132 *DS4)"
+                .to_string(),
+            "     A          R REC".to_string(),
+            line("WIDE", "10", 'A', 'O', 5, 84, ""),
+            line("D1", "", 'L', 'O', 6, 2, ""),
+            line("D2", "", 'L', 'B', 7, 2, "DATFMT(*MDY)"),
+            line("T1", "", 'T', 'O', 8, 2, ""),
+            line("Z1", "", 'Z', 'O', 9, 2, ""),
+        ]
+        .join("\n");
+        let f = parse("X", &src).unwrap();
+        let lens: Vec<u16> = f.records[0].fields.iter().map(|x| x.length).collect();
+        assert_eq!(lens, [10, 10, 8, 8, 26]);
+        // A comment line ending in '-' does not continue onto the next.
+        let commented = format!(
+            "      * ----------------------------------------------------------------------\n{src}"
+        );
+        assert_eq!(parse("X", &commented).unwrap().records[0].fields.len(), 5);
+        // *DS3 / *DS4 condition names: true and false on a 24 x 80 display.
+        assert!(cond_true(
+            &Some(vec![parse_indicators("  *DS3").unwrap()]),
+            &[false; 100]
+        ));
+        assert!(!cond_true(
+            &Some(vec![parse_indicators("  *DS4").unwrap()]),
+            &[false; 100]
+        ));
+        let narrow = src.replace("DSPSIZ(24 80 *DS3 27 132 *DS4)", "");
+        assert!(parse("X", &narrow)
+            .unwrap_err()
+            .to_string()
+            .contains("outside a 24x80"));
+    }
 
     #[test]
     fn parses_the_sample_display_file() {

@@ -146,8 +146,9 @@ Customer 5. `EDTCDE(J)` edits the negative balance, and `*IN40` shows it in red:
 
 | Area | Supported |
 | --- | --- |
-| Records and fields | `R` record formats; named fields with length, data type `A`, `Y`, `S` (and `N`, `X`, `W` as character), decimal positions; usage `O`, `I`, `B`, `H`; line and position |
+| Records and fields | `R` record formats; named fields with length, data type `A`, `Y`, `S` (and `N`, `X`, `W` as character), `L` (date, length 10, or 8 with `DATFMT(*MDY|*DMY|*YMD)`, 6 with `*JUL`), `T` (time, 8) and `Z` (timestamp, 26) with their implied lengths, decimal positions; usage `O`, `I`, `B`, `H`; line and position |
 | Constants | `'text'` (with `-`/`+` continuation), `DATE` (MM/DD/YY), `TIME`, `USER`, `SYSNAME` |
+| Display size | `DSPSIZ(24 80 *DS3)`, and `DSPSIZ(27 132 *DS4)` alone or as the second size: positions are checked against the largest size named. Conditioning on `*DS3` is always true and on `*DS4` always false (every session is a 24x80 display) |
 | Option indicators | Up to three per line in positions 8-16, `N` for not, `O` lines for OR, condition-only lines that carry to the next line |
 | Keywords | `CAnn`/`CFnn` (file or record level, with response indicator), `DSPATR(HI RI UL ND PR PC)`, `COLOR(WHT RED BLU TRQ YLW PNK GRN)`, `EDTCDE(1 2 3 4 J K L M Z)`, `ERRMSG('text' nn)`, `CHECK(LC)` |
 | Input | Numeric fields are validated (digits, decimals, sign) and re-shown with a message if wrong. An input-capable numeric field with `EDTCDE` is shown edited (with `EDTCDE(Z)` a zero is blank); blanks and commas are taken out again on input. Character input is folded to upper case unless `CHECK(LC)`. |
@@ -155,7 +156,7 @@ Customer 5. `EDTCDE(J)` edits the negative balance, and `*IN40` shows it in red:
 | Screen | `OVERLAY`: without it a record clears the screen; with it, only records sharing a line with it are removed. `WRITE` puts a record on the screen for the next `EXFMT`. |
 | Subfiles | `SFL`, `SFLCTL`, `SFLSIZ`, `SFLPAG`, `SFLDSP`, `SFLDSPCTL`, `SFLCLR`, `SFLDLT`, `SFLEND(*MORE *PLUS)`, `SFLNXTCHG`, `SFLMSG`, `PAGEDOWN`/`ROLLUP`, `PAGEUP`/`ROLLDOWN` |
 
-Keywords not in this list are accepted and ignored. Fidelity gaps (`SFLRCDNBR`, `PUTOVR`, `WINDOW`, `REF`/`REFFLD`, `VALUES`/`RANGE`/`COMP`, `EDTWRD`, 27x132 screens, job date formats) are listed in [fidelity-gaps.md](fidelity-gaps.md).
+Keywords not in this list are accepted and ignored. Fidelity gaps (`SFLRCDNBR`, `PUTOVR`, `WINDOW`, `REF`/`REFFLD`, `VALUES`/`RANGE`/`COMP`, `EDTWRD`, 27x132 screens, date and time field formats, job date formats) are listed in [fidelity-gaps.md](fidelity-gaps.md).
 
 ## Subfiles
 

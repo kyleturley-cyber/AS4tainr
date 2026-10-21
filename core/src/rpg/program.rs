@@ -529,6 +529,12 @@ pub fn display_files(src: &Source) -> Vec<String> {
 /// character otherwise (ILE RPG Reference, externally described
 /// WORKSTN files).
 fn display_type(f: &crate::dspf::Field) -> DType {
+    match f.dtype {
+        'L' => return DType::Date,
+        'T' => return DType::Time,
+        'Z' => return DType::Timestamp,
+        _ => {}
+    }
     match f.decimals {
         Some(d) => DType::Zoned(f.length as u32, d as u32),
         None => DType::Char(f.length as u32),
@@ -624,7 +630,12 @@ fn program_type(f: &crate::dds::FieldDef, in_ds: bool, extbinint: bool) -> Optio
         DataType::Float => DType::Float(if f.double { 8 } else { 4 }),
         DataType::Graphic if f.varlen => DType::VarUcs2(f.length),
         DataType::Graphic => DType::Ucs2(f.length),
-        DataType::Clob | DataType::Blob | DataType::Dbclob => return None,
+        DataType::Clob
+        | DataType::Blob
+        | DataType::Dbclob
+        | DataType::Decfloat
+        | DataType::Boolean
+        | DataType::Xml => return None,
         DataType::Binary if extbinint && f.decimals == 0 => DType::Int(match f.length {
             0..=4 => 5,
             5..=9 => 10,

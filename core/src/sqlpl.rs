@@ -2380,14 +2380,16 @@ pub async fn drop_routine(
         );
     };
     if kind == "FUNCTION" {
-        catalog
+        catalog.batch_execute(catalog::ROLE_DDL_LOCK).await?;
+        let r2 = catalog
             .batch_execute(&format!(
                 "DROP FUNCTION IF EXISTS {}.{}",
                 ident(&r.library),
                 ident(&r.name)
             ))
-            .await
-            .map_err(|e| crate::sql::map_error(&e, ""))?;
+            .await;
+        let _ = catalog.batch_execute(catalog::ROLE_DDL_UNLOCK).await;
+        r2.map_err(|e| crate::sql::map_error(&e, ""))?;
     }
     catalog
         .execute(

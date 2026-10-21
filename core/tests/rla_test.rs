@@ -7796,3 +7796,212 @@ exec sql rollback;
         rows.iter().filter(|r| r[0].starts_with('R')).count() + 1
     );
 }
+
+/// Date and time formats (ILE RPG Reference, "Date Data Type", "Time
+/// Data Type", DATFMT and TIMFMT keywords, "Moving Date-Time Data",
+/// %CHAR, %DEC, %DATE): a date is held in its format (the definition's
+/// DATFMT, else the control specification's, else *ISO), so a *MDY
+/// subfield takes 8 bytes; %CHAR without a format and DSPLY give the
+/// field's format, an expression's is the control specification's; %DEC
+/// gives the digits in the field's format; MOVE takes factor 1 as the
+/// format of the character or numeric side (blank: the date field's) and
+/// moves the rightmost (MOVE) or leftmost (MOVEL) characters.
+#[tokio::test]
+async fn rpg_date_and_time_formats() {
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "DATES",
+        include_str!("rpg/dates.rpgle"),
+        None,
+        None,
+    )
+    .await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let m: Vec<String> = r
+        .messages
+        .iter()
+        .map(|m| m.trim_start_matches("DSPLY").trim().to_string())
+        .collect();
+    assert_eq!(
+        m,
+        [
+            "10/21/2026",
+            "10/21/26",
+            "26/294",
+            "21.10.2026",
+            "13:45:00",
+            "10/21/26ZZ",
+            "2110/21/26",
+            "10212026",
+            "2039-12-25",
+            "2026-01-02",
+            "134500",
+            "02/01/2026",
+            "102126",
+            "01/02/2027",
+        ]
+    );
+}
+
+/// XML-INTO (ILE RPG Reference, XML-INTO, "%XML options for the XML-INTO
+/// operation code", "Path option", "Program Status Codes"): a data
+/// structure from the element of its name, subfields from child elements
+/// and attributes (names in lower case by default), character data
+/// trimmed (trim=all), a numeric attribute, a date, an indicator, an
+/// array subfield with its count (countprefix), a LIKEDS subfield; an
+/// array from the elements of its name under the outermost element; a
+/// path with case=any; an element no subfield takes is status 00353; a
+/// document that is not well formed 00351.
+#[tokio::test]
+async fn rpg_xml_into() {
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "XMLINTO",
+        include_str!("rpg/xmlinto.rpgle"),
+        None,
+        None,
+    )
+    .await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let m: Vec<String> = r
+        .messages
+        .iter()
+        .map(|m| m.trim_start_matches("DSPLY").trim().to_string())
+        .collect();
+    assert_eq!(
+        m,
+        [
+            "17/Ann Lee/2020-02-29/555-2       /2/Oslo",
+            "ac",
+            "q",
+            "mismatch 353",
+            "351"
+        ]
+    );
+}
+
+/// LIKEFILE, TEMPLATE and file parameters, EXTFILE (ILE RPG Reference):
+/// a file defined like a template file; a file passed to a procedure is
+/// the caller's open file; EXTFILE names the file opened, from a
+/// variable at open. Halt indicators (ILE RPG Reference, "Halt Indicators
+/// (H1-H9)", "Program Status Codes"): a program that ends with H1-H9 on
+/// ends abnormally (00232); its caller gets 00231. PSDS positions 288-333
+/// (ILE RPG Reference, "Program Status Data Structure"): the date and
+/// time the program was created and its source file, library and member.
+#[tokio::test]
+async fn rpg_likefile_extfile_halt_and_psds() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    cl_cmd(
+        &mut job,
+        format!("RUNSQL SQL('CREATE TABLE {lib}.CUSTCOPY AS (SELECT * FROM {lib}.CUSTMAST WHERE CUSNO <= 2) WITH DATA') COMMIT(*NONE)"),
+    )
+    .await
+    .unwrap();
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "LIKEF",
+        include_str!("rpg/likefile.rpgle"),
+        None,
+        None,
+    )
+    .await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let m: Vec<String> = r
+        .messages
+        .iter()
+        .map(|m| m.trim_start_matches("DSPLY").trim().to_string())
+        .collect();
+    assert_eq!(m, ["count 5", "copy 2", "last 2"]);
+
+    source::create_file(&client, &lib, "QRPGLESRC", "")
+        .await
+        .unwrap();
+    let put = |name: &str, src: &str| source::Member {
+        library: lib.clone(),
+        file: "QRPGLESRC".into(),
+        name: name.into(),
+        srctype: "RPGLE".into(),
+        text: String::new(),
+        source: src.into(),
+    };
+    let caller = "**FREE
+dcl-pr halt extpgm('HALT') end-pr;
+monitor;
+  halt();
+on-error;
+  dsply %char(%status);
+endmon;
+*inlr = *on;
+";
+    let psds = "**FREE
+dcl-ds psds psds;
+  lib char(10) pos(81);
+  crtdate char(6) pos(288);
+  crttime char(6) pos(294);
+  srcfile char(10) pos(304);
+  srclib char(10) pos(314);
+  srcmbr char(10) pos(324);
+end-ds;
+dsply (lib + srcfile + srclib + srcmbr);
+dsply (%char(%len(%trim(crtdate + crttime))));
+*inlr = *on;
+";
+    for m in [
+        put("HALT", include_str!("rpg/halt.rpgle")),
+        put("HALTC", caller),
+        put("PSDSC", psds),
+    ] {
+        source::put_member(&client, &m, false).await.unwrap();
+    }
+    for n in ["HALT", "HALTC", "PSDSC"] {
+        cl_cmd(&mut job, format!("CRTBNDRPG PGM({lib}/{n})"))
+            .await
+            .unwrap();
+    }
+    let e = cl_cmd(&mut job, format!("CALL PGM({lib}/HALT)"))
+        .await
+        .unwrap_err();
+    assert!(e.contains("RNQ0232") && e.contains("H3"), "{e}");
+    assert_eq!(
+        cl_cmd(&mut job, format!("CALL PGM({lib}/HALTC)"))
+            .await
+            .unwrap(),
+        ["DSPLY  231"]
+    );
+    let out = cl_cmd(&mut job, format!("CALL PGM({lib}/PSDSC)"))
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        [
+            format!("DSPLY  {lib:<10}QRPGLESRC {lib:<10}PSDSC"),
+            "DSPLY  12".to_string()
+        ]
+    );
+}

@@ -42,6 +42,10 @@ pub(super) fn status_code(err: &anyhow::Error) -> u32 {
     let text = err.root_cause().to_string();
     // A called program that ended in error: 00202.
     if text.trim_end().ends_with("ended abnormally.") {
+        // 00231: it ended with a halt indicator on.
+        if text.contains("RNQ0232") || text.contains("RNQ0233") {
+            return 231;
+        }
         return 202;
     }
     let id = message_id(err);
@@ -257,6 +261,25 @@ impl<'a> Machine<'a> {
         self.ds_zoned(&ds, 270, 6, mdy);
         self.ds_zoned(&ds, 276, 6, mdy);
         self.ds_zoned(&ds, 282, 6, (hh * 10_000 + mi * 100 + ss) as i64);
+        // When the program was created and from which source member.
+        if !lib.is_empty() {
+            let row = self.io.rt.clone().block_on(self.io.client.query_opt(
+                "SELECT to_char(o.created, 'MMDDYY'), to_char(o.created, 'HH24MISS'),
+                                p.src_file, p.src_lib, p.src_mbr
+                           FROM as4tainr.programs p JOIN as4tainr.objects o
+                             ON o.library = p.library AND o.name = p.name AND o.objtype = '*PGM'
+                          WHERE p.library = $1 AND p.name = $2",
+                &[&lib, &pgm],
+            ));
+            if let Ok(Some(r)) = row {
+                let g = |i: usize| r.get::<_, String>(i);
+                self.ds_text(&ds, 288, 6, &g(0));
+                self.ds_text(&ds, 294, 6, &g(1));
+                self.ds_text(&ds, 304, 10, &g(2));
+                self.ds_text(&ds, 314, 10, &g(3));
+                self.ds_text(&ds, 324, 10, &g(4));
+            }
+        }
         // The program and module the procedure is in; the current user.
         self.ds_text(&ds, 334, 10, &pgm);
         self.ds_text(&ds, 344, 10, &self.prog.name.clone());
@@ -578,6 +601,10 @@ impl<'a> Machine<'a> {
     /// The file a name in the calculations refers to: one declared in the
     /// running procedure first, then the program's.
     pub(super) fn file_idx(&self, name: &str) -> Option<usize> {
+        // A file parameter (LIKEFILE): the caller's file.
+        if let Some(i) = self.frames.last().and_then(|f| f.files.get(name)) {
+            return Some(*i);
+        }
         let files = &self.prog.files;
         let proc = self.frames.last().map(|f| f.proc.name.as_str());
         let local = |f: &FileInfo| f.decl.proc.as_deref() == proc;
@@ -638,6 +665,7 @@ impl<'a> Machine<'a> {
             let d = &self.prog.files[i].decl;
             if d.proc.as_deref() != Some(pi.name.as_str())
                 || keyword(&d.keywords, "USROPN").is_some()
+                || keyword(&d.keywords, "TEMPLATE").is_some()
                 || self.files[i].open.is_some()
                 || self.files[i].ws_open
             {

@@ -77,9 +77,36 @@ impl Machine<'_> {
 
     fn type_is_temporal(&self, e: &Expr) -> bool {
         matches!(
-            self.type_of(e),
-            Some(DType::Date) | Some(DType::Time) | Some(DType::Timestamp)
+            self.temporal_type(e),
+            Some(DType::Date(_)) | Some(DType::Time(_)) | Some(DType::Timestamp)
         )
+    }
+
+    /// The type of a date, time or timestamp expression: a field's own;
+    /// a built-in's result or date arithmetic in the control
+    /// specification's format.
+    pub(super) fn temporal_type(&self, e: &Expr) -> Option<DType> {
+        let dft_d = DType::Date(self.prog.datfmt().ok()?);
+        let dft_t = DType::Time(self.prog.timfmt().ok()?);
+        match e {
+            Expr::Bif(b, _) => match b.as_str() {
+                "DATE" => Some(dft_d),
+                "TIME" => Some(dft_t),
+                "TIMESTAMP" => Some(DType::Timestamp),
+                _ => self.type_of(e),
+            },
+            Expr::Bin(BinOp::Add | BinOp::Sub, l, r) => {
+                match (self.temporal_type(l), self.temporal_type(r)) {
+                    (Some(DType::Date(_)), None) | (None, Some(DType::Date(_))) => Some(dft_d),
+                    (Some(DType::Time(_)), None) | (None, Some(DType::Time(_))) => Some(dft_t),
+                    (Some(DType::Timestamp), None) | (None, Some(DType::Timestamp)) => {
+                        Some(DType::Timestamp)
+                    }
+                    _ => None,
+                }
+            }
+            _ => self.type_of(e),
+        }
     }
 
     /// The elements of an array (or the values of a list): those in use
@@ -160,12 +187,25 @@ impl Machine<'_> {
                     return Ok(None);
                 };
                 let fmt = self.special_arg(args, 1);
+                // Without a format: the date's (time's) own format; an
+                // expression's is the control specification's.
+                let ty = self.temporal_type(&args[0]);
                 Ok(Some(Value::str(&match t {
                     Temporal::Date(d) => {
-                        dates::format_date(d, &DateFmt::parse(fmt.as_deref().unwrap_or("*ISO"))?)
+                        let f = match (fmt.as_deref(), ty) {
+                            (Some(f), _) => DateFmt::parse(f)?,
+                            (None, Some(DType::Date(f))) => f.or(self.prog.datfmt()?),
+                            (None, _) => self.prog.datfmt()?,
+                        };
+                        dates::format_date(d, &f)
                     }
                     Temporal::Time(h) => {
-                        dates::format_time(h, &TimeFmt::parse(fmt.as_deref().unwrap_or("*ISO"))?)
+                        let f = match (fmt.as_deref(), ty) {
+                            (Some(f), _) => TimeFmt::parse(f)?,
+                            (None, Some(DType::Time(f))) => f.or(self.prog.timfmt()?),
+                            (None, _) => self.prog.timfmt()?,
+                        };
+                        dates::format_time(h, &f)
                     }
                     Temporal::Ts(ts) => dates::format_ts(&ts, fmt.as_deref() == Some("*ISO0")),
                 })))
@@ -183,14 +223,26 @@ impl Machine<'_> {
                     return Ok(None);
                 };
                 let fmt = self.special_arg(args, 1);
-                // The value's digits in the format, without separators.
+                let ty = self.temporal_type(&args[0]);
+                // The value's digits in the format (else the date's own),
+                // without separators.
                 let text = match t {
                     Temporal::Date(d) => {
-                        let f = DateFmt::parse(&format!("{}0", fmt.as_deref().unwrap_or("*ISO")))?;
+                        let mut f = match (fmt.as_deref(), ty) {
+                            (Some(x), _) => DateFmt::parse(x)?,
+                            (None, Some(DType::Date(f))) => f.or(self.prog.datfmt()?),
+                            _ => self.prog.datfmt()?,
+                        };
+                        f.sep = None;
                         dates::format_date(d, &f)
                     }
                     Temporal::Time(h) => {
-                        let f = TimeFmt::parse(&format!("{}0", fmt.as_deref().unwrap_or("*ISO")))?;
+                        let mut f = match (fmt.as_deref(), ty) {
+                            (Some(x), _) => TimeFmt::parse(x)?,
+                            (None, Some(DType::Time(f))) => f.or(self.prog.timfmt()?),
+                            _ => self.prog.timfmt()?,
+                        };
+                        f.sep = None;
                         dates::format_time(h, &f)
                     }
                     Temporal::Ts(ts) => dates::format_ts(&ts, true),
@@ -238,7 +290,9 @@ impl Machine<'_> {
                         }));
                     }
                 }
-                let f = fmt.unwrap_or_else(|| "*ISO".into());
+                // Without a format: the control specification's DATFMT.
+                let dft = self.prog.datfmt()?;
+                let f = fmt.unwrap_or_else(|| dft.code());
                 let d = match v {
                     Value::Num(n) => {
                         let f = DateFmt::parse(&format!("{}0", f.trim_end_matches('0')))?;
@@ -262,7 +316,8 @@ impl Machine<'_> {
                         }));
                     }
                 }
-                let f = fmt.unwrap_or_else(|| "*ISO".into());
+                let dft = self.prog.timfmt()?;
+                let f = fmt.unwrap_or_else(|| dft.code());
                 let h = match v {
                     Value::Num(n) => dates::parse_time(
                         &n.trunc().mantissa().to_string(),
@@ -701,8 +756,8 @@ impl Machine<'_> {
     fn arg_kind(&mut self, e: &Expr) -> Result<Vec<char>> {
         let of_type = |t: DType| -> char {
             match t {
-                DType::Date => 'D',
-                DType::Time => 'T',
+                DType::Date(_) => 'D',
+                DType::Time(_) => 'T',
                 DType::Timestamp => 'Z',
                 DType::Ind => 'I',
                 t if t.is_numeric() => 'N',
@@ -751,8 +806,8 @@ impl Machine<'_> {
             }
             let fits = params.iter().zip(&kinds).all(|(p, k)| {
                 let want = match p.dtype {
-                    DType::Date => 'D',
-                    DType::Time => 'T',
+                    DType::Date(_) => 'D',
+                    DType::Time(_) => 'T',
                     DType::Timestamp => 'Z',
                     DType::Ind => 'I',
                     t if t.is_numeric() => 'N',

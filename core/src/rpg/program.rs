@@ -175,6 +175,8 @@ pub struct ParamInfo {
     /// In a procedure interface: the buffer the parameter is bound to
     /// (aliased to the caller's storage when passed by reference).
     pub buf: Option<usize>,
+    /// LIKEFILE(file): a file is passed (the caller's open file).
+    pub file: bool,
 }
 
 /// A prototype (DCL-PR / PR): what a call passes and where it goes.
@@ -578,8 +580,8 @@ pub fn display_files(src: &Source) -> Vec<String> {
 /// WORKSTN files).
 fn display_type(f: &crate::dspf::Field) -> DType {
     match f.dtype {
-        'L' => return DType::Date,
-        'T' => return DType::Time,
+        'L' => return DType::Date(crate::rpg::dates::DateFmt::iso()),
+        'T' => return DType::Time(crate::rpg::dates::TimeFmt::iso()),
         'Z' => return DType::Timestamp,
         _ => {}
     }
@@ -690,8 +692,8 @@ pub fn program_type(f: &crate::dds::FieldDef, in_ds: bool, extbinint: bool) -> O
             _ => 20,
         }),
         DataType::Binary => DType::Binary(f.length, f.decimals),
-        DataType::Date => DType::Date,
-        DataType::Time => DType::Time,
+        DataType::Date => DType::Date(crate::rpg::dates::DateFmt::iso()),
+        DataType::Time => DType::Time(crate::rpg::dates::TimeFmt::iso()),
         DataType::Timestamp => DType::Timestamp,
         DataType::Packed => DType::Packed(f.length, f.decimals),
         DataType::Zoned => {
@@ -727,6 +729,9 @@ struct Binder<'a> {
     globals: Vec<Vec<u8>>,
     /// EXTBININT(*YES): external binary fields are integers.
     extbinint: bool,
+    /// The control specification's DATFMT and TIMFMT (*ISO by default).
+    datfmt: crate::rpg::dates::DateFmt,
+    timfmt: crate::rpg::dates::TimeFmt,
     /// Multiple-occurrence data structures (OCCURS).
     occurs: Vec<Occurs>,
     /// Record formats of the program's files (for LIKEREC): the fields
@@ -924,7 +929,10 @@ impl Binder<'_> {
                         let p = &defs[j];
                         let (by_value, konst, nopass, omit) = param_flags(p);
                         let likeds = keyword(&p.keywords, "LIKEDS").is_some();
-                        let (dtype, buf) = if interface {
+                        let likefile = keyword(&p.keywords, "LIKEFILE").is_some();
+                        let (dtype, buf) = if likefile {
+                            (DType::Char(1), None)
+                        } else if interface {
                             // The parameter is a variable of the procedure.
                             if likeds {
                                 self.ds(defs, j)
@@ -975,6 +983,7 @@ impl Binder<'_> {
                                     .any(|a| a.trim().eq_ignore_ascii_case("*STRING"))
                             }),
                             buf,
+                            file: likefile,
                         });
                         j += 1;
                     }
@@ -1063,8 +1072,26 @@ impl Binder<'_> {
     }
 
     fn resolve_type(&self, d: &Def) -> Result<Option<DType>> {
-        if let Some(t) = d.dtype {
-            return Ok(Some(t));
+        // A date or time: the DATFMT (TIMFMT) of the definition, else the
+        // control specification's, else *ISO (ILE RPG Reference, "Date
+        // Data Type", "Time Data Type").
+        match d.dtype {
+            Some(DType::Date(f)) => {
+                let f = match keyword(&d.keywords, "DATFMT").and_then(|k| k.args.first()) {
+                    Some(a) => crate::rpg::dates::DateFmt::parse(a)?,
+                    None => f.or(self.datfmt),
+                };
+                return Ok(Some(DType::Date(f)));
+            }
+            Some(DType::Time(f)) => {
+                let f = match keyword(&d.keywords, "TIMFMT").and_then(|k| k.args.first()) {
+                    Some(a) => crate::rpg::dates::TimeFmt::parse(a)?,
+                    None => f.or(self.timfmt),
+                };
+                return Ok(Some(DType::Time(f)));
+            }
+            Some(t) => return Ok(Some(t)),
+            None => {}
         }
         // A free-form type with a constant length: CHAR(MAXLEN).
         if let Some(k) = d.keywords.iter().find(|k| k.name.starts_with("TYPE:")) {
@@ -1078,6 +1105,20 @@ impl Binder<'_> {
                 "ZONED" => DType::Zoned(n(0)?, if k.args.len() > 1 { n(1)? } else { 0 }),
                 "INT" => DType::Int(n(0)?),
                 "UNS" => DType::Uns(n(0)?),
+                "DATE" => {
+                    let f = match k.args.first() {
+                        Some(a) if !a.trim().is_empty() => crate::rpg::dates::DateFmt::parse(a)?,
+                        _ => self.datfmt,
+                    };
+                    DType::Date(f)
+                }
+                "TIME" => {
+                    let f = match k.args.first() {
+                        Some(a) if !a.trim().is_empty() => crate::rpg::dates::TimeFmt::parse(a)?,
+                        _ => self.timfmt,
+                    };
+                    DType::Time(f)
+                }
                 other => bail!("type {other} is not supported yet"),
             }));
         }
@@ -1237,6 +1278,8 @@ impl Binder<'_> {
             )
         });
         if let Some((fmt, which)) = &likerec {
+            // A qualified file's format: FILE.FORMAT.
+            let fmt = fmt.rsplit('.').next().unwrap_or(fmt);
             let (fields, keys) = self.formats.get(fmt).cloned().ok_or_else(|| {
                 anyhow!("LIKEREC({fmt}): not a record format of a file of the program")
             })?;
@@ -1564,6 +1607,34 @@ fn basing_pointer(d: &Def) -> Option<String> {
 
 /// Bind a parsed source. `externals`: descriptions of the external files
 /// (by file name), from the catalog.
+impl Program {
+    /// The control specification's DATFMT.
+    pub fn datfmt(&self) -> Result<crate::rpg::dates::DateFmt> {
+        control_datfmt(&self.control)
+    }
+
+    /// The control specification's TIMFMT.
+    pub fn timfmt(&self) -> Result<crate::rpg::dates::TimeFmt> {
+        control_timfmt(&self.control)
+    }
+}
+
+/// The control specification's DATFMT (*ISO when it has none).
+pub fn control_datfmt(control: &[Keyword]) -> Result<crate::rpg::dates::DateFmt> {
+    match keyword(control, "DATFMT").and_then(|k| k.args.first()) {
+        Some(a) => crate::rpg::dates::DateFmt::parse(a),
+        None => Ok(crate::rpg::dates::DateFmt::iso()),
+    }
+}
+
+/// The control specification's TIMFMT (*ISO when it has none).
+pub fn control_timfmt(control: &[Keyword]) -> Result<crate::rpg::dates::TimeFmt> {
+    match keyword(control, "TIMFMT").and_then(|k| k.args.first()) {
+        Some(a) => crate::rpg::dates::TimeFmt::parse(a),
+        None => Ok(crate::rpg::dates::TimeFmt::iso()),
+    }
+}
+
 pub fn bind(
     name: &str,
     src: &Source,
@@ -1582,6 +1653,8 @@ pub fn bind(
         extbinint: keyword(&src.control, "EXTBININT")
             .and_then(|k| k.args.first())
             .is_some_and(|a| a.trim().eq_ignore_ascii_case("*YES")),
+        datfmt: control_datfmt(&src.control)?,
+        timfmt: control_timfmt(&src.control)?,
         local: false,
         statics: vec![],
         occurs: vec![],
@@ -2001,6 +2074,8 @@ pub fn bind(
             statics: vec![],
             globals: b.bufs.clone(),
             extbinint: b.extbinint,
+            datfmt: b.datfmt,
+            timfmt: b.timfmt,
             occurs: vec![],
             based: HashMap::new(),
             formats: b.formats.clone(),

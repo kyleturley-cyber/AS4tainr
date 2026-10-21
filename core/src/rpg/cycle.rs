@@ -402,6 +402,8 @@ impl Machine<'_> {
                 }
                 self.routine = "*GETIN".into();
                 self.in_detail = false;
+                // Halt indicators are tested at *GETIN.
+                self.halt_check(false)?;
                 // Record identifying and control level indicators go
                 // off; overflow indicators too, unless detail
                 // calculations or output set them on.
@@ -468,10 +470,12 @@ impl Machine<'_> {
                 if st.data_seen && !st.first_record || self.ind("LR") {
                     self.routine = "*TOTC".into();
                     if let Flow::Return(_) = self.run_code_at(&prog.routines.total, start)? {
+                        self.halt_check(true)?;
                         return Ok(None);
                     }
                     Phase::TotL
                 } else if self.ind("LR") {
+                    self.halt_check(false)?;
                     return Ok(None);
                 } else {
                     Phase::Ofl
@@ -484,6 +488,7 @@ impl Machine<'_> {
                 self.routine = "*OFL".into();
                 self.overflow_routine(None)?;
                 if self.ind("LR") {
+                    self.halt_check(false)?;
                     return Ok(None);
                 }
                 Phase::Ofl
@@ -502,6 +507,7 @@ impl Machine<'_> {
                 self.routine = "*DETC".into();
                 self.in_detail = true;
                 if let Flow::Return(_) = self.run_code_at(&prog.routines.detail, start)? {
+                    self.halt_check(true)?;
                     return Ok(None);
                 }
                 Phase::Detl
@@ -772,5 +778,26 @@ impl Machine<'_> {
         let mut b = st.initial();
         data::store(&st, &v, &mut b, Fit::Truncate { half_adjust: false }, false)?;
         Ok(b)
+    }
+}
+
+impl Machine<'_> {
+    /// A halt indicator (H1-H9) on in a cycle-main program: it ends
+    /// abnormally, status 00232 (00233 at a RETURN) (ILE RPG Reference,
+    /// "Halt Indicators (H1-H9)", "Program Status Codes").
+    pub(super) fn halt_check(&self, at_return: bool) -> Result<()> {
+        if let Some(h) = (1..=9).find(|h| self.ind(&format!("H{h}"))) {
+            if at_return {
+                bail!(
+                    "RNQ0233: Halt indicator H{h} is on at RETURN in program {}.",
+                    self.prog.name
+                );
+            }
+            bail!(
+                "RNQ0232: Halt indicator H{h} is on in program {}.",
+                self.prog.name
+            );
+        }
+        Ok(())
     }
 }

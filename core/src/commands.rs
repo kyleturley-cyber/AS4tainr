@@ -1831,6 +1831,8 @@ impl Job<'_> {
         let mut c = runtime::connect_db(&self.env.database_url).await?;
         catalog::create_program(&mut c, &lib, &name, attribute, &text, &source, replace).await?;
         catalog::set_program_options(self.client, &lib, &name, &options).await?;
+        catalog::set_program_source(self.client, &lib, &name, (&m.file, &m.library, &m.name))
+            .await?;
         crate::ile::set_program_binding(self.client, &lib, &name, binding.as_ref()).await?;
         authority::set_owner(self.client, &lib, &name, "*PGM", &self.user).await?;
         Ok(Outcome::Messages(vec![format!(

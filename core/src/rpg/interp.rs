@@ -35,6 +35,8 @@ mod ops;
 mod printer;
 #[path = "ptrs.rs"]
 mod ptrs;
+#[path = "xmlinto.rs"]
+mod xmlinto;
 
 /// What the program runs with: the database, the job.
 pub struct Io<'a> {
@@ -353,6 +355,8 @@ struct Frame<'a> {
     passed: usize,
     /// Parameters passed as *OMIT.
     omitted: Vec<String>,
+    /// File parameters (LIKEFILE): the caller's file.
+    files: HashMap<String, usize>,
 }
 
 /// Where an argument passed by reference lives.
@@ -1479,9 +1483,39 @@ impl<'a> Machine<'a> {
                 fi.decl.name
             );
         }
-        let Some(fref) = fi.fref.clone() else {
+        let Some(mut fref) = fi.fref.clone() else {
             return Ok(());
         };
+        // EXTFILE: the file opened is the one it names when the file is
+        // opened (a literal, or a variable's value; *EXTDESC: the one
+        // EXTDESC names) (ILE RPG Reference, EXTFILE).
+        if let Some(k) = crate::rpg::ast::keyword(&fi.decl.keywords, "EXTFILE") {
+            let arg = k
+                .args
+                .first()
+                .map(|a| a.trim().to_string())
+                .unwrap_or_default();
+            let name = if arg.eq_ignore_ascii_case("*EXTDESC") {
+                None
+            } else if let Some(lit) = arg.strip_prefix('\'') {
+                Some(lit.trim_end_matches('\'').to_string())
+            } else {
+                let v = self.eval(&Expr::name(&arg.to_ascii_uppercase()))?;
+                Some(a(&v.chars()?))
+            };
+            if let Some(n) = name {
+                let n = n.trim().to_ascii_uppercase();
+                let n = n.strip_prefix("*LIBL/").unwrap_or(&n).to_string();
+                fref = self
+                    .block(crate::catalog::resolve_file(
+                        self.io.client,
+                        &self.io.libl,
+                        &n,
+                    ))
+                    .map_err(|_| anyhow!("CPF4101: File {n} not found."))?;
+            }
+        }
+        let fi = &self.prog.files[i];
         let update = fi.decl.usage == 'U';
         let need = if update || fi.decl.usage == 'O' || fi.decl.add {
             crate::authority::Aut::Change
@@ -2452,6 +2486,16 @@ impl<'a> Machine<'a> {
                         let x = self.eval(m)?.num()?;
                         data::float_text(x.to_string().parse().unwrap_or(0.0), n)
                     }
+                    // A date or time shows in its format.
+                    Some(m)
+                        if matches!(
+                            self.type_of(m),
+                            Some(DType::Date(_)) | Some(DType::Time(_))
+                        ) =>
+                    {
+                        let v = self.bif("CHAR", std::slice::from_ref(m))?;
+                        self.text_of(&v)?
+                    }
                     Some(m) => {
                         let v = self.eval(m)?;
                         self.text_of(&v)?
@@ -2541,10 +2585,15 @@ impl<'a> Machine<'a> {
             Stmt::Move {
                 left,
                 pad,
+                fmt,
                 from,
                 to,
                 ind,
-            } => self.do_move(*left, *pad, from, to, ind)?,
+            } => {
+                if !self.move_temporal(*left, fmt.as_deref(), from, to)? {
+                    self.do_move(*left, *pad, from, to, ind)?
+                }
+            }
             Stmt::Comp { f1, f2, ind } => {
                 let x = self.eval(f1)?;
                 let y = self.eval(f2)?;
@@ -2706,6 +2755,181 @@ impl<'a> Machine<'a> {
             }
             other => other.chars()?,
         })
+    }
+
+    /// MOVE and MOVEL with a date, time or timestamp on either side (ILE
+    /// RPG Reference, "Moving Date-Time Data"): false when neither is one.
+    fn move_temporal(
+        &mut self,
+        left: bool,
+        fmt: Option<&str>,
+        from: &Expr,
+        to: &Expr,
+    ) -> Result<bool> {
+        use crate::rpg::dates::{self, DateFmt, TimeFmt};
+        enum K {
+            D(DateFmt),
+            T(TimeFmt),
+            Z,
+        }
+        let kind = |t: Option<DType>| match t {
+            Some(DType::Date(f)) => Some(K::D(f)),
+            Some(DType::Time(f)) => Some(K::T(f)),
+            Some(DType::Timestamp) => Some(K::Z),
+            _ => None,
+        };
+        let st = self.type_of(from);
+        let tt = self.type_of(to);
+        let (sk, tk) = (kind(st), kind(tt));
+        if sk.is_none() && tk.is_none() {
+            return Ok(false);
+        }
+        let dft_d = self.prog.datfmt()?;
+        let dft_t = self.prog.timfmt()?;
+        let fit = Fit::Truncate { half_adjust: false };
+        match (sk, tk) {
+            // Date, time or timestamp to another.
+            (Some(s), Some(t)) => {
+                if fmt.is_some() {
+                    bail!("MOVE between date, time or timestamp fields takes no factor 1");
+                }
+                let v = self.eval(from)?;
+                let cur = self.eval(to)?;
+                let iso = a(&v.chars()?);
+                let now = a(&cur.chars()?);
+                let out = match (s, t) {
+                    (K::D(_), K::D(_)) | (K::T(_), K::T(_)) | (K::Z, K::Z) => iso,
+                    // The timestamp keeps its time (date) part.
+                    (K::D(_), K::Z) => format!("{}{}", iso, &now[10..]),
+                    (K::T(_), K::Z) => format!("{}-{}.000000", &now[..10], iso),
+                    (K::Z, K::D(_)) => iso[..10].to_string(),
+                    (K::Z, K::T(_)) => iso[11..19].to_string(),
+                    _ => bail!("MOVE between a date and a time is not valid"),
+                };
+                self.assign(to, &Value::str(&out), fit, false)?;
+            }
+            // Date, time or timestamp to character or numeric: in factor
+            // 1's format, else the field's.
+            (Some(s), None) => {
+                let tt = tt.ok_or_else(|| anyhow!("MOVE needs a field as the result"))?;
+                let v = self.eval(from)?;
+                let iso = a(&v.chars()?);
+                let text = match s {
+                    K::D(f) => {
+                        let f = match fmt {
+                            Some(x) => DateFmt::parse(x)?,
+                            None => f.or(dft_d),
+                        };
+                        dates::format_date(dates::parse_date(&iso, &DateFmt::iso())?, &f)
+                    }
+                    K::T(f) => {
+                        let f = match fmt {
+                            Some(x) => TimeFmt::parse(x)?,
+                            None => f.or(dft_t),
+                        };
+                        dates::format_time(dates::parse_time(&iso, &TimeFmt::iso())?, &f)
+                    }
+                    K::Z => iso,
+                };
+                if tt.is_numeric() {
+                    let digits: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
+                    let (n, _) = tt.precision();
+                    let n = n as usize;
+                    let take = if digits.len() > n {
+                        if left {
+                            &digits[..n]
+                        } else {
+                            &digits[digits.len() - n..]
+                        }
+                    } else {
+                        &digits[..]
+                    };
+                    let mut cur = self.move_image(to)?;
+                    let k = take.len();
+                    let bytes = data::e(take);
+                    if left {
+                        cur[..k].copy_from_slice(&bytes);
+                    } else {
+                        let l = cur.len();
+                        cur[l - k..].copy_from_slice(&bytes);
+                    }
+                    let (_, decs) = tt.precision();
+                    let d = data::decode_num(&DType::Zoned(cur.len() as u32, decs), &cur)?;
+                    self.assign(to, &Value::Num(d), fit, false)?;
+                } else {
+                    let mut cur = self.eval(to)?.chars()?;
+                    let src = data::e(&text);
+                    let n = cur.len();
+                    let k = src.len().min(n);
+                    if left {
+                        cur[..k].copy_from_slice(&src[..k]);
+                    } else {
+                        cur[n - k..].copy_from_slice(&src[src.len() - k..]);
+                    }
+                    self.assign(to, &Value::Char(cur), fit, false)?;
+                }
+            }
+            // Character or numeric to a date, time or timestamp: factor
+            // 1's format (else the field's) says how many characters, the
+            // rightmost (MOVE) or leftmost (MOVEL).
+            (None, Some(t)) => {
+                let numeric =
+                    st.is_some_and(|t| t.is_numeric()) || matches!(self.eval(from)?, Value::Num(_));
+                let src = if numeric {
+                    let b = self.move_image(from)?;
+                    b.iter()
+                        .map(|x| char::from(b'0' + (x & 0x0F).min(9)))
+                        .collect::<String>()
+                } else {
+                    a(&self.eval(from)?.chars()?)
+                };
+                let pick = |n: usize| -> String {
+                    let c: Vec<char> = src.chars().collect();
+                    if c.len() <= n {
+                        src.clone()
+                    } else if left {
+                        c[..n].iter().collect()
+                    } else {
+                        c[c.len() - n..].iter().collect()
+                    }
+                };
+                let out = match t {
+                    K::D(f) => {
+                        let mut f = match fmt {
+                            Some(x) => DateFmt::parse(x)?,
+                            None => f.or(dft_d),
+                        };
+                        if numeric {
+                            f.sep = None;
+                        }
+                        let d = dates::parse_date(&pick(f.len()), &f)?;
+                        dates::format_date(d, &DateFmt::iso())
+                    }
+                    K::T(f) => {
+                        let mut f = match fmt {
+                            Some(x) => TimeFmt::parse(x)?,
+                            None => f.or(dft_t),
+                        };
+                        if numeric {
+                            if f.name == "*USA" {
+                                bail!("MOVE between a time and a numeric field cannot use *USA");
+                            }
+                            f.sep = None;
+                        }
+                        let n = if f.sep.is_some() { 8 } else { 6 };
+                        let h = dates::parse_time(&pick(n), &f)?;
+                        dates::format_time(h, &TimeFmt::iso())
+                    }
+                    K::Z => {
+                        let n = if numeric { 20 } else { 26 };
+                        dates::format_ts(&dates::parse_ts(&pick(n))?, false)
+                    }
+                };
+                self.assign(to, &Value::str(&out), fit, false)?;
+            }
+            (None, None) => unreachable!(),
+        }
+        Ok(true)
     }
 
     fn do_move(
@@ -2876,6 +3100,26 @@ impl<'a> Machine<'a> {
                 };
                 for field in fields {
                     self.data_area(code == "IN", lock, &field)?;
+                }
+            }
+            "XML-INTO" | "DATA-INTO" => {
+                let target = need(f1, "a receiver")?;
+                let Some(Expr::Bif(_, parts)) = f2 else {
+                    bail!("{code}: %XML or %DATA is needed");
+                };
+                let arg = |n: &str| {
+                    parts.iter().find_map(|p| match p {
+                        Expr::Bif(b, a) if b == n => Some(a.clone()),
+                        _ => None,
+                    })
+                };
+                if code == "XML-INTO" {
+                    if matches!(&target, Expr::Bif(b, _) if b == "HANDLER") {
+                        bail!("XML-INTO %HANDLER is not supported yet");
+                    }
+                    self.xml_into(&target, &arg("XML").unwrap_or_default())?;
+                } else {
+                    self.data_into(&target, &arg("DATA").unwrap_or_default(), &arg("PARSER"))?;
                 }
             }
             other => bail!("operation {other} is not supported yet"),
@@ -3226,7 +3470,10 @@ impl<'a> Machine<'a> {
                 // procedure's own files when it is called.
                 for i in 0..self.prog.files.len() {
                     let d = &self.prog.files[i].decl;
-                    if keyword(&d.keywords, "USROPN").is_none() && d.proc.is_none() {
+                    if keyword(&d.keywords, "USROPN").is_none()
+                        && keyword(&d.keywords, "TEMPLATE").is_none()
+                        && d.proc.is_none()
+                    {
                         self.open_file(i)?;
                     }
                 }
@@ -3754,6 +4001,8 @@ enum Arg {
     Val(Value),
     /// *OMIT, or not passed (OPTIONS(*NOPASS)).
     Omit,
+    /// A file (LIKEFILE parameter).
+    File(usize),
 }
 
 impl<'a> Machine<'a> {
@@ -3843,7 +4092,16 @@ impl<'a> Machine<'a> {
                 out.push(Arg::Omit);
                 continue;
             };
-            out.push(if matches!(a, Expr::Omit) {
+            out.push(if p.file {
+                let name = match a {
+                    Expr::Name { parts, args: None } => parts.join("."),
+                    other => bail!("{what}: parameter {} needs a file, found {other:?}", p.name),
+                };
+                Arg::File(
+                    self.file_idx(&name)
+                        .ok_or_else(|| anyhow!("{what}: {name} is not a file"))?,
+                )
+            } else if matches!(a, Expr::Omit) {
                 if !p.omit {
                     bail!("{what}: *OMIT is not allowed for parameter {}", p.name);
                 }
@@ -3936,6 +4194,7 @@ impl<'a> Machine<'a> {
                         self.bufs.push(buf);
                     }
                     Arg::Omit => break,
+                    Arg::File(_) => bail!("{name}: a file cannot be passed to a program"),
                 }
             }
             let r = self.call_program(&pgm, &locs);
@@ -4234,9 +4493,14 @@ impl<'a> Machine<'a> {
         let mut values = Vec::new();
         let mut passed = 0;
         let mut omitted = Vec::new();
+        let mut files = HashMap::new();
         for (i, arg) in args.into_iter().enumerate() {
             let p = &pi.params[i];
             match arg {
+                Arg::File(f) => {
+                    files.insert(p.name.clone(), f);
+                    passed = i + 1;
+                }
                 Arg::Ref(l) => {
                     if let Some(b) = p.buf {
                         alias.insert(b, (l.buf, l.off));
@@ -4262,6 +4526,7 @@ impl<'a> Machine<'a> {
             alias,
             passed,
             omitted,
+            files,
         });
         let saved_routine = std::mem::replace(&mut self.routine, pi.name.clone());
         let saved_line = self.line;

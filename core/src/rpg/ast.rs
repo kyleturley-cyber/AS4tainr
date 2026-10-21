@@ -196,6 +196,9 @@ pub enum Stmt {
         left: bool,
         /// P: pad the result.
         pad: bool,
+        /// Factor 1: the date or time format of the character or numeric
+        /// side when the other is a date, time or timestamp (*MDY, *USA/...).
+        fmt: Option<String>,
         from: Expr,
         to: Expr,
         ind: ResultInd,

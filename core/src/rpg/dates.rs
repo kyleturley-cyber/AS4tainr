@@ -76,9 +76,11 @@ fn century_year(yy: i32) -> i32 {
 }
 
 /// A date format and its separator: `*MDY/`, `*ISO`, `*ISO0`, `*YMD-`...
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DateFmt {
-    pub name: String,
+    /// The format; "" when a definition gives none (the program's
+    /// default applies, *ISO until then).
+    pub name: &'static str,
     /// None: no separator (the `0` forms).
     pub sep: Option<char>,
 }
@@ -86,7 +88,7 @@ pub struct DateFmt {
 impl DateFmt {
     pub fn parse(s: &str) -> Result<DateFmt> {
         let s = s.trim().to_ascii_uppercase();
-        let names = [
+        let names: [&'static str; 12] = [
             "*LONGJUL", "*CYMD", "*CMDY", "*CDMY", "*ISO", "*USA", "*EUR", "*JIS", "*MDY", "*DMY",
             "*YMD", "*JUL",
         ];
@@ -112,24 +114,63 @@ impl DateFmt {
             }
             _ => bail!("date format {s} is not valid"),
         };
-        Ok(DateFmt {
-            name: name.to_string(),
-            sep,
-        })
+        Ok(DateFmt { name, sep })
     }
 
-    pub fn iso() -> DateFmt {
+    pub const fn iso() -> DateFmt {
         DateFmt {
-            name: "*ISO".into(),
+            name: "*ISO",
             sep: Some('-'),
         }
+    }
+
+    /// No format given (DATE without DATFMT).
+    pub const fn unset() -> DateFmt {
+        DateFmt {
+            name: "",
+            sep: Some('-'),
+        }
+    }
+
+    /// This format, or `dft` when none was given.
+    pub fn or(self, dft: DateFmt) -> DateFmt {
+        if self.name.is_empty() {
+            dft
+        } else {
+            self
+        }
+    }
+
+    /// Stored as the *ISO value is.
+    pub fn is_iso(&self) -> bool {
+        matches!(self.name, "*ISO" | "*JIS" | "") && self.sep == Some('-')
+    }
+
+    /// The format as written: *MDY, *MDY-, *ISO0, *DMY&.
+    pub fn code(&self) -> String {
+        let dft = match self.name {
+            "*ISO" | "*JIS" => '-',
+            "*EUR" => '.',
+            _ => '/',
+        };
+        match self.sep {
+            None => format!("{}0", self.name),
+            Some(c) if c == dft => self.name.to_string(),
+            Some(' ') => format!("{}&", self.name),
+            Some(c) => format!("{}{c}", self.name),
+        }
+    }
+
+    /// A 2-digit-year format (1940-2039).
+    pub fn short_year(&self) -> bool {
+        matches!(self.name, "*MDY" | "*DMY" | "*YMD" | "*JUL")
     }
 
     /// The parts in order: Y4 (4-digit year), Y2, C (century), M, D, J
     /// (day of year).
     fn parts(&self) -> &'static [&'static str] {
-        match self.name.as_str() {
-            "*ISO" | "*JIS" => &["Y4", "M", "D"],
+        match self.name {
+            "*ISO" | "*JIS" | "" => &["Y4", "M", "D"],
             "*USA" => &["M", "D", "Y4"],
             "*EUR" => &["D", "M", "Y4"],
             "*MDY" => &["M", "D", "Y2"],
@@ -283,9 +324,10 @@ pub fn parse_date(text: &str, f: &DateFmt) -> Result<Ymd> {
 }
 
 /// A time format: *HMS (with a separator), *ISO, *USA, *EUR, *JIS.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimeFmt {
-    pub name: String,
+    /// The format; "" when a definition gives none.
+    pub name: &'static str,
     pub sep: Option<char>,
 }
 
@@ -308,16 +350,47 @@ impl TimeFmt {
             r if r.len() == 1 && ":.,".contains(r) && name == "*HMS" => r.chars().next(),
             _ => bail!("time format {s} is not valid"),
         };
-        Ok(TimeFmt {
-            name: name.into(),
-            sep,
-        })
+        Ok(TimeFmt { name, sep })
     }
 
-    pub fn iso() -> TimeFmt {
+    pub const fn iso() -> TimeFmt {
         TimeFmt {
-            name: "*ISO".into(),
+            name: "*ISO",
             sep: Some('.'),
+        }
+    }
+
+    pub const fn unset() -> TimeFmt {
+        TimeFmt {
+            name: "",
+            sep: Some('.'),
+        }
+    }
+
+    /// Stored as the *ISO value is.
+    pub fn is_iso(&self) -> bool {
+        matches!(self.name, "*ISO" | "") && self.sep == Some('.')
+    }
+
+    /// The format as written: *HMS, *HMS., *ISO0.
+    pub fn code(&self) -> String {
+        let dft = match self.name {
+            "*ISO" | "*EUR" => '.',
+            _ => ':',
+        };
+        match self.sep {
+            None => format!("{}0", self.name),
+            Some(c) if c == dft => self.name.to_string(),
+            Some(' ') => format!("{}&", self.name),
+            Some(c) => format!("{}{c}", self.name),
+        }
+    }
+
+    pub fn or(self, dft: TimeFmt) -> TimeFmt {
+        if self.name.is_empty() {
+            dft
+        } else {
+            self
         }
     }
 }

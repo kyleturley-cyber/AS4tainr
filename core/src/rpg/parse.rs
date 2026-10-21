@@ -508,8 +508,8 @@ fn fixed_type(
             }
             DType::Float(len)
         }
-        'D' => DType::Date,
-        'T' => DType::Time,
+        'D' => DType::Date(crate::rpg::dates::DateFmt::unset()),
+        'T' => DType::Time(crate::rpg::dates::TimeFmt::unset()),
         'Z' => DType::Timestamp,
         '*' => DType::Pointer,
         other => bail!("data type {other} is not supported yet"),
@@ -552,8 +552,15 @@ fn free_type(word: &str, args: &[String]) -> Result<Option<DType>> {
             DType::Float(b)
         }
         "IND" => DType::Ind,
-        "DATE" => DType::Date,
-        "TIME" => DType::Time,
+        // DATE(*MDY), TIME(*HMS:): the format.
+        "DATE" => DType::Date(match args.first() {
+            Some(f) if !f.trim().is_empty() => crate::rpg::dates::DateFmt::parse(f)?,
+            _ => crate::rpg::dates::DateFmt::unset(),
+        }),
+        "TIME" => DType::Time(match args.first() {
+            Some(f) if !f.trim().is_empty() => crate::rpg::dates::TimeFmt::parse(f)?,
+            _ => crate::rpg::dates::TimeFmt::unset(),
+        }),
         "TIMESTAMP" => DType::Timestamp,
         "POINTER" => DType::Pointer,
         _ => return Ok(None),
@@ -770,7 +777,57 @@ pub fn parse(source: &str, includes: &dyn Fn(&str) -> Option<String>) -> Result<
     if let Some(p) = ctx.proc.take() {
         bail!("procedure {} has no end (P spec E or END-PROC)", p.name);
     }
+    like_files(&mut ctx.src.files)?;
     Ok(ctx.src)
+}
+
+/// LIKEFILE(parent) on a file declaration (ILE RPG Reference, LIKEFILE):
+/// the file is defined as the parent is (device, usage, external
+/// description, keyed), with keywords of its own (EXTFILE, EXTMBR,
+/// USROPN...); the parent's TEMPLATE, EXTDESC and file name are not taken.
+fn like_files(files: &mut [FileDecl]) -> Result<()> {
+    for i in 0..files.len() {
+        let Some(k) = keyword(&files[i].keywords, "LIKEFILE") else {
+            continue;
+        };
+        let parent = k
+            .args
+            .first()
+            .map(|a| a.trim().to_ascii_uppercase())
+            .unwrap_or_default();
+        let p = files
+            .iter()
+            .find(|f| f.name == parent)
+            .cloned()
+            .ok_or_else(|| anyhow!("LIKEFILE({parent}): {parent} is not a file defined before"))?;
+        let f = &mut files[i];
+        f.usage = p.usage;
+        f.designation = p.designation;
+        f.add = p.add;
+        f.external = p.external;
+        f.keyed = p.keyed;
+        f.record_len = p.record_len;
+        f.device = p.device.clone();
+        let ext = keyword(&p.keywords, "EXTDESC").cloned();
+        let own: Vec<String> = f.keywords.iter().map(|k| k.name.clone()).collect();
+        for k in &p.keywords {
+            if !matches!(
+                k.name.as_str(),
+                "TEMPLATE" | "LIKEFILE" | "BLOCK" | "EXTDESC"
+            ) && !own.contains(&k.name)
+            {
+                f.keywords.push(k.clone());
+            }
+        }
+        // The parent's database file.
+        if keyword(&f.keywords, "EXTDESC").is_none() {
+            f.keywords.push(ext.unwrap_or(Keyword {
+                name: "EXTDESC".into(),
+                args: vec![p.name.clone()],
+            }));
+        }
+    }
+    Ok(())
 }
 
 /// Opcodes whose factor 2 is an extended factor 2 (positions 36-80).
@@ -1521,6 +1578,7 @@ fn fixed_c(ctx: &mut Ctx, cs: &[char], ext2: &str, lineno: usize) -> Result<()> 
         "MOVE" | "MOVEL" => Line::Stmt(Stmt::Move {
             left: op == "MOVEL",
             pad: ext.other.contains('P'),
+            fmt: Some(f1t.trim().to_ascii_uppercase()).filter(|f| f.starts_with('*')),
             from: need(f2(), "factor 2")?,
             to: need(res(), "a result field")?,
             ind: ind.clone(),
@@ -2642,6 +2700,31 @@ fn free_calc(text: &str) -> Result<Line> {
                 code: op.clone(),
                 f1: Some(Expr::name(&kind)),
                 f2: Some(expr::parse(t)?),
+                result: None,
+                ext,
+                ind: ResultInd::default(),
+            })
+        }
+        // XML-INTO receiver %XML(doc : options); DATA-INTO receiver
+        // %DATA(doc : options) %PARSER(program : options).
+        "XML-INTO" | "DATA-INTO" => {
+            let t = rest_t.trim();
+            let up = t.to_ascii_uppercase();
+            let at = up
+                .find(if op == "XML-INTO" { "%XML" } else { "%DATA" })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{op} needs {}",
+                        if op == "XML-INTO" { "%XML" } else { "%DATA" }
+                    )
+                })?;
+            Line::Stmt(Stmt::Op {
+                code: op.clone(),
+                f1: Some(expr::parse(t[..at].trim())?),
+                f2: Some(expr::parse(&format!(
+                    "%LIST({})",
+                    t[at..].trim().replace(") %", "):%")
+                ))?),
                 result: None,
                 ext,
                 ind: ResultInd::default(),

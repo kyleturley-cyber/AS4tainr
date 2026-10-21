@@ -45,10 +45,12 @@ pub enum DType {
     Uns(u32),
     /// Indicator (N).
     Ind,
-    /// Date (D) in *ISO form, 10 characters.
-    Date,
-    /// Time (T) in *ISO form, 8 characters.
-    Time,
+    /// Date (D), stored in its format (DATFMT); its value in
+    /// expressions is the *ISO form.
+    Date(crate::rpg::dates::DateFmt),
+    /// Time (T), stored in its format (TIMFMT); its value in expressions
+    /// is the *ISO form.
+    Time(crate::rpg::dates::TimeFmt),
     /// Timestamp (Z), 26 characters.
     Timestamp,
     /// Pointer (*): 16 bytes, opaque here.
@@ -91,8 +93,8 @@ impl DType {
                 _ => 8,
             },
             DType::Ind => 1,
-            DType::Date => 10,
-            DType::Time => 8,
+            DType::Date(f) => f.len(),
+            DType::Time(_) => 8,
             DType::Timestamp => 26,
             DType::Pointer => 16,
         }
@@ -115,8 +117,8 @@ impl DType {
             self,
             DType::Char(_)
                 | DType::Varchar(_)
-                | DType::Date
-                | DType::Time
+                | DType::Date(_)
+                | DType::Time(_)
                 | DType::Timestamp
                 | DType::Ucs2(_)
                 | DType::VarUcs2(_)
@@ -138,8 +140,8 @@ impl DType {
         match *self {
             DType::Char(n) | DType::Varchar(n) | DType::Ucs2(n) | DType::VarUcs2(n) => n,
             DType::Ind => 1,
-            DType::Date => 10,
-            DType::Time => 8,
+            DType::Date(f) => f.len() as u32,
+            DType::Time(_) => 8,
             DType::Timestamp => 26,
             DType::Pointer => 16,
             n => n.precision().0,
@@ -170,8 +172,13 @@ impl DType {
                 }
             }
             DType::VarUcs2(_) => {}
-            DType::Date => b.copy_from_slice(&e("0001-01-01")),
-            DType::Time => b.copy_from_slice(&e("00.00.00")),
+            // 0001-01-01, or 1940-01-01 in a 2-digit-year format; midnight
+            // (ILE RPG Reference, "Date Data Type", "Time Data Type").
+            DType::Date(f) => {
+                let y = if f.short_year() { 1940 } else { 1 };
+                b.copy_from_slice(&e(&crate::rpg::dates::format_date((y, 1, 1), &f)))
+            }
+            DType::Time(f) => b.copy_from_slice(&e(&crate::rpg::dates::format_time((0, 0, 0), &f))),
             DType::Timestamp => b.copy_from_slice(&e("0001-01-01-00.00.00.000000")),
             DType::Pointer => {}
         }
@@ -425,8 +432,34 @@ pub fn decode_num(t: &DType, b: &[u8]) -> Result<Dec> {
 /// Store a value in a field of type `t` (bytes `out`), converting as RPG
 /// assignment does. `right`: right-adjust character data (EVALR).
 pub fn store(t: &DType, v: &Value, out: &mut [u8], fit: Fit, right: bool) -> Result<()> {
+    // A date or time in its format: from the *ISO value.
+    match (t, v) {
+        (DType::Date(f), Value::Char(c)) if !f.is_iso() => {
+            use crate::rpg::dates;
+            if let Ok(d) = dates::parse_date(&a(c), &dates::DateFmt::iso()) {
+                let text = dates::format_date(d, f);
+                if f.short_year() && !(1940..=2039).contains(&d.0) {
+                    bail!(
+                        "RNX0112: Date {} is outside the range of format {}.",
+                        a(c),
+                        f.name
+                    );
+                }
+                put_chars(&e(&text), out, false);
+                return Ok(());
+            }
+        }
+        (DType::Time(f), Value::Char(c)) if !f.is_iso() => {
+            use crate::rpg::dates;
+            if let Ok(h) = dates::parse_time(&a(c), &dates::TimeFmt::iso()) {
+                put_chars(&e(&dates::format_time(h, f)), out, false);
+                return Ok(());
+            }
+        }
+        _ => {}
+    }
     match t {
-        DType::Char(_) | DType::Date | DType::Time | DType::Timestamp => {
+        DType::Char(_) | DType::Date(_) | DType::Time(_) | DType::Timestamp => {
             let src = match v {
                 Value::Fig(f) => return fill_fig(t, f, out),
                 Value::Num(_) => bail!("A numeric value cannot be assigned to a character field."),
@@ -567,7 +600,24 @@ pub fn store(t: &DType, v: &Value, out: &mut [u8], fit: Fit, right: bool) -> Res
 /// Read a field's value.
 pub fn load(t: &DType, b: &[u8]) -> Result<Value> {
     Ok(match t {
-        DType::Char(_) | DType::Date | DType::Time | DType::Timestamp => Value::Char(b.to_vec()),
+        // A date or time in its format: its *ISO value.
+        DType::Date(f) if !f.is_iso() => {
+            use crate::rpg::dates;
+            match dates::parse_date(&a(b), f) {
+                Ok(d) => Value::str(&dates::format_date(d, &dates::DateFmt::iso())),
+                Err(_) => Value::Char(b.to_vec()),
+            }
+        }
+        DType::Time(f) if !f.is_iso() => {
+            use crate::rpg::dates;
+            match dates::parse_time(&a(b), f) {
+                Ok(h) => Value::str(&dates::format_time(h, &dates::TimeFmt::iso())),
+                Err(_) => Value::Char(b.to_vec()),
+            }
+        }
+        DType::Char(_) | DType::Date(_) | DType::Time(_) | DType::Timestamp => {
+            Value::Char(b.to_vec())
+        }
         DType::Varchar(max) => {
             let n = (u16::from_be_bytes([b[0], b[1]]) as usize).min(*max as usize);
             Value::Char(b[2..2 + n].to_vec())

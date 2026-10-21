@@ -99,6 +99,12 @@ BEGIN
     ALTER TABLE as4tainr.programs ADD COLUMN IF NOT EXISTS options text NOT NULL DEFAULT '';
   END IF;
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='programs' AND column_name='src_file') THEN
+    ALTER TABLE as4tainr.programs ADD COLUMN IF NOT EXISTS src_file text NOT NULL DEFAULT '',
+      ADD COLUMN IF NOT EXISTS src_lib text NOT NULL DEFAULT '',
+      ADD COLUMN IF NOT EXISTS src_mbr text NOT NULL DEFAULT '';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
                  WHERE table_schema='as4tainr' AND table_name='file_fields' AND column_name='dft') THEN
     ALTER TABLE as4tainr.file_fields
       ADD COLUMN IF NOT EXISTS varlen boolean NOT NULL DEFAULT false,
@@ -419,6 +425,22 @@ pub async fn create_program(
 }
 
 /// Record a program's compile options (see `Program::options`).
+/// The source member a program was created from.
+pub async fn set_program_source(
+    client: &Client,
+    library: &str,
+    name: &str,
+    member: (&str, &str, &str),
+) -> Result<()> {
+    client
+        .execute(
+            "UPDATE as4tainr.programs SET src_file=$3, src_lib=$4, src_mbr=$5 WHERE library=$1 AND name=$2",
+            &[&library, &name, &member.0, &member.1, &member.2],
+        )
+        .await?;
+    Ok(())
+}
+
 pub async fn set_program_options(
     client: &Client,
     library: &str,

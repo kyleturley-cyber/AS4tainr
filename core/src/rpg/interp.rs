@@ -209,6 +209,8 @@ struct FileState {
     /// Opened under commitment control (the COMMIT keyword): its I/O runs
     /// in the commitment definition.
     cmt: Option<std::sync::Arc<crate::cmtctl::Definition>>,
+    /// Has trigger programs (ADDPFTRG); None until the first change.
+    pftrg: Option<bool>,
 }
 
 /// How a program handles null values in externally described database
@@ -434,6 +436,7 @@ impl<'a> Machine<'a> {
                     others: 0,
                     aid: None,
                     cmt: None,
+                    pftrg: None,
                 })
                 .collect(),
             last: Status::default(),
@@ -1717,6 +1720,9 @@ impl<'a> Machine<'a> {
         };
         let rt = self.io.rt.clone();
         let result: Result<Option<ReadResult>> = (|| {
+            if matches!(op, FileOp::Open | FileOp::Close) {
+                return Ok(None);
+            }
             let f = self.files[i]
                 .open
                 .as_mut()
@@ -1873,8 +1879,32 @@ impl<'a> Machine<'a> {
                     }
                     rec
                 };
+                // A file with trigger programs (ADDPFTRG): the change is
+                // kept only if they end normally.
+                let fref = self.prog.files[i].fref.clone().unwrap();
+                let triggered = match self.files[i].pftrg {
+                    Some(t) => t,
+                    None => {
+                        let t: bool = rt
+                            .block_on(client.query_one(
+                                "SELECT as4tainr_svc.has_pftrg($1, $2)",
+                                &[&fref.library, &fref.file.name],
+                            ))
+                            .map(|r| r.get(0))
+                            .unwrap_or(false);
+                        self.files[i].pftrg = Some(t);
+                        t
+                    }
+                };
+                if triggered {
+                    rt.block_on(client.batch_execute(if cmt.is_some() {
+                        "SAVEPOINT as4tainr_trg"
+                    } else {
+                        "BEGIN"
+                    }))?;
+                }
                 let f = self.files[i].open.as_mut().unwrap();
-                let r: Result<()> = match op {
+                let mut r: Result<()> = match op {
                     FileOp::Write => rt.block_on(f.write(client, &rec)).map(|_| ()),
                     FileOp::Update => rt.block_on(async {
                         f.update(client, &rec).await?;
@@ -1891,6 +1921,29 @@ impl<'a> Machine<'a> {
                         f.release(client).await
                     }),
                 };
+                if triggered {
+                    if r.is_ok() {
+                        let who = crate::pftrg::Caller {
+                            database_url: &self.io.database_url,
+                            libl: self.io.libl.clone(),
+                            user: self.io.user.clone(),
+                            job: self.io.job.as_ref().map(|j| j.to_string()),
+                            curlib: self.io.cl.as_ref().and_then(|c| c.curlib.clone()),
+                        };
+                        if let Err(e) =
+                            rt.block_on(crate::pftrg::fire(client, self.io.client, &who))
+                        {
+                            r = Err(e);
+                        }
+                    }
+                    let end = match (&r, cmt.is_some()) {
+                        (Ok(_), true) => "RELEASE SAVEPOINT as4tainr_trg",
+                        (Err(_), true) => "ROLLBACK TO SAVEPOINT as4tainr_trg",
+                        (Ok(_), false) => "COMMIT",
+                        (Err(_), false) => "ROLLBACK",
+                    };
+                    rt.block_on(client.batch_execute(end))?;
+                }
                 match r {
                     Ok(()) => {
                         if let Some(d) = &cmt {
@@ -3277,17 +3330,35 @@ impl<'a> Machine<'a> {
             None => {
                 // *ENTRY PLIST (or a PI outside procedures): the bytes go
                 // into the parameter fields, and come back after.
+                // A parameter is the caller's storage (by reference): a
+                // parameter with storage of its own gets all the bytes
+                // passed, so that a pointer from %ADDR reaches past its
+                // declared length (a trigger program's buffer).
                 let mut locs = Vec::new();
                 for (p, bytes) in prog.entry.iter().zip(parms.iter()) {
                     let l = self.loc_of(&p.target)?;
-                    let n = l.size.min(bytes.len());
-                    self.bufs[l.buf][l.off..l.off + n].copy_from_slice(&bytes[..n]);
-                    locs.push(l);
+                    let whole = l.off == 0
+                        && bytes.len() > l.size
+                        && self.bufs.get(l.buf).is_some_and(|b| b.len() == l.size);
+                    if whole {
+                        self.bufs[l.buf] = bytes.clone();
+                    } else {
+                        let n = l.size.min(bytes.len());
+                        self.bufs[l.buf][l.off..l.off + n].copy_from_slice(&bytes[..n]);
+                    }
+                    locs.push((l, whole));
                 }
                 let r = self.cycle();
-                for (l, bytes) in locs.iter().zip(parms.iter_mut()) {
-                    let n = l.size.min(bytes.len());
-                    bytes[..n].copy_from_slice(&self.bufs[l.buf][l.off..l.off + n]);
+                for ((l, whole), bytes) in locs.iter().zip(parms.iter_mut()) {
+                    if *whole {
+                        let b = &mut self.bufs[l.buf];
+                        let n = bytes.len().min(b.len());
+                        bytes[..n].copy_from_slice(&b[..n]);
+                        b.truncate(l.size);
+                    } else {
+                        let n = l.size.min(bytes.len());
+                        bytes[..n].copy_from_slice(&self.bufs[l.buf][l.off..l.off + n]);
+                    }
                 }
                 r
             }

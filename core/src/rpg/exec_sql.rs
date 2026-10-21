@@ -411,6 +411,11 @@ impl Machine<'_> {
             // The program does not know which entry is the current
             // library.
             self.block(s.set_context(&user, None, job))?;
+            // The program (journal entries name it): LIB/NAME.
+            if let Some((l, n)) = self.io.program.split_once('/') {
+                let (l, n) = (l.to_string(), n.to_string());
+                self.block(s.set_program(&n, &l))?;
+            }
             self.sql.session = Some(s);
         }
         Ok(self.sql.session.as_ref().unwrap())

@@ -66,3 +66,12 @@ for p in CUSTPGM ITEMPGM MENUPGM ORDPGM; do
   "$bin" --libl COM022LIB system "CRTBNDRPG PGM(COM022LIB/$p) SRCFILE(COM022LIB/QRPGLESRC)"
 done
 "$bin" --libl COM022LIB system "CRTSQLRPGI OBJ(COM022LIB/ORDINQ) SRCFILE(COM022LIB/QRPGLESRC)"
+# Journaling and the audit trigger (README: SETUPJRN, ADDTRG), then an
+# order changed: the trigger program ORDTRG writes ORDAUD, and the journal
+# view ORDAUDJV shows the same change.
+"$bin" --libl COM022LIB system "CALL COM022LIB/SETUPJRN" | tail -1
+"$bin" --libl COM022LIB system "CALL COM022LIB/ADDTRG" | tail -1
+"$bin" --libl COM022LIB system "RUNSQLSTM SRCFILE(COM022LIB/QSQLSRC) SRCMBR(ORDAUDJV) COMMIT(*NONE)" | tail -1
+"$bin" --libl COM022LIB sql "UPDATE ORDHDR SET STATUS = STATUS WHERE ORDNO = 10001"
+"$bin" --libl COM022LIB sql "SELECT ORDNO, ACTION FROM ORDAUD"
+"$bin" --libl COM022LIB sql "SELECT ORDNO, ACTION, AUDSRC FROM ORDAUDJV"

@@ -2521,6 +2521,266 @@ pub static COMMANDS: &[CommandDef] = &[
             .ch("*YES, *NO"),
         ],
     },
+    CommandDef {
+        name: "CRTJRNRCV",
+        description: "Create Journal Receiver",
+        params: &[
+            p("JRNRCV", Kind::Qualified, true, None, "Journal receiver").ch("Name"),
+            p("ASP", Kind::Name, false, Some("*LIBASP"), "ASP number").keyword_only(),
+            p(
+                "THRESHOLD",
+                Kind::Text,
+                false,
+                Some("1500000"),
+                "Journal receiver threshold",
+            )
+            .keyword_only(),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*BLANK"),
+                "Text 'description'",
+            )
+            .keyword_only(),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CRTJRN",
+        description: "Create Journal",
+        params: &[
+            p("JRN", Kind::Qualified, true, None, "Journal").ch("Name"),
+            p("JRNRCV", Kind::Qualified, true, None, "Journal receiver").ch("Name"),
+            p(
+                "MNGRCV",
+                Kind::Name,
+                false,
+                Some("*SYSTEM"),
+                "Manage receivers",
+            )
+            .ch("*SYSTEM, *USER")
+            .keyword_only(),
+            p("DLTRCV", Kind::Name, false, Some("*NO"), "Delete receivers")
+                .ch("*NO, *YES")
+                .keyword_only(),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*BLANK"),
+                "Text 'description'",
+            )
+            .keyword_only(),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CHGJRN",
+        description: "Change Journal",
+        params: &[
+            p("JRN", Kind::Qualified, true, None, "Journal").ch("Name"),
+            p(
+                "JRNRCV",
+                Kind::Qualified,
+                false,
+                Some("*SAME"),
+                "Journal receiver",
+            )
+            .ch("Name, *SAME, *GEN"),
+            p(
+                "SEQOPT",
+                Kind::Name,
+                false,
+                Some("*CONT"),
+                "Sequence option",
+            )
+            .ch("*CONT, *RESET")
+            .keyword_only(),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*SAME"),
+                "Text 'description'",
+            )
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "DLTJRN",
+        description: "Delete Journal",
+        params: &[p("JRN", Kind::Qualified, true, None, "Journal").ch("Name")],
+    },
+    CommandDef {
+        name: "DLTJRNRCV",
+        description: "Delete Journal Receiver",
+        params: &[
+            p("JRNRCV", Kind::Qualified, true, None, "Journal receiver").ch("Name"),
+            p("DLTOPT", Kind::List, false, Some("*NONE"), "Option").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "STRJRNPF",
+        description: "Start Journal Physical File",
+        params: &[
+            p(
+                "FILE",
+                Kind::List,
+                true,
+                None,
+                "Physical file to be journaled",
+            )
+            .ch("Name, generic*, *ALL"),
+            p("JRN", Kind::Qualified, true, None, "Journal").ch("Name"),
+            p("IMAGES", Kind::Name, false, Some("*AFTER"), "Record images")
+                .ch("*AFTER, *BOTH")
+                .keyword_only(),
+            p(
+                "OMTJRNE",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "Journal entries to be omitted",
+            )
+            .ch("*NONE, *OPNCLO")
+            .keyword_only(),
+            p(
+                "LOGLVL",
+                Kind::Name,
+                false,
+                Some("*ERRORS"),
+                "Logging level",
+            )
+            .ch("*ERRORS, *ALL")
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "ENDJRNPF",
+        description: "End Journal Physical File",
+        params: &[
+            p("FILE", Kind::List, true, None, "Journaled physical file").ch("Name, generic*, *ALL"),
+            p("JRN", Kind::Qualified, false, Some("*FILE"), "Journal").ch("Name, *FILE"),
+            p(
+                "LOGLVL",
+                Kind::Name,
+                false,
+                Some("*ERRORS"),
+                "Logging level",
+            )
+            .ch("*ERRORS, *ALL")
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "DSPJRN",
+        description: "Display Journal",
+        params: &[
+            p("JRN", Kind::Qualified, true, None, "Journal").ch("Name"),
+            p(
+                "FILE",
+                Kind::List,
+                false,
+                Some("*ALLFILE"),
+                "Journaled physical file",
+            )
+            .ch("Name, *ALLFILE, *ALL"),
+            p(
+                "RCVRNG",
+                Kind::List,
+                false,
+                Some("*CURRENT"),
+                "Range of journal receivers",
+            )
+            .ch("*CURRENT, *CURCHAIN")
+            .keyword_only(),
+            p("JRNCDE", Kind::List, false, Some("*ALL"), "Journal codes")
+                .ch("*ALL, *CTL, code")
+                .keyword_only(),
+            p(
+                "ENTTYP",
+                Kind::List,
+                false,
+                Some("*ALL"),
+                "Journal entry types",
+            )
+            .ch("*ALL, *RCD, type")
+            .keyword_only(),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output")
+                .ch("*, *PRINT")
+                .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "ADDPFTRG",
+        description: "Add Physical File Trigger",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "Physical file").ch("Name"),
+            p("TRGTIME", Kind::Name, true, None, "Trigger time").ch("*BEFORE, *AFTER"),
+            p("TRGEVENT", Kind::Name, true, None, "Trigger event")
+                .ch("*INSERT, *DELETE, *UPDATE, *READ"),
+            p("PGM", Kind::Qualified, true, None, "Program").ch("Name"),
+            p("RPLTRG", Kind::Name, false, Some("*NO"), "Replace trigger").ch("*NO, *YES"),
+            p("TRG", Kind::Text, false, Some("*GEN"), "Trigger")
+                .ch("Name, *GEN")
+                .keyword_only(),
+            p(
+                "TRGLIB",
+                Kind::Name,
+                false,
+                Some("*FILE"),
+                "Trigger library",
+            )
+            .ch("Name, *FILE, *CURLIB")
+            .keyword_only(),
+            p(
+                "ALWREPCHG",
+                Kind::Name,
+                false,
+                Some("*NO"),
+                "Allow repeated change",
+            )
+            .ch("*NO, *YES")
+            .keyword_only(),
+            p("THDSAFE", Kind::Name, false, Some("*UNKNOWN"), "Threadsafe")
+                .ch("*UNKNOWN, *NO, *YES")
+                .keyword_only(),
+            p(
+                "MLTTHDACN",
+                Kind::Name,
+                false,
+                Some("*SYSVAL"),
+                "Multithreaded job action",
+            )
+            .ch("*SYSVAL, *MSG, *NORUN, *RUN")
+            .keyword_only(),
+            p(
+                "TRGUPDCND",
+                Kind::Name,
+                false,
+                Some("*ALWAYS"),
+                "Trigger update condition",
+            )
+            .ch("*ALWAYS, *CHANGE")
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "RMVPFTRG",
+        description: "Remove Physical File Trigger",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "Physical file").ch("Name"),
+            p("TRGTIME", Kind::Name, false, Some("*ALL"), "Trigger time")
+                .ch("*ALL, *BEFORE, *AFTER"),
+            p("TRGEVENT", Kind::Name, false, Some("*ALL"), "Trigger event")
+                .ch("*ALL, *INSERT, *DELETE, *UPDATE, *READ"),
+            p("TRG", Kind::Text, false, Some("*ALL"), "Trigger")
+                .ch("Name, *ALL")
+                .keyword_only(),
+            p("TRGLIB", Kind::Name, false, Some("*ALL"), "Trigger library").keyword_only(),
+        ],
+    },
 ];
 
 /// A group of commands on the F4 menu.
@@ -2693,6 +2953,25 @@ pub static GROUPS: &[Group] = &[
             "CPYTOSTMF",
             "CPYFRMSTMF",
         ],
+    },
+    Group {
+        item: "Journal commands",
+        title: "Journal Commands",
+        commands: &[
+            "CRTJRNRCV",
+            "CRTJRN",
+            "CHGJRN",
+            "DLTJRN",
+            "DLTJRNRCV",
+            "STRJRNPF",
+            "ENDJRNPF",
+            "DSPJRN",
+        ],
+    },
+    Group {
+        item: "Trigger commands",
+        title: "Trigger Commands",
+        commands: &["ADDPFTRG", "RMVPFTRG"],
     },
 ];
 

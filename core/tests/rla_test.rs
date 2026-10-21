@@ -7075,3 +7075,405 @@ dsply %char(n);
     as4tainr_core::pgmmsg::named_remove(&key, "TMSGQ", "*ALL", None);
     assert!(as4tainr_core::pgmmsg::named_messages(&key, "TMSGQ").is_empty());
 }
+
+/// A job for the journal and trigger tests, and its SQL.
+async fn sql_rows(client: &tokio_postgres::Client, url: &str, lib: &str, q: &str) -> Vec<String> {
+    match as4tainr_core::sql::run_as(
+        client,
+        url,
+        &[lib.to_string()],
+        "QSECOFR",
+        Some(lib.to_string()),
+        None,
+        q,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{q}: {e:#}"))
+    {
+        as4tainr_core::sql::Outcome::Rows { rows, .. } => rows
+            .into_iter()
+            .map(|r| r.iter().map(|v| v.trim()).collect::<Vec<_>>().join("|"))
+            .collect(),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// Journals (CL reference: CRTJRNRCV, CRTJRN, STRJRNPF, CHGJRN, DLTJRNRCV,
+/// ENDJRNPF; Db2 for i services: DISPLAY_JOURNAL). With IMAGES(*BOTH) an
+/// SQL INSERT is an R PT entry, an UPDATE R UB and R UP, a DELETE R DL;
+/// starting journaling is F JM, ending it F EJ. The entry data is the
+/// record image in the record format's storage formats: packed decimal
+/// 10001 in 7 digits is X'0010001F' (digits, sign F), CHAR in CCSID 37
+/// ('W' = X'E6', blank = X'40'), INTEGER -5 as 4-byte two's complement
+/// X'FFFFFFFB', zoned 12.50 in NUMERIC(5,2) is X'F0F1F2F5F0'; INTERPRET
+/// reads them back. Changes under commitment control are a commit cycle:
+/// C SC, the changes, C CM (COMMIT) or C RB (ROLLBACK), the cycle number
+/// in COMMIT_CYCLE. CHGJRN JRNRCV(*GEN) attaches RCV0002; the default
+/// receiver range is the current receiver, *CURCHAIN all of them.
+/// Existing objects: CPF7010; journaling a journaled file: CPF7030.
+#[tokio::test]
+async fn journals_and_display_journal() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let sql = |s: String| format!("RUNSQL SQL('{}') COMMIT(*NONE)", s.replace('\'', "''"));
+    for c in [
+        sql(format!("CREATE TABLE {lib}.ITEMS (ID DECIMAL(7, 0) NOT NULL, NAME CHAR(10), QTY INTEGER, PRICE NUMERIC(5, 2)) RCDFMT ITEMR")),
+        format!("CRTJRNRCV JRNRCV({lib}/RCV0001)"),
+        format!("CRTJRN JRN({lib}/JRN) JRNRCV({lib}/RCV0001)"),
+        format!("STRJRNPF FILE({lib}/ITEMS) JRN({lib}/JRN) IMAGES(*BOTH)"),
+        sql(format!("INSERT INTO {lib}.ITEMS VALUES (10001, 'Widget', -5, 12.50)")),
+        sql(format!("UPDATE {lib}.ITEMS SET QTY = 7")),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    let e = cl_cmd(
+        &mut job,
+        format!("CRTJRN JRN({lib}/JRN) JRNRCV({lib}/RCV0001)"),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("CPF7010"), "{e}");
+    let e = cl_cmd(
+        &mut job,
+        format!("STRJRNPF FILE({lib}/ITEMS) JRN({lib}/JRN)"),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("CPF7030"), "{e}");
+    let dj = format!("TABLE(QSYS2.DISPLAY_JOURNAL('{lib}', 'JRN')) X");
+    assert_eq!(
+        sql_rows(&client, &url, &lib, &format!("SELECT JOURNAL_CODE, JOURNAL_ENTRY_TYPE, RTRIM(SUBSTR(\"OBJECT\", 1, 10)), COUNT_OR_RRN FROM {dj} ORDER BY SEQUENCE_NUMBER")).await,
+        ["F|JM|ITEMS|0", "R|PT|ITEMS|1", "R|UB|ITEMS|1", "R|UP|ITEMS|1"]
+    );
+    assert_eq!(
+        sql_rows(
+            &client,
+            &url,
+            &lib,
+            &format!("SELECT HEX(ENTRY_DATA) FROM {dj} WHERE JOURNAL_ENTRY_TYPE = 'PT'")
+        )
+        .await,
+        ["0010001FE689848785A340404040FFFFFFFBF0F1F2F5F0"]
+    );
+    assert_eq!(
+        sql_rows(&client, &url, &lib, &format!(
+            "SELECT INTERPRET(SUBSTR(ENTRY_DATA, 1, 4) AS DECIMAL(7, 0)), INTERPRET(SUBSTR(ENTRY_DATA, 5, 10) AS CHAR(10)), \
+             INTERPRET(SUBSTR(ENTRY_DATA, 15, 4) AS INTEGER), INTERPRET(SUBSTR(ENTRY_DATA, 19, 5) AS NUMERIC(5, 2)) \
+             FROM {dj} WHERE JOURNAL_ENTRY_TYPE = 'UP'"
+        )).await,
+        ["10001|Widget|7|12.50"]
+    );
+    // Commitment control: embedded SQL with COMMIT(*CHG).
+    source::create_file(&client, &lib, "QRPGLESRC", "")
+        .await
+        .unwrap();
+    let src = format!(
+        "**FREE\nexec sql set option commit = *chg;\nexec sql insert into {lib}.ITEMS values (2, 'Two', 2, 2.00);\nexec sql commit;\nexec sql insert into {lib}.ITEMS values (3, 'Three', 3, 3.00);\nexec sql rollback;\n*inlr = *on;\n"
+    );
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QRPGLESRC".into(),
+            name: "CMTPGM".into(),
+            srctype: "SQLRPGLE".into(),
+            text: String::new(),
+            source: src,
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    cl_cmd(
+        &mut job,
+        format!("CRTSQLRPGI OBJ({lib}/CMTPGM) SRCFILE({lib}/QRPGLESRC)"),
+    )
+    .await
+    .unwrap();
+    cl_cmd(&mut job, format!("CALL PGM({lib}/CMTPGM)"))
+        .await
+        .unwrap();
+    let rows = sql_rows(&client, &url, &lib, &format!(
+        "SELECT JOURNAL_CODE, JOURNAL_ENTRY_TYPE, COMMIT_CYCLE, COALESCE(PROGRAM_NAME, '-'), SEQUENCE_NUMBER FROM {dj} \
+         WHERE SEQUENCE_NUMBER > 4 ORDER BY SEQUENCE_NUMBER"
+    )).await;
+    let f: Vec<Vec<&str>> = rows.iter().map(|r| r.split('|').collect()).collect();
+    // The first cycle: start, the insert, commit; its number is the start's.
+    assert_eq!((f[0][0], f[0][1], f[0][2]), ("C", "SC", f[0][4]));
+    assert_eq!(
+        (f[1][0], f[1][1], f[1][2], f[1][3]),
+        ("R", "PT", f[0][4], "CMTPGM")
+    );
+    assert_eq!((f[2][0], f[2][1], f[2][2]), ("C", "CM", f[0][4]));
+    // The second: rolled back (its start and the rollback).
+    assert_eq!((f[3][0], f[3][1]), ("C", "SC"));
+    assert_eq!((f[4][0], f[4][1], f[4][2]), ("C", "RB", f[3][4]));
+    assert_eq!(f.len(), 5, "{rows:?}");
+    // A new receiver: only its entries by default; *CURCHAIN all.
+    cl_cmd(&mut job, format!("CHGJRN JRN({lib}/JRN) JRNRCV(*GEN)"))
+        .await
+        .unwrap();
+    cl_cmd(
+        &mut job,
+        sql(format!("DELETE FROM {lib}.ITEMS WHERE ID = 2")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sql_rows(
+            &client,
+            &url,
+            &lib,
+            &format!("SELECT JOURNAL_ENTRY_TYPE, RECEIVER_NAME FROM {dj}")
+        )
+        .await,
+        ["DL|RCV0002"]
+    );
+    let all = format!(
+        "TABLE(QSYS2.DISPLAY_JOURNAL('{lib}', 'JRN', STARTING_RECEIVER_NAME => '*CURCHAIN')) X"
+    );
+    assert_eq!(
+        sql_rows(&client, &url, &lib, &format!("SELECT COUNT(*) FROM {all}")).await,
+        ["11"]
+    );
+    let e = cl_cmd(&mut job, format!("DLTJRNRCV JRNRCV({lib}/RCV0002)"))
+        .await
+        .unwrap_err();
+    assert!(e.contains("attached"), "{e}");
+    cl_cmd(&mut job, format!("DLTJRNRCV JRNRCV({lib}/RCV0001)"))
+        .await
+        .unwrap();
+    assert_eq!(
+        sql_rows(&client, &url, &lib, &format!("SELECT COUNT(*) FROM {all}")).await,
+        ["1"]
+    );
+    // Ending journaling: F EJ, and changes are no longer journaled.
+    cl_cmd(&mut job, format!("ENDJRNPF FILE({lib}/ITEMS)"))
+        .await
+        .unwrap();
+    cl_cmd(&mut job, sql(format!("DELETE FROM {lib}.ITEMS")))
+        .await
+        .unwrap();
+    assert_eq!(
+        sql_rows(
+            &client,
+            &url,
+            &lib,
+            &format!(
+                "SELECT JOURNAL_CODE || JOURNAL_ENTRY_TYPE FROM {dj} ORDER BY SEQUENCE_NUMBER"
+            )
+        )
+        .await,
+        ["RDL", "FEJ"]
+    );
+    let d = cl_cmd(&mut job, format!("DSPJRN JRN({lib}/JRN)"))
+        .await
+        .unwrap();
+    assert!(d[0].contains("ITEMS"), "{d:?}");
+}
+
+/// Trigger programs (CL reference: ADDPFTRG, RMVPFTRG; Db2 for i "Trigger
+/// buffer sections"): the program gets the trigger buffer and its length.
+/// Event '1' insert, '3' update; time '1' after; commit lock level '0'
+/// without commitment control; the new record image at the new record
+/// offset, in the file's format (an EXTNAME data structure BASED on a
+/// pointer to it reads it, with PREFIX names). It runs for SQL and for
+/// record-level access. A trigger program that ends in error undoes the
+/// change: SQL0443 for an SQL statement, file status 01024 (error in the
+/// trigger program after the operation) for an RPG UPDATE. RMVPFTRG
+/// removes it. ILE RPG: OPEN of a USROPN file.
+#[tokio::test]
+async fn trigger_programs_addpftrg() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let sql = |s: String| format!("RUNSQL SQL('{}') COMMIT(*NONE)", s.replace('\'', "''"));
+    for c in [
+        sql(format!("CREATE TABLE {lib}.ORD (ORDNO DECIMAL(7, 0) NOT NULL, STS CHAR(1)) RCDFMT ORDR")),
+        sql(format!("CREATE TABLE {lib}.AUD (ORDNO DECIMAL(7, 0), ACT CHAR(2), CMT CHAR(1), LEN INTEGER, OLDSTS CHAR(1)) RCDFMT AUDR")),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    source::create_file(&client, &lib, "QRPGLESRC", "")
+        .await
+        .unwrap();
+    let put = |name: &str, src: &str| source::Member {
+        library: lib.clone(),
+        file: "QRPGLESRC".into(),
+        name: name.into(),
+        srctype: "RPGLE".into(),
+        text: String::new(),
+        source: src.into(),
+    };
+    let trg = "**FREE
+ctl-opt dftactgrp(*no) actgrp(*caller);
+dcl-f AUD usage(*output) usropn;
+dcl-ds TrgBufT qualified template;
+  File char(10) pos(1);
+  Lib char(10) pos(11);
+  Event char(1) pos(31);
+  Time char(1) pos(32);
+  Cmt char(1) pos(33);
+  OldOff int(10) pos(49);
+  NewOff int(10) pos(65);
+end-ds;
+dcl-pi *n;
+  pBuf likeds(TrgBufT);
+  pLen int(10);
+end-pi;
+dcl-ds NewRec extname('ORD') prefix(N_) based(pNew) end-ds;
+dcl-ds OldRec extname('ORD') prefix(O_) based(pOld) end-ds;
+dcl-pr SndPgmMsg extpgm('QMHSNDPM');
+  id char(7) const; f char(20) const; d char(40) const; l int(10) const;
+  t char(10) const; e char(10) const; c int(10) const; k char(4); err char(8);
+end-pr;
+dcl-s key char(4);
+dcl-s err char(8) inz(*allx'00');
+pNew = %addr(pBuf) + pBuf.NewOff;
+if pBuf.Event = '3' and N_STS = 'X';
+  SndPgmMsg('CPF9898': 'QCPFMSG   *LIBL': 'X is not allowed': 16: '*ESCAPE': '*PGMBDY': 1: key: err);
+endif;
+ORDNO = N_ORDNO;
+ACT = pBuf.Event + pBuf.Time;
+CMT = pBuf.Cmt;
+LEN = pLen;
+OLDSTS = ' ';
+if pBuf.Event = '3';
+  pOld = %addr(pBuf) + pBuf.OldOff;
+  OLDSTS = O_STS;
+endif;
+open AUD;
+write AUDR;
+close AUD;
+*inlr = *on;
+";
+    let upd = "**FREE
+dcl-f ORD usage(*update);
+read ORDR;
+STS = 'X';
+update(e) ORDR;
+dsply %char(%status(ORD));
+*inlr = *on;
+";
+    for m in [put("TRG", trg), put("UPD", upd)] {
+        source::put_member(&client, &m, false).await.unwrap();
+    }
+    for c in [
+        format!("CRTBNDRPG PGM({lib}/TRG)"),
+        format!("CRTBNDRPG PGM({lib}/UPD)"),
+        format!("ADDPFTRG FILE({lib}/ORD) TRGTIME(*AFTER) TRGEVENT(*INSERT) PGM({lib}/TRG)"),
+        format!("ADDPFTRG FILE({lib}/ORD) TRGTIME(*AFTER) TRGEVENT(*UPDATE) PGM({lib}/TRG)"),
+        sql(format!("INSERT INTO {lib}.ORD VALUES (101, 'O')")),
+        sql(format!("UPDATE {lib}.ORD SET STS = 'S'")),
+    ] {
+        cl_cmd(&mut job, c.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    let e = cl_cmd(
+        &mut job,
+        format!("ADDPFTRG FILE({lib}/ORD) TRGTIME(*AFTER) TRGEVENT(*INSERT) PGM({lib}/TRG)"),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("already"), "{e}");
+    let rows = sql_rows(
+        &client,
+        &url,
+        &lib,
+        &format!("SELECT ORDNO, ACT, CMT, OLDSTS FROM {lib}.AUD ORDER BY ACT"),
+    )
+    .await;
+    assert_eq!(rows, ["101|11|0|", "101|31|0|O"]);
+    let len: i64 = sql_rows(
+        &client,
+        &url,
+        &lib,
+        &format!("SELECT MIN(LEN) FROM {lib}.AUD"),
+    )
+    .await[0]
+        .parse()
+        .unwrap();
+    assert!(
+        len > 96,
+        "the buffer is the 96-byte static part and the images: {len}"
+    );
+    // Refused by the trigger program: the change is undone.
+    let e = cl_cmd(&mut job, sql(format!("UPDATE {lib}.ORD SET STS = 'X'")))
+        .await
+        .unwrap_err();
+    assert!(
+        e.contains("SQL0443") && e.contains("X is not allowed"),
+        "{e}"
+    );
+    assert_eq!(
+        sql_rows(&client, &url, &lib, &format!("SELECT STS FROM {lib}.ORD")).await,
+        ["S"]
+    );
+    assert_eq!(
+        cl_cmd(&mut job, format!("CALL PGM({lib}/UPD)"))
+            .await
+            .unwrap(),
+        ["DSPLY  1024"]
+    );
+    assert_eq!(
+        sql_rows(&client, &url, &lib, &format!("SELECT STS FROM {lib}.ORD")).await,
+        ["S"]
+    );
+    assert_eq!(
+        sql_rows(
+            &client,
+            &url,
+            &lib,
+            &format!("SELECT COUNT(*) FROM {lib}.AUD")
+        )
+        .await,
+        ["2"]
+    );
+    // Removed: changes no longer call it.
+    cl_cmd(&mut job, format!("RMVPFTRG FILE({lib}/ORD)"))
+        .await
+        .unwrap();
+    cl_cmd(&mut job, sql(format!("UPDATE {lib}.ORD SET STS = 'X'")))
+        .await
+        .unwrap();
+    assert_eq!(
+        sql_rows(
+            &client,
+            &url,
+            &lib,
+            &format!("SELECT COUNT(*) FROM {lib}.AUD")
+        )
+        .await,
+        ["2"]
+    );
+}

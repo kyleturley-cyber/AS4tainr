@@ -578,6 +578,117 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
                 i += 1;
                 continue;
             }
+            // TIME(expression) (Db2 for i SQL Reference, TIME): the
+            // time of a timestamp or time; TIME(6) as a data type stays.
+            Some("TIME")
+                if next_non_space(&toks, i + 1)
+                    .is_some_and(|o| toks[o] == Tok::Punct("(".into()))
+                    && {
+                        let o = next_non_space(&toks, i + 1).unwrap();
+                        !matches!(
+                            (next_non_space(&toks, o + 1).map(|j| &toks[j]), next_non_space(&toks, o + 1).and_then(|j| next_non_space(&toks, j + 1)).map(|j| &toks[j])),
+                            (Some(Tok::Number(_)), Some(Tok::Punct(p))) if p == ")"
+                        )
+                    } =>
+            {
+                let o = next_non_space(&toks, i + 1).unwrap();
+                let mut depth = 0i32;
+                let close = (o..toks.len()).find(|&j| {
+                    match &toks[j] {
+                        Tok::Punct(p) if p == "(" => depth += 1,
+                        Tok::Punct(p) if p == ")" => depth -= 1,
+                        _ => {}
+                    }
+                    depth == 0
+                });
+                if let Some(c) = close {
+                    out.push(Tok::Punct("CAST((".into()));
+                    close_with.push((c, ") AS time(0))".into()));
+                    i = o + 1;
+                    continue;
+                }
+            }
+            // INTERPRET(bytes AS type) (Db2 for i SQL Reference): bytes
+            // read as the type's internal form (packed, zoned, binary,
+            // EBCDIC characters).
+            Some("INTERPRET")
+                if next_non_space(&toks, i + 1)
+                    .is_some_and(|o| toks[o] == Tok::Punct("(".into())) =>
+            {
+                let o = next_non_space(&toks, i + 1).unwrap();
+                let mut depth = 0i32;
+                let mut as_at = None;
+                let close = (o..toks.len()).find(|&j| {
+                    match &toks[j] {
+                        Tok::Punct(p) if p == "(" => depth += 1,
+                        Tok::Punct(p) if p == ")" => depth -= 1,
+                        t if depth == 1 && word(t).as_deref() == Some("AS") => as_at = Some(j),
+                        _ => {}
+                    }
+                    depth == 0
+                });
+                let (Some(c), Some(a)) = (close, as_at) else {
+                    bail!("SQL0104: INTERPRET needs (expression AS data type).");
+                };
+                let ty: Vec<&Tok> = toks[a + 1..c]
+                    .iter()
+                    .filter(|t| !matches!(t, Tok::Space(_)))
+                    .collect();
+                let name = ty.first().and_then(|t| word(t)).unwrap_or_default();
+                let nums: Vec<u32> = ty
+                    .iter()
+                    .filter_map(|t| match t {
+                        Tok::Number(n) => n.parse().ok(),
+                        _ => None,
+                    })
+                    .collect();
+                let n0 = nums.first().copied();
+                let n1 = nums.get(1).copied().unwrap_or(0);
+                let (code, p, sc, pg) = match name.as_str() {
+                    "DECIMAL" | "DEC" => {
+                        let p = n0.unwrap_or(5);
+                        ("P", p, n1, format!("numeric({p},{n1})"))
+                    }
+                    "NUMERIC" => {
+                        let p = n0.unwrap_or(5);
+                        ("S", p, n1, format!("numeric({p},{n1})"))
+                    }
+                    "SMALLINT" => ("B", 2, 0, "smallint".to_string()),
+                    "INTEGER" | "INT" => ("B", 4, 0, "integer".to_string()),
+                    "BIGINT" => ("B", 8, 0, "bigint".to_string()),
+                    "CHAR" | "CHARACTER" => {
+                        let n = n0.unwrap_or(1);
+                        ("A", n, 0, format!("char({n})"))
+                    }
+                    "VARCHAR" => {
+                        let n = n0.unwrap_or(1);
+                        ("V", n, 0, format!("varchar({n})"))
+                    }
+                    "BINARY" | "VARBINARY" => ("", 0, 0, "bytea".to_string()),
+                    other => bail!("SQL0084: INTERPRET AS {other} is not supported yet."),
+                };
+                if code.is_empty() {
+                    out.push(Tok::Punct("CAST((".into()));
+                    close_with.push((a, ") AS bytea)".into()));
+                } else {
+                    out.push(Tok::Punct("CAST(as4tainr_svc.interpret((".into()));
+                    close_with.push((a, format!("), '{code}', {p}, {sc}) AS {pg})")));
+                }
+                skip_close.extend(a + 1..=c);
+                i = o + 1;
+                continue;
+            }
+            Some(f @ ("HEX" | "SUBSTR"))
+                if next_non_space(&toks, i + 1)
+                    .is_some_and(|o| toks[o] == Tok::Punct("(".into())) =>
+            {
+                out.push(Tok::Word(format!(
+                    "as4tainr_svc.{}",
+                    f.to_ascii_lowercase()
+                )));
+                i += 1;
+                continue;
+            }
             Some("UCASE") => {
                 out.push(Tok::Word("UPPER".into()));
                 i += 1;
@@ -970,12 +1081,32 @@ pub async fn run_as(
     let sql_client = connect_as_sql_role(client, database_url).await?;
     sql_client.batch_execute(&context).await?;
     sql_client.batch_execute("BEGIN").await?;
-    let result = run_in_transaction(&sql_client, &t, &text, &path).await;
+    let mut result = run_in_transaction(&sql_client, &t, &text, &path).await;
+    // Trigger programs (ADDPFTRG) for the changes, before they are
+    // committed; one that fails undoes the statement (SQL0443).
+    if result.is_ok() && t.kind != Kind::Query {
+        let who = crate::pftrg::Caller {
+            database_url,
+            libl: libl.to_vec(),
+            user: user.to_string(),
+            job: job.clone(),
+            curlib: curlib.clone(),
+        };
+        if let Err(e) = crate::pftrg::fire(&sql_client, client, &who).await {
+            result = Err(trigger_failed(e));
+        }
+    }
     match &result {
         Ok(_) => sql_client.batch_execute("COMMIT").await?,
         Err(_) => sql_client.batch_execute("ROLLBACK").await?,
     }
     result
+}
+
+/// A trigger program failed: SQL0443 for the statement (Db2 for i: a
+/// trigger program or external routine detected an error).
+fn trigger_failed(e: anyhow::Error) -> anyhow::Error {
+    anyhow!("SQL0443: Trigger program detected an error: {e:#}")
 }
 
 async fn run_in_transaction(
@@ -1224,7 +1355,7 @@ mod tests {
         // DB2: VALUES with a list of expressions gives one row per expression.
         assert_eq!(
             tr("values 1, (2), substr('ab', 1, 1)").sql,
-            "values (1), ((2)), (substr('ab', 1, 1))"
+            "values (1), ((2)), (as4tainr_svc.substr('ab', 1, 1))"
         );
         assert_eq!(tr("values (1, 2)").sql, "values (1, 2)");
         assert_eq!(tr("select a concat b from t").sql, "select a || b from t");
@@ -1323,6 +1454,9 @@ pub struct Session {
     libl: Vec<String>,
     /// The job it runs for: (user, current library, job).
     context: Option<(String, Option<String>, Option<String>)>,
+    /// The program running the statements (journal entries name it).
+    program: Option<(String, String)>,
+    database_url: String,
 }
 
 impl Session {
@@ -1338,6 +1472,18 @@ impl Session {
             .batch_execute(&context_sql(user, curlib.as_deref(), job.as_deref()))
             .await?;
         self.context = Some((user.to_string(), curlib, job));
+        Ok(())
+    }
+
+    /// The program the statements run for: its name and library.
+    pub async fn set_program(&mut self, name: &str, library: &str) -> Result<()> {
+        self.client
+            .execute(
+                "SELECT set_config('as4tainr.program', $1, false), set_config('as4tainr.program_lib', $2, false)",
+                &[&name, &library],
+            )
+            .await?;
+        self.program = Some((name.to_string(), library.to_string()));
         Ok(())
     }
 
@@ -1374,6 +1520,8 @@ impl Session {
             .await?;
         Ok(Session {
             context: None,
+            program: None,
+            database_url: database_url.to_string(),
             client: sql_client,
             cmt: None,
             libraries: catalog::list_libraries(client).await?,
@@ -1405,7 +1553,23 @@ impl Session {
         // savepoint, so that a statement that fails takes back only its
         // own changes.
         let Some(d) = &self.cmt else {
-            return self.exec_on(&self.client, &t, text).await;
+            if t.kind == Kind::Query {
+                return self.exec_on(&self.client, &t, text).await;
+            }
+            // A change: committed when its trigger programs (if any) end
+            // normally.
+            self.client.batch_execute("BEGIN").await?;
+            let mut r = self.exec_on(&self.client, &t, text).await;
+            if r.is_ok() {
+                if let Err(e) = self.fire_triggers(&self.client, catalog_client).await {
+                    r = Err(trigger_failed(e));
+                }
+            }
+            match &r {
+                Ok(_) => self.client.batch_execute("COMMIT").await?,
+                Err(_) => self.client.batch_execute("ROLLBACK").await?,
+            }
+            return r;
         };
         let path: Vec<String> = self.libl.iter().map(|l| ident(l)).collect();
         d.client
@@ -1423,7 +1587,20 @@ impl Session {
                 .batch_execute(&context_sql_in(u, c.as_deref(), j.as_deref(), true))
                 .await?;
         }
-        let r = self.exec_on(&d.client, &t, text).await;
+        if let Some((n, l)) = &self.program {
+            d.client
+                .execute(
+                    "SELECT set_config('as4tainr.program', $1, true), set_config('as4tainr.program_lib', $2, true)",
+                    &[n, l],
+                )
+                .await?;
+        }
+        let mut r = self.exec_on(&d.client, &t, text).await;
+        if r.is_ok() && t.kind != Kind::Query {
+            if let Err(e) = self.fire_triggers(&d.client, catalog_client).await {
+                r = Err(trigger_failed(e));
+            }
+        }
         match &r {
             Ok(_) => {
                 d.client
@@ -1437,6 +1614,22 @@ impl Session {
             }
         }
         r
+    }
+
+    /// Call the trigger programs for the changes the statement made.
+    async fn fire_triggers(&self, client: &Client, catalog: &Client) -> Result<()> {
+        let (user, curlib, job) = match &self.context {
+            Some((u, c, j)) => (u.clone(), c.clone(), j.clone()),
+            None => ("QSECOFR".to_string(), None, None),
+        };
+        let who = crate::pftrg::Caller {
+            database_url: &self.database_url,
+            libl: self.libl.clone(),
+            user,
+            job,
+            curlib,
+        };
+        crate::pftrg::fire(client, catalog, &who).await
     }
 
     async fn exec_on(&self, client: &Client, t: &Translated, text: String) -> Result<Exec> {

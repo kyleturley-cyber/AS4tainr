@@ -128,6 +128,12 @@ impl Job<'_> {
         if let Some(o) = self.ifs_command(&cmd).await? {
             return Ok(o);
         }
+        if let Some(o) = self.journal_command(&cmd).await? {
+            return Ok(o);
+        }
+        if let Some(o) = self.pftrg_command(&cmd).await? {
+            return Ok(o);
+        }
         match cmd.def.name {
             "CRTLIB" => self.crtlib(&cmd).await,
             "DSPLIB" => self.dsplib(&cmd).await,
@@ -1438,7 +1444,7 @@ impl Job<'_> {
 
     /// A qualified name to create: LIB/NAME, *CURLIB/NAME or NAME (the
     /// current library).
-    fn create_target(&self, q: &str) -> (String, String) {
+    pub(crate) fn create_target(&self, q: &str) -> (String, String) {
         match q.split_once('/') {
             Some(("*CURLIB", n)) => (self.current_library(), n.to_string()),
             Some((l, n)) => (l.to_string(), n.to_string()),
@@ -1447,7 +1453,7 @@ impl Job<'_> {
     }
 
     /// The libraries a qualified name is looked for in, and the name.
-    fn search(&self, q: &str) -> (Vec<String>, String) {
+    pub(crate) fn search(&self, q: &str) -> (Vec<String>, String) {
         match q.split_once('/') {
             Some(("*LIBL", n)) => (self.library_list(), n.to_string()),
             Some(("*CURLIB", n)) => (vec![self.current_library()], n.to_string()),

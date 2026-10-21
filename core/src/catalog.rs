@@ -249,6 +249,14 @@ pub async fn init(client: &Client) -> Result<()> {
             .batch_execute(crate::spool::DDL)
             .await
             .context("creating catalog")?;
+        client
+            .batch_execute(crate::journal::DDL)
+            .await
+            .context("creating catalog")?;
+        client
+            .batch_execute(crate::pftrg::DDL)
+            .await
+            .context("creating catalog")?;
         for (lib, text) in SYSTEM_LIBRARIES {
             create_library(client, lib, text).await?;
             // Catalogs made by older versions gave every one the same text.
@@ -1254,6 +1262,22 @@ pub async fn delete_file(
             (None, _) => {
                 tx.batch_execute(&format!("DROP TABLE IF EXISTS {qualified} CASCADE"))
                     .await?;
+                // A journaled file: journaling ends with it (F EJ).
+                if let Some(j) = tx
+                    .query_opt(
+                        "DELETE FROM as4tainr.journaled_files WHERE library=$1 AND file=$2 RETURNING journal_lib, journal",
+                        &[l, n],
+                    )
+                    .await?
+                {
+                    let (jl, jn): (String, String) = (j.get(0), j.get(1));
+                    let obj = format!("{n:<10}{l:<10}{n:<10}");
+                    tx.execute(
+                        "SELECT as4tainr_svc.journal_entry($1, $2, 'F', 'EJ', 0, NULL, NULL, $3, '*QDDS')",
+                        &[&jl, &jn, &obj],
+                    )
+                    .await?;
+                }
             }
         }
         for table in ["files", "logical_files", "display_files", "printer_files"] {

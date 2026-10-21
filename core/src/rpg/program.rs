@@ -1194,6 +1194,21 @@ impl Binder<'_> {
             // ALIAS: the subfields have the fields' alternative (SQL)
             // names where they have one (ILE RPG Reference, ALIAS).
             let alias = keyword(&d.keywords, "ALIAS").is_some();
+            // PREFIX(prefix [: n]) (ILE RPG Reference, PREFIX): the
+            // prefix put in front of each name, in place of its first n
+            // characters.
+            let prefix = keyword(&d.keywords, "PREFIX").map(|k| {
+                (
+                    k.args
+                        .first()
+                        .map(|p| p.trim().trim_matches('\'').to_ascii_uppercase())
+                        .unwrap_or_default(),
+                    k.args
+                        .get(1)
+                        .and_then(|n| n.trim().parse::<usize>().ok())
+                        .unwrap_or(0),
+                )
+            });
             for fd in &fr.file.fields {
                 let Some(t) = program_type(fd, true, self.extbinint) else {
                     continue;
@@ -1201,6 +1216,10 @@ impl Binder<'_> {
                 let n = match (&fd.alias, alias) {
                     (Some(a), true) => a.clone(),
                     _ => fd.name.clone(),
+                };
+                let n = match &prefix {
+                    Some((p, k)) => format!("{p}{}", n.chars().skip(*k).collect::<String>()),
+                    None => n,
                 };
                 subs.push((n, t, next, 0, d));
                 next += t.size();

@@ -64,6 +64,10 @@ pub(super) fn status_code(err: &anyhow::Error) -> u32 {
         "CPF5026" => 1021,
         // Check and referential constraints: 01022.
         "CPF502F" | "CPF502D" => 1022,
+        // Error in a trigger program (ILE RPG Reference, file status
+        // codes): 01023 before the operation, 01024 after it.
+        "CPF502B" if text.contains("(before the change)") => 1023,
+        "CPF502B" => 1024,
         "CPF5013" if text.contains("requires a prior") => 1221,
         // Data area not found.
         "CPF1015" => 401,

@@ -68,12 +68,38 @@ fn isolation(lcklvl: &str) -> &'static str {
 
 impl Definition {
     async fn begin(&self) -> Result<()> {
+        // as4tainr.cmt: journaled changes belong to a commit cycle.
         self.client
             .batch_execute(&format!(
-                "BEGIN ISOLATION LEVEL {}",
+                "BEGIN ISOLATION LEVEL {}; SELECT set_config('as4tainr.cmt', '1', true)",
                 isolation(&self.lcklvl)
             ))
             .await?;
+        Ok(())
+    }
+
+    /// ROLLBACK, and the journals' C RB entries for the commit cycles it
+    /// ends.
+    async fn roll_back(&self) -> Result<()> {
+        let open = self
+            .client
+            .query(
+                "SELECT jid, cycle::text FROM as4tainr_svc.open_cycles()",
+                &[],
+            )
+            .await
+            .unwrap_or_default();
+        self.client.batch_execute("ROLLBACK").await?;
+        if !open.is_empty() {
+            let ids: Vec<i32> = open.iter().map(|r| r.get(0)).collect();
+            let cycles: Vec<String> = open.iter().map(|r| r.get(1)).collect();
+            self.client
+                .execute(
+                    "SELECT as4tainr_svc.journal_rolled_back($1, $2::text[]::numeric[])",
+                    &[&ids, &cycles],
+                )
+                .await?;
+        }
         Ok(())
     }
 
@@ -89,6 +115,10 @@ impl Definition {
     /// COMMIT: the pending changes become permanent; a new unit of work
     /// starts.
     pub async fn commit(&self) -> Result<()> {
+        // The journals' C CM entries for the commit cycles it ends.
+        self.client
+            .batch_execute("SELECT as4tainr_svc.journal_commit()")
+            .await?;
         self.client.batch_execute("COMMIT").await?;
         self.changes.store(0, Ordering::Relaxed);
         self.begin().await
@@ -96,7 +126,7 @@ impl Definition {
 
     /// ROLLBACK: the pending changes are removed.
     pub async fn rollback(&self) -> Result<()> {
-        self.client.batch_execute("ROLLBACK").await?;
+        self.roll_back().await?;
         self.changes.store(0, Ordering::Relaxed);
         self.begin().await
     }
@@ -163,7 +193,7 @@ pub async fn end(job: &str, actgrp: &str) -> Result<u64> {
         bail!("CPF8350: Commitment definition not found.");
     };
     let n = d.pending();
-    let _ = d.client.batch_execute("ROLLBACK").await;
+    let _ = d.roll_back().await;
     Ok(n)
 }
 
@@ -174,6 +204,6 @@ pub async fn end_job(job: &str) {
         keys.into_iter().filter_map(|k| m.remove(&k)).collect()
     });
     for d in ds {
-        let _ = d.client.batch_execute("ROLLBACK").await;
+        let _ = d.roll_back().await;
     }
 }

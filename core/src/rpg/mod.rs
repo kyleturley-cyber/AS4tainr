@@ -276,6 +276,61 @@ pub async fn call_with(
     code: ProgramCode,
     args: Vec<String>,
 ) -> Result<CallResult> {
+    call_any(
+        database_url,
+        libl,
+        user,
+        job,
+        display,
+        cl,
+        name,
+        code,
+        Ok(args),
+    )
+    .await
+    .map(|r| r.0)
+}
+
+/// A program object called with parameters as bytes (passed by
+/// reference, as the database passes a trigger program its buffer):
+/// the result and the parameters as the program left them.
+#[allow(clippy::too_many_arguments)]
+pub async fn call_bytes(
+    database_url: &str,
+    libl: Vec<String>,
+    user: String,
+    job: Option<String>,
+    cl: Option<ClContext>,
+    name: String,
+    code: ProgramCode,
+    parms: Vec<Vec<u8>>,
+) -> Result<(CallResult, Vec<Vec<u8>>)> {
+    call_any(
+        database_url,
+        libl,
+        user,
+        job,
+        None,
+        cl,
+        name,
+        code,
+        Err(parms),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn call_any(
+    database_url: &str,
+    libl: Vec<String>,
+    user: String,
+    job: Option<String>,
+    display: Option<crate::runtime::DisplayHandle>,
+    cl: Option<ClContext>,
+    name: String,
+    code: ProgramCode,
+    args: std::result::Result<Vec<String>, Vec<Vec<u8>>>,
+) -> Result<(CallResult, Vec<Vec<u8>>)> {
     let ProgramCode {
         library,
         source,
@@ -284,12 +339,18 @@ pub async fn call_with(
     } = code;
     let rt = tokio::runtime::Handle::current();
     let url = database_url.to_string();
-    tokio::task::spawn_blocking(move || -> Result<CallResult> {
+    tokio::task::spawn_blocking(move || -> Result<(CallResult, Vec<Vec<u8>>)> {
         let client = rt.block_on(crate::runtime::connect_db(&url))?;
         rt.block_on(crate::runtime::job_session(
             &client,
             job.as_deref(),
             crate::runtime::default_record_wait(),
+        ))?;
+        // The program, for the journal entries of its changes.
+        rt.block_on(client.execute(
+            "SELECT set_config('as4tainr.program', $1, false), set_config('as4tainr.program_lib', $2, false),
+                    set_config('as4tainr.user', $3, false)",
+            &[&name.to_ascii_uppercase(), &library.clone().unwrap_or_default(), &user],
         ))?;
         // The job number of "000123/USER/NAME".
         let job_number = job
@@ -336,13 +397,22 @@ pub async fn call_with(
                 shared: Default::default(),
             },
         );
-        let r = m.run(&args);
-        Ok(CallResult {
-            messages: std::mem::take(&mut m.messages),
-            printed: std::mem::take(&mut m.printed),
-            error: r.err(),
-            params: std::mem::take(&mut m.returned),
-        })
+        let (r, bytes) = match args {
+            Ok(args) => (m.run(&args), Vec::new()),
+            Err(mut parms) => {
+                let r = m.run_bytes(&mut parms);
+                (r, parms)
+            }
+        };
+        Ok((
+            CallResult {
+                messages: std::mem::take(&mut m.messages),
+                printed: std::mem::take(&mut m.printed),
+                error: r.err(),
+                params: std::mem::take(&mut m.returned),
+            },
+            bytes,
+        ))
     })
     .await?
 }

@@ -103,6 +103,7 @@ What R3 adds:
 
 What R2 adds:
 - **Display files** (externally described WORKSTN): the record formats' fields become program fields (numbers zoned); EXFMT, WRITE, READC; subfiles with `SFILE(format:rrn)`: WRITE, CHAIN and UPDATE by relative record number; `INDDS`; response indicators; `*INKA`-`*INKY` from the function key pressed. The display work itself (overlay, paging, validation) is the same code Jariko used (`workstn.rs`, `dspf.rs`).
+- **Externally described data structures:** EXTNAME with PREFIX (`PREFIX(N_)`, `PREFIX(X:2)` in place of the first two characters), as trigger programs use for the record images; an entry parameter is the caller's storage, so a pointer from %ADDR reaches past its declared length (the trigger buffer). OPEN and CLOSE of USROPN files.
 - **Data areas:** `*DTAARA DEFINE`, the `DTAARA` keyword (`DTAARA(*VAR : field)`: the name the field holds when the program runs), `IN` (with `*LOCK`), `OUT`, `IN *DTAARA`. `INZ(*USER)`: the job's user profile.
 - **Record locks:** the job's database session is named after the job and waits WAITRCD for a locked record, positions 73-74 (or `(E)`) catch the error.
 

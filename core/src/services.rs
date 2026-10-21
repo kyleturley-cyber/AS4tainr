@@ -19,7 +19,7 @@ use tokio_postgres::Client;
 use crate::sql::SQL_ROLE;
 
 /// The services' version: change it whenever a definition below changes.
-const VERSION: &str = "as4tainr services 5";
+const VERSION: &str = "as4tainr services 6";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -465,9 +465,11 @@ pub async fn init(client: &Client) -> Result<()> {
                    qsys2.sysindexes, qsys2.syskeys, qsys2.sysviews TO {SQL_ROLE};
              GRANT EXECUTE ON FUNCTION qsys2.object_statistics(varchar, varchar, varchar) TO {SQL_ROLE};
              {}
+             {}
              COMMENT ON SCHEMA as4tainr_svc IS '{VERSION}';",
             object_statistics(),
-            work_services()
+            work_services(),
+            crate::journal::sql_functions() + &crate::pftrg::sql_functions()
         ))
         .await
         .context("creating the QSYS2 services")?;

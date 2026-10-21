@@ -668,7 +668,7 @@ impl Program {
 /// With EXTBININT(*YES), binary fields with no decimal places are
 /// integers (5, 10 or 20 digits). Large objects have no program type
 /// (None): the program's record leaves them out (RNF7575).
-fn program_type(f: &crate::dds::FieldDef, in_ds: bool, extbinint: bool) -> Option<DType> {
+pub fn program_type(f: &crate::dds::FieldDef, in_ds: bool, extbinint: bool) -> Option<DType> {
     Some(match f.data_type {
         DataType::Char if f.varlen => DType::Varchar(f.length),
         DataType::Char => DType::Char(f.length),

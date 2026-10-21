@@ -285,7 +285,7 @@ impl Machine<'_> {
         if self.ahead[i].is_some() || self.cycle_eof[i] {
             return Ok(());
         }
-        let client = self.io.client;
+        let client = self.io.data.unwrap_or(self.io.client);
         let job = self.io.job_number;
         let lock = self.prog.files[i].decl.usage == 'U';
         let rt = self.io.rt.clone();
@@ -726,23 +726,19 @@ impl Machine<'_> {
                 rec
             }
         };
-        let rt = self.io.rt.clone();
-        let f = self.files[i]
-            .open
-            .as_mut()
-            .ok_or_else(|| anyhow!("CPF4135: File {} is not open.", r.file))?;
-        if r.del {
-            rt.block_on(async {
-                f.delete(client).await?;
-                f.release(client).await
-            })?;
+        if self.files[i].open.is_none() {
+            bail!("CPF4135: File {} is not open.", r.file);
+        }
+        let op = if r.del {
+            crate::rpg::interp::FileOp::Delete
         } else if r.add {
-            rt.block_on(f.write(client, &rec))?;
+            crate::rpg::interp::FileOp::Write
         } else {
-            rt.block_on(async {
-                f.update(client, &rec).await?;
-                f.release(client).await
-            })?;
+            crate::rpg::interp::FileOp::Update
+        };
+        self.record_change(i, op, &rec, &None)?;
+        if let Some(d) = &self.files[i].cmt {
+            d.changed();
         }
         Ok(())
     }

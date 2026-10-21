@@ -245,6 +245,10 @@ DECLARE
   obj text := rpad(TG_ARGV[4], 10) || rpad(TG_ARGV[3], 10) || rpad(TG_ARGV[4], 10);
   img record;
 BEGIN
+  -- A change made on trial, for *BEFORE trigger programs, is not one;
+  -- changes APYJRNCHG and RMVJRNCHG make are journaled as F AY and RC.
+  IF current_setting('as4tainr.pftrg_trial', true) = '1'
+     OR current_setting('as4tainr.apply', true) = '1' THEN RETURN NULL; END IF;
   IF TG_OP = 'INSERT' THEN
     SELECT * INTO img FROM as4tainr_svc.record_image(TG_ARGV[3], TG_ARGV[4], to_jsonb(NEW));
     PERFORM as4tainr_svc.journal_entry(TG_ARGV[0], TG_ARGV[1], 'R', 'PT', (to_jsonb(NEW) ->> 'rrn')::bigint,
@@ -322,12 +326,109 @@ BEGIN
   END LOOP;
 END $as4tainr$;
 
+-- The entries of the commit cycles open in this transaction (before a
+-- rollback): JSON for journal_restore.
+CREATE OR REPLACE FUNCTION as4tainr_svc.journal_hold() RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $as4tainr$
+DECLARE
+  res jsonb := '[]'::jsonb;
+  c record;
+  j record;
+BEGIN
+  FOR c IN SELECT * FROM as4tainr_svc.open_cycles() LOOP
+    SELECT library, name INTO j FROM as4tainr.journals WHERE jid = c.jid;
+    IF FOUND THEN
+      res := res || coalesce((SELECT jsonb_agg(to_jsonb(e) ORDER BY e.seq) FROM as4tainr.journal_entries e
+          WHERE e.journal_lib = j.library AND e.journal = j.name AND e.commit_cycle = c.cycle), '[]'::jsonb);
+    END IF;
+  END LOOP;
+  IF res = '[]'::jsonb THEN RETURN NULL; END IF;
+  RETURN jsonb_build_object('cycles', current_setting('as4tainr.cycles', true), 'entries', res);
+END $as4tainr$;
+
+-- After a rollback (whole: the transaction; otherwise to a savepoint):
+-- the entries it took back are in the journal again, as on IBM i (an
+-- entry is written when the change is made), and each record change it
+-- undid is journaled, newest first (Journal code R: DR, record deleted
+-- for rollback, for an added record; BR and UR, before- and after-image
+-- of a record updated for rollback, for an updated record (BR when the
+-- journal has before-images); UR for a deleted record put back).
+CREATE OR REPLACE FUNCTION as4tainr_svc.journal_restore(held jsonb, whole boolean) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $as4tainr$
+DECLARE
+  e as4tainr.journal_entries;
+  prev as4tainr.journal_entries;
+  lost as4tainr.journal_entries[] := '{{}}';
+  all_e as4tainr.journal_entries[];
+  img record;
+  id int;
+  r jsonb;
+  l text;
+  f text;
+  d bytea;
+  nl text;
+BEGIN
+  IF held IS NULL THEN RETURN; END IF;
+  SELECT array_agg(x ORDER BY x.seq) INTO all_e
+    FROM jsonb_populate_recordset(NULL::as4tainr.journal_entries, held -> 'entries') x;
+  FOREACH e IN ARRAY coalesce(all_e, '{{}}') LOOP
+    IF NOT EXISTS (SELECT 1 FROM as4tainr.journal_entries
+                    WHERE journal_lib = e.journal_lib AND journal = e.journal AND seq = e.seq) THEN
+      INSERT INTO as4tainr.journal_entries VALUES (e.*);
+      lost := lost || e;
+    END IF;
+  END LOOP;
+  IF cardinality(lost) = 0 THEN RETURN; END IF;
+  IF NOT whole THEN
+    PERFORM set_config('as4tainr.cycles', coalesce(held ->> 'cycles', ''), true);
+  END IF;
+  PERFORM set_config('as4tainr.cmt', '1', true);
+  FOR i IN REVERSE cardinality(lost)..1 LOOP
+    e := lost[i];
+    SELECT jid INTO id FROM as4tainr.journals WHERE library = e.journal_lib AND name = e.journal;
+    PERFORM set_config('as4tainr.cc_' || id, e.commit_cycle::text, true);
+    CONTINUE WHEN e.code <> 'R' OR e.type NOT IN ('PT', 'PX', 'UP', 'DL');
+    IF e.type IN ('PT', 'PX') THEN
+      PERFORM as4tainr_svc.journal_entry(e.journal_lib, e.journal, 'R', 'DR', e.count_rrn,
+          e.entry_data, e.null_ind, e.object, e.object_type);
+    ELSIF e.type = 'DL' THEN
+      PERFORM as4tainr_svc.journal_entry(e.journal_lib, e.journal, 'R', 'UR', e.count_rrn,
+          e.entry_data, e.null_ind, e.object, e.object_type);
+    ELSE
+      -- The record as it was before the update: its before-image, the
+      -- entry before for it, or (no such entry) the record now.
+      SELECT * INTO prev FROM unnest(all_e) x
+       WHERE x.object = e.object AND x.count_rrn = e.count_rrn AND x.seq < e.seq AND x.code = 'R'
+         AND x.type IN ('UB', 'PT', 'PX', 'UP')
+       ORDER BY x.seq DESC LIMIT 1;
+      IF FOUND THEN
+        d := prev.entry_data;
+        nl := prev.null_ind;
+        IF prev.type = 'UB' THEN
+          PERFORM as4tainr_svc.journal_entry(e.journal_lib, e.journal, 'R', 'BR', e.count_rrn,
+              e.entry_data, e.null_ind, e.object, e.object_type);
+        END IF;
+      ELSE
+        f := rtrim(substr(e.object, 1, 10));
+        l := rtrim(substr(e.object, 11, 10));
+        EXECUTE format('SELECT to_jsonb(t) FROM %I.%I t WHERE rrn = $1', lower(l), lower(f)) INTO r USING e.count_rrn;
+        SELECT * INTO img FROM as4tainr_svc.record_image(l, f, r);
+        d := img.image;
+        nl := img.nulls;
+      END IF;
+      PERFORM as4tainr_svc.journal_entry(e.journal_lib, e.journal, 'R', 'UR', e.count_rrn,
+          d, nl, e.object, e.object_type);
+    END IF;
+  END LOOP;
+END $as4tainr$;
+
 {display_journal}
 
 {interpret}
 
 GRANT EXECUTE ON FUNCTION as4tainr_svc.journal_commit(), as4tainr_svc.open_cycles(),
     as4tainr_svc.journal_rolled_back(int[], numeric[]), as4tainr_svc.e37(text),
+    as4tainr_svc.journal_hold(), as4tainr_svc.journal_restore(jsonb, boolean),
     as4tainr_svc.interpret(bytea, text, int, int) TO {role};
 GRANT EXECUTE ON FUNCTION qsys2.display_journal(varchar, varchar, varchar, varchar, timestamp, numeric,
     varchar, varchar, varchar, varchar, varchar, varchar, varchar, varchar, varchar, varchar, varchar,
@@ -433,7 +534,16 @@ CREATE TYPE qsys2.display_journal_row AS (
     syslog_event varchar(2048), syslog_facility integer, syslog_severity integer, syslog_priority integer);
 END IF;
 END $as4tainr$;
-ALTER TYPE qsys2.display_journal_row ALTER ATTRIBUTE "object" TYPE char(30);
+-- An older OBJECT attribute is changed (only then: a user's view over
+-- DISPLAY_JOURNAL depends on the type).
+DO $as4tainr$ BEGIN
+IF EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_type t ON t.typrelid = a.attrelid
+             JOIN pg_namespace n ON n.oid = t.typnamespace
+            WHERE n.nspname = 'qsys2' AND t.typname = 'display_journal_row' AND a.attname = 'object'
+              AND format_type(a.atttypid, a.atttypmod) <> 'character(30)') THEN
+  ALTER TYPE qsys2.display_journal_row ALTER ATTRIBUTE "object" TYPE char(30);
+END IF;
+END $as4tainr$;
 CREATE OR REPLACE FUNCTION qsys2.display_journal(
     journal_library varchar, journal_name varchar,
     starting_receiver_library varchar DEFAULT NULL, starting_receiver_name varchar DEFAULT '*CURRENT',
@@ -667,6 +777,8 @@ impl Job<'_> {
             "STRJRNPF" => self.strjrnpf(cmd).await?,
             "ENDJRNPF" => self.endjrnpf(cmd).await?,
             "DSPJRN" => return self.dspjrn(cmd).await.map(Some),
+            "APYJRNCHG" => self.apply_journal(cmd, false).await?,
+            "RMVJRNCHG" => self.apply_journal(cmd, true).await?,
             _ => return Ok(None),
         };
         Ok(Some(Outcome::Messages(msg)))
@@ -1175,6 +1287,512 @@ impl Job<'_> {
     }
 }
 
+/// The entries of the open commit cycles, held over a rollback (None:
+/// there are none).
+pub async fn hold(client: &Client) -> Option<String> {
+    client
+        .query_one("SELECT as4tainr_svc.journal_hold()::text", &[])
+        .await
+        .ok()
+        .and_then(|r| r.get(0))
+}
+
+/// After a rollback: its entries back in the journal, and the record
+/// changes it undid journaled (`as4tainr_svc.journal_restore`).
+pub async fn restore(client: &Client, held: Option<String>, whole: bool) -> Result<()> {
+    if held.is_some() {
+        client
+            .execute(
+                "SELECT as4tainr_svc.journal_restore($1::text::jsonb, $2)",
+                &[&held, &whole],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// ROLLBACK TO SAVEPOINT under commitment control, journaled.
+pub async fn rollback_to(client: &Client, sp: &str) -> Result<()> {
+    let held = hold(client).await;
+    client
+        .batch_execute(&format!("ROLLBACK TO SAVEPOINT {sp}"))
+        .await?;
+    restore(client, held, false).await
+}
+
+/// A record image (and null byte map) of a file as a JSON object of its
+/// column values, for `jsonb_populate_record`: the inverse of
+/// `as4tainr_svc.field_image`.
+pub async fn image_json(
+    catalog: &Client,
+    lib: &str,
+    file: &str,
+    img: &[u8],
+    nulls: &str,
+) -> Result<String> {
+    let rows = catalog
+        .query(
+            "SELECT name, alias, data_type, length, decimals, varlen, flt_double
+               FROM as4tainr.file_fields
+              WHERE library = $1 AND file = $2
+                AND data_type NOT IN ('CLOB', 'BLOB', 'DBCLOB', 'DECFLOAT', 'BOOLEAN', 'XML')
+              ORDER BY seq",
+            &[&lib, &file],
+        )
+        .await?;
+    let mut obj = serde_json::Map::new();
+    let mut off = 0usize;
+    let nulls: Vec<char> = nulls.chars().collect();
+    for (i, r) in rows.iter().enumerate() {
+        let name: String = r.get(0);
+        let alias: Option<String> = r.get(1);
+        let t: String = r.get(2);
+        let len = r.get::<_, i32>(3).max(0) as usize;
+        let decs = r.get::<_, i32>(4).max(0) as u32;
+        let varlen: bool = r.get(5);
+        let dbl: bool = r.get(6);
+        let key = catalog::pg_name(alias.as_deref().unwrap_or(&name));
+        let (v, n) = field_value(&t, len, decs, varlen, dbl, &img[off.min(img.len())..])?;
+        off += n;
+        let v = if nulls.get(i) == Some(&'1') {
+            serde_json::Value::Null
+        } else {
+            v
+        };
+        obj.insert(key, v);
+    }
+    Ok(serde_json::Value::Object(obj).to_string())
+}
+
+/// One field's value from its bytes in a record image, and its size.
+fn field_value(
+    t: &str,
+    len: usize,
+    decs: u32,
+    varlen: bool,
+    dbl: bool,
+    b: &[u8],
+) -> Result<(serde_json::Value, usize)> {
+    use serde_json::Value;
+    let need = |n: usize| -> Result<&[u8]> {
+        b.get(..n)
+            .ok_or_else(|| anyhow::anyhow!("the record image is shorter than the record format"))
+    };
+    let vlen = |b: &[u8]| -> usize { u16::from_be_bytes([b[0], b[1]]) as usize };
+    let num = |digits: String, neg: bool| -> Value {
+        let d = format!("{:0>w$}", digits, w = decs as usize + 1);
+        let (i, f) = d.split_at(d.len() - decs as usize);
+        let s = if f.is_empty() {
+            i.to_string()
+        } else {
+            format!("{i}.{f}")
+        };
+        Value::String(if neg { format!("-{s}") } else { s })
+    };
+    Ok(match t {
+        "P" => {
+            let n = len / 2 + 1;
+            let x = need(n)?;
+            let h: String = x.iter().map(|c| format!("{c:02x}")).collect();
+            let (digits, sign) = h.split_at(h.len() - 1);
+            (num(digits.to_string(), matches!(sign, "d" | "b")), n)
+        }
+        "S" => {
+            let x = need(len)?;
+            let digits: String = x.iter().map(|c| char::from(b'0' + (c & 0x0F))).collect();
+            let neg = x.last().is_some_and(|c| matches!(c >> 4, 0xD | 0xB));
+            (num(digits, neg), len)
+        }
+        "B" => {
+            let n = if len <= 4 {
+                2
+            } else if len <= 9 {
+                4
+            } else {
+                8
+            };
+            let x = need(n)?;
+            let v: i64 = match n {
+                2 => i16::from_be_bytes([x[0], x[1]]) as i64,
+                4 => i32::from_be_bytes(x.try_into()?) as i64,
+                _ => i64::from_be_bytes(x.try_into()?),
+            };
+            (num(v.unsigned_abs().to_string(), v < 0), n)
+        }
+        "F" => {
+            if dbl || len > 9 {
+                let x = need(8)?;
+                (
+                    Value::String(f64::from_be_bytes(x.try_into()?).to_string()),
+                    8,
+                )
+            } else {
+                let x = need(4)?;
+                (
+                    Value::String(f32::from_be_bytes(x.try_into()?).to_string()),
+                    4,
+                )
+            }
+        }
+        "L" => {
+            let x = need(10)?;
+            (Value::String(crate::tn5250::ebcdic::decode(x)), 10)
+        }
+        "T" => {
+            let x = need(8)?;
+            (
+                Value::String(crate::tn5250::ebcdic::decode(x).replace('.', ":")),
+                8,
+            )
+        }
+        "Z" => {
+            let x = need(26)?;
+            let s = crate::tn5250::ebcdic::decode(x);
+            // YYYY-MM-DD-HH.MM.SS.ffffff
+            let s = format!("{} {}{}", &s[..10], s[11..19].replace('.', ":"), &s[19..]);
+            (Value::String(s), 26)
+        }
+        "H" => {
+            let (x, n) = if varlen {
+                let x = need(2 + len)?;
+                (&x[2..2 + vlen(x).min(len)], 2 + len)
+            } else {
+                (need(len)?, len)
+            };
+            let h: String = x.iter().map(|c| format!("{c:02x}")).collect();
+            (Value::String(format!("\\x{h}")), n)
+        }
+        "G" => {
+            let (x, n) = if varlen {
+                let x = need(2 + len * 2)?;
+                (&x[2..2 + vlen(x).min(len) * 2], 2 + len * 2)
+            } else {
+                (need(len * 2)?, len * 2)
+            };
+            let units: Vec<u16> = x
+                .chunks(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect();
+            let s = String::from_utf16_lossy(&units);
+            (
+                Value::String(if varlen { s } else { s.trim_end().to_string() }),
+                n,
+            )
+        }
+        _ => {
+            if varlen {
+                let x = need(2 + len)?;
+                let s = crate::tn5250::ebcdic::decode(&x[2..2 + vlen(x).min(len)]);
+                (Value::String(s), 2 + len)
+            } else {
+                let x = need(len)?;
+                (Value::String(crate::tn5250::ebcdic::decode(x)), len)
+            }
+        }
+    })
+}
+
+/// A journaled file was cleared (CLRPFM): its F CR entry.
+pub async fn file_cleared(client: &Client, lib: &str, file: &str, who: (&str, &str)) -> Result<()> {
+    if let Some((jl, jn)) = journal_of(client, lib, file).await? {
+        entry(
+            client,
+            &jl,
+            &jn,
+            "F",
+            "CR",
+            Some(member_object(lib, file)),
+            Some("*QDDS"),
+            who,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// An entry limit of APYJRNCHG and RMVJRNCHG (FROMENT, TOENT).
+fn entry_limit(v: &str, first: i64, last: i64) -> Result<i64> {
+    match v.trim().to_ascii_uppercase().as_str() {
+        "*FIRST" => Ok(first),
+        "*LAST" | "*LASTRST" | "*COMPLETE" => Ok(last),
+        "*LASTSAVE" => bail!(
+            "CPF9898: No save of the file is recorded (as4tainr keeps no saves); give FROMENT(*FIRST) or a sequence number, and RCVRNG(*CURRENT) or RCVRNG(*CURCHAIN)."
+        ),
+        n => n
+            .parse()
+            .map_err(|_| anyhow::anyhow!("CPF0006: Errors occurred in command. {v} is not a sequence number.")),
+    }
+}
+
+impl Job<'_> {
+    /// APYJRNCHG and RMVJRNCHG (CL reference; IBM i "Actions of applying
+    /// or removing journaled changes by journal code"): the record
+    /// changes journaled for files, applied oldest first (PT and PX add
+    /// the record at its relative record number, UP and UR update it to
+    /// the after-image, DL and DR delete it, F CR clears the member; UB
+    /// and BR are ignored) or removed newest first (PT and PX delete the
+    /// record, UB and BR update it to the before-image, DL and DR put it
+    /// back; UP and UR are ignored; RMVJRNCHG needs IMAGES(*BOTH)). With
+    /// CMTBDY(*YES) a change made under commitment control is applied or
+    /// removed only when its commit cycle was committed within the range.
+    /// Trigger programs are not called and the changes are not journaled
+    /// one by one: the journal gets F SA (SR) when the command starts and
+    /// F AY (RC) for each file.
+    pub(crate) async fn apply_journal(
+        &mut self,
+        cmd: &Command,
+        remove: bool,
+    ) -> Result<Vec<String>> {
+        let (jlib, jname, _, rlib, rname) = self.journal(cmd.get("JRN")).await?;
+        let files = self.physical_files(&cmd.list("FILE")).await?;
+        let rcvrng = cmd.list("RCVRNG").join(" ").to_ascii_uppercase();
+        let current = if rcvrng.contains("*LASTSAVE") {
+            bail!(
+                "CPF9898: No save of the file is recorded (as4tainr keeps no saves); give RCVRNG(*CURRENT) or RCVRNG(*CURCHAIN)."
+            );
+        } else {
+            !rcvrng.contains("*CURCHAIN")
+        };
+        let pick = |a: &str, b: &str| -> String {
+            match cmd.get(b) {
+                "" => cmd.get(a).to_string(),
+                l => l.to_string(),
+            }
+        };
+        let from = pick("FROMENT", "FROMENTLRG");
+        let to = pick("TOENT", "TOENTLRG");
+        // Apply: from the older to the newer entry; remove: from the
+        // newer back to the older.
+        let (lo, hi) = if remove {
+            (
+                entry_limit(&to, 0, 0)?,
+                entry_limit(&from, i64::MAX, i64::MAX)?,
+            )
+        } else {
+            (
+                entry_limit(&from, 0, 0)?,
+                entry_limit(&to, i64::MAX, i64::MAX)?,
+            )
+        };
+        let cmtbdy = !cmd.get("CMTBDY").eq_ignore_ascii_case("*NO");
+        let job = self.job_name();
+        let who = (job.as_str(), self.user.as_str());
+        let mut msgs = Vec::new();
+        let tx = self.client;
+        tx.batch_execute("BEGIN; SELECT set_config('as4tainr.apply', '1', true)")
+            .await?;
+        let r: Result<()> = async {
+            entry(
+                tx,
+                &jlib,
+                &jname,
+                "F",
+                if remove { "SR" } else { "SA" },
+                None,
+                None,
+                who,
+            )
+            .await?;
+            for (lib, file) in &files {
+                let n = self
+                    .apply_file(
+                        &jlib,
+                        &jname,
+                        lib,
+                        file,
+                        remove,
+                        (lo, hi),
+                        current.then_some((&rlib, &rname)),
+                        cmtbdy,
+                    )
+                    .await?;
+                entry(
+                    tx,
+                    &jlib,
+                    &jname,
+                    "F",
+                    if remove { "RC" } else { "AY" },
+                    Some(member_object(lib, file)),
+                    Some("*QDDS"),
+                    who,
+                )
+                .await?;
+                msgs.push(format!(
+                    "{n} entries {} member {file} file {file} in {lib}.",
+                    if remove { "removed from" } else { "applied to" }
+                ));
+            }
+            Ok(())
+        }
+        .await;
+        match r {
+            Ok(()) => tx.batch_execute("COMMIT").await?,
+            Err(e) => {
+                tx.batch_execute("ROLLBACK").await?;
+                return Err(e);
+            }
+        }
+        Ok(msgs)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_file(
+        &self,
+        jlib: &str,
+        jname: &str,
+        lib: &str,
+        file: &str,
+        remove: bool,
+        (lo, hi): (i64, i64),
+        receiver: Option<(&String, &String)>,
+        cmtbdy: bool,
+    ) -> Result<usize> {
+        let tx = self.client;
+        let images = tx
+            .query_opt(
+                "SELECT images FROM as4tainr.journaled_files WHERE library=$1 AND file=$2 AND journal_lib=$3 AND journal=$4",
+                &[&lib, &file, &jlib, &jname],
+            )
+            .await?;
+        // The file may no longer be journaled; its entries are still in
+        // the journal.
+        if remove && images.as_ref().map(|r| r.get::<_, String>(0)).as_deref() == Some("*AFTER") {
+            bail!(
+                "CPF9898: File {file} in {lib} is journaled with IMAGES(*AFTER); RMVJRNCHG needs before-images (IMAGES(*BOTH))."
+            );
+        }
+        let obj = member_object(lib, file);
+        let (rl, rn) = match receiver {
+            Some((l, n)) => (Some(l.as_str()), Some(n.as_str())),
+            None => (None, None),
+        };
+        let rows = tx
+            .query(
+                "SELECT e.seq, e.code::text, e.type::text, coalesce(e.count_rrn, 0), e.entry_data, coalesce(e.null_ind, ''),
+                        e.commit_cycle::text,
+                        e.commit_cycle = 0 OR EXISTS (SELECT 1 FROM as4tainr.journal_entries c
+                            WHERE c.journal_lib = e.journal_lib AND c.journal = e.journal AND c.code = 'C'
+                              AND c.type = 'CM' AND c.commit_cycle = e.commit_cycle AND c.seq BETWEEN $4 AND $5)
+                   FROM as4tainr.journal_entries e
+                  WHERE e.journal_lib = $1 AND e.journal = $2 AND e.object = $3 AND e.code IN ('R', 'F')
+                    AND e.seq BETWEEN $4 AND $5
+                    AND ($6::text IS NULL OR (e.receiver_lib = $6 AND e.receiver = $7))
+                  ORDER BY e.seq",
+                &[&jlib, &jname, &obj, &lo, &hi, &rl, &rn],
+            )
+            .await?;
+        let table = format!("{}.{}", ident(lib), ident(file));
+        let mut n = 0usize;
+        let mut rows: Vec<_> = rows.iter().collect();
+        if remove {
+            rows.reverse();
+        }
+        for r in rows {
+            let seq: i64 = r.get(0);
+            let code: String = r.get(1);
+            let ty: String = r.get(2);
+            let rrn: i64 = r.get(3);
+            let img: Option<Vec<u8>> = r.get(4);
+            let nulls: String = r.get(5);
+            let committed: bool = r.get(7);
+            if cmtbdy && !committed {
+                continue;
+            }
+            #[derive(PartialEq)]
+            enum Act {
+                Add,
+                Put,
+                Delete,
+                Clear,
+                Skip,
+            }
+            let act = match (code.as_str(), ty.as_str(), remove) {
+                ("R", "PT" | "PX", false) => Act::Add,
+                ("R", "UP" | "UR", false) => Act::Put,
+                ("R", "DL" | "DR", false) => Act::Delete,
+                ("F", "CR", false) => Act::Clear,
+                ("R", "PT" | "PX", true) => Act::Delete,
+                ("R", "UB" | "BR" | "DL" | "DR", true) => Act::Put,
+                ("F", "CR", true) => bail!(
+                    "CPF9898: Entry {seq} (F CR, member cleared) cannot be removed; {n} entries were removed from file {file} in {lib} before it."
+                ),
+                _ => Act::Skip,
+            };
+            if act == Act::Skip {
+                continue;
+            }
+            let row = match (&act, &img) {
+                (Act::Add | Act::Put, Some(img)) => {
+                    Some(image_json(tx, lib, file, img, &nulls).await?)
+                }
+                (Act::Add | Act::Put, None) => {
+                    bail!("CPF9898: Entry {seq} has no record image.")
+                }
+                _ => None,
+            };
+            match act {
+                Act::Delete => {
+                    tx.execute(&format!("DELETE FROM {table} WHERE rrn = $1"), &[&rrn])
+                        .await?;
+                }
+                Act::Clear => {
+                    tx.batch_execute(&format!("TRUNCATE TABLE {table} RESTART IDENTITY"))
+                        .await?;
+                }
+                Act::Add | Act::Put => {
+                    let row = row.unwrap_or_default();
+                    let cols: Vec<String> =
+                        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&row)?
+                            .keys()
+                            .map(|k| format!("\"{}\"", k.replace('"', "\"\"")))
+                            .collect();
+                    let exists = tx
+                        .query_opt(&format!("SELECT 1 FROM {table} WHERE rrn = $1"), &[&rrn])
+                        .await?
+                        .is_some();
+                    if exists && act == Act::Add {
+                        bail!(
+                            "CPF9898: Entry {seq}: record {rrn} of file {file} in {lib} already exists; {n} entries were applied before it."
+                        );
+                    }
+                    if exists {
+                        let sets: Vec<String> =
+                            cols.iter().map(|c| format!("{c} = r.{c}")).collect();
+                        tx.execute(
+                            &format!(
+                                "UPDATE {table} t SET {} FROM jsonb_populate_record(NULL::{table}, $2::text::jsonb) r WHERE t.rrn = $1",
+                                sets.join(", ")
+                            ),
+                            &[&rrn, &row],
+                        )
+                        .await?;
+                    } else {
+                        tx.execute(
+                            &format!(
+                                "INSERT INTO {table} (rrn, {c}) SELECT $1, {c} FROM jsonb_populate_record(NULL::{table}, $2::text::jsonb)",
+                                c = cols.join(", ")
+                            ),
+                            &[&rrn, &row],
+                        )
+                        .await?;
+                    }
+                }
+                Act::Skip => {}
+            }
+            n += 1;
+        }
+        // New records get numbers after those put back.
+        let t = table.replace('\'', "''");
+        tx.batch_execute(&format!(
+            "SELECT setval(pg_get_serial_sequence('{t}', 'rrn'),
+                    greatest(m, nextval(pg_get_serial_sequence('{t}', 'rrn')) - 1, 1))
+               FROM (SELECT max(rrn) AS m FROM {table}) x WHERE m IS NOT NULL"
+        ))
+        .await?;
+        Ok(n)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1187,5 +1805,28 @@ mod tests {
         assert_eq!(next_receiver_name("RCV0099"), "RCV0100");
         assert_eq!(next_receiver_name("RCV9"), "RCV0");
         assert_eq!(next_receiver_name("MYRCV"), "MYRCV0001");
+    }
+
+    #[test]
+    fn record_image_fields_as_values() {
+        // Storage formats (ILE RPG Reference, "Data types and data
+        // formats"): packed 12345- in P(5,2) is X'12345D'; zoned 0042 in
+        // S(4,0) is X'F0F0F4F2'; binary B(4,0) -7 is X'FFF9'; an ISO date
+        // is its 10 characters.
+        let (v, n) = field_value("P", 5, 2, false, false, &[0x12, 0x34, 0x5D]).unwrap();
+        assert_eq!((v.as_str().unwrap(), n), ("-123.45", 3));
+        let (v, n) = field_value("S", 4, 0, false, false, &[0xF0, 0xF0, 0xF4, 0xF2]).unwrap();
+        assert_eq!((v.as_str().unwrap(), n), ("0042", 4));
+        let (v, n) = field_value("B", 4, 0, false, false, &[0xFF, 0xF9]).unwrap();
+        assert_eq!((v.as_str().unwrap(), n), ("-7", 2));
+        let d = crate::tn5250::ebcdic::encode("2026-10-21");
+        let (v, _) = field_value("L", 10, 0, false, false, &d).unwrap();
+        assert_eq!(v.as_str().unwrap(), "2026-10-21");
+        let z = crate::tn5250::ebcdic::encode("2026-10-21-13.45.10.000001");
+        let (v, _) = field_value("Z", 26, 0, false, false, &z).unwrap();
+        assert_eq!(v.as_str().unwrap(), "2026-10-21 13:45:10.000001");
+        let a = [&[0u8, 2][..], &crate::tn5250::ebcdic::encode("OKxx")].concat();
+        let (v, n) = field_value("A", 4, 0, true, false, &a).unwrap();
+        assert_eq!((v.as_str().unwrap(), n), ("OK", 6));
     }
 }

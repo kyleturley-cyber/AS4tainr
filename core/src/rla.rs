@@ -136,6 +136,12 @@ impl OpenFile {
         self.current_rrn
     }
 
+    /// Back to a record (a change made again after its *BEFORE trigger
+    /// programs).
+    pub fn set_current_rrn(&mut self, rrn: Option<i64>) {
+        self.current_rrn = rrn;
+    }
+
     pub fn new(file: FileRef) -> Self {
         OpenFile {
             file,

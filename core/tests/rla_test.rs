@@ -7220,10 +7220,14 @@ async fn journals_and_display_journal() {
         ("R", "PT", f[0][4], "CMTPGM")
     );
     assert_eq!((f[2][0], f[2][1], f[2][2]), ("C", "CM", f[0][4]));
-    // The second: rolled back (its start and the rollback).
+    // The second, rolled back: its start, the insert (written when it
+    // was made), the record deleted during the rollback (R DR, IBM i
+    // "All journal entries by code and type") and the rollback (C RB).
     assert_eq!((f[3][0], f[3][1]), ("C", "SC"));
-    assert_eq!((f[4][0], f[4][1], f[4][2]), ("C", "RB", f[3][4]));
-    assert_eq!(f.len(), 5, "{rows:?}");
+    assert_eq!((f[4][0], f[4][1], f[4][2]), ("R", "PT", f[3][4]));
+    assert_eq!((f[5][0], f[5][1], f[5][2]), ("R", "DR", f[3][4]));
+    assert_eq!((f[6][0], f[6][1], f[6][2]), ("C", "RB", f[3][4]));
+    assert_eq!(f.len(), 7, "{rows:?}");
     // A new receiver: only its entries by default; *CURCHAIN all.
     cl_cmd(&mut job, format!("CHGJRN JRN({lib}/JRN) JRNRCV(*GEN)"))
         .await
@@ -7249,7 +7253,7 @@ async fn journals_and_display_journal() {
     );
     assert_eq!(
         sql_rows(&client, &url, &lib, &format!("SELECT COUNT(*) FROM {all}")).await,
-        ["11"]
+        ["13"]
     );
     let e = cl_cmd(&mut job, format!("DLTJRNRCV JRNRCV({lib}/RCV0002)"))
         .await
@@ -7289,14 +7293,22 @@ async fn journals_and_display_journal() {
 
 /// Trigger programs (CL reference: ADDPFTRG, RMVPFTRG; Db2 for i "Trigger
 /// buffer sections"): the program gets the trigger buffer and its length.
-/// Event '1' insert, '3' update; time '1' after; commit lock level '0'
-/// without commitment control; the new record image at the new record
-/// offset, in the file's format (an EXTNAME data structure BASED on a
-/// pointer to it reads it, with PREFIX names). It runs for SQL and for
-/// record-level access. A trigger program that ends in error undoes the
-/// change: SQL0443 for an SQL statement, file status 01024 (error in the
-/// trigger program after the operation) for an RPG UPDATE. RMVPFTRG
-/// removes it. ILE RPG: OPEN of a USROPN file.
+/// Event '1' insert, '3' update; time '1' after, '2' before; commit lock
+/// level '0' without commitment control; the new record image at the new
+/// record offset, in the file's format (an EXTNAME data structure BASED
+/// on a pointer to it reads it, with PREFIX names). It runs for SQL and
+/// for record-level access, in the job's session: it sees the record the
+/// change wrote before it is committed (Db2 for i, "Trigger programs":
+/// the trigger program runs in the same job and commitment definition as
+/// the application). A *BEFORE program that ends in error stops the
+/// change (SQL0443; RPG file status 01023, error in the trigger program
+/// before the operation); one with ALWREPCHG(*YES) may change the new
+/// record, which is written so. An *AFTER program that ends in error
+/// without commitment control: "No rollback occurs" (Db2 for i, "Trigger
+/// and application programs that are not under commitment control") —
+/// the change and the program's own changes stay; under commitment
+/// control both are taken back. RMVPFTRG removes the programs. ILE RPG:
+/// OPEN of a USROPN file.
 #[tokio::test]
 async fn trigger_programs_addpftrg() {
     use as4tainr_core::commands::{Environment, Job};
@@ -7306,6 +7318,16 @@ async fn trigger_programs_addpftrg() {
     let env = Environment {
         database_url: url.clone(),
     };
+    // A job of its own: its commitment definition is not another test's.
+    let id = as4tainr_core::jobs::start_interactive(
+        &client,
+        &format!("P{}", &lib[1..]),
+        "QSECOFR",
+        None,
+        std::slice::from_ref(&lib),
+    )
+    .await
+    .unwrap();
     let mut job = Job {
         client: &client,
         env: &env,
@@ -7313,30 +7335,41 @@ async fn trigger_programs_addpftrg() {
         curlib: Some(lib.clone()),
         libl: vec![lib.clone()],
         display: None,
-        id: None,
+        id: Some(id),
         calls: Default::default(),
     };
     let sql = |s: String| format!("RUNSQL SQL('{}') COMMIT(*NONE)", s.replace('\'', "''"));
     for c in [
         sql(format!("CREATE TABLE {lib}.ORD (ORDNO DECIMAL(7, 0) NOT NULL, STS CHAR(1)) RCDFMT ORDR")),
-        sql(format!("CREATE TABLE {lib}.AUD (ORDNO DECIMAL(7, 0), ACT CHAR(2), CMT CHAR(1), LEN INTEGER, OLDSTS CHAR(1)) RCDFMT AUDR")),
+        sql(format!("CREATE TABLE {lib}.AUD (ORDNO DECIMAL(7, 0), ACT CHAR(2), CMT CHAR(1), LEN INTEGER, OLDSTS CHAR(1), NEWSTS CHAR(1), SEEN CHAR(1)) RCDFMT AUDR")),
     ] {
         cl_cmd(&mut job, c).await.unwrap();
     }
     source::create_file(&client, &lib, "QRPGLESRC", "")
         .await
         .unwrap();
-    let put = |name: &str, src: &str| source::Member {
+    let put = |name: &str, srctype: &str, src: &str| source::Member {
         library: lib.clone(),
         file: "QRPGLESRC".into(),
         name: name.into(),
-        srctype: "RPGLE".into(),
+        srctype: srctype.into(),
         text: String::new(),
         source: src.into(),
     };
-    let trg = "**FREE
+    let msg = "dcl-pr SndPgmMsg extpgm('QMHSNDPM');
+  id char(7) const; f char(20) const; d char(40) const; l int(10) const;
+  t char(10) const; e char(10) const; c int(10) const; k char(4); err char(8);
+end-pr;
+dcl-s key char(4);
+dcl-s err char(8) inz(*allx'00');
+";
+    // *AFTER: audits the change (and whether the inserted record can be
+    // read), then refuses status Y.
+    let trg = format!(
+        "**FREE
 ctl-opt dftactgrp(*no) actgrp(*caller);
 dcl-f AUD usage(*output) usropn;
+dcl-f ORD usage(*input) usropn prefix(R_);
 dcl-ds TrgBufT qualified template;
   File char(10) pos(1);
   Lib char(10) pos(11);
@@ -7352,30 +7385,63 @@ dcl-pi *n;
 end-pi;
 dcl-ds NewRec extname('ORD') prefix(N_) based(pNew) end-ds;
 dcl-ds OldRec extname('ORD') prefix(O_) based(pOld) end-ds;
-dcl-pr SndPgmMsg extpgm('QMHSNDPM');
-  id char(7) const; f char(20) const; d char(40) const; l int(10) const;
-  t char(10) const; e char(10) const; c int(10) const; k char(4); err char(8);
-end-pr;
-dcl-s key char(4);
-dcl-s err char(8) inz(*allx'00');
+{msg}
 pNew = %addr(pBuf) + pBuf.NewOff;
-if pBuf.Event = '3' and N_STS = 'X';
-  SndPgmMsg('CPF9898': 'QCPFMSG   *LIBL': 'X is not allowed': 16: '*ESCAPE': '*PGMBDY': 1: key: err);
-endif;
 ORDNO = N_ORDNO;
 ACT = pBuf.Event + pBuf.Time;
 CMT = pBuf.Cmt;
 LEN = pLen;
 OLDSTS = ' ';
+NEWSTS = N_STS;
+SEEN = 'N';
 if pBuf.Event = '3';
   pOld = %addr(pBuf) + pBuf.OldOff;
   OLDSTS = O_STS;
 endif;
+if pBuf.Event = '1';
+  open ORD;
+  read ORD;
+  dow not %eof(ORD);
+    if R_ORDNO = N_ORDNO;
+      SEEN = 'Y';
+    endif;
+    read ORD;
+  enddo;
+  close ORD;
+endif;
 open AUD;
 write AUDR;
 close AUD;
+if pBuf.Event = '3' and N_STS = 'Y';
+  SndPgmMsg('CPF9898': 'QCPFMSG   *LIBL': 'Y is not allowed': 16: '*ESCAPE': '*PGMBDY': 1: key: err);
+endif;
 *inlr = *on;
-";
+"
+    );
+    // *BEFORE, ALWREPCHG(*YES): refuses status X, makes U a V.
+    let btrg = format!(
+        "**FREE
+ctl-opt dftactgrp(*no) actgrp(*caller);
+dcl-ds TrgBufT qualified template;
+  Time char(1) pos(32);
+  NewOff int(10) pos(65);
+end-ds;
+dcl-pi *n;
+  pBuf likeds(TrgBufT);
+  pLen int(10);
+end-pi;
+dcl-ds NewRec extname('ORD') prefix(N_) based(pNew) end-ds;
+{msg}
+pNew = %addr(pBuf) + pBuf.NewOff;
+if pBuf.Time = '2' and N_STS = 'X';
+  SndPgmMsg('CPF9898': 'QCPFMSG   *LIBL': 'X is not allowed': 16: '*ESCAPE': '*PGMBDY': 1: key: err);
+endif;
+if N_STS = 'U';
+  N_STS = 'V';
+endif;
+*inlr = *on;
+"
+    );
     let upd = "**FREE
 dcl-f ORD usage(*update);
 read ORDR;
@@ -7384,12 +7450,35 @@ update(e) ORDR;
 dsply %char(%status(ORD));
 *inlr = *on;
 ";
-    for m in [put("TRG", trg), put("UPD", upd)] {
+    let wrt = "**FREE
+dcl-f ORD usage(*output);
+ORDNO = 102;
+STS = 'U';
+write ORDR;
+*inlr = *on;
+";
+    let cmtupd = "**FREE
+exec sql set option commit = *chg;
+exec sql update ORD set STS = 'Y';
+dsply %char(sqlcode);
+exec sql commit;
+*inlr = *on;
+";
+    for m in [
+        put("TRG", "RPGLE", &trg),
+        put("BTRG", "RPGLE", &btrg),
+        put("UPD", "RPGLE", upd),
+        put("WRT", "RPGLE", wrt),
+        put("CMTUPD", "SQLRPGLE", cmtupd),
+    ] {
         source::put_member(&client, &m, false).await.unwrap();
     }
     for c in [
         format!("CRTBNDRPG PGM({lib}/TRG)"),
+        format!("CRTBNDRPG PGM({lib}/BTRG)"),
         format!("CRTBNDRPG PGM({lib}/UPD)"),
+        format!("CRTBNDRPG PGM({lib}/WRT)"),
+        format!("CRTSQLRPGI OBJ({lib}/CMTUPD) SRCFILE({lib}/QRPGLESRC)"),
         format!("ADDPFTRG FILE({lib}/ORD) TRGTIME(*AFTER) TRGEVENT(*INSERT) PGM({lib}/TRG)"),
         format!("ADDPFTRG FILE({lib}/ORD) TRGTIME(*AFTER) TRGEVENT(*UPDATE) PGM({lib}/TRG)"),
         sql(format!("INSERT INTO {lib}.ORD VALUES (101, 'O')")),
@@ -7406,14 +7495,11 @@ dsply %char(%status(ORD));
     .await
     .unwrap_err();
     assert!(e.contains("already"), "{e}");
-    let rows = sql_rows(
-        &client,
-        &url,
-        &lib,
-        &format!("SELECT ORDNO, ACT, CMT, OLDSTS FROM {lib}.AUD ORDER BY ACT"),
-    )
-    .await;
-    assert_eq!(rows, ["101|11|0|", "101|31|0|O"]);
+    let aq =
+        format!("SELECT ORDNO, ACT, CMT, OLDSTS, NEWSTS, SEEN FROM {lib}.AUD ORDER BY ACT, NEWSTS");
+    let aud = || sql_rows(&client, &url, &lib, &aq);
+    // The inserted record was there for the program to read.
+    assert_eq!(aud().await, ["101|11|0||O|Y", "101|31|0|O|S|N"]);
     let len: i64 = sql_rows(
         &client,
         &url,
@@ -7427,7 +7513,19 @@ dsply %char(%status(ORD));
         len > 96,
         "the buffer is the 96-byte static part and the images: {len}"
     );
-    // Refused by the trigger program: the change is undone.
+    let sq = format!("SELECT STS FROM {lib}.ORD");
+    let sts = || sql_rows(&client, &url, &lib, &sq);
+
+    // *BEFORE, refused: the change is not made, the *AFTER program is
+    // not called.
+    cl_cmd(
+        &mut job,
+        format!(
+            "ADDPFTRG FILE({lib}/ORD) TRGTIME(*BEFORE) TRGEVENT(*UPDATE) PGM({lib}/BTRG) ALWREPCHG(*YES)"
+        ),
+    )
+    .await
+    .unwrap();
     let e = cl_cmd(&mut job, sql(format!("UPDATE {lib}.ORD SET STS = 'X'")))
         .await
         .unwrap_err();
@@ -7435,45 +7533,266 @@ dsply %char(%status(ORD));
         e.contains("SQL0443") && e.contains("X is not allowed"),
         "{e}"
     );
-    assert_eq!(
-        sql_rows(&client, &url, &lib, &format!("SELECT STS FROM {lib}.ORD")).await,
-        ["S"]
-    );
+    assert_eq!(sts().await, ["S"]);
     assert_eq!(
         cl_cmd(&mut job, format!("CALL PGM({lib}/UPD)"))
             .await
             .unwrap(),
-        ["DSPLY  1024"]
+        ["DSPLY  1023"]
     );
+    assert_eq!(sts().await, ["S"]);
+    assert_eq!(aud().await.len(), 2);
+
+    // ALWREPCHG(*YES): the record as the *BEFORE program left it is
+    // written; the *AFTER program sees it.
+    cl_cmd(&mut job, sql(format!("UPDATE {lib}.ORD SET STS = 'U'")))
+        .await
+        .unwrap();
+    assert_eq!(sts().await, ["V"]);
+    assert_eq!(aud().await[2], "101|31|0|S|V|N");
+
+    // *AFTER, refused under commitment control: the change and the
+    // program's audit record are taken back.
     assert_eq!(
-        sql_rows(&client, &url, &lib, &format!("SELECT STS FROM {lib}.ORD")).await,
-        ["S"]
+        cl_cmd(&mut job, format!("CALL PGM({lib}/CMTUPD)"))
+            .await
+            .unwrap(),
+        ["DSPLY  -443"]
     );
+    assert_eq!(sts().await, ["V"]);
+    assert_eq!(aud().await.len(), 3);
+
+    // *AFTER, refused without commitment control: no rollback; the
+    // change and the audit record stay.
+    let e = cl_cmd(&mut job, sql(format!("UPDATE {lib}.ORD SET STS = 'Y'")))
+        .await
+        .unwrap_err();
+    assert!(
+        e.contains("SQL0443") && e.contains("Y is not allowed"),
+        "{e}"
+    );
+    assert_eq!(sts().await, ["Y"]);
+    assert_eq!(aud().await.len(), 4);
+
+    // An RPG WRITE with a *BEFORE insert program that changes the
+    // record: it is written as the program left it.
+    cl_cmd(
+        &mut job,
+        format!(
+            "ADDPFTRG FILE({lib}/ORD) TRGTIME(*BEFORE) TRGEVENT(*INSERT) PGM({lib}/BTRG) ALWREPCHG(*YES)"
+        ),
+    )
+    .await
+    .unwrap();
+    cl_cmd(&mut job, format!("CALL PGM({lib}/WRT)"))
+        .await
+        .unwrap();
     assert_eq!(
         sql_rows(
             &client,
             &url,
             &lib,
-            &format!("SELECT COUNT(*) FROM {lib}.AUD")
+            &format!("SELECT STS FROM {lib}.ORD WHERE ORDNO = 102")
         )
         .await,
-        ["2"]
+        ["V"]
     );
-    // Removed: changes no longer call it.
+    assert_eq!(aud().await[1], "102|11|0||V|Y");
+
+    // Removed: changes no longer call them.
     cl_cmd(&mut job, format!("RMVPFTRG FILE({lib}/ORD)"))
         .await
         .unwrap();
     cl_cmd(&mut job, sql(format!("UPDATE {lib}.ORD SET STS = 'X'")))
         .await
         .unwrap();
+    assert_eq!(sts().await, ["X", "X"]);
+    assert_eq!(aud().await.len(), 5);
+}
+
+/// Rolled-back changes are journaled, and journaled changes are applied
+/// and removed (IBM i "All journal entries by code and type"; "Actions
+/// of applying or removing journaled changes by journal code"; CL
+/// reference APYJRNCHG, RMVJRNCHG, CLRPFM). A ROLLBACK of an update
+/// leaves the update's entries in the journal and adds BR (the
+/// before-image of the record updated for rollback: the image it had)
+/// and UR (the after-image: the record put back), then C RB. RMVJRNCHG
+/// works from the newest entry back: DL puts the record back, UB updates
+/// it to its before-image, UP is ignored; a commit cycle that was not
+/// committed is left out (CMTBDY(*YES), the default). CLRPFM journals F
+/// CR. APYJRNCHG works from the oldest: PT adds the record at its
+/// relative record number, UP updates it, DL deletes it. The commands
+/// journal F SR and RC, F SA and AY; *LASTSAVE needs a save, which
+/// as4tainr does not record (CPF9898).
+#[tokio::test]
+async fn journal_rollback_apply_and_remove() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let id = as4tainr_core::jobs::start_interactive(
+        &client,
+        &format!("A{}", &lib[1..]),
+        "QSECOFR",
+        None,
+        std::slice::from_ref(&lib),
+    )
+    .await
+    .unwrap();
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: Some(id),
+        calls: Default::default(),
+    };
+    let sql = |s: String| format!("RUNSQL SQL('{}') COMMIT(*NONE)", s.replace('\'', "''"));
+    source::create_file(&client, &lib, "QRPGLESRC", "")
+        .await
+        .unwrap();
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QRPGLESRC".into(),
+            name: "RBK".into(),
+            srctype: "SQLRPGLE".into(),
+            text: String::new(),
+            source: "**FREE
+exec sql set option commit = *chg;
+exec sql update ITM set NAME = 'Temp' where ID = 1;
+exec sql rollback;
+*inlr = *on;
+"
+            .into(),
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    for c in [
+        sql(format!(
+            "CREATE TABLE {lib}.ITM (ID DECIMAL(5, 0) NOT NULL, NAME CHAR(10)) RCDFMT ITMR"
+        )),
+        format!("CRTJRNRCV JRNRCV({lib}/RCV0001)"),
+        format!("CRTJRN JRN({lib}/JRN) JRNRCV({lib}/RCV0001)"),
+        format!("STRJRNPF FILE({lib}/ITM) JRN({lib}/JRN) IMAGES(*BOTH)"),
+        sql(format!(
+            "INSERT INTO {lib}.ITM VALUES (1, 'One'), (2, 'Two'), (3, 'Three')"
+        )),
+        sql(format!("UPDATE {lib}.ITM SET NAME = 'Deux' WHERE ID = 2")),
+        sql(format!("DELETE FROM {lib}.ITM WHERE ID = 3")),
+        format!("CRTSQLRPGI OBJ({lib}/RBK) SRCFILE({lib}/QRPGLESRC)"),
+        format!("CALL PGM({lib}/RBK)"),
+    ] {
+        cl_cmd(&mut job, c.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    let dj = format!("TABLE(QSYS2.DISPLAY_JOURNAL('{lib}', 'JRN')) X");
+    let entries = |w: &str| {
+        let q = format!(
+            "SELECT JOURNAL_CODE || JOURNAL_ENTRY_TYPE, SEQUENCE_NUMBER, COUNT_OR_RRN, \
+             COALESCE(INTERPRET(SUBSTR(ENTRY_DATA, 4, 10) AS CHAR(10)), '') FROM {dj} {w} ORDER BY SEQUENCE_NUMBER"
+        );
+        let (client, url, lib) = (&client, &url, &lib);
+        async move {
+            sql_rows(client, url, lib, &q)
+                .await
+                .into_iter()
+                .map(|r| {
+                    r.split('|')
+                        .map(|x| x.trim().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    let rows = entries("WHERE JOURNAL_CODE IN ('R', 'C')").await;
+    let t: Vec<String> = rows.iter().map(|r| r[0].clone()).collect();
+    assert_eq!(
+        t,
+        ["RPT", "RPT", "RPT", "RUB", "RUP", "RDL", "CSC", "RUB", "RUP", "RBR", "RUR", "CRB"]
+    );
+    // BR: the image the rollback found (Temp); UR: the record put back.
+    assert_eq!((rows[9][2].as_str(), rows[9][3].as_str()), ("1", "Temp"));
+    assert_eq!((rows[10][2].as_str(), rows[10][3].as_str()), ("1", "One"));
+    let names = || {
+        let q = format!("SELECT ID, NAME FROM {lib}.ITM ORDER BY ID");
+        let (client, url, lib) = (&client, &url, &lib);
+        async move { sql_rows(client, url, lib, &q).await }
+    };
+    assert_eq!(names().await, ["1|One", "2|Deux"]);
+
+    // Remove back to the update of record 2 (its UB).
+    let ub = rows[3][1].clone();
+    let m = cl_cmd(
+        &mut job,
+        format!(
+            "RMVJRNCHG JRN({lib}/JRN) FILE({lib}/ITM) RCVRNG(*CURRENT) FROMENT(*LAST) TOENT({ub})"
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(m[0].starts_with("2 entries removed"), "{m:?}");
+    assert_eq!(names().await, ["1|One", "2|Two", "3|Three"]);
+
+    // Cleared, then rebuilt from the journal up to the clear.
+    cl_cmd(&mut job, format!("CLRPFM FILE({lib}/ITM)"))
+        .await
+        .unwrap();
+    assert!(names().await.is_empty());
+    let cr = entries("WHERE JOURNAL_CODE = 'F' AND JOURNAL_ENTRY_TYPE = 'CR'").await;
+    let before_clear = cr[0][1].parse::<i64>().unwrap() - 1;
+    let e = cl_cmd(
+        &mut job,
+        format!("APYJRNCHG JRN({lib}/JRN) FILE({lib}/ITM)"),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("CPF9898") && e.contains("save"), "{e}");
+    let m = cl_cmd(
+        &mut job,
+        format!(
+            "APYJRNCHG JRN({lib}/JRN) FILE({lib}/ITM) RCVRNG(*CURRENT) FROMENT(*FIRST) TOENT({before_clear})"
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(m[0].starts_with("5 entries applied"), "{m:?}");
+    assert_eq!(names().await, ["1|One", "2|Deux"]);
     assert_eq!(
         sql_rows(
             &client,
             &url,
             &lib,
-            &format!("SELECT COUNT(*) FROM {lib}.AUD")
+            &format!("SELECT RRN(X), ID FROM {lib}.ITM X ORDER BY 1")
         )
         .await,
-        ["2"]
+        ["1|1", "2|2"]
+    );
+    // New records get new numbers.
+    cl_cmd(
+        &mut job,
+        sql(format!("INSERT INTO {lib}.ITM VALUES (4, 'Four')")),
+    )
+    .await
+    .unwrap();
+    let f: Vec<String> = entries("WHERE JOURNAL_CODE = 'F'")
+        .await
+        .iter()
+        .map(|r| r[0].clone())
+        .collect();
+    assert_eq!(f, ["FJM", "FSR", "FRC", "FCR", "FSA", "FAY"]);
+    // The applied changes are not journaled one by one.
+    assert_eq!(
+        entries("WHERE JOURNAL_CODE = 'R'").await.len(),
+        rows.iter().filter(|r| r[0].starts_with('R')).count() + 1
     );
 }

@@ -2713,6 +2713,130 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "APYJRNCHG",
+        description: "Apply Journaled Changes",
+        params: &[
+            p("JRN", Kind::Qualified, true, None, "Journal").ch("Name"),
+            p("FILE", Kind::List, true, None, "Journaled physical file").ch("Name, generic*, *ALL"),
+            p(
+                "RCVRNG",
+                Kind::List,
+                false,
+                Some("*LASTSAVE"),
+                "Range of journal receivers",
+            )
+            .ch("*LASTSAVE, *CURRENT, *CURCHAIN")
+            .keyword_only(),
+            p(
+                "FROMENT",
+                Kind::Text,
+                false,
+                Some("*LASTSAVE"),
+                "Starting sequence number",
+            )
+            .ch("*LASTSAVE, *FIRST, number")
+            .keyword_only(),
+            p(
+                "FROMENTLRG",
+                Kind::Text,
+                false,
+                None,
+                "Starting large sequence number",
+            )
+            .ch("number")
+            .keyword_only(),
+            p(
+                "TOENT",
+                Kind::Text,
+                false,
+                Some("*LASTRST"),
+                "Ending sequence number",
+            )
+            .ch("*LASTRST, number")
+            .keyword_only(),
+            p(
+                "TOENTLRG",
+                Kind::Text,
+                false,
+                None,
+                "Ending large sequence number",
+            )
+            .ch("number")
+            .keyword_only(),
+            p(
+                "CMTBDY",
+                Kind::Name,
+                false,
+                Some("*YES"),
+                "Commitment boundary",
+            )
+            .ch("*YES, *NO")
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "RMVJRNCHG",
+        description: "Remove Journaled Changes",
+        params: &[
+            p("JRN", Kind::Qualified, true, None, "Journal").ch("Name"),
+            p("FILE", Kind::List, true, None, "Journaled physical file").ch("Name, generic*, *ALL"),
+            p(
+                "RCVRNG",
+                Kind::List,
+                false,
+                Some("*LASTSAVE"),
+                "Range of journal receivers",
+            )
+            .ch("*LASTSAVE, *CURRENT, *CURCHAIN")
+            .keyword_only(),
+            p(
+                "FROMENT",
+                Kind::Text,
+                false,
+                Some("*LAST"),
+                "Starting sequence number",
+            )
+            .ch("*LAST, number")
+            .keyword_only(),
+            p(
+                "FROMENTLRG",
+                Kind::Text,
+                false,
+                None,
+                "Starting large sequence number",
+            )
+            .ch("number")
+            .keyword_only(),
+            p(
+                "TOENT",
+                Kind::Text,
+                false,
+                Some("*FIRST"),
+                "Ending sequence number",
+            )
+            .ch("*FIRST, number")
+            .keyword_only(),
+            p(
+                "TOENTLRG",
+                Kind::Text,
+                false,
+                None,
+                "Ending large sequence number",
+            )
+            .ch("number")
+            .keyword_only(),
+            p(
+                "CMTBDY",
+                Kind::Name,
+                false,
+                Some("*YES"),
+                "Commitment boundary",
+            )
+            .ch("*YES, *NO")
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
         name: "ADDPFTRG",
         description: "Add Physical File Trigger",
         params: &[
@@ -2966,6 +3090,8 @@ pub static GROUPS: &[Group] = &[
             "STRJRNPF",
             "ENDJRNPF",
             "DSPJRN",
+            "APYJRNCHG",
+            "RMVJRNCHG",
         ],
     },
     Group {

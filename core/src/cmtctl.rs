@@ -89,7 +89,9 @@ impl Definition {
             )
             .await
             .unwrap_or_default();
+        let held = crate::journal::hold(&self.client).await;
         self.client.batch_execute("ROLLBACK").await?;
+        crate::journal::restore(&self.client, held, true).await?;
         if !open.is_empty() {
             let ids: Vec<i32> = open.iter().map(|r| r.get(0)).collect();
             let cycles: Vec<String> = open.iter().map(|r| r.get(1)).collect();

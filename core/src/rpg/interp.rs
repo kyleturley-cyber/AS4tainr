@@ -40,6 +40,10 @@ mod ptrs;
 pub struct Io<'a> {
     pub rt: Handle,
     pub client: &'a Client,
+    /// Record changes of files not under commitment control go to this
+    /// session instead of `client` (a trigger program runs in the session
+    /// of the change that called it).
+    pub data: Option<&'a Client>,
     pub user: String,
     pub job_number: Option<i64>,
     /// The library list (data areas).
@@ -1703,7 +1707,7 @@ impl<'a> Machine<'a> {
         let cmt = self.files[i].cmt.clone();
         let client: &tokio_postgres::Client = match &cmt {
             Some(d) => &d.client,
-            None => self.io.client,
+            None => self.io.data.unwrap_or(self.io.client),
         };
         let job = self.io.job_number;
         // *LOVAL/*START and *HIVAL/*END positioning.
@@ -1879,71 +1883,7 @@ impl<'a> Machine<'a> {
                     }
                     rec
                 };
-                // A file with trigger programs (ADDPFTRG): the change is
-                // kept only if they end normally.
-                let fref = self.prog.files[i].fref.clone().unwrap();
-                let triggered = match self.files[i].pftrg {
-                    Some(t) => t,
-                    None => {
-                        let t: bool = rt
-                            .block_on(client.query_one(
-                                "SELECT as4tainr_svc.has_pftrg($1, $2)",
-                                &[&fref.library, &fref.file.name],
-                            ))
-                            .map(|r| r.get(0))
-                            .unwrap_or(false);
-                        self.files[i].pftrg = Some(t);
-                        t
-                    }
-                };
-                if triggered {
-                    rt.block_on(client.batch_execute(if cmt.is_some() {
-                        "SAVEPOINT as4tainr_trg"
-                    } else {
-                        "BEGIN"
-                    }))?;
-                }
-                let f = self.files[i].open.as_mut().unwrap();
-                let mut r: Result<()> = match op {
-                    FileOp::Write => rt.block_on(f.write(client, &rec)).map(|_| ()),
-                    FileOp::Update => rt.block_on(async {
-                        f.update(client, &rec).await?;
-                        f.release(client).await
-                    }),
-                    _ => rt.block_on(async {
-                        if let Some(k) = &keys {
-                            let r = f.chain(client, k).await?;
-                            if !r.found {
-                                bail!("CPF5013: The record to delete was not found.");
-                            }
-                        }
-                        f.delete(client).await?;
-                        f.release(client).await
-                    }),
-                };
-                if triggered {
-                    if r.is_ok() {
-                        let who = crate::pftrg::Caller {
-                            database_url: &self.io.database_url,
-                            libl: self.io.libl.clone(),
-                            user: self.io.user.clone(),
-                            job: self.io.job.as_ref().map(|j| j.to_string()),
-                            curlib: self.io.cl.as_ref().and_then(|c| c.curlib.clone()),
-                        };
-                        if let Err(e) =
-                            rt.block_on(crate::pftrg::fire(client, self.io.client, &who))
-                        {
-                            r = Err(e);
-                        }
-                    }
-                    let end = match (&r, cmt.is_some()) {
-                        (Ok(_), true) => "RELEASE SAVEPOINT as4tainr_trg",
-                        (Err(_), true) => "ROLLBACK TO SAVEPOINT as4tainr_trg",
-                        (Ok(_), false) => "COMMIT",
-                        (Err(_), false) => "ROLLBACK",
-                    };
-                    rt.block_on(client.batch_execute(end))?;
-                }
+                let r = self.record_change(i, op, &rec, &keys);
                 match r {
                     Ok(()) => {
                         if let Some(d) = &cmt {
@@ -4200,6 +4140,7 @@ impl<'a> Machine<'a> {
             Io {
                 rt: self.io.rt.clone(),
                 client,
+                data: self.io.data,
                 user: self.io.user.clone(),
                 job_number: self.io.job_number,
                 libl: libl.clone(),
@@ -4456,6 +4397,257 @@ impl<'a> Machine<'a> {
         Ok((back, r?))
     }
 
+    /// WRITE, UPDATE or DELETE on file `i` (calculations or cycle
+    /// output), with the file's trigger programs (ADDPFTRG), in its
+    /// commitment definition or (no commitment control) a transaction of
+    /// its own, or the change session of the trigger program running.
+    pub(super) fn record_change(
+        &mut self,
+        i: usize,
+        op: FileOp,
+        rec: &Record,
+        keys: &Option<Vec<String>>,
+    ) -> Result<()> {
+        let rt = self.io.rt.clone();
+        let cmt = self.files[i].cmt.clone();
+        let client: &Client = match &cmt {
+            Some(d) => &d.client,
+            None => self.io.data.unwrap_or(self.io.client),
+        };
+        let fref = self.prog.files[i].fref.clone().unwrap();
+        let triggered = match self.files[i].pftrg {
+            Some(t) => t,
+            None => {
+                let t: bool = rt
+                    .block_on(client.query_one(
+                        "SELECT as4tainr_svc.has_pftrg($1, $2)",
+                        &[&fref.library, &fref.file.name],
+                    ))
+                    .map(|r| r.get(0))
+                    .unwrap_or(false);
+                self.files[i].pftrg = Some(t);
+                t
+            }
+        };
+        let r: Result<()> = if triggered {
+            let own = cmt.is_none() && self.io.data.is_none();
+            if own {
+                rt.block_on(client.batch_execute("BEGIN"))?;
+            }
+            let (r, keep) = self.triggered_change(i, op, rec, keys, client, cmt.is_some());
+            if own {
+                rt.block_on(client.batch_execute(if r.is_ok() || keep {
+                    "COMMIT"
+                } else {
+                    "ROLLBACK"
+                }))?;
+            }
+            r
+        } else {
+            self.rla_change(i, op, rec, keys, client)
+        };
+        if r.is_ok() && matches!(op, FileOp::Update | FileOp::Delete) {
+            if let Some(f) = self.files[i].open.as_mut() {
+                rt.block_on(f.release(client))?;
+            }
+        }
+        r
+    }
+
+    /// Make a record change (WRITE, UPDATE, DELETE) on file `i`.
+    fn rla_change(
+        &mut self,
+        i: usize,
+        op: FileOp,
+        rec: &Record,
+        keys: &Option<Vec<String>>,
+        client: &Client,
+    ) -> Result<()> {
+        let rt = self.io.rt.clone();
+        let f = self.files[i].open.as_mut().unwrap();
+        match op {
+            FileOp::Write => rt.block_on(f.write(client, rec)).map(|_| ()),
+            FileOp::Update => rt.block_on(f.update(client, rec)),
+            _ => rt.block_on(async {
+                if let Some(k) = keys {
+                    let r = f.chain(client, k).await?;
+                    if !r.found {
+                        bail!("CPF5013: The record to delete was not found.");
+                    }
+                }
+                f.delete(client).await
+            }),
+        }
+    }
+
+    /// A record change on a file with trigger programs (ADDPFTRG), in the
+    /// open transaction of `client` ([`crate::pftrg::Change`]): the
+    /// result, and whether to keep the change though it is an error.
+    fn triggered_change(
+        &mut self,
+        i: usize,
+        op: FileOp,
+        rec: &Record,
+        keys: &Option<Vec<String>>,
+        client: &Client,
+        cmt: bool,
+    ) -> (Result<()>, bool) {
+        let rt = self.io.rt.clone();
+        let catalog = self.io.client;
+        let mut ch = match rt.block_on(crate::pftrg::Change::start(client, catalog, cmt)) {
+            Ok(c) => c,
+            Err(e) => return (Err(e), false),
+        };
+        let at = self.files[i].open.as_ref().and_then(|f| f.current_rrn());
+        let mut r = self.rla_change(i, op, rec, keys, client);
+        if rt.block_on(ch.probed(&r)) {
+            if let Some(f) = self.files[i].open.as_mut() {
+                f.set_current_rrn(at);
+            }
+            r = self.rla_change(i, op, rec, keys, client);
+            let groups = match rt.block_on(ch.trial_made(r.is_ok())) {
+                Ok(g) => g,
+                Err(e) => return rt.block_on(ch.failed(e)),
+            };
+            if r.is_err() {
+                return (r, false);
+            }
+            for g in groups {
+                let mut new = g[0].new.clone();
+                let mut replaced = false;
+                for e in &g {
+                    let mut e = e.clone();
+                    e.new = new.clone();
+                    match self.call_trigger(&e, client) {
+                        Ok(buf) => {
+                            if let Some(img) = crate::pftrg::changed_new_image(&e, &buf) {
+                                let nulls = new.as_ref().map(|n| n.1.clone()).unwrap_or_default();
+                                new = Some((img, nulls));
+                                replaced = true;
+                            }
+                        }
+                        Err(err) => return rt.block_on(ch.failed(err)),
+                    }
+                }
+                if let Err(err) = rt.block_on(ch.redo(&g[0], &new, replaced)) {
+                    return rt.block_on(ch.failed(err));
+                }
+            }
+            if let Err(err) = rt.block_on(ch.again()) {
+                return rt.block_on(ch.failed(err));
+            }
+            if let Some(f) = self.files[i].open.as_mut() {
+                f.set_current_rrn(at);
+            }
+            r = self.rla_change(i, op, rec, keys, client);
+        }
+        let after = match rt.block_on(ch.made(r.is_ok())) {
+            Ok(a) => a,
+            Err(e) => return rt.block_on(ch.failed(e)),
+        };
+        if r.is_err() {
+            return (r, false);
+        }
+        for e in &after {
+            if let Err(err) = self.call_trigger(e, client) {
+                return rt.block_on(ch.failed(err));
+            }
+        }
+        let _ = rt.block_on(ch.done());
+        (r, false)
+    }
+
+    /// Call a trigger program for a change, in this thread, with its
+    /// record changes in session `data` (the change's): the trigger
+    /// buffer as it left it. An error is CPF502B.
+    fn call_trigger(&mut self, e: &crate::pftrg::Event, data: &Client) -> Result<Vec<u8>> {
+        let client = self.io.client;
+        let when = crate::pftrg::when(e);
+        let p = self
+            .block(crate::catalog::find_program(
+                client,
+                std::slice::from_ref(&e.pgm_lib),
+                &e.pgm,
+            ))?
+            .ok_or_else(|| {
+                anyhow!(
+                    "CPF502B: Trigger program {}/{} for file {}/{} not found ({when} the change).",
+                    e.pgm_lib,
+                    e.pgm,
+                    e.lib,
+                    e.file
+                )
+            })?;
+        if !matches!(p.attribute.as_str(), "RPGLE" | "SQLRPGLE" | "RPG") {
+            bail!(
+                "CPF502B: Trigger program {}/{} is a {} program; as4tainr calls RPG trigger programs ({when} the change).",
+                p.library,
+                p.name,
+                p.attribute
+            );
+        }
+        if p.name == self.prog.name || self.io.callers.contains(&p.name) {
+            bail!(
+                "CPF502B: Trigger program {}/{} is already active in the job ({when} the change).",
+                p.library,
+                p.name
+            );
+        }
+        let libl = self.io.libl.clone();
+        let callee = self.block(super::compile_with(
+            client, &libl, &p.name, &p.source, &p.options,
+        ))?;
+        let group = program_group(&callee, &self.io.actgrp);
+        let buf = crate::pftrg::buffer(e);
+        let mut parms = vec![buf.clone(), (buf.len() as i32).to_be_bytes().to_vec()];
+        let rt = self.io.rt.clone();
+        let back = rt.block_on(crate::pftrg::set_program(data, &p.name, &p.library));
+        let r = {
+            let mut m = Machine::new(
+                &callee,
+                Io {
+                    rt: self.io.rt.clone(),
+                    client,
+                    data: Some(data),
+                    user: self.io.user.clone(),
+                    job_number: self.io.job_number,
+                    libl,
+                    job: self.io.job.clone(),
+                    display: self.io.display.clone(),
+                    cl: self.io.cl.clone(),
+                    callers: {
+                        let mut c = self.io.callers.clone();
+                        c.push(self.prog.name.clone());
+                        c
+                    },
+                    database_url: self.io.database_url.clone(),
+                    job_key: self.io.job_key.clone(),
+                    binding: p.binding.map(std::sync::Arc::new),
+                    unit: None,
+                    modules: Default::default(),
+                    actgrp: group,
+                    program: format!("{}/{}", p.library, p.name),
+                    shared: Default::default(),
+                },
+            );
+            let r = m.run_bytes(&mut parms);
+            self.messages.append(&mut m.messages);
+            self.printed.append(&mut m.printed);
+            r
+        };
+        rt.block_on(crate::pftrg::set_program(data, &back.0, &back.1));
+        if let Err(err) = r {
+            bail!(
+                "CPF502B: Error in trigger program {}/{} for file {}/{} ({when} the change): {err:#}",
+                p.library,
+                p.name,
+                e.lib,
+                e.file
+            );
+        }
+        Ok(parms.into_iter().next().unwrap_or_default())
+    }
+
     fn call_program(&mut self, name: &str, locs: &[Loc]) -> Result<()> {
         if self.system_program(name, locs)? {
             return Ok(());
@@ -4563,6 +4755,7 @@ impl<'a> Machine<'a> {
                 Io {
                     rt: self.io.rt.clone(),
                     client,
+                    data: self.io.data,
                     user: self.io.user.clone(),
                     job_number: self.io.job_number,
                     libl: libl.clone(),

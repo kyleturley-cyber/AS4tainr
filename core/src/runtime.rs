@@ -7,6 +7,25 @@ use crate::workstn::Frame;
 use anyhow::Result;
 use tokio_postgres::{Client, NoTls};
 
+/// The database session a program's record changes go to when it is not
+/// its own: a trigger program runs in the session (and transaction) of
+/// the change that called it — an SQL statement's, or a commitment
+/// definition's.
+#[derive(Clone)]
+pub enum DataSession {
+    Sql(std::sync::Arc<Client>),
+    Cmt(std::sync::Arc<crate::cmtctl::Definition>),
+}
+
+impl DataSession {
+    pub fn client(&self) -> &Client {
+        match self {
+            DataSession::Sql(c) => c,
+            DataSession::Cmt(d) => &d.client,
+        }
+    }
+}
+
 /// A database session of its own (each program call, each job).
 pub async fn connect_db(url: &str) -> Result<Client> {
     let (client, conn) = tokio_postgres::connect(url, NoTls).await?;

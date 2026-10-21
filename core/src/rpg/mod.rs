@@ -286,6 +286,7 @@ pub async fn call_with(
         name,
         code,
         Ok(args),
+        None,
     )
     .await
     .map(|r| r.0)
@@ -304,6 +305,7 @@ pub async fn call_bytes(
     name: String,
     code: ProgramCode,
     parms: Vec<Vec<u8>>,
+    data: Option<crate::runtime::DataSession>,
 ) -> Result<(CallResult, Vec<Vec<u8>>)> {
     call_any(
         database_url,
@@ -315,6 +317,7 @@ pub async fn call_bytes(
         name,
         code,
         Err(parms),
+        data,
     )
     .await
 }
@@ -330,6 +333,7 @@ async fn call_any(
     name: String,
     code: ProgramCode,
     args: std::result::Result<Vec<String>, Vec<Vec<u8>>>,
+    data: Option<crate::runtime::DataSession>,
 ) -> Result<(CallResult, Vec<Vec<u8>>)> {
     let ProgramCode {
         library,
@@ -372,6 +376,7 @@ async fn call_any(
         let mut m = interp::Machine::new(
             &prog,
             interp::Io {
+                data: data.as_ref().map(|d| d.client()),
                 rt: rt.clone(),
                 client: &client,
                 user,
@@ -491,6 +496,7 @@ pub async fn call_procedure(
         let mut m = interp::Machine::new(
             &prog,
             interp::Io {
+                data: None,
                 rt: rt.clone(),
                 client: &client,
                 user,

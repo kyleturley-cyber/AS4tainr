@@ -19,7 +19,7 @@ use tokio_postgres::Client;
 use crate::sql::SQL_ROLE;
 
 /// The services' version: change it whenever a definition below changes.
-const VERSION: &str = "as4tainr services 6";
+const VERSION: &str = "as4tainr services 7";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.

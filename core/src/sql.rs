@@ -1078,13 +1078,12 @@ pub async fn run_as(
     let path: Vec<String> = libl.iter().map(|l| ident(l)).collect();
     // One transaction per statement (COMMIT(*NONE)), on a connection of
     // its own as the SQL role.
-    let sql_client = connect_as_sql_role(client, database_url).await?;
+    let sql_client = std::sync::Arc::new(connect_as_sql_role(client, database_url).await?);
     sql_client.batch_execute(&context).await?;
     sql_client.batch_execute("BEGIN").await?;
-    let mut result = run_in_transaction(&sql_client, &t, &text, &path).await;
-    // Trigger programs (ADDPFTRG) for the changes, before they are
-    // committed; one that fails undoes the statement (SQL0443).
-    if result.is_ok() && t.kind != Kind::Query {
+    // Trigger programs (ADDPFTRG) for the changes, in this transaction; one
+    // that fails ends the statement in SQL0443.
+    let (result, keep) = if t.kind != Kind::Query && crate::pftrg::any(&sql_client).await {
         let who = crate::pftrg::Caller {
             database_url,
             libl: libl.to_vec(),
@@ -1092,15 +1091,33 @@ pub async fn run_as(
             job: job.clone(),
             curlib: curlib.clone(),
         };
-        if let Err(e) = crate::pftrg::fire(&sql_client, client, &who).await {
-            result = Err(trigger_failed(e));
-        }
-    }
-    match &result {
-        Ok(_) => sql_client.batch_execute("COMMIT").await?,
-        Err(_) => sql_client.batch_execute("ROLLBACK").await?,
+        let data = crate::runtime::DataSession::Sql(sql_client.clone());
+        let (r, keep) = crate::pftrg::run(data, client, &who, false, || {
+            run_in_transaction(&sql_client, &t, &text, &path)
+        })
+        .await;
+        (r.map_err(trigger_failed_if), keep)
+    } else {
+        (
+            run_in_transaction(&sql_client, &t, &text, &path).await,
+            false,
+        )
+    };
+    if result.is_ok() || keep {
+        sql_client.batch_execute("COMMIT").await?
+    } else {
+        sql_client.batch_execute("ROLLBACK").await?
     }
     result
+}
+
+/// SQL0443 for a trigger program's error (CPF502B); others as they are.
+fn trigger_failed_if(e: anyhow::Error) -> anyhow::Error {
+    if format!("{e}").starts_with("CPF502B") {
+        trigger_failed(e)
+    } else {
+        e
+    }
 }
 
 /// A trigger program failed: SQL0443 for the statement (Db2 for i: a
@@ -1446,7 +1463,7 @@ pub enum Exec {
 /// the SQL role, the job's library list as the search path, each
 /// statement committed when it succeeds (COMMIT(*NONE)).
 pub struct Session {
-    client: Client,
+    client: std::sync::Arc<Client>,
     /// Run under commitment control: statements run in the commitment
     /// definition's unit of work, not committed when they end.
     cmt: Option<std::sync::Arc<crate::cmtctl::Definition>>,
@@ -1522,7 +1539,7 @@ impl Session {
             context: None,
             program: None,
             database_url: database_url.to_string(),
-            client: sql_client,
+            client: std::sync::Arc::new(sql_client),
             cmt: None,
             libraries: catalog::list_libraries(client).await?,
             libl: libl.to_vec(),
@@ -1559,15 +1576,14 @@ impl Session {
             // A change: committed when its trigger programs (if any) end
             // normally.
             self.client.batch_execute("BEGIN").await?;
-            let mut r = self.exec_on(&self.client, &t, text).await;
-            if r.is_ok() {
-                if let Err(e) = self.fire_triggers(&self.client, catalog_client).await {
-                    r = Err(trigger_failed(e));
-                }
-            }
-            match &r {
-                Ok(_) => self.client.batch_execute("COMMIT").await?,
-                Err(_) => self.client.batch_execute("ROLLBACK").await?,
+            let data = crate::runtime::DataSession::Sql(self.client.clone());
+            let (r, keep) = self
+                .exec_change(data, catalog_client, &t, &text, false)
+                .await;
+            if r.is_ok() || keep {
+                self.client.batch_execute("COMMIT").await?
+            } else {
+                self.client.batch_execute("ROLLBACK").await?
             }
             return r;
         };
@@ -1595,29 +1611,42 @@ impl Session {
                 )
                 .await?;
         }
-        let mut r = self.exec_on(&d.client, &t, text).await;
-        if r.is_ok() && t.kind != Kind::Query {
-            if let Err(e) = self.fire_triggers(&d.client, catalog_client).await {
-                r = Err(trigger_failed(e));
-            }
-        }
+        let r = if t.kind == Kind::Query {
+            self.exec_on(&d.client, &t, text).await
+        } else {
+            let data = crate::runtime::DataSession::Cmt(d.clone());
+            self.exec_change(data, catalog_client, &t, &text, true)
+                .await
+                .0
+        };
         match &r {
             Ok(_) => {
                 d.client
                     .batch_execute("RELEASE SAVEPOINT as4tainr_stmt")
                     .await?
             }
-            Err(_) => {
-                d.client
-                    .batch_execute("ROLLBACK TO SAVEPOINT as4tainr_stmt")
-                    .await?
-            }
+            // The statement's changes are taken back (and journaled).
+            Err(_) => crate::journal::rollback_to(&d.client, "as4tainr_stmt").await?,
         }
         r
     }
 
-    /// Call the trigger programs for the changes the statement made.
-    async fn fire_triggers(&self, client: &Client, catalog: &Client) -> Result<()> {
+    /// Make a change with the trigger programs of its files (ADDPFTRG):
+    /// the result, and whether to keep the change though it is an error.
+    async fn exec_change(
+        &self,
+        data: crate::runtime::DataSession,
+        catalog: &Client,
+        t: &Translated,
+        text: &str,
+        cmt: bool,
+    ) -> (Result<Exec>, bool) {
+        if !crate::pftrg::any(data.client()).await {
+            return (
+                self.exec_on(data.client(), t, text.to_string()).await,
+                false,
+            );
+        }
         let (user, curlib, job) = match &self.context {
             Some((u, c, j)) => (u.clone(), c.clone(), j.clone()),
             None => ("QSECOFR".to_string(), None, None),
@@ -1629,7 +1658,12 @@ impl Session {
             job,
             curlib,
         };
-        crate::pftrg::fire(client, catalog, &who).await
+        let c = data.clone();
+        let (r, keep) = crate::pftrg::run(data, catalog, &who, cmt, || {
+            self.exec_on(c.client(), t, text.to_string())
+        })
+        .await;
+        (r.map_err(trigger_failed_if), keep)
     }
 
     async fn exec_on(&self, client: &Client, t: &Translated, text: String) -> Result<Exec> {

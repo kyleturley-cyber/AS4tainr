@@ -2396,6 +2396,9 @@ impl Job<'_> {
                 catalog::ident(&name)
             ))
             .await?;
+        // A journaled file: F CR, member cleared.
+        let job = self.id.as_ref().map(|i| i.to_string()).unwrap_or_default();
+        crate::journal::file_cleared(self.client, &fr.library, &name, (&job, &self.user)).await?;
         let mbr = match cmd.get("MBR") {
             "*FIRST" | "*LAST" | "" => name.clone(),
             m => m.to_ascii_uppercase(),

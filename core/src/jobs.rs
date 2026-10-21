@@ -207,6 +207,10 @@ pub async fn start_interactive(
 pub async fn end(client: &Client, id: &JobId, normal: bool) -> Result<()> {
     // Its commitment definitions end: what is pending is rolled back.
     crate::cmtctl::end_job(&id.to_string()).await;
+    // Its open stream files are closed.
+    for (path, data) in crate::rpg::interp::crt::end_job(&id.to_string()) {
+        let _ = crate::ifs::write_file(client, &path, &data, 37, 0o644, "QSECOFR").await;
+    }
     client
         .execute(
             "UPDATE as4tainr.jobs SET status='OUTQ', ended=now(), function='', activity='',

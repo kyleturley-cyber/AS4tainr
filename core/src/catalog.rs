@@ -238,6 +238,9 @@ pub async fn init(client: &Client) -> Result<()> {
             .batch_execute(crate::source::DDL)
             .await
             .context("creating catalog")?;
+        crate::ifs::init(client)
+            .await
+            .context("creating the integrated file system")?;
         client
             .batch_execute(crate::jobs::DDL)
             .await

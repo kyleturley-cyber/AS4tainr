@@ -200,7 +200,7 @@ pub async fn bnddir_entries(
 pub const SYSTEM_BNDDIRS: &[&str] = &["QC2LE", "QUSAPIBD"];
 
 /// Procedures of the system's service programs that as4tainr provides.
-pub const SYSTEM_PROCEDURES: &[&str] = &["QP0ZLPRINTF"];
+pub const SYSTEM_PROCEDURES: &[&str] = crate::rpg::interp::crt::C_FUNCTIONS;
 
 /// A service program's binding, found through the library list (or in
 /// the library named).

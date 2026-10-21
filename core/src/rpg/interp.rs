@@ -21,6 +21,8 @@ use tokio_postgres::Client;
 
 #[path = "bifs.rs"]
 mod bifs;
+#[path = "crt.rs"]
+pub mod crt;
 #[path = "cycle.rs"]
 mod cycle;
 #[path = "errors.rs"]
@@ -31,6 +33,8 @@ mod exec_sql;
 mod ops;
 #[path = "printer.rs"]
 mod printer;
+#[path = "ptrs.rs"]
+mod ptrs;
 
 /// What the program runs with: the database, the job.
 pub struct Io<'a> {
@@ -78,7 +82,7 @@ pub type SharedData = std::sync::Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>
 /// termination"): what its next call in the activation group finds — its
 /// storage, indicators, open files and the storage of its bound modules.
 struct Active {
-    bufs: Vec<Vec<u8>>,
+    bufs: super::mem::Mem,
     inds: HashMap<String, bool>,
     files: Vec<Option<OpenFile>>,
     modules: HashMap<String, Vec<Vec<u8>>>,
@@ -225,7 +229,15 @@ enum Flow {
 
 pub struct Machine<'a> {
     prog: &'a Program,
-    bufs: Vec<Vec<u8>>,
+    bufs: super::mem::Mem,
+    /// This run's number in pointers to its storage.
+    owner: u32,
+    /// A pointer that addressed nothing during the statement running.
+    ptr_fault: std::cell::RefCell<Option<String>>,
+    /// Heap blocks holding OPTIONS(*STRING) arguments of calls running.
+    temp_strings: Vec<usize>,
+    /// The heap block of errno (C runtime).
+    errno_block: Option<usize>,
     /// Indicators: 01-99 and the named ones (LR, RT, KA-KY, H1-H9,
     /// L1-L9, OF, OV, OA-OG, U1-U8, 1P, MR).
     inds: HashMap<String, bool>,
@@ -341,6 +353,11 @@ struct Printer {
     out_pos: (i32, i32),
 }
 
+/// The bytes a variable (all its elements) takes.
+fn var_span(v: &VarInfo) -> usize {
+    v.stride * (v.dim.max(1) as usize - 1) + v.dtype.size()
+}
+
 /// Function key indicators *INKA-*INKY for F1-F24 (there is no *INKO).
 const FKEYS: &[u8; 24] = b"ABCDEFGHIJKLMNPQRSTUVWXY";
 
@@ -373,7 +390,15 @@ impl<'a> Machine<'a> {
     pub fn new(prog: &'a Program, io: Io<'a>) -> Machine<'a> {
         Machine {
             prog,
-            bufs: prog.globals.clone(),
+            bufs: {
+                let mut m = super::mem::Mem::new(prog.globals.clone());
+                m.scratch(Self::largest_based(prog));
+                m
+            },
+            owner: super::mem::new_owner(),
+            ptr_fault: Default::default(),
+            temp_strings: Vec::new(),
+            errno_block: None,
             inds: HashMap::new(),
             files: prog
                 .files
@@ -483,18 +508,39 @@ impl<'a> Machine<'a> {
                 };
                 return Some(match s.clone() {
                     Sym::Var(mut v) if v.local => {
-                        (v.buf, v.off) = place(v.buf, v.off);
+                        (v.buf, v.off) = match f.proc.based.get(&v.buf) {
+                            Some(p) => self.based_place(p, v.off, var_span(&v)),
+                            None => place(v.buf, v.off),
+                        };
                         v.local = false;
                         Sym::Var(v)
                     }
                     Sym::Ds(mut d) if d.local => {
-                        (d.buf, d.off) = place(d.buf, d.off);
+                        (d.buf, d.off) = match f.proc.based.get(&d.buf) {
+                            Some(p) => self.based_place(p, d.off, d.size * d.dim.max(1) as usize),
+                            None => place(d.buf, d.off),
+                        };
                         d.local = false;
                         Sym::Ds(d)
                     }
                     other => other,
                 });
             }
+        }
+        // Based storage: where its pointer points now.
+        match self.prog.syms.get(name) {
+            Some(Sym::Var(v)) if self.prog.based.contains_key(&v.buf) => {
+                let mut v = v.clone();
+                (v.buf, v.off) = self.based_place(&self.prog.based[&v.buf], v.off, var_span(&v));
+                return Some(Sym::Var(v));
+            }
+            Some(Sym::Ds(d)) if self.prog.based.contains_key(&d.buf) => {
+                let mut d = d.clone();
+                let size = d.size * d.dim.max(1) as usize;
+                (d.buf, d.off) = self.based_place(&self.prog.based[&d.buf], d.off, size);
+                return Some(Sym::Ds(d));
+            }
+            _ => {}
         }
         // A subfield of a multiple-occurrence data structure: in the
         // current occurrence.
@@ -627,7 +673,20 @@ impl<'a> Machine<'a> {
         }
     }
 
+    /// Storage reached through a pointer that addresses nothing: the
+    /// pointer fault, as the error.
+    fn check_buf(&self, buf: usize) -> Result<()> {
+        if buf == super::mem::BAD_BUF {
+            let f = self
+                .take_fault()
+                .unwrap_or_else(|| "MCH3601: the pointer does not address storage.".to_string());
+            bail!(f);
+        }
+        Ok(())
+    }
+
     fn load_var(&self, v: &VarInfo, index: Option<i128>) -> Result<Value> {
+        self.check_buf(v.buf)?;
         let off = self.elem_off(v, index)?;
         data::load(&v.dtype, &self.bufs[v.buf][off..off + v.dtype.size()])
     }
@@ -640,6 +699,7 @@ impl<'a> Machine<'a> {
         fit: Fit,
         right: bool,
     ) -> Result<()> {
+        self.check_buf(v.buf)?;
         let offs: Vec<usize> = match index {
             // Assigning to an array without an index sets every element.
             None if v.dim > 0 => (0..v.dim as usize).map(|k| v.off + k * v.stride).collect(),
@@ -720,6 +780,7 @@ impl<'a> Machine<'a> {
                     }
                     Some(Sym::Const(c)) => c,
                     Some(Sym::Ds(d)) => {
+                        self.check_buf(d.buf)?;
                         let off = self.ds_element(&d, args)?;
                         Value::Char(self.bufs[d.buf][off..off + d.size].to_vec())
                     }
@@ -769,6 +830,9 @@ impl<'a> Machine<'a> {
                     && (matches!(y, Value::Dur(..)) || matches!(x, Value::Dur(..)))
                 {
                     return self.date_arith(*op, x, y);
+                }
+                if let Some(r) = self.ptr_arith(op, &x, &y) {
+                    return r;
                 }
                 match op {
                     BinOp::Add => match (&x, &y) {
@@ -1123,7 +1187,40 @@ impl<'a> Machine<'a> {
                     code.chars().next().unwrap_or('Z'),
                 ))
             }
-            "ADDR" | "PADDR" => Value::Fig(Fig::Null),
+            "ADDR" => {
+                // %ADDR(name), %ADDR(array(i)), %ADDR(varying: *DATA).
+                let Some(target) = args.first() else {
+                    bail!("%ADDR needs a variable");
+                };
+                let l = self.loc_of(target)?;
+                let data = args.get(1).is_some_and(
+                    |a| matches!(a, Expr::Name { parts, .. } if parts.len() == 1 && parts[0] == "*DATA"),
+                );
+                let skip = match (data, l.dtype) {
+                    (true, DType::Varchar(_) | DType::VarUcs2(_)) => 2,
+                    _ => 0,
+                };
+                self.ptr_to(l.buf, l.off + skip)
+            }
+            // Procedure pointers are not supported yet: *NULL.
+            "PADDR" => Value::Fig(Fig::Null),
+            "ALLOC" => {
+                let n = arg(self, 0)?;
+                self.alloc(&n)?
+            }
+            "REALLOC" => {
+                let p = arg(self, 0)?;
+                let n = arg(self, 1)?;
+                self.realloc(&p, &n)?
+            }
+            "STR" => {
+                let p = arg(self, 0)?;
+                let max = match args.get(1) {
+                    Some(m) => Some(self.eval(m)?.num()?.to_i128()? as usize),
+                    None => None,
+                };
+                self.str_at(&p, max)?
+            }
             "PARMS" => Value::Num(Dec::from_i64(match self.frames.last() {
                 Some(f) => f.passed,
                 None => self.parms_passed,
@@ -1180,6 +1277,15 @@ impl<'a> Machine<'a> {
                         .copy_from_slice(&arr.var.dtype.initial());
                 }
                 self.var_elems.insert(arr.name, n as u32);
+            }
+            Expr::Bif(b, args) if b == "STR" => {
+                // %STR(ptr: max) = value.
+                let (Some(p), Some(m)) = (args.first(), args.get(1)) else {
+                    bail!("%STR as a target needs a pointer and a maximum length");
+                };
+                let p = self.eval(p)?;
+                let max = self.eval(m)?.num()?.to_i128()? as usize;
+                self.store_str(&p, max, val)?;
             }
             Expr::Bif(b, args) if b == "OCCUR" => {
                 let n = val.num()?.to_i128()?;
@@ -2206,7 +2312,30 @@ impl<'a> Machine<'a> {
         })
     }
 
+    /// A statement; a pointer that addressed nothing while it ran is its
+    /// error (status 00222).
     fn stmt(&mut self, s: &Stmt) -> Result<()> {
+        let r = self.stmt_inner(s);
+        match (r, self.take_fault()) {
+            (Err(e), _) if errors::is_signal(&e) => Err(e),
+            (_, Some(f)) => Err(anyhow!(f)),
+            (r, None) => r,
+        }
+    }
+
+    /// The pointer fault of the statement running, if any.
+    fn take_fault(&self) -> Option<String> {
+        self.ptr_fault.borrow_mut().take()
+    }
+
+    fn fault(&self, text: String) {
+        let mut f = self.ptr_fault.borrow_mut();
+        if f.is_none() {
+            *f = Some(text);
+        }
+    }
+
+    fn stmt_inner(&mut self, s: &Stmt) -> Result<()> {
         match s {
             Stmt::Sql(text) => self.exec_sql(text)?,
             Stmt::Eval {
@@ -2401,7 +2530,8 @@ impl<'a> Machine<'a> {
                 ext,
                 ind,
             } => {
-                if !(self.string_op(code, f1, f2, result, ext, ind)?
+                if !(self.storage_op(code, f2, result, ext)?
+                    || self.string_op(code, f1, f2, result, ext, ind)?
                     || self.array_op(code, f1, f2, result, ext, ind)?
                     || self.bit_op(code, f1, f2, result, ind)?)
                 {
@@ -2607,7 +2737,7 @@ impl<'a> Machine<'a> {
                     )
                 })?;
             }
-            "DEFINE" | "FORCE" | "DUMP" | "DEALLOC" => {}
+            "DEFINE" | "FORCE" | "DUMP" => {}
             // CALLP(E): the call, its errors taken by the extender.
             "CALLP" => {
                 if let Some(x) = f2 {
@@ -2865,6 +2995,12 @@ impl<'a> Machine<'a> {
                     }
                 })
             })();
+            // A pointer fault in a condition (IF, DOW...).
+            let step = match (step, self.take_fault()) {
+                (Err(e), _) if errors::is_signal(&e) => Err(e),
+                (_, Some(f)) => Err(anyhow!(f)),
+                (s, None) => s,
+            };
             match step {
                 Ok(Some(t)) => pc = t,
                 Ok(None) => pc += 1,
@@ -3086,6 +3222,8 @@ impl<'a> Machine<'a> {
         // An activation group *NEW ends with the program.
         // (A source run outside a library, by `as4tainr call` or the
         // tests, is not a program object: nothing stays active.)
+        // What the program wrote to stream files still open is stored.
+        self.c_flush();
         let keep = r.is_ok()
             && (prog.main.is_some() || !self.ind("LR"))
             && !self.io.actgrp.starts_with("*NEW")
@@ -3098,8 +3236,11 @@ impl<'a> Machine<'a> {
         }
         if keep {
             let globals = self.prog.globals.len();
+            let mut kept = super::mem::Mem::new(self.bufs.own[..globals].to_vec());
+            // Heap storage lives as long as the activation.
+            kept.heap = std::mem::take(&mut self.bufs.heap);
             let a = Active {
-                bufs: self.bufs[..globals].to_vec(),
+                bufs: kept,
                 inds: self.inds.clone(),
                 files: self.files.iter_mut().map(|f| f.open.take()).collect(),
                 modules: self
@@ -3382,6 +3523,11 @@ impl<'a> Machine<'a> {
             _ => bail!("a variable is needed for a parameter passed by reference, found {ex:?}"),
         };
         let name = parts.join(".");
+        match &sym {
+            Some(Sym::Var(v)) => self.check_buf(v.buf)?,
+            Some(Sym::Ds(d)) => self.check_buf(d.buf)?,
+            _ => {}
+        }
         match sym {
             Some(Sym::Var(v)) => {
                 let index = self.index_of(args)?;
@@ -3460,7 +3606,19 @@ impl<'a> Machine<'a> {
                 }
                 Arg::Omit
             } else if p.by_value || p.konst {
-                Arg::Val(self.eval(a)?)
+                let v = self.eval(a)?;
+                // OPTIONS(*STRING): a character value goes as a pointer to
+                // a null-terminated copy (ILE RPG Reference, OPTIONS).
+                if p.string && p.dtype == DType::Pointer && matches!(v, Value::Char(_)) {
+                    let mut bytes = v.chars()?;
+                    bytes.push(0);
+                    let h = self.bufs.heap.alloc(bytes.len());
+                    self.bufs.heap.blocks[h] = bytes;
+                    self.temp_strings.push(h);
+                    Arg::Val(self.ptr_to(super::mem::HEAP_BASE + h, 0))
+                } else {
+                    Arg::Val(v)
+                }
             } else {
                 Arg::Ref(self.loc_of(a)?)
             });
@@ -3472,6 +3630,22 @@ impl<'a> Machine<'a> {
     /// a prototype for one or for a program (EXTPGM). Returns the
     /// procedure's return value.
     fn call_named(&mut self, name: &str, args: &[Expr]) -> Result<Option<Value>> {
+        let mark = self.temp_strings.len();
+        let r = self.call_named_inner(name, args);
+        // The OPTIONS(*STRING) copies last as long as the call.
+        for h in self.temp_strings.split_off(mark) {
+            if let (Some(f), Some(b)) = (
+                self.bufs.heap.freed.get_mut(h),
+                self.bufs.heap.blocks.get_mut(h),
+            ) {
+                *f = true;
+                *b = Vec::new();
+            }
+        }
+        r
+    }
+
+    fn call_named_inner(&mut self, name: &str, args: &[Expr]) -> Result<Option<Value>> {
         let prog: &'a Program = self.prog;
         if let Some(pi) = prog.procs.get(name) {
             let a = self.args_for(name, &pi.params, args)?;
@@ -3532,15 +3706,18 @@ impl<'a> Machine<'a> {
                 let a = self.args_for(name, &pr.params, args)?;
                 self.call_proc(pi, a)
             }
-            None if target == "QP0ZLPRINTF" => {
-                // Qp0zLprintf (C runtime): printf-style text to the job log.
-                let mut vals = Vec::new();
-                for a in args {
-                    vals.push(self.eval(a)?);
+            None if crt::C_FUNCTIONS.contains(&target.to_ascii_uppercase().as_str()) => {
+                // A C runtime or UNIX-type function. Arguments beyond the
+                // prototype's go as values (printf's variable list).
+                let n = args.len().min(pr.params.len());
+                let mut a = self.args_for(name, &pr.params, &args[..n])?;
+                a.truncate(n);
+                for x in &args[n..] {
+                    a.push(Arg::Val(self.eval(x)?));
                 }
-                let text = self.printf(&vals)?;
-                self.job_log(&text);
-                Ok(Some(Value::Num(Dec::from_i64(text.len() as i64))))
+                let sym = target.to_ascii_uppercase();
+                let v = self.c_call(&sym, &a).expect("a C function")?;
+                Ok(Some(v))
             }
             None => {
                 let sym = target.to_ascii_uppercase();
@@ -3684,7 +3861,7 @@ impl<'a> Machine<'a> {
             },
         );
         if let Some(s) = storage {
-            m.bufs = s;
+            m.bufs.own = s;
         }
         // Exported data: the caller's changes go to the shared copy, the
         // callee sees them.
@@ -3692,37 +3869,41 @@ impl<'a> Machine<'a> {
         m.share_seed();
         m.share_in();
         let globals = m.bufs.len();
-        // Parameters by reference: the callee works on a copy that comes
-        // back when it returns.
-        let mut back = Vec::new();
+        // The caller's storage and the heap are lent to the callee for the
+        // call: parameters by reference and pointers address them there.
+        let k = self.bufs.lent.len();
+        m.bufs.lent = std::mem::take(&mut self.bufs.lent);
+        m.bufs
+            .lent
+            .push((self.owner, std::mem::take(&mut self.bufs.own)));
+        m.bufs.heap = std::mem::take(&mut self.bufs.heap);
+        let lent = |b: usize| -> usize {
+            if b < super::mem::HEAP_BASE {
+                super::mem::LENT_BASE + (k << 24) + b
+            } else {
+                b
+            }
+        };
         let args: Vec<Arg> = args
             .into_iter()
             .map(|a| match a {
-                Arg::Ref(l) => {
-                    let idx = m.bufs.len();
-                    m.bufs
-                        .push(self.bufs[l.buf][l.off..l.off + l.size].to_vec());
-                    back.push((idx, l));
-                    Arg::Ref(Loc {
-                        buf: idx,
-                        off: 0,
-                        size: l.size,
-                        dtype: l.dtype,
-                    })
-                }
+                Arg::Ref(l) => Arg::Ref(Loc {
+                    buf: lent(l.buf),
+                    ..l
+                }),
                 other => other,
             })
             .collect();
         let r = m.call_proc(pi, args);
         m.share_out();
+        // The caller's storage comes back.
+        self.bufs.own = m.bufs.lent.pop().map(|l| l.1).unwrap_or_default();
+        self.bufs.lent = std::mem::take(&mut m.bufs.lent);
+        self.bufs.heap = std::mem::take(&mut m.bufs.heap);
         self.share_in();
         self.messages.append(&mut m.messages);
         self.printed.append(&mut m.printed);
-        for (idx, l) in &back {
-            let bytes = m.bufs[*idx].clone();
-            self.bufs[l.buf][l.off..l.off + l.size].copy_from_slice(&bytes[..l.size]);
-        }
-        let kept: Vec<Vec<u8>> = m.bufs[..globals].to_vec();
+        let kept: Vec<Vec<u8>> = m.bufs.own[..globals].to_vec();
         if srvpgm {
             crate::ile::keep_activation(&self.io.job_key, &group, &unit, kept);
         } else if let Ok(mut g) = self.io.modules.lock() {
@@ -3837,12 +4018,12 @@ impl<'a> Machine<'a> {
     /// when it returns.
     /// The module's global storage (kept in its activation).
     pub fn storage(&self, globals: usize) -> Vec<Vec<u8>> {
-        self.bufs[..globals].to_vec()
+        self.bufs.own[..globals].to_vec()
     }
 
     /// The module's global storage as its activation left it.
     pub fn set_storage(&mut self, s: Vec<Vec<u8>>) {
-        self.bufs = s;
+        self.bufs.own = s;
     }
 
     /// Call an exported procedure of this module with values (CALLPRC

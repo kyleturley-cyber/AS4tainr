@@ -50,6 +50,9 @@ pub(super) fn status_code(err: &anyhow::Error) -> u32 {
         // (not found, signature not valid).
         "MCH1211" => 102,
         "MCH4431" | "CPF4101" => 211,
+        // A pointer that addresses nothing, or storage outside what it
+        // addresses: pointer or parameter error.
+        "MCH3601" | "MCH0601" => 222,
         // I/O to a file that is not open; OPEN of a file already open;
         // an implicit open that failed.
         "CPF4135" => 1211,

@@ -169,6 +169,9 @@ pub struct ParamInfo {
     /// OPTIONS(*NOPASS), OPTIONS(*OMIT).
     pub nopass: bool,
     pub omit: bool,
+    /// OPTIONS(*STRING) on a pointer: a character value is passed as a
+    /// pointer to a null-terminated copy of it.
+    pub string: bool,
     /// In a procedure interface: the buffer the parameter is bound to
     /// (aliased to the caller's storage when passed by reference).
     pub buf: Option<usize>,
@@ -206,6 +209,8 @@ pub struct ProcInfo {
     pub on_exit: Option<(Option<String>, Routines)>,
     /// EXPORT: other modules and programs can call it.
     pub export: bool,
+    /// Based storage (BASED): frame buffer → the basing pointer's name.
+    pub based: HashMap<usize, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -243,6 +248,8 @@ pub struct Program {
     pub cursors: HashMap<String, Cursor>,
     /// Multiple-occurrence data structures.
     pub occurs: Vec<Occurs>,
+    /// Based storage (BASED): global buffer → the basing pointer's name.
+    pub based: HashMap<usize, String>,
     /// Arrays and tables in sequence: 'A' (ASCEND) or 'D' (DESCEND).
     pub sequence: HashMap<String, char>,
     /// Varying-dimension arrays: 'A' DIM(*AUTO:n), 'V' DIM(*VAR:n).
@@ -684,6 +691,8 @@ struct Binder<'a> {
     formats: HashMap<String, RecordFormat>,
     /// File information data structures (INFDS on a file).
     infds: Vec<String>,
+    /// Based storage: buffer → basing pointer name.
+    based: HashMap<usize, String>,
 }
 
 /// A multiple-occurrence data structure (OCCURS keyword): its storage
@@ -846,13 +855,22 @@ impl Binder<'_> {
                     if self.local && keyword(&d.keywords, "STATIC").is_some() {
                         self.statics.push(v.buf);
                     }
-                    self.inz(&d.name.clone(), d)?;
+                    if let Some(p) = basing_pointer(d) {
+                        self.based.insert(v.buf, p);
+                    } else {
+                        self.inz(&d.name.clone(), d)?;
+                    }
                 }
                 DefKind::Ds => {
                     self.ds(defs, i)
                         .map_err(|e| anyhow!("line {}: {e}", d.line))?;
                     if self.local && keyword(&d.keywords, "STATIC").is_some() {
                         self.statics.push(self.bufs.len() - 1);
+                    }
+                    if let (Some(p), Some(Sym::Ds(ds))) =
+                        (basing_pointer(d), self.syms.get(&d.name))
+                    {
+                        self.based.insert(ds.buf, p);
                     }
                 }
                 DefKind::Proto | DefKind::Interface => {
@@ -908,6 +926,11 @@ impl Binder<'_> {
                             konst,
                             nopass,
                             omit,
+                            string: keyword(&p.keywords, "OPTIONS").is_some_and(|k| {
+                                k.args
+                                    .iter()
+                                    .any(|a| a.trim().eq_ignore_ascii_case("*STRING"))
+                            }),
                             buf,
                         });
                         j += 1;
@@ -952,6 +975,16 @@ impl Binder<'_> {
                     d.line,
                     d.name
                 ),
+            }
+        }
+        // A basing pointer that is not defined is defined implicitly
+        // (ILE RPG Reference, BASED keyword).
+        let mut implicit: Vec<String> = self.based.values().cloned().collect();
+        implicit.sort();
+        implicit.dedup();
+        for p in implicit {
+            if !self.syms.contains_key(&p) && !p.contains('.') {
+                self.add_var(&p, DType::Pointer, 0);
             }
         }
         Ok(pi)
@@ -1445,6 +1478,14 @@ fn special_subfield(k: &str, psds: bool, infds: bool) -> Option<(usize, DType)> 
     })
 }
 
+/// BASED(ptr): the basing pointer's name.
+fn basing_pointer(d: &Def) -> Option<String> {
+    keyword(&d.keywords, "BASED")
+        .and_then(|k| k.args.first())
+        .map(|a| a.trim().to_ascii_uppercase())
+        .filter(|a| !a.is_empty())
+}
+
 /// Bind a parsed source. `externals`: descriptions of the external files
 /// (by file name), from the catalog.
 pub fn bind(
@@ -1467,6 +1508,7 @@ pub fn bind(
         local: false,
         statics: vec![],
         occurs: vec![],
+        based: HashMap::new(),
         formats: HashMap::new(),
         infds: src
             .files
@@ -1882,6 +1924,7 @@ pub fn bind(
             globals: b.bufs.clone(),
             extbinint: b.extbinint,
             occurs: vec![],
+            based: HashMap::new(),
             formats: b.formats.clone(),
             infds: b.infds.clone(),
         };
@@ -1952,6 +1995,7 @@ pub fn bind(
                 routines: code::build(body).map_err(|e| anyhow!("procedure {}: {e}", pr.name))?,
                 on_exit,
                 export: pr.export,
+                based: pb.based,
             },
         );
     }
@@ -2067,6 +2111,7 @@ pub fn bind(
         varying,
         sequence,
         occurs: b.occurs.clone(),
+        based: b.based.clone(),
         imports,
         nomain,
         name: name.to_ascii_uppercase(),

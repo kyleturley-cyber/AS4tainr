@@ -187,38 +187,36 @@ pub async fn members(
         .collect())
 }
 
-/// Store a stream file (replacing it). Paths are absolute, `/` separated.
+/// Store a stream file (replacing it) in the IFS, as UTF-8 text.
 pub async fn put_stream_file(client: &Client, path: &str, data: &str) -> Result<()> {
-    client
-        .execute(
-            "INSERT INTO as4tainr.stream_files VALUES ($1, $2, now())
-             ON CONFLICT (path) DO UPDATE SET data=EXCLUDED.data, changed=now()",
-            &[&path, &data],
-        )
-        .await?;
-    Ok(())
+    crate::ifs::put_text(client, path, data).await
 }
 
 /// A stream file by path: an absolute path as is; a relative one (an
 /// include named relative to an include directory) is the shortest path
-/// that ends with it. Case is ignored, as for IBM i source names.
+/// that ends with it. Case is ignored, as in the IFS root file system.
+/// The text in its CCSID.
 pub async fn find_stream_file(client: &Client, path: &str) -> Result<Option<(String, String)>> {
     let want = path.trim().trim_start_matches("./");
     let suffix = format!(
         "%/{}",
         want.trim_start_matches('/')
+            .to_lowercase()
             .replace('%', "\\%")
             .replace('_', "\\_")
     );
     let r = client
         .query_opt(
-            "SELECT path, data FROM as4tainr.stream_files
-             WHERE lower(path) = lower($1) OR lower(path) LIKE lower($2)
-             ORDER BY lower(path) = lower($1) DESC, length(path) LIMIT 1",
+            "SELECT path, data, ccsid FROM as4tainr.ifs
+             WHERE kind = 'F' AND (path_key = lower($1) OR path_key LIKE $2)
+             ORDER BY path_key = lower($1) DESC, length(path) LIMIT 1",
             &[&want, &suffix],
         )
         .await?;
-    Ok(r.map(|r| (r.get(0), r.get(1))))
+    Ok(r.map(|r| {
+        let data: Vec<u8> = r.get(1);
+        (r.get(0), crate::ifs::codec::text(r.get(2), &data))
+    }))
 }
 
 /// The value of KEYWORD(...) in a command, quotes removed.

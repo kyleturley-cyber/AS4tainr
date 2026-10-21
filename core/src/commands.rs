@@ -125,6 +125,9 @@ impl Job<'_> {
             return self.run_user_command(&d, line).await;
         }
         let cmd = cl::parse(line)?;
+        if let Some(o) = self.ifs_command(&cmd).await? {
+            return Ok(o);
+        }
         match cmd.def.name {
             "CRTLIB" => self.crtlib(&cmd).await,
             "DSPLIB" => self.dsplib(&cmd).await,

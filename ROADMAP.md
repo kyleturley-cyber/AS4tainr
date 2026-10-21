@@ -118,14 +118,15 @@ The gates were met with the project's own sample apps, so real legacy code is th
 ### What runs today
 
 - **RPG:** RPG IV in fixed, mixed and free form up to IBM i 7.5 (date built-ins, FOR-EACH, IN, DCL-ENUM, OVERLOAD, SND-MSG). RPG/400 (RPG III) builds with CRTRPGPGM and converts with CVTRPGSRC. The full RPG cycle runs: control levels, matching records, program-described files, edit words. CVTRPGFREE converts fixed form to free.
-- **RPG runtime:** status codes, the program status and file information data structures, \*PSSR, INFSR and ENDSR return points, overflow and fetch overflow, the local data area (\*LDA), and files declared in procedures.
+- **RPG runtime:** status codes, the program status and file information data structures, \*PSSR, INFSR and ENDSR return points, overflow and fetch overflow, the local data area (\*LDA), and files declared in procedures. Pointers: %ADDR, BASED storage, pointer arithmetic, %ALLOC/%REALLOC/DEALLOC, %STR and OPTIONS(\*STRING).
 - **ILE:** modules, service programs and binding directories (CRTRPGMOD, CRTSRVPGM, CRTPGM, binder language); activation groups, signature checking, exported data, and CL modules (CALLPRC).
 - **SQL:** embedded SQL (SQLRPGLE, CRTSQLRPGI) with cursors, prepared statements, host structures and null indicators. SQL DDL (CREATE TABLE, CREATE INDEX, ALTER TABLE, DROP, LABEL ON) and RUNSQLSTM create real files that RPG reads and writes, with long names, views, identity columns, CREATE TABLE AS, and the SQL data types including DECFLOAT, BOOLEAN, XML and TIMESTAMP(p). SQL procedures and functions (CREATE PROCEDURE, CREATE FUNCTION, compound statements with handlers, cursors and loops), CALL from STRSQL, RUNSQL, RUNSQLSTM and embedded SQL, dynamic compound statements, external procedures over RPG and CL programs, and SQL table functions. IBM i services: the QSYS2 catalog views (SYSSCHEMAS, SYSTABLES, SYSCOLUMNS, SYSINDEXES, SYSKEYS, SYSVIEWS) and OBJECT_STATISTICS.
 - **Commitment control:** STRCMTCTL, ENDCMTCTL, COMMIT and ROLLBACK in CL, RPG files with the COMMIT keyword and COMMIT/ROLBK, and embedded SQL under its commit level; pending changes roll back when the job ends.
 - **CL:** program message queues (SNDPGMMSG, RCVMSG from the program's, its caller's and user message queues with WAIT, RTVMSG) and message files (CRTMSGF, ADDMSGD), files in CL (DCLF, RCVF, SNDF, SNDRCVF), overrides (OVRDBF, OVRPRTF, DLTOVR), subroutines (SUBR, CALLSUBR), parameters passed by reference between CL and RPG programs, RTVOBJD, RTVMBRD, CLRPFM, DLYJOB, RTVSYSVAL and the newer CL built-ins.
+- **IFS:** directories and stream files with CCSIDs, the C runtime and UNIX-type APIs bound from QC2LE (open, read, write, close, lseek, unlink, mkdir, errno, strerror, string and memory functions, system()), and the CL commands MKDIR, RMVDIR, RMVLNK, RNM, WRKLNK, CPYTOSTMF and CPYFRMSTMF.
 - **System:** commands made with CRTCMD, DDS printer files (CRTPRTF), READ of a display record, and CL defined and based storage.
 
-49 corpus objects (42 programs, 4 modules, 3 service programs) and 6 commands build; most remaining corpus failures would fail on IBM i too (see docs/import.md). Known gaps are listed in [docs/fidelity-gaps.md](docs/fidelity-gaps.md).
+50 corpus objects (43 programs, 4 modules, 3 service programs) and 6 commands build; most remaining corpus failures would fail on IBM i too (see docs/import.md). Known gaps are listed in [docs/fidelity-gaps.md](docs/fidelity-gaps.md).
 
 ## Risks
 
@@ -155,7 +156,8 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [ ] Pick three legacy-style apps (fixed-form RPG, DDS, CL) as the target corpus, run them and fix what they need. The CL they were expected to need (DCLF, SNDRCVF, RCVF, message files, OVRDBF, RTVSYSVAL) is done.
 - [x] Close the SQL gaps: commitment control, compound statements, routines.
 - [ ] Remaining SQL: external functions, triggers, sequences, the other QSYS2 catalog views (SYSROUTINES, SYSPARMS, constraints) and IBM i services (ACTIVE_JOB_INFO, USER_INFO, SYSTEM_VALUE_INFO...).
-- [ ] C runtime and IFS procedures (open, read, write, close) for RPG, with pointers.
+- [x] C runtime and IFS procedures (open, read, write, close) for RPG, with pointers.
+- [ ] IFS beyond the basics: stat() and directory APIs, CPYTOIMPF/CPYFRMIMPF, procedure pointers, pointers between programs, IFS authority checks.
 - [ ] Packaging: TLS on port 992, SAVLIB and RSTLIB with a portable archive format, multi-arch images (amd64, arm64).
 - [ ] Get a trademark opinion on the name before the public launch.
 - [ ] Phase 4: ODBC/JDBC and ACS host servers, so existing tools connect.

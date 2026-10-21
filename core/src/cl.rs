@@ -2067,6 +2067,241 @@ pub static COMMANDS: &[CommandDef] = &[
             .keyword_only(),
         ],
     },
+    CommandDef {
+        name: "MKDIR",
+        description: "Make Directory",
+        params: &[
+            p("DIR", Kind::Text, true, None, "Directory").ch("Path name"),
+            p(
+                "DTAAUT",
+                Kind::Name,
+                false,
+                Some("*INDIR"),
+                "Public authority for data",
+            )
+            .ch("*INDIR, *RWX, *RW, *RX, *WX, *R, *W, *X, *EXCLUDE, *NONE"),
+            p(
+                "OBJAUT",
+                Kind::List,
+                false,
+                Some("*INDIR"),
+                "Public authority for object",
+            )
+            .ch("*INDIR, *NONE, *ALL, *OBJEXIST, *OBJMGT, *OBJALTER, *OBJREF"),
+        ],
+    },
+    CommandDef {
+        name: "MD",
+        description: "Make Directory",
+        params: &[
+            p("DIR", Kind::Text, true, None, "Directory").ch("Path name"),
+            p(
+                "DTAAUT",
+                Kind::Name,
+                false,
+                Some("*INDIR"),
+                "Public authority for data",
+            )
+            .ch("*INDIR, *RWX, *RW, *RX, *WX, *R, *W, *X, *EXCLUDE, *NONE"),
+            p(
+                "OBJAUT",
+                Kind::List,
+                false,
+                Some("*INDIR"),
+                "Public authority for object",
+            )
+            .ch("*INDIR, *NONE, *ALL, *OBJEXIST, *OBJMGT, *OBJALTER, *OBJREF"),
+        ],
+    },
+    CommandDef {
+        name: "CRTDIR",
+        description: "Create Directory",
+        params: &[
+            p("DIR", Kind::Text, true, None, "Directory").ch("Path name"),
+            p(
+                "DTAAUT",
+                Kind::Name,
+                false,
+                Some("*INDIR"),
+                "Public authority for data",
+            )
+            .ch("*INDIR, *RWX, *RW, *RX, *WX, *R, *W, *X, *EXCLUDE, *NONE"),
+            p(
+                "OBJAUT",
+                Kind::List,
+                false,
+                Some("*INDIR"),
+                "Public authority for object",
+            )
+            .ch("*INDIR, *NONE, *ALL, *OBJEXIST, *OBJMGT, *OBJALTER, *OBJREF"),
+        ],
+    },
+    CommandDef {
+        name: "RMVDIR",
+        description: "Remove Directory",
+        params: &[
+            p("DIR", Kind::Text, true, None, "Directory").ch("Path name"),
+            p("RMVLNK", Kind::Name, false, Some("*NO"), "Remove link").ch("*NO, *YES"),
+            p("SUBTREE", Kind::Name, false, Some("*NONE"), "Subtree").ch("*NONE, *ALL"),
+        ],
+    },
+    CommandDef {
+        name: "RMDIR",
+        description: "Remove Directory",
+        params: &[
+            p("DIR", Kind::Text, true, None, "Directory").ch("Path name"),
+            p("RMVLNK", Kind::Name, false, Some("*NO"), "Remove link").ch("*NO, *YES"),
+            p("SUBTREE", Kind::Name, false, Some("*NONE"), "Subtree").ch("*NONE, *ALL"),
+        ],
+    },
+    CommandDef {
+        name: "RD",
+        description: "Remove Directory",
+        params: &[
+            p("DIR", Kind::Text, true, None, "Directory").ch("Path name"),
+            p("RMVLNK", Kind::Name, false, Some("*NO"), "Remove link").ch("*NO, *YES"),
+            p("SUBTREE", Kind::Name, false, Some("*NONE"), "Subtree").ch("*NONE, *ALL"),
+        ],
+    },
+    CommandDef {
+        name: "RMVLNK",
+        description: "Remove Link",
+        params: &[p("OBJLNK", Kind::Text, true, None, "Object link").ch("Path name, generic*")],
+    },
+    CommandDef {
+        name: "DEL",
+        description: "Delete File",
+        params: &[p("OBJLNK", Kind::Text, true, None, "Object link").ch("Path name, generic*")],
+    },
+    CommandDef {
+        name: "ERASE",
+        description: "Erase File",
+        params: &[p("OBJLNK", Kind::Text, true, None, "Object link").ch("Path name, generic*")],
+    },
+    CommandDef {
+        name: "RNM",
+        description: "Rename Object",
+        params: &[
+            p("OBJ", Kind::Text, true, None, "Object").ch("Path name"),
+            p("NEWOBJ", Kind::Text, true, None, "New object").ch("Name"),
+        ],
+    },
+    CommandDef {
+        name: "WRKLNK",
+        description: "Work with Object Links",
+        params: &[p("OBJ", Kind::Text, false, Some("*"), "Object").ch("Path name, *")],
+    },
+    CommandDef {
+        name: "DSPLNK",
+        description: "Display Object Links",
+        params: &[p("OBJ", Kind::Text, false, Some("*"), "Object").ch("Path name, *")],
+    },
+    CommandDef {
+        name: "CPYTOSTMF",
+        description: "Copy To Stream File",
+        params: &[
+            p("FROMMBR", Kind::Text, true, None, "From member").ch("Path name"),
+            p("TOSTMF", Kind::Text, true, None, "To stream file").ch("Path name"),
+            p(
+                "STMFOPT",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "Stream file option",
+            )
+            .ch("*NONE, *ADD, *REPLACE"),
+            p(
+                "CVTDTA",
+                Kind::Name,
+                false,
+                Some("*AUTO"),
+                "Data conversion options",
+            )
+            .ch("*AUTO, *TBL, *NONE"),
+            p(
+                "DBFCCSID",
+                Kind::Text,
+                false,
+                Some("*FILE"),
+                "Database file CCSID",
+            )
+            .ch("1-65533, *FILE"),
+            p(
+                "STMFCCSID",
+                Kind::Text,
+                false,
+                Some("*STMF"),
+                "Stream file CCSID",
+            )
+            .ch("1-65533, *STMF, *PCASCII, *STDASCII"),
+            p(
+                "ENDLINFMT",
+                Kind::Name,
+                false,
+                Some("*CRLF"),
+                "End of line characters",
+            )
+            .ch("*CRLF, *LF, *CR, *LFCR, *FIXED"),
+            p("AUT", Kind::Name, false, Some("*DFT"), "Authority")
+                .ch("*DFT, *INDIR, *FILE, *INDIRFILE"),
+        ],
+    },
+    CommandDef {
+        name: "CPYFRMSTMF",
+        description: "Copy From Stream File",
+        params: &[
+            p("FROMSTMF", Kind::Text, true, None, "From stream file").ch("Path name"),
+            p("TOMBR", Kind::Text, true, None, "To member").ch("Path name"),
+            p(
+                "MBROPT",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "Replace or add records",
+            )
+            .ch("*NONE, *ADD, *REPLACE"),
+            p(
+                "CVTDTA",
+                Kind::Name,
+                false,
+                Some("*AUTO"),
+                "Data conversion options",
+            )
+            .ch("*AUTO, *TBL, *NONE"),
+            p(
+                "STMFCCSID",
+                Kind::Text,
+                false,
+                Some("*STMF"),
+                "Stream file CCSID",
+            )
+            .ch("1-65533, *STMF, *PCASCII"),
+            p(
+                "DBFCCSID",
+                Kind::Text,
+                false,
+                Some("*FILE"),
+                "Database file CCSID",
+            )
+            .ch("1-65533, *FILE"),
+            p(
+                "ENDLINFMT",
+                Kind::Name,
+                false,
+                Some("*ALL"),
+                "End of line characters",
+            )
+            .ch("*ALL, *CRLF, *LF, *CR, *LFCR, *FIXED"),
+            p(
+                "TABEXPN",
+                Kind::Name,
+                false,
+                Some("*YES"),
+                "Tab character expansion",
+            )
+            .ch("*YES, *NO"),
+        ],
+    },
 ];
 
 /// A group of commands on the F4 menu.
@@ -2218,6 +2453,26 @@ pub static GROUPS: &[Group] = &[
         item: "Session commands",
         title: "Session Commands",
         commands: &["SIGNOFF"],
+    },
+    Group {
+        item: "Integrated file system commands",
+        title: "Integrated File System Commands",
+        commands: &[
+            "WRKLNK",
+            "DSPLNK",
+            "MKDIR",
+            "MD",
+            "CRTDIR",
+            "RMVDIR",
+            "RMDIR",
+            "RD",
+            "RMVLNK",
+            "DEL",
+            "ERASE",
+            "RNM",
+            "CPYTOSTMF",
+            "CPYFRMSTMF",
+        ],
     },
 ];
 

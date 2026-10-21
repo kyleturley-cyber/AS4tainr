@@ -13,6 +13,7 @@ pub mod dates;
 pub mod dec;
 pub mod expr;
 pub mod interp;
+pub mod mem;
 pub mod parse;
 pub mod program;
 pub mod rpg3;

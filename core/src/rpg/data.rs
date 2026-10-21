@@ -206,6 +206,8 @@ pub enum Value {
     Dur(DurUnit, i64),
     /// A list of values: an array, %LIST, %SPLIT, %SUBARR, an enum.
     List(Vec<Value>),
+    /// A pointer with an address (*NULL is `Fig(Null)`).
+    Ptr(super::mem::Ptr),
 }
 
 /// The unit of a duration (ILE RPG Reference, %DIFF and the duration
@@ -282,6 +284,7 @@ impl Value {
             Value::Fig(f) => format!("{f:?}"),
             Value::Dur(u, n) => format!("{n} {u:?}"),
             Value::List(v) => format!("a list of {} values", v.len()),
+            Value::Ptr(_) => "a pointer".into(),
         }
     }
 }
@@ -488,12 +491,14 @@ pub fn store(t: &DType, v: &Value, out: &mut [u8], fit: Fit, right: bool) -> Res
                 }
             }
         }
-        DType::Pointer => {
-            if !matches!(v, Value::Fig(Fig::Null)) {
-                bail!("pointers can only be set to *NULL here");
-            }
-            out.fill(0);
-        }
+        DType::Pointer => match v {
+            Value::Fig(Fig::Null) => out.fill(0),
+            Value::Ptr(p) => out[..16].copy_from_slice(&p.encode()),
+            other => bail!(
+                "a pointer can only be set to a pointer or *NULL, not {}",
+                other.describe()
+            ),
+        },
         DType::Float(n) => {
             let x = match v {
                 Value::Fig(Fig::Zeros) => Dec::ZERO,
@@ -575,7 +580,10 @@ pub fn load(t: &DType, b: &[u8]) -> Result<Value> {
             Value::Char(e(&utf16_text(&b[2..2 + 2 * n])))
         }
         DType::Ind => Value::Ind(b[0] == 0xF1),
-        DType::Pointer => Value::Fig(Fig::Null),
+        DType::Pointer => match super::mem::Ptr::decode(b) {
+            Some(p) => Value::Ptr(p),
+            None => Value::Fig(Fig::Null),
+        },
         _ => Value::Num(decode_num(t, b)?),
     })
 }
@@ -629,6 +637,18 @@ pub fn compare(x: &Value, y: &Value) -> Result<std::cmp::Ordering> {
         let _ = fill_fig(&DType::Char(len as u32), f, &mut v);
         v
     };
+    // Pointers: the order of their addresses; *NULL before any address.
+    let key = |v: &Value| match v {
+        Value::Ptr(p) => Some(Some(*p)),
+        Value::Fig(Fig::Null) => Some(None),
+        _ => None,
+    };
+    if matches!(x, Value::Ptr(_)) || matches!(y, Value::Ptr(_)) {
+        return match (key(x), key(y)) {
+            (Some(a), Some(b)) => Ok(a.cmp(&b)),
+            _ => bail!("{} and {} cannot be compared", x.describe(), y.describe()),
+        };
+    }
     Ok(match (x, y) {
         (Value::Num(a), b) => a.cmp(&fig_num(b)?),
         (a, Value::Num(b)) => fig_num(a)?.cmp(b),

@@ -2470,6 +2470,341 @@ CREATE TABLE {lib}.OBJS AS (SELECT OBJNAME, OBJTYPE, CURRENT TIMESTAMP AS TS FRO
     );
 }
 
+/// Pointers (ILE RPG Reference: "Basing Pointer Data Type", BASED, %ADDR,
+/// pointer arithmetic, %ALLOC, %REALLOC, %STR, DEALLOC(N), and status
+/// 00222 "pointer or parameter error" for storage used through *NULL).
+#[tokio::test]
+async fn rpg_pointers_and_based_storage() {
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let rpg = "**FREE
+ctl-opt dftactgrp(*no);
+dcl-s p pointer;
+dcl-s q pointer;
+dcl-s name char(10) inz('ABCDEFGHIJ');
+dcl-s c3 char(3) based(p);
+dcl-s c5 char(5) based(ip);
+dcl-ds rec qualified based(q);
+  a char(2);
+  n packed(5:0);
+end-ds;
+dcl-s buf char(20);
+dcl-s s varchar(20) inz('hello');
+dcl-s nums int(10) dim(3);
+dcl-s one int(10) based(np);
+
+p = %addr(name);
+dsply c3;
+p += 2;
+dsply c3;
+c3 = 'xyz';
+dsply name;
+dsply (%char(p - %addr(name)));
+if p > %addr(name);
+  dsply 'later';
+endif;
+ip = %addr(name);
+dsply c5;
+q = %alloc(10);
+rec.a = 'QQ';
+rec.n = 123;
+dsply (rec.a + %char(rec.n));
+q = %realloc(q: 20);
+dsply (%char(rec.n));
+%str(%addr(buf): 6) = 'abcdefgh';
+dsply %str(%addr(buf));
+p = %addr(s: *data);
+dsply c3;
+nums(2) = 42;
+np = %addr(nums(2));
+dsply (%char(one));
+np += 4;
+one = 7;
+dsply (%char(nums(3)));
+dsply (%char(addOne(%addr(nums(3)))));
+dsply (%char(nums(3)));
+dealloc(n) q;
+if q = *null;
+  dsply 'null';
+endif;
+monitor;
+  dsply rec.a;
+on-error 222;
+  dsply 'pointer error';
+endmon;
+*inlr = *on;
+
+dcl-proc addOne;
+  dcl-pi *n int(10);
+    at pointer value;
+  end-pi;
+  dcl-s n int(10) based(at);
+  n += 1;
+  return n;
+end-proc;
+";
+    let r = run_rpg(&url, &lib, "QSECOFR", "PTRS", rpg, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "ABC",
+            "CDE",
+            "ABxyzFGHIJ",
+            "2",
+            "later",
+            "ABxyz",
+            "QQ123",
+            "123",
+            // At most max - 1 characters, then the null character.
+            "abcde",
+            // %ADDR(varying: *DATA) addresses the data after the length.
+            "hel",
+            "42",
+            "7",
+            "8",
+            "8",
+            "null",
+            "pointer error"
+        ]
+    );
+}
+
+/// The C runtime and the IFS (IBM i open(), read(), write(), close(),
+/// unlink(), mkdir() APIs; errno values from "Errno Values for UNIX-Type
+/// Functions": EEXIST 3457, ENOENT 3025). A file created with O_CCSID
+/// 1208 and O_TEXT_CREAT is UTF-8 and gets the job's EBCDIC text
+/// converted; read with O_TEXTDATA converts back; read without it gives
+/// the file's bytes ('é' is two bytes in UTF-8).
+#[tokio::test]
+async fn rpg_c_runtime_and_ifs() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let dir = format!("/t{}", lib.to_lowercase());
+    let _ = as4tainr_core::ifs::rmdir(&client, &dir).await;
+    let rpg = format!(
+        "**FREE
+ctl-opt dftactgrp(*no) bnddir('QC2LE');
+dcl-pr open int(10) extproc('open');
+  path pointer value options(*string);
+  oflag int(10) value;
+  mode uns(10) value options(*nopass);
+  ccsid uns(10) value options(*nopass);
+  txtcreatid uns(10) value options(*nopass);
+end-pr;
+dcl-pr read int(10) extproc('read');
+  fd int(10) value;
+  buf pointer value;
+  n uns(10) value;
+end-pr;
+dcl-pr write int(10) extproc('write');
+  fd int(10) value;
+  buf pointer value;
+  n uns(10) value;
+end-pr;
+dcl-pr close int(10) extproc('close');
+  fd int(10) value;
+end-pr;
+dcl-pr unlink int(10) extproc('unlink');
+  path pointer value options(*string);
+end-pr;
+dcl-pr mkdir int(10) extproc('mkdir');
+  path pointer value options(*string);
+  mode uns(10) value;
+end-pr;
+dcl-pr getErrno pointer extproc('__errno');
+end-pr;
+dcl-pr strerror pointer extproc('strerror');
+  n int(10) value;
+end-pr;
+dcl-s errno int(10) based(perr);
+dcl-c O_RDONLY 1;
+dcl-c O_WRONLY 2;
+dcl-c O_CREAT 8;
+dcl-c O_CCSID 32;
+dcl-c O_TRUNC 64;
+dcl-c O_APPEND 256;
+dcl-c O_TEXTDATA 16777216;
+dcl-c O_TEXT_CREAT 33554432;
+dcl-s dir varchar(40) inz('{dir}');
+dcl-s fd int(10);
+dcl-s line char(7) inz('Hello é');
+dcl-s buf char(50);
+dcl-s n int(10);
+
+perr = getErrno();
+dsply (%char(mkdir(dir: 511)));
+dsply (%char(mkdir(dir: 511)) + ' ' + %char(errno));
+fd = open(dir + '/a.txt': O_WRONLY + O_CREAT + O_TRUNC + O_CCSID + O_TEXTDATA + O_TEXT_CREAT:
+          420: 1208: 0);
+n = write(fd: %addr(line): %size(line));
+callp close(fd);
+fd = open(dir + '/a.txt': O_RDONLY);
+n = read(fd: %addr(buf): %size(buf));
+callp close(fd);
+dsply (%char(n));
+fd = open(dir + '/a.txt': O_RDONLY + O_TEXTDATA);
+buf = *blanks;
+n = read(fd: %addr(buf): %size(buf));
+callp close(fd);
+dsply (%char(n) + ' ' + %subst(buf: 1: n));
+fd = open(dir + '/a.txt': O_WRONLY + O_APPEND + O_TEXTDATA);
+n = write(fd: %addr(line): 5);
+callp close(fd);
+dsply (%char(unlink(dir + '/b.txt')) + ' ' + %char(errno));
+dsply %str(strerror(errno));
+*inlr = *on;
+"
+    );
+    let r = run_rpg(&url, &lib, "QSECOFR", "CRT", &rpg, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "0",
+            "-1 3457",
+            "8",
+            "7 Hello é",
+            "-1 3025",
+            "The file or directory does not exist."
+        ]
+    );
+    let (data, ccsid) = as4tainr_core::ifs::read_file(&client, &format!("{dir}/a.txt"))
+        .await
+        .unwrap();
+    assert_eq!(ccsid, 1208);
+    assert_eq!(String::from_utf8(data).unwrap(), "Hello éHello");
+    as4tainr_core::ifs::unlink(&client, &format!("{dir}/a.txt"))
+        .await
+        .unwrap();
+    as4tainr_core::ifs::rmdir(&client, &dir).await.unwrap();
+}
+
+/// IFS commands (IBM CL reference): MKDIR (CPFA0A0 when the directory
+/// exists), CPYTOSTMF (trailing blanks removed and *CRLF line ends added;
+/// STMFOPT(*NONE) fails when the file exists), CPYFRMSTMF (any CR/LF
+/// combination ends a line; TABEXPN(*YES) expands tabs), RNM, WRKLNK,
+/// RMVLNK with a generic name (CPFA0A9 when nothing is found), RMVDIR.
+#[tokio::test]
+async fn ifs_commands() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let dir = format!("/c{}", lib.to_lowercase());
+    let _ = job.run(&format!("RMVDIR DIR('{dir}') SUBTREE(*ALL)")).await;
+    as4tainr_core::source::create_file(&client, &lib, "QSRC", "")
+        .await
+        .unwrap();
+    as4tainr_core::source::put_member(
+        &client,
+        &as4tainr_core::source::Member {
+            library: lib.clone(),
+            file: "QSRC".into(),
+            name: "M1".into(),
+            srctype: "TXT".into(),
+            text: String::new(),
+            source: "line one   \nline two".into(),
+        },
+        true,
+    )
+    .await
+    .unwrap();
+    let ok = |o: Result<Outcome, anyhow::Error>| match o {
+        Ok(Outcome::Messages(m)) => m.join(" "),
+        Ok(other) => panic!("unexpected {other:?}"),
+        Err(e) => panic!("{e:#}"),
+    };
+    ok(job.run(&format!("MKDIR DIR('{dir}')")).await);
+    let e = job.run(&format!("MKDIR DIR('{dir}')")).await.unwrap_err();
+    assert!(e.to_string().starts_with("CPFA0A0"), "{e}");
+    let mbr = format!("/QSYS.LIB/{lib}.LIB/QSRC.FILE/M1.MBR");
+    ok(job
+        .run(&format!(
+            "CPYTOSTMF FROMMBR('{mbr}') TOSTMF('{dir}/m1.txt') STMFCCSID(1208)"
+        ))
+        .await);
+    let (data, ccsid) = as4tainr_core::ifs::read_file(&client, &format!("{dir}/m1.txt"))
+        .await
+        .unwrap();
+    assert_eq!(
+        (data.as_slice(), ccsid),
+        (&b"line one\r\nline two\r\n"[..], 1208)
+    );
+    let e = job
+        .run(&format!(
+            "CPYTOSTMF FROMMBR('{mbr}') TOSTMF('{dir}/m1.txt')"
+        ))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().starts_with("CPFA097"), "{e}");
+    ok(job
+        .run(&format!(
+            "CPYFRMSTMF FROMSTMF('{dir}/m1.txt') TOMBR('/QSYS.LIB/{lib}.LIB/QSRC.FILE/M2.MBR')"
+        ))
+        .await);
+    let m2 = as4tainr_core::source::find_member(&client, std::slice::from_ref(&lib), "QSRC", "M2")
+        .await
+        .unwrap();
+    assert_eq!(m2.source, "line one\nline two");
+    as4tainr_core::ifs::write_file(
+        &client,
+        &format!("{dir}/tabs.txt"),
+        b"a\tb\rc\n",
+        819,
+        0o644,
+        "QSECOFR",
+    )
+    .await
+    .unwrap();
+    ok(job
+        .run(&format!(
+            "CPYFRMSTMF FROMSTMF('{dir}/tabs.txt') TOMBR('/QSYS.LIB/{lib}.LIB/QSRC.FILE/M2.MBR') MBROPT(*REPLACE)"
+        ))
+        .await);
+    let m2 = as4tainr_core::source::find_member(&client, std::slice::from_ref(&lib), "QSRC", "M2")
+        .await
+        .unwrap();
+    assert_eq!(m2.source, "a       b\nc");
+    ok(job
+        .run(&format!("RNM OBJ('{dir}/m1.txt') NEWOBJ('m9.txt')"))
+        .await);
+    match job.run(&format!("WRKLNK OBJ('{dir}')")).await.unwrap() {
+        Outcome::Display(d) => {
+            let names: Vec<&str> = d
+                .rows
+                .iter()
+                .map(|r| r.split_whitespace().next().unwrap())
+                .collect();
+            assert_eq!(names, ["m9.txt", "tabs.txt"]);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    let e = job
+        .run(&format!("RMVLNK OBJLNK('{dir}/nothing')"))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().starts_with("CPFA0A9"), "{e}");
+    assert!(ok(job.run(&format!("RMVLNK OBJLNK('{dir}/*')")).await).starts_with("2 "));
+    ok(job.run(&format!("RMVDIR DIR('{dir}')")).await);
+    assert!(as4tainr_core::ifs::stat(&client, &dir)
+        .await
+        .unwrap()
+        .is_none());
+}
+
 /// CL programs (IBM CL reference): loops with LEAVE and ITERATE, DOUNTIL
 /// running its body at least once, nested DOFOR, variables in command
 /// parameters, CALL between CL programs with parameters.

@@ -19,7 +19,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | Path | What |
 | --- | --- |
 | `core/src/dds.rs` | DDS parser: physical files (R, K lines with `DESCEND`, fields A/P/S/B/L/T/Z, `UNIQUE`, `TEXT`, `VARLEN`, `ALWNULL`, `DFT`) and logical files (`PFILE`, field subsets, keys, select/omit); a field's PostgreSQL type, default and external text form |
-| `core/src/ddl.rs` | SQL data definition (CREATE TABLE/INDEX/VIEW, ALTER TABLE, DROP, LABEL ON, SET SCHEMA) parsed into file descriptions, never passed on (a view's query is translated and defined by the restricted SQL login, `sql::create_view`); system names for long SQL names; RUNSQLSTM's statement splitting |
+| `core/src/ddl.rs` | SQL data definition (CREATE SCHEMA/TABLE/INDEX/VIEW/TRIGGER, ALTER TABLE, DROP, LABEL ON, GRANT, SET SCHEMA) parsed into file descriptions, never passed on (a view's query is translated and defined by the restricted SQL login, `sql::create_view`); system names for long SQL names; RUNSQLSTM's statement splitting |
 | `core/src/ile.rs` | ILE objects: modules, service programs, binding directories (`as4tainr.modules`, `as4tainr.service_programs`, `as4tainr.bnddir_entries`), the binder (imports, exports, binder language, signatures), service program activations per job |
 | `core/src/catalog.rs` | Libraries = PostgreSQL schemas; file descriptions in schema `as4tainr`; library list resolution |
 | `core/src/rla.rs` | Record-level access: cursor position per open file, keyset queries ordered by (keys, rrn), record locks (advisory locks on the physical file + rrn) |
@@ -60,6 +60,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `samples/` | DDS, CSV data, RPG and CL programs, golden outputs in `expected/`. `samples/apps/contacts` is an application laid out as a git repository, imported with `as4tainr import` (into CONTACTS by samples.sh). The order entry app (Phase 2 gate) is described in `docs/order-entry.md` |
 | `scripts/samples.sh` | Creates every sample object in QGPL (used by demo.sh, the Docker entrypoint and CI). Add new sample objects here |
 | `tools/corpus.sh` | Clone a public repository of IBM i source and import it (real-world test; never vendored) |
+| `tools/legacy.sh` | Install real applications (Northwind for IBM i, COM order management) the way their READMEs say, on an empty database (cloned at test time; never vendored). docs/import.md |
 
 ## Commands
 

@@ -636,6 +636,7 @@ pub async fn delete_object(
         _ => "DELETE FROM as4tainr.bnddir_entries WHERE library=$1 AND bnddir=$2",
     };
     client.execute(table, &[&library, &name]).await?;
+    binding_changed();
     client
         .execute(
             "DELETE FROM as4tainr.object_auths WHERE library=$1 AND name=$2 AND objtype=$3",
@@ -705,7 +706,17 @@ pub async fn store(
         .await?;
     }
     tx.commit().await?;
+    binding_changed();
     Ok(())
+}
+
+/// Bumped when modules, service programs or bindings change: bound calls
+/// resolved before are resolved again (as4tainr lets a job see a
+/// re-created service program, and its new signature, at the next call).
+pub static BINDING_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn binding_changed() {
+    BINDING_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// A program's binding (CRTPGM, or CRTBNDRPG with imports).
@@ -722,5 +733,6 @@ pub async fn set_program_binding(
             &[&library, &name, &b],
         )
         .await?;
+    binding_changed();
     Ok(())
 }

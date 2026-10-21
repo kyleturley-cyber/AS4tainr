@@ -154,7 +154,7 @@ Customer 5. `EDTCDE(J)` edits the negative balance, and `*IN40` shows it in red:
 | Input | Numeric fields are validated (digits, decimals, sign) and re-shown with a message if wrong. An input-capable numeric field with `EDTCDE` is shown edited (with `EDTCDE(Z)` a zero is blank); blanks and commas are taken out again on input. Character input is folded to upper case unless `CHECK(LC)`. |
 | Response indicators | On input, the record's `CA`/`CF` indicators and `ERRMSG` indicators are set off, and the pressed key's indicator is set on. `CA` keys return no data; `CF` keys and Enter do. |
 | Screen | `OVERLAY`: without it a record clears the screen; with it, only records sharing a line with it are removed. `WRITE` puts a record on the screen for the next `EXFMT`. |
-| Subfiles | `SFL`, `SFLCTL`, `SFLSIZ`, `SFLPAG`, `SFLDSP`, `SFLDSPCTL`, `SFLCLR`, `SFLDLT`, `SFLEND(*MORE *PLUS)`, `SFLNXTCHG`, `SFLMSG`, `PAGEDOWN`/`ROLLUP`, `PAGEUP`/`ROLLDOWN` |
+| Subfiles | `SFL`, `SFLCTL`, `SFLSIZ`, `SFLPAG`, `SFLDSP`, `SFLDSPCTL`, `SFLCLR`, `SFLDLT`, `SFLEND(*MORE *PLUS)`, `SFLNXTCHG`, `SFLMSG`, `PAGEDOWN`/`ROLLUP`, `PAGEUP`/`ROLLDOWN`; message subfiles: `SFLMSGRCD(line)`, `SFLMSGKEY` and `SFLPGMQ(10)` fields (hidden, their lengths implied), `SFLINZ` on the control record |
 
 Keywords not in this list are accepted and ignored. Fidelity gaps (`SFLRCDNBR`, `PUTOVR`, `WINDOW`, `REF`/`REFFLD`, `VALUES`/`RANGE`/`COMP`, `EDTWRD`, 27x132 screens, date and time field formats, job date formats) are listed in [fidelity-gaps.md](fidelity-gaps.md).
 
@@ -218,3 +218,7 @@ The subfile, the records on the screen, and paging all live in as4tainr core (`c
 ## Testing
 
 `dspf.rs` has unit tests for parsing, indicator conditions, edit codes (expected values from IBM's published edit code table), numeric input, and response indicators. `workstn.rs` tests the subfile DDS rules, record numbers, `SFLCLR`, `OVERLAY`, paging and `SFLEND`, `READC` order and `SFLNXTCHG`, `CA` keys and `SFLMSG`. Integration tests run CUSTINQ and WRKCUST on the RPG engine with a stand-in display. `tools/e2e_5250.py` runs `CUSTINQ` and `WRKCUST` through the real tn5250 client: error messages, edited numbers, function keys, Page Down/Up, `More...`/`Bottom`, option 5, a wrong option.
+
+## Message subfiles
+
+A subfile record with `SFLMSGRCD(line)` is a message subfile. Writing its control record with `SFLINZ` on fills it with the messages on the program message queue its `SFLPGMQ` field names (`*` or blank: the program's own), which programs send with the QMHSNDPM API and clear with QMHRMVPM. The first `SFLPAG` messages show from that line, first-level text from position 2, with `+` at the end of the last when there are more. The control record usually has `OVERLAY`, so the record the program then shows with EXFMT keeps the messages on the screen. The COM order management application (`tools/legacy.sh`) shows its validation messages this way. See fidelity-gaps.md for what is not done yet.

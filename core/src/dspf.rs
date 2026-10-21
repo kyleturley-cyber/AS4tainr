@@ -69,6 +69,13 @@ pub enum Keyword {
         text: String,
         indicator: Option<u8>,
     },
+    /// SFLMSGRCD(line): a message subfile record; its messages start on
+    /// this line.
+    SflMsgRcd(u8),
+    /// SFLMSGKEY: the field holds a message key (4 bytes, hidden).
+    SflMsgKey,
+    /// SFLPGMQ(length): the field names a program message queue.
+    SflPgmQ(u16),
     /// PAGEDOWN/ROLLUP: return to the program when paging past the last record.
     PageDown(Option<u8>),
     /// PAGEUP/ROLLDOWN: return to the program when paging before the first record.
@@ -184,6 +191,23 @@ impl Record {
             .unwrap_or(1)
     }
 
+    /// SFLMSGRCD: the line of a message subfile's first message.
+    pub fn message_line(&self) -> Option<u8> {
+        self.keywords.iter().find_map(|k| match k.kw {
+            Keyword::SflMsgRcd(n) => Some(n),
+            _ => None,
+        })
+    }
+
+    /// The field that names the program message queue (SFLPGMQ).
+    pub fn pgmq_field(&self) -> Option<&Field> {
+        self.fields.iter().find(|f| {
+            f.keywords
+                .iter()
+                .any(|k| matches!(k.kw, Keyword::SflPgmQ(_)))
+        })
+    }
+
     pub fn sflpag(&self) -> u16 {
         self.keywords
             .iter()
@@ -202,6 +226,7 @@ impl Record {
             .iter()
             .filter_map(|f| f.pos.map(|p| p.0))
             .chain(self.constants.iter().map(|c| c.pos.0))
+            .chain(self.message_line())
             .collect();
         rows.sort_unstable();
         rows.dedup();
@@ -397,6 +422,18 @@ fn to_keyword(name: &str, args: &[String]) -> Result<Keyword> {
             text: args.first().cloned().unwrap_or_default(),
             indicator: ind(args.get(1)),
         },
+        "SFLMSGRCD" => Keyword::SflMsgRcd(
+            args.first()
+                .and_then(|a| a.trim().parse().ok())
+                .filter(|n| (1..=27).contains(n))
+                .ok_or_else(|| anyhow::anyhow!("SFLMSGRCD needs a line number"))?,
+        ),
+        "SFLMSGKEY" => Keyword::SflMsgKey,
+        "SFLPGMQ" => Keyword::SflPgmQ(
+            args.first()
+                .and_then(|a| a.trim().parse().ok())
+                .unwrap_or(10),
+        ),
         "PAGEDOWN" | "ROLLUP" => Keyword::PageDown(ind(args.first())),
         "PAGEUP" | "ROLLDOWN" => Keyword::PageUp(ind(args.first())),
         other => Keyword::Other(other.to_string()),
@@ -564,7 +601,25 @@ pub fn parse(name: &str, source: &str) -> Result<DisplayFile> {
                 }
                 "T" => Some(8),
                 "Z" => Some(26),
-                _ => None,
+                // Message subfile fields (DDS for display files,
+                // SFLMSGKEY and SFLPGMQ): a 4-byte message key; the
+                // queue name, 10 or 276 bytes as SFLPGMQ says.
+                _ => {
+                    let k = kwarea.to_ascii_uppercase();
+                    if k.contains("SFLMSGKEY") {
+                        Some(4)
+                    } else if k.contains("SFLPGMQ(276)") {
+                        Some(276)
+                    } else if k.contains("SFLPGMQ") {
+                        Some(10)
+                    } else {
+                        None
+                    }
+                }
+            };
+            let message_field = {
+                let k = kwarea.to_ascii_uppercase();
+                k.contains("SFLMSGKEY") || k.contains("SFLPGMQ")
             };
             let length: u16 = match (implied, length.is_empty()) {
                 (Some(n), true) => n,
@@ -586,6 +641,7 @@ pub fn parse(name: &str, source: &str) -> Result<DisplayFile> {
                 bail!("line {lineno}: data type {dtype} is not supported");
             }
             let usage = match usage.as_str() {
+                "" if message_field => Usage::Hidden,
                 "" | "O" => Usage::Output,
                 "I" => Usage::Input,
                 "B" => Usage::Both,
@@ -1001,6 +1057,12 @@ pub struct Drawn {
 
 /// Draw a record format onto a screen with the program's field values and
 /// indicators.
+/// Values of a message subfile control record (not fields): the line of
+/// the first message, each message's text, more messages than shown.
+pub const MSG_LINE: &str = "\0MSGLINE";
+pub const MSG_TEXT: &str = "\0MSG";
+pub const MSG_MORE: &str = "\0MSGMORE";
+
 pub fn draw(
     s: &mut Screen,
     record: &Record,
@@ -1032,6 +1094,21 @@ pub fn draw(
         let (a, _, _, nd) = attribute_for(&c.keywords, ind, false);
         if !nd {
             s.text(c.pos.0 + off, c.pos.1, a, &text);
+        }
+    }
+
+    // A message subfile's control record: the messages it was written
+    // with (first-level text from position 2; '+' at the end when there
+    // are more than a page).
+    if let Some(line) = values.get(MSG_LINE).and_then(|l| l.parse::<u8>().ok()) {
+        let mut i = 0u8;
+        while let Some(m) = values.get(&format!("{MSG_TEXT}{i}")) {
+            let t: String = m.chars().take(78).collect();
+            s.text(line + i, 2, attr::NORMAL, &t);
+            i += 1;
+        }
+        if values.contains_key(MSG_MORE) && i > 0 {
+            s.text(line + i - 1, 80, attr::NORMAL, "+");
         }
     }
 
@@ -1544,5 +1621,49 @@ mod tests {
         let text = crate::tn5250::ebcdic::decode(&r.screen.to_stream());
         assert!(text.contains("75.25-"), "{text}");
         assert!(r.inputs.is_empty());
+    }
+
+    #[test]
+    fn message_subfiles() {
+        // DDS for display files: SFLMSGRCD(24) puts the messages on line
+        // 24; a SFLMSGKEY field is a 4-byte message key and a SFLPGMQ(10)
+        // field a 10-byte queue name, both hidden, with no length given.
+        let src = "     A          R MSGSFL                    SFL
+     A                                      SFLMSGRCD(24)
+     A            MSGKEY                    SFLMSGKEY
+     A            PGMQ                      SFLPGMQ(10)
+     A          R MSGCTL                    SFLCTL(MSGSFL)
+     A                                      OVERLAY SFLDSP SFLDSPCTL SFLINZ
+     A                                      SFLSIZ(0002) SFLPAG(0001)
+     A            PGMQ                      SFLPGMQ(10)
+";
+        let f = parse("MSGF", src).unwrap();
+        let sfl = f.record("MSGSFL").unwrap();
+        assert_eq!(sfl.message_line(), Some(24));
+        assert_eq!(sfl.rows(), [24]);
+        let key = &sfl.fields[0];
+        assert_eq!((key.length, &key.usage), (4, &Usage::Hidden));
+        let ctl = f.record("MSGCTL").unwrap();
+        assert_eq!(ctl.pgmq_field().map(|f| f.length), Some(10));
+        // The control record written with its messages: the first page,
+        // and '+' when there are more.
+        let mut v = BTreeMap::new();
+        v.insert(MSG_LINE.to_string(), "24".to_string());
+        v.insert(
+            format!("{MSG_TEXT}0"),
+            "Customer number must be given.".to_string(),
+        );
+        v.insert(MSG_MORE.to_string(), "1".to_string());
+        let ctx = Context {
+            user: "QSECOFR",
+            system: "AS4TAINR",
+            date: "10/15/26".into(),
+            time: "12:00:00".into(),
+        };
+        let mut s = Screen::new();
+        draw(&mut s, ctl, &v, &[false; 100], &ctx, &DrawOpts::default());
+        let text = crate::tn5250::ebcdic::decode(&s.to_stream());
+        assert!(text.contains("Customer number must be given."), "{text}");
+        assert!(text.contains('+'), "{text}");
     }
 }

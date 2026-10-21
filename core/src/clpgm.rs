@@ -744,11 +744,13 @@ fn pad_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 fn eval(e: &Expr, vars: &HashMap<String, Var>) -> Result<Value> {
     Ok(match e {
         Expr::Lit(v) => v.clone(),
-        Expr::Var(n) => vars
-            .get(n)
-            .ok_or_else(|| anyhow!("CPD0727: Variable {n} is not declared."))?
-            .value
-            .clone(),
+        Expr::Var(n) => {
+            not_passed(n, vars)?;
+            vars.get(n)
+                .ok_or_else(|| anyhow!("CPD0727: Variable {n} is not declared."))?
+                .value
+                .clone()
+        }
         Expr::Not(x) => Value::Lgl(!eval(x, vars)?.as_lgl()?),
         Expr::Neg(x) => Value::Dec(-eval(x, vars)?.as_dec()?),
         Expr::Bin(op, a, b) => {
@@ -986,13 +988,21 @@ fn assign(name: &str, var: &mut Var, v: Value) -> Result<()> {
     var.value = match var.ty {
         VarType::Char => {
             let s = match v {
-                // Number to character: the digits with leading zeros, a
-                // decimal point, and '-' first when negative.
+                // Number to character (CL programming, "Changing the
+                // value of a variable"): right-aligned and padded with
+                // leading zeros, its decimal point kept, '-' leftmost
+                // when negative (123 of a *DEC (5 2) in *CHAR 6 is
+                // '123.00').
                 Value::Dec(d) => {
                     let neg = d.is_sign_negative() && !d.is_zero();
-                    let mut a = d.abs();
-                    a.rescale(var.decimals.min(28));
-                    let t = a.to_string();
+                    let t = d.abs().to_string();
+                    let n = var.len as usize;
+                    let room = n.saturating_sub(usize::from(neg));
+                    let t = if t.len() < room {
+                        format!("{}{t}", "0".repeat(room - t.len()))
+                    } else {
+                        t
+                    };
                     if neg {
                         format!("-{t}")
                     } else {
@@ -1025,7 +1035,10 @@ fn assign(name: &str, var: &mut Var, v: Value) -> Result<()> {
                 Value::Lgl(_) => bail!("a logical value cannot be stored in {name}"),
                 Value::Ptr(_) => bail!("a pointer cannot be stored in {name}"),
             };
-            let d = d.trunc_with_scale(var.decimals);
+            let mut d = d.trunc_with_scale(var.decimals);
+            if var.ty == VarType::Dec {
+                d.rescale(var.decimals);
+            }
             let int_digits = var.len.saturating_sub(var.decimals);
             let limit = Decimal::from(10u64.pow(int_digits.min(18)));
             if d.abs().trunc() >= limit {
@@ -1083,6 +1096,8 @@ pub struct Program {
     labels: HashMap<String, usize>,
     /// Program-level MONMSG: (IDs, EXEC start).
     global: Vec<(Vec<String>, usize)>,
+    /// MONMSGs after CHGVAR: place -> (IDs, handler).
+    guarded: HashMap<usize, Vec<(Vec<String>, usize)>>,
     /// An ILE CL program bound to modules and service programs (CRTPGM):
     /// how, its object (LIB/NAME) and its activation group — for
     /// CALLPRC.
@@ -1154,6 +1169,11 @@ struct Compiler<'a> {
     labels: HashMap<String, usize>,
     /// Open loops, innermost last.
     loops: Vec<Loop>,
+    /// MONMSGs of instructions that are not commands: place -> (IDs,
+    /// handler).
+    guarded: HashMap<usize, Vec<(Vec<String>, usize)>>,
+    /// Compiling the command of an EXEC.
+    in_exec: bool,
 }
 
 /// A loop being compiled: where ITERATE and LEAVE go.
@@ -1205,7 +1225,11 @@ impl Compiler<'_> {
     fn nested(&mut self, outer: &Statement, text: &str) -> Result<()> {
         let st = parse_statement(outer.line, text)?;
         if st.name == "DO" {
-            match self.block(&["ENDDO"])? {
+            // Commands in the DO group have MONMSGs of their own.
+            let was = std::mem::replace(&mut self.in_exec, false);
+            let r = self.block(&["ENDDO"]);
+            self.in_exec = was;
+            match r? {
                 Some(_) => Ok(()),
                 None => Err(self.err(outer, "DO has no ENDDO")),
             }
@@ -1214,6 +1238,97 @@ impl Compiler<'_> {
         } else {
             self.statement(&st)
         }
+    }
+
+    /// MONMSG's EXEC: the MONMSGs that follow belong to the statement
+    /// being monitored, not to the EXEC's command.
+    fn exec(&mut self, m: &Statement, x: &str) -> Result<()> {
+        let was = std::mem::replace(&mut self.in_exec, true);
+        let r = self.nested(m, x);
+        self.in_exec = was;
+        r
+    }
+
+    /// CHGVAR: one instruction.
+    fn chgvar(&mut self, st: &Statement) -> Result<()> {
+        let p = named(st, &["VAR", "VALUE"])?;
+        let var = p
+            .get("VAR")
+            .ok_or_else(|| self.err(st, "VAR is required"))?;
+        let value = p
+            .get("VALUE")
+            .ok_or_else(|| self.err(st, "VALUE is required"))?;
+        let target = var.trim().to_ascii_uppercase();
+        let e = parse_expr(value).map_err(|e| self.err(st, e))?;
+        // %SST(&var start length) and %OFFSET(&ptr) as targets
+        // (CL reference, CHGVAR).
+        if target.starts_with('%') {
+            match parse_expr(&target).map_err(|e| self.err(st, e))? {
+                Expr::Builtin(f, a) if (f == "%SST" || f == "%SUBSTRING") && a.len() == 3 => {
+                    let Expr::Var(v) = &a[0] else {
+                        return Err(self.err(st, "%SST needs a variable here"));
+                    };
+                    self.code
+                        .push(Ins::ChgSst(v.clone(), a[1].clone(), a[2].clone(), e));
+                }
+                Expr::Builtin(f, a)
+                    if (f == "%BIN" || f == "%BINARY") && (a.len() == 1 || a.len() == 3) =>
+                {
+                    let Expr::Var(v) = &a[0] else {
+                        return Err(self.err(st, "%BIN needs a variable"));
+                    };
+                    let part = (a.len() == 3).then(|| (a[1].clone(), a[2].clone()));
+                    self.code.push(Ins::ChgBin(v.clone(), part, e));
+                }
+                Expr::Builtin(f, a) if (f == "%OFFSET" || f == "%OFS") && a.len() == 1 => {
+                    let Expr::Var(v) = &a[0] else {
+                        return Err(self.err(st, "%OFFSET needs a variable"));
+                    };
+                    self.code.push(Ins::ChgOfs(v.clone(), e));
+                }
+                _ => return Err(self.err(st, format!("{var} is not a variable"))),
+            }
+            return Ok(());
+        }
+        if !target.starts_with('&') {
+            return Err(self.err(st, format!("{var} is not a variable")));
+        }
+        self.code.push(Ins::ChgVar(target, e));
+        Ok(())
+    }
+
+    /// MONMSGs after a statement that is not run as a command (CHGVAR):
+    /// kept by the instruction's place (CL reference, MONMSG: it can
+    /// follow any command).
+    fn guard(&mut self, at: usize) -> Result<()> {
+        if self.in_exec {
+            return Ok(());
+        }
+        let mut skips = Vec::new();
+        let mut monitors = Vec::new();
+        while self.sts.get(self.i).is_some_and(|n| n.name == "MONMSG") {
+            let m = self.sts[self.i].clone();
+            self.i += 1;
+            if skips.is_empty() {
+                skips.push(self.here());
+                self.code.push(Ins::Jump(0));
+            }
+            let (ids, exec) = monmsg(&m)?;
+            monitors.push((ids, self.here()));
+            if let Some(x) = exec {
+                self.exec(&m, &x)?;
+            }
+            skips.push(self.here());
+            self.code.push(Ins::Jump(0));
+        }
+        let end = self.here();
+        for s in skips {
+            self.patch(s, end);
+        }
+        if !monitors.is_empty() {
+            self.guarded.insert(at, monitors);
+        }
+        Ok(())
     }
 
     fn statement(&mut self, st: &Statement) -> Result<()> {
@@ -1227,52 +1342,9 @@ impl Compiler<'_> {
             "DCL" | "PGM" => return Err(self.err(st, "must come at the start of the program")),
             "ENDPGM" => self.code.push(Ins::Return),
             "CHGVAR" => {
-                let p = named(st, &["VAR", "VALUE"])?;
-                let var = p
-                    .get("VAR")
-                    .ok_or_else(|| self.err(st, "VAR is required"))?;
-                let value = p
-                    .get("VALUE")
-                    .ok_or_else(|| self.err(st, "VALUE is required"))?;
-                let target = var.trim().to_ascii_uppercase();
-                let e = parse_expr(value).map_err(|e| self.err(st, e))?;
-                // %SST(&var start length) and %OFFSET(&ptr) as targets
-                // (CL reference, CHGVAR).
-                if target.starts_with('%') {
-                    match parse_expr(&target).map_err(|e| self.err(st, e))? {
-                        Expr::Builtin(f, a)
-                            if (f == "%SST" || f == "%SUBSTRING") && a.len() == 3 =>
-                        {
-                            let Expr::Var(v) = &a[0] else {
-                                return Err(self.err(st, "%SST needs a variable here"));
-                            };
-                            self.code
-                                .push(Ins::ChgSst(v.clone(), a[1].clone(), a[2].clone(), e));
-                        }
-                        Expr::Builtin(f, a)
-                            if (f == "%BIN" || f == "%BINARY")
-                                && (a.len() == 1 || a.len() == 3) =>
-                        {
-                            let Expr::Var(v) = &a[0] else {
-                                return Err(self.err(st, "%BIN needs a variable"));
-                            };
-                            let part = (a.len() == 3).then(|| (a[1].clone(), a[2].clone()));
-                            self.code.push(Ins::ChgBin(v.clone(), part, e));
-                        }
-                        Expr::Builtin(f, a) if (f == "%OFFSET" || f == "%OFS") && a.len() == 1 => {
-                            let Expr::Var(v) = &a[0] else {
-                                return Err(self.err(st, "%OFFSET needs a variable"));
-                            };
-                            self.code.push(Ins::ChgOfs(v.clone(), e));
-                        }
-                        _ => return Err(self.err(st, format!("{var} is not a variable"))),
-                    }
-                    return Ok(());
-                }
-                if !target.starts_with('&') {
-                    return Err(self.err(st, format!("{var} is not a variable")));
-                }
-                self.code.push(Ins::ChgVar(target, e));
+                let at = self.here();
+                self.chgvar(st)?;
+                self.guard(at)?;
             }
             "IF" => {
                 let p = named(st, &["COND", "THEN"])?;
@@ -1519,7 +1591,7 @@ impl Compiler<'_> {
                     monitors: vec![],
                 });
                 let mut skips = Vec::new();
-                while self.sts.get(self.i).is_some_and(|n| n.name == "MONMSG") {
+                while !self.in_exec && self.sts.get(self.i).is_some_and(|n| n.name == "MONMSG") {
                     let m = self.sts[self.i].clone();
                     self.i += 1;
                     if skips.is_empty() {
@@ -1533,7 +1605,7 @@ impl Compiler<'_> {
                         monitors.push((ids, start));
                     }
                     if let Some(x) = exec {
-                        self.nested(&m, &x)?;
+                        self.exec(&m, &x)?;
                     }
                     skips.push(self.here());
                     self.code.push(Ins::Jump(0));
@@ -1730,6 +1802,24 @@ fn parse_dcl(st: &Statement) -> Result<(String, Var)> {
 
 /// The hidden variable holding how many parameters were passed (%PARMS).
 const PARMS_VAR: &str = "%PARMS";
+/// The parameters the caller did not pass, as " &A &B ".
+const UNPASSED_VAR: &str = "\0UNPASSED";
+
+/// A parameter the caller did not pass has no storage: using it is
+/// MCH3601 (CL reference, PGM: a program can check %PARMS, or monitor
+/// for MCH3601, before it uses an optional parameter).
+fn not_passed(name: &str, vars: &HashMap<String, Var>) -> Result<()> {
+    if let Some(Var {
+        value: Value::Char(list),
+        ..
+    }) = vars.get(UNPASSED_VAR)
+    {
+        if list.contains(&format!(" {name} ")) {
+            bail!("MCH3601: Parameter {name} was not passed.");
+        }
+    }
+    Ok(())
+}
 
 /// How many bytes a variable takes: *CHAR its length, *LGL 1, *DEC packed
 /// (digits / 2 + 1), *INT its length, *PTR 16.
@@ -2154,6 +2244,8 @@ pub fn compile_with(
         code: vec![],
         labels: HashMap::new(),
         loops: vec![],
+        guarded: HashMap::new(),
+        in_exec: false,
     };
     // The program, then its subroutines (SUBR ... ENDSUBR, after the
     // program's other statements).
@@ -2235,6 +2327,7 @@ pub fn compile_with(
         labels: c.labels,
         code: c.code,
         global,
+        guarded: c.guarded,
         binding: None,
         object: String::new(),
         actgrp: crate::ile::DEFAULT_GROUP.into(),
@@ -2353,6 +2446,24 @@ async fn run_program(
             shadow: None,
         },
     );
+    if args.len() < pgm.params.len() {
+        let list: String = pgm.params[args.len()..]
+            .iter()
+            .map(|p| format!(" {p}"))
+            .collect();
+        vars.insert(
+            UNPASSED_VAR.into(),
+            Var {
+                ty: VarType::Char,
+                len: 0,
+                decimals: 0,
+                value: Value::Char(format!("{list} ")),
+                defined: None,
+                based: None,
+                shadow: None,
+            },
+        );
+    }
     for (p, a) in pgm.params.iter().zip(args) {
         let var = vars.get_mut(p).expect("checked at compile time");
         let v = match var.ty {
@@ -2444,70 +2555,32 @@ async fn run_program(
                     Err(e) => bail!("{e:#}\nError in CL program {} (a condition).", pgm.name),
                 }
             }
-            Ins::ChgVar(name, e) => {
-                let v = eval(e, &vars)?;
-                let var = vars
-                    .get_mut(name)
-                    .ok_or_else(|| anyhow!("CPD0727: Variable {name} is not declared."))?;
-                assign(name, var, v)?;
-                pc += 1;
-            }
-            Ins::ChgSst(name, start, len, e) => {
-                let v = eval(e, &vars)?.as_char()?;
-                let start = eval(start, &vars)?.as_dec()?.to_usize().unwrap_or(0);
-                let len = eval(len, &vars)?.as_dec()?.to_usize().unwrap_or(0);
-                let var = vars
-                    .get_mut(name)
-                    .ok_or_else(|| anyhow!("CPD0727: Variable {name} is not declared."))?;
-                let mut cs: Vec<char> = var.value.as_char()?.chars().collect();
-                if start == 0 || len == 0 || start + len - 1 > cs.len() {
-                    bail!(
-                        "CPD0012: %SST({start} {len}) is outside {name} (length {}).",
-                        cs.len()
-                    );
+            Ins::ChgVar(..) | Ins::ChgSst(..) | Ins::ChgBin(..) | Ins::ChgOfs(..) => {
+                match change(&pgm.code[pc], &mut vars) {
+                    Ok(()) => pc += 1,
+                    Err(e) => {
+                        // MONMSG after the CHGVAR, else the program's.
+                        let id = error_id(&e);
+                        let hit = |m: &[(Vec<String>, usize)]| {
+                            m.iter()
+                                .find(|(ids, _)| ids.iter().any(|x| msgid_matches(x, &id)))
+                                .map(|x| x.1)
+                        };
+                        let local = pgm.guarded.get(&pc).and_then(|m| hit(m));
+                        let global = hit(&pgm.global);
+                        if local.is_none() && global.is_none() {
+                            return Err(e);
+                        }
+                        job.calls.put(crate::pgmmsg::from_error(&e, &id), false);
+                        match local {
+                            Some(start) => pc = start,
+                            None => {
+                                resume_at = Some(pc + 1);
+                                pc = global.unwrap_or(pc + 1);
+                            }
+                        }
+                    }
                 }
-                let piece: Vec<char> = format!("{v:<len$}").chars().take(len).collect();
-                cs.splice(start - 1..start - 1 + len, piece);
-                let text: String = cs.into_iter().collect();
-                assign(name, var, Value::Char(text))?;
-                pc += 1;
-            }
-            Ins::ChgBin(name, part, e) => {
-                let n = eval(e, &vars)?.as_dec()?.trunc().to_i64().unwrap_or(0);
-                let (start, len) = match part {
-                    Some((a, b)) => (
-                        eval(a, &vars)?.as_dec()?.to_usize().unwrap_or(0),
-                        eval(b, &vars)?.as_dec()?.to_usize().unwrap_or(0),
-                    ),
-                    None => (1, vars.get(name).map(storage_size).unwrap_or(0)),
-                };
-                let var = vars
-                    .get_mut(name)
-                    .ok_or_else(|| anyhow!("CPD0727: Variable {name} is not declared."))?;
-                let mut bytes = to_bytes(var)?;
-                if start == 0 || !matches!(len, 2 | 4) || start + len - 1 > bytes.len() {
-                    bail!("CPD0012: %BIN({name} {start} {len}) is not valid: the length is 2 or 4 inside the variable.");
-                }
-                let b: Vec<u8> = if len == 2 {
-                    (n as i16).to_be_bytes().to_vec()
-                } else {
-                    (n as i32).to_be_bytes().to_vec()
-                };
-                bytes[start - 1..start - 1 + len].copy_from_slice(&b);
-                let v = from_bytes(var, &bytes)?;
-                var.value = v;
-                pc += 1;
-            }
-            Ins::ChgOfs(name, e) => {
-                let off = eval(e, &vars)?.as_dec()?.to_usize().unwrap_or(0);
-                let var = vars
-                    .get_mut(name)
-                    .ok_or_else(|| anyhow!("CPD0727: Variable {name} is not declared."))?;
-                match &mut var.value {
-                    Value::Ptr(Some((_, o))) => *o = off,
-                    _ => bail!("MCH3601: Pointer {name} is not set."),
-                }
-                pc += 1;
             }
             Ins::Cmd { st, monitors } => {
                 job.calls.escape = None;
@@ -2569,6 +2642,81 @@ async fn run_program(
         }
     }
     Ok((Outcome::Messages(msgs), param_values(pgm, &vars)))
+}
+
+/// CHGVAR (its instruction forms): the variable changes or the error.
+fn change(ins: &Ins, vars: &mut HashMap<String, Var>) -> Result<()> {
+    if let Ins::ChgVar(n, _) | Ins::ChgSst(n, ..) | Ins::ChgBin(n, ..) | Ins::ChgOfs(n, _) = ins {
+        not_passed(n, vars)?;
+    }
+    match ins {
+        Ins::ChgVar(name, e) => {
+            let v = eval(e, vars)?;
+            let var = vars
+                .get_mut(name)
+                .ok_or_else(|| anyhow!("CPD0727: Variable {name} is not declared."))?;
+            assign(name, var, v)?;
+            Ok(())
+        }
+        Ins::ChgSst(name, start, len, e) => {
+            let v = eval(e, vars)?.as_char()?;
+            let start = eval(start, vars)?.as_dec()?.to_usize().unwrap_or(0);
+            let len = eval(len, vars)?.as_dec()?.to_usize().unwrap_or(0);
+            let var = vars
+                .get_mut(name)
+                .ok_or_else(|| anyhow!("CPD0727: Variable {name} is not declared."))?;
+            let mut cs: Vec<char> = var.value.as_char()?.chars().collect();
+            if start == 0 || len == 0 || start + len - 1 > cs.len() {
+                bail!(
+                    "CPD0012: %SST({start} {len}) is outside {name} (length {}).",
+                    cs.len()
+                );
+            }
+            let piece: Vec<char> = format!("{v:<len$}").chars().take(len).collect();
+            cs.splice(start - 1..start - 1 + len, piece);
+            let text: String = cs.into_iter().collect();
+            assign(name, var, Value::Char(text))?;
+            Ok(())
+        }
+        Ins::ChgBin(name, part, e) => {
+            let n = eval(e, vars)?.as_dec()?.trunc().to_i64().unwrap_or(0);
+            let (start, len) = match part {
+                Some((a, b)) => (
+                    eval(a, vars)?.as_dec()?.to_usize().unwrap_or(0),
+                    eval(b, vars)?.as_dec()?.to_usize().unwrap_or(0),
+                ),
+                None => (1, vars.get(name).map(storage_size).unwrap_or(0)),
+            };
+            let var = vars
+                .get_mut(name)
+                .ok_or_else(|| anyhow!("CPD0727: Variable {name} is not declared."))?;
+            let mut bytes = to_bytes(var)?;
+            if start == 0 || !matches!(len, 2 | 4) || start + len - 1 > bytes.len() {
+                bail!("CPD0012: %BIN({name} {start} {len}) is not valid: the length is 2 or 4 inside the variable.");
+            }
+            let b: Vec<u8> = if len == 2 {
+                (n as i16).to_be_bytes().to_vec()
+            } else {
+                (n as i32).to_be_bytes().to_vec()
+            };
+            bytes[start - 1..start - 1 + len].copy_from_slice(&b);
+            let v = from_bytes(var, &bytes)?;
+            var.value = v;
+            Ok(())
+        }
+        Ins::ChgOfs(name, e) => {
+            let off = eval(e, vars)?.as_dec()?.to_usize().unwrap_or(0);
+            let var = vars
+                .get_mut(name)
+                .ok_or_else(|| anyhow!("CPD0727: Variable {name} is not declared."))?;
+            match &mut var.value {
+                Value::Ptr(Some((_, o))) => *o = off,
+                _ => bail!("MCH3601: Pointer {name} is not set."),
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The files of one program call: database files open for RCVF, the
@@ -3941,6 +4089,51 @@ async fn command(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn decimal_to_character_is_right_aligned_with_zeros() {
+        // CL programming, "Changing the value of a variable": a decimal
+        // variable of length 5 with 2 decimals holding 123, assigned to a
+        // *CHAR 6, is '123.00'; unused positions are leading zeros.
+        use super::*;
+        let dec = |len, decimals| Var {
+            ty: VarType::Dec,
+            len,
+            decimals,
+            value: Value::Dec(Decimal::ZERO),
+            defined: None,
+            based: None,
+            shadow: None,
+        };
+        let chr = |len| Var {
+            ty: VarType::Char,
+            decimals: 0,
+            ..dec(len, 0)
+        };
+        let mut n = dec(5, 2);
+        assign("&N", &mut n, Value::Dec(Decimal::from(123))).unwrap();
+        let mut c = chr(6);
+        assign("&C", &mut c, n.value.clone()).unwrap();
+        assert!(
+            matches!(&c.value, Value::Char(s) if s == "123.00"),
+            "{:?}",
+            c.value
+        );
+        let mut c = chr(3);
+        assign("&C", &mut c, Value::Dec(Decimal::from(42))).unwrap();
+        assert!(
+            matches!(&c.value, Value::Char(s) if s == "042"),
+            "{:?}",
+            c.value
+        );
+        let mut c = chr(5);
+        assign("&C", &mut c, Value::Dec(Decimal::from(-7))).unwrap();
+        assert!(
+            matches!(&c.value, Value::Char(s) if s == "-0007"),
+            "{:?}",
+            c.value
+        );
+    }
+
     use super::*;
 
     fn vars(p: &Program) -> HashMap<String, Var> {

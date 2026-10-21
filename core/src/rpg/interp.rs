@@ -98,10 +98,31 @@ type ActivePrograms = HashMap<(String, String, String), Active>;
 
 static PROGRAMS: std::sync::Mutex<Option<ActivePrograms>> = std::sync::Mutex::new(None);
 
+/// A module that bound calls run: its unit (LIB/SRVPGM/MODULE), how its
+/// service program is bound, the module compiled.
+type BoundModule = (
+    u64,
+    String,
+    std::sync::Arc<crate::ile::Binding>,
+    std::sync::Arc<Program>,
+);
+
+/// Bound calls resolved in each job's activation groups: (job, group,
+/// caller and target) → the module.
+type BoundCache = HashMap<(String, String, String), BoundModule>;
+static BOUND: std::sync::Mutex<Option<BoundCache>> = std::sync::Mutex::new(None);
+
 /// RCLACTGRP, RCLRSC, the end of a job: the programs active in those
 /// activation groups end (their files close; the next call starts them
 /// anew). The number ended.
 pub fn end_programs(job: &str, groups: &crate::ile::Groups) -> usize {
+    // Their cursors close too (service programs' modules included).
+    exec_sql::end_activations(job, groups);
+    if let Ok(mut g) = BOUND.lock() {
+        if let Some(m) = g.as_mut() {
+            m.retain(|(j, grp, _), _| !(j == job && groups.covers(grp)));
+        }
+    }
     let mut n = 0;
     if let Ok(mut g) = PROGRAMS.lock() {
         if let Some(m) = g.as_mut() {
@@ -1915,6 +1936,13 @@ impl<'a> Machine<'a> {
             .get(field)
             .cloned()
             .ok_or_else(|| anyhow!("{field} is not defined as a data area (DEFINE *DTAARA)"))?;
+        let name = match name.strip_prefix("*VAR:") {
+            Some(v) => {
+                let n = self.eval(&Expr::name(v))?.chars()?;
+                a(&n).trim().to_ascii_uppercase()
+            }
+            None => name,
+        };
         if name == "*LDA" {
             return self.local_data_area(input, field);
         }
@@ -2011,6 +2039,20 @@ impl<'a> Machine<'a> {
     /// and locked when they are data area objects, as the program starts
     /// (ILE RPG Reference, "Detailed RPG IV Object Program Cycle", step 3);
     /// written and unlocked when it ends with LR (steps 35-36).
+    /// INZ(*USER): the job's user profile.
+    fn user_inz(&mut self) -> Result<()> {
+        let user = Value::str(&self.io.user);
+        for f in &self.prog.user_inz {
+            self.assign(
+                &Expr::name(f),
+                &user,
+                Fit::Truncate { half_adjust: false },
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn auto_dtaaras(&mut self, start: bool) -> Result<()> {
         let prog = self.prog;
         for (ds, name) in &prog.auto_dtaaras {
@@ -2103,6 +2145,51 @@ impl<'a> Machine<'a> {
 
     /// The program fields of a record format, as display text by display
     /// field name (numbers as plain decimal text, "-12.50").
+    /// WRITE of a message subfile's control record with SFLINZ (DDS for
+    /// display files, SFLMSGRCD, SFLPGMQ, SFLINZ): the subfile is the
+    /// messages on the program message queue its SFLPGMQ field names.
+    fn message_subfile(
+        &self,
+        file: &crate::dspf::DisplayFile,
+        format: &str,
+        mut values: BTreeMap<String, String>,
+        inds: &[bool; 100],
+    ) -> BTreeMap<String, String> {
+        use crate::dspf::Keyword;
+        let Some(ctl) = file.record(format) else {
+            return values;
+        };
+        let Some(sfl) = ctl.subfile_control().and_then(|s| file.record(s)) else {
+            return values;
+        };
+        let Some(line) = sfl.message_line() else {
+            return values;
+        };
+        if !ctl.active(inds, |k| *k == Keyword::SflInz) {
+            return values;
+        }
+        let queue = ctl
+            .pgmq_field()
+            .and_then(|f| values.get(&f.name))
+            .map(|q| q.trim().to_string())
+            .unwrap_or_default();
+        let queue = if queue.is_empty() || queue == "*" {
+            self.prog.name.clone()
+        } else {
+            queue
+        };
+        let msgs = crate::pgmmsg::named_messages(&self.io.job_key, &queue);
+        let pag = ctl.sflpag() as usize;
+        values.insert(crate::dspf::MSG_LINE.into(), line.to_string());
+        for (i, m) in msgs.iter().take(pag).enumerate() {
+            values.insert(format!("{}{i}", crate::dspf::MSG_TEXT), m.text.clone());
+        }
+        if msgs.len() > pag {
+            values.insert(crate::dspf::MSG_MORE.into(), "1".into());
+        }
+        values
+    }
+
     fn ws_values(&mut self, d: &Display, format: &str) -> Result<BTreeMap<String, String>> {
         let rec = d.file.record(format);
         let mut out = BTreeMap::new();
@@ -2221,7 +2308,10 @@ impl<'a> Machine<'a> {
                         let rrn = i64::try_from(rrn).unwrap_or(-1);
                         self.ws.sfl_write(&file, &format, rrn, values, inds)?;
                     }
-                    None => self.ws.write(&file, &format, values, inds)?,
+                    None => {
+                        let values = self.message_subfile(&file, &format, values, &inds);
+                        self.ws.write(&file, &format, values, inds)?
+                    }
                 }
                 set_status(self, Status::default());
             }
@@ -3133,6 +3223,7 @@ impl<'a> Machine<'a> {
                 if let Ok(mut s) = self.io.shared.lock() {
                     s.extend(a.shared);
                 }
+                self.sql.restore(&key);
                 self.reactivated = true;
                 // RT or RETURN ended it: the next cycle starts afresh.
                 self.set_ind("RT", false);
@@ -3159,6 +3250,7 @@ impl<'a> Machine<'a> {
         self.share_in();
         let prog = self.prog;
         if !self.reactivated {
+            self.user_inz()?;
             self.auto_dtaaras(true)?;
         }
         let r = match &prog.main {
@@ -3254,6 +3346,7 @@ impl<'a> Machine<'a> {
                 var_elems: self.var_elems.clone(),
                 shared: self.io.shared.lock().map(|s| s.clone()).unwrap_or_default(),
             };
+            self.sql.keep(key.clone());
             if let Ok(mut g) = PROGRAMS.lock() {
                 g.get_or_insert_with(HashMap::new).insert(key, a);
             }
@@ -3309,9 +3402,148 @@ impl Machine<'_> {
                     other => bail!("QDCXLATE: table {other} is not supported (QTCPASC, QTCPEBC)"),
                 }
             }
+            // QMHSNDPM (message ID, qualified message file, message
+            // data, its length, message type, call stack entry, counter,
+            // message key returned, error code): Send Program Message.
+            "QMHSNDPM" => {
+                let [id, msgf, data, dlen, ty, entry, counter, rest @ ..] = locs else {
+                    bail!("QMHSNDPM needs 7 parameters before the message key");
+                };
+                let msgid = text(self, id).trim().to_ascii_uppercase();
+                let qual = text(self, msgf);
+                let (fname, flib) = (
+                    qual.get(0..10).unwrap_or("").trim().to_string(),
+                    qual.get(10..20).unwrap_or("").trim().to_string(),
+                );
+                let n = (num(self, dlen)?.to_i128()?.max(0) as usize).min(data.size);
+                let bytes = self.bufs[data.buf][data.off..data.off + n].to_vec();
+                let ty = text(self, ty).trim().to_ascii_uppercase();
+                let queue = self.stack_entry(&text(self, entry), num(self, counter)?.to_i128()?);
+                let msg = if msgid.is_empty() {
+                    crate::pgmmsg::QMsg {
+                        text: a(&bytes).trim_end().to_string(),
+                        ..Default::default()
+                    }
+                } else {
+                    let f = if flib.is_empty() || flib == "*LIBL" {
+                        fname
+                    } else {
+                        format!("{flib}/{fname}")
+                    };
+                    let r = self.io.rt.block_on(crate::pgmmsg::describe(
+                        self.io.client,
+                        &self.io.libl,
+                        &Default::default(),
+                        &msgid,
+                        &f,
+                        &bytes,
+                    ));
+                    match r {
+                        Ok(m) => m,
+                        Err(e) => return self.api_error(rest.get(1), e).map(|_| true),
+                    }
+                };
+                let msg = crate::pgmmsg::QMsg {
+                    ty: ty.clone(),
+                    ..msg
+                };
+                if ty == "*ESCAPE" {
+                    // An escape message ends the program it is sent to:
+                    // here, the call fails with it.
+                    bail!(
+                        "{}: {}",
+                        if msgid.is_empty() { "CPF9898" } else { &msgid },
+                        msg.text
+                    );
+                }
+                // *EXT, or a caller above the RPG programs (a command
+                // line, a CL program): the message goes to the job log.
+                let Some(queue) = queue.filter(|q| q != "*EXT") else {
+                    self.job_log(&msg.text);
+                    self.api_ok(rest.get(1));
+                    return Ok(true);
+                };
+                let key = crate::pgmmsg::named_send(&self.io.job_key, &queue, msg);
+                if let Some(k) = rest.first() {
+                    let kb = crate::pgmmsg::key_text(key).into_bytes();
+                    let kb: Vec<u8> = kb
+                        .iter()
+                        .map(|c| crate::tn5250::ebcdic::FROM_UNICODE[*c as usize])
+                        .collect();
+                    let n = k.size.min(4);
+                    self.bufs[k.buf][k.off..k.off + n].copy_from_slice(&kb[..n]);
+                }
+                self.api_ok(rest.get(1));
+            }
+            // QMHRMVPM (call stack entry, counter, message key, messages
+            // to remove, error code): Remove Program Messages.
+            "QMHRMVPM" => {
+                let [entry, counter, key, which, rest @ ..] = locs else {
+                    bail!("QMHRMVPM needs 4 parameters and an error code");
+                };
+                let queue = self.stack_entry(&text(self, entry), num(self, counter)?.to_i128()?);
+                let which = text(self, which).trim().to_ascii_uppercase();
+                let k = crate::pgmmsg::parse_key(&text(self, key));
+                if let Some(queue) = queue {
+                    crate::pgmmsg::named_remove(&self.io.job_key, &queue, &which, k);
+                }
+                self.api_ok(rest.first());
+            }
             _ => return Ok(false),
         }
         Ok(true)
+    }
+
+    /// A call stack entry as the message APIs name it: '*' or '*PGMBDY'
+    /// is this program (counter 0) or a caller above it; a name is that
+    /// entry.
+    /// None: above the outermost RPG program (its caller: the job log).
+    fn stack_entry(&self, entry: &str, counter: i128) -> Option<String> {
+        let e = entry.trim().to_ascii_uppercase();
+        if !matches!(e.as_str(), "*" | "*PGMBDY" | "*CTLBDY" | "") {
+            return Some(e);
+        }
+        if counter <= 0 {
+            return Some(self.prog.name.clone());
+        }
+        let up = counter as usize;
+        let c = &self.io.callers;
+        (up <= c.len()).then(|| c[c.len() - up].clone())
+    }
+
+    /// An API's error code structure (ERRC0100): bytes provided 0 means
+    /// an error is an exception; otherwise the exception ID is returned in
+    /// it.
+    fn api_error(&mut self, err: Option<&Loc>, e: anyhow::Error) -> Result<()> {
+        let provided = err
+            .filter(|l| l.size >= 8)
+            .map(|l| i32::from_be_bytes(self.bufs[l.buf][l.off..l.off + 4].try_into().unwrap()))
+            .unwrap_or(0);
+        let Some(l) = err.filter(|_| provided >= 8) else {
+            return Err(e);
+        };
+        let id = crate::clpgm::error_id(&e);
+        let mut out = [0x40u8; 7];
+        for (o, c) in out.iter_mut().zip(id.bytes()) {
+            *o = crate::tn5250::ebcdic::FROM_UNICODE[c as usize];
+        }
+        let avail: i32 = 15;
+        let b = &mut self.bufs[l.buf];
+        b[l.off + 4..l.off + 8].copy_from_slice(&avail.min(provided).to_be_bytes());
+        let n = ((provided as usize).min(l.size)).saturating_sub(8).min(7);
+        b[l.off + 8..l.off + 8 + n].copy_from_slice(&out[..n]);
+        Ok(())
+    }
+
+    /// The API ended normally: bytes available 0 in the error code.
+    fn api_ok(&mut self, err: Option<&Loc>) {
+        if let Some(l) = err.filter(|l| l.size >= 8) {
+            let provided =
+                i32::from_be_bytes(self.bufs[l.buf][l.off..l.off + 4].try_into().unwrap());
+            if provided >= 8 {
+                self.bufs[l.buf][l.off + 4..l.off + 8].copy_from_slice(&0i32.to_be_bytes());
+            }
+        }
     }
 
     /// Run a CL command in the calling job (QCMDEXC, CALL of a CL
@@ -3748,9 +3980,51 @@ impl<'a> Machine<'a> {
         target: &crate::ile::Target,
         args: Vec<Arg>,
     ) -> Result<Option<Value>> {
-        use crate::ile::Target;
         let client = self.io.client;
         let libl = self.io.libl.clone();
+        // Found and compiled at the first call in the activation group
+        // (ILE Concepts: a service program is activated once, then its
+        // procedures are called directly).
+        let bound_key = (
+            self.io.job_key.clone(),
+            self.io.actgrp.clone(),
+            format!("{}|{:?}|{sym}", self.io.program, target),
+        );
+        let cached = BOUND
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|m| m.get(&bound_key).cloned()));
+        let generation = crate::ile::BINDING_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+        let (_, unit, binding, prog) = match cached.filter(|c| c.0 == generation) {
+            Some(c) => c,
+            None => {
+                let mut c = self.resolve_bound(sym, target, client, &libl)?;
+                c.0 = generation;
+                if let Ok(mut g) = BOUND.lock() {
+                    g.get_or_insert_with(HashMap::new)
+                        .insert(bound_key, c.clone());
+                }
+                c
+            }
+        };
+        let prog: &Program = &prog;
+        let pi = prog
+            .procs
+            .get(sym)
+            .filter(|pi| pi.export)
+            .ok_or_else(|| anyhow!("CPD5D02: Module does not export {sym}."))?;
+        self.run_bound(sym, target, args, unit, binding, prog, pi)
+    }
+
+    /// The module a bound call runs: (unit, binding, compiled module).
+    fn resolve_bound(
+        &mut self,
+        sym: &str,
+        target: &crate::ile::Target,
+        client: &'a Client,
+        libl: &[String],
+    ) -> Result<BoundModule> {
+        use crate::ile::Target;
         let (code, unit, binding) = match target {
             Target::Module(m) => {
                 let b = self.io.binding.clone().unwrap_or_default();
@@ -3763,7 +4037,7 @@ impl<'a> Machine<'a> {
                 (code, format!("MODULE {m}"), b)
             }
             Target::SrvPgm { library, name } => {
-                let (lib, b) = self.block(crate::ile::find_srvpgm(client, &libl, library, name))?;
+                let (lib, b) = self.block(crate::ile::find_srvpgm(client, libl, library, name))?;
                 // Signature checking (ILE Concepts, "Service program
                 // activation"): the service program must still have the
                 // signature it had when the caller was bound, as its
@@ -3790,7 +4064,7 @@ impl<'a> Machine<'a> {
                 let mut found = None;
                 for m in &b.modules {
                     let p = self.block(super::compile_with(
-                        client, &libl, &m.name, &m.source, &m.options,
+                        client, libl, &m.name, &m.source, &m.options,
                     ))?;
                     if p.procs.get(sym).is_some_and(|pi| pi.export) {
                         found = Some(m.clone());
@@ -3806,16 +4080,32 @@ impl<'a> Machine<'a> {
         };
         let prog = self.block(super::compile_with(
             client,
-            &libl,
+            libl,
             &code.name,
             &code.source,
             &code.options,
         ))?;
-        let pi = prog
-            .procs
-            .get(sym)
-            .filter(|pi| pi.export)
-            .ok_or_else(|| anyhow!("CPD5D02: Module {} does not export {sym}.", code.name))?;
+        if !prog.procs.get(sym).is_some_and(|pi| pi.export) {
+            bail!("CPD5D02: Module {} does not export {sym}.", code.name);
+        }
+        let generation = crate::ile::BINDING_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+        Ok((generation, unit, binding, std::sync::Arc::new(prog)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_bound(
+        &mut self,
+        _sym: &str,
+        target: &crate::ile::Target,
+        args: Vec<Arg>,
+        unit: String,
+        binding: std::sync::Arc<crate::ile::Binding>,
+        prog: &Program,
+        pi: &ProcInfo,
+    ) -> Result<Option<Value>> {
+        use crate::ile::Target;
+        let client = self.io.client;
+        let libl = self.io.libl.clone();
         let srvpgm = matches!(target, Target::SrvPgm { .. });
         // A service program runs in its activation group: the caller's
         // (*CALLER) or the one it names.
@@ -3835,7 +4125,7 @@ impl<'a> Machine<'a> {
                 .and_then(|m| m.get(&unit).cloned())
         };
         let mut m = Machine::new(
-            &prog,
+            prog,
             Io {
                 rt: self.io.rt.clone(),
                 client,
@@ -3856,12 +4146,13 @@ impl<'a> Machine<'a> {
                     self.io.modules.clone()
                 },
                 actgrp: group.clone(),
-                program: format!("*BOUND/{}", code.name),
+                program: format!("*BOUND/{}", prog.name),
                 shared: self.io.shared.clone(),
             },
         );
-        if let Some(s) = storage {
-            m.bufs.own = s;
+        match storage {
+            Some(s) => m.bufs.own = s,
+            None => m.user_inz()?,
         }
         // Exported data: the caller's changes go to the shared copy, the
         // callee sees them.
@@ -3894,7 +4185,14 @@ impl<'a> Machine<'a> {
                 other => other,
             })
             .collect();
+        let sql_key = (self.io.job_key.clone(), group.clone(), unit.clone());
+        if srvpgm {
+            m.sql.restore(&sql_key);
+        }
         let r = m.call_proc(pi, args);
+        if srvpgm {
+            m.sql.keep(sql_key);
+        }
         m.share_out();
         // The caller's storage comes back.
         self.bufs.own = m.bufs.lent.pop().map(|l| l.1).unwrap_or_default();

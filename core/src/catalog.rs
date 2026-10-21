@@ -734,6 +734,30 @@ pub async fn create_display_file(
     Ok(parsed)
 }
 
+/// CRTDSPF REPLACE(*YES): a display file that already exists gets the new
+/// source (IBM i moves the old object to QRPLOBJ; as4tainr keeps no copy).
+/// Any other kind of file with the name is still CPF7302.
+pub async fn replace_display_file(
+    client: &mut Client,
+    lib: &str,
+    name: &str,
+    source: &str,
+) -> Result<crate::dspf::DisplayFile> {
+    let lib = validate_name("library", lib)?;
+    let name = validate_name("file", name)?;
+    let parsed = crate::dspf::parse(&name, source)?;
+    let n = client
+        .execute(
+            "UPDATE as4tainr.display_files SET source=$3 WHERE library=$1 AND name=$2",
+            &[&lib, &name, &source],
+        )
+        .await?;
+    if n == 0 {
+        return create_display_file(client, &lib, &name, source).await;
+    }
+    Ok(parsed)
+}
+
 /// Find a display file through the library list; returns (library, source).
 pub async fn resolve_display_file(
     client: &Client,

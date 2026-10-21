@@ -998,9 +998,13 @@ pub fn parse_create(sql: &str) -> Result<Option<(bool, Routine)>> {
                 loop {
                     let _ = p.ident()?;
                     p.expect_punct("=")?;
-                    // The value: *WORD, a word, a number or a string.
+                    // The value: *WORD, a word, a number, a string, or a
+                    // list in parentheses (DECRESULT = (31, 31, 00)).
                     if p.punct("*") {
                         let _ = p.ident()?;
+                    } else if p.punct("(") {
+                        let _ = p.until(&[], false);
+                        p.expect_punct(")")?;
                     } else {
                         p.skip();
                         p.i += 1;

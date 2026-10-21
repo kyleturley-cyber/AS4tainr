@@ -158,13 +158,14 @@ DSPLIB:
 | `WRKOBJ OBJ(lib/name) OBJTYPE(*ALL\|*LIB\|*FILE)` | Lists objects. The name can be generic (`CUST*`) or `*ALL`; the library `*LIBL`, `*CURLIB`, `*USRLIBL`, `*ALL`, `*ALLUSR` or a name. List only for now: no options. |
 | `STRSQL` | Interactive SQL: type a statement, see the rows (see [sql.md](sql.md)). |
 | `RUNSQL SQL('...')` | Runs one INSERT, UPDATE or DELETE (not SELECT) and reports the rows changed, or a data definition statement such as CREATE TABLE. |
-| `RUNSQLSTM SRCFILE(LIB/QSQLSRC) SRCMBR(NAME)` | Runs the SQL statements in a source member ([sql.md](sql.md)). |
+| `RUNSQLSTM SRCFILE(LIB/QSQLSRC) SRCMBR(NAME)` or `SRCSTMF(path)` | Runs the SQL statements in a source member, or in a stream file (converted from its CCSID; a byte order mark is skipped) ([sql.md](sql.md)). |
+| `CHGPFM FILE(LIB/FILE) MBR(name) SRCTYPE(type) TEXT('...')` | Changes a source member's type and text (CPF3141 if the member does not exist). |
 | `DLTF FILE(LIB/NAME)` | Deletes a database or display file (not a physical file with logical files over it: CPF3203). |
 | `CRTRPGPGM PGM(LIB/NAME)` | Creates a program from RPG/400 (RPG III) source in QRPGSRC: converted to RPG IV as CVTRPGSRC does, then compiled. |
 | `CVTRPGSRC FROMFILE(LIB/QRPGSRC) FROMMBR(name\|generic*\|*ALL) TOFILE(LIB/QRPGLESRC)` | Converts RPG III members to RPG IV members (type RPGLE) and lists the conversion messages. |
 | `CVTRPGFREE FROMFILE(LIB/QRPGLESRC) FROMMBR(name) TOMBR(name)` | as4tainr's own command: converts a fixed-form RPGLE member to free form (what has no free form stays fixed). |
-| `CRTRPGMOD MODULE(LIB/NAME)` | Creates a module from QRPGLESRC (checked like CRTBNDRPG; `NOMAIN` modules have only procedures). |
-| `CRTSRVPGM SRVPGM(LIB/NAME) MODULE(...) EXPORT(*SRCFILE\|*ALL) SRCFILE SRCMBR BNDSRVPGM BNDDIR` | Creates a service program from modules; its exports come from binder language (`STRPGMEXP`/`EXPORT`/`ENDPGMEXP` in QSRVSRC) or all exported procedures. |
+| `CRTRPGMOD MODULE(LIB/NAME)` | Creates a module from QRPGLESRC (checked like CRTBNDRPG; `NOMAIN` modules have only procedures). The compile options that change nothing here are accepted on the create commands: `DBGVIEW`, `OPTION`, `OUTPUT`, `TGTRLS`, CRTSQLRPGI's `RPGPPOPT` and `CLOSQLCSR`, CRTDSPF's `RSTDSP`, `DFRWRT`. CRTDSPF `REPLACE(*YES)` (the default) replaces a display file. |
+| `CRTSRVPGM SRVPGM(LIB/NAME) MODULE(...) EXPORT(*SRCFILE\|*ALL) SRCFILE SRCMBR BNDSRVPGM BNDDIR` | Creates a service program from modules (`BNDSRVPGM((LIB/NAME *IMMED))` element lists too); its exports come from binder language (`STRPGMEXP`/`EXPORT`/`ENDPGMEXP` in QSRVSRC) or all exported procedures. |
 | `CRTPGM PGM(LIB/NAME) MODULE(...) ENTMOD BNDSRVPGM BNDDIR` | Binds modules and service programs into a program. |
 | `CRTBNDDIR`, `ADDBNDDIRE`, `RMVBNDDIRE`, `DSPBNDDIR` | Binding directories: lists of modules and service programs searched for imports by CRTPGM, CRTSRVPGM and CRTBNDRPG (`BNDDIR`, or `ctl-opt bnddir`). |
 | `DLTMOD`, `DLTSRVPGM`, `DLTBNDDIR` | Delete ILE objects. |

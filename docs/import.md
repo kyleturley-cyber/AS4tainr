@@ -29,7 +29,7 @@ app/
 
 ## What it does
 
-1. Creates the library if needed (CRTLIB), and each source file (CRTSRCPF). Then it adds every member, replacing a member of the same name.
+1. Creates the library if needed (CRTLIB), and each source file (CRTSRCPF). Then it adds every member, replacing a member of the same name. Include files (`.rpgleinc`, `.clleinc`) go to the IFS under `/library/`, and those in a folder named for a source file (`QCPYSRC/NWUTILPR.rpgleinc`) are also members of it, for `/COPY QCPYSRC,NWUTILPR`.
 2. Creates the physical files with `CRTPF FILE(LIB/NAME) SRCFILE(LIB/QDDSSRC) SRCMBR(NAME)` and loads their CSV data.
 3. Runs the SQL scripts as `RUNSQLSTM ... ERRLVL(30)` would: every statement runs, and the ones that fail are reported. Scripts that create tables run first. Everything goes to the import library: it is the default schema, and `SET SCHEMA` statements are skipped. A script with failing statements counts as an object that could not be created.
 4. Creates the logical files (CRTLF), display files (CRTDSPF) and printer files (CRTPRTF). Files that exist are kept.
@@ -81,3 +81,12 @@ On Oct 21, 2026 the corpus builds 43 programs (50 objects with its 4 modules and
 What as4tainr still lacks for the rest: DATALINK, ROWID, arrays and generated expression columns (ALLTABLE). JSNIFSSQL1 builds now that the IFS APIs and JSON_TABLE are there (docs/ifs.md, docs/sql.md).
 
 See [fidelity-gaps.md](fidelity-gaps.md).
+
+## Legacy applications, installed their own way
+
+`tools/legacy.sh` installs real IBM i applications the way their READMEs say, on an empty database, and reports what works. The repositories are cloned at test time and never added to as4tainr.
+
+- **Northwind for IBM i** (GPL-3.0; github.com/ZodandSons). The NORTHWIND database comes from its own SQL scripts (`RUNSQLSTM SRCSTMF`: CREATE SCHEMA, tables with foreign keys, views, GRANT, and 3,309 INSERTs). The application is then built by its own CL program, NWBUILD, from the folder copied into the IFS (`as4tainr put`): it copies every member with CPYFRMSTMF, sets the source types with CHGPFM, and builds 13 SQLRPGLE service programs (and its RPG utility service program), 14 display files, 13 RPG programs and its CL menu and test runner. On Oct 21, 2026 NWBUILD ends with "Northwind build completed successfully"; only its iRPGUnit tests are skipped (the RPGUNIT library is not there). The menu (`CALL NWAPP/NWMENU`, or a user profile with it as initial program) lists the 91 customers, the 830 orders with their totals, and an order's lines.
+- **COM order management** (no license file: test use only; github.com/ARNAV2684). Imported into COM022LIB with `as4tainr import`, then the README's order: the NXTORDNO data area, CRTCOMMSG (its message file), LOADDATA, the COMBNDDIR binding directory, and the programs bound through it. `CALL COM022LIB/COMSTART` runs the green-screen application: menus, customer, item and order maintenance with message subfiles, and an SQL order inquiry. Its SQL trigger (ITMPRCH) logs price changes.
+
+What still fails there would mostly fail on IBM i too (SELECT statements in RUNSQLSTM scripts: JRNQRY, PRACTICE1), or needs what as4tainr does not have yet: journals and QSYS2.DISPLAY_JOURNAL (ORDAUDJV, SETUPJRN) and external trigger programs (ADDTRG's ADDPFTRG for ORDTRG).

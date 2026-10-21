@@ -808,6 +808,10 @@ fn map_db_error(e: tokio_postgres::Error) -> anyhow::Error {
             "23514" => {
                 anyhow!("CPF502F: the record does not satisfy a check constraint of the file")
             }
+            "23503" => anyhow!(
+                "CPF502D: referential constraint violation: {}",
+                db.message()
+            ),
             "22003" => anyhow!(
                 "RNX0103: value does not fit the numeric field ({})",
                 db.message()

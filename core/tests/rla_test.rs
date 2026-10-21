@@ -6639,3 +6639,439 @@ async fn rpg_read_of_a_display_record() {
     assert!(e.contains("READ DETAIL"), "{e}");
     assert_eq!(seen.await.unwrap(), 2);
 }
+
+/// An optional parameter (IBM CL reference, PGM and MONMSG): a parameter
+/// the caller did not pass has no storage, so using it is MCH3601, which a
+/// MONMSG after the CHGVAR handles (MONMSG can follow any command,
+/// CHGVAR included). The MONMSG after that EXEC's CHGVAR belongs to the
+/// first CHGVAR, not to the one in EXEC. Passed, the value is used.
+#[tokio::test]
+async fn cl_optional_parameter_and_monmsg_after_chgvar() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let pgm = "PGM PARM(&P)
+  DCL &P *CHAR 10
+  DCL &V *CHAR 10
+  CHGVAR &V &P
+  MONMSG MCH3601 EXEC(CHGVAR &V 'DEFAULT')
+  MONMSG CPF0000 EXEC(CHGVAR &V 'OTHER')
+  SNDPGMMSG MSG('V=' *CAT &V)
+ENDPGM";
+    let m = cl_job_run(&client, &url, &lib, &[("OPTPARM", pgm)], "CALL OPTPARM")
+        .await
+        .unwrap();
+    assert_eq!(m.last().unwrap(), "V=DEFAULT");
+    let m = cl_job_run(
+        &client,
+        &url,
+        &lib,
+        &[("OPTPARM", pgm)],
+        "CALL OPTPARM PARM(GIVEN)",
+    )
+    .await
+    .unwrap();
+    assert_eq!(m.last().unwrap(), "V=GIVEN");
+    // Not monitored: the program ends with MCH3601.
+    let bare = "PGM PARM(&P)
+  DCL &P *CHAR 10
+  DCL &V *CHAR 10
+  CHGVAR &V &P
+ENDPGM";
+    let e = cl_job_run(&client, &url, &lib, &[("BAREPARM", bare)], "CALL BAREPARM")
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("MCH3601"), "{e:#}");
+}
+
+/// Db2 for i scalar functions that PostgreSQL writes differently (Db2 for
+/// i SQL Reference, scalar functions). DECIMAL/DEC: precision 15 and scale
+/// 0 by default, extra fraction digits cut off (truncated, as assigning
+/// to a decimal column does), a string argument read as a number.
+/// DAYOFWEEK: 1 is Sunday (2024-03-10 was a Sunday). DAYOFYEAR: March 1 of
+/// the leap year 2024 is day 61. DAYS: 0001-01-01 is day 1. QUARTER: 1-4.
+#[tokio::test]
+async fn sql_db2_scalar_functions() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let libl = vec!["QSYS".to_string(), lib.clone()];
+    let run = |sql: &str| {
+        let (client, url, libl, sql) = (&client, url.clone(), libl.clone(), sql.to_string());
+        async move {
+            match as4tainr_core::sql::run_as(client, &url, &libl, "QSECOFR", None, None, &sql)
+                .await
+                .unwrap()
+            {
+                as4tainr_core::sql::Outcome::Rows { rows, .. } => rows[0]
+                    .iter()
+                    .map(|v| v.trim().to_string())
+                    .collect::<Vec<_>>()
+                    .join("|"),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    };
+    assert_eq!(
+        run(
+            "SELECT DEC(2.349, 5, 2), DECIMAL(-2.349, 5, 2), DEC(7.9), DEC('12.345', 5, 1), \
+             DEC(ROUND(2.345, 2), 19, 4) FROM SYSIBM.SYSDUMMY1"
+        )
+        .await,
+        "2.34|-2.34|7|12.3|2.3500"
+    );
+    assert_eq!(
+        run(
+            "SELECT DAYOFWEEK(DATE('2024-03-10')), DAYOFYEAR(DATE('2024-03-01')), \
+             DAYS(DATE('0001-01-01')), DAYS(DATE('0001-01-31')), QUARTER(DATE('2024-08-15')), \
+             YEAR(DATE('2024-08-15')), MONTH(DATE('2024-08-15')), DAY(DATE('2024-08-15')) \
+             FROM SYSIBM.SYSDUMMY1"
+        )
+        .await,
+        "1|61|1|31|3|2024|8|15"
+    );
+}
+
+/// A service program whose NOMAIN module holds an SQL cursor (Db2 for i
+/// SQL Programming, "Cursor scope", and SET OPTION CLOSQLCSR: *ENDACTGRP
+/// is the default, so a cursor stays open until its activation group
+/// ends). SET OPTION and DECLARE CURSOR are declarations, allowed in a
+/// NOMAIN module's global section; one procedure opens the cursor and
+/// another fetches from it, call after call. RCLACTGRP closes it: the
+/// next fetch is SQLCODE -501. BNDSRVPGM elements are (service program
+/// activation). A CHAR host variable compares with blank padding. GET
+/// DIAGNOSTICS reads the previous statement: ROW_COUNT, and condition 1's
+/// RETURNED_SQLSTATE, DB2_RETURNED_SQLCODE and DB2_MESSAGE_ID (an unknown
+/// column is SQL0206, SQLSTATE 42703); it ends with SQLSTATE 00000.
+/// Compile options with nothing to change here (DBGVIEW,
+/// RPGPPOPT) are accepted, as is CRTDSPF REPLACE(*YES) over an existing
+/// display file.
+#[tokio::test]
+async fn ile_service_program_sql_cursor_across_calls() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    for s in [
+        format!("RUNSQL SQL('CREATE TABLE {lib}.ITEMS (ID INTEGER NOT NULL PRIMARY KEY, NAME VARCHAR(20))') COMMIT(*NONE)"),
+        format!("RUNSQL SQL('INSERT INTO {lib}.ITEMS VALUES (1, ''one''), (2, ''two''), (3, ''three'')') COMMIT(*NONE)"),
+    ] {
+        cl_cmd(&mut job, s).await.unwrap();
+    }
+    for f in ["QRPGLESRC", "QSRVSRC", "QDDSSRC"] {
+        source::create_file(&client, &lib, f, "").await.unwrap();
+    }
+    let put = |file: &str, name: &str, srctype: &str, text: &str| source::Member {
+        library: lib.clone(),
+        file: file.into(),
+        name: name.into(),
+        srctype: srctype.into(),
+        text: String::new(),
+        source: text.into(),
+    };
+    let members = [
+        put("QRPGLESRC", "UTIL", "RPGLE", "**FREE\nctl-opt nomain;\ndcl-proc twice export;\n  dcl-pi *n int(10);\n    n int(10) const;\n  end-pi;\n  return n * 2;\nend-proc;\n"),
+        put("QSRVSRC", "UTIL", "BND", "STRPGMEXP PGMLVL(*CURRENT)\n  EXPORT SYMBOL(TWICE)\nENDPGMEXP\n"),
+        put("QRPGLESRC", "ITEMSV", "SQLRPGLE", "**FREE\nctl-opt nomain;\nexec sql set option commit = *none, closqlcsr = *endactgrp;\ndcl-s gFrom int(10);\ndcl-s gName varchar(20);\nexec sql declare ITEMLIST cursor for\n  select NAME from ITEMS where ID >= :gFrom order by ID;\ndcl-proc openList export;\n  dcl-pi *n int(10);\n    from int(10) const;\n  end-pi;\n  gFrom = from;\n  exec sql open ITEMLIST;\n  return sqlcode;\nend-proc;\ndcl-proc nextName export;\n  dcl-pi *n varchar(20) end-pi;\n  exec sql fetch next from ITEMLIST into :gName;\n  if sqlcode <> 0;\n    return '*' + %char(sqlcode);\n  endif;\n  return gName;\nend-proc;\n"),
+        put("QSRVSRC", "ITEMSV", "BND", "STRPGMEXP PGMLVL(*CURRENT)\n  EXPORT SYMBOL(OPENLIST)\n  EXPORT SYMBOL(NEXTNAME)\nENDPGMEXP\n"),
+        put("QRPGLESRC", "LISTA", "RPGLE", "**FREE\nctl-opt dftactgrp(*no) actgrp('ITEMS') bnddir('ITEMDIR');\ndcl-pr openList int(10);\n  from int(10) const;\nend-pr;\ndcl-pr nextName varchar(20) end-pr;\ndsply %char(openList(2));\ndsply nextName();\n*inlr = *on;\n"),
+        put("QRPGLESRC", "LISTB", "RPGLE", "**FREE\nctl-opt dftactgrp(*no) actgrp('ITEMS') bnddir('ITEMDIR');\ndcl-pr nextName varchar(20) end-pr;\ndsply nextName();\ndsply nextName();\n*inlr = *on;\n"),
+        put("QRPGLESRC", "LISTC", "SQLRPGLE", "**FREE\ndcl-s blank char(5);\ndcl-s key char(10) inz('two');\ndcl-s n int(10);\ndcl-s st char(5);\ndcl-s id varchar(10);\nexec sql set option commit = *none;\nexec sql select count(*) into :n from ITEMS where (:blank = ' ' or ID = 0);\ndsply %char(n);\nexec sql select ID into :n from ITEMS where NAME = :key;\ndsply %char(n);\nexec sql update ITEMS set NAME = NAME where ID >= 2;\nexec sql get diagnostics :n = ROW_COUNT;\ndsply %char(n);\nexec sql select NOSUCH into :n from ITEMS;\nexec sql get diagnostics condition 1 :st = RETURNED_SQLSTATE, :n = DB2_RETURNED_SQLCODE, :id = DB2_MESSAGE_ID;\ndsply (st + ' ' + %char(n) + ' ' + id + ' ' + sqlstate);\n*inlr = *on;\n"),
+        put("QDDSSRC", "ITEMD", "DSPF", "     A          R ITEMR\n     A                                  1  2'Items'\n"),
+    ];
+    for m in &members {
+        source::put_member(&client, m, false).await.unwrap();
+    }
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/UTIL) DBGVIEW(*SOURCE) REPLACE(*YES)"),
+        format!("CRTSRVPGM SRVPGM({lib}/UTIL) MODULE({lib}/UTIL) SRCFILE({lib}/QSRVSRC)"),
+        format!("CRTSQLRPGI OBJ({lib}/ITEMSV) SRCFILE({lib}/QRPGLESRC) OBJTYPE(*MODULE) RPGPPOPT(*LVL2) DBGVIEW(*SOURCE)"),
+        format!("CRTSRVPGM SRVPGM({lib}/ITEMSV) MODULE({lib}/ITEMSV) EXPORT(*SRCFILE) SRCFILE({lib}/QSRVSRC) BNDSRVPGM(({lib}/UTIL *IMMED)) ACTGRP(*CALLER)"),
+        format!("CRTBNDDIR BNDDIR({lib}/ITEMDIR)"),
+        format!("ADDBNDDIRE BNDDIR({lib}/ITEMDIR) OBJ(({lib}/ITEMSV *SRVPGM))"),
+        format!("CRTBNDRPG PGM({lib}/LISTA) DBGVIEW(*SOURCE)"),
+        format!("CRTBNDRPG PGM({lib}/LISTB)"),
+        format!("CRTDSPF FILE({lib}/ITEMD) SRCFILE({lib}/QDDSSRC) RSTDSP(*YES)"),
+        format!("CRTDSPF FILE({lib}/ITEMD) SRCFILE({lib}/QDDSSRC) REPLACE(*YES)"),
+    ] {
+        cl_cmd(&mut job, c.clone()).await.unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    // Fixed-length character host variables compare as CHAR(n): blanks
+    // added to the shorter value (Db2 for i SQL Reference, "String
+    // comparisons").
+    cl_cmd(
+        &mut job,
+        format!("CRTSQLRPGI OBJ({lib}/LISTC) SRCFILE({lib}/QRPGLESRC)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        cl_cmd(&mut job, format!("CALL PGM({lib}/LISTC)"))
+            .await
+            .unwrap(),
+        [
+            "DSPLY  3",
+            "DSPLY  2",
+            "DSPLY  2",
+            "DSPLY  42703 -206 SQL0206 00000"
+        ]
+    );
+    let e = cl_cmd(
+        &mut job,
+        format!("CRTDSPF FILE({lib}/ITEMD) SRCFILE({lib}/QDDSSRC) REPLACE(*NO)"),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("CPF7302"), "{e}");
+    assert_eq!(
+        cl_cmd(&mut job, format!("CALL PGM({lib}/LISTA)"))
+            .await
+            .unwrap(),
+        ["DSPLY  0", "DSPLY  two"]
+    );
+    assert_eq!(
+        cl_cmd(&mut job, format!("CALL PGM({lib}/LISTB)"))
+            .await
+            .unwrap(),
+        ["DSPLY  three", "DSPLY  *100"]
+    );
+    cl_cmd(&mut job, "RCLACTGRP ACTGRP(ITEMS)".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        cl_cmd(&mut job, format!("CALL PGM({lib}/LISTB)"))
+            .await
+            .unwrap(),
+        ["DSPLY  *-501", "DSPLY  *-501"]
+    );
+}
+
+/// SQL triggers (Db2 for i SQL Reference, CREATE TRIGGER, DROP TRIGGER):
+/// an AFTER UPDATE OF trigger with REFERENCING OLD/NEW and WHEN runs its
+/// INSERT for the rows whose price changed, and the USER special register
+/// is the job's user;
+/// a BEFORE INSERT trigger's SET changes the new row; SIGNAL fails the
+/// change with its SQLSTATE. CREATE TRIGGER of an existing name without
+/// OR REPLACE is SQL0601; DROP TRIGGER removes it. CREATE OR REPLACE
+/// TABLE ... ON REPLACE PRESERVE ROWS keeps the rows (in the columns kept).
+#[tokio::test]
+async fn sql_triggers_and_preserve_rows() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let sql = |s: String| format!("RUNSQL SQL('{}') COMMIT(*NONE)", s.replace('\'', "''"));
+    for s in [
+        format!("CREATE TABLE {lib}.PRICES (ID INTEGER NOT NULL PRIMARY KEY, NAME VARCHAR(20), PRICE DECIMAL(7, 2))"),
+        format!("CREATE TABLE {lib}.PRCLOG (ID INTEGER, OLDP DECIMAL(7, 2), NEWP DECIMAL(7, 2), WHO VARCHAR(18))"),
+        format!("INSERT INTO {lib}.PRICES VALUES (1, 'one', 10.00), (2, 'two', 20.00)"),
+        format!("CREATE TRIGGER {lib}.PRCTRG AFTER UPDATE OF PRICE ON {lib}.PRICES REFERENCING OLD AS O NEW AS N FOR EACH ROW WHEN (O.PRICE <> N.PRICE) INSERT INTO {lib}.PRCLOG VALUES (N.ID, O.PRICE, N.PRICE, USER)"),
+        format!("CREATE TRIGGER {lib}.NAMTRG NO CASCADE BEFORE INSERT ON {lib}.PRICES REFERENCING NEW AS N FOR EACH ROW BEGIN ATOMIC SET N.NAME = UPPER(N.NAME); END"),
+        format!("CREATE TRIGGER {lib}.NEGTRG BEFORE UPDATE ON {lib}.PRICES REFERENCING NEW AS N FOR EACH ROW WHEN (N.PRICE < 0) SIGNAL SQLSTATE '75001' SET MESSAGE_TEXT = 'Price below zero'"),
+        format!("UPDATE {lib}.PRICES SET PRICE = PRICE + 1"),
+        format!("UPDATE {lib}.PRICES SET NAME = 'uno' WHERE ID = 1"),
+        format!("INSERT INTO {lib}.PRICES VALUES (3, 'three', 30.00)"),
+    ] {
+        cl_cmd(&mut job, sql(s.clone())).await.unwrap_or_else(|e| panic!("{s}: {e}"));
+    }
+    let rows = |q: String| {
+        let (client, url, lib) = (&client, url.clone(), lib.clone());
+        async move {
+            match as4tainr_core::sql::run_as(
+                client,
+                &url,
+                std::slice::from_ref(&lib),
+                "QSECOFR",
+                Some(lib.clone()),
+                None,
+                &q,
+            )
+            .await
+            .unwrap()
+            {
+                as4tainr_core::sql::Outcome::Rows { rows, .. } => rows
+                    .into_iter()
+                    .map(|r| r.iter().map(|v| v.trim()).collect::<Vec<_>>().join("|"))
+                    .collect::<Vec<_>>(),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    };
+    assert_eq!(
+        rows(format!(
+            "SELECT ID, OLDP, NEWP, WHO FROM {lib}.PRCLOG ORDER BY ID"
+        ))
+        .await,
+        ["1|10.00|11.00|QSECOFR", "2|20.00|21.00|QSECOFR"]
+    );
+    assert_eq!(
+        rows(format!("SELECT NAME FROM {lib}.PRICES WHERE ID = 3")).await,
+        ["THREE"]
+    );
+    let e = cl_cmd(
+        &mut job,
+        sql(format!("UPDATE {lib}.PRICES SET PRICE = -1 WHERE ID = 2")),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("Price below zero"), "{e}");
+    let e = cl_cmd(&mut job, sql(format!("CREATE TRIGGER {lib}.NEGTRG AFTER DELETE ON {lib}.PRICES FOR EACH ROW DELETE FROM {lib}.PRCLOG")))
+        .await
+        .unwrap_err();
+    assert!(e.contains("SQL0601"), "{e}");
+    cl_cmd(&mut job, sql(format!("DROP TRIGGER {lib}.NEGTRG")))
+        .await
+        .unwrap();
+    cl_cmd(
+        &mut job,
+        sql(format!("UPDATE {lib}.PRICES SET PRICE = -1 WHERE ID = 2")),
+    )
+    .await
+    .unwrap();
+    let e = cl_cmd(&mut job, sql(format!("DROP TRIGGER {lib}.NEGTRG")))
+        .await
+        .unwrap_err();
+    assert!(e.contains("SQL0204"), "{e}");
+    // The table replaced, its rows kept in the columns it still has.
+    cl_cmd(
+        &mut job,
+        sql(format!("CREATE OR REPLACE TABLE {lib}.PRCLOG (ID INTEGER, NEWP DECIMAL(7, 2), NOTE VARCHAR(10) DEFAULT 'none') ON REPLACE PRESERVE ROWS")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows(format!(
+            "SELECT ID, NEWP, NOTE FROM {lib}.PRCLOG ORDER BY ID, NEWP"
+        ))
+        .await,
+        ["1|11.00|none", "2|-1.00|none", "2|21.00|none"]
+    );
+}
+
+/// The program message APIs and other job values in RPG. QMHSNDPM (API
+/// reference, Send Program Message): the text is the message
+/// description's with &1 replaced by the message data (*CHAR without its
+/// trailing blanks), put on the call stack entry named; a 4-byte key comes
+/// back; with an error code of 16 bytes provided, an unknown message ID is
+/// not an exception: bytes available and the exception ID (CPF2419) are
+/// returned. QMHRMVPM removes one message by key, or *ALL. ILE RPG
+/// Reference: DTAARA(*VAR : field) names the data area by the field's
+/// value when the program runs; INZ(*USER) is the job's user profile.
+#[tokio::test]
+async fn rpg_message_apis_dtaara_var_inz_user() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    source::create_file(&client, &lib, "QRPGLESRC", "")
+        .await
+        .unwrap();
+    let src = format!(
+        "**FREE
+dcl-pr SndPgmMsg extpgm('QMHSNDPM');
+  id char(7) const; f char(20) const; d char(10) const; l int(10) const;
+  t char(10) const; e char(10) const; c int(10) const; k char(4); err char(16);
+end-pr;
+dcl-pr RmvPgmMsg extpgm('QMHRMVPM');
+  e char(10) const; c int(10) const; k char(4) const; w char(10) const; err char(16);
+end-pr;
+dcl-ds apierr len(16) qualified;
+  prov int(10) pos(1) inz(16);
+  avail int(10) pos(5);
+  exid char(7) pos(9);
+end-ds;
+dcl-s key1 char(4);
+dcl-s key2 char(4);
+dcl-s me char(10) inz(*USER);
+dcl-s daname char(21) inz('{lib}/COUNTER');
+dcl-s n packed(5:0) dtaara(*var:daname);
+SndPgmMsg('TST0001': 'TMSGF     {lib}': 'WIDGET': 10: '*INFO': 'TMSGQ': 0: key1: apierr);
+SndPgmMsg('TST0001': 'TMSGF     {lib}': 'GADGET': 10: '*INFO': 'TMSGQ': 0: key2: apierr);
+RmvPgmMsg('TMSGQ': 0: key1: '*BYKEY': apierr);
+SndPgmMsg('TST9999': 'TMSGF     {lib}': ' ': 0: '*INFO': 'TMSGQ2': 0: key1: apierr);
+dsply (apierr.exid + ' ' + %char(apierr.avail > 0));
+dsply me;
+in *lock n;
+n += 1;
+out n;
+dsply %char(n);
+*inlr = *on;
+"
+    );
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QRPGLESRC".into(),
+            name: "MSGAPI".into(),
+            srctype: "RPGLE".into(),
+            text: String::new(),
+            source: src,
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    for c in [
+        format!("CRTMSGF MSGF({lib}/TMSGF)"),
+        format!(
+            "ADDMSGD MSGID(TST0001) MSGF({lib}/TMSGF) MSG('Item &1 is short.') FMT((*CHAR 10))"
+        ),
+        format!("CRTDTAARA DTAARA({lib}/COUNTER) TYPE(*DEC) LEN(5 0) VALUE(41)"),
+        format!("CRTBNDRPG PGM({lib}/MSGAPI)"),
+    ] {
+        cl_cmd(&mut job, c.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    assert_eq!(
+        cl_cmd(&mut job, format!("CALL PGM({lib}/MSGAPI)"))
+            .await
+            .unwrap(),
+        ["DSPLY  CPF2419 1", "DSPLY  QSECOFR", "DSPLY  42"]
+    );
+    let key = format!("PID{}", std::process::id());
+    let q: Vec<String> = as4tainr_core::pgmmsg::named_messages(&key, "TMSGQ")
+        .into_iter()
+        .map(|m| m.text)
+        .collect();
+    assert_eq!(q, ["Item GADGET is short."]);
+    as4tainr_core::pgmmsg::named_remove(&key, "TMSGQ", "*ALL", None);
+    assert!(as4tainr_core::pgmmsg::named_messages(&key, "TMSGQ").is_empty());
+}

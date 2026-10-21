@@ -163,8 +163,9 @@ pub static COMMANDS: &[CommandDef] = &[
         name: "RUNSQLSTM",
         description: "Run SQL Statements",
         params: &[
-            p("SRCFILE", Kind::Qualified, true, None, "Source file").ch("Name"),
-            p("SRCMBR", Kind::Name, true, None, "Source member").ch("Name"),
+            p("SRCFILE", Kind::Qualified, false, None, "Source file").ch("Name"),
+            p("SRCMBR", Kind::Name, false, None, "Source member").ch("Name"),
+            p("SRCSTMF", Kind::Text, false, None, "Source stream file").ch("Path name"),
             p(
                 "COMMIT",
                 Kind::Name,
@@ -1304,6 +1305,38 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "CHGPFM",
+        description: "Change Physical File Member",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "Physical file").ch("Name"),
+            p("MBR", Kind::Name, true, None, "Member").ch("Name"),
+            p("SRCTYPE", Kind::Name, false, Some("*SAME"), "Source type").ch("Name, *SAME, *NONE"),
+            p(
+                "EXPDATE",
+                Kind::Name,
+                false,
+                Some("*SAME"),
+                "Expiration date for member",
+            )
+            .ch("Date, *SAME, *NONE"),
+            p(
+                "SHARE",
+                Kind::Name,
+                false,
+                Some("*SAME"),
+                "Share open data path",
+            )
+            .ch("*SAME, *NO, *YES"),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*SAME"),
+                "Text 'description'",
+            ),
+        ],
+    },
+    CommandDef {
         name: "DSPFD",
         description: "Display File Description",
         params: &[
@@ -1364,6 +1397,24 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("Name"),
             p("SRCMBR", Kind::Name, false, Some("*FILE"), "Source member").ch("Name, *FILE"),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*SRCMBRTXT"),
+                "Text 'description'",
+            )
+            .ch("")
+            .keyword_only(),
+            p("RSTDSP", Kind::Name, false, Some("*NO"), "Restore display")
+                .ch("*NO, *YES")
+                .keyword_only(),
+            p("DFRWRT", Kind::Name, false, Some("*YES"), "Defer write")
+                .ch("*YES, *NO")
+                .keyword_only(),
+            p("REPLACE", Kind::Name, false, Some("*YES"), "Replace file")
+                .ch("*YES, *NO")
+                .keyword_only(),
         ],
     },
     CommandDef {
@@ -1478,6 +1529,36 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*YES, *NO")
             .keyword_only(),
+            p(
+                "DBGVIEW",
+                Kind::Name,
+                false,
+                Some("*STMT"),
+                "Debugging views",
+            )
+            .ch("*STMT, *SOURCE, *LIST, *COPY, *ALL, *NONE")
+            .keyword_only(),
+            p("OPTION", Kind::List, false, None, "Compiler options")
+                .ch("*XREF, *NOXREF, *SRCSTMT, *NOSRCSTMT...")
+                .keyword_only(),
+            p(
+                "OUTPUT",
+                Kind::Name,
+                false,
+                Some("*PRINT"),
+                "Compiler listing",
+            )
+            .ch("*PRINT, *NONE")
+            .keyword_only(),
+            p(
+                "TGTRLS",
+                Kind::Name,
+                false,
+                Some("*CURRENT"),
+                "Target release",
+            )
+            .ch("*CURRENT, *PRV, VxRxMx")
+            .keyword_only(),
         ],
     },
     CommandDef {
@@ -1580,6 +1661,36 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*YES, *NO")
             .keyword_only(),
+            p(
+                "DBGVIEW",
+                Kind::Name,
+                false,
+                Some("*STMT"),
+                "Debugging views",
+            )
+            .ch("*STMT, *SOURCE, *LIST, *COPY, *ALL, *NONE")
+            .keyword_only(),
+            p("OPTION", Kind::List, false, None, "Compiler options")
+                .ch("*XREF, *NOXREF, *SRCSTMT, *NOSRCSTMT...")
+                .keyword_only(),
+            p(
+                "OUTPUT",
+                Kind::Name,
+                false,
+                Some("*PRINT"),
+                "Compiler listing",
+            )
+            .ch("*PRINT, *NONE")
+            .keyword_only(),
+            p(
+                "TGTRLS",
+                Kind::Name,
+                false,
+                Some("*CURRENT"),
+                "Target release",
+            )
+            .ch("*CURRENT, *PRV, VxRxMx")
+            .keyword_only(),
         ],
     },
     CommandDef {
@@ -1614,6 +1725,36 @@ pub static COMMANDS: &[CommandDef] = &[
             p("REPLACE", Kind::Name, false, Some("*YES"), "Replace module")
                 .ch("*YES, *NO")
                 .keyword_only(),
+            p(
+                "DBGVIEW",
+                Kind::Name,
+                false,
+                Some("*STMT"),
+                "Debugging views",
+            )
+            .ch("*STMT, *SOURCE, *LIST, *COPY, *ALL, *NONE")
+            .keyword_only(),
+            p("OPTION", Kind::List, false, None, "Compiler options")
+                .ch("*XREF, *NOXREF, *SRCSTMT, *NOSRCSTMT...")
+                .keyword_only(),
+            p(
+                "OUTPUT",
+                Kind::Name,
+                false,
+                Some("*PRINT"),
+                "Compiler listing",
+            )
+            .ch("*PRINT, *NONE")
+            .keyword_only(),
+            p(
+                "TGTRLS",
+                Kind::Name,
+                false,
+                Some("*CURRENT"),
+                "Target release",
+            )
+            .ch("*CURRENT, *PRV, VxRxMx")
+            .keyword_only(),
         ],
     },
     CommandDef {
@@ -1657,6 +1798,36 @@ pub static COMMANDS: &[CommandDef] = &[
             p("REPLACE", Kind::Name, false, Some("*YES"), "Replace module")
                 .ch("*YES, *NO")
                 .keyword_only(),
+            p(
+                "DBGVIEW",
+                Kind::Name,
+                false,
+                Some("*STMT"),
+                "Debugging views",
+            )
+            .ch("*STMT, *SOURCE, *LIST, *COPY, *ALL, *NONE")
+            .keyword_only(),
+            p("OPTION", Kind::List, false, None, "Compiler options")
+                .ch("*XREF, *NOXREF, *SRCSTMT, *NOSRCSTMT...")
+                .keyword_only(),
+            p(
+                "OUTPUT",
+                Kind::Name,
+                false,
+                Some("*PRINT"),
+                "Compiler listing",
+            )
+            .ch("*PRINT, *NONE")
+            .keyword_only(),
+            p(
+                "TGTRLS",
+                Kind::Name,
+                false,
+                Some("*CURRENT"),
+                "Target release",
+            )
+            .ch("*CURRENT, *PRV, VxRxMx")
+            .keyword_only(),
         ],
     },
     CommandDef {
@@ -2065,6 +2236,54 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*YES, *NO")
             .keyword_only(),
+            p(
+                "DBGVIEW",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "Debugging views",
+            )
+            .ch("*STMT, *SOURCE, *LIST, *COPY, *ALL, *NONE")
+            .keyword_only(),
+            p("OPTION", Kind::List, false, None, "Compiler options")
+                .ch("*XREF, *NOXREF, *SRCSTMT, *NOSRCSTMT...")
+                .keyword_only(),
+            p(
+                "OUTPUT",
+                Kind::Name,
+                false,
+                Some("*PRINT"),
+                "Compiler listing",
+            )
+            .ch("*PRINT, *NONE")
+            .keyword_only(),
+            p(
+                "TGTRLS",
+                Kind::Name,
+                false,
+                Some("*CURRENT"),
+                "Target release",
+            )
+            .ch("*CURRENT, *PRV, VxRxMx")
+            .keyword_only(),
+            p(
+                "RPGPPOPT",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "RPG preprocessor options",
+            )
+            .ch("*NONE, *LVL1, *LVL2")
+            .keyword_only(),
+            p(
+                "CLOSQLCSR",
+                Kind::Name,
+                false,
+                Some("*ENDACTGRP"),
+                "Close SQL cursor",
+            )
+            .ch("*ENDACTGRP, *ENDMOD")
+            .keyword_only(),
         ],
     },
     CommandDef {
@@ -2382,6 +2601,7 @@ pub static GROUPS: &[Group] = &[
         title: "Source and Create Commands",
         commands: &[
             "CRTSRCPF",
+            "CHGPFM",
             "DSPFD",
             "CRTPF",
             "CRTLF",
@@ -2732,18 +2952,37 @@ pub fn parse_partial(
                         // substring in DTAARA(NAME (1 10)): kept as one
                         // value "(1 10)" for the command to take apart.
                         Some(Tok::Open) => {
-                            let mut inner = Vec::new();
-                            loop {
+                            // Lists in lists (CALL PARM(('x' (*CHAR 128)))):
+                            // the whole group as written.
+                            let mut text = String::from("(");
+                            let mut depth = 1;
+                            while depth > 0 {
                                 match it.next() {
-                                    Some(Tok::Close) => break,
-                                    Some(Tok::Word(v)) => inner.push(v),
-                                    Some(Tok::Quoted(v)) => {
-                                        inner.push(format!("'{}'", v.replace('\'', "''")))
+                                    Some(Tok::Close) => {
+                                        depth -= 1;
+                                        text = text.trim_end().to_string();
+                                        text.push_str(") ");
                                     }
                                     Some(Tok::Open) => {
-                                        return Err(err(
-                                            "Lists nested more than two deep are not supported.",
-                                        ))
+                                        depth += 1;
+                                        // Only CALL's PARM takes a list
+                                        // inside an element list: a value
+                                        // and its (type length).
+                                        let typed = pd.keyword == "PARM"
+                                            && matches!(def.name, "CALL" | "TFRCTL" | "CALLPRC");
+                                        if depth > 2 || !typed {
+                                            return Err(err(format!(
+                                                "Lists nested more than two deep are not supported in {w}."
+                                            )));
+                                        }
+                                        text.push('(');
+                                    }
+                                    Some(Tok::Word(v)) => {
+                                        text.push_str(&v);
+                                        text.push(' ');
+                                    }
+                                    Some(Tok::Quoted(v)) => {
+                                        text.push_str(&format!("'{}' ", v.replace('\'', "''")));
                                     }
                                     None => {
                                         return Err(err(format!(
@@ -2752,7 +2991,7 @@ pub fn parse_partial(
                                     }
                                 }
                             }
-                            vals.push(Value::Word(format!("({})", inner.join(" "))));
+                            vals.push(Value::Word(text.trim_end().to_string()));
                         }
                         None => {
                             return Err(err(format!("A closing parenthesis is missing after {w}.")))
@@ -2963,6 +3202,15 @@ mod tests {
         let c = parse("crtdtaara nxt *dec len(7 0) value(1004)").unwrap();
         assert_eq!(c.list("LEN"), ["7", "0"]);
         assert!(parse("CHGDTAARA DTAARA(CO (1 (2))) VALUE(X)").is_err());
+    }
+
+    #[test]
+    fn call_parm_values_with_a_type() {
+        // CL Reference, CALL: a parameter can be written (value (type
+        // length)), e.g. PARM(('abc' (*CHAR 128))). Nowhere else.
+        let c = parse("CALL NWAPP/NWBUILD PARM(('/home/me' (*CHAR 128)) 'NWAPP')").unwrap();
+        assert_eq!(c.list("PARM"), ["('/home/me' (*CHAR 128))", "NWAPP"]);
+        assert!(parse("CALL X PARM(('a' (*CHAR (1))))").is_err());
     }
 
     #[test]

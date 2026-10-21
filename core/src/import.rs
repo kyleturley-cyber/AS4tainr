@@ -217,6 +217,28 @@ fn scan(dir: &Path) -> Result<Scan> {
                     .to_string_lossy()
                     .replace('\\', "/");
                 out.includes.push((rel, p.clone()));
+                // In a folder named for a source file (QCPYSRC/): also a
+                // member of that file, for /COPY QCPYSRC,NAME.
+                let stem = fname.rsplit_once('.').map(|x| x.0).unwrap_or(fname);
+                if let (Some(file), Ok(member)) = (
+                    file_of_folder.clone(),
+                    catalog::validate_name("member", &stem.to_ascii_uppercase()),
+                ) {
+                    if !out
+                        .members
+                        .iter()
+                        .any(|m| m.file == file && m.member == member)
+                    {
+                        out.members.push(Found {
+                            file,
+                            member,
+                            srctype: ext.to_ascii_uppercase(),
+                            text: String::new(),
+                            path: p.clone(),
+                            objtype: None,
+                        });
+                    }
+                }
                 continue;
             }
             let Some((name, text, ext)) = member_of(fname) else {
@@ -709,5 +731,25 @@ mod tests {
         assert_eq!(default_source_file("PF"), "QDDSSRC");
         assert_eq!(default_source_file("RPGLE"), "QRPGLESRC");
         assert_eq!(default_source_file("CLLE"), "QCLSRC");
+    }
+
+    #[test]
+    fn include_files_in_source_file_folders_are_members() {
+        // A copy member lives in a source file (ILE RPG Reference, /COPY
+        // file,member): QCPYSRC/NWUTILPR.rpgleinc is member NWUTILPR of
+        // QCPYSRC, and still an include file for /INCLUDE 'path'.
+        let dir = std::env::temp_dir().join(format!("as4tainr-inc-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("qcpysrc")).unwrap();
+        std::fs::write(dir.join("qcpysrc/nwutilpr.rpgleinc"), "dcl-pr x; end-pr;\n").unwrap();
+        std::fs::write(dir.join("loose.rpgleinc"), "\n").unwrap();
+        let s = scan(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(s.includes.len(), 2);
+        let m: Vec<(&str, &str, &str)> = s
+            .members
+            .iter()
+            .map(|m| (m.file.as_str(), m.member.as_str(), m.srctype.as_str()))
+            .collect();
+        assert_eq!(m, [("QCPYSRC", "NWUTILPR", "RPGLEINC")]);
     }
 }

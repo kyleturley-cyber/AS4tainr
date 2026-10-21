@@ -142,6 +142,7 @@ impl Job<'_> {
             "CHGUSRPRF" => self.chgusrprf(&cmd).await,
             "GO" => self.go(&cmd).await,
             "CRTSRCPF" => self.crtsrcpf(&cmd).await,
+            "CHGPFM" => self.chgpfm(&cmd).await,
             "DSPFD" => self.dspfd(&cmd).await,
             "CRTPF" | "CRTLF" | "CRTDSPF" => self.crtfile(&cmd).await,
             "CRTPRTF" => self.crtprtf(&cmd).await,
@@ -459,14 +460,33 @@ impl Job<'_> {
             .ok()
             .filter(|n| *n <= 40)
             .ok_or_else(|| anyhow::anyhow!("CPD0084: ERRLVL must be a number from 0 to 40."))?;
-        let m = self.source_member(cmd, "").await?;
+        // SRCSTMF, or SRCFILE and SRCMBR (one or the other).
+        let stmf = cmd.get("SRCSTMF").to_string();
+        let (source, what) = if !stmf.is_empty() {
+            if !cmd.get("SRCFILE").is_empty() || !cmd.get("SRCMBR").is_empty() {
+                bail!("CPD0084: SRCSTMF cannot be given with SRCFILE or SRCMBR.");
+            }
+            let (bytes, ccsid) = crate::ifs::read_file(self.client, &stmf)
+                .await
+                .map_err(|e| anyhow::anyhow!("CPFA0A9: Object {stmf} not found: {e}"))?;
+            let text = crate::ifs::codec::text(ccsid, &bytes);
+            // A byte order mark is not a statement.
+            let text = text.trim_start_matches('\u{FEFF}').to_string();
+            (text, format!("stream file {stmf}"))
+        } else {
+            if cmd.get("SRCFILE").is_empty() || cmd.get("SRCMBR").is_empty() {
+                bail!("CPD0084: SRCFILE and SRCMBR, or SRCSTMF, are needed.");
+            }
+            let m = self.source_member(cmd, "").await?;
+            let what = format!("member {} in {}/{}", m.name, m.library, m.file);
+            (m.source, what)
+        };
         let schema = match cmd.get("DFTRDBCOL") {
             "*NONE" => None,
             s => Some(catalog::validate_name("library", s)?),
         };
-        let what = format!("member {} in {}/{}", m.name, m.library, m.file);
         let lines = self
-            .run_sql_script(&m.source, &what, errlvl, schema, true)
+            .run_sql_script(&source, &what, errlvl, schema, true)
             .await?;
         Ok(Outcome::Messages(lines))
     }
@@ -485,6 +505,9 @@ impl Job<'_> {
         let mut lines = Vec::new();
         let mut errors = 0;
         let statements = crate::ddl::split_statements(source);
+        // INSERT, UPDATE and DELETE run on one SQL session, made again
+        // after data definition (which can add libraries).
+        let mut session: Option<(Vec<String>, crate::sql::Session)> = None;
         for (k, stmt) in statements.iter().enumerate() {
             if !set_schema
                 && matches!(
@@ -509,13 +532,42 @@ impl Job<'_> {
             )
             .await
             {
-                Ok(Some(msg)) => Ok(msg),
+                Ok(Some(msg)) => {
+                    session = None;
+                    Ok(msg)
+                }
                 Ok(None) => {
                     let t = crate::sql::translate(stmt, &|_| false);
+                    let plain = crate::sqlpl::parse_call(stmt).ok().flatten().is_none()
+                        && !crate::sqlpl::is_compound(stmt);
                     if matches!(&t, Ok(t) if t.kind == crate::sql::Kind::Query) {
                         Err(anyhow::anyhow!(
                             "SQL0084: SELECT is not valid in RUNSQLSTM."
                         ))
+                    } else if plain && t.is_ok() {
+                        if session.as_ref().map(|(l, _)| l != &libl).unwrap_or(true) {
+                            let mut s = crate::sql::Session::open(
+                                self.client,
+                                &self.env.database_url,
+                                &libl,
+                            )
+                            .await?;
+                            s.set_context(
+                                &self.user,
+                                Some(self.current_library()),
+                                self.id.as_ref().map(|i| i.to_string()),
+                            )
+                            .await?;
+                            session = Some((libl.clone(), s));
+                        }
+                        let (_, s) = session.as_ref().unwrap();
+                        match s.exec(self.client, stmt).await {
+                            Ok(crate::sql::Exec::Count(kind, n)) => {
+                                Ok(crate::sql::count_message(kind, n))
+                            }
+                            Ok(crate::sql::Exec::Rows { .. }) => Ok(String::new()),
+                            Err(e) => Err(e),
+                        }
                     } else {
                         match crate::sql::run_as(
                             self.client,
@@ -887,6 +939,16 @@ impl Job<'_> {
             .list("BNDSRVPGM")
             .into_iter()
             .filter(|x| x != "*NONE")
+            // An element is (service program activation), e.g.
+            // ((MYLIB/UTIL *IMMED)): the activation is not kept.
+            .map(|x| {
+                x.trim_start_matches('(')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches(')')
+                    .to_string()
+            })
             .map(|x| match x.split_once('/') {
                 Some((l, n)) => (l.to_ascii_uppercase(), n.to_ascii_uppercase()),
                 None => ("*LIBL".to_string(), x.to_ascii_uppercase()),
@@ -1415,6 +1477,63 @@ impl Job<'_> {
         Ok(m)
     }
 
+    /// CHGPFM: a member's source type and text (source files; other
+    /// attributes are accepted).
+    async fn chgpfm(&mut self, cmd: &Command) -> Result<Outcome> {
+        let q = cmd.get("FILE").to_ascii_uppercase();
+        let (lib, file) = match q.split_once('/') {
+            Some((l, f)) => (l.to_string(), f.to_string()),
+            None => ("*LIBL".to_string(), q.clone()),
+        };
+        let lib = match lib.as_str() {
+            "*LIBL" => {
+                let mut found = None;
+                for l in self.library_list() {
+                    if crate::source::is_source_file(self.client, &l, &file).await?
+                        || catalog::object_exists(
+                            self.client,
+                            std::slice::from_ref(&l),
+                            &file,
+                            "*FILE",
+                        )
+                        .await?
+                    {
+                        found = Some(l);
+                        break;
+                    }
+                }
+                found.ok_or_else(|| {
+                    anyhow::anyhow!("CPF9812: File {file} in library *LIBL not found.")
+                })?
+            }
+            "*CURLIB" => self.current_library(),
+            l => l.to_string(),
+        };
+        let mbr = cmd.get("MBR").to_ascii_uppercase();
+        if crate::source::is_source_file(self.client, &lib, &file).await? {
+            let n = self
+                .client
+                .execute(
+                    "UPDATE as4tainr.source_members
+                        SET srctype = CASE WHEN $4 = '*SAME' THEN srctype WHEN $4 = '*NONE' THEN '' ELSE $4 END,
+                            text = CASE WHEN $5 = '*SAME' THEN text ELSE $5 END
+                      WHERE library = $1 AND file = $2 AND member = $3",
+                    &[&lib, &file, &mbr, &cmd.get("SRCTYPE").to_ascii_uppercase(), &cmd.get("TEXT")],
+                )
+                .await?;
+            if n == 0 {
+                bail!("CPF3141: Member {mbr} not found in file {lib}/{file}.");
+            }
+        } else if !catalog::object_exists(self.client, std::slice::from_ref(&lib), &file, "*FILE")
+            .await?
+        {
+            bail!("CPF9812: File {file} in library {lib} not found.");
+        }
+        Ok(Outcome::Messages(vec![format!(
+            "Member {mbr} file {file} in {lib} changed."
+        )]))
+    }
+
     async fn crtsrcpf(&mut self, cmd: &Command) -> Result<Outcome> {
         let (lib, name) = self.create_target(cmd.get("FILE"));
         number(cmd.get("RCDLEN"), "RCDLEN")?;
@@ -1519,7 +1638,11 @@ impl Job<'_> {
                 format!("File {name} created in library {lib} over {}.", lf.based_on)
             }
             _ => {
-                catalog::create_display_file(&mut c, &lib, &name, &m.source).await?;
+                if cmd.get("REPLACE") == "*NO" {
+                    catalog::create_display_file(&mut c, &lib, &name, &m.source).await?;
+                } else {
+                    catalog::replace_display_file(&mut c, &lib, &name, &m.source).await?;
+                }
                 format!("Display file {name} created in library {lib}.")
             }
         };
@@ -3314,7 +3437,12 @@ impl Job<'_> {
     /// back as messages.
     async fn call(&mut self, cmd: &Command) -> Result<Outcome> {
         let pgm = cmd.get("PGM").to_string();
-        self.call_program(&pgm, cmd.list("PARM")).await
+        let args = cmd
+            .list("PARM")
+            .into_iter()
+            .map(|a| typed_parm(&a))
+            .collect();
+        self.call_program(&pgm, args).await
     }
 
     /// Run a command line, boxed: CL programs run commands, and commands
@@ -3362,13 +3490,18 @@ impl Job<'_> {
                     .await?;
                 match p.attribute.as_str() {
                     "CLLE" | "CLP" => {
-                        let mut program = crate::clpgm::compile_in(
-                            self.client,
-                            &self.library_list(),
-                            &name,
-                            &p.source,
-                        )
-                        .await?;
+                        // The files DCLF names were found when the program
+                        // was created; IBM i opens them by the library
+                        // list at the first I/O, which the program may
+                        // change first (ADDLIBLE). Their descriptions are
+                        // taken from the library list, else from the
+                        // program's own library.
+                        let mut libl = self.library_list();
+                        if !libl.contains(&p.library) {
+                            libl.push(p.library.clone());
+                        }
+                        let mut program =
+                            crate::clpgm::compile_in(self.client, &libl, &name, &p.source).await?;
                         // An ILE CL program bound to modules and service
                         // programs: for CALLPRC.
                         program.object = format!("{}/{}", p.library, name);
@@ -3476,5 +3609,53 @@ async fn client_update_srvpgm(
             &[&lib, &name, &json],
         )
         .await?;
+    crate::ile::binding_changed();
     Ok(())
+}
+
+/// A CALL parameter written with its type and length, `(value (*CHAR
+/// 128))` (IBM CL reference, CALL PARM): the value, a character value
+/// padded to the length. Other parameters as they are.
+fn typed_parm(a: &str) -> String {
+    let t = a.trim();
+    let Some(inner) = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')) else {
+        return a.to_string();
+    };
+    let inner = inner.trim();
+    // The value: a quoted string or a word, then the (type length) group.
+    let (value, rest) = if let Some(q) = inner.strip_prefix('\'') {
+        let mut v = String::new();
+        let mut chars = q.char_indices().peekable();
+        let mut end = q.len();
+        while let Some((i, c)) = chars.next() {
+            if c == '\'' {
+                if chars.peek().map(|x| x.1) == Some('\'') {
+                    v.push('\'');
+                    chars.next();
+                    continue;
+                }
+                end = i + 1;
+                break;
+            }
+            v.push(c);
+        }
+        (v, q[end..].trim())
+    } else {
+        match inner.split_once(char::is_whitespace) {
+            Some((v, r)) => (v.to_string(), r.trim()),
+            None => (inner.to_string(), ""),
+        }
+    };
+    let ty: Vec<&str> = rest
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split_whitespace()
+        .collect();
+    match ty.as_slice() {
+        [t, len, ..] if t.eq_ignore_ascii_case("*CHAR") => {
+            let n: usize = len.parse().unwrap_or(value.len());
+            format!("{value:<n$}")
+        }
+        _ => value,
+    }
 }

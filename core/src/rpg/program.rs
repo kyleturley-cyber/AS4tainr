@@ -265,6 +265,8 @@ pub struct Program {
     /// written when it ends with LR (U in position 23, DTAARA(*AUTO)):
     /// (data structure, data area: a name or *LDA).
     pub auto_dtaaras: Vec<(String, String)>,
+    /// Global fields with INZ(*USER).
+    pub user_inz: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -303,6 +305,27 @@ fn sql_statements(calcs: &[CalcLine]) -> impl Iterator<Item = &str> {
         Line::Stmt(Stmt::Sql(s)) => Some(s.as_str()),
         _ => None,
     })
+}
+
+/// Statements the SQL precompiler takes as declarations, not calculations
+/// (Db2 for i SQL Reference: SET OPTION, DECLARE CURSOR, INCLUDE and
+/// WHENEVER are not executable), so a NOMAIN module may have them in its
+/// global section.
+fn declarative_sql(c: &CalcLine) -> bool {
+    let Line::Stmt(Stmt::Sql(s)) = &c.what else {
+        return false;
+    };
+    let w: Vec<String> = s
+        .split_whitespace()
+        .take(4)
+        .map(|x| x.to_ascii_uppercase())
+        .collect();
+    match w.first().map(String::as_str) {
+        Some("SET") => w.get(1).map(String::as_str) == Some("OPTION"),
+        Some("INCLUDE" | "WHENEVER") => true,
+        Some("DECLARE") => w.iter().any(|x| x == "CURSOR" || x == "STATEMENT"),
+        _ => false,
+    }
 }
 
 /// The commit level of a program's embedded SQL (Db2 for i SQL Reference,
@@ -417,6 +440,24 @@ fn ds_key(d: &Def) -> String {
 /// data area), else the definition's own name; an unnamed data area data
 /// structure is the local data area.
 fn dtaara_name(d: &Def) -> String {
+    // DTAARA(*VAR : name): the name is a variable (or a literal) whose
+    // value names the data area when the program runs: "*VAR:" + it.
+    if let Some(k) = keyword(&d.keywords, "DTAARA") {
+        if let Some(i) = k
+            .args
+            .iter()
+            .position(|a| a.trim().eq_ignore_ascii_case("*VAR"))
+        {
+            if let Some(v) = k.args.get(i + 1) {
+                let v = v.trim();
+                return if v.starts_with('\'') {
+                    v.trim_matches('\'').to_ascii_uppercase()
+                } else {
+                    format!("*VAR:{}", v.to_ascii_uppercase())
+                };
+            }
+        }
+    }
     keyword(&d.keywords, "DTAARA")
         .and_then(|k| {
             k.args
@@ -676,6 +717,8 @@ struct Binder<'a> {
     /// Pending INZ values: (variable, value, or its text when it refers to
     /// a name defined later, as %SIZE of a later subfield can).
     inz: Vec<(String, Result<Value, String>)>,
+    /// INZ(*USER): set to the job's user profile when the program starts.
+    user_inz: Vec<String>,
     /// Binding a procedure's local storage.
     local: bool,
     /// Local buffers of STATIC variables (moved to global storage).
@@ -1084,6 +1127,20 @@ impl Binder<'_> {
 
     fn inz(&mut self, name: &str, d: &Def) -> Result<()> {
         if let Some(k) = keyword(&d.keywords, "INZ") {
+            if let Some(a) = k
+                .args
+                .first()
+                .filter(|a| a.trim().eq_ignore_ascii_case("*USER"))
+            {
+                // INZ(*USER) (ILE RPG Reference, INZ): the name of the
+                // job's user profile, known when the program runs.
+                let _ = a;
+                if self.local {
+                    bail!("INZ(*USER) on a local variable of a procedure is not supported yet");
+                }
+                self.user_inz.push(name.to_string());
+                return Ok(());
+            }
             if let Some(a) = k.args.first().filter(|a| !a.is_empty()) {
                 // A value that names something not defined yet is worked
                 // out once all definitions are in.
@@ -1501,6 +1558,7 @@ pub fn bind(
         externals,
         file_fields: HashMap::new(),
         inz: vec![],
+        user_inz: vec![],
         globals: vec![],
         extbinint: keyword(&src.control, "EXTBININT")
             .and_then(|k| k.args.first())
@@ -1919,6 +1977,7 @@ pub fn bind(
             externals,
             file_fields: b.file_fields.clone(),
             inz: vec![],
+            user_inz: vec![],
             local: true,
             statics: vec![],
             globals: b.bufs.clone(),
@@ -2048,7 +2107,7 @@ pub fn bind(
     imports.sort();
     imports.dedup();
     let nomain = keyword(&src.control, "NOMAIN").is_some();
-    if nomain && !src.calcs.is_empty() {
+    if nomain && !src.calcs.iter().all(declarative_sql) {
         bail!("ctl-opt NOMAIN: a module without a main procedure has no calculations outside procedures (RNF3788)");
     }
     // Every occurrence of a multiple-occurrence data structure starts as
@@ -2131,6 +2190,7 @@ pub fn bind(
             .find(|d| d.kind == DefKind::Ds && keyword(&d.keywords, "PSDS").is_some())
             .map(ds_key),
         auto_dtaaras: auto_dtaaras(src),
+        user_inz: b.user_inz.clone(),
         protos,
         procs,
         main,

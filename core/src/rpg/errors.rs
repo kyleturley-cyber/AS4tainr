@@ -62,7 +62,8 @@ pub(super) fn status_code(err: &anyhow::Error) -> u32 {
         // UPDATE or DELETE without a record read before.
         "CPF5027" => 1218,
         "CPF5026" => 1021,
-        "CPF502F" => 1022,
+        // Check and referential constraints: 01022.
+        "CPF502F" | "CPF502D" => 1022,
         "CPF5013" if text.contains("requires a prior") => 1221,
         // Data area not found.
         "CPF1015" => 401,

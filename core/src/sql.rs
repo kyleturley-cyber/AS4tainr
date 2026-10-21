@@ -329,8 +329,17 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
     };
     // Closing parentheses of TABLE(...) table references, left out.
     let mut skip_close: Vec<usize> = Vec::new();
+    // Closing parentheses replaced: (position, text).
+    let mut close_with: Vec<(usize, String)> = Vec::new();
     while i < toks.len() {
         if skip_close.contains(&i) {
+            i += 1;
+            continue;
+        }
+        // The closing parenthesis of a function written differently in
+        // PostgreSQL.
+        if let Some(k) = close_with.iter().position(|(at, _)| *at == i) {
+            out.push(Tok::Punct(close_with.remove(k).1));
             i += 1;
             continue;
         }
@@ -374,6 +383,200 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
                     i += 1;
                     continue;
                 }
+            }
+            // Date and time parts (Db2 for i SQL Reference, scalar
+            // functions): integers, DAYOFWEEK 1 for Sunday, DAYS the days
+            // since 0001-01-01 counting that day as 1.
+            Some(
+                f @ ("YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND" | "MICROSECOND"
+                | "DAYOFWEEK" | "DAYOFYEAR" | "QUARTER" | "DAYS"),
+            ) if next_non_space(&toks, i + 1)
+                .is_some_and(|o| toks[o] == Tok::Punct("(".into())) =>
+            {
+                let o = next_non_space(&toks, i + 1).unwrap();
+                let mut depth = 0i32;
+                let close = (o..toks.len()).find(|&j| {
+                    match &toks[j] {
+                        Tok::Punct(p) if p == "(" => depth += 1,
+                        Tok::Punct(p) if p == ")" => depth -= 1,
+                        _ => {}
+                    }
+                    depth == 0
+                });
+                if let Some(c) = close {
+                    let (open, end) = match f {
+                        "DAYOFWEEK" => ("CAST(extract(dow FROM (", ")) AS integer) + 1"),
+                        "DAYOFYEAR" => ("CAST(extract(doy FROM (", ")) AS integer)"),
+                        "MICROSECOND" => (
+                            "CAST(extract(microseconds FROM (",
+                            ")) AS integer) % 1000000",
+                        ),
+                        "SECOND" => ("CAST(floor(extract(second FROM (", "))) AS integer)"),
+                        "DAYS" => ("(CAST((", ") AS date) - DATE '0001-01-01' + 1)"),
+                        other => {
+                            out.push(Tok::Punct(format!(
+                                "CAST(extract({} FROM (",
+                                other.to_ascii_lowercase()
+                            )));
+                            close_with.push((c, ")) AS integer)".into()));
+                            i = o + 1;
+                            continue;
+                        }
+                    };
+                    out.push(Tok::Punct(open.into()));
+                    close_with.push((c, end.into()));
+                    i = o + 1;
+                    continue;
+                }
+            }
+            // DECIMAL(numeric-expression [, precision [, scale]]), DEC
+            // (Db2 for i SQL Reference, DECIMAL or DEC): the value as a
+            // decimal number, extra fraction digits cut off (not
+            // rounded), precision 15 and scale 0 by default.
+            // (DECIMAL(5, 2) after a name, AS or RETURNS is the data type.)
+            Some("DEC" | "DECIMAL")
+                if next_non_space(&toks, i + 1)
+                    .is_some_and(|o| toks[o] == Tok::Punct("(".into()))
+                    && match out.iter().rev().find(|t| !matches!(t, Tok::Space(_))) {
+                        None => true,
+                        Some(Tok::Punct(p)) => p != ")",
+                        Some(t) => word(t).is_some_and(|w| {
+                            matches!(
+                                w.as_str(),
+                                "SELECT"
+                                    | "WHERE"
+                                    | "AND"
+                                    | "OR"
+                                    | "NOT"
+                                    | "THEN"
+                                    | "ELSE"
+                                    | "WHEN"
+                                    | "RETURN"
+                                    | "VALUES"
+                                    | "ON"
+                                    | "HAVING"
+                                    | "BY"
+                                    | "DISTINCT"
+                                    | "ALL"
+                            )
+                        }),
+                    } =>
+            {
+                let o = next_non_space(&toks, i + 1).unwrap();
+                let mut depth = 0i32;
+                let mut commas = Vec::new();
+                let close = (o..toks.len()).find(|&j| {
+                    match &toks[j] {
+                        Tok::Punct(p) if p == "(" => depth += 1,
+                        Tok::Punct(p) if p == ")" => depth -= 1,
+                        Tok::Punct(p) if p == "," && depth == 1 => commas.push(j),
+                        _ => {}
+                    }
+                    depth == 0
+                });
+                let number = |a: usize, b: usize| -> Option<String> {
+                    let v: Vec<&Tok> = toks[a + 1..b]
+                        .iter()
+                        .filter(|t| !matches!(t, Tok::Space(_)))
+                        .collect();
+                    match v.as_slice() {
+                        [Tok::Number(n)] if n.chars().all(|c| c.is_ascii_digit()) => {
+                            Some(n.clone())
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(c) = close {
+                    let ends: Vec<usize> = commas.iter().copied().chain([c]).collect();
+                    let p = if commas.is_empty() {
+                        Some("15".to_string())
+                    } else {
+                        number(ends[0], ends[1])
+                    };
+                    let sc = if commas.len() < 2 {
+                        Some("0".to_string())
+                    } else {
+                        number(ends[1], ends[2])
+                    };
+                    if let (Some(p), Some(sc), true) = (p, sc, commas.len() <= 2) {
+                        out.push(Tok::Punct("CAST(trunc(CAST((".into()));
+                        let first = ends[0];
+                        close_with
+                            .push((first, format!(") AS numeric), {sc}) AS numeric({p},{sc}))")));
+                        skip_close.extend(first + 1..=c);
+                        i = o + 1;
+                        continue;
+                    }
+                }
+            }
+            // ROUND and TRUNCATE (TRUNC) of any number (Db2 for i SQL
+            // Reference): PostgreSQL rounds a double precision value only
+            // to an integer, so the value is rounded as a decimal number.
+            Some(f @ ("ROUND" | "TRUNCATE" | "TRUNC"))
+                if next_non_space(&toks, i + 1)
+                    .is_some_and(|o| toks[o] == Tok::Punct("(".into())) =>
+            {
+                let o = next_non_space(&toks, i + 1).unwrap();
+                let mut depth = 0i32;
+                let mut comma = None;
+                let close = (o..toks.len()).find(|&j| {
+                    match &toks[j] {
+                        Tok::Punct(p) if p == "(" => depth += 1,
+                        Tok::Punct(p) if p == ")" => depth -= 1,
+                        Tok::Punct(p) if p == "," && depth == 1 && comma.is_none() => {
+                            comma = Some(j)
+                        }
+                        _ => {}
+                    }
+                    depth == 0
+                });
+                if let (Some(_), Some(k)) = (close, comma) {
+                    let name = if f == "ROUND" { "round" } else { "trunc" };
+                    out.push(Tok::Punct(format!("{name}(CAST((")));
+                    close_with.push((k, ") AS numeric),".into()));
+                    i = o + 1;
+                    continue;
+                }
+            }
+            // USER (Db2 for i SQL Reference, special registers): the
+            // job's user profile; record-level access and triggers know
+            // the job by its name (number/user/name).
+            Some("USER")
+                if !out
+                    .iter()
+                    .rev()
+                    .find(|t| !matches!(t, Tok::Space(_)))
+                    .is_some_and(|t| matches!(t, Tok::Punct(p) if p == "."))
+                    && !next_non_space(&toks, i + 1).is_some_and(
+                        |j| matches!(&toks[j], Tok::Punct(p) if p == "." || p == "("),
+                    ) =>
+            {
+                out.push(Tok::Punct(
+                    "CAST(COALESCE(NULLIF(current_setting('as4tainr.user', true), ''), \
+                     NULLIF(split_part(current_setting('application_name'), '/', 2), ''), \
+                     upper(session_user)) AS varchar(18))"
+                        .into(),
+                ));
+                i += 1;
+                continue;
+            }
+            // CAST(x AS DOUBLE): Db2's DOUBLE is DOUBLE PRECISION.
+            Some("DOUBLE")
+                if out
+                    .iter()
+                    .rev()
+                    .find(|t| !matches!(t, Tok::Space(_)))
+                    .and_then(word)
+                    .as_deref()
+                    == Some("AS")
+                    && next_non_space(&toks, i + 1)
+                        .and_then(|j| word(&toks[j]))
+                        .as_deref()
+                        != Some("PRECISION") =>
+            {
+                out.push(Tok::Word("double precision".into()));
+                i += 1;
+                continue;
             }
             Some("UCASE") => {
                 out.push(Tok::Word("UPPER".into()));
@@ -613,6 +816,12 @@ pub(crate) fn map_error(e: &tokio_postgres::Error, sql: &str) -> anyhow::Error {
         "42601" => anyhow!("SQL0104: Statement not valid: {msg}."),
         "23505" => anyhow!("SQL0803: Duplicate key value: the record was not written."),
         "23514" => anyhow!("SQL0545: The row does not satisfy a check constraint: {msg}."),
+        // A referential constraint: a foreign key with no parent row
+        // (INSERT, UPDATE), or a parent row still referenced (DELETE).
+        "23503" if msg.contains("is still referenced") => {
+            anyhow!("SQL0532: Delete prevented by referential constraint: {msg}.")
+        }
+        "23503" => anyhow!("SQL0530: Operation not allowed by referential constraint: {msg}."),
         "2BP01" => anyhow!("SQL0478: Other objects depend on this one: {msg}."),
         "23502" => anyhow!("SQL0407: Null value not allowed in a NOT NULL column: {msg}."),
         "42501" => anyhow!("SQL0551: Not authorized to an object in the statement."),

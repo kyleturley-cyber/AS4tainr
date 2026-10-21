@@ -22,6 +22,65 @@ pub(super) struct SqlState {
     cursors: HashMap<String, OpenCursor>,
     /// PREPARE: statement name → text (with ? markers).
     prepared: HashMap<String, String>,
+    /// How the last statement other than GET DIAGNOSTICS ended.
+    last: Option<Outcome>,
+}
+
+/// The cursors and prepared statements of a module that stays active (a
+/// service program's module in its activation group, a program that ended
+/// without LR): with CLOSQLCSR(*ENDACTGRP), the default, they stay open
+/// until the activation group ends (Db2 for i SQL Programming, "Cursor
+/// scope"), so a cursor opened by one procedure can be fetched by
+/// another.
+#[derive(Default)]
+pub(super) struct KeptSql {
+    cursors: HashMap<String, OpenCursor>,
+    prepared: HashMap<String, String>,
+}
+
+type Key = (String, String, String);
+static KEPT: std::sync::Mutex<Option<HashMap<Key, KeptSql>>> = std::sync::Mutex::new(None);
+
+/// The activation group ends: its modules' cursors close.
+pub fn end_activations(job: &str, groups: &crate::ile::Groups) {
+    if let Ok(mut g) = KEPT.lock() {
+        if let Some(m) = g.as_mut() {
+            m.retain(|(j, grp, _), _| !(j == job && groups.covers(grp)));
+        }
+    }
+}
+
+impl SqlState {
+    /// Keep the module's cursors for its next call (job, group, unit).
+    pub(super) fn keep(&mut self, key: Key) {
+        let k = KeptSql {
+            cursors: std::mem::take(&mut self.cursors),
+            prepared: std::mem::take(&mut self.prepared),
+        };
+        if k.cursors.is_empty() && k.prepared.is_empty() {
+            if let Ok(mut g) = KEPT.lock() {
+                if let Some(m) = g.as_mut() {
+                    m.remove(&key);
+                }
+            }
+            return;
+        }
+        if let Ok(mut g) = KEPT.lock() {
+            g.get_or_insert_with(HashMap::new).insert(key, k);
+        }
+    }
+
+    /// The module's cursors as its last call left them.
+    pub(super) fn restore(&mut self, key: &Key) {
+        let k = KEPT
+            .lock()
+            .ok()
+            .and_then(|mut g| g.as_mut().and_then(|m| m.remove(key)));
+        if let Some(k) = k {
+            self.cursors = k.cursors;
+            self.prepared = k.prepared;
+        }
+    }
 }
 
 struct OpenCursor {
@@ -31,6 +90,7 @@ struct OpenCursor {
 }
 
 /// How a statement ended: SQLCODE, SQLSTATE, rows (SQLERRD(3)), message.
+#[derive(Clone)]
 struct Outcome {
     code: i64,
     state: String,
@@ -208,13 +268,23 @@ fn fill_markers(sql: &str, values: &[String]) -> Result<String> {
 impl Machine<'_> {
     /// EXEC SQL: run the statement, then set the SQLCA.
     pub(super) fn exec_sql(&mut self, text: &str) -> Result<()> {
-        let out = match self.sql_statement(text.trim()) {
+        let w = words(text);
+        let diagnostics = w.first().map(String::as_str) == Some("GET")
+            && w.iter().take(3).any(|x| x == "DIAGNOSTICS");
+        let out = match if diagnostics {
+            self.get_diagnostics(text.trim())
+        } else {
+            self.sql_statement(text.trim())
+        } {
             Ok(o) => o,
             Err(e) => match sql_error(&e) {
                 Some(o) => o,
                 None => return Err(e),
             },
         };
+        if !diagnostics {
+            self.sql.last = Some(out.clone());
+        }
         let set = |m: &mut Self, name: &str, v: Value| {
             m.assign(
                 &Expr::name(name),
@@ -237,6 +307,70 @@ impl Machine<'_> {
             false,
         )?;
         Ok(())
+    }
+
+    /// GET [CURRENT] DIAGNOSTICS (Db2 for i SQL Reference): about the
+    /// last statement, :hv = ROW_COUNT; or CONDITION n (EXCEPTION n) with
+    /// :hv = MESSAGE_TEXT, MESSAGE_LENGTH, RETURNED_SQLSTATE,
+    /// DB2_RETURNED_SQLCODE, MESSAGE_ID or DB2_MESSAGE_ID. It does not
+    /// change what the next GET DIAGNOSTICS sees.
+    fn get_diagnostics(&mut self, sql: &str) -> Result<Outcome> {
+        let last = self.sql.last.clone().unwrap_or_else(|| Outcome::ok(0));
+        let up = sql.to_ascii_uppercase();
+        let at = up.find("DIAGNOSTICS").unwrap() + "DIAGNOSTICS".len();
+        let mut rest = sql[at..].trim().trim_end_matches(';').trim();
+        let first = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        let condition = matches!(first.as_str(), "CONDITION" | "EXCEPTION");
+        if condition {
+            // The condition number: only one condition is kept.
+            let mut it = rest.splitn(3, char::is_whitespace);
+            it.next();
+            it.next();
+            rest = it.next().unwrap_or("").trim();
+        }
+        let id = last
+            .text
+            .split(':')
+            .next()
+            .filter(|p| p.len() == 7 && p.starts_with("SQL"))
+            .unwrap_or("")
+            .to_string();
+        let text = if id.is_empty() {
+            last.text.clone()
+        } else {
+            last.text[id.len() + 1..].trim().to_string()
+        };
+        for item in rest.split(',') {
+            let Some((target, name)) = item.split_once('=') else {
+                return Ok(Outcome::error(
+                    -104,
+                    format!("SQL0104: GET DIAGNOSTICS item {item} is not valid."),
+                ));
+            };
+            let target = target.trim().trim_start_matches(':');
+            let v = match (condition, name.trim().to_ascii_uppercase().as_str()) {
+                (false, "ROW_COUNT") => Value::Num(Dec::from_i64(last.rows)),
+                (true, "MESSAGE_TEXT") => Value::str(&text),
+                (true, "MESSAGE_LENGTH") => Value::Num(Dec::from_i64(text.chars().count() as i64)),
+                (true, "RETURNED_SQLSTATE") => Value::str(&last.state),
+                (true, "DB2_RETURNED_SQLCODE") => Value::Num(Dec::from_i64(last.code)),
+                (true, "MESSAGE_ID" | "DB2_MESSAGE_ID") => Value::str(&id),
+                (_, other) => {
+                    return Ok(Outcome::error(
+                        -104,
+                        format!("SQL0104: GET DIAGNOSTICS item {other} is not supported."),
+                    ))
+                }
+            };
+            for t in self.host_targets(target)? {
+                self.assign(&t, &v, Fit::Truncate { half_adjust: false }, false)?;
+            }
+        }
+        Ok(Outcome::ok(0))
     }
 
     fn session(&mut self) -> Result<&Session> {
@@ -307,7 +441,18 @@ impl Machine<'_> {
         let mut parts = Vec::new();
         for t in targets {
             let v = self.eval(&t)?;
-            parts.push(literal(&v)?);
+            // A fixed-length character host variable is a CHAR(n) value
+            // (Db2 for i SQL Programming, "Host variables in ILE RPG"):
+            // compared with blanks added to the shorter string, so a
+            // blank CHAR(5) equals ' '.
+            match (self.type_of(&t), &v) {
+                (Some(super::data::DType::Char(n)), Value::Char(_))
+                    if (1..=10_485_760).contains(&n) =>
+                {
+                    parts.push(format!("CAST({} AS char({n}))", literal(&v)?))
+                }
+                _ => parts.push(literal(&v)?),
+            }
         }
         Ok(parts.join(", "))
     }

@@ -105,6 +105,17 @@ enum Cmd {
         #[arg(long)]
         lib: String,
     },
+    /// Copy a file, or a folder and everything in it, into the integrated
+    /// file system (as copying it to an IBM i would), tagged with a CCSID.
+    Put {
+        /// The local file or folder.
+        from: PathBuf,
+        /// The IFS path it becomes (directories above it are made).
+        to: String,
+        /// The CCSID the stream files are tagged with.
+        #[arg(long, default_value_t = 1208)]
+        ccsid: i32,
+    },
     /// Load records from a CSV file (header row = field names) with WRITE.
     Load {
         /// File name, optionally qualified LIB/FILE.
@@ -314,6 +325,38 @@ async fn run(cli: Cli) -> Result<u8> {
             let (lib, name) = (f.library.clone(), f.file.name.clone());
             let n = as4tainr_core::import::load_csv(&client, f, &text).await?;
             println!("{n} records written to {lib}/{name}.");
+        }
+        Cmd::Put { from, to, ccsid } => {
+            let client = runtime::connect_db(&cli.database_url).await?;
+            catalog::init(&client).await?;
+            let mut n = 0;
+            let mut todo = vec![(from.clone(), as4tainr_core::ifs::normalize(&to)?)];
+            while let Some((local, path)) = todo.pop() {
+                if local.is_dir() {
+                    as4tainr_core::ifs::mkdir_all(&client, &path, "QSECOFR").await?;
+                    for e in std::fs::read_dir(&local)? {
+                        let e = e?;
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if name.starts_with('.') {
+                            continue;
+                        }
+                        todo.push((e.path(), format!("{}/{name}", path.trim_end_matches('/'))));
+                    }
+                } else {
+                    let data = std::fs::read(&local)?;
+                    let parent = path.rsplit_once('/').map(|x| x.0).unwrap_or("/");
+                    as4tainr_core::ifs::mkdir_all(
+                        &client,
+                        if parent.is_empty() { "/" } else { parent },
+                        "QSECOFR",
+                    )
+                    .await?;
+                    as4tainr_core::ifs::write_file(&client, &path, &data, ccsid, 0o644, "QSECOFR")
+                        .await?;
+                    n += 1;
+                }
+            }
+            println!("{n} stream files copied to {to}.");
         }
         Cmd::Import { dir, lib } => {
             let client = runtime::connect_db(&cli.database_url).await?;

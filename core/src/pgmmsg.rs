@@ -306,6 +306,70 @@ pub async fn describe(
     Ok(m)
 }
 
+/// Program message queues by call stack entry name, for the message
+/// APIs (QMHSNDPM, QMHRMVPM) and message subfiles (SFLPGMQ): each job's
+/// queues, by the name of the program or procedure they belong to.
+type Named = HashMap<(String, String), Vec<QMsg>>;
+static NAMED: std::sync::Mutex<Option<Named>> = std::sync::Mutex::new(None);
+static NAMED_KEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+fn queue_name(q: &str) -> String {
+    q.trim().to_ascii_uppercase()
+}
+
+/// Put a message on a named program message queue; its key.
+pub fn named_send(job: &str, queue: &str, mut m: QMsg) -> u32 {
+    let key = NAMED_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    m.key = key;
+    if let Ok(mut g) = NAMED.lock() {
+        g.get_or_insert_with(HashMap::new)
+            .entry((job.to_string(), queue_name(queue)))
+            .or_default()
+            .push(m);
+    }
+    key
+}
+
+/// QMHRMVPM messages to remove: *ALL, *BYKEY (the message with `key`),
+/// *OLD, *NEW, *KEEPRQS (all but requests).
+pub fn named_remove(job: &str, queue: &str, which: &str, key: Option<u32>) {
+    if let Ok(mut g) = NAMED.lock() {
+        if let Some(q) = g
+            .as_mut()
+            .and_then(|m| m.get_mut(&(job.to_string(), queue_name(queue))))
+        {
+            match which {
+                "*BYKEY" => q.retain(|m| Some(m.key) != key),
+                "*OLD" => q.retain(|m| !m.old),
+                "*NEW" => q.retain(|m| m.old),
+                "*KEEPRQS" => q.retain(|m| m.ty == "*RQS"),
+                _ => q.clear(),
+            }
+        }
+    }
+}
+
+/// The messages on a named program message queue, oldest first.
+pub fn named_messages(job: &str, queue: &str) -> Vec<QMsg> {
+    NAMED
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref()
+                .and_then(|m| m.get(&(job.to_string(), queue_name(queue))).cloned())
+        })
+        .unwrap_or_default()
+}
+
+/// The job ended: its named queues go.
+pub fn named_end_job(job: &str) {
+    if let Ok(mut g) = NAMED.lock() {
+        if let Some(m) = g.as_mut() {
+            m.retain(|(j, _), _| j != job);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

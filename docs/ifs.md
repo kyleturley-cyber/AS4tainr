@@ -28,6 +28,10 @@ File descriptors belong to the job: a descriptor one program opened can be used 
 | `CPYTOSTMF FROMMBR('/QSYS.LIB/lib.LIB/file.FILE/mbr.MBR') TOSTMF(path)` | A source member's records as lines: trailing blanks removed and ENDLINFMT's line end added (*CRLF by default; *FIXED keeps the records whole); STMFOPT(*NONE, *ADD, *REPLACE); STMFCCSID (a number, *STMF: the existing file's CCSID or 37 for a new file, *PCASCII 1252, *STDASCII 819). CPFA097 when the file exists with STMFOPT(*NONE) |
 | `CPYFRMSTMF FROMSTMF(path) TOMBR('/QSYS.LIB/...')` | Lines into a source member: any combination of CR and LF ends a line, tabs become blanks to the next stop of 8 (TABEXPN(*YES)); MBROPT(*NONE, *ADD, *REPLACE); CPFA095 when it cannot copy |
 
+## From outside
+
+`as4tainr put LOCAL PATH [--ccsid N]` copies a file, or a folder and everything in it, from the machine as4tainr runs on into the IFS (as copying files to an IBM i with FTP or a mapped drive would), tagged with CCSID 1208 unless `--ccsid` says otherwise. `tools/legacy.sh` uses it to install applications the way their READMEs say.
+
 ## From SQL
 
 `QSYS2.IFS_READ`, `IFS_READ_UTF8` and `IFS_READ_BINARY` read a stream file as lines, and `QSYS2.IFS_WRITE`, `IFS_WRITE_UTF8` and `IFS_WRITE_BINARY` write lines (docs/sql.md, IBM i services).

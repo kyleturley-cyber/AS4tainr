@@ -44,6 +44,16 @@ impl std::fmt::Display for Name {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ddl {
+    /// CREATE SCHEMA: a library.
+    CreateSchema(String),
+    /// GRANT (or REVOKE) privileges ON a table or view TO users or PUBLIC;
+    /// `object` None for schemas and routines (accepted, not kept).
+    Grant {
+        revoke: bool,
+        privileges: Vec<String>,
+        object: Option<Name>,
+        grantees: Vec<String>,
+    },
     CreateTable {
         name: Name,
         /// FOR SYSTEM NAME
@@ -54,6 +64,10 @@ pub enum Ddl {
         uniques: Vec<(String, Vec<String>)>,
         /// CHECK constraints: (constraint name, condition as SQL).
         checks: Vec<(String, String)>,
+        /// FOREIGN KEY (referential) constraints.
+        foreign: Vec<ForeignKey>,
+        /// OR REPLACE ... ON REPLACE PRESERVE ROWS: the rows are kept.
+        preserve: bool,
     },
     CreateIndex {
         name: Name,
@@ -112,8 +126,37 @@ pub enum Ddl {
     },
     /// COMMENT ON: accepted, not kept.
     Comment,
+    /// CREATE TRIGGER (an SQL trigger).
+    CreateTrigger(Trigger),
+    /// DROP TRIGGER.
+    DropTrigger {
+        name: Name,
+        if_exists: bool,
+    },
     /// SET SCHEMA: the default library for unqualified names.
     SetSchema(String),
+}
+
+/// An SQL trigger (Db2 for i SQL Reference, CREATE TRIGGER).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trigger {
+    pub name: Name,
+    pub replace: bool,
+    /// BEFORE, AFTER or INSTEAD OF.
+    pub timing: String,
+    /// INSERT, UPDATE, DELETE.
+    pub events: Vec<String>,
+    /// UPDATE OF these columns.
+    pub columns: Vec<String>,
+    pub table: Name,
+    /// REFERENCING OLD [ROW] AS, NEW [ROW] AS.
+    pub old: Option<String>,
+    pub new: Option<String>,
+    pub each_row: bool,
+    /// WHEN (condition), as written.
+    pub when: Option<String>,
+    /// The triggered action: SQL statements as written.
+    pub body: Vec<String>,
 }
 
 /// Is this statement data definition? `Ok(None)` for other statements
@@ -134,6 +177,20 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
                 p.expect("REPLACE")?;
             }
             let unique = p.eat("UNIQUE");
+            if !replace && !unique && p.eat("SCHEMA") {
+                // CREATE SCHEMA name [AUTHORIZATION user]: the
+                // authorization name is accepted.
+                let name = p.ident()?;
+                if p.eat("AUTHORIZATION") {
+                    p.ident()?;
+                }
+                if let Some(t) = p.t.get(p.i) {
+                    bail!("SQL0104: Token {} not valid here.", show(t));
+                }
+                return Ok(Some(Ddl::CreateSchema(
+                    validate_name("library", &name).map_err(sql0104)?,
+                )));
+            }
             match p.word().as_deref() {
                 Some("TABLE") if !unique => {
                     // CREATE TABLE name [(columns)] AS (query) WITH DATA.
@@ -154,6 +211,9 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
                     // The query is taken from the statement's text.
                     return create_view(sql, replace).map(Some);
                 }
+                Some("TRIGGER") if !unique => {
+                    return create_trigger(sql, replace).map(Some);
+                }
                 Some(other) => {
                     bail!("SQL0084: CREATE {other} is not supported yet.")
                 }
@@ -162,6 +222,18 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
         }
         "DROP" => {
             p.i += 1;
+            if p.word().as_deref() == Some("TRIGGER") {
+                p.i += 1;
+                let if_exists = p.eat("IF");
+                if if_exists {
+                    p.expect("EXISTS")?;
+                }
+                let name = p.name()?;
+                if let Some(t) = p.t.get(p.i) {
+                    bail!("SQL0104: Token {} not valid here.", show(t));
+                }
+                return Ok(Some(Ddl::DropTrigger { name, if_exists }));
+            }
             let kind = match p.word().as_deref() {
                 Some("TABLE") => "TABLE",
                 Some("INDEX") => "INDEX",
@@ -233,7 +305,11 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
             p.expect("TABLE")?;
             alter_table(&mut p)?
         }
-        "RENAME" | "TRUNCATE" | "GRANT" | "REVOKE" => {
+        "GRANT" | "REVOKE" => {
+            p.i += 1;
+            grant(&mut p, first == "REVOKE")?
+        }
+        "RENAME" | "TRUNCATE" => {
             bail!("SQL0084: {first} is not supported yet.")
         }
         _ => return Ok(None),
@@ -242,6 +318,83 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
         bail!("SQL0104: Token {} not valid here.", show(t));
     }
     Ok(Some(ddl))
+}
+
+/// GRANT privileges ON [TABLE] name TO grantees [WITH GRANT OPTION], and
+/// REVOKE privileges ON [TABLE] name FROM grantees (Db2 for i SQL
+/// Reference, GRANT (table or view privileges)); schemas, procedures,
+/// functions, packages, sequences and types are accepted.
+fn grant(p: &mut P, revoke: bool) -> Result<Ddl> {
+    let mut privileges = Vec::new();
+    loop {
+        let w = p
+            .word()
+            .ok_or_else(|| sql0104(anyhow::anyhow!("a privilege is expected")))?;
+        p.i += 1;
+        if w == "ALL" {
+            let _ = p.eat("PRIVILEGES");
+        }
+        // UPDATE (columns), REFERENCES (columns): the whole table here.
+        if p.punct("(") {
+            while !p.punct(")") {
+                if p.next().is_none() {
+                    bail!("SQL0104: ) expected.");
+                }
+            }
+        }
+        privileges.push(w);
+        if !p.punct(",") {
+            break;
+        }
+    }
+    p.expect("ON")?;
+    let object = match p.word().as_deref() {
+        Some(
+            "SCHEMA" | "PROCEDURE" | "FUNCTION" | "SPECIFIC" | "PACKAGE" | "SEQUENCE" | "TYPE"
+            | "DISTINCT" | "VARIABLE" | "ROUTINE" | "XSROBJECT",
+        ) => {
+            // Not kept: skip to TO or FROM.
+            while !matches!(p.word().as_deref(), Some("TO" | "FROM")) {
+                if p.next().is_none() {
+                    bail!("SQL0104: TO is expected.");
+                }
+            }
+            None
+        }
+        _ => {
+            let _ = p.eat("TABLE");
+            Some(p.name()?)
+        }
+    };
+    if !(p.eat(if revoke { "FROM" } else { "TO" })) {
+        bail!(
+            "SQL0104: {} is expected.",
+            if revoke { "FROM" } else { "TO" }
+        );
+    }
+    let mut grantees = Vec::new();
+    loop {
+        let _ = p.eat("USER") || p.eat("GROUP");
+        let g = p.ident()?.to_ascii_uppercase();
+        grantees.push(if g == "PUBLIC" {
+            "*PUBLIC".to_string()
+        } else {
+            g
+        });
+        if !p.punct(",") {
+            break;
+        }
+    }
+    if !revoke && p.eat("WITH") {
+        p.expect("GRANT")?;
+        p.expect("OPTION")?;
+    }
+    Ok(Ddl::Grant {
+        revoke,
+        privileges,
+        object,
+        grantees,
+    })
 }
 
 /// A data type as SQL writes it (`DECIMAL(9, 2)`, `VARCHAR(50)`): the
@@ -705,11 +858,12 @@ fn default_value(p: &mut P, f: &FieldDef) -> Result<FieldDefault> {
     Ok(d)
 }
 
-/// A CHECK condition as SQL: column names, constants, comparisons, IN,
+/// A CHECK condition as SQL: column names, constants, arithmetic (+ - * /),
+/// concatenation, comparisons, IN,
 /// BETWEEN, IS [NOT] NULL, AND, OR, NOT and parentheses only.
 fn check_sql(toks: &[Tok], fields: &[FieldDef]) -> Result<String> {
     const WORDS: &[&str] = &["AND", "OR", "NOT", "IN", "BETWEEN", "IS", "NULL", "LIKE"];
-    const PUNCT: &[&str] = &["(", ")", ",", "=", "<", ">", "-", "+"];
+    const PUNCT: &[&str] = &["(", ")", ",", "=", "<", ">", "-", "+", "*", "/", "||"];
     // Scalar functions a condition may use: Db2 name -> PostgreSQL name.
     const FUNCTIONS: &[(&str, &str)] = &[
         ("LENGTH", "length"),
@@ -861,9 +1015,15 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
     // (constraint name, condition tokens), checked once all columns are known.
     let mut checks: Vec<(Option<String>, Vec<Tok>)> = Vec::new();
     let mut not_null: Vec<String> = Vec::new();
+    let mut foreign: Vec<ForeignKey> = Vec::new();
     loop {
         let constraint = if p.eat("CONSTRAINT") {
-            Some(p.ident()?)
+            // [schema.]name: the constraint is in the table's schema.
+            let mut c = p.ident()?;
+            if p.punct(".") {
+                c = p.ident()?;
+            }
+            Some(c)
         } else {
             None
         };
@@ -901,7 +1061,10 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
                 p.expect_punct("(")?;
                 checks.push((constraint, p.group()?));
             }
-            Some("FOREIGN") => bail!("SQL0084: FOREIGN KEY constraints are not supported yet."),
+            Some("FOREIGN") => {
+                p.i += 1;
+                foreign.push(foreign_key(p, constraint)?);
+            }
             _ if constraint.is_some() => {
                 bail!("SQL0104: a constraint is expected{}.", p.at())
             }
@@ -1041,15 +1204,16 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
     // The record format: RCDFMT, else the system table name (set when the
     // table is created, if it is generated).
     let mut format = String::new();
+    let mut preserve = false;
     loop {
         if p.eat("RCDFMT") {
             format = p.system_name("record format")?;
         } else if p.eat("ON") {
             p.expect("REPLACE")?;
-            if p.eat("PRESERVE") {
-                bail!("SQL0084: ON REPLACE PRESERVE ROWS is not supported yet.");
+            preserve = p.eat("PRESERVE");
+            if !preserve {
+                p.expect("DELETE")?;
             }
-            p.expect("DELETE")?;
             p.expect("ROWS")?;
         } else if p.eat("NOT") {
             p.expect("LOGGED")?;
@@ -1084,7 +1248,162 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
         replace,
         uniques,
         checks,
+        foreign,
+        preserve,
     })
+}
+
+/// A referential constraint (Db2 for i SQL Reference, CREATE TABLE,
+/// referential-constraint): the dependent columns, the parent table and
+/// its columns (its primary key when none are named), the delete and
+/// update rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKey {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+    pub parent: Name,
+    pub parent_columns: Vec<String>,
+    /// NO ACTION, RESTRICT, CASCADE, SET NULL or SET DEFAULT.
+    pub on_delete: String,
+    /// NO ACTION or RESTRICT.
+    pub on_update: String,
+}
+
+/// FOREIGN KEY (columns) REFERENCES table [(columns)] [ON DELETE rule]
+/// [ON UPDATE rule], after FOREIGN.
+fn foreign_key(p: &mut P, name: Option<String>) -> Result<ForeignKey> {
+    p.expect("KEY")?;
+    let cols = |p: &mut P| -> Result<Vec<String>> {
+        p.expect_punct("(")?;
+        let mut c = Vec::new();
+        loop {
+            c.push(p.field()?);
+            if !p.punct(",") {
+                break;
+            }
+        }
+        p.expect_punct(")")?;
+        Ok(c)
+    };
+    let columns = cols(p)?;
+    p.expect("REFERENCES")?;
+    let parent = p.name()?;
+    let parent_columns = if p.t.get(p.i).is_some_and(|t| *t == Tok::Punct("(".into())) {
+        cols(p)?
+    } else {
+        Vec::new()
+    };
+    let (mut on_delete, mut on_update) = ("NO ACTION".to_string(), "NO ACTION".to_string());
+    while p.word().as_deref() == Some("ON") {
+        p.i += 1;
+        let delete = p.eat("DELETE");
+        if !delete {
+            p.expect("UPDATE")?;
+        }
+        let rule = if p.eat("NO") {
+            p.expect("ACTION")?;
+            "NO ACTION"
+        } else if p.eat("RESTRICT") {
+            "RESTRICT"
+        } else if delete && p.eat("CASCADE") {
+            "CASCADE"
+        } else if delete && p.eat("SET") {
+            if p.eat("NULL") {
+                "SET NULL"
+            } else {
+                p.expect("DEFAULT")?;
+                "SET DEFAULT"
+            }
+        } else {
+            bail!("SQL0104: a delete or update rule is expected{}.", p.at());
+        };
+        if delete {
+            on_delete = rule.into();
+        } else {
+            on_update = rule.into();
+        }
+    }
+    if columns.len() != parent_columns.len() && !parent_columns.is_empty() {
+        bail!("SQL0538: The foreign key and the parent key have different numbers of columns.");
+    }
+    Ok(ForeignKey {
+        name,
+        columns,
+        parent,
+        parent_columns,
+        on_delete,
+        on_update,
+    })
+}
+
+/// Add a referential constraint to LIB/SYS (a PostgreSQL foreign key over
+/// the files' tables, named SYS_constraint).
+async fn add_foreign_key(
+    ctx: &mut Ctx<'_>,
+    lib: &str,
+    sys: &str,
+    table: &str,
+    fk: &ForeignKey,
+) -> Result<String> {
+    let Some((plib, pattr, psys)) = ctx.find(&fk.parent).await? else {
+        return Err(not_found(&fk.parent, "table"));
+    };
+    if pattr != "PF" {
+        bail!("SQL0156: {} is not a table.", fk.parent.name);
+    }
+    let child = catalog::resolve_file(ctx.client, &[lib.to_string()], sys).await?;
+    let parent = catalog::resolve_file(ctx.client, std::slice::from_ref(&plib), &psys).await?;
+    let column = |f: &PhysicalFile, c: &str, t: &str| -> Result<String> {
+        f.fields
+            .iter()
+            .find(|x| x.is_named(c))
+            .map(|x| x.column())
+            .ok_or_else(|| anyhow::anyhow!("SQL0205: Column {c} not in table {t}."))
+    };
+    let cols: Vec<String> = fk
+        .columns
+        .iter()
+        .map(|c| column(&child.file, c, table))
+        .collect::<Result<_>>()?;
+    let pcols: Vec<String> = fk
+        .parent_columns
+        .iter()
+        .map(|c| column(&parent.file, c, &fk.parent.name))
+        .collect::<Result<_>>()?;
+    let cname = fk
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("FK_{}", fk.columns.join("_")));
+    ctx.client
+        .batch_execute(&format!(
+            "ALTER TABLE {}.{} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}.{}{} ON DELETE {} ON UPDATE {}",
+            ident(lib),
+            ident(sys),
+            ident(&format!("{sys}_{cname}")),
+            cols.join(", "),
+            ident(&plib),
+            ident(&psys),
+            if pcols.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", pcols.join(", "))
+            },
+            fk.on_delete,
+            fk.on_update
+        ))
+        .await
+        .map_err(|e| match e.as_db_error() {
+            Some(d) if d.code().code() == "42830" => anyhow::anyhow!(
+                "SQL0573: Table {} has no unique key matching the parent key columns.",
+                fk.parent.name
+            ),
+            Some(d) if d.code().code() == "23503" => anyhow::anyhow!(
+                "SQL0667: The foreign key does not match a row of the parent table: {}.",
+                d.message()
+            ),
+            _ => db(e),
+        })?;
+    Ok(cname)
 }
 
 /// What ALTER TABLE does.
@@ -1112,7 +1431,10 @@ pub enum Alter {
         column: String,
         cascade: bool,
     },
-    /// DROP PRIMARY KEY (name PK), DROP CONSTRAINT / UNIQUE / CHECK name.
+    /// ADD FOREIGN KEY.
+    AddForeign(ForeignKey),
+    /// DROP PRIMARY KEY (name PK), DROP CONSTRAINT / UNIQUE / CHECK /
+    /// FOREIGN KEY name.
     DropConstraint {
         name: String,
     },
@@ -1130,6 +1452,8 @@ pub enum ColumnChange {
     DropDefault,
     SetNotNull,
     DropNotNull,
+    /// RESTART [WITH n]: an identity column's next value.
+    Restart(Option<i64>),
 }
 
 /// ALTER TABLE name action (Db2 for i SQL Reference, ALTER TABLE): one
@@ -1138,7 +1462,11 @@ fn alter_table(p: &mut P) -> Result<Ddl> {
     let table = p.name()?;
     let action = if p.eat("ADD") {
         let constraint = if p.eat("CONSTRAINT") {
-            Some(p.field()?)
+            let mut c = p.field()?;
+            if p.punct(".") {
+                c = p.field()?;
+            }
+            Some(c)
         } else {
             None
         };
@@ -1180,7 +1508,10 @@ fn alter_table(p: &mut P) -> Result<Ddl> {
                     condition: toks.iter().map(show).collect::<Vec<_>>().join(" "),
                 }
             }
-            Some("FOREIGN") => bail!("SQL0084: FOREIGN KEY constraints are not supported yet."),
+            Some("FOREIGN") => {
+                p.i += 1;
+                Alter::AddForeign(foreign_key(p, constraint)?)
+            }
             _ if constraint.is_some() => bail!("SQL0104: a constraint is expected{}.", p.at()),
             _ => {
                 let _ = p.eat("COLUMN");
@@ -1217,7 +1548,8 @@ fn alter_table(p: &mut P) -> Result<Ddl> {
         } else if p.eat("CONSTRAINT") || p.eat("UNIQUE") || p.eat("CHECK") {
             Alter::DropConstraint { name: p.field()? }
         } else if p.eat("FOREIGN") {
-            bail!("SQL0084: FOREIGN KEY constraints are not supported yet.");
+            p.expect("KEY")?;
+            Alter::DropConstraint { name: p.field()? }
         } else {
             let _ = p.eat("COLUMN");
             let column = p.field()?;
@@ -1253,6 +1585,15 @@ fn alter_table(p: &mut P) -> Result<Ddl> {
                 p.expect("NULL")?;
                 ColumnChange::DropNotNull
             }
+        } else if p.eat("RESTART") {
+            let n = if p.eat("WITH") {
+                let neg = p.punct("-");
+                let v = i64::from(p.number()?);
+                Some(if neg { -v } else { v })
+            } else {
+                None
+            };
+            ColumnChange::Restart(n)
         } else {
             bail!("SQL0084: this ALTER COLUMN change is not supported yet.");
         };
@@ -1265,6 +1606,164 @@ fn alter_table(p: &mut P) -> Result<Ddl> {
 
 /// Top-level words of a statement with their byte offsets (outside
 /// constants, quoted names, comments and parentheses).
+/// CREATE [OR REPLACE] TRIGGER name [NO CASCADE] BEFORE | AFTER |
+/// INSTEAD OF  INSERT | DELETE | UPDATE [OF columns] [OR ...]  ON table
+/// [REFERENCING OLD [ROW] [AS] o NEW [ROW] [AS] n]  [FOR EACH ROW |
+/// STATEMENT]  [MODE DB2SQL | DB2ROW]  [WHEN (condition)]  action, the
+/// action one statement or BEGIN ATOMIC statements END.
+fn create_trigger(sql: &str, replace: bool) -> Result<Ddl> {
+    let all = tokenize(sql)?;
+    let at: Vec<usize> = (0..all.len())
+        .filter(|&i| !matches!(all[i], Tok::Space(_)))
+        .collect();
+    let t: Vec<Tok> = at.iter().map(|&i| all[i].clone()).collect();
+    let mut p = P { t, i: 0 };
+    p.expect("CREATE")?;
+    if replace {
+        p.expect("OR")?;
+        p.expect("REPLACE")?;
+    }
+    p.expect("TRIGGER")?;
+    let name = p.name()?;
+    if p.eat("NO") {
+        p.expect("CASCADE")?;
+    }
+    let timing = if p.eat("BEFORE") {
+        "BEFORE".to_string()
+    } else if p.eat("AFTER") {
+        "AFTER".to_string()
+    } else if p.eat("INSTEAD") {
+        p.expect("OF")?;
+        "INSTEAD OF".to_string()
+    } else {
+        bail!("SQL0104: BEFORE, AFTER or INSTEAD OF expected{}.", p.at());
+    };
+    let mut events = Vec::new();
+    let mut columns = Vec::new();
+    loop {
+        match p.word().as_deref() {
+            Some(e @ ("INSERT" | "DELETE" | "UPDATE")) => {
+                p.i += 1;
+                events.push(e.to_string());
+                if e == "UPDATE" && p.eat("OF") {
+                    loop {
+                        columns.push(p.field()?);
+                        if !p.punct(",") {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => bail!("SQL0104: INSERT, UPDATE or DELETE expected{}.", p.at()),
+        }
+        if !p.eat("OR") {
+            break;
+        }
+    }
+    p.expect("ON")?;
+    let table = p.name()?;
+    let (mut old, mut new) = (None, None);
+    if p.eat("REFERENCING") {
+        loop {
+            let which = if p.eat("OLD") {
+                "OLD"
+            } else if p.eat("NEW") {
+                "NEW"
+            } else {
+                break;
+            };
+            if p.eat("TABLE") {
+                bail!("SQL0084: REFERENCING {which} TABLE is not supported yet.");
+            }
+            let _ = p.eat("ROW");
+            let _ = p.eat("AS");
+            let n = p.ident()?;
+            if which == "OLD" {
+                old = Some(n);
+            } else {
+                new = Some(n);
+            }
+        }
+    }
+    let mut each_row = false;
+    if p.eat("FOR") {
+        p.expect("EACH")?;
+        if p.eat("ROW") {
+            each_row = true;
+        } else {
+            p.expect("STATEMENT")?;
+        }
+    }
+    if p.eat("MODE") {
+        p.ident()?;
+    }
+    let rest = |k: usize| -> String {
+        at.get(k)
+            .map(|&s| all[s..].iter().map(show).collect::<String>())
+            .unwrap_or_default()
+    };
+    let mut when = None;
+    if p.eat("WHEN") {
+        if !p.is_punct("(") {
+            bail!("SQL0104: ( expected after WHEN{}.", p.at());
+        }
+        let start = p.i;
+        let mut depth = 0;
+        loop {
+            match p.next() {
+                Some(Tok::Punct(x)) if x == "(" => depth += 1,
+                Some(Tok::Punct(x)) if x == ")" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                None => bail!("SQL0104: the WHEN condition has no closing parenthesis."),
+                _ => {}
+            }
+        }
+        let text: String = all[at[start]..=at[p.i - 1]].iter().map(show).collect();
+        when = Some(text);
+    }
+    let action = rest(p.i);
+    let action = action.trim().trim_end_matches(';').trim();
+    let up = action.to_ascii_uppercase();
+    let body = if up.starts_with("BEGIN") {
+        let inner = action[5..].trim_start();
+        let inner = if inner.to_ascii_uppercase().starts_with("ATOMIC") {
+            &inner[6..]
+        } else {
+            inner
+        };
+        let inner = inner.trim_end();
+        if !inner.to_ascii_uppercase().ends_with("END") {
+            bail!("SQL0104: the trigger's BEGIN has no END.");
+        }
+        split_statements(&inner[..inner.len() - 3])
+            .into_iter()
+            .map(|s| s.trim().trim_end_matches(';').trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else if action.is_empty() {
+        bail!("SQL0104: the trigger has no triggered action.");
+    } else {
+        vec![action.to_string()]
+    };
+    Ok(Ddl::CreateTrigger(Trigger {
+        name,
+        replace,
+        timing,
+        events,
+        columns,
+        table,
+        old,
+        new,
+        each_row,
+        when,
+        body,
+    }))
+}
+
 fn top_words(sql: &str) -> Vec<(usize, String)> {
     let b: Vec<(usize, char)> = sql.char_indices().collect();
     let mut out = Vec::new();
@@ -1330,6 +1829,12 @@ fn create_table_as(sql: &str, replace: bool, k: usize, words: &[(usize, String)]
     if p.punct("(") {
         loop {
             columns.push(p.field()?);
+            // FOR COLUMN system-name: accepted (the new columns get
+            // system names of their own).
+            if p.eat("FOR") {
+                p.expect("COLUMN")?;
+                p.system_name("column")?;
+            }
             if !p.punct(",") {
                 break;
             }
@@ -1443,6 +1948,12 @@ fn create_view(sql: &str, replace: bool) -> Result<Ddl> {
     if p.punct("(") {
         loop {
             columns.push(p.field()?);
+            // FOR COLUMN system-name: accepted (the view's columns get
+            // system names of their own).
+            if p.eat("FOR") {
+                p.expect("COLUMN")?;
+                p.system_name("column")?;
+            }
             if !p.punct(",") {
                 break;
             }
@@ -1750,6 +2261,302 @@ fn not_found(n: &Name, kind: &str) -> anyhow::Error {
     )
 }
 
+/// The PostgreSQL function that does a trigger's action.
+fn trigger_function(lib: &str, name: &str) -> String {
+    format!("{}.{}", ident(lib), ident(&format!("{name}~trigger")))
+}
+
+/// Drop an SQL trigger (and its function); false when there is none.
+async fn drop_trigger(ctx: &mut Ctx<'_>, lib: &str, name: &str) -> Result<bool> {
+    let row = ctx
+        .client
+        .query_opt(
+            "SELECT c.relname::text FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = $1 AND t.tgname = $2 AND NOT t.tgisinternal",
+            &[&catalog::pg_name(lib), &catalog::pg_name(name)],
+        )
+        .await?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let table: String = row.get(0);
+    if let Some(file) = ctx
+        .client
+        .query_opt(
+            "SELECT name FROM as4tainr.objects WHERE library=$1 AND lower(name)=$2 AND objtype='*FILE'",
+            &[&lib, &table],
+        )
+        .await?
+        .map(|r| r.get::<_, String>(0))
+    {
+        authority::check_manage(ctx.client, ctx.user, lib, &file, "*FILE").await?;
+    }
+    ctx.client
+        .batch_execute(&format!(
+            "DROP TRIGGER {} ON {}.{}",
+            ident(name),
+            ident(lib),
+            ident(&table)
+        ))
+        .await?;
+    let url = ctx.database_url.clone();
+    crate::sql::define_as_sql_role(
+        ctx.client,
+        &url,
+        &[lib.to_string()],
+        lib,
+        &format!("DROP FUNCTION IF EXISTS {}()", trigger_function(lib, name)),
+    )
+    .await?;
+    Ok(true)
+}
+
+/// Split at commas outside parentheses and constants.
+fn split_commas(s: &str) -> Vec<String> {
+    let (mut out, mut cur, mut depth, mut q) = (Vec::new(), String::new(), 0i32, false);
+    for c in s.chars() {
+        match c {
+            '\'' => q = !q,
+            '(' if !q => depth += 1,
+            ')' if !q => depth -= 1,
+            ',' if !q && depth == 0 => {
+                out.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    out.push(cur);
+    out
+}
+
+/// OLD and NEW for the correlation names a trigger's REFERENCING gave.
+fn correlate(text: &str, old: &Option<String>, new: &Option<String>) -> Result<String> {
+    let toks = tokenize(text)?;
+    let mut out = String::new();
+    for (i, t) in toks.iter().enumerate() {
+        let dot = matches!(toks.get(i + 1), Some(Tok::Punct(p)) if p == ".");
+        let prev_dot = i > 0 && matches!(toks.get(i - 1), Some(Tok::Punct(p)) if p == ".");
+        match t {
+            Tok::Word(w) if dot && !prev_dot => {
+                let u = w.to_ascii_uppercase();
+                if old.as_deref() == Some(u.as_str()) {
+                    out.push_str("OLD");
+                } else if new.as_deref() == Some(u.as_str()) {
+                    out.push_str("NEW");
+                } else {
+                    out.push_str(w);
+                }
+            }
+            other => out.push_str(&show(other)),
+        }
+    }
+    Ok(out)
+}
+
+/// CREATE TRIGGER as a PostgreSQL trigger: its action is a PL/pgSQL
+/// function defined by the SQL role (it runs as that role, whoever
+/// changes the table: SQL, record-level access or another trigger).
+async fn create_trigger_run(ctx: &mut Ctx<'_>, t: &Trigger) -> Result<String> {
+    let Some((lib, attr, sys)) = ctx.find(&t.table).await? else {
+        return Err(not_found(&t.table, "table"));
+    };
+    if attr != "PF" {
+        bail!("SQL0084: triggers on views (INSTEAD OF) are not supported yet.");
+    }
+    if t.timing == "INSTEAD OF" {
+        bail!(
+            "SQL0156: INSTEAD OF triggers are defined on views, and {} is a table.",
+            t.table.name
+        );
+    }
+    authority::check_manage(ctx.client, ctx.user, &lib, &sys, "*FILE").await?;
+    let tlib = match &t.name.lib {
+        Some(l) => l.clone(),
+        None => lib.clone(),
+    };
+    let tname = validate_name("trigger", &t.name.name).map_err(|_| {
+        anyhow!("SQL0084: trigger names longer than 10 characters are not supported yet.")
+    })?;
+    let file = catalog::resolve_file(ctx.client, std::slice::from_ref(&lib), &sys).await?;
+    let column = |c: &str| -> Result<String> {
+        file.file
+            .fields
+            .iter()
+            .find(|x| x.is_named(c))
+            .map(|x| x.column())
+            .ok_or_else(|| anyhow!("SQL0205: Column {c} not in table {}.", t.table.name))
+    };
+    let libraries = catalog::list_libraries(ctx.client).await?;
+    let libl: Vec<String> = match &ctx.schema {
+        Some(s) => vec![s.clone()],
+        None => ctx.libl.to_vec(),
+    };
+    let row = t.each_row;
+    let corr = |x: &str| -> Result<String> {
+        let c = correlate(x, &t.old, &t.new)?;
+        if !row && c != x {
+            bail!("SQL0104: OLD and NEW rows are for FOR EACH ROW triggers.");
+        }
+        Ok(c)
+    };
+    let expr = |x: &str| -> Result<String> {
+        let tr = crate::sql::translate(&format!("SELECT {}", corr(x)?), &|n| {
+            libraries.iter().any(|l| l == n)
+        })?;
+        let s = tr.sql.trim();
+        Ok(s[s.find(' ').map(|i| i + 1).unwrap_or(0)..].to_string())
+    };
+    let mut code = String::new();
+    for st in &t.body {
+        let words: Vec<String> = st
+            .split_whitespace()
+            .take(3)
+            .map(|w| w.to_ascii_uppercase())
+            .collect();
+        match words.first().map(String::as_str) {
+            Some("INSERT" | "UPDATE" | "DELETE") => {
+                let tr = crate::sql::translate(&corr(st)?, &|n| libraries.iter().any(|l| l == n))?;
+                let mut text = tr.sql.clone();
+                if let Some((target, at)) = &tr.insert_needs_columns {
+                    let name = target.replace('"', "").replace('.', "/").to_ascii_uppercase();
+                    let f = catalog::resolve_sql_file(ctx.client, &libl, &name)
+                        .await
+                        .map_err(|_| anyhow!("SQL0204: {name} not found."))?;
+                    let cols: Vec<String> = f.file.fields.iter().map(|fd| fd.column()).collect();
+                    text.insert_str(*at, &format!(" ({})", cols.join(", ")));
+                }
+                code.push_str(text.trim().trim_end_matches(';'));
+                code.push_str(";\n");
+            }
+            // SET n.column = expression, ...: a BEFORE trigger changes
+            // the new row.
+            Some("SET") if t.timing == "BEFORE" && row => {
+                let rest = st.trim()[3..].trim();
+                for a in split_commas(rest) {
+                    let (target, value) = a
+                        .split_once('=')
+                        .ok_or_else(|| anyhow!("SQL0104: SET needs column = value."))?;
+                    let target = target.trim().to_ascii_uppercase();
+                    let col = match target.split_once('.') {
+                        Some((c, col)) if t.new.as_deref() == Some(c.trim()) => col.trim().to_string(),
+                        _ => bail!("SQL0104: a BEFORE trigger sets columns of its new row ({target})."),
+                    };
+                    code.push_str(&format!("NEW.{} := {};\n", column(&col)?, expr(value)?));
+                }
+            }
+            // SIGNAL SQLSTATE [VALUE] 'xxxxx' [SET MESSAGE_TEXT = text].
+            Some("SIGNAL") => {
+                let toks: Vec<Tok> = tokenize(st)?
+                    .into_iter()
+                    .filter(|t| !matches!(t, Tok::Space(_)))
+                    .collect();
+                let state = toks.iter().find_map(|t| match t {
+                    Tok::Str(s) => Some(s.clone()),
+                    _ => None,
+                });
+                let Some(state) = state.filter(|s| s.len() == 5) else {
+                    bail!("SQL0104: SIGNAL needs SQLSTATE 'xxxxx'.");
+                };
+                let msg = match st.to_ascii_uppercase().find("MESSAGE_TEXT") {
+                    Some(i) => {
+                        let v = st[i + 12..].trim_start().trim_start_matches('=');
+                        expr(v)?
+                    }
+                    None => format!("'SQLSTATE {state} signalled by trigger {tname}'"),
+                };
+                code.push_str(&format!(
+                    "RAISE EXCEPTION USING ERRCODE = {}, MESSAGE = {msg};\n",
+                    crate::dds::quote(&state)
+                ));
+            }
+            _ => bail!(
+                "SQL0084: {} in a trigger is not supported yet (INSERT, UPDATE, DELETE, SET, SIGNAL).",
+                words.first().cloned().unwrap_or_default()
+            ),
+        }
+    }
+    let result = match (row, t.timing.as_str()) {
+        (true, "BEFORE") if t.events.iter().all(|e| e == "DELETE") => "OLD",
+        (true, "BEFORE") => "COALESCE(NEW, OLD)",
+        _ => "NULL",
+    };
+    let result = if result == "COALESCE(NEW, OLD)" {
+        // BEFORE INSERT/UPDATE: the new row; BEFORE DELETE: the old one.
+        "CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END"
+    } else {
+        result
+    };
+    let mut tag = String::from("as4tainr_trigger");
+    while code.contains(&format!("${tag}$")) {
+        tag.push('x');
+    }
+    let path: Vec<String> = libl.iter().map(|l| ident(l)).collect();
+    let func = trigger_function(&tlib, &tname);
+    let fdef =
+        format!(
+        "CREATE OR REPLACE FUNCTION {func}() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER \
+         SET search_path = {} AS ${tag}$ BEGIN\n{code}RETURN {result};\nEND ${tag}$",
+        if path.is_empty() { "\"qgpl\"".to_string() } else { path.join(", ") }
+    );
+    let exists = ctx
+        .client
+        .query_opt(
+            "SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = $1 AND t.tgname = $2 AND NOT t.tgisinternal",
+            &[&catalog::pg_name(&tlib), &catalog::pg_name(&tname)],
+        )
+        .await?
+        .is_some();
+    if exists && !t.replace {
+        bail!("SQL0601: {tname} in {tlib} type *TRIGGER already exists.");
+    }
+    if exists {
+        drop_trigger(ctx, &tlib, &tname).await?;
+    }
+    let url = ctx.database_url.clone();
+    crate::sql::define_as_sql_role(ctx.client, &url, &libl, &tlib, &fdef).await?;
+    let events: Vec<String> = t
+        .events
+        .iter()
+        .map(|e| {
+            if e == "UPDATE" && !t.columns.is_empty() {
+                Ok(format!(
+                    "UPDATE OF {}",
+                    t.columns
+                        .iter()
+                        .map(|c| column(c))
+                        .collect::<Result<Vec<_>>>()?
+                        .join(", ")
+                ))
+            } else {
+                Ok(e.clone())
+            }
+        })
+        .collect::<Result<_>>()?;
+    let when = match &t.when {
+        Some(w) if row => format!(" WHEN ({})", expr(w)?),
+        Some(_) => bail!("SQL0084: WHEN on a FOR EACH STATEMENT trigger is not supported yet."),
+        None => String::new(),
+    };
+    ctx.client
+        .batch_execute(&format!(
+            "CREATE TRIGGER {} {} {} ON {}.{} FOR EACH {}{when} EXECUTE FUNCTION {func}()",
+            ident(&tname),
+            t.timing,
+            events.join(" OR "),
+            ident(&lib),
+            ident(&sys),
+            if row { "ROW" } else { "STATEMENT" },
+        ))
+        .await
+        .map_err(|e| anyhow!("SQL0104: the trigger cannot be created: {e}"))?;
+    Ok(format!("Trigger {tname} created in {tlib} on {lib}/{sys}."))
+}
+
 /// Run a data definition statement; the message says what was done.
 pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
     match ddl {
@@ -1761,6 +2568,74 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
             Ok(format!("Default schema set to {s}."))
         }
         Ddl::Comment => Ok("Comment accepted (not kept).".into()),
+        Ddl::CreateTrigger(t) => create_trigger_run(ctx, t).await,
+        Ddl::DropTrigger { name, if_exists } => {
+            let lib = ctx.target(name);
+            match drop_trigger(ctx, &lib, &name.name).await? {
+                true => Ok(format!("Trigger {} in {lib} dropped.", name.name)),
+                false if *if_exists => Ok(format!("Trigger {} not found.", name.name)),
+                false => bail!("SQL0204: {} in {lib} type *TRIGGER not found.", name.name),
+            }
+        }
+        Ddl::CreateSchema(lib) => {
+            if catalog::library_exists(ctx.client, lib).await? {
+                bail!("SQL0601: {lib} in QSYS type *LIB already exists.");
+            }
+            catalog::create_library(ctx.client, lib, "").await?;
+            authority::set_owner(ctx.client, "QSYS", lib, "*LIB", ctx.user).await?;
+            Ok(format!("Schema {lib} created."))
+        }
+        Ddl::Grant {
+            revoke,
+            privileges,
+            object,
+            grantees,
+        } => {
+            let Some(name) = object else {
+                return Ok(format!(
+                    "{} accepted (privileges on schemas and routines are not kept).",
+                    if *revoke { "REVOKE" } else { "GRANT" }
+                ));
+            };
+            let Some((lib, _, sys)) = ctx.find(name).await? else {
+                return Err(not_found(name, "table"));
+            };
+            authority::check_manage(ctx.client, ctx.user, &lib, &sys, "*FILE").await?;
+            // Data privileges as object authorities: reading is *USE,
+            // changing records *CHANGE.
+            let changes = |p: &String| ["ALL", "INSERT", "UPDATE", "DELETE"].contains(&p.as_str());
+            let reads = |p: &String| ["ALL", "SELECT"].contains(&p.as_str());
+            for g in grantees {
+                let now = authority::effective(ctx.client, g, &lib, &sys, "*FILE")
+                    .await
+                    .unwrap_or(Aut::Exclude);
+                let aut = if *revoke {
+                    if privileges.iter().any(reads) {
+                        Aut::Exclude
+                    } else if privileges.iter().any(changes) {
+                        now.min(Aut::Use)
+                    } else {
+                        now
+                    }
+                } else if privileges.iter().any(changes) {
+                    now.max(Aut::Change)
+                } else if privileges.iter().any(reads) {
+                    now.max(Aut::Use)
+                } else {
+                    now
+                };
+                if *revoke && aut == Aut::Exclude && g != "*PUBLIC" {
+                    authority::revoke(ctx.client, &lib, &sys, "*FILE", g).await?;
+                } else {
+                    authority::grant(ctx.client, &lib, &sys, "*FILE", g, aut).await?;
+                }
+            }
+            Ok(format!(
+                "{} done for {}.",
+                if *revoke { "REVOKE" } else { "GRANT" },
+                name.name
+            ))
+        }
         Ddl::CreateTable {
             name,
             system,
@@ -1768,6 +2643,8 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
             file,
             uniques,
             checks,
+            foreign,
+            preserve,
         } => {
             let lib = ctx.target(name);
             if !catalog::library_exists(ctx.client, &lib).await? {
@@ -1777,11 +2654,27 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
                 lib: Some(lib.clone()),
                 name: name.name.clone(),
             };
+            // ON REPLACE PRESERVE ROWS (Db2 for i SQL Reference, CREATE
+            // TABLE): the rows of the table replaced are kept, in the
+            // columns that have the same names.
+            let mut kept: Option<Vec<String>> = None;
             if let Some((_, attr, sys)) = ctx.find(&here).await? {
                 if !replace || attr != "PF" {
                     bail!("SQL0601: {} in {lib} type *FILE already exists.", name.name);
                 }
                 ctx.may_delete(&lib, &sys).await?;
+                if *preserve {
+                    let old =
+                        catalog::resolve_file(ctx.client, std::slice::from_ref(&lib), &sys).await?;
+                    ctx.client
+                        .batch_execute(&format!(
+                            "DROP TABLE IF EXISTS pg_temp.as4tainr_keep; CREATE TEMP TABLE as4tainr_keep AS SELECT * FROM {}.{}",
+                            ident(&lib),
+                            ident(&sys)
+                        ))
+                        .await?;
+                    kept = Some(old.file.fields.iter().map(|f| f.column()).collect());
+                }
                 catalog::delete_file(ctx.client, &lib, &sys, true).await?;
             }
             let sys = ctx.new_system_name(&lib, name, system).await?;
@@ -1792,8 +2685,41 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
             }
             catalog::create_physical_file(ctx.client, &lib, &file).await?;
             let mut done = constraints(ctx.client, &lib, &sys, uniques, checks).await;
+            for fk in foreign {
+                if done.is_ok() {
+                    done = add_foreign_key(ctx, &lib, &sys, &name.name, fk)
+                        .await
+                        .map(|_| ());
+                }
+            }
             if done.is_ok() && sys != name.name {
                 done = catalog::set_sql_name(ctx.client, &lib, &sys, &name.name, true).await;
+            }
+            if let (true, Some(old)) = (done.is_ok(), &kept) {
+                let common: Vec<String> = file
+                    .fields
+                    .iter()
+                    .map(|f| f.column())
+                    .filter(|c| old.contains(c))
+                    .collect();
+                if !common.is_empty() {
+                    let cols = common.join(", ");
+                    done = ctx
+                        .client
+                        .batch_execute(&format!(
+                            "INSERT INTO {}.{} ({cols}) SELECT {cols} FROM pg_temp.as4tainr_keep",
+                            ident(&lib),
+                            ident(&sys)
+                        ))
+                        .await
+                        .map_err(|e| {
+                            anyhow!("SQL0404: the rows kept do not fit the new table: {e}")
+                        });
+                }
+                let _ = ctx
+                    .client
+                    .batch_execute("DROP TABLE IF EXISTS pg_temp.as4tainr_keep")
+                    .await;
             }
             if let Err(e) = done {
                 let _ = catalog::delete_file(ctx.client, &lib, &sys, true).await;
@@ -1981,6 +2907,8 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
                 file,
                 uniques: vec![],
                 checks: vec![],
+                foreign: vec![],
+                preserve: false,
             };
             let msg = Box::pin(run(ctx, &create)).await?;
             if *with_data {
@@ -2063,6 +2991,25 @@ pub async fn try_run(
     schema: &mut Option<String>,
     stmt: &str,
 ) -> Result<Option<String>> {
+    // SET [CURRENT] PATH: accepted; routines are found through the
+    // library list (not data definition: `parse` leaves it alone).
+    {
+        let w: Vec<String> = stmt
+            .split(|c: char| c.is_whitespace() || c == '=')
+            .filter(|x| !x.is_empty())
+            .take(3)
+            .map(|x| x.to_ascii_uppercase())
+            .collect();
+        if w.first().map(String::as_str) == Some("SET")
+            && (w.get(1).map(String::as_str) == Some("PATH")
+                || (w.get(1).map(String::as_str) == Some("CURRENT")
+                    && w.get(2).map(String::as_str) == Some("PATH")))
+        {
+            return Ok(Some(
+                "Path accepted (routines are found through the library list).".into(),
+            ));
+        }
+    }
     // SQL procedures and functions.
     if let Some((replace, r)) = crate::sqlpl::parse_create(stmt)? {
         let client = crate::runtime::connect_db(database_url).await?;
@@ -2423,6 +3370,11 @@ async fn alter(ctx: &mut Ctx<'_>, table: &Name, action: &Alter) -> Result<String
             constraints(ctx.client, &lib, &sys, &[(name.clone(), cols)], &[]).await?;
             Ok(format!("Constraint {name} added to {}.", table.name))
         }
+        Alter::AddForeign(fk) => {
+            let tname = table.name.clone();
+            let cname = add_foreign_key(ctx, &lib, &sys, &tname, fk).await?;
+            Ok(format!("Referential constraint {cname} added to {tname}."))
+        }
         Alter::AddCheck { name, condition } => {
             let toks: Vec<Tok> = tokenize(condition)?
                 .into_iter()
@@ -2616,6 +3568,15 @@ async fn alter(ctx: &mut Ctx<'_>, table: &Name, action: &Alter) -> Result<String
                     };
                     format!("ALTER TABLE {tbl} ALTER COLUMN {col} DROP DEFAULT")
                 }
+                ColumnChange::Restart(n) => {
+                    if nf.identity.is_none() {
+                        bail!("SQL0084: RESTART is only for an identity column ({column} is not one).");
+                    }
+                    match n {
+                        Some(n) => format!("ALTER TABLE {tbl} ALTER COLUMN {col} RESTART WITH {n}"),
+                        None => format!("ALTER TABLE {tbl} ALTER COLUMN {col} RESTART"),
+                    }
+                }
                 ColumnChange::SetNotNull => {
                     nf.null_capable = false;
                     if nf.default.is_none() {
@@ -2791,6 +3752,56 @@ mod tests {
         assert!(e.starts_with("SQL0084"), "{e}");
         let (_, _, c) = table("CREATE TABLE T (A INT, B INT, CHECK (A <> B AND A >= 0))");
         assert_eq!(c[0].1, "\"a\" <> \"b\" AND \"a\" >= 0");
+        // Db2 for i SQL Reference, check-condition: expressions, so
+        // arithmetic too (AMOUNT = QTY * PRICE).
+        let (_, _, c) = table("CREATE TABLE T (A INT, B INT, C INT, CHECK (C = A * B))");
+        assert_eq!(c[0].1, "\"c\" = \"a\" * \"b\"");
+    }
+
+    #[test]
+    fn sql_triggers() {
+        // Db2 for i SQL Reference, CREATE TRIGGER: timing, events (UPDATE
+        // OF columns), REFERENCING correlation names, FOR EACH ROW, WHEN,
+        // and a single statement or BEGIN ATOMIC ... END.
+        let Some(Ddl::CreateTrigger(t)) = parse(
+            "CREATE OR REPLACE TRIGGER L.TRG AFTER UPDATE OF PRICE ON L.ITEMS \
+             REFERENCING OLD AS O NEW AS N FOR EACH ROW MODE DB2ROW \
+             WHEN (O.PRICE <> N.PRICE) INSERT INTO L.LOG VALUES (N.ID, 'x;y')",
+        )
+        .unwrap() else {
+            panic!("not a trigger");
+        };
+        assert_eq!(t.timing, "AFTER");
+        assert_eq!(t.events, ["UPDATE"]);
+        assert_eq!(t.columns, ["PRICE"]);
+        assert_eq!((t.old.as_deref(), t.new.as_deref()), (Some("O"), Some("N")));
+        assert!(t.each_row && t.replace);
+        assert_eq!(t.when.as_deref(), Some("(O.PRICE <> N.PRICE)"));
+        assert_eq!(t.body, ["INSERT INTO L.LOG VALUES (N.ID, 'x;y')"]);
+        let Some(Ddl::CreateTrigger(t)) = parse(
+            "CREATE TRIGGER T2 NO CASCADE BEFORE INSERT OR UPDATE ON ITEMS \
+             REFERENCING NEW ROW AS N FOR EACH ROW \
+             BEGIN ATOMIC SET N.NAME = UPPER(N.NAME); SIGNAL SQLSTATE '75001'; END",
+        )
+        .unwrap() else {
+            panic!("not a trigger");
+        };
+        assert_eq!(t.events, ["INSERT", "UPDATE"]);
+        assert_eq!(
+            t.body,
+            ["SET N.NAME = UPPER(N.NAME)", "SIGNAL SQLSTATE '75001'"]
+        );
+        assert_eq!(
+            correlate("N.NAME = O.X.Y", &Some("O".into()), &Some("N".into())).unwrap(),
+            "NEW.NAME = OLD.X.Y"
+        );
+        assert!(matches!(
+            parse("DROP TRIGGER IF EXISTS L.TRG").unwrap(),
+            Some(Ddl::DropTrigger {
+                if_exists: true,
+                ..
+            })
+        ));
     }
 
     #[test]

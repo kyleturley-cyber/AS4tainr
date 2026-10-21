@@ -234,6 +234,8 @@ pub struct Machine<'a> {
     io: Io<'a>,
     /// DSPLY output, in order.
     pub messages: Vec<String>,
+    /// The entry parameters' values when the program ended (`run`).
+    pub returned: Vec<String>,
     /// The remainder of the last DIV, for MVR.
     remainder: Dec,
     /// The display files' screen and subfiles.
@@ -391,6 +393,7 @@ impl<'a> Machine<'a> {
             last: Status::default(),
             io,
             messages: Vec::new(),
+            returned: Vec::new(),
             remainder: Dec::ZERO,
             ws: Workstation::new(),
             dtaara_locks: Vec::new(),
@@ -2948,7 +2951,19 @@ impl<'a> Machine<'a> {
             data::store(t, &v, &mut buf, Fit::Strict { half_adjust: false }, false)?;
             parms.push(buf);
         }
-        self.run_bytes(&mut parms)
+        let r = self.run_bytes(&mut parms);
+        // The parameters as the program left them: the caller's variables
+        // get them back (parameters are passed by reference).
+        self.returned = types
+            .iter()
+            .zip(&parms)
+            .map(|(t, b)| match data::load(t, b) {
+                Ok(Value::Num(d)) => d.to_string(),
+                Ok(other) => other.chars().map(|c| a(&c)).unwrap_or_default(),
+                Err(_) => String::new(),
+            })
+            .collect();
+        r
     }
 
     /// Run the program with parameters passed by reference (a CALL from
@@ -3161,6 +3176,12 @@ impl Machine<'_> {
     /// Run a CL command in the calling job (QCMDEXC, CALL of a CL
     /// program). Its messages go to the job log.
     fn run_cl(&mut self, cmd: &str) -> Result<()> {
+        self.run_cl_returning(cmd).map(|_| ())
+    }
+
+    /// `run_cl`, with the parameter values a called CL program left (CALL
+    /// passes parameters by reference).
+    fn run_cl_returning(&mut self, cmd: &str) -> Result<Option<Vec<String>>> {
         let ctx =
             self.io.cl.clone().ok_or_else(|| {
                 anyhow!("CL command '{cmd}' cannot run here: the program has no job")
@@ -3182,13 +3203,14 @@ impl Machine<'_> {
         if let Some(c) = self.io.cl.as_mut() {
             c.overrides = job.calls.overrides.clone();
         }
+        let returned = job.calls.returned.take();
         let out = out?;
         if let crate::commands::Outcome::Messages(msgs) = out {
             for m in msgs {
                 self.job_log(&m);
             }
         }
-        Ok(())
+        Ok(returned)
     }
 
     /// A message to the job log; without a job (`as4tainr call`), to the
@@ -3915,8 +3937,8 @@ impl<'a> Machine<'a> {
                 (p.source, p.options, p.binding)
             }
             Some(p) if p.attribute == "CLLE" || p.attribute == "CLP" => {
-                // A CL program runs in the job; parameters go in as
-                // values (changes it makes do not come back yet).
+                // A CL program runs in the job; the values it leaves in its
+                // parameters come back (by reference).
                 let mut parms = Vec::new();
                 for l in locs {
                     let bytes = &self.bufs[l.buf][l.off..l.off + l.size];
@@ -3930,7 +3952,34 @@ impl<'a> Machine<'a> {
                 } else {
                     format!(" PARM({})", parms.join(" "))
                 };
-                return self.run_cl(&format!("CALL PGM({}/{}){parm}", p.library, p.name));
+                let back =
+                    self.run_cl_returning(&format!("CALL PGM({}/{}){parm}", p.library, p.name))?;
+                for (l, v) in locs.iter().zip(back.unwrap_or_default()) {
+                    let val = if l.dtype.is_numeric() {
+                        match Dec::parse(v.trim()) {
+                            Ok(d) => Value::Num(d),
+                            Err(_) => continue,
+                        }
+                    } else {
+                        // A shorter value changes only the first bytes.
+                        let mut b = crate::rpg::data::e(&v);
+                        let old = &self.bufs[l.buf][l.off..l.off + l.size];
+                        if b.len() < old.len() {
+                            b.extend_from_slice(&old[b.len()..]);
+                        }
+                        Value::Char(b)
+                    };
+                    let mut buf = self.bufs[l.buf][l.off..l.off + l.size].to_vec();
+                    data::store(
+                        &l.dtype,
+                        &val,
+                        &mut buf,
+                        Fit::Truncate { half_adjust: false },
+                        false,
+                    )?;
+                    self.bufs[l.buf][l.off..l.off + l.size].copy_from_slice(&buf);
+                }
+                return Ok(());
             }
             Some(p) => bail!(
                 "CALL {name}: {} programs cannot be called from RPG on the native engine yet",

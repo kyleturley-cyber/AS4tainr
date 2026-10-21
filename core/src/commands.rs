@@ -3438,6 +3438,7 @@ impl Job<'_> {
             args,
         )
         .await?;
+        self.calls.returned = Some(r.params.clone());
         let mut msgs: Vec<String> = r.messages.iter().map(|m| format!("DSPLY  {m}")).collect();
         // Without a job there are no spooled files: printed lines come back
         // as they would be on paper.

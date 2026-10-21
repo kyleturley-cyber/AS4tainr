@@ -56,6 +56,10 @@ pub struct CallStack {
     texts: HashMap<String, String>,
     /// File overrides (OVRDBF, OVRPRTF), with the call level of each.
     pub overrides: Vec<crate::ovr::Override>,
+    /// The parameters' values when the program CALL ran ended:
+    /// parameters are passed by reference, so the caller's variables get
+    /// them back.
+    pub returned: Option<Vec<String>>,
 }
 
 impl CallStack {
@@ -111,7 +115,20 @@ impl CallStack {
     /// RCVMSG on the running program's queue: the message, removed
     /// (`rmv`) or kept as old.
     pub fn receive(&mut self, msgtype: &str, key: Option<u32>, rmv: &str) -> Option<QMsg> {
-        let q = self.stack.last_mut()?;
+        self.receive_from(0, msgtype, key, rmv)
+    }
+
+    /// RCVMSG PGMQ: the queue `up` levels above the running program's
+    /// (1: its caller's, PGMQ(*PRV)).
+    pub fn receive_from(
+        &mut self,
+        up: usize,
+        msgtype: &str,
+        key: Option<u32>,
+        rmv: &str,
+    ) -> Option<QMsg> {
+        let n = self.stack.len().checked_sub(1 + up)?;
+        let q = self.stack.get_mut(n)?;
         let i = select(q, msgtype, key)?;
         let exception = matches!(q[i].ty.as_str(), "*ESCAPE" | "*NOTIFY");
         let remove = match rmv {

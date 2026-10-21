@@ -1068,6 +1068,10 @@ enum Ins {
     /// End of a program-level MONMSG's EXEC: go on after the command that
     /// failed.
     Resume,
+    /// CALLSUBR: the subroutine, and the *INT variable for its RTNVAL.
+    CallSubr(String, Option<String>),
+    /// RTNSUBR or ENDSUBR: back to after the CALLSUBR, with RTNVAL.
+    RtnSubr(Option<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -1485,6 +1489,27 @@ impl Compiler<'_> {
                 self.code.push(Ins::Goto(l.trim().to_ascii_uppercase()));
             }
             "RETURN" => self.code.push(Ins::Return),
+            "CALLSUBR" => {
+                let p = named(st, &["SUBR", "RTNVAL"])?;
+                let n = p
+                    .get("SUBR")
+                    .ok_or_else(|| self.err(st, "CALLSUBR needs SUBR"))?
+                    .trim()
+                    .to_ascii_uppercase();
+                let r = p.get("RTNVAL").map(|v| v.trim().to_ascii_uppercase());
+                self.code.push(Ins::CallSubr(n, r));
+            }
+            "RTNSUBR" => {
+                let p = named(st, &["RTNVAL"])?;
+                let r = p.get("RTNVAL").map(|v| parse_expr(v)).transpose()?;
+                self.code.push(Ins::RtnSubr(r));
+            }
+            "SUBR" | "ENDSUBR" => {
+                return Err(self.err(
+                    st,
+                    "subroutines go after the program's statements and cannot be nested",
+                ))
+            }
             "MONMSG" => return Err(self.err(st, "must follow a command (or the declarations)")),
             _ => {
                 // A command, with its MONMSGs.
@@ -2130,8 +2155,48 @@ pub fn compile_with(
         labels: HashMap::new(),
         loops: vec![],
     };
-    c.block(&["ENDPGM"])?;
+    // The program, then its subroutines (SUBR ... ENDSUBR, after the
+    // program's other statements).
+    let mut end = c.block(&["ENDPGM", "SUBR"])?;
     c.code.push(Ins::Return);
+    while end.as_deref() == Some("SUBR") {
+        let st = c.sts[c.i - 1].clone();
+        let p = named(&st, &["SUBR"])?;
+        let name = p
+            .get("SUBR")
+            .ok_or_else(|| c.err(&st, "SUBR needs a name"))?
+            .trim()
+            .to_ascii_uppercase();
+        if c.labels
+            .insert(format!("\0SUBR:{name}"), c.here())
+            .is_some()
+        {
+            return Err(c.err(&st, format!("subroutine {name} is defined twice")));
+        }
+        if c.block(&["ENDSUBR"])?.is_none() {
+            return Err(c.err(&st, "SUBR has no ENDSUBR"));
+        }
+        let e = &c.sts[c.i - 1];
+        let rtn = named(e, &["RTNVAL"])?
+            .get("RTNVAL")
+            .map(|v| parse_expr(v))
+            .transpose()?;
+        c.code.push(Ins::RtnSubr(rtn));
+        end = match c.sts.get(c.i) {
+            Some(n) if n.name == "SUBR" => {
+                c.i += 1;
+                Some("SUBR".into())
+            }
+            Some(n) if n.name == "ENDPGM" => {
+                c.i += 1;
+                Some("ENDPGM".into())
+            }
+            None => None,
+            Some(n) => {
+                return Err(c.err(n, "only subroutines (SUBR) can follow a subroutine"));
+            }
+        };
+    }
     // Handlers of program-level MONMSGs go after the program.
     let mut global = Vec::new();
     for m in &global_src {
@@ -2147,6 +2212,11 @@ pub fn compile_with(
         if let Ins::Goto(l) = ins {
             if !c.labels.contains_key(l) {
                 bail!("GOTO CMDLBL({l}): there is no label {l}");
+            }
+        }
+        if let Ins::CallSubr(n, _) = ins {
+            if !c.labels.contains_key(&format!("\0SUBR:{n}")) {
+                bail!("CALLSUBR SUBR({n}): there is no subroutine {n}");
             }
         }
     }
@@ -2233,10 +2303,35 @@ pub async fn run(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Result<Ou
     job.calls.enter();
     let r = run_program(job, pgm, args).await;
     job.calls.leave();
-    r
+    if let Ok((_, values)) = &r {
+        job.calls.returned = Some(values.clone());
+    }
+    r.map(|(o, _)| o)
 }
 
-async fn run_program(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Result<Outcome> {
+/// The parameters' values, for the caller.
+fn param_values(pgm: &Program, vars: &HashMap<String, Var>) -> Vec<String> {
+    pgm.params
+        .iter()
+        .map(|p| vars.get(p).map(returned_text).unwrap_or_default())
+        .collect()
+}
+
+/// A parameter's value as the caller gets it back.
+fn returned_text(v: &Var) -> String {
+    match &v.value {
+        Value::Dec(d) => dec_text(d),
+        Value::Lgl(b) => if *b { "1" } else { "0" }.into(),
+        Value::Char(c) => c.clone(),
+        Value::Ptr(_) => String::new(),
+    }
+}
+
+async fn run_program(
+    job: &mut Job<'_>,
+    pgm: &Program,
+    args: &[String],
+) -> Result<(Outcome, Vec<String>)> {
     let mut vars: HashMap<String, Var> = pgm.decls.iter().cloned().collect();
     if args.len() > pgm.params.len() {
         bail!(
@@ -2281,6 +2376,8 @@ async fn run_program(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Resul
     let mut pc = 0usize;
     let mut steps = 0u64;
     let mut resume_at: Option<usize> = None;
+    // CALLSUBR return points.
+    let mut subrs: Vec<(usize, Option<String>)> = Vec::new();
     let fail = |pgm: &Program, st: &Statement, e: &anyhow::Error| -> anyhow::Error {
         anyhow!(
             "{e:#}\nError in CL program {} at line {} ({}).",
@@ -2301,9 +2398,40 @@ async fn run_program(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Resul
             );
         }
         match &pgm.code[pc] {
-            Ins::Return => return Ok(Outcome::Messages(msgs)),
+            Ins::Return => return Ok((Outcome::Messages(msgs), param_values(pgm, &vars))),
             Ins::Jump(t) => pc = *t,
             Ins::Goto(l) => pc = pgm.labels[l],
+            Ins::CallSubr(name, rtn) => {
+                // CALLSUBR: at most 99 levels deep (DCLPRCOPT SUBRSTACK's
+                // default, IBM CL reference).
+                if subrs.len() >= 99 {
+                    bail!(
+                        "CL program {}: subroutines called more than 99 levels deep (at {name}).",
+                        pgm.name
+                    );
+                }
+                subrs.push((pc + 1, rtn.clone()));
+                pc = pgm.labels[&format!("\0SUBR:{name}")];
+            }
+            Ins::RtnSubr(e) => {
+                let Some((back, rtn)) = subrs.pop() else {
+                    bail!(
+                        "CL program {}: RTNSUBR or ENDSUBR outside a subroutine.",
+                        pgm.name
+                    );
+                };
+                if let Some(name) = rtn {
+                    let v = match e {
+                        Some(e) => eval(e, &vars)?,
+                        None => Value::Dec(Decimal::ZERO),
+                    };
+                    let var = vars
+                        .get_mut(&name)
+                        .ok_or_else(|| anyhow!("CPD0727: Variable {name} is not declared."))?;
+                    assign(&name, var, v)?;
+                }
+                pc = back;
+            }
             Ins::Resume => match resume_at.take() {
                 Some(r) => pc = r,
                 None => pc += 1,
@@ -2386,7 +2514,7 @@ async fn run_program(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Resul
                 job.calls.escape_to_caller = false;
                 let result = command(job, pgm, st, &mut vars, &mut msgs, &mut io).await;
                 match result {
-                    Ok(Some(o)) => return Ok(o),
+                    Ok(Some(o)) => return Ok((o, param_values(pgm, &vars))),
                     Ok(None) => pc += 1,
                     // An escape message sent to the caller ends this
                     // program; its own MONMSGs do not see it.
@@ -2440,7 +2568,7 @@ async fn run_program(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Resul
             }
         }
     }
-    Ok(Outcome::Messages(msgs))
+    Ok((Outcome::Messages(msgs), param_values(pgm, &vars)))
 }
 
 /// The files of one program call: database files open for RCVF, the
@@ -2947,13 +3075,21 @@ async fn command(
                     .unwrap_or_else(|| d.to_string())
             };
             let pgmq = up("PGMQ", "*SAME");
-            if !pgmq.starts_with("*SAME") {
-                bail!("line {}: RCVMSG PGMQ({pgmq}) is not supported yet: only the program's own queue", st.line);
-            }
-            let msgq = up("MSGQ", "*PGMQ");
-            if msgq != "*PGMQ" {
-                bail!("line {}: RCVMSG MSGQ({msgq}) is not supported yet: only the program's own queue", st.line);
-            }
+            let levels = match pgmq.split_whitespace().next().unwrap_or("*SAME") {
+                "*SAME" => 0,
+                "*PRV" => 1,
+                other => bail!(
+                    "line {}: RCVMSG PGMQ({other}) is not supported yet: *SAME or *PRV",
+                    st.line
+                ),
+            };
+            let msgq = match p.get("MSGQ") {
+                Some(q) => substitute_text(q, vars)?
+                    .trim()
+                    .trim_matches('\'')
+                    .to_ascii_uppercase(),
+                None => "*PGMQ".into(),
+            };
             let msgtype = up("MSGTYPE", "*ANY");
             let key = match p.get("MSGKEY") {
                 None => None,
@@ -2967,7 +3103,52 @@ async fn command(
                 }
             };
             let rmv = up("RMV", "*YES");
-            let got = job.calls.receive(&msgtype, key, &rmv);
+            let got = if msgq == "*PGMQ" {
+                job.calls.receive_from(levels, &msgtype, key, &rmv)
+            } else {
+                // A message queue (a user's, or QSYSOPR): WAIT seconds for
+                // a message when there is none (*MAX: until one comes).
+                let name = msgq.rsplit('/').next().unwrap_or(&msgq).to_string();
+                if name != "QSYSOPR" && crate::users::get(job.client, &name).await?.is_none() {
+                    bail!("CPF2403: Message queue {name} in *LIBL not found.");
+                }
+                let wait = match up("WAIT", "0").as_str() {
+                    "*MAX" => u64::MAX,
+                    w => w.parse::<u64>().unwrap_or(0),
+                };
+                let started = std::time::Instant::now();
+                loop {
+                    if let Some(msg) =
+                        jobs::receive_message(job.client, &name, &msgtype, rmv != "*NO").await?
+                    {
+                        let text = match msg.text.split_once(": ") {
+                            Some((id, t)) if id == msg.msgid => t.to_string(),
+                            _ => msg.text.clone(),
+                        };
+                        break Some(crate::pgmmsg::QMsg {
+                            key: msg.id as u32,
+                            msgf: if msg.msgid.is_empty() {
+                                String::new()
+                            } else {
+                                crate::msgf::system_msgf(&msg.msgid).into()
+                            },
+                            msgflib: if msg.msgid.is_empty() {
+                                String::new()
+                            } else {
+                                "QSYS".into()
+                            },
+                            msgid: msg.msgid,
+                            text,
+                            ty: msg.kind,
+                            ..Default::default()
+                        });
+                    }
+                    if started.elapsed().as_secs() >= wait {
+                        break None;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            };
             let m = got.clone().unwrap_or_default();
             let found = got.is_some();
             let n = |x: usize| Value::Dec(Decimal::from(x as u64));
@@ -3079,6 +3260,324 @@ async fn command(
                 .ok_or_else(|| anyhow!("line {}: RTVSYSVAL needs RTNVAR", st.line))?;
             let v = system_value(&name)?;
             set_var(vars, target, v)?;
+            Ok(None)
+        }
+        // RTVOBJD: an object's description into variables (return
+        // values not kept here are blank or zero).
+        "RTVOBJD" => {
+            let keys = [
+                "OBJ",
+                "OBJTYPE",
+                "ASPDEV",
+                "RTNLIB",
+                "OBJATR",
+                "USRDFNATR",
+                "TEXT",
+                "OWNER",
+                "PGP",
+                "PRMGRP",
+                "ASP",
+                "LIBASP",
+                "OBJASPDEV",
+                "OVFASP",
+                "CRTDATE",
+                "CHGDATE",
+                "SAVDATE",
+                "SAVACTDATE",
+                "RSTDATE",
+                "CRTUSER",
+                "CRTSYSTEM",
+                "OBJDMN",
+                "USEDATE",
+                "USEUPD",
+                "NBRDAYSUSE",
+                "RESETDATE",
+                "SRCF",
+                "SRCFLIB",
+                "SRCMBR",
+                "SRCDATE",
+                "SAVCMD",
+                "SAVVOL",
+                "SAVDEV",
+                "SAVF",
+                "SAVFLIB",
+                "SAVLABEL",
+                "SAVSEQNBR",
+                "SAVACT",
+                "SYSLVL",
+                "COMPILER",
+                "OBJLVL",
+                "USRCHG",
+                "LICPGM",
+                "PTF",
+                "APAR",
+                "SIZE",
+                "STG",
+                "COMPRESSED",
+                "OBJOVFASP",
+                "JRNSTS",
+                "JRN",
+                "JRNLIB",
+                "JRNIMG",
+                "JRNOMTE",
+                "JRNSTRDATE",
+                "ALWAPICHG",
+                "APICHG",
+            ];
+            let p = named(st, &keys)?;
+            let obj = substitute_text(
+                p.get("OBJ")
+                    .ok_or_else(|| anyhow!("line {}: RTVOBJD needs OBJ", st.line))?,
+                vars,
+            )?
+            .trim_matches('\'')
+            .to_ascii_uppercase();
+            let objtype = substitute_text(
+                p.get("OBJTYPE")
+                    .ok_or_else(|| anyhow!("line {}: RTVOBJD needs OBJTYPE", st.line))?,
+                vars,
+            )?
+            .trim()
+            .to_ascii_uppercase();
+            let (libs, name, label) = match obj.split_once('/') {
+                Some(("*LIBL", n)) => (job.library_list(), n.to_string(), "*LIBL".to_string()),
+                Some(("*CURLIB", n)) => {
+                    (vec![job.current_library()], n.to_string(), "*CURLIB".into())
+                }
+                Some((l, n)) => (vec![l.to_string()], n.to_string(), l.to_string()),
+                None => (job.library_list(), obj.clone(), "*LIBL".into()),
+            };
+            let libs = if objtype == "*LIB" {
+                vec!["QSYS".to_string()]
+            } else {
+                libs
+            };
+            let mut row = None;
+            for lib in &libs {
+                if let Some(r) = job
+                    .client
+                    .query_opt(
+                        "SELECT library, attribute, text, owner,
+                                to_char(created AT TIME ZONE 'UTC', 'YYMMDDHH24MISS'),
+                                extract(year FROM created)::int
+                           FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype=$3",
+                        &[lib, &name, &objtype],
+                    )
+                    .await?
+                {
+                    row = Some(r);
+                    break;
+                }
+            }
+            let Some(r) = row else {
+                bail!("CPF9801: Object {name} in library {label} not found.");
+            };
+            let lib: String = r.get(0);
+            crate::authority::check(
+                job.client,
+                &job.user,
+                &lib,
+                &name,
+                &objtype,
+                crate::authority::Aut::Use,
+            )
+            .await?;
+            // Dates: CYYMMDDHHMMSS (C: 0 for 19xx, 1 for 20xx).
+            let year: i32 = r.get(5);
+            let stamp = format!(
+                "{}{}",
+                if year >= 2000 { 1 } else { 0 },
+                r.get::<_, String>(4)
+            );
+            let owner: String = r.get(3);
+            for (k, target) in &p {
+                let v = match k.as_str() {
+                    "OBJ" | "OBJTYPE" | "ASPDEV" => continue,
+                    "RTNLIB" => Value::Char(lib.clone()),
+                    "OBJATR" => Value::Char(r.get(1)),
+                    "TEXT" => Value::Char(r.get(2)),
+                    "OWNER" | "CRTUSER" => Value::Char(owner.clone()),
+                    "CRTDATE" | "CHGDATE" => Value::Char(stamp.clone()),
+                    "OBJDMN" => Value::Char("*SYSTEM".into()),
+                    "PGP" => Value::Char("*NONE".into()),
+                    _ => {
+                        let name = target.trim().to_ascii_uppercase();
+                        match vars.get(&name).map(|v| v.ty) {
+                            Some(VarType::Char) => Value::Char(String::new()),
+                            Some(VarType::Lgl) => Value::Lgl(false),
+                            _ => Value::Dec(Decimal::ZERO),
+                        }
+                    }
+                };
+                set_var(vars, target, v)?;
+            }
+            Ok(None)
+        }
+        // RTVMBRD: a database file member's description (a database file
+        // has one member, named as the file; a source file one per source
+        // member).
+        "RTVMBRD" => {
+            let p = named(
+                st,
+                &[
+                    "FILE",
+                    "MBR",
+                    "RTNSYSNAME",
+                    "RTNLIB",
+                    "RTNMBR",
+                    "FILEATR",
+                    "FILETYPE",
+                    "SRCTYPE",
+                    "SRCF",
+                    "SRCFLIB",
+                    "SRCMBR",
+                    "SRCCHGDATE",
+                    "CRTDATE",
+                    "CHGDATE",
+                    "TEXT",
+                    "NBRCURRCD",
+                    "NBRDLTRCD",
+                    "DTASPCSIZ",
+                    "ACCPTHSIZ",
+                    "NBRDTAMBRS",
+                    "SHARE",
+                    "EXPDATE",
+                    "RESETDATE",
+                    "SAVDATE",
+                    "RSTDATE",
+                    "USEDATE",
+                    "USECOUNT",
+                    "SQLFILETYPE",
+                ],
+            )?;
+            let file = substitute_text(
+                p.get("FILE")
+                    .ok_or_else(|| anyhow!("line {}: RTVMBRD needs FILE", st.line))?,
+                vars,
+            )?
+            .trim_matches('\'')
+            .to_ascii_uppercase();
+            let mbr_arg = p
+                .get("MBR")
+                .map(|m| substitute_text(m, vars))
+                .transpose()?
+                .map(|m| m.trim().trim_matches('\'').to_ascii_uppercase())
+                .unwrap_or_else(|| "*FIRST".into());
+            let mbr_arg = mbr_arg
+                .split_whitespace()
+                .next()
+                .unwrap_or("*FIRST")
+                .to_string();
+            let (libs, fname, label) = match file.split_once('/') {
+                Some(("*LIBL", n)) => (job.library_list(), n.to_string(), "*LIBL".to_string()),
+                Some(("*CURLIB", n)) => {
+                    (vec![job.current_library()], n.to_string(), "*CURLIB".into())
+                }
+                Some((l, n)) => (vec![l.to_string()], n.to_string(), l.to_string()),
+                None => (job.library_list(), file.clone(), "*LIBL".into()),
+            };
+            let mut found = None;
+            for lib in &libs {
+                if let Some(r) = job
+                    .client
+                    .query_opt(
+                        "SELECT attribute, text, to_char(created AT TIME ZONE 'UTC', 'YYMMDDHH24MISS'),
+                                extract(year FROM created)::int
+                           FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+                        &[lib, &fname],
+                    )
+                    .await?
+                {
+                    found = Some((lib.clone(), r));
+                    break;
+                }
+            }
+            let Some((lib, r)) = found else {
+                bail!("CPF9812: File {fname} in library {label} not found.");
+            };
+            let attr: String = r.get(0);
+            let cent = |y: i32| if y >= 2000 { 1 } else { 0 };
+            let year: i32 = r.get(3);
+            let mut stamp = format!("{}{}", cent(year), r.get::<_, String>(2));
+            let mut text: String = r.get(1);
+            let source = attr.ends_with("-SRC") || attr == "PF-SRC";
+            let (member, srctype, count): (String, String, i64) = if source {
+                let rows = job
+                    .client
+                    .query(
+                        "SELECT member, srctype, text, source,
+                                to_char(changed AT TIME ZONE 'UTC', 'YYMMDDHH24MISS'),
+                                extract(year FROM changed)::int
+                           FROM as4tainr.source_members WHERE library=$1 AND file=$2 ORDER BY member",
+                        &[&lib, &fname],
+                    )
+                    .await?;
+                let pick = match mbr_arg.as_str() {
+                    "*FIRST" => rows.first(),
+                    "*LAST" => rows.last(),
+                    m => rows.iter().find(|r| r.get::<_, String>(0) == m),
+                };
+                let Some(m) = pick else {
+                    bail!("CPF9815: Member {mbr_arg} file {fname} in library {lib} not found.");
+                };
+                text = m.get(2);
+                stamp = format!("{}{}", cent(m.get(5)), m.get::<_, String>(4));
+                let lines = m.get::<_, String>(3).lines().count() as i64;
+                (m.get(0), m.get(1), lines)
+            } else {
+                if !matches!(mbr_arg.as_str(), "*FIRST" | "*LAST") && mbr_arg != fname {
+                    bail!("CPF9815: Member {mbr_arg} file {fname} in library {lib} not found.");
+                }
+                let count = if attr == "PF" || attr == "LF" {
+                    let fr = crate::catalog::resolve_file(
+                        job.client,
+                        std::slice::from_ref(&lib),
+                        &fname,
+                    )
+                    .await?;
+                    job.client
+                        .query_one(&format!("SELECT count(*) FROM {}", fr.table()), &[])
+                        .await?
+                        .get(0)
+                } else {
+                    0
+                };
+                (fname.clone(), String::new(), count)
+            };
+            for (k, target) in &p {
+                let v = match k.as_str() {
+                    "FILE" | "MBR" => continue,
+                    "RTNLIB" => Value::Char(lib.clone()),
+                    "RTNSYSNAME" => Value::Char(String::new()),
+                    "RTNMBR" => Value::Char(member.clone()),
+                    "FILEATR" => Value::Char(if attr.starts_with("LF") {
+                        "LF".into()
+                    } else {
+                        "PF".into()
+                    }),
+                    "FILETYPE" => Value::Char(if source {
+                        "*SRC".into()
+                    } else {
+                        "*DATA".into()
+                    }),
+                    "SRCTYPE" => Value::Char(srctype.clone()),
+                    "CRTDATE" | "CHGDATE" | "SRCCHGDATE" => Value::Char(stamp.clone()),
+                    "TEXT" => Value::Char(text.clone()),
+                    "NBRCURRCD" => Value::Dec(Decimal::from(count)),
+                    "NBRDLTRCD" => Value::Dec(Decimal::ZERO),
+                    "NBRDTAMBRS" => Value::Dec(Decimal::from(1)),
+                    "SQLFILETYPE" => Value::Char(String::new()),
+                    _ => {
+                        let name = target.trim().to_ascii_uppercase();
+                        match vars.get(&name).map(|v| v.ty) {
+                            Some(VarType::Char) => Value::Char(String::new()),
+                            Some(VarType::Lgl) => Value::Lgl(false),
+                            _ => Value::Dec(Decimal::ZERO),
+                        }
+                    }
+                };
+                set_var(vars, target, v)?;
+            }
             Ok(None)
         }
         "CHKOBJ" => {
@@ -3290,9 +3789,12 @@ async fn command(
             .trim_matches('\'')
             .to_ascii_uppercase();
             let mut args = Vec::new();
+            let mut targets: Vec<Option<String>> = Vec::new();
             if let Some(parm) = p.get("PARM") {
                 for tok in split_params(parm)? {
                     let v = tok.value;
+                    let is_var = v.starts_with('&') && vars.contains_key(&v.to_ascii_uppercase());
+                    targets.push(is_var.then(|| v.to_ascii_uppercase()));
                     let val = if v.starts_with('&') {
                         let name = v.to_ascii_uppercase();
                         match &vars
@@ -3312,7 +3814,37 @@ async fn command(
                     args.push(val);
                 }
             }
+            job.calls.returned = None;
             let o = job.call_program_boxed(&pgm, args).await?;
+            // Parameters are passed by reference: a variable gets back
+            // the value the called program left in it (a character
+            // parameter shorter than the variable changes only its first
+            // characters).
+            if let Some(values) = job.calls.returned.take() {
+                for (t, v) in targets.iter().zip(values) {
+                    let Some(name) = t else { continue };
+                    let Some(var) = vars.get_mut(name) else {
+                        continue;
+                    };
+                    let new = match var.ty {
+                        VarType::Char => {
+                            let old: Vec<char> = var.value.as_char()?.chars().collect();
+                            let mut cs: Vec<char> = v.chars().collect();
+                            if cs.len() < old.len() {
+                                cs.extend(&old[cs.len()..]);
+                            }
+                            Value::Char(cs.into_iter().collect())
+                        }
+                        VarType::Lgl => Value::Lgl(v.starts_with('1')),
+                        VarType::Ptr => continue,
+                        _ => match Decimal::from_str(v.trim()) {
+                            Ok(d) => Value::Dec(d),
+                            Err(_) => continue,
+                        },
+                    };
+                    assign(name, var, new)?;
+                }
+            }
             match o {
                 Outcome::Messages(m) => msgs.extend(m),
                 Outcome::SignOff => return Ok(Some(Outcome::SignOff)),

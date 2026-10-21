@@ -213,6 +213,9 @@ pub struct CallResult {
     /// job's spooled files).
     pub printed: Vec<String>,
     pub error: Option<anyhow::Error>,
+    /// The parameters' values when the program ended (passed by
+    /// reference: the caller's variables get them back).
+    pub params: Vec<String>,
 }
 
 /// Run a program in its own database session, on a blocking thread.
@@ -337,6 +340,7 @@ pub async fn call_with(
             messages: std::mem::take(&mut m.messages),
             printed: std::mem::take(&mut m.printed),
             error: r.err(),
+            params: std::mem::take(&mut m.returned),
         })
     })
     .await?

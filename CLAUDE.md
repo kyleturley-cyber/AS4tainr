@@ -33,7 +33,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/web/` | Browser 5250 terminal: HTTP + WebSocket (`mod.rs`, `ws.rs`, dependency-free), a 5250 display station that talks TN5250 to this process's server (`display.rs`), the page (`static/`). See `docs/web-terminal.md` |
 | `core/src/cl.rs` | CL parser and the command definition table (add new commands here first) |
 | `core/src/commands.rs` | CL command implementations for a job |
-| `core/src/clpgm.rs` | CL programs: parse/check (CRTBNDCL), expressions (exact decimals), run in the calling job with MONMSG, *DEFINED and *BASED storage, program messages (SNDPGMMSG, RCVMSG, RTVMSG), files (DCLF, RCVF, SNDF, SNDRCVF, CLOSE), RTVSYSVAL |
+| `core/src/clpgm.rs` | CL programs: parse/check (CRTBNDCL), expressions (exact decimals), run in the calling job with MONMSG, *DEFINED and *BASED storage, program messages (SNDPGMMSG, RCVMSG, RTVMSG), files (DCLF, RCVF, SNDF, SNDRCVF, CLOSE), subroutines, parameters by reference, RTVSYSVAL, RTVOBJD, RTVMBRD |
 | `core/src/msgf.rs` | Message files (*MSGF) and message descriptions (`as4tainr.message_descriptions`): CRTMSGF, ADDMSGD, CHGMSGD, RMVMSGD, substitution of message data (&1-&99 by FMT) |
 | `core/src/pgmmsg.rs` | The job's CL call stack (`Job.calls`): program message queues (SNDPGMMSG, RCVMSG), the escape message being raised, file overrides by call level |
 | `core/src/ovr.rs` | File overrides (OVRDBF, OVRPRTF, DLTOVR): which override counts, the file a program opens |

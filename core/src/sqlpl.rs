@@ -58,8 +58,12 @@ pub struct Routine {
     pub returns: Option<String>,
     /// DYNAMIC RESULT SETS.
     pub result_sets: u32,
-    /// The body as written.
+    /// The body as written (empty for an external procedure).
     pub body: String,
+    /// An external procedure: the program it calls (`LIB/PGM`, or a
+    /// name found through the library list), PARAMETER STYLE GENERAL.
+    #[serde(default)]
+    pub external: Option<String>,
 }
 
 // ------------------------------------------------------------ parsing
@@ -856,6 +860,9 @@ pub fn parse_create(sql: &str) -> Result<Option<(bool, Routine)>> {
     let parms = parameters(&mut p, function)?;
     let mut returns = None;
     let mut result_sets = 0;
+    let mut language: Option<String> = None;
+    let mut external: Option<String> = None;
+    let mut style_other: Option<String> = None;
     // Options, in any order, up to the body.
     while let Some(w) = p.word() {
         match w.as_str() {
@@ -870,11 +877,31 @@ pub fn parse_create(sql: &str) -> Result<Option<(bool, Routine)>> {
                 p.i += 1;
                 let l = p.ident()?;
                 if l != "SQL" {
-                    bail!("SQL0084: LANGUAGE {l}: external routines are not supported yet; only SQL routines.");
+                    language = Some(l);
                 }
             }
             "EXTERNAL" if p.ahead(1).as_deref() == Some("NAME") => {
-                bail!("SQL0084: EXTERNAL NAME: external routines are not supported yet; only SQL routines.");
+                p.i += 1;
+                p.expect("NAME")?;
+                p.skip();
+                let n = match p.t.get(p.i).cloned() {
+                    Some(Tok::Str(s)) => {
+                        p.i += 1;
+                        s.to_ascii_uppercase()
+                    }
+                    _ => {
+                        let (l, n) = p.qualified()?;
+                        match l {
+                            Some(l) => format!("{l}/{n}"),
+                            None => n,
+                        }
+                    }
+                };
+                external = Some(n.replace('.', "/"));
+            }
+            "EXTERNAL" if p.ahead(1).as_deref() != Some("ACTION") => {
+                p.i += 1;
+                external = Some(name.clone());
             }
             "SPECIFIC" => {
                 p.i += 1;
@@ -896,7 +923,8 @@ pub fn parse_create(sql: &str) -> Result<Option<(bool, Routine)>> {
             "DETERMINISTIC" | "FENCED" | "AUTONOMOUS" | "SECURED" => p.i += 1,
             "NOT" => {
                 p.i += 1;
-                p.i += 1; // DETERMINISTIC, FENCED, SECURED
+                // DETERMINISTIC, FENCED, SECURED
+                let _ = p.ident()?;
             }
             "MODIFIES" | "READS" => {
                 p.i += 1;
@@ -951,11 +979,18 @@ pub fn parse_create(sql: &str) -> Result<Option<(bool, Routine)>> {
                 let _ = p.ident()?;
             }
             "SET" if p.ahead(1).as_deref() == Some("OPTION") => {
-                p.i += 2;
+                p.i += 1;
+                p.expect("OPTION")?;
                 loop {
                     let _ = p.ident()?;
                     p.expect_punct("=")?;
-                    let _ = p.until(&[], true);
+                    // The value: *WORD, a word, a number or a string.
+                    if p.punct("*") {
+                        let _ = p.ident()?;
+                    } else {
+                        p.skip();
+                        p.i += 1;
+                    }
                     if !p.punct(",") {
                         break;
                     }
@@ -964,7 +999,14 @@ pub fn parse_create(sql: &str) -> Result<Option<(bool, Routine)>> {
             "PARAMETER" => {
                 p.i += 1;
                 p.expect("STYLE")?;
-                let _ = p.ident()?;
+                let style = p.ident()?;
+                if style == "GENERAL" {
+                    if p.eat("WITH") {
+                        p.expect("NULLS")?;
+                    }
+                } else if style != "JAVA" {
+                    style_other = Some(style);
+                }
             }
             "STATEMENT" => {
                 p.i += 1;
@@ -980,6 +1022,29 @@ pub fn parse_create(sql: &str) -> Result<Option<(bool, Routine)>> {
             }
             _ => break,
         }
+    }
+    if let Some(pgm) = external.or_else(|| language.as_ref().map(|_| name.clone())) {
+        if function {
+            bail!("SQL0084: external functions are not supported yet.");
+        }
+        if let Some(st) = style_other {
+            bail!(
+                "SQL0084: PARAMETER STYLE {st} is not supported yet; use PARAMETER STYLE GENERAL."
+            );
+        }
+        return Ok(Some((
+            replace,
+            Routine {
+                library: lib.unwrap_or_default(),
+                name,
+                kind: kind.to_string(),
+                parms,
+                returns,
+                result_sets,
+                body: String::new(),
+                external: Some(pgm),
+            },
+        )));
     }
     finish_create(
         &mut p,
@@ -1025,6 +1090,7 @@ fn finish_create(
             returns,
             result_sets,
             body,
+            external: None,
         },
     )))
 }
@@ -2101,6 +2167,9 @@ pub async fn run_procedure(
             values.len()
         );
     }
+    if let Some(pgm) = &r.external {
+        return call_external(env, r, pgm, values).await;
+    }
     let body = parse_body(&r.body)?;
     let mut run = Run {
         env,
@@ -2154,6 +2223,49 @@ pub async fn run_procedure(
         values,
         result_sets: std::mem::take(&mut run.result_sets),
         status,
+    })
+}
+
+/// An external procedure: CALL of the program, its parameters passed by
+/// reference (PARAMETER STYLE GENERAL); OUT and INOUT parameters are what
+/// the program left in them.
+async fn call_external(
+    env: &Env<'_>,
+    r: &Routine,
+    pgm: &str,
+    values: Vec<Option<String>>,
+) -> Result<CallResult> {
+    let mut args = Vec::new();
+    for (k, p) in r.parms.iter().enumerate() {
+        let v = values.get(k).cloned().flatten();
+        let numeric = is_numeric_type(&p.ty);
+        args.push(match v {
+            Some(v) => v,
+            None if numeric => "0".into(),
+            None => String::new(),
+        });
+    }
+    let environment = crate::commands::Environment {
+        database_url: env.database_url.to_string(),
+    };
+    let mut job = crate::commands::Job {
+        client: env.catalog,
+        env: &environment,
+        user: env.user.to_string(),
+        curlib: env.curlib.clone(),
+        libl: env.libl.to_vec(),
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    job.call_program_boxed(pgm, args.clone())
+        .await
+        .map_err(|e| anyhow!("SQL0443: Procedure {} failed: {e:#}", r.name))?;
+    let back = job.calls.returned.take().unwrap_or(args);
+    Ok(CallResult {
+        values: back.into_iter().map(Some).collect(),
+        result_sets: vec![],
+        status: 0,
     })
 }
 
@@ -2641,6 +2753,19 @@ mod tests {
         assert_eq!(c.vars[0].0, "X");
         assert!(matches!(&c.body[0], Stmt::If(arms, None) if arms.len() == 1));
         assert!(matches!(&c.body[1], Stmt::While(None, _, b) if b.len() == 1));
+        // Options, including SET OPTION and NOT DETERMINISTIC.
+        let (_, o) = parse_create(
+            "CREATE PROCEDURE P2 () LANGUAGE SQL NOT DETERMINISTIC SET OPTION COMMIT = *NONE, DATFMT = *ISO BEGIN END",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(o.external.is_none() && o.body.starts_with("BEGIN"));
+        let (_, x) = parse_create(
+            "CREATE PROCEDURE P3 (INOUT A CHAR(5)) LANGUAGE RPGLE EXTERNAL NAME 'MYLIB/MYPGM' PARAMETER STYLE GENERAL",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(x.external.as_deref(), Some("MYLIB/MYPGM"));
         let (_, f) = parse_create(&st[2]).unwrap().unwrap();
         assert_eq!(f.returns.as_deref(), Some("INT"));
         assert_eq!(

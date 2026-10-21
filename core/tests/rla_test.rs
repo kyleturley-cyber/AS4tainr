@@ -2010,6 +2010,223 @@ UPDATE {lib}.CUSTMAST SET CUSBAL = CUSBAL WHERE CUSNO = 4;"
     assert!(e.starts_with("SQL"), "{e}");
 }
 
+/// Parameters are passed by reference (IBM CL reference, CALL: "the
+/// called program can change the value of a CL variable passed as a
+/// parameter"; ILE RPG Reference, parameters passed by reference): the
+/// caller's variable gets back what the called program left in it,
+/// between CL programs, from CL to RPG and from RPG to CL. A called
+/// program whose character parameter is shorter than the variable passed
+/// changes only its first characters (it shares the variable's storage).
+#[tokio::test]
+async fn parameters_by_reference() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let mut c = runtime::connect_db(&url).await.unwrap();
+    let rpgset = "**FREE
+dcl-pi *n;
+  s char(20);
+  n packed(5:0);
+end-pi;
+s = 'From RPG';
+n = n * 2;
+*inlr = *on;
+";
+    catalog::create_program(&mut c, &lib, "RPGSET", "RPGLE", "", rpgset, true)
+        .await
+        .unwrap();
+    let rpgcall = "**FREE
+dcl-pr clset2 extpgm('CLSET2');
+  s char(10);
+  x packed(5:0);
+end-pr;
+dcl-s v char(10) inz('start');
+dcl-s k packed(5:0) inz(3);
+clset2(v: k);
+dsply (%trim(v) + ' ' + %char(k));
+*inlr = *on;
+";
+    catalog::create_program(&mut c, &lib, "RPGCALLCL", "RPGLE", "", rpgcall, true)
+        .await
+        .unwrap();
+    let clset = "PGM PARM(&S &X &F)
+  DCL &S *CHAR 5
+  DCL &X *DEC (5 0)
+  DCL &F *LGL
+  CHGVAR &S 'HELLO'
+  CHGVAR &X (&X + 41)
+  CHGVAR &F '1'
+ENDPGM";
+    let clset2 = "PGM PARM(&S &X)
+  DCL &S *CHAR 10
+  DCL &X *DEC (5 0)
+  CHGVAR &S 'done'
+  CHGVAR &X (&X * 10)
+ENDPGM";
+    let caller = "PGM
+  DCL &NAME *CHAR 20 VALUE('abcdefghijklmnopqrst')
+  DCL &N *DEC (5 0) VALUE(1)
+  DCL &FLAG *LGL
+  CALL CLSET PARM(&NAME &N &FLAG)
+  SNDPGMMSG MSG(&NAME *CAT '|' *CAT %CHAR(&N) *CAT '|' *CAT &FLAG)
+  CALL RPGSET PARM(&NAME &N)
+  SNDPGMMSG MSG(&NAME *TCAT '|' *CAT %CHAR(&N))
+  CALL RPGCALLCL
+ENDPGM";
+    let m = cl_job_run(
+        &client,
+        &url,
+        &lib,
+        &[("CLSET", clset), ("CLSET2", clset2), ("REFCALLER", caller)],
+        "CALL REFCALLER",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        m,
+        ["HELLOfghijklmnopqrst|42|1", "From RPG|84", "DSPLY  done 30"]
+    );
+    // An external procedure (Db2 for i SQL Reference, CREATE PROCEDURE
+    // (external), PARAMETER STYLE GENERAL): CALL runs the program; INOUT
+    // parameters get what it left in them.
+    let libl = vec![lib.clone()];
+    as4tainr_core::ddl::try_run(
+        &url,
+        "QSECOFR",
+        &libl,
+        Some(lib.clone()),
+        &mut None,
+        &format!(
+            "CREATE PROCEDURE {lib}.SETPROC (INOUT S CHAR(20), INOUT N DECIMAL(5, 0)) \
+             LANGUAGE RPGLE EXTERNAL NAME {lib}/RPGSET PARAMETER STYLE GENERAL"
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    match as4tainr_core::sql::run_as(
+        &client,
+        &url,
+        &libl,
+        "QSECOFR",
+        Some(lib.clone()),
+        "CALL SETPROC('x', 5)",
+    )
+    .await
+    .unwrap()
+    {
+        as4tainr_core::sql::Outcome::Message(m) => {
+            assert_eq!(
+                m,
+                "Procedure SETPROC ran: S = From RPG            , N = 10."
+            )
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// RCVMSG from the caller's program queue (PGMQ(*PRV)) and from a
+/// message queue (MSGQ, WAIT); RTVOBJD and RTVMBRD (IBM CL reference).
+/// RTVOBJD CRTDATE is CYYMMDDHHMMSS (13 characters, C 1 for 20xx);
+/// RTVMBRD NBRCURRCD is the member's number of records (5 in
+/// samples/data/CUSTMAST.csv); an object that is not there is CPF9801;
+/// with no message and WAIT(1), RCVMSG returns blanks after waiting.
+#[tokio::test]
+async fn rcvmsg_queues_rtvobjd_rtvmbrd() {
+    use as4tainr_core::users;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let user = format!("Q{}", &lib[1..]);
+    let _ = users::delete(&client, &user).await;
+    let callee = "PGM
+  DCL &M *CHAR 40
+  RCVMSG PGMQ(*PRV) MSG(&M)
+  SNDPGMMSG MSG('callee got' *BCAT &M)
+ENDPGM";
+    let main = format!(
+        "PGM
+  DCL &M *CHAR 40
+  DCL &L *CHAR 10
+  DCL &A *CHAR 10
+  DCL &O *CHAR 10
+  DCL &D *CHAR 13
+  DCL &N *DEC (10 0)
+  DCL &FA *CHAR 3
+  DCL &FT *CHAR 5
+  DCL &MB *CHAR 10
+  SNDPGMMSG MSG('kept for the callee') TOPGMQ(*SAME)
+  CALL RCVCALLEE
+  CRTUSRPRF {user} PASSWORD(*NONE)
+  SNDMSG MSG('hello queue') TOUSR({user})
+  RCVMSG MSGQ({user}) MSG(&M)
+  SNDPGMMSG MSG('queue gave' *BCAT &M)
+  RCVMSG MSGQ({user}) MSG(&M) WAIT(1)
+  IF COND(&M *EQ ' ') THEN(SNDPGMMSG MSG('queue empty after waiting'))
+  RTVOBJD OBJ(CUSTMAST) OBJTYPE(*FILE) RTNLIB(&L) OBJATR(&A) OWNER(&O) CRTDATE(&D)
+  SNDPGMMSG MSG(&L *BCAT &A *BCAT &O *BCAT %SST(&D 1 1) *BCAT %CHAR(%LEN(%TRIM(&D))))
+  RTVMBRD FILE(CUSTMAST) RTNMBR(&MB) FILEATR(&FA) FILETYPE(&FT) NBRCURRCD(&N)
+  SNDPGMMSG MSG(&MB *BCAT &FA *BCAT &FT *BCAT %CHAR(&N))
+  RTVOBJD OBJ(NOSUCH) OBJTYPE(*PGM) RTNLIB(&L)
+  MONMSG CPF9801 EXEC(SNDPGMMSG MSG('no such object'))
+ENDPGM"
+    );
+    let started = std::time::Instant::now();
+    let m = cl_job_run(
+        &client,
+        &url,
+        &lib,
+        &[("RCVCALLEE", callee), ("RCVMAIN", &main)],
+        "CALL RCVMAIN",
+    )
+    .await
+    .unwrap();
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    // The completion messages of CRTUSRPRF and SNDMSG are not looked at here.
+    let m: Vec<&String> = m
+        .iter()
+        .filter(|l| !l.starts_with("User profile") && !l.starts_with("Message sent"))
+        .collect();
+    assert_eq!(
+        m,
+        [
+            "callee got kept for the callee",
+            "queue gave hello queue",
+            "queue empty after waiting",
+            &format!("{lib} PF QSECOFR 1 13"),
+            "CUSTMAST PF *DATA 5",
+            "no such object",
+        ]
+    );
+    users::delete(&client, &user).await.unwrap();
+
+    // Subroutines (IBM CL reference: SUBR, ENDSUBR, CALLSUBR, RTNSUBR):
+    // after the program's statements; CALLSUBR RTNVAL gets the value of
+    // RTNSUBR or ENDSUBR RTNVAL (0 when none is given).
+    let subr = "PGM
+  DCL &N *DEC (5 0) VALUE(0)
+  DCL &RC *INT 4
+  DCL &RC2 *INT 4 VALUE(7)
+  CALLSUBR SUBR(ADD5)
+  CALLSUBR SUBR(ADD5) RTNVAL(&RC2)
+  CALLSUBR SUBR(CHECK) RTNVAL(&RC)
+  SNDPGMMSG MSG(%CHAR(&N) *BCAT %CHAR(&RC) *BCAT %CHAR(&RC2))
+  CHGVAR &N 0
+  CALLSUBR SUBR(CHECK) RTNVAL(&RC)
+  SNDPGMMSG MSG(%CHAR(&RC))
+  RETURN
+SUBR SUBR(ADD5)
+  CHGVAR &N (&N + 5)
+ENDSUBR
+SUBR SUBR(CHECK)
+  IF COND(&N *GT 5) THEN(RTNSUBR RTNVAL(1))
+ENDSUBR RTNVAL(-1)
+ENDPGM";
+    let m = cl_job_run(&client, &url, &lib, &[("CLSUBR", subr)], "CALL CLSUBR")
+        .await
+        .unwrap();
+    assert_eq!(m, ["10 1 0", "-1"]);
+    assert!(as4tainr_core::clpgm::compile("X", "PGM\n CALLSUBR SUBR(NOPE)\nENDPGM").is_err());
+}
+
 /// CL programs (IBM CL reference): loops with LEAVE and ITERATE, DOUNTIL
 /// running its body at least once, nested DOFOR, variables in command
 /// parameters, CALL between CL programs with parameters.

@@ -77,7 +77,7 @@ Also from the corpus: `*ALLX'..'` figurative constants; prototypes and procedure
 What R5 added, from running the corpus (Nick Litten's examples, `tools/corpus.sh`):
 - **DSPLY with a response** in an interactive job: a Display Program Messages screen with the message and a reply line; the reply goes into the response field (lower case kept). In batch the response stays as it was.
 - **System programs** RPG programs call: `QCMDEXC` (runs a CL command in the job), `QDCXLATE` (EBCDIC/ASCII translation with QTCPASC and QTCPEBC), and the C runtime's `Qp0zLprintf` (printf-style text to the job log).
-- **CALL of a CL program** from RPG, in the same job (parameters go in as values).
+- **CALL of a CL program** from RPG, in the same job (parameters by reference: the values the CL program leaves in them come back).
 - A program that calls itself is refused: RPG programs are not recursive (procedures are).
 - One-line empty interfaces (`dcl-pi *n int(10) end-pi;`).
 

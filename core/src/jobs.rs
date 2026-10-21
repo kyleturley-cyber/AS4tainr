@@ -539,6 +539,58 @@ pub async fn messages(client: &Client, user: &str, mark_old: bool) -> Result<Vec
         .collect())
 }
 
+/// RCVMSG from a message queue: the oldest new message (`msgtype` *ANY,
+/// *FIRST... or a type such as *INFO), removed (`rmv`) or kept as an old
+/// message.
+pub async fn receive_message(
+    client: &Client,
+    msgq: &str,
+    msgtype: &str,
+    rmv: bool,
+) -> Result<Option<Message>> {
+    let (newest, kinds): (bool, Vec<String>) = match msgtype {
+        "*ANY" | "*NEXT" | "*FIRST" => (false, vec![]),
+        "*LAST" => (true, vec![]),
+        t => (false, vec![t.to_string()]),
+    };
+    let row = client
+        .query_opt(
+            &format!(
+                "SELECT id, to_char(sent, 'MM/DD/YY HH24:MI:SS'), from_user, from_job, msgid, kind, text, is_new
+                 FROM as4tainr.messages
+                 WHERE msgq=$1 AND (is_new OR $2) AND (cardinality($3::text[]) = 0 OR kind = ANY($3))
+                 ORDER BY id {} LIMIT 1 FOR UPDATE SKIP LOCKED",
+                if newest { "DESC" } else { "ASC" }
+            ),
+            &[&msgq, &(msgtype == "*FIRST" || msgtype == "*LAST"), &kinds],
+        )
+        .await?;
+    let Some(r) = row else { return Ok(None) };
+    let m = Message {
+        id: r.get(0),
+        sent: r.get(1),
+        from_user: r.get(2),
+        from_job: r.get(3),
+        msgid: r.get(4),
+        kind: r.get(5),
+        text: r.get(6),
+        is_new: r.get(7),
+    };
+    if rmv {
+        client
+            .execute("DELETE FROM as4tainr.messages WHERE id=$1", &[&m.id])
+            .await?;
+    } else {
+        client
+            .execute(
+                "UPDATE as4tainr.messages SET is_new=false WHERE id=$1",
+                &[&m.id],
+            )
+            .await?;
+    }
+    Ok(Some(m))
+}
+
 /// Number of new messages waiting on a user's queue.
 pub async fn new_messages(client: &Client, user: &str) -> Result<i64> {
     Ok(client

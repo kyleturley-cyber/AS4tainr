@@ -2312,6 +2312,164 @@ printf('printed' + x'25');
     assert_eq!(r.messages, ["1 ab", "printed"]);
 }
 
+/// IBM i SQL services (Db2 for i SQL Reference, catalog views; IBM i
+/// services, OBJECT_STATISTICS) and table functions (CREATE FUNCTION (SQL
+/// table), table-reference TABLE(function)). Code values from those pages:
+/// SYSTABLES TABLE_TYPE T table, P physical file, V view, L logical file,
+/// FILE_TYPE D data; SYSCOLUMNS IS_NULLABLE Y/N, HAS_DEFAULT Y/N, DECIMAL
+/// STORAGE (precision/2)+1; SYSINDEXES IS_UNIQUE D duplicates allowed;
+/// SYSKEYS ORDERING A/D.
+#[tokio::test]
+async fn sql_catalog_views_and_table_functions() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let script = format!(
+        "CREATE TABLE {lib}.ITEMS (ID INTEGER NOT NULL, NAME VARCHAR(20), PRICE DECIMAL(7, 2) NOT NULL DEFAULT 0);
+CREATE INDEX {lib}.ITEMSIX ON {lib}.ITEMS (PRICE DESC, ID);
+CREATE VIEW {lib}.CHEAP AS SELECT ID, NAME FROM {lib}.ITEMS WHERE PRICE < 10;
+CREATE FUNCTION {lib}.OWES (MINBAL DECIMAL(9, 2)) RETURNS TABLE (NO DECIMAL(5, 0), NAME CHAR(30))
+  LANGUAGE SQL READS SQL DATA RETURN SELECT CUSNO, CUSNAM FROM {lib}.CUSTMAST WHERE CUSBAL > MINBAL;
+CREATE TABLE {lib}.OBJS AS (SELECT OBJNAME, OBJTYPE, CURRENT TIMESTAMP AS TS FROM TABLE (QSYS2.OBJECT_STATISTICS(
+  OBJECT_SCHEMA => '{lib}', OBJTYPELIST => '*ALL')) AS S) WITH DATA;"
+    );
+    let lines = job
+        .run_sql_script(&script, "services script", 0, None, true)
+        .await
+        .unwrap();
+    assert!(lines.last().unwrap().contains("0 with errors"), "{lines:?}");
+    let rows = |sql: String| {
+        let client = &client;
+        let url = url.clone();
+        let lib = lib.clone();
+        async move {
+            match as4tainr_core::sql::run(client, &url, &[lib], &sql)
+                .await
+                .unwrap()
+            {
+                as4tainr_core::sql::Outcome::Rows { rows, .. } => rows
+                    .into_iter()
+                    .map(|r| r.iter().map(|v| v.trim()).collect::<Vec<_>>().join("|"))
+                    .collect::<Vec<_>>(),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    };
+    assert_eq!(
+        rows(format!(
+            "SELECT TABLE_NAME, TABLE_TYPE, FILE_TYPE, COLUMN_COUNT FROM QSYS2.SYSTABLES
+              WHERE TABLE_SCHEMA = '{lib}' AND TABLE_NAME IN ('CHEAP', 'CUSTMAST', 'ITEMS', 'ITEMSIX')
+              ORDER BY TABLE_NAME"
+        ))
+        .await,
+        ["CHEAP|V|D|2", "CUSTMAST|P|D|4", "ITEMS|T|D|3"]
+    );
+    assert_eq!(
+        rows(format!(
+            "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, HAS_DEFAULT FROM QSYS2.SYSCOLUMNS
+              WHERE TABLE_SCHEMA = '{lib}' AND TABLE_NAME = 'ITEMS' ORDER BY ORDINAL_POSITION"
+        ))
+        .await,
+        ["ID|INTEGER|N|N", "NAME|VARCHAR|Y|Y", "PRICE|DECIMAL|N|Y"]
+    );
+    assert_eq!(
+        rows(format!(
+            "SELECT LENGTH, NUMERIC_SCALE, STORAGE FROM QSYS2.SYSCOLUMNS
+              WHERE TABLE_SCHEMA = '{lib}' AND TABLE_NAME = 'ITEMS' AND COLUMN_NAME = 'PRICE'"
+        ))
+        .await,
+        ["7|2|4"]
+    );
+    assert_eq!(
+        rows(format!(
+            "SELECT I.INDEX_NAME, I.TABLE_NAME, I.IS_UNIQUE, I.COLUMN_COUNT, K.COLUMN_NAME, K.ORDERING
+               FROM QSYS2.SYSINDEXES I JOIN QSYS2.SYSKEYS K
+                 ON K.INDEX_SCHEMA = I.INDEX_SCHEMA AND K.INDEX_NAME = I.INDEX_NAME
+              WHERE I.INDEX_SCHEMA = '{lib}' ORDER BY K.ORDINAL_POSITION"
+        ))
+        .await,
+        ["ITEMSIX|ITEMS|D|2|PRICE|D", "ITEMSIX|ITEMS|D|2|ID|A"]
+    );
+    assert_eq!(
+        rows(format!(
+            "SELECT TABLE_NAME FROM QSYS2.SYSVIEWS WHERE TABLE_SCHEMA = '{lib}'"
+        ))
+        .await,
+        ["CHEAP"]
+    );
+    assert_eq!(
+        rows(format!(
+            "SELECT SCHEMA_NAME FROM QSYS2.SYSSCHEMAS WHERE SCHEMA_NAME = '{lib}'"
+        ))
+        .await,
+        std::slice::from_ref(&lib)
+    );
+    // OBJECT_STATISTICS: by library and generic name, with named
+    // parameters, and through the library list.
+    assert_eq!(
+        rows(format!(
+            "SELECT OBJNAME, OBJTYPE, OBJATTRIBUTE, SQL_OBJECT_TYPE
+               FROM TABLE(QSYS2.OBJECT_STATISTICS('{lib}', '*FILE', 'ITEM*')) AS X ORDER BY OBJNAME"
+        ))
+        .await,
+        ["ITEMS|*FILE|PF|TABLE", "ITEMSIX|*FILE|LF|INDEX"]
+    );
+    assert_eq!(
+        rows(
+            "SELECT OBJLIB, OBJNAME FROM TABLE(QSYS2.OBJECT_STATISTICS(OBJECT_SCHEMA => '*LIBL',
+               OBJTYPELIST => 'FILE', OBJECT_NAME => 'CHEAP')) X"
+                .to_string()
+        )
+        .await,
+        [format!("{lib}|CHEAP")]
+    );
+    // CURRENT TIMESTAMP is a TIMESTAMP (Db2 for i SQL Reference, special
+    // registers).
+    assert_eq!(
+        rows(format!(
+            "SELECT DATA_TYPE FROM QSYS2.SYSCOLUMNS
+              WHERE TABLE_SCHEMA = '{lib}' AND TABLE_NAME = 'OBJS' AND COLUMN_NAME = 'TS'"
+        ))
+        .await,
+        ["TIMESTMP"]
+    );
+    assert!(!rows(format!(
+        "SELECT * FROM {lib}.OBJS WHERE OBJNAME = 'CUSTMAST'"
+    ))
+    .await
+    .is_empty());
+    // The table function: balances above zero are customers 1, 2 and 4
+    // (samples/data/CUSTMAST.csv), and it takes a correlated argument.
+    assert_eq!(
+        rows(format!(
+            "SELECT NO FROM TABLE({lib}.OWES(0)) AS O ORDER BY NO"
+        ))
+        .await,
+        ["1", "2", "4"]
+    );
+    assert_eq!(
+        rows(format!(
+            "SELECT C.CUSNO, O.NO FROM {lib}.CUSTMAST C, TABLE(OWES(C.CUSBAL - 1)) AS O
+              WHERE C.CUSNO = 1 AND O.NO = 1"
+        ))
+        .await,
+        ["1|1"]
+    );
+}
+
 /// CL programs (IBM CL reference): loops with LEAVE and ITERATE, DOUNTIL
 /// running its body at least once, nested DOFOR, variables in command
 /// parameters, CALL between CL programs with parameters.

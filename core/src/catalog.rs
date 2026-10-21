@@ -105,6 +105,12 @@ BEGIN
       ADD COLUMN IF NOT EXISTS null_capable boolean NOT NULL DEFAULT false,
       ADD COLUMN IF NOT EXISTS dft text;
   END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='files' AND column_name='sql_type') THEN
+    -- TABLE or INDEX for files made by SQL CREATE TABLE / CREATE INDEX
+    -- (views are files with `view`); null for files made from DDS.
+    ALTER TABLE as4tainr.files ADD COLUMN IF NOT EXISTS sql_type text;
+  END IF;
 END $$;
 "#;
 
@@ -1317,6 +1323,23 @@ pub async fn set_sql_name(
     Ok(())
 }
 
+/// Mark a file as made by SQL (`TABLE` or `INDEX`), for the catalog
+/// views (QSYS2.SYSTABLES: table type T rather than P).
+pub async fn set_sql_type(
+    client: &Client,
+    library: &str,
+    name: &str,
+    sql_type: &str,
+) -> Result<()> {
+    client
+        .execute(
+            "UPDATE as4tainr.files SET sql_type=$3 WHERE library=$1 AND name=$2",
+            &[&library, &name, &sql_type],
+        )
+        .await?;
+    Ok(())
+}
+
 /// A file found by its system name or its SQL name (SQL statements).
 pub async fn resolve_sql_file(client: &Client, libl: &[String], name: &str) -> Result<FileRef> {
     let (libs, n) = match name.split_once('/') {
@@ -1498,8 +1521,13 @@ pub fn fields_of_columns(cols: &[tokio_postgres::Row]) -> Result<(Vec<FieldDef>,
             "double precision" => (DataType::Float, 17, 0, false),
             "bytea" => (DataType::Hex, 32740, 0, true),
             "date" => (DataType::Date, 10, 0, false),
-            "time without time zone" => (DataType::Time, 8, 0, false),
-            "timestamp without time zone" => (DataType::Timestamp, 26, 0, false),
+            // Db2 has no time zone types: CURRENT TIME and CURRENT
+            // TIMESTAMP are TIME and TIMESTAMP (PostgreSQL's are with time
+            // zone).
+            "time without time zone" | "time with time zone" => (DataType::Time, 8, 0, false),
+            "timestamp without time zone" | "timestamp with time zone" => {
+                (DataType::Timestamp, 26, 0, false)
+            }
             "boolean" => (DataType::Boolean, 1, 0, false),
             other => bail!("SQL0084: a column of type {other} ({col}) is not supported yet."),
         };

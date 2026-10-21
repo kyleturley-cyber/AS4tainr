@@ -37,6 +37,7 @@ Written from the Db2 for i SQL Reference (CREATE PROCEDURE (SQL), CREATE FUNCTIO
 | --- | --- |
 | `CREATE [OR REPLACE] PROCEDURE name ([IN\|OUT\|INOUT] p type [DEFAULT x], ...) options body` | Options: LANGUAGE SQL, SPECIFIC, [NOT] DETERMINISTIC, MODIFIES/READS SQL DATA, CONTAINS SQL, DYNAMIC RESULT SETS n, COMMIT ON RETURN, SET OPTION, PROGRAM TYPE, and the other options Db2 for i takes (accepted). The body is one statement, usually `BEGIN ... END` |
 | `CREATE [OR REPLACE] FUNCTION name (p type, ...) RETURNS type options body` | Scalar functions: `RETURN expression`, or `BEGIN ... END` with DECLARE, SET, IF, CASE, WHILE, REPEAT, LOOP, LEAVE, ITERATE, SELECT INTO, VALUES INTO, SIGNAL and RETURN. Used in any statement like a built-in function |
+| `CREATE [OR REPLACE] FUNCTION name (p type, ...) RETURNS TABLE (c type, ...) options RETURN fullselect` | A table function: its rows are the query's, with the parameters' values, cast to the declared column types (SQL0117 if the number of columns differs). Used as `TABLE(name(arguments)) AS x` in a FROM clause; arguments may name columns of tables to its left |
 | `CALL name (arguments)` | From STRSQL, RUNSQL, RUNSQLSTM, `as4tainr sql`, embedded SQL (host variables receive OUT and INOUT parameters) and from other procedures. `?` (or any argument) for an OUT parameter, `DEFAULT` for a parameter's default; parameters left out at the end take their defaults. STRSQL shows a procedure's first result set, or its OUT parameters |
 | `CREATE PROCEDURE name (...) LANGUAGE RPGLE\|CL\|... EXTERNAL NAME lib/pgm PARAMETER STYLE GENERAL` | An external procedure: CALL calls the program with the parameters by reference; OUT and INOUT parameters are what the program left in them |
 | `DROP PROCEDURE\|FUNCTION [IF EXISTS] name` | |
@@ -83,7 +84,22 @@ Written from the Db2 for i SQL Reference. A table is a physical file and an inde
 
 New objects go to the library named, else the default schema, else the current library, else QGPL (system naming). Names can be SQL names of up to 128 characters. An SQL name that is not a valid system name (longer than 10 characters) gets a system name, as Db2 for i gives one: its first five characters and a five-digit number unique in the library (a table COUNTRY_LIST is COUNT00001) or in the table for a column (COUNTRY_CODE is COUNT00001, COUNTRY_NAME COUNT00002), unless FOR SYSTEM NAME or FOR COLUMN names it. CL commands (DSPPFM, DLTF, CRTLF PFILE) and RPG use the system names; SQL statements use the SQL names, and the table's system name too. An RPG program uses the SQL column names with the ALIAS keyword on the file or on an EXTNAME data structure. Tables get the owner and authorities CRTPF gives a file; DROP needs *ALL authority to the file (SQL0551).
 
-The statements are parsed by as4tainr and the PostgreSQL objects built from the parsed description; no part of the statement text is passed on. Procedures and functions are described above. Not supported yet: quoted names with lower case or special characters, several ALTER TABLE actions in one statement, ADD COLUMN ... BEFORE, generated columns other than identity columns, FOREIGN KEY, the other data types (ROWID, DATALINK, arrays), external functions, table functions, triggers and sequences. See fidelity-gaps.md.
+The statements are parsed by as4tainr and the PostgreSQL objects built from the parsed description; no part of the statement text is passed on. Procedures and functions are described above. Not supported yet: quoted names with lower case or special characters, several ALTER TABLE actions in one statement, ADD COLUMN ... BEFORE, generated columns other than identity columns, FOREIGN KEY, the other data types (ROWID, DATALINK, arrays), external functions, table functions with a compound body, triggers and sequences. See fidelity-gaps.md.
+
+## IBM i services
+
+Written from the Db2 for i SQL Reference (catalog views) and the IBM i services reference. The catalog views are in QSYS2, so they are found through the system part of the library list or by their qualified names; column names, order and code values are IBM's.
+
+| View or function | What it shows |
+| --- | --- |
+| `QSYS2.SYSSCHEMAS` | One row per library: name, owner, creation time, size, text |
+| `QSYS2.SYSTABLES` | Tables (TABLE_TYPE `T`), physical files (`P`), views (`V`) and logical files (`L`), with source files as FILE_TYPE `S`: names (SQL and system), owner, column count, row length, text |
+| `QSYS2.SYSCOLUMNS` | Their columns: SQL data type (CHAR, VARCHAR, DECIMAL, NUMERIC, SMALLINT, INTEGER, BIGINT, FLOAT, DATE, TIME, TIMESTMP, GRAPHIC, VARG, BINARY, VARBIN, CLOB, BLOB, DBCLOB, DECFLOAT, BOOLEAN, XML), length, scale, precision, nullability, default, storage, identity columns, column text |
+| `QSYS2.SYSINDEXES`, `QSYS2.SYSKEYS` | Indexes made by CREATE INDEX (IS_UNIQUE `U` or `D`) and their key columns (ORDERING `A` or `D`) |
+| `QSYS2.SYSVIEWS` | Views and their queries |
+| `TABLE(QSYS2.OBJECT_STATISTICS(schema, types [, name]))` | Objects in a library, or in `*LIBL`, `*USRLIBL`, `*CURLIB`, `*ALL`, `*ALLUSR`, `*ALLSIMPLE`; types like `'*FILE *PGM'`, `'FILE'` or `'*ALL'`; a name, a generic name (`CUST*`) or `*ALLSIMPLE`. Positional or named parameters (`OBJECT_SCHEMA =>`, `OBJTYPELIST =>`, `OBJECT_NAME =>`). All 69 of IBM's columns: name, type, attribute, owner, creation time, size, text, long name, SQL object type; what as4tainr does not keep (usage, save and journal information, compiler) is null or "NO" |
+
+The views are PostgreSQL views owned by the catalog user: the SQL login reads them without being able to read the catalog itself.
 
 ## Security
 
@@ -93,4 +109,4 @@ User SQL never runs as the database user as4tainr itself uses. `as4tainr init` c
 
 ## Not supported yet
 
-The data definition listed above as not supported yet, the QSYS2 catalog views, `SELECT *` in `INSERT ... SELECT` (it includes the record number; list the columns), DB2-only scalar functions beyond the ones above, and special registers other than the dates and times. Object authority is not checked: anyone who can sign on can read and change every file with SQL, as with record-level access. See [fidelity-gaps.md](fidelity-gaps.md).
+The data definition listed above as not supported yet, catalog views other than those above (SYSROUTINES, SYSPARMS, SYSCST and the others) and other IBM i services, `SELECT *` in `INSERT ... SELECT` (it includes the record number; list the columns), DB2-only scalar functions beyond the ones above, and special registers other than the dates and times. Object authority is not checked: anyone who can sign on can read and change every file with SQL, as with record-level access. See [fidelity-gaps.md](fidelity-gaps.md).

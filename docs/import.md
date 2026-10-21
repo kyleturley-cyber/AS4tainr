@@ -74,10 +74,10 @@ CALL CONTACTS
 
 On Oct 21, 2026 the corpus builds 42 programs (49 objects with its 4 modules and 3 service programs) and 6 commands. Most of what still fails would fail on IBM i too:
 
-- SQL scripts that run SELECT in RUNSQLSTM (SIMPLESHOW, SORTSFLPF, WEBSQLSMP, FATQPFRA, FATQPFRB; the last two also use `CHAR(n, '999,999,999')`), drop tables that do not exist (FOODFILE, FILEIN, FILEOUT) or name a schema that is not there (LSTLIB).
+- SQL scripts that run SELECT in RUNSQLSTM (SIMPLESHOW, SORTSFLPF, WEBSQLSMP, FATQPFRA, FATQPFRB; these two now run everything else, including CREATE TABLE AS over QSYS2.OBJECT_STATISTICS), drop tables that do not exist (FOODFILE, FILEIN, FILEOUT) or name a schema that is not there (LSTLIB).
 - Build files and sources that do not match: BIGFATSRV's Rules.mk names a module that is not in the repository, so LOGMESSAGE is missing for SORTSFLBOB, SORTSFLVSC and UPDIASPSQL; members include files (QTXTSRC, IFS paths) that are not in the repository; STOREPRCR and SFLSNIP2 need files (EMPLO00001, CUSTOMER) the repository does not create; LSTLIBSIMP and UPDIASP declare outfiles that only exist after the program has run once.
 - Sources that do not compile: a missing parenthesis (IFSREAD), fixed-form specifications or PLIST inside `**FREE` (FREERPG1-3), a comment in factor 2 (SFLSNIP1), RPG III input specifications in an RPG IV member (LEGACYRPG), a prototype without an implementation (PWDEXPILE), LIKEDS of another procedure's local data structure (JSNIFSSQL2), and WRITEIFS2, whose include `modern/ifsio_h.rpgleinc` has no `**FREE` line, so it is column-limited, yet starts its statements in column 7 (columns 6 and 7 must be blank).
 
-What as4tainr still lacks for the rest: the C runtime and IFS procedures (open, read, write, close) and pointers to call them (JSNIFSSQL1), DATALINK, ROWID, arrays and generated expression columns (ALLTABLE), and table functions such as QSYS2.OBJECT_STATISTICS.
+What as4tainr still lacks for the rest: the C runtime and IFS procedures (open, read, write, close) and pointers to call them (JSNIFSSQL1), and DATALINK, ROWID, arrays and generated expression columns (ALLTABLE).
 
 See [fidelity-gaps.md](fidelity-gaps.md).

@@ -76,6 +76,7 @@ pub async fn init(client: &Client) -> Result<()> {
     for lib in catalog::list_libraries(client).await? {
         grant_library(client, &lib).await?;
     }
+    crate::services::init(client).await?;
     Ok(())
 }
 
@@ -218,6 +219,29 @@ fn render(toks: &[Tok]) -> String {
         .collect()
 }
 
+/// Replace unqualified names (variables, parameters) by expressions,
+/// e.g. to find out a routine query's result columns without its
+/// parameters' values.
+pub(crate) fn substitute_names(sql: &str, names: &[(String, String)]) -> Result<String> {
+    let toks = tokenize(sql)?;
+    let mut out = Vec::with_capacity(toks.len());
+    for (i, t) in toks.iter().enumerate() {
+        let dot = |j: Option<&Tok>| matches!(j, Some(Tok::Punct(p)) if p == ".");
+        if let Some(w) = word(t) {
+            let qualified = dot(i.checked_sub(1).and_then(|j| toks.get(j))) || dot(toks.get(i + 1));
+            if let Some((_, e)) = names
+                .iter()
+                .find(|(n, _)| !qualified && n.eq_ignore_ascii_case(&w))
+            {
+                out.push(Tok::Punct(e.clone()));
+                continue;
+            }
+        }
+        out.push(t.clone());
+    }
+    Ok(render(&out))
+}
+
 /// What kind of statement it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -286,6 +310,7 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
     for t in &toks {
         if let Some(w) = word(t) {
             if w == "AS4TAINR"
+                || w == "AS4TAINR_SVC"
                 || w.starts_with("PG_")
                 || w == "INFORMATION_SCHEMA"
                 || w == "SET_CONFIG"
@@ -302,7 +327,13 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
     let next_non_space = |toks: &[Tok], from: usize| -> Option<usize> {
         (from..toks.len()).find(|&j| !matches!(toks[j], Tok::Space(_)))
     };
+    // Closing parentheses of TABLE(...) table references, left out.
+    let mut skip_close: Vec<usize> = Vec::new();
     while i < toks.len() {
+        if skip_close.contains(&i) {
+            i += 1;
+            continue;
+        }
         let t = &toks[i];
         let w = word(t);
         // System naming: LIB/FILE, written without blanks.
@@ -366,6 +397,39 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
                         if po == "(" && pc == ")" {
                             out.push(Tok::Word(format!("{nm}.rrn")));
                             i = c + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            Some("TABLE") => {
+                // A table function reference: FROM TABLE(f(args)) AS x
+                // (Db2 for i SQL Reference, table-reference) is f(args) AS
+                // x in PostgreSQL.
+                let prev = out
+                    .iter()
+                    .rev()
+                    .find(|t| !matches!(t, Tok::Space(_)))
+                    .cloned();
+                let in_from = match &prev {
+                    Some(Tok::Punct(p)) => p.trim() == ",",
+                    Some(t) => matches!(word(t).as_deref(), Some("FROM" | "JOIN" | "LATERAL")),
+                    None => false,
+                };
+                if let Some(o) = next_non_space(&toks, i + 1).filter(|_| in_from) {
+                    if toks[o] == Tok::Punct("(".into()) {
+                        let mut depth = 0i32;
+                        let close = (o..toks.len()).find(|&j| {
+                            match &toks[j] {
+                                Tok::Punct(p) if p == "(" => depth += 1,
+                                Tok::Punct(p) if p == ")" => depth -= 1,
+                                _ => {}
+                            }
+                            depth == 0
+                        });
+                        if let Some(c) = close {
+                            skip_close.push(c);
+                            i = o + 1;
                             continue;
                         }
                     }
@@ -939,6 +1003,16 @@ mod tests {
         assert_eq!(
             tr("select ucase(cusnam) from t").sql,
             "select UPPER(cusnam) from t"
+        );
+        // Db2 for i SQL Reference, table-reference: TABLE(function) with a
+        // correlation name; in PostgreSQL the call itself is the table.
+        assert_eq!(
+            tr("select x.objname from table (qsys2.object_statistics('A', '*PGM')) as x, t").sql,
+            "select x.objname from qsys2.object_statistics('A', '*PGM') as x, t"
+        );
+        assert_eq!(
+            tr("select * from t join table(f(t.a, (1))) x on 1 = 1").sql,
+            "select * from t join f(t.a, (1)) x on 1 = 1"
         );
         let t = tr("select rrn(c), cusnam from custmast c");
         assert_eq!(t.sql, "select c.rrn, cusnam from custmast c");

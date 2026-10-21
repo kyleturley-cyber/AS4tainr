@@ -868,10 +868,24 @@ pub fn parse_create(sql: &str) -> Result<Option<(bool, Routine)>> {
         match w.as_str() {
             "RETURNS" if function => {
                 p.i += 1;
-                if p.word().as_deref() == Some("TABLE") {
-                    bail!("SQL0084: table functions are not supported yet.");
+                if p.eat("TABLE") {
+                    // RETURNS TABLE (column type, ...): a table function,
+                    // kept as TABLE(column type, ...).
+                    p.expect_punct("(")?;
+                    let mut cols = Vec::new();
+                    loop {
+                        let c = p.ident()?;
+                        let t = data_type_text(&mut p)?;
+                        cols.push(format!("{c} {t}"));
+                        if !p.punct(",") {
+                            break;
+                        }
+                    }
+                    p.expect_punct(")")?;
+                    returns = Some(format!("TABLE({})", cols.join(", ")));
+                } else {
+                    returns = Some(data_type_text(&mut p)?);
                 }
-                returns = Some(data_type_text(&mut p)?);
             }
             "LANGUAGE" => {
                 p.i += 1;
@@ -2699,6 +2713,15 @@ async fn define_function(
         libraries: catalog::list_libraries(catalog).await?,
         out: String::new(),
     };
+    if let Some(cols) = r
+        .returns
+        .as_deref()
+        .and_then(|t| t.strip_prefix("TABLE("))
+        .and_then(|t| t.strip_suffix(')'))
+    {
+        return define_table_function(catalog, database_url, libl, r, replace, &g, cols, &body)
+            .await;
+    }
     let ret = pg_type(r.returns.as_deref().unwrap_or("INTEGER"))?;
     let (language, code) = match &body {
         Stmt::Return(Some(e)) => ("sql", format!("SELECT CAST({} AS {ret})", g.expr(e)?)),
@@ -2727,6 +2750,100 @@ async fn define_function(
         ident(&r.library),
         ident(&r.name),
         params.join(", ")
+    );
+    crate::sql::define_as_sql_role(catalog, database_url, libl, &r.library, &text).await
+}
+
+/// A table function (RETURNS TABLE): its body is RETURN fullselect (Db2 for
+/// i SQL Reference, CREATE FUNCTION (SQL table)); in PostgreSQL an SQL
+/// function returning a table whose columns are cast to the declared
+/// types. It is called as TABLE(f(...)) in a FROM clause.
+#[allow(clippy::too_many_arguments)]
+async fn define_table_function(
+    catalog: &Client,
+    database_url: &str,
+    libl: &[String],
+    r: &Routine,
+    replace: bool,
+    g: &FnGen,
+    cols: &str,
+    body: &Stmt,
+) -> Result<()> {
+    let Stmt::Return(Some(q)) = body else {
+        bail!("SQL0084: a table function's body must be RETURN fullselect yet.");
+    };
+    // The column definitions, split at commas outside parentheses.
+    let mut defs = Vec::new();
+    let (mut depth, mut cur) = (0i32, String::new());
+    for c in cols.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                defs.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    defs.push(cur);
+    let mut out_cols = Vec::new();
+    let mut types = Vec::new();
+    for d in &defs {
+        let d = d.trim();
+        let (n, t) = d.split_once(' ').unwrap_or((d, "INTEGER"));
+        let t = pg_type(t.trim())?;
+        out_cols.push(format!("{} {t}", pg_name(n)?));
+        types.push(t);
+    }
+    let mut q = q.trim();
+    while q.starts_with('(') && q.ends_with(')') {
+        q = q[1..q.len() - 1].trim();
+    }
+    let t = crate::sql::translate(q, &g.is_library())?;
+    // The query's result columns (without the relative record number),
+    // found with the parameters as typed null values.
+    let probe_names: Vec<(String, String)> = r
+        .parms
+        .iter()
+        .map(|p| Ok((p.name.clone(), format!("CAST(NULL AS {})", pg_type(&p.ty)?))))
+        .collect::<Result<_>>()?;
+    let probe = crate::sql::substitute_names(q, &probe_names)?;
+    let fields = crate::sql::query_fields(catalog, database_url, libl, &probe).await?;
+    if fields.len() != defs.len() {
+        bail!(
+            "SQL0117: the query has {} columns and RETURNS TABLE {}.",
+            fields.len(),
+            defs.len()
+        );
+    }
+    let casts: Vec<String> = fields
+        .iter()
+        .zip(&types)
+        .map(|(f, t)| format!("CAST(as4tainr_q.{} AS {t})", ident(&f.name)))
+        .collect();
+    let code = format!(
+        "SELECT {} FROM ({}) AS as4tainr_q",
+        casts.join(", "),
+        t.sql.trim().trim_end_matches(';')
+    );
+    let params: Vec<String> = r
+        .parms
+        .iter()
+        .map(|p| Ok(format!("{} {}", pg_name(&p.name)?, pg_type(&p.ty)?)))
+        .collect::<Result<_>>()?;
+    let mut tag = String::from("as4tainr_body");
+    while code.contains(&format!("${tag}$")) {
+        tag.push('x');
+    }
+    let text = format!(
+        "CREATE {}FUNCTION {}.{}({}) RETURNS TABLE ({}) LANGUAGE sql STABLE AS ${tag}${code}${tag}$",
+        if replace { "OR REPLACE " } else { "" },
+        ident(&r.library),
+        ident(&r.name),
+        params.join(", "),
+        out_cols.join(", ")
     );
     crate::sql::define_as_sql_role(catalog, database_url, libl, &r.library, &text).await
 }

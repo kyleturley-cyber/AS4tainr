@@ -38,6 +38,7 @@ pub mod prtf;
 pub mod rla;
 pub mod rpg;
 pub mod runtime;
+pub mod services;
 pub mod source;
 pub mod spool;
 pub mod sql;

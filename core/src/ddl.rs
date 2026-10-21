@@ -1800,6 +1800,7 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
                 return Err(e);
             }
             authority::set_owner(ctx.client, &lib, &sys, "*FILE", ctx.user).await?;
+            catalog::set_sql_type(ctx.client, &lib, &sys, "TABLE").await?;
             Ok(if sys == name.name {
                 format!("Table {sys} created in {lib}.")
             } else {
@@ -1862,6 +1863,7 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
                 catalog::set_sql_name(ctx.client, &lib, &sys, &name.name, false).await?;
             }
             authority::set_owner(ctx.client, &lib, &sys, "*FILE", ctx.user).await?;
+            catalog::set_sql_type(ctx.client, &lib, &sys, "INDEX").await?;
             Ok(format!(
                 "Index {} created in {lib} over {tlib}/{tsys}{}.",
                 name.name,

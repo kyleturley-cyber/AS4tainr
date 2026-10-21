@@ -25,6 +25,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/rla.rs` | Record-level access: cursor position per open file, keyset queries ordered by (keys, rrn), record locks (advisory locks on the physical file + rrn) |
 | `core/src/sqlpl.rs` | SQL procedures and functions (SQL PL): CREATE PROCEDURE/FUNCTION parsed into statements (`as4tainr.routines`); procedures run here statement by statement (handlers, cursors, loops, SIGNAL, GET DIAGNOSTICS), functions written as PostgreSQL functions; CALL |
 | `core/src/cmtctl.rs` | Commitment control: commitment definitions per job and activation group (one PostgreSQL session with a transaction each), STRCMTCTL/ENDCMTCTL, COMMIT/ROLLBACK, the job's end |
+| `core/src/services.rs` | IBM i services for SQL: the QSYS2 catalog views (SYSTABLES, SYSCOLUMNS...) and OBJECT_STATISTICS, as PostgreSQL views and functions over the catalog (made again when `VERSION` changes) |
 | `core/src/sql.rs` | SQL in the DB2 for i dialect: translation to PostgreSQL, run on a separate connection as the restricted `as4tainr_sql` login |
 | `core/src/runtime.rs` | What a running program shares with its job: database sessions (`connect_db`, `job_session`: application name and record wait), the display channel (`DisplayRequest`) |
 | `core/src/dspf.rs` | DDS display files: parser, drawing a record on a 5250 screen, input validation, response indicators |

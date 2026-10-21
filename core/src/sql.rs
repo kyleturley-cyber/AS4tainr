@@ -267,7 +267,7 @@ pub struct Translated {
 /// Translate one DB2 for i statement. `is_library` says whether a name is
 /// a library, for system naming (`LIB/FILE`).
 pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Translated> {
-    let mut toks = tokenize(sql.trim())?;
+    let mut toks = crate::sqljson::rewrite(tokenize(sql.trim())?)?;
     // One statement: a trailing ';' is allowed, no other.
     while matches!(toks.last(), Some(Tok::Space(_))) {
         toks.pop();
@@ -646,7 +646,25 @@ pub async fn run(
     libl: &[String],
     sql: &str,
 ) -> Result<Outcome> {
-    run_as(client, database_url, libl, "QSECOFR", None, sql).await
+    run_as(client, database_url, libl, "QSECOFR", None, None, sql).await
+}
+
+/// The job a statement runs for, as the IBM i services see it (the
+/// session settings `as4tainr.user`, `as4tainr.curlib`, `as4tainr.job`:
+/// set by as4tainr, never by user SQL, which cannot run SET).
+pub(crate) fn context_sql(user: &str, curlib: Option<&str>, job: Option<&str>) -> String {
+    context_sql_in(user, curlib, job, false)
+}
+
+/// `context_sql`, for the transaction only (`local`) or the session.
+fn context_sql_in(user: &str, curlib: Option<&str>, job: Option<&str>, local: bool) -> String {
+    let q = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    format!(
+        "SELECT set_config('as4tainr.user', {u}, {local}), set_config('as4tainr.curlib', {c}, {local}), set_config('as4tainr.job', {j}, {local})",
+        u = q(user),
+        c = q(curlib.unwrap_or("")),
+        j = q(job.unwrap_or(""))
+    )
 }
 
 /// `run` for a user (data definition in SQL procedures is done for them)
@@ -658,11 +676,14 @@ pub async fn run_as(
     libl: &[String],
     user: &str,
     curlib: Option<String>,
+    job: Option<String>,
     sql: &str,
 ) -> Result<Outcome> {
+    let context = context_sql(user, curlib.as_deref(), job.as_deref());
     // A dynamic compound statement (BEGIN ... END).
     if crate::sqlpl::is_compound(sql) {
         let session = Session::open(client, database_url, libl).await?;
+        session.client.batch_execute(&context).await?;
         let env = crate::sqlpl::Env {
             session: &session,
             catalog: client,
@@ -677,6 +698,7 @@ pub async fn run_as(
     }
     if let Some((name, args)) = crate::sqlpl::parse_call(sql)? {
         let session = Session::open(client, database_url, libl).await?;
+        session.client.batch_execute(&context).await?;
         let env = crate::sqlpl::Env {
             session: &session,
             catalog: client,
@@ -737,6 +759,7 @@ pub async fn run_as(
     // One transaction per statement (COMMIT(*NONE)), on a connection of
     // its own as the SQL role.
     let sql_client = connect_as_sql_role(client, database_url).await?;
+    sql_client.batch_execute(&context).await?;
     sql_client.batch_execute("BEGIN").await?;
     let result = run_in_transaction(&sql_client, &t, &text, &path).await;
     match &result {
@@ -1089,9 +1112,26 @@ pub struct Session {
     cmt: Option<std::sync::Arc<crate::cmtctl::Definition>>,
     libraries: Vec<String>,
     libl: Vec<String>,
+    /// The job it runs for: (user, current library, job).
+    context: Option<(String, Option<String>, Option<String>)>,
 }
 
 impl Session {
+    /// The job the session's statements run for (QSYS2 services such as
+    /// JOBLOG_INFO('*') and LIBRARY_LIST_INFO use it).
+    pub async fn set_context(
+        &mut self,
+        user: &str,
+        curlib: Option<String>,
+        job: Option<String>,
+    ) -> Result<()> {
+        self.client
+            .batch_execute(&context_sql(user, curlib.as_deref(), job.as_deref()))
+            .await?;
+        self.context = Some((user.to_string(), curlib, job));
+        Ok(())
+    }
+
     /// A session whose statements run under a commitment definition (a
     /// program with a commit level other than *NONE).
     pub async fn open_in(
@@ -1124,6 +1164,7 @@ impl Session {
             ))
             .await?;
         Ok(Session {
+            context: None,
             client: sql_client,
             cmt: None,
             libraries: catalog::list_libraries(client).await?,
@@ -1168,6 +1209,11 @@ impl Session {
                 }
             ))
             .await?;
+        if let Some((u, c, j)) = &self.context {
+            d.client
+                .batch_execute(&context_sql_in(u, c.as_deref(), j.as_deref(), true))
+                .await?;
+        }
         let r = self.exec_on(&d.client, &t, text).await;
         match &r {
             Ok(_) => {

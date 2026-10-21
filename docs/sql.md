@@ -97,6 +97,16 @@ Written from the Db2 for i SQL Reference (catalog views) and the IBM i services 
 | `QSYS2.SYSCOLUMNS` | Their columns: SQL data type (CHAR, VARCHAR, DECIMAL, NUMERIC, SMALLINT, INTEGER, BIGINT, FLOAT, DATE, TIME, TIMESTMP, GRAPHIC, VARG, BINARY, VARBIN, CLOB, BLOB, DBCLOB, DECFLOAT, BOOLEAN, XML), length, scale, precision, nullability, default, storage, identity columns, column text |
 | `QSYS2.SYSINDEXES`, `QSYS2.SYSKEYS` | Indexes made by CREATE INDEX (IS_UNIQUE `U` or `D`) and their key columns (ORDERING `A` or `D`) |
 | `QSYS2.SYSVIEWS` | Views and their queries |
+| `QSYS2.SYSROUTINES`, `QSYS2.SYSPARMS` | SQL procedures and functions and their parameters (ROW_TYPE P for a parameter, C for a scalar function's result); ROUTINE_TYPE PROCEDURE or FUNCTION, ROUTINE_BODY SQL or EXTERNAL |
+| `QSYS2.LIBRARY_LIST_INFO` | The statement's library list: TYPE SYSTEM, CURRENT or USER |
+| `QSYS2.USER_INFO` | User profiles: status, class, special authorities, current library, initial program and menu, text (IBM's 82 columns; what as4tainr does not keep is a default or null) |
+| `QSYS2.SYSTEM_VALUE_INFO` | The system values RTVSYSVAL has: SYSTEM_VALUE_NAME, CURRENT_NUMERIC_VALUE, CURRENT_CHARACTER_VALUE |
+| `TABLE(QSYS2.JOBLOG_INFO(job [, IGNORE_ERRORS]))` | A job's log, oldest first (`'*'` is the statement's own job) |
+| `TABLE(QSYS2.ACTIVE_JOB_INFO(...))` | The active jobs (IBM's 129 columns), filtered by SUBSYSTEM_LIST_FILTER, JOB_NAME_FILTER (a name, generic name or *CURRENT) and CURRENT_USER_LIST_FILTER; DETAILED_INFO WORK or ALL adds the work management columns as4tainr knows |
+| `TABLE(QSYS2.IFS_READ(path [, MAXIMUM_LINE_LENGTH] [, END_OF_LINE] [, IGNORE_ERRORS]))`, `IFS_READ_UTF8`, `IFS_READ_BINARY` | A stream file's lines (END_OF_LINE ANY, CR, LF, CRLF, LFCR, NONE), converted from its CCSID; binary pieces |
+| `CALL QSYS2.IFS_WRITE(path, line [, FILE_CCSID] [, OVERWRITE] [, END_OF_LINE])`, `IFS_WRITE_UTF8`, `IFS_WRITE_BINARY` | A line added (APPEND), replacing the file (REPLACE) or only to a new file (NONE), with CRLF after it by default; a new file's CCSID is FILE_CCSID, else 37 (1208 for IFS_WRITE_UTF8) |
+| `CALL QSYS2.QCMDEXC(command)` | Runs a CL command for the statement's user, library list and current library |
+| `JSON_TABLE(document, 'row path' COLUMNS(...))` | Rows from a JSON document (Db2 for i JSON_TABLE): columns by PATH (default `$.` and the column name as written), FOR ORDINALITY, FORMAT JSON (KEEP or OMIT QUOTES, WITH ARRAY WRAPPER), one NESTED PATH per level (a left outer join), lax and strict paths; a column whose path finds nothing or an error is null; a document that is not JSON gives no rows (EMPTY ON ERROR) unless ERROR ON ERROR |
 | `TABLE(QSYS2.OBJECT_STATISTICS(schema, types [, name]))` | Objects in a library, or in `*LIBL`, `*USRLIBL`, `*CURLIB`, `*ALL`, `*ALLUSR`, `*ALLSIMPLE`; types like `'*FILE *PGM'`, `'FILE'` or `'*ALL'`; a name, a generic name (`CUST*`) or `*ALLSIMPLE`. Positional or named parameters (`OBJECT_SCHEMA =>`, `OBJTYPELIST =>`, `OBJECT_NAME =>`). All 69 of IBM's columns: name, type, attribute, owner, creation time, size, text, long name, SQL object type; what as4tainr does not keep (usage, save and journal information, compiler) is null or "NO" |
 
 The views are PostgreSQL views owned by the catalog user: the SQL login reads them without being able to read the catalog itself.
@@ -109,4 +119,4 @@ User SQL never runs as the database user as4tainr itself uses. `as4tainr init` c
 
 ## Not supported yet
 
-The data definition listed above as not supported yet, catalog views other than those above (SYSROUTINES, SYSPARMS, SYSCST and the others) and other IBM i services, `SELECT *` in `INSERT ... SELECT` (it includes the record number; list the columns), DB2-only scalar functions beyond the ones above, and special registers other than the dates and times. Object authority is not checked: anyone who can sign on can read and change every file with SQL, as with record-level access. See [fidelity-gaps.md](fidelity-gaps.md).
+The data definition listed above as not supported yet, catalog views other than those above (SYSCST, SYSTRIGGERS and the others) and other IBM i services, `SELECT *` in `INSERT ... SELECT` (it includes the record number; list the columns), DB2-only scalar functions beyond the ones above, and special registers other than the dates and times. Object authority is not checked: anyone who can sign on can read and change every file with SQL, as with record-level access. See [fidelity-gaps.md](fidelity-gaps.md).

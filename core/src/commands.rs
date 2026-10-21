@@ -435,6 +435,7 @@ impl Job<'_> {
             &self.library_list(),
             &self.user,
             Some(self.current_library()),
+            self.id.as_ref().map(|i| i.to_string()),
             stmt,
         )
         .await?
@@ -522,6 +523,7 @@ impl Job<'_> {
                             &libl,
                             &self.user,
                             Some(self.current_library()),
+                            self.id.as_ref().map(|i| i.to_string()),
                             stmt,
                         )
                         .await

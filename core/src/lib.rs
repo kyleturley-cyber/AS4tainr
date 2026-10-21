@@ -44,6 +44,7 @@ pub mod services;
 pub mod source;
 pub mod spool;
 pub mod sql;
+pub mod sqljson;
 pub mod sqlpl;
 pub mod tn5250;
 pub mod users;

@@ -2434,15 +2434,19 @@ pub async fn call_exprs(
     name: &str,
     args: &[String],
 ) -> Result<(Routine, CallResult)> {
-    let r = find(env.catalog, env.libl, name, "PROCEDURE")
-        .await?
-        .ok_or_else(|| {
-            anyhow!(
-                "SQL0440: Procedure {} with {} parameters not found.",
-                name.to_ascii_uppercase(),
-                args.len()
-            )
-        })?;
+    let found = find(env.catalog, env.libl, name, "PROCEDURE").await?;
+    if found.is_none() {
+        if let Some(r) = call_service(env, name, args).await {
+            return r;
+        }
+    }
+    let r = found.ok_or_else(|| {
+        anyhow!(
+            "SQL0440: Procedure {} with {} parameters not found.",
+            name.to_ascii_uppercase(),
+            args.len()
+        )
+    })?;
     if args.len() > r.parms.len() {
         bail!(
             "SQL0440: Procedure {} with {} parameters not found.",
@@ -2477,6 +2481,208 @@ pub async fn call_exprs(
     // Parameters left out take their defaults.
     let out = run_procedure(env, &r, values, 0).await?;
     Ok((r, out))
+}
+
+/// The IBM i services that are procedures (QSYS2.IFS_WRITE,
+/// IFS_WRITE_UTF8, IFS_WRITE_BINARY, QCMDEXC), qualified with QSYS2 or
+/// found through the path. None when `name` is not one.
+async fn call_service(
+    env: &Env<'_>,
+    name: &str,
+    args: &[String],
+) -> Option<Result<(Routine, CallResult)>> {
+    let up = name.trim().to_ascii_uppercase().replace('/', ".");
+    let base = match up.split_once('.') {
+        Some(("QSYS2", n)) => n.to_string(),
+        Some(_) => return None,
+        None => up,
+    };
+    let params: &[&str] = match base.as_str() {
+        "IFS_WRITE" | "IFS_WRITE_UTF8" | "IFS_WRITE_BINARY" => &[
+            "PATH_NAME",
+            "LINE",
+            "FILE_CCSID",
+            "OVERWRITE",
+            "END_OF_LINE",
+        ],
+        "QCMDEXC" => &["COMMAND"],
+        _ => return None,
+    };
+    Some(run_service(env, &base, params, args).await)
+}
+
+async fn run_service(
+    env: &Env<'_>,
+    name: &str,
+    params: &[&str],
+    args: &[String],
+) -> Result<(Routine, CallResult)> {
+    let run = Run {
+        env,
+        routine: name.to_string(),
+        frames: vec![],
+        diag: (0, "00000".into(), String::new()),
+        row_count: 0,
+        handler_floor: 0,
+        result_sets: vec![],
+        depth: 0,
+    };
+    // Arguments by position, or by name (PATH_NAME => ...).
+    let mut values: Vec<Option<String>> = vec![None; params.len()];
+    let mut given = vec![false; params.len()];
+    for (i, a) in args.iter().enumerate() {
+        let (slot, expr) = match a.split_once("=>") {
+            Some((n, e)) if params.iter().any(|p| p.eq_ignore_ascii_case(n.trim())) => (
+                params
+                    .iter()
+                    .position(|p| p.eq_ignore_ascii_case(n.trim()))
+                    .unwrap(),
+                e.trim(),
+            ),
+            _ => (i, a.trim()),
+        };
+        if slot >= params.len() {
+            bail!(
+                "SQL0440: Procedure {name} with {} parameters not found.",
+                args.len()
+            );
+        }
+        values[slot] = run.value(expr, None).await?;
+        given[slot] = true;
+    }
+    let get = |n: &str| -> Option<String> {
+        params
+            .iter()
+            .position(|p| *p == n)
+            .and_then(|i| values[i].clone())
+    };
+    if name == "QCMDEXC" {
+        let cmd = get("COMMAND").ok_or_else(|| anyhow!("SQL0204: QCMDEXC needs a command."))?;
+        let environment = crate::commands::Environment {
+            database_url: env.database_url.to_string(),
+        };
+        let mut job = crate::commands::Job {
+            client: env.catalog,
+            env: &environment,
+            user: env.user.to_string(),
+            curlib: env.curlib.clone(),
+            libl: env
+                .libl
+                .iter()
+                .filter(|l| !crate::commands::SYSTEM_LIBRARY_LIST.contains(&l.as_str()))
+                .cloned()
+                .collect(),
+            display: None,
+            id: None,
+            calls: Default::default(),
+        };
+        Box::pin(job.run(cmd.trim())).await?;
+    } else {
+        ifs_write(env, name, &get)?.await?;
+    }
+    let r = Routine {
+        library: "QSYS2".into(),
+        name: name.to_string(),
+        kind: "PROCEDURE".into(),
+        parms: params
+            .iter()
+            .map(|p| Parm {
+                mode: "IN".into(),
+                name: p.to_string(),
+                ty: "VARCHAR(32740)".into(),
+                default: None,
+            })
+            .collect(),
+        returns: None,
+        result_sets: 0,
+        body: String::new(),
+        external: None,
+    };
+    Ok((
+        r,
+        CallResult {
+            values,
+            ..Default::default()
+        },
+    ))
+}
+
+/// IFS_WRITE, IFS_WRITE_UTF8, IFS_WRITE_BINARY (IBM i services): a line
+/// added to a stream file (OVERWRITE APPEND, the default), replacing it
+/// (REPLACE), or only to a new file (NONE); END_OF_LINE after it (CRLF;
+/// NONE for binary). A new file's CCSID is FILE_CCSID, or the job's (37)
+/// for IFS_WRITE and IFS_WRITE_BINARY and 1208 for IFS_WRITE_UTF8.
+fn ifs_write<'e>(
+    env: &'e Env<'_>,
+    name: &str,
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Result<BoxFut<'e, Result<()>>> {
+    use crate::ifs;
+    let binary = name == "IFS_WRITE_BINARY";
+    let path = get("PATH_NAME").ok_or_else(|| anyhow!("SQL0204: {name} needs PATH_NAME."))?;
+    let line = get("LINE").unwrap_or_default();
+    let ccsid: i32 = get("FILE_CCSID")
+        .and_then(|c| c.trim().parse().ok())
+        .unwrap_or(0);
+    let overwrite = get("OVERWRITE")
+        .unwrap_or_else(|| "APPEND".into())
+        .trim()
+        .to_ascii_uppercase();
+    let eol = get("END_OF_LINE")
+        .unwrap_or_else(|| if binary { "NONE".into() } else { "CRLF".into() })
+        .trim()
+        .to_ascii_uppercase();
+    let eol = match eol.as_str() {
+        "NONE" => "",
+        "CR" => "\r",
+        "LF" => "\n",
+        "CRLF" => "\r\n",
+        "LFCR" => "\n\r",
+        other => bail!("SQL0171: END_OF_LINE {other} is not valid."),
+    };
+    if binary && !eol.is_empty() {
+        bail!("SQL0171: END_OF_LINE must be NONE for IFS_WRITE_BINARY.");
+    }
+    if !["APPEND", "REPLACE", "NONE"].contains(&overwrite.as_str()) {
+        bail!("SQL0171: OVERWRITE {overwrite} is not valid.");
+    }
+    let new_ccsid = match (ccsid, name) {
+        (c, _) if c > 0 => c,
+        (_, "IFS_WRITE_UTF8") => 1208,
+        _ => 37,
+    };
+    let user = env.user.to_string();
+    let client = env.catalog;
+    Ok(Box::pin(async move {
+        let existing = ifs::stat(client, &path).await?;
+        if existing.is_some() && overwrite == "NONE" {
+            bail!("SQL0443: IFS_WRITE: stream file {path} exists (OVERWRITE NONE).");
+        }
+        let file_ccsid = existing.as_ref().map(|e| e.ccsid).unwrap_or(new_ccsid);
+        if !binary && !ifs::codec::supported(file_ccsid) {
+            bail!("SQL0443: IFS_WRITE: CCSID {file_ccsid} cannot be converted.");
+        }
+        let mut bytes = if binary {
+            // Binary values are shown as hexadecimal digits.
+            (0..line.len() / 2)
+                .filter_map(|i| u8::from_str_radix(line.get(2 * i..2 * i + 2)?, 16).ok())
+                .collect()
+        } else {
+            let mut b = Vec::new();
+            for c in line.chars().chain(eol.chars()) {
+                ifs::codec::encode_char(file_ccsid, c, &mut b);
+            }
+            b
+        };
+        if existing.is_some() && overwrite == "APPEND" {
+            let (mut old, _) = ifs::read_file(client, &path).await?;
+            old.append(&mut bytes);
+            bytes = old;
+        }
+        ifs::write_file(client, &path, &bytes, file_ccsid, 0o644, &user)
+            .await
+            .map_err(|e| anyhow!("SQL0443: IFS_WRITE: {path}: {e}"))
+    }))
 }
 
 /// Is the statement a compound statement (`BEGIN`, or `label: BEGIN`)?

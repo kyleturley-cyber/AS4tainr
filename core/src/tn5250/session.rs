@@ -1264,6 +1264,7 @@ async fn sql_session(term: &mut Term, job: &mut Job<'_>) -> Result<()> {
             &libl,
             &job.user,
             Some(job.current_library()),
+            job.id.as_ref().map(|i| i.to_string()),
             &stmt,
         )
         .await

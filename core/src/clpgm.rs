@@ -2828,6 +2828,43 @@ async fn file_command(
     Ok(())
 }
 
+/// The system values as4tainr has (RTVSYSVAL, QSYS2.SYSTEM_VALUE_INFO).
+pub(crate) const SYSTEM_VALUE_NAMES: &[&str] = &[
+    "QDATE",
+    "QYEAR",
+    "QMONTH",
+    "QDAY",
+    "QCENTURY",
+    "QTIME",
+    "QHOUR",
+    "QMINUTE",
+    "QSECOND",
+    "QDAYOFWEEK",
+    "QDATFMT",
+    "QDATSEP",
+    "QTIMSEP",
+    "QDECFMT",
+    "QCURSYM",
+    "QLANGID",
+    "QCNTRYID",
+    "QCCSID",
+    "QUTCOFFSET",
+    "QTIMZON",
+    "QSECURITY",
+    "QSYSLIBL",
+    "QUSRLIBL",
+    "QMODEL",
+    "QSRLNBR",
+];
+
+/// A system value as text, or as a number (QSYS2.SYSTEM_VALUE_INFO).
+pub(crate) fn system_value_text(name: &str) -> Option<Result<String, i64>> {
+    match system_value(name).ok()? {
+        Value::Dec(d) => Some(Err(d.trunc().to_string().parse().unwrap_or(0))),
+        other => other.as_char().ok().map(Ok),
+    }
+}
+
 /// A system value (RTVSYSVAL): the values IBM ships, the date and time
 /// from the clock.
 fn system_value(name: &str) -> Result<Value> {

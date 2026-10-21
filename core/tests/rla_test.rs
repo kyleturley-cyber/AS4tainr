@@ -1882,7 +1882,7 @@ END;
         let lib = lib.clone();
         async move {
             let libl = vec![lib.clone()];
-            as4tainr_core::sql::run_as(client, &url, &libl, "QSECOFR", Some(lib), &s).await
+            as4tainr_core::sql::run_as(client, &url, &libl, "QSECOFR", Some(lib), None, &s).await
         }
     };
     let msg = |o: SqlOut| match o {
@@ -2109,6 +2109,7 @@ ENDPGM";
         &libl,
         "QSECOFR",
         Some(lib.clone()),
+        None,
         "CALL SETPROC('x', 5)",
     )
     .await
@@ -2803,6 +2804,185 @@ async fn ifs_commands() {
         .await
         .unwrap()
         .is_none());
+}
+
+/// IBM i services (IBM i services reference; Db2 for i SQL Reference):
+/// LIBRARY_LIST_INFO (TYPE SYSTEM, CURRENT, USER), JOBLOG_INFO (oldest
+/// first; MESSAGE_TYPE INFORMATIONAL, ESCAPE; '*' is the current job),
+/// ACTIVE_JOB_INFO (JOB_TYPE INT, JOB_STATUS DSPW), USER_INFO (special
+/// authorities padded to 11 characters), SYSTEM_VALUE_INFO (QCCSID is
+/// numeric, shipped 65535), SYSROUTINES and SYSPARMS (ROW_TYPE P for a
+/// parameter, C for a scalar function's result, as on a real system),
+/// IFS_WRITE (CRLF after each line, APPEND by default), IFS_READ,
+/// IFS_READ_BINARY, QCMDEXC, and JSON_TABLE with the shapes of IBM's
+/// "Using JSON_TABLE" examples.
+#[tokio::test]
+async fn sql_ibm_i_services() {
+    use as4tainr_core::jobs;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let libl: Vec<String> = ["QSYS", "QSYS2", "QHLPSYS", "QUSRSYS"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([lib.clone()])
+        .collect();
+    let id = jobs::start_interactive(
+        &client,
+        &format!("S{}", &lib[1..]),
+        "QSECOFR",
+        Some(&lib),
+        &libl,
+    )
+    .await
+    .unwrap();
+    jobs::log(&client, &id, "*INFO", "first message").await;
+    jobs::log(&client, &id, "*ESCAPE", "second message").await;
+    let run = |sql: String| {
+        let client = &client;
+        let url = url.clone();
+        let libl = libl.clone();
+        let lib = lib.clone();
+        let job = id.to_string();
+        async move {
+            as4tainr_core::sql::run_as(client, &url, &libl, "QSECOFR", Some(lib), Some(job), &sql)
+                .await
+        }
+    };
+    let rows = |sql: String| {
+        let r = run(sql);
+        async move {
+            match r.await.unwrap() {
+                as4tainr_core::sql::Outcome::Rows { rows, .. } => rows
+                    .into_iter()
+                    .map(|r| r.iter().map(|v| v.trim()).collect::<Vec<_>>().join("|"))
+                    .collect::<Vec<_>>(),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    };
+    assert_eq!(
+        rows("SELECT ORDINAL_POSITION, SCHEMA_NAME, TYPE FROM QSYS2.LIBRARY_LIST_INFO WHERE ORDINAL_POSITION IN (1, 5)".into()).await,
+        ["1|QSYS|SYSTEM".to_string(), format!("5|{lib}|CURRENT")]
+    );
+    assert_eq!(
+        rows("SELECT ORDINAL_POSITION, MESSAGE_TYPE, MESSAGE_TEXT, QUALIFIED_JOB_NAME FROM TABLE(QSYS2.JOBLOG_INFO('*')) AS L".into()).await,
+        [
+            format!("1|INFORMATIONAL|first message|{id}"),
+            format!("2|ESCAPE|second message|{id}")
+        ]
+    );
+    assert!(
+        run("SELECT * FROM TABLE(QSYS2.JOBLOG_INFO('999999/NOBODY/NOJOB')) AS L".into())
+            .await
+            .is_err()
+    );
+    assert!(rows("SELECT * FROM TABLE(QSYS2.JOBLOG_INFO('999999/NOBODY/NOJOB', IGNORE_ERRORS => 'YES')) AS L".into())
+        .await
+        .is_empty());
+    assert_eq!(
+        rows("SELECT JOB_NAME, JOB_TYPE, JOB_STATUS, SUBSYSTEM FROM TABLE(QSYS2.ACTIVE_JOB_INFO(JOB_NAME_FILTER => '*CURRENT')) AS J".into()).await,
+        [format!("{id}|INT|DSPW|QINTER")]
+    );
+    let u = rows("SELECT STATUS, USER_CLASS_NAME, SPECIAL_AUTHORITIES FROM QSYS2.USER_INFO WHERE AUTHORIZATION_NAME = 'QSECOFR'".into()).await;
+    assert!(u[0].starts_with("*ENABLED|*SECOFR|*ALLOBJ    *"), "{u:?}");
+    assert_eq!(
+        rows("SELECT SYSTEM_VALUE_NAME, CURRENT_NUMERIC_VALUE, CURRENT_CHARACTER_VALUE FROM QSYS2.SYSTEM_VALUE_INFO WHERE SYSTEM_VALUE_NAME IN ('QCCSID', 'QDATFMT') ORDER BY 1".into()).await,
+        ["QCCSID|65535|-", "QDATFMT|-|MDY"]
+    );
+    {
+        use as4tainr_core::commands::{Environment, Job};
+        let env = Environment {
+            database_url: url.clone(),
+        };
+        let mut job = Job {
+            client: &client,
+            env: &env,
+            user: "QSECOFR".into(),
+            curlib: Some(lib.clone()),
+            libl: vec![lib.clone()],
+            display: None,
+            id: None,
+            calls: Default::default(),
+        };
+        let script = format!(
+            "CREATE PROCEDURE {lib}.P1 (IN A INTEGER, OUT B VARCHAR(10)) LANGUAGE SQL SET B = 'x';
+CREATE FUNCTION {lib}.F1 (X DECIMAL(5, 2)) RETURNS INTEGER LANGUAGE SQL RETURN 1;"
+        );
+        let lines = job
+            .run_sql_script(&script, "routines", 0, None, true)
+            .await
+            .unwrap();
+        assert!(lines.last().unwrap().contains("0 with errors"), "{lines:?}");
+    }
+    assert_eq!(
+        rows(format!("SELECT ROUTINE_NAME, ROUTINE_TYPE, ROUTINE_BODY, IN_PARMS, OUT_PARMS FROM QSYS2.SYSROUTINES WHERE ROUTINE_SCHEMA = '{lib}' ORDER BY 1")).await,
+        ["F1|FUNCTION|SQL|1|0", "P1|PROCEDURE|SQL|1|1"]
+    );
+    assert_eq!(
+        rows(format!("SELECT SPECIFIC_NAME, ORDINAL_POSITION, PARAMETER_MODE, PARAMETER_NAME, NUMERIC_PRECISION, ROW_TYPE FROM QSYS2.SYSPARMS WHERE SPECIFIC_SCHEMA = '{lib}' ORDER BY 1, 2")).await,
+        ["F1|1|IN|X|5|P", "F1|2|OUT|-|10|C", "P1|1|IN|A|10|P", "P1|2|OUT|B|-|P"]
+    );
+    // IFS_WRITE and IFS_READ.
+    let dir = format!("/s{}", lib.to_lowercase());
+    let _ = as4tainr_core::ifs::mkdir(&client, &dir, 0o755, "QSECOFR").await;
+    run(format!("CALL QSYS2.IFS_WRITE(PATH_NAME => '{dir}/f.txt', LINE => 'one', FILE_CCSID => 1208, OVERWRITE => 'REPLACE')")).await.unwrap();
+    run(format!("CALL QSYS2.IFS_WRITE('{dir}/f.txt', 'two')"))
+        .await
+        .unwrap();
+    let (data, ccsid) = as4tainr_core::ifs::read_file(&client, &format!("{dir}/f.txt"))
+        .await
+        .unwrap();
+    assert_eq!((data.as_slice(), ccsid), (&b"one\r\ntwo\r\n"[..], 1208));
+    assert!(run(format!(
+        "CALL QSYS2.IFS_WRITE('{dir}/f.txt', 'three', OVERWRITE => 'NONE')"
+    ))
+    .await
+    .is_err());
+    assert_eq!(
+        rows(format!(
+            "SELECT LINE_NUMBER, LINE FROM TABLE(QSYS2.IFS_READ('{dir}/f.txt')) AS F"
+        ))
+        .await,
+        ["1|one", "2|two"]
+    );
+    assert_eq!(
+        rows(format!("SELECT LINE FROM TABLE(QSYS2.IFS_READ_BINARY(PATH_NAME => '{dir}/f.txt', MAXIMUM_LINE_LENGTH => 5)) AS F")).await,
+        ["6F6E650D0A", "74776F0D0A"]
+    );
+    as4tainr_core::ifs::unlink(&client, &format!("{dir}/f.txt"))
+        .await
+        .unwrap();
+    as4tainr_core::ifs::rmdir(&client, &dir).await.unwrap();
+    // QCMDEXC runs a CL command.
+    run(format!(
+        "CALL QSYS2.QCMDEXC('CRTDTAARA DTAARA({lib}/SVC) TYPE(*CHAR) LEN(3)')"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        rows(format!(
+            "SELECT OBJNAME FROM TABLE(QSYS2.OBJECT_STATISTICS('{lib}', '*DTAARA')) AS O"
+        ))
+        .await,
+        ["SVC"]
+    );
+    // JSON_TABLE: a row per array element; a missing key is null (lax);
+    // a nested path is a left outer join, its ordinality 1 when it finds
+    // nothing.
+    let doc = r#"{"employees":[{"id":901,"name":{"first":"John","last":"Doe"},"office":"E-334","phones":[{"type":"home","number":"555-3762"},{"type":"work","number":"555-7242"}]},{"id":904,"name":{"first":"Sally","last":"Smith"}}]}"#;
+    assert_eq!(
+        rows(format!("SELECT U.FIRST, U.OFFICE FROM JSON_TABLE('{doc}', 'lax $.employees[*]' COLUMNS(FIRST VARCHAR(10) PATH 'lax $.name.first', OFFICE CHAR(5) PATH 'lax $.office')) AS U")).await,
+        ["John|E-334", "Sally|-"]
+    );
+    assert_eq!(
+        rows(format!("SELECT U.FIRST, U.NESTED_ORD, U.TYPE FROM JSON_TABLE('{doc}', 'lax $.employees[*]' COLUMNS(FIRST VARCHAR(10) PATH 'lax $.name.first', NESTED PATH 'lax $.phones[*]' COLUMNS(NESTED_ORD FOR ORDINALITY, TYPE VARCHAR(10) PATH 'lax $.type'))) AS U")).await,
+        ["John|1|home", "John|2|work", "Sally|1|-"]
+    );
+    assert_eq!(
+        rows(format!("SELECT U.OFFICE FROM JSON_TABLE('{doc}', 'lax $.employees[*]' COLUMNS(OFFICE VARCHAR(10) FORMAT JSON PATH 'lax $.office')) AS U")).await,
+        ["\"E-334\"", "-"]
+    );
+    jobs::end(&client, &id, true).await.unwrap();
 }
 
 /// CL programs (IBM CL reference): loops with LEAVE and ITERATE, DOUNTIL

@@ -19,7 +19,7 @@ use tokio_postgres::Client;
 use crate::sql::SQL_ROLE;
 
 /// The services' version: change it whenever a definition below changes.
-const VERSION: &str = "as4tainr services 3";
+const VERSION: &str = "as4tainr services 5";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -464,10 +464,668 @@ pub async fn init(client: &Client) -> Result<()> {
              GRANT SELECT ON qsys2.sysschemas, qsys2.systables, qsys2.syscolumns,
                    qsys2.sysindexes, qsys2.syskeys, qsys2.sysviews TO {SQL_ROLE};
              GRANT EXECUTE ON FUNCTION qsys2.object_statistics(varchar, varchar, varchar) TO {SQL_ROLE};
+             {}
              COMMENT ON SCHEMA as4tainr_svc IS '{VERSION}';",
-            object_statistics()
+            object_statistics(),
+            work_services()
         ))
         .await
         .context("creating the QSYS2 services")?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Work management, security, system values, routines and the IFS.
+
+/// One result column of a service: (name, type, value).
+type Col = (&'static str, &'static str, &'static str);
+
+/// `name type, ...` and `CAST(value AS type), ...` for a column list.
+fn col_lists(cols: &[Col]) -> (String, String) {
+    let defs: Vec<String> = cols.iter().map(|(n, t, _)| format!("{n} {t}")).collect();
+    let vals: Vec<String> = cols
+        .iter()
+        .map(|(n, t, e)| format!("CAST({e} AS {t}) AS {n}"))
+        .collect();
+    (defs.join(", "), vals.join(", "))
+}
+
+/// QSYS2.LIBRARY_LIST_INFO (IBM i services: LIBRARY_LIST_INFO view): the
+/// statement's library list, from the SQL session's search path.
+fn library_list_info() -> String {
+    let system: Vec<String> = crate::commands::SYSTEM_LIBRARY_LIST
+        .iter()
+        .map(|l| format!("'{l}'"))
+        .collect();
+    format!(
+        "CREATE OR REPLACE VIEW qsys2.library_list_info AS
+         SELECT CAST(x.n AS integer) AS ordinal_position,
+                CAST(upper(x.s) AS varchar(128)) AS schema_name,
+                CAST(upper(x.s) AS varchar(10)) AS system_schema_name,
+                CAST(CASE WHEN upper(x.s) IN ({sys}) THEN 'SYSTEM'
+                          WHEN upper(x.s) = current_setting('as4tainr.curlib', true) THEN 'CURRENT'
+                          ELSE 'USER' END AS varchar(15)) AS type,
+                CAST(0 AS smallint) AS iasp_number,
+                CAST(nullif(o.text, '') AS varchar(50)) AS text_description
+         FROM unnest(current_schemas(false)) WITH ORDINALITY AS x(s, n)
+         LEFT JOIN as4tainr.objects o
+           ON o.library = 'QSYS' AND o.objtype = '*LIB' AND o.name = upper(x.s);",
+        sys = system.join(", ")
+    )
+}
+
+/// QSYS2.USER_INFO (IBM i services: USER_INFO view) over the user
+/// profiles. Values as4tainr does not keep are the null value.
+const USER_INFO: &[Col] = &[
+    ("authorization_name", "varchar(10)", "u.name"),
+    ("previous_signon", "timestamp", "u.last_signon"),
+    ("sign_on_attempts_not_valid", "integer", "0"),
+    ("status", "varchar(10)", "u.status"),
+    ("netserver_disabled", "varchar(3)", "'NO'"),
+    ("password_change_date", "timestamp", "NULL"),
+    ("no_password_indicator", "varchar(3)", "CASE WHEN u.password_hash = '*NONE' THEN 'YES' ELSE 'NO' END"),
+    ("password_level_0_1", "varchar(3)", "'NO'"),
+    ("password_level_2_3", "varchar(3)", "'YES'"),
+    ("password_expiration_interval", "smallint", "0"),
+    ("date_password_expires", "timestamp", "NULL"),
+    ("days_until_password_expires", "integer", "NULL"),
+    ("set_password_to_expire", "varchar(3)", "CASE WHEN u.pwd_expired THEN 'YES' ELSE 'NO' END"),
+    ("user_class_name", "varchar(10)", "u.usrcls"),
+    ("special_authorities", "varchar(88)", "nullif(rtrim(array_to_string(ARRAY(SELECT rpad(a, 11) FROM unnest(u.special_auth) AS a), '')), '')"),
+    ("group_profile_name", "varchar(10)", "'*NONE'"),
+    ("supplemental_group_count", "smallint", "0"),
+    ("supplemental_group_list", "varchar(150)", "NULL"),
+    ("owner", "varchar(10)", "'*USRPRF'"),
+    ("group_authority", "varchar(10)", "'*NONE'"),
+    ("assistance_level", "varchar(10)", "'*SYSVAL'"),
+    ("current_library_name", "varchar(10)", "u.curlib"),
+    ("initial_menu_name", "varchar(10)", "CASE WHEN position('/' IN u.inlmnu) > 0 THEN split_part(u.inlmnu, '/', 2) ELSE u.inlmnu END"),
+    ("initial_menu_library_name", "varchar(10)", "CASE WHEN position('/' IN u.inlmnu) > 0 THEN split_part(u.inlmnu, '/', 1) WHEN u.inlmnu = '*SIGNOFF' THEN NULL ELSE '*LIBL' END"),
+    ("initial_program_name", "varchar(10)", "CASE WHEN position('/' IN u.inlpgm) > 0 THEN split_part(u.inlpgm, '/', 2) ELSE u.inlpgm END"),
+    ("initial_program_library_name", "varchar(10)", "CASE WHEN position('/' IN u.inlpgm) > 0 THEN split_part(u.inlpgm, '/', 1) WHEN u.inlpgm = '*NONE' THEN NULL ELSE '*LIBL' END"),
+    ("limit_capabilities", "varchar(10)", "'*NO'"),
+    ("text_description", "varchar(50)", "nullif(u.text, '')"),
+    ("display_signon_information", "varchar(10)", "'*SYSVAL'"),
+    ("limit_device_sessions", "varchar(10)", "'*SYSVAL'"),
+    ("keyboard_buffering", "varchar(10)", "'*SYSVAL'"),
+    ("maximum_allowed_storage", "bigint", "-1"),
+    ("storage_used", "bigint", "0"),
+    ("highest_scheduling_priority", "char(1)", "'3'"),
+    ("job_description_name", "varchar(10)", "'QDFTJOBD'"),
+    ("job_description_library_name", "varchar(10)", "'QGPL'"),
+    ("accounting_code", "varchar(15)", "NULL"),
+    ("message_queue_name", "varchar(10)", "u.name"),
+    ("message_queue_library_name", "varchar(10)", "'QUSRSYS'"),
+    ("message_queue_delivery_method", "varchar(10)", "'*NOTIFY'"),
+    ("message_queue_severity", "smallint", "0"),
+    ("output_queue_name", "varchar(10)", "'*WRKSTN'"),
+    ("output_queue_library_name", "varchar(10)", "NULL"),
+    ("print_device", "varchar(10)", "'*WRKSTN'"),
+    ("special_environment", "varchar(10)", "'*SYSVAL'"),
+    ("attention_key_handling_program_name", "varchar(10)", "'*SYSVAL'"),
+    ("attention_key_handling_program_library_name", "varchar(10)", "NULL"),
+    ("language_id", "varchar(10)", "'*SYSVAL'"),
+    ("country_or_region_id", "varchar(10)", "'*SYSVAL'"),
+    ("character_code_set_id", "varchar(6)", "'*SYSVAL'"),
+    ("user_options", "varchar(77)", "NULL"),
+    ("sort_sequence_table_name", "varchar(10)", "'*SYSVAL'"),
+    ("sort_sequence_table_library_name", "varchar(10)", "NULL"),
+    ("object_auditing_value", "varchar(10)", "'*NONE'"),
+    ("user_action_audit_level", "varchar(363)", "NULL"),
+    ("group_authority_type", "varchar(10)", "'*PRIVATE'"),
+    ("user_id_number", "bigint", "NULL"),
+    ("group_id_number", "bigint", "0"),
+    ("locale_job_attributes", "varchar(88)", "NULL"),
+    ("group_member_indicator", "varchar(3)", "'NO'"),
+    ("digital_certificate_indicator", "varchar(3)", "'NO'"),
+    ("character_identifier_control", "varchar(10)", "'*SYSVAL'"),
+    ("local_password_management", "varchar(3)", "'YES'"),
+    ("block_password_change", "varchar(10)", "'*SYSVAL'"),
+    ("user_entitlement_required", "varchar(3)", "'YES'"),
+    ("user_expiration_interval", "smallint", "0"),
+    ("user_expiration_date", "timestamp", "NULL"),
+    ("user_expiration_action", "varchar(8)", "NULL"),
+    ("home_directory", "varchar(1024)", "'/home/' || u.name"),
+    ("locale_path_name", "varchar(1024)", "'*SYSVAL'"),
+    ("user_default_password", "varchar(3)", "'NO'"),
+    ("user_owner", "varchar(10)", "'QSECOFR'"),
+    ("user_creator", "varchar(10)", "'QSECOFR'"),
+    ("size", "decimal(15,0)", "NULL"),
+    ("creation_timestamp", "timestamp", "u.created"),
+    ("last_used_timestamp", "timestamp", "u.last_signon"),
+    ("days_used_count", "integer", "NULL"),
+    ("last_reset_timestamp", "timestamp", "NULL"),
+    ("authority_collection_active", "varchar(3)", "'NO'"),
+    ("authority_collection_repository_exists", "varchar(3)", "'NO'"),
+    ("pase_shell_path", "varchar(1024)", "NULL"),
+];
+
+fn user_info() -> String {
+    let (_, vals) = col_lists(USER_INFO);
+    format!(
+        "CREATE OR REPLACE VIEW qsys2.user_info AS SELECT {vals} FROM as4tainr.user_profiles u;"
+    )
+}
+
+/// QSYS2.SYSTEM_VALUE_INFO (IBM i services): the system values RTVSYSVAL
+/// knows; the date and time ones from the clock when read.
+fn system_value_info() -> String {
+    let clock = |name: &str| -> Option<&'static str> {
+        Some(match name {
+            "QDATE" => "to_char(localtimestamp, 'MMDDYY')",
+            "QYEAR" => "to_char(localtimestamp, 'YY')",
+            "QMONTH" => "to_char(localtimestamp, 'MM')",
+            "QDAY" => "to_char(localtimestamp, 'DD')",
+            "QCENTURY" => {
+                "CASE WHEN extract(year FROM localtimestamp) >= 2000 THEN '1' ELSE '0' END"
+            }
+            "QTIME" => "to_char(localtimestamp, 'HH24MISSMS')",
+            "QHOUR" => "to_char(localtimestamp, 'HH24')",
+            "QMINUTE" => "to_char(localtimestamp, 'MI')",
+            "QSECOND" => "to_char(localtimestamp, 'SS')",
+            "QDAYOFWEEK" => "'*' || upper(to_char(localtimestamp, 'DY'))",
+            _ => return None,
+        })
+    };
+    let q = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let rows: Vec<String> = crate::clpgm::SYSTEM_VALUE_NAMES
+        .iter()
+        .filter_map(|n| {
+            let (num, ch) = match clock(n) {
+                Some(e) => ("NULL".to_string(), e.to_string()),
+                None => match crate::clpgm::system_value_text(n)? {
+                    Ok(t) => ("NULL".to_string(), q(&t)),
+                    Err(v) => (v.to_string(), "NULL".to_string()),
+                },
+            };
+            Some(format!("({}, {num}, {ch})", q(n)))
+        })
+        .collect();
+    format!(
+        "CREATE OR REPLACE VIEW qsys2.system_value_info AS
+         SELECT CAST(v.n AS varchar(10)) AS system_value_name,
+                CAST(v.num AS bigint) AS current_numeric_value,
+                CAST(v.ch AS varchar(4096)) AS current_character_value
+         FROM (VALUES {}) AS v(n, num, ch);",
+        rows.join(", ")
+    )
+}
+
+/// QSYS2.JOBLOG_INFO(job [, ignore errors]): a job's log, oldest first
+/// ('*' is the statement's own job).
+const JOBLOG_INFO: &str = r#"
+DROP FUNCTION IF EXISTS qsys2.joblog_info(varchar, varchar);
+CREATE FUNCTION qsys2.joblog_info(job_name varchar, ignore_errors varchar DEFAULT 'NO')
+RETURNS TABLE (
+  ordinal_position integer, message_id varchar(7), message_type varchar(13),
+  message_subtype varchar(22), severity smallint, message_timestamp timestamp,
+  from_library varchar(10), from_program varchar(256), from_module varchar(10),
+  from_procedure varchar(4096), from_instruction varchar(10), to_library varchar(10),
+  to_program varchar(10), to_module varchar(10), to_procedure varchar(4096),
+  to_instruction varchar(10), from_user varchar(10), message_file varchar(10),
+  message_library varchar(10), message_token_length smallint, message_tokens bytea,
+  message_text varchar(1024), message_second_level_text varchar(4096),
+  message_key bytea, qualified_job_name varchar(28))
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+  q text := upper(trim(job_name));
+  n bigint;
+  j record;
+BEGIN
+  IF q = '*' THEN
+    q := upper(coalesce(current_setting('as4tainr.job', true), ''));
+  END IF;
+  IF split_part(q, '/', 1) ~ '^[0-9]{1,6}$' THEN
+    n := split_part(q, '/', 1)::bigint;
+  END IF;
+  SELECT * INTO j FROM as4tainr.jobs
+   WHERE number = n AND user_name = split_part(q, '/', 2) AND name = split_part(q, '/', 3);
+  IF NOT FOUND THEN
+    IF upper(coalesce(ignore_errors, 'NO')) = 'YES' THEN
+      RETURN;
+    END IF;
+    RAISE EXCEPTION 'Job % not found.', job_name USING ERRCODE = '42704';
+  END IF;
+  RETURN QUERY
+  SELECT CAST(row_number() OVER (ORDER BY l.seq) AS integer),
+         CAST(nullif(l.msgid, '') AS varchar(7)),
+         CAST(CASE l.kind WHEN '*RQS' THEN 'REQUEST' WHEN '*COMP' THEN 'COMPLETION'
+                          WHEN '*ESCAPE' THEN 'ESCAPE' WHEN '*DIAG' THEN 'DIAGNOSTIC'
+                          WHEN '*NOTIFY' THEN 'NOTIFY' WHEN '*INQ' THEN 'INQUIRY'
+                          WHEN '*RPY' THEN 'REPLY' ELSE 'INFORMATIONAL' END AS varchar(13)),
+         CAST(NULL AS varchar(22)), CAST(NULL AS smallint), CAST(l.sent AS timestamp),
+         CAST(NULL AS varchar(10)), CAST(NULL AS varchar(256)), CAST(NULL AS varchar(10)),
+         CAST(NULL AS varchar(4096)), CAST(NULL AS varchar(10)), CAST(NULL AS varchar(10)),
+         CAST(NULL AS varchar(10)), CAST(NULL AS varchar(10)), CAST(NULL AS varchar(4096)),
+         CAST(NULL AS varchar(10)), CAST(j.user_name AS varchar(10)), CAST(NULL AS varchar(10)),
+         CAST(NULL AS varchar(10)), CAST(NULL AS smallint), CAST(NULL AS bytea),
+         CAST(l.text AS varchar(1024)), CAST(NULL AS varchar(4096)),
+         CAST(int4send(CAST(l.seq AS integer)) AS bytea),
+         CAST(lpad(j.number::text, 6, '0') || '/' || j.user_name || '/' || j.name AS varchar(28))
+    FROM as4tainr.job_log l WHERE l.job = j.number ORDER BY l.seq;
+END $$;
+"#;
+
+/// QSYS2.ACTIVE_JOB_INFO's result columns (IBM i services), in IBM's
+/// order: (name, type, value). DETAILED_INFO NONE gives the first 30;
+/// WORK and ALL the work management ones as4tainr knows.
+const ACTIVE_JOB_INFO: &[Col] = &[
+    ("ordinal_position", "integer", "row_number() OVER (ORDER BY j.number)"),
+    ("job_name", "varchar(28)", "lpad(j.number::text, 6, '0') || '/' || j.user_name || '/' || j.name"),
+    ("job_name_short", "varchar(10)", "j.name"),
+    ("job_user", "varchar(10)", "j.user_name"),
+    ("job_number", "varchar(6)", "lpad(j.number::text, 6, '0')"),
+    ("internal_job_id", "bytea", "NULL"),
+    ("subsystem", "varchar(10)", "nullif(j.subsystem, '')"),
+    ("subsystem_library_name", "varchar(10)", "CASE WHEN j.subsystem <> '' THEN 'QSYS' END"),
+    ("authorization_name", "varchar(10)", "j.user_name"),
+    ("job_type", "varchar(3)", "j.type"),
+    ("function_type", "varchar(3)", "CASE WHEN j.function LIKE '___-%' THEN left(j.function, 3) END"),
+    ("function", "varchar(10)", "CASE WHEN j.function LIKE '___-%' THEN substr(j.function, 5) ELSE nullif(j.function, '') END"),
+    ("job_status", "varchar(4)", "coalesce(nullif(j.activity, ''), 'RUN')"),
+    ("memory_pool", "varchar(9)", "CASE j.type WHEN 'INT' THEN 'INTERACT' ELSE 'BASE' END"),
+    ("run_priority", "integer", "CASE j.type WHEN 'INT' THEN 20 ELSE 50 END"),
+    ("thread_count", "integer", "1"),
+    ("temporary_storage", "integer", "NULL"),
+    ("cpu_time", "decimal(20,0)", "NULL"),
+    ("total_disk_io_count", "decimal(20,0)", "NULL"),
+    ("elapsed_interaction_count", "integer", "NULL"),
+    ("elapsed_total_response_time", "integer", "NULL"),
+    ("elapsed_total_disk_io_count", "decimal(20,0)", "NULL"),
+    ("elapsed_async_disk_io_count", "decimal(20,0)", "NULL"),
+    ("elapsed_sync_disk_io_count", "decimal(20,0)", "NULL"),
+    ("elapsed_cpu_percentage", "decimal(10,2)", "NULL"),
+    ("elapsed_cpu_time", "decimal(20,0)", "NULL"),
+    ("elapsed_page_fault_count", "decimal(20,0)", "NULL"),
+    ("job_end_reason", "varchar(60)", "NULL"),
+    ("server_type", "varchar(30)", "NULL"),
+    ("elapsed_time", "decimal(20,3)", "NULL"),
+    ("job_description_library", "varchar(10)", "CASE WHEN work THEN 'QGPL' END"),
+    ("job_description", "varchar(10)", "CASE WHEN work THEN 'QDFTJOBD' END"),
+    ("job_queue_library", "varchar(10)", "CASE WHEN work AND j.jobq <> '' THEN 'QGPL' END"),
+    ("job_queue", "varchar(10)", "CASE WHEN work THEN nullif(j.jobq, '') END"),
+    ("output_queue_library", "varchar(10)", "CASE WHEN work THEN 'QGPL' END"),
+    ("output_queue", "varchar(10)", "CASE WHEN work THEN 'QPRINT' END"),
+    ("workload_group", "varchar(10)", "NULL"),
+    ("ccsid", "integer", "CASE WHEN work THEN 37 END"),
+    ("default_ccsid", "integer", "CASE WHEN work THEN 37 END"),
+    ("sort_sequence_library", "varchar(10)", "NULL"),
+    ("sort_sequence", "varchar(10)", "CASE WHEN work THEN '*HEX' END"),
+    ("language_id", "char(3)", "CASE WHEN work THEN 'ENU' END"),
+    ("date_format", "char(4)", "CASE WHEN work THEN '*MDY' END"),
+    ("date_separator", "char(1)", "CASE WHEN work THEN '/' END"),
+    ("time_separator", "char(1)", "CASE WHEN work THEN ':' END"),
+    ("decimal_format", "varchar(6)", "CASE WHEN work THEN '*BLANK' END"),
+    ("timezone_description", "varchar(10)", "NULL"),
+    ("timezone_current_offset", "integer", "NULL"),
+    ("timezone_full_name", "varchar(50)", "NULL"),
+    ("timezone_abbreviated_name", "varchar(10)", "NULL"),
+    ("job_type_enhanced", "varchar(28)", "CASE WHEN work THEN CASE j.type WHEN 'INT' THEN 'INTERACTIVE' ELSE 'BATCH' END END"),
+    ("job_entered_system_time", "timestamp(0)", "CASE WHEN work THEN j.entered END"),
+    ("job_active_time", "timestamp(0)", "CASE WHEN work THEN j.started END"),
+    ("client_ip_address", "varchar(45)", "NULL"),
+    ("job_user_identity_setting", "varchar(11)", "NULL"),
+    ("job_user_identity", "varchar(10)", "NULL"),
+    ("dbcs_capable", "varchar(3)", "NULL"),
+    ("signal_status", "varchar(3)", "NULL"),
+    ("message_reply", "varchar(3)", "NULL"),
+    ("end_status", "varchar(3)", "NULL"),
+    ("cancel_key", "varchar(3)", "NULL"),
+    ("exit_key", "varchar(3)", "NULL"),
+    ("maximum_active_threads", "integer", "NULL"),
+    ("system_pool_id", "integer", "NULL"),
+    ("pool_name", "varchar(10)", "NULL"),
+    ("qtemp_size", "integer", "NULL"),
+    ("peak_temporary_storage", "integer", "NULL"),
+    ("default_wait", "integer", "NULL"),
+    ("maximum_processing_time_allowed", "integer", "NULL"),
+    ("maximum_temporary_storage_allowed", "integer", "NULL"),
+    ("time_slice", "integer", "NULL"),
+    ("page_faults", "bigint", "NULL"),
+    ("total_response_time", "bigint", "NULL"),
+    ("interactive_transactions", "integer", "NULL"),
+    ("database_lock_waits", "integer", "NULL"),
+    ("non_database_lock_waits", "integer", "NULL"),
+    ("internal_machine_lock_waits", "integer", "NULL"),
+    ("database_lock_wait_time", "integer", "NULL"),
+    ("non_database_lock_wait_time", "integer", "NULL"),
+    ("internal_machine_lock_wait_time", "integer", "NULL"),
+    ("sql_statement_text", "varchar(10000)", "NULL"),
+    ("sql_statement_status", "varchar(8)", "NULL"),
+    ("sql_statement_start_timestamp", "timestamp", "NULL"),
+    ("sql_statement_name", "varchar(128)", "NULL"),
+    ("sql_statement_library_name", "varchar(10)", "NULL"),
+    ("sql_statement_object_name", "varchar(10)", "NULL"),
+    ("sql_statement_object_type", "varchar(7)", "NULL"),
+    ("query_options_library_name", "varchar(10)", "NULL"),
+    ("sql_activation_group_count", "integer", "NULL"),
+    ("sql_descriptor_count", "bigint", "NULL"),
+    ("sql_lob_locator_count", "integer", "NULL"),
+    ("cli_handle_count", "bigint", "NULL"),
+    ("sql_server_mode", "varchar(3)", "NULL"),
+    ("client_acctng", "varchar(255)", "NULL"),
+    ("client_applname", "varchar(255)", "NULL"),
+    ("client_programid", "varchar(255)", "NULL"),
+    ("client_userid", "varchar(255)", "NULL"),
+    ("client_wrkstnname", "varchar(255)", "NULL"),
+    ("routine_type", "char(1)", "NULL"),
+    ("routine_schema", "varchar(128)", "NULL"),
+    ("routine_specific_name", "varchar(128)", "NULL"),
+    ("client_port", "integer", "NULL"),
+    ("client_host", "varchar(255)", "NULL"),
+    ("interface_name", "varchar(127)", "NULL"),
+    ("interface_type", "varchar(63)", "NULL"),
+    ("interface_level", "varchar(63)", "NULL"),
+    ("server_mode_connecting_job", "varchar(28)", "NULL"),
+    ("server_mode_connecting_thread", "bigint", "NULL"),
+    ("prestart_job_reuse_count", "integer", "NULL"),
+    ("prestart_job_max_use_count", "integer", "NULL"),
+    ("available_result_sets", "integer", "NULL"),
+    ("unconsumed_result_sets", "integer", "NULL"),
+    ("open_cursor_count", "integer", "NULL"),
+    ("full_open_cursor_count", "bigint", "NULL"),
+    ("pseudo_open_cursor_count", "bigint", "NULL"),
+    ("pseudo_closed_cursor_count", "integer", "NULL"),
+    ("cqe_cursor_count", "integer", "NULL"),
+    ("cqe_cursor_storage", "integer", "NULL"),
+    ("sqe_cursor_count", "integer", "NULL"),
+    ("sqe_cursor_storage", "integer", "NULL"),
+    ("largest_query_size", "integer", "NULL"),
+    ("qro_hash", "varchar(8)", "NULL"),
+    ("open_files", "integer", "NULL"),
+];
+
+/// QSYS2.ACTIVE_JOB_INFO(...): the active jobs, filtered by subsystems,
+/// job names (generic with *; *CURRENT for the statement's job) and
+/// users, given as comma-separated lists.
+fn active_job_info() -> String {
+    let (defs, vals) = col_lists(ACTIVE_JOB_INFO);
+    format!(
+        "DROP FUNCTION IF EXISTS qsys2.active_job_info(varchar, varchar, varchar, varchar, varchar);
+         CREATE FUNCTION qsys2.active_job_info(reset_statistics varchar DEFAULT 'NO',
+             subsystem_list_filter varchar DEFAULT NULL, job_name_filter varchar DEFAULT NULL,
+             current_user_list_filter varchar DEFAULT NULL, detailed_info varchar DEFAULT 'NONE')
+         RETURNS TABLE ({defs})
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $as4tainr$
+         SELECT {vals}
+           FROM as4tainr.jobs j
+          CROSS JOIN (SELECT upper(coalesce(detailed_info, 'NONE')) IN ('WORK', 'ALL') AS work) AS d
+          WHERE j.status = 'ACTIVE'
+            AND (subsystem_list_filter IS NULL OR j.subsystem = ANY (
+                   SELECT upper(trim(s)) FROM regexp_split_to_table(subsystem_list_filter, ',') AS s))
+            AND (current_user_list_filter IS NULL OR j.user_name = ANY (
+                   SELECT upper(trim(s)) FROM regexp_split_to_table(current_user_list_filter, ',') AS s))
+            AND (job_name_filter IS NULL OR upper(trim(job_name_filter)) = '*ALL'
+                 OR (upper(trim(job_name_filter)) = '*CURRENT'
+                     AND lpad(j.number::text, 6, '0') || '/' || j.user_name || '/' || j.name
+                         = upper(current_setting('as4tainr.job', true)))
+                 OR j.name LIKE replace(replace(upper(trim(job_name_filter)), '_', '\\_'), '*', '%'))
+          ORDER BY j.number
+         $as4tainr$;"
+    )
+}
+
+/// QSYS2.SYSROUTINES and QSYS2.SYSPARMS (Db2 for i catalog views) over
+/// the SQL procedures and functions.
+const ROUTINE_VIEWS: &str = r#"
+CREATE OR REPLACE VIEW as4tainr_svc.routines AS
+SELECT r.library, r.name, r.kind, r.created, d.def
+  FROM as4tainr.routines r CROSS JOIN LATERAL (SELECT r.definition::jsonb AS def) d;
+CREATE OR REPLACE VIEW qsys2.sysroutines AS
+SELECT CAST(r.library AS varchar(128)) AS specific_schema,
+       CAST(r.name AS varchar(128)) AS specific_name,
+       CAST(r.library AS varchar(128)) AS routine_schema,
+       CAST(r.name AS varchar(128)) AS routine_name,
+       CAST(r.kind AS varchar(9)) AS routine_type,
+       CAST(r.created AS timestamp) AS routine_created,
+       CAST(NULL AS varchar(128)) AS routine_definer,
+       CAST(CASE WHEN r.def ->> 'external' IS NOT NULL THEN 'EXTERNAL' ELSE 'SQL' END AS varchar(8)) AS routine_body,
+       CAST(r.def ->> 'external' AS varchar(279)) AS external_name,
+       CAST(NULL AS varchar(8)) AS external_language,
+       CAST(CASE WHEN r.def ->> 'external' IS NOT NULL THEN 'GENERAL' END AS varchar(7)) AS parameter_style,
+       CAST('NO' AS varchar(3)) AS is_deterministic,
+       CAST(CASE r.kind WHEN 'PROCEDURE' THEN 'MODIFIES' ELSE 'READS' END AS varchar(8)) AS sql_data_access,
+       CAST(NULL AS varchar(3483)) AS sql_path,
+       CAST(NULL AS varchar(2048)) AS parm_signature,
+       CAST(CASE WHEN r.kind = 'FUNCTION' THEN 1 ELSE 0 END AS smallint) AS number_of_results,
+       CAST(coalesce((r.def ->> 'result_sets')::int, 0) AS smallint) AS max_dynamic_result_sets,
+       CAST((SELECT count(*) FROM jsonb_array_elements(r.def -> 'parms') p WHERE p ->> 'mode' = 'IN') AS smallint) AS in_parms,
+       CAST((SELECT count(*) FROM jsonb_array_elements(r.def -> 'parms') p WHERE p ->> 'mode' = 'OUT') AS smallint) AS out_parms,
+       CAST((SELECT count(*) FROM jsonb_array_elements(r.def -> 'parms') p WHERE p ->> 'mode' = 'INOUT') AS smallint) AS inout_parms,
+       CAST(NULL AS bytea) AS parse_tree,
+       CAST(NULL AS bytea) AS parm_array,
+       CAST(NULL AS varchar(2000)) AS long_comment,
+       CAST(nullif(r.def ->> 'body', '') AS text) AS routine_definition,
+       CAST(CASE WHEN r.kind = 'PROCEDURE' THEN ' ' END AS char(1)) AS function_origin,
+       CAST(CASE WHEN r.kind = 'PROCEDURE' THEN ' '
+                 WHEN r.def ->> 'returns' LIKE 'TABLE(%' THEN 'T' ELSE 'S' END AS char(1)) AS function_type,
+       CAST(NULL AS char(1)) AS external_action,
+       CAST(NULL AS varchar(3)) AS is_null_call,
+       CAST(NULL AS integer) AS scratch_pad,
+       CAST(NULL AS varchar(3)) AS final_call,
+       CAST(NULL AS varchar(3)) AS parallelizable,
+       CAST(NULL AS varchar(3)) AS dbinfo,
+       CAST(NULL AS varchar(128)) AS source_specific_schema,
+       CAST(NULL AS varchar(128)) AS source_specific_name,
+       CAST(NULL AS varchar(3)) AS is_user_defined_cast,
+       CAST(NULL AS bigint) AS cardinality,
+       CAST(NULL AS varchar(3)) AS fenced,
+       CAST(NULL AS varchar(3)) AS commit_on_return,
+       CAST(0 AS smallint) AS iasp_number,
+       CAST(NULL AS varchar(3)) AS new_savepoint_level,
+       CAST(r.created AS timestamp) AS last_altered,
+       CAST(NULL AS char(1)) AS debug_mode,
+       CAST(NULL AS text) AS debug_data,
+       CAST(NULL AS char(1)) AS rounding_mode,
+       CAST(NULL AS varchar(50)) AS routine_text,
+       CAST(NULL AS char(1)) AS secure,
+       CAST(NULL AS bytea) AS routine_environment,
+       CAST(NULL AS bytea) AS routine_default_qdt
+  FROM as4tainr_svc.routines r;
+CREATE OR REPLACE VIEW qsys2.sysparms AS
+WITH p AS (
+  SELECT r.library, r.name, CAST(x.n AS integer) AS pos, x.p ->> 'mode' AS mode,
+         x.p ->> 'name' AS pname, x.p ->> 'ty' AS ty, x.p ->> 'default' AS dft, 'P' AS row_type
+    FROM as4tainr_svc.routines r,
+         jsonb_array_elements(r.def -> 'parms') WITH ORDINALITY AS x(p, n)
+  UNION ALL
+  -- A scalar function's result.
+  SELECT r.library, r.name, CAST(jsonb_array_length(r.def -> 'parms') + 1 AS integer), 'OUT',
+         NULL, r.def ->> 'returns', NULL, 'C'
+    FROM as4tainr_svc.routines r
+   WHERE r.kind = 'FUNCTION' AND r.def ->> 'returns' NOT LIKE 'TABLE(%'
+)
+SELECT CAST(p.library AS varchar(128)) AS specific_schema,
+       CAST(p.name AS varchar(128)) AS specific_name,
+       p.pos AS ordinal_position,
+       CAST(p.mode AS varchar(5)) AS parameter_mode,
+       CAST(p.pname AS varchar(128)) AS parameter_name,
+       CAST(upper(trim(regexp_replace(p.ty, '\s*\(.*$', ''))) AS varchar(128)) AS data_type,
+       CAST(CASE WHEN upper(p.ty) ~ '^(DEC|DECIMAL|NUMERIC|NUM)\y'
+                 THEN coalesce((regexp_match(p.ty, '\(\s*\d+\s*,\s*(\d+)'))[1]::int, 0) END AS integer) AS numeric_scale,
+       CAST(CASE WHEN upper(p.ty) ~ '^(DEC|DECIMAL|NUMERIC|NUM)\y'
+                 THEN coalesce((regexp_match(p.ty, '\(\s*(\d+)'))[1]::int, 5)
+                 WHEN upper(p.ty) ~ '^SMALLINT' THEN 5
+                 WHEN upper(p.ty) ~ '^(INT|INTEGER)\y' THEN 10
+                 WHEN upper(p.ty) ~ '^BIGINT' THEN 19 END AS integer) AS numeric_precision,
+       CAST(CASE WHEN upper(p.ty) ~ '^(CHAR|CHARACTER|VARCHAR|CLOB)' THEN 37 END AS integer) AS ccsid,
+       CAST(CASE WHEN upper(p.ty) ~ '^(CHAR|CHARACTER|VARCHAR|GRAPHIC|VARGRAPHIC|BINARY|VARBINARY)'
+                 THEN coalesce((regexp_match(p.ty, '\(\s*(\d+)'))[1]::int, 1) END AS integer) AS character_maximum_length,
+       CAST(NULL AS integer) AS character_octet_length,
+       CAST(CASE WHEN upper(p.ty) ~ '^(DEC|DECIMAL|NUMERIC|NUM|SMALLINT|INT|INTEGER|BIGINT)\y' THEN 10 END AS integer) AS numeric_precision_radix,
+       CAST(NULL AS integer) AS datetime_precision,
+       CAST('YES' AS varchar(3)) AS is_nullable,
+       CAST(NULL AS varchar(2000)) AS long_comment,
+       CAST(p.row_type AS char(1)) AS row_type,
+       CAST(NULL AS varchar(128)) AS data_type_schema,
+       CAST(NULL AS varchar(128)) AS data_type_name,
+       CAST('NO' AS varchar(3)) AS as_locator,
+       CAST(0 AS smallint) AS iasp_number,
+       CAST('NO' AS varchar(3)) AS normalize_data,
+       CAST(p.dft AS text) AS "default"
+  FROM p;
+"#;
+
+/// Text from bytes in a CCSID (IFS_READ).
+fn decode_function() -> String {
+    // CCSID 37 as a 256-character string (NUL as a blank: PostgreSQL text
+    // cannot hold it).
+    let map: String = crate::tn5250::ebcdic::TO_UNICODE
+        .iter()
+        .map(|&u| format!("\\{:04X}", if u == 0 { 0x20 } else { u }))
+        .collect();
+    format!(
+        r#"CREATE OR REPLACE FUNCTION as4tainr_svc.decode(b bytea, ccsid integer)
+RETURNS text LANGUAGE plpgsql IMMUTABLE SET search_path = pg_catalog, pg_temp AS $as4tainr$
+DECLARE
+  m text := U&'{map}';
+  out text := '';
+  i integer := 0;
+  u integer;
+BEGIN
+  IF ccsid = 1208 THEN RETURN convert_from(b, 'UTF8'); END IF;
+  IF ccsid IN (819, 367) THEN RETURN convert_from(b, 'LATIN1'); END IF;
+  IF ccsid = 1252 THEN RETURN convert_from(b, 'WIN1252'); END IF;
+  IF ccsid = 37 THEN
+    RETURN (SELECT coalesce(string_agg(substr(m, get_byte(b, k) + 1, 1), '' ORDER BY k), '')
+              FROM generate_series(0, length(b) - 1) AS k);
+  END IF;
+  IF ccsid IN (1200, 13488) THEN
+    WHILE i + 1 < length(b) LOOP
+      u := get_byte(b, i) * 256 + get_byte(b, i + 1);
+      out := out || CASE WHEN u BETWEEN 55296 AND 57343 OR u = 0 THEN '?' ELSE chr(u) END;
+      i := i + 2;
+    END LOOP;
+    RETURN out;
+  END IF;
+  RAISE EXCEPTION 'CCSID % cannot be converted.', ccsid USING ERRCODE = '22021';
+END $as4tainr$;"#
+    )
+}
+
+/// QSYS2.IFS_READ, IFS_READ_UTF8 (lines as text) and IFS_READ_BINARY
+/// (pieces as bytes): a stream file, split at its line ends.
+const IFS_READ: &str = r#"
+CREATE OR REPLACE FUNCTION as4tainr_svc.ifs_path(p text)
+RETURNS text LANGUAGE plpgsql IMMUTABLE SET search_path = pg_catalog, pg_temp AS $as4tainr$
+DECLARE
+  parts text[] := '{}';
+  x text;
+BEGIN
+  FOREACH x IN ARRAY string_to_array(coalesce(p, ''), '/') LOOP
+    IF x = '' OR x = '.' THEN CONTINUE; END IF;
+    IF x = '..' THEN parts := parts[1:cardinality(parts) - 1]; CONTINUE; END IF;
+    parts := parts || x;
+  END LOOP;
+  RETURN '/' || array_to_string(parts, '/');
+END $as4tainr$;
+
+CREATE OR REPLACE FUNCTION as4tainr_svc.ifs_file(path_name text, ignore_errors text)
+RETURNS TABLE (data bytea, ccsid integer)
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $as4tainr$
+BEGIN
+  RETURN QUERY SELECT f.data, f.ccsid FROM as4tainr.ifs f
+   WHERE f.path_key = lower(as4tainr_svc.ifs_path(path_name)) AND f.kind = 'F';
+  IF NOT FOUND AND upper(coalesce(ignore_errors, 'YES')) = 'NO' THEN
+    RAISE EXCEPTION 'Stream file % not found.', path_name USING ERRCODE = '42704';
+  END IF;
+END $as4tainr$;
+
+CREATE OR REPLACE FUNCTION as4tainr_svc.ifs_lines(t text, max_len integer, eol text)
+RETURNS TABLE (line_number integer, line text)
+LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, pg_temp AS $as4tainr$
+  WITH lines AS (
+    SELECT l, n FROM regexp_split_to_table(t,
+             CASE upper(coalesce(eol, 'ANY'))
+               WHEN 'ANY' THEN E'\r\n|\n\r|\r|\n' WHEN 'CR' THEN E'\r' WHEN 'LF' THEN E'\n'
+               WHEN 'CRLF' THEN E'\r\n' WHEN 'LFCR' THEN E'\n\r' ELSE E'\\A(?!)' END)
+         WITH ORDINALITY AS x(l, n)
+  ),
+  kept AS (
+    -- The line ends end lines: nothing after the last one is no line.
+    SELECT l, n FROM lines
+     WHERE NOT (l = '' AND n = (SELECT max(n) FROM lines))
+  ),
+  pieces AS (
+    SELECT n, k, substr(l, k * max_len + 1, max_len) AS piece
+      FROM kept, generate_series(0, greatest(ceil(length(l)::numeric / max_len)::int - 1, 0)) AS k
+  )
+  SELECT CAST(row_number() OVER (ORDER BY n, k) AS integer), piece FROM pieces ORDER BY n, k
+$as4tainr$;
+
+DROP FUNCTION IF EXISTS qsys2.ifs_read(varchar, integer, varchar, varchar);
+CREATE FUNCTION qsys2.ifs_read(path_name varchar, maximum_line_length integer DEFAULT 2147483647,
+    end_of_line varchar DEFAULT 'ANY', ignore_errors varchar DEFAULT 'YES')
+RETURNS TABLE (line_number integer, line text)
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $as4tainr$
+  SELECT l.line_number, l.line
+    FROM as4tainr_svc.ifs_file(path_name, ignore_errors) f,
+         as4tainr_svc.ifs_lines(as4tainr_svc.decode(f.data, f.ccsid), maximum_line_length, end_of_line) l
+$as4tainr$;
+
+DROP FUNCTION IF EXISTS qsys2.ifs_read_utf8(varchar, integer, varchar, varchar);
+CREATE FUNCTION qsys2.ifs_read_utf8(path_name varchar, maximum_line_length integer DEFAULT 2147483647,
+    end_of_line varchar DEFAULT 'ANY', ignore_errors varchar DEFAULT 'YES')
+RETURNS TABLE (line_number integer, line text)
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $as4tainr$
+  SELECT * FROM qsys2.ifs_read(path_name, maximum_line_length, end_of_line, ignore_errors)
+$as4tainr$;
+
+DROP FUNCTION IF EXISTS qsys2.ifs_read_binary(varchar, integer, varchar, varchar);
+CREATE FUNCTION qsys2.ifs_read_binary(path_name varchar, maximum_line_length integer DEFAULT 2147483647,
+    end_of_line varchar DEFAULT 'NONE', ignore_errors varchar DEFAULT 'YES')
+RETURNS TABLE (line_number integer, line bytea)
+LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $as4tainr$
+DECLARE
+  f record;
+  k integer := 0;
+BEGIN
+  IF upper(coalesce(end_of_line, 'NONE')) <> 'NONE' THEN
+    RAISE EXCEPTION 'END_OF_LINE must be NONE for IFS_READ_BINARY.' USING ERRCODE = '22023';
+  END IF;
+  FOR f IN SELECT * FROM as4tainr_svc.ifs_file(path_name, ignore_errors) LOOP
+    WHILE k * maximum_line_length < length(f.data) LOOP
+      line_number := k + 1;
+      line := substring(f.data FROM k * maximum_line_length + 1 FOR maximum_line_length);
+      RETURN NEXT;
+      k := k + 1;
+    END LOOP;
+  END LOOP;
+END $as4tainr$;
+"#;
+
+/// JSON text as jsonb, or the null value when it is not JSON (JSON_TABLE
+/// EMPTY ON ERROR).
+const TRY_JSONB: &str = r#"
+CREATE OR REPLACE FUNCTION as4tainr_svc.try_jsonb(t text)
+RETURNS jsonb LANGUAGE plpgsql IMMUTABLE SET search_path = pg_catalog, pg_temp AS $as4tainr$
+BEGIN
+  RETURN t::jsonb;
+EXCEPTION WHEN others THEN
+  RETURN NULL;
+END $as4tainr$;
+GRANT EXECUTE ON FUNCTION as4tainr_svc.try_jsonb(text) TO PUBLIC;
+"#;
+
+/// The services added with this version: definitions and grants.
+fn work_services() -> String {
+    format!(
+        "ALTER TABLE as4tainr.routines ADD COLUMN IF NOT EXISTS created timestamptz NOT NULL DEFAULT now();
+         {TRY_JSONB}
+         {}
+         {}
+         {}
+         {JOBLOG_INFO}
+         {}
+         {ROUTINE_VIEWS}
+         {}
+         {IFS_READ}
+         GRANT SELECT ON qsys2.library_list_info, qsys2.user_info, qsys2.system_value_info,
+               qsys2.sysroutines, qsys2.sysparms TO {SQL_ROLE};",
+        library_list_info(),
+        user_info(),
+        system_value_info(),
+        active_job_info(),
+        decode_function(),
+    )
 }

@@ -28,6 +28,10 @@ File descriptors belong to the job: a descriptor one program opened can be used 
 | `CPYTOSTMF FROMMBR('/QSYS.LIB/lib.LIB/file.FILE/mbr.MBR') TOSTMF(path)` | A source member's records as lines: trailing blanks removed and ENDLINFMT's line end added (*CRLF by default; *FIXED keeps the records whole); STMFOPT(*NONE, *ADD, *REPLACE); STMFCCSID (a number, *STMF: the existing file's CCSID or 37 for a new file, *PCASCII 1252, *STDASCII 819). CPFA097 when the file exists with STMFOPT(*NONE) |
 | `CPYFRMSTMF FROMSTMF(path) TOMBR('/QSYS.LIB/...')` | Lines into a source member: any combination of CR and LF ends a line, tabs become blanks to the next stop of 8 (TABEXPN(*YES)); MBROPT(*NONE, *ADD, *REPLACE); CPFA095 when it cannot copy |
 
+## From SQL
+
+`QSYS2.IFS_READ`, `IFS_READ_UTF8` and `IFS_READ_BINARY` read a stream file as lines, and `QSYS2.IFS_WRITE`, `IFS_WRITE_UTF8` and `IFS_WRITE_BINARY` write lines (docs/sql.md, IBM i services).
+
 ## CCSIDs
 
 Text is converted between CCSID 37 (EBCDIC), 1208 (UTF-8), 819 and 367 (ISO 8859-1 and ASCII), 1252 (taken as ISO 8859-1), and 1200 and 13488 (UTF-16). An open with O_TEXTDATA between other CCSIDs fails with ECONVERT.

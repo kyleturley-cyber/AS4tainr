@@ -271,6 +271,12 @@ impl Machine<'_> {
                     d,
                 ))?
             };
+            let mut s = s;
+            let job = self.io.job.as_ref().map(|j| j.to_string());
+            let user = self.io.user.clone();
+            // The program does not know which entry is the current
+            // library.
+            self.block(s.set_context(&user, None, job))?;
             self.sql.session = Some(s);
         }
         Ok(self.sql.session.as_ref().unwrap())

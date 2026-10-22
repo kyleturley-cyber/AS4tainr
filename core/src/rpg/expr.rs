@@ -140,9 +140,23 @@ pub fn tokens(text: &str) -> Result<Vec<Tok>> {
             while i < cs.len() && is_name_char(cs[i]) {
                 i += 1;
             }
-            out.push(Tok::Special(
-                cs[start..i].iter().collect::<String>().to_ascii_uppercase(),
-            ));
+            let mut word = cs[start..i].iter().collect::<String>().to_ascii_uppercase();
+            // A date or time format with its separator: *MDY-, *DMY., *HMS&
+            // (ILE RPG reference, date and time formats); the separator is
+            // the last character of the argument.
+            if matches!(
+                word.as_str(),
+                "*MDY" | "*DMY" | "*YMD" | "*JUL" | "*CYMD" | "*CMDY" | "*CDMY" | "*HMS"
+            ) && cs.get(i).is_some_and(|c| "/-.,&:".contains(*c))
+                && cs
+                    .get(i + 1)
+                    .is_none_or(|c| *c == ')' || *c == ':' || c.is_whitespace())
+                && !(cs[i] == ':' && word != "*HMS")
+            {
+                word.push(cs[i]);
+                i += 1;
+            }
+            out.push(Tok::Special(word));
             continue;
         }
         // `.NAME` right after an index: `list.users(i).name`.

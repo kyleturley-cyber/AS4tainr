@@ -22,7 +22,8 @@ use crate::sql::SQL_ROLE;
 // 9: character columns of the catalog views in the "C" collation, so
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
-const VERSION: &str = "as4tainr services 9";
+// 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
+const VERSION: &str = "as4tainr services 12";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -511,7 +512,7 @@ pub async fn init(client: &Client) -> Result<()> {
              COMMENT ON SCHEMA as4tainr_svc IS '{VERSION}';",
             object_statistics(),
             work_services(),
-            crate::journal::sql_functions() + &crate::pftrg::sql_functions() + &crate::sqlcat::sql()
+            crate::journal::sql_functions() + &crate::pftrg::sql_functions() + &crate::sqlcat::sql() + &crate::sqlfn::sql()
         ))
         .await
         .context("creating the QSYS2 services")?;

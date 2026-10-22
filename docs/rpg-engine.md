@@ -123,7 +123,7 @@ What R1 covers:
   - EVAL/EVALR (including `+=`), arithmetic (Z-ADD, Z-SUB, ADD, SUB, MULT, DIV, MVR), MOVE/MOVEL, COMP, CAT, TIME, CLEAR;
   - SETON/SETOFF, conditioning and resulting indicators;
   - file operations, `*ENTRY PLIST`, KLIST, DSPLY.
-- **Built-in functions:** %EOF, %FOUND, %EQUAL, %ERROR, %CHAR, %TRIM(L/R), %SUBST (also as a target), %LEN, %SIZE, %ELEM, %SCAN, %REPLACE, %XLATE, %UPPER, %LOWER, %CHECK(R), %INT(H), %DEC(H), %ABS, %DIV, %REM, %EDITC.
+- **Built-in functions:** %EOF, %FOUND, %EQUAL, %ERROR, %CHAR, %TRIM(L/R), %SUBST (also as a target), %LEN, %SIZE, %ELEM, %SCAN, %REPLACE, %XLATE, %UPPER, %LOWER, %CHECK(R), %INT(H), %DEC(H), %ABS, %DIV, %REM, %EDITC (with *ASTFILL, *CURSYM or a currency symbol).
 - **The cycle:** detail calculations repeat until LR (no primary file), then total calculations (`LR` in positions 7-8). RETURN ends the program.
 
 ## Milestones

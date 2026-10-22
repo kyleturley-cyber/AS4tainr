@@ -265,7 +265,15 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<Tok>> {
             || (c == '.' && cs.get(i + 1).is_some_and(|d| d.is_ascii_digit()))
         {
             let s = i;
-            while i < cs.len() && (cs[i].is_ascii_alphanumeric() || cs[i] == '.') {
+            while i < cs.len()
+                && (cs[i].is_ascii_alphanumeric()
+                    || cs[i] == '.'
+                    // 1.0E-3: the exponent's sign.
+                    || ("+-".contains(cs[i])
+                        && matches!(cs.get(i - 1), Some('e' | 'E'))
+                        && cs[s..i - 1].iter().all(|c| c.is_ascii_digit() || *c == '.')
+                        && cs.get(i + 1).is_some_and(|d| d.is_ascii_digit())))
+            {
                 i += 1;
             }
             out.push(Tok::Number(cs[s..i].iter().collect()));
@@ -284,6 +292,27 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<Tok>> {
         }
     }
     Ok(out)
+}
+
+/// The closing parenthesis of the one at `open`, and the commas at its
+/// level.
+fn paren_span(toks: &[Tok], open: usize) -> Option<(usize, Vec<usize>)> {
+    let mut depth = 0i32;
+    let mut commas = Vec::new();
+    for (j, t) in toks.iter().enumerate().skip(open) {
+        match t {
+            Tok::Punct(p) if p == "(" => depth += 1,
+            Tok::Punct(p) if p == ")" => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((j, commas));
+                }
+            }
+            Tok::Punct(p) if p == "," && depth == 1 => commas.push(j),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn word(t: &Tok) -> Option<String> {
@@ -351,11 +380,178 @@ pub struct Translated {
 
 /// Translate one DB2 for i statement. `is_library` says whether a name is
 /// a library, for system naming (`LIB/FILE`).
+/// The decimal type of a simple operand of `/`: a numeric constant, an
+/// integer constant (DECIMAL(11, 0) in decimal arithmetic, as INTEGER is),
+/// DECIMAL(x, p, s) / DEC(...) with constant precision and scale, or
+/// CAST(... AS DECIMAL(p, s)). (precision, scale, is a decimal).
+fn operand_type(toks: &[Tok], from: usize, to: usize) -> Option<(u32, u32, bool)> {
+    let sig: Vec<usize> = (from..=to)
+        .filter(|&j| !matches!(toks[j], Tok::Space(_)))
+        .collect();
+    let num = |n: &str| -> Option<(u32, u32, bool)> {
+        if !n.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return None;
+        }
+        match n.split_once('.') {
+            Some((i, f)) => {
+                let i = i.trim_start_matches('0');
+                Some(((i.len() + f.len()).max(1) as u32, f.len() as u32, true))
+            }
+            None => Some((11, 0, false)),
+        }
+    };
+    if let [one] = sig.as_slice() {
+        if let Tok::Number(n) = &toks[*one] {
+            return num(n);
+        }
+        return None;
+    }
+    let first = word(&toks[*sig.first()?])?;
+    let open = *sig.get(1)?;
+    if toks[open] != Tok::Punct("(".into()) {
+        return None;
+    }
+    let (close, commas) = paren_span(toks, open)?;
+    if close != to {
+        return None;
+    }
+    let int_at = |a: usize, b: usize| -> Option<u32> {
+        let v: Vec<&Tok> = toks[a + 1..b]
+            .iter()
+            .filter(|t| !matches!(t, Tok::Space(_)))
+            .collect();
+        match v.as_slice() {
+            [Tok::Number(n)] => n.parse().ok(),
+            _ => None,
+        }
+    };
+    match first.as_str() {
+        "DEC" | "DECIMAL" => {
+            let ends: Vec<usize> = commas.iter().copied().chain([close]).collect();
+            let p = if commas.is_empty() {
+                15
+            } else {
+                int_at(ends[0], ends[1])?
+            };
+            let sc = if commas.len() < 2 {
+                0
+            } else {
+                int_at(ends[1], ends[2])?
+            };
+            Some((p, sc, true))
+        }
+        "CAST" => {
+            let a = (open..close)
+                .rev()
+                .find(|&j| word(&toks[j]).as_deref() == Some("AS"))?;
+            let t = (a + 1..close).find(|&j| !matches!(toks[j], Tok::Space(_)))?;
+            if !matches!(
+                word(&toks[t]).as_deref(),
+                Some("DEC" | "DECIMAL" | "NUMERIC")
+            ) {
+                return None;
+            }
+            let tp = (t + 1..close).find(|&j| !matches!(toks[j], Tok::Space(_)));
+            match tp {
+                Some(tp) if toks[tp] == Tok::Punct("(".into()) => {
+                    let (c2, cm) = paren_span(toks, tp)?;
+                    let p = int_at(tp, *cm.first().unwrap_or(&c2))?;
+                    let sc = match cm.first() {
+                        Some(&k) => int_at(k, c2)?,
+                        None => 0,
+                    };
+                    Some((p, sc, true))
+                }
+                _ => Some((5, 0, true)),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Decimal division as Db2 for i does it (IBM i SQL Reference, decimal
+/// arithmetic: "The precision of the result of division is 31"; the scale
+/// is 31 - p + s - s'): `a / b` of operands whose types are known here is
+/// rewritten to as4tainr_svc.ddiv(a, b, scale). Other divisions keep
+/// PostgreSQL's scale.
+fn decimal_division(toks: Vec<Tok>) -> Vec<Tok> {
+    let mut toks = toks;
+    let mut k = 0;
+    while k < toks.len() {
+        if toks[k] != Tok::Punct("/".into()) {
+            k += 1;
+            continue;
+        }
+        let prev = (0..k).rev().find(|&j| !matches!(toks[j], Tok::Space(_)));
+        let next = (k + 1..toks.len()).find(|&j| !matches!(toks[j], Tok::Space(_)));
+        let (Some(pe), Some(ns)) = (prev, next) else {
+            k += 1;
+            continue;
+        };
+        // The left operand: a number, or a call ending at `pe`.
+        let ls = match &toks[pe] {
+            Tok::Number(_) => Some(pe),
+            Tok::Punct(p) if p == ")" => {
+                let mut depth = 0i32;
+                let open = (0..=pe).rev().find(|&j| {
+                    match &toks[j] {
+                        Tok::Punct(p) if p == ")" => depth += 1,
+                        Tok::Punct(p) if p == "(" => depth -= 1,
+                        _ => {}
+                    }
+                    depth == 0
+                });
+                open.and_then(|o| (0..o).rev().find(|&j| !matches!(toks[j], Tok::Space(_))))
+            }
+            _ => None,
+        };
+        // The right operand: a number, or a call starting at `ns`.
+        let re = match &toks[ns] {
+            Tok::Number(_) => Some(ns),
+            Tok::Word(_) => (ns + 1..toks.len())
+                .find(|&j| !matches!(toks[j], Tok::Space(_)))
+                .filter(|&o| toks[o] == Tok::Punct("(".into()))
+                .and_then(|o| paren_span(&toks, o).map(|(c, _)| c)),
+            _ => None,
+        };
+        let (Some(ls), Some(re)) = (ls, re) else {
+            k += 1;
+            continue;
+        };
+        let (Some((p, s, ld)), Some((_, s2, rd))) =
+            (operand_type(&toks, ls, pe), operand_type(&toks, ns, re))
+        else {
+            k += 1;
+            continue;
+        };
+        // Integer by integer stays integer division.
+        if !ld && !rd {
+            k += 1;
+            continue;
+        }
+        let scale = (31i64 - p as i64 + s as i64 - s2 as i64).max(0);
+        let mut new: Vec<Tok> = toks[..ls].to_vec();
+        new.push(Tok::Word("as4tainr_svc.ddiv".into()));
+        new.push(Tok::Punct("(".into()));
+        new.extend_from_slice(&toks[ls..=pe]);
+        new.push(Tok::Punct(",".into()));
+        new.extend_from_slice(&toks[ns..=re]);
+        new.push(Tok::Punct(",".into()));
+        new.push(Tok::Number(scale.to_string()));
+        new.push(Tok::Punct(")".into()));
+        let resume = new.len();
+        new.extend_from_slice(&toks[re + 1..]);
+        toks = new;
+        k = resume;
+    }
+    toks
+}
+
 pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Translated> {
-    let mut toks = sequence_values(
+    let mut toks = decimal_division(sequence_values(
         crate::sqljsonfn::rewrite(crate::sqljson::rewrite(tokenize(sql.trim())?)?)?,
         is_library,
-    );
+    ));
     // One statement: a trailing ';' is allowed, no other.
     while matches!(toks.last(), Some(Tok::Space(_))) {
         toks.pop();
@@ -451,7 +647,216 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
                 continue;
             }
         }
+        // A number with an exponent is floating point in Db2 (Db2 for i SQL
+        // Reference, constants); PostgreSQL would read it as numeric.
+        if let Tok::Number(n) = t {
+            if n.contains(['e', 'E'])
+                && n.chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit() || c == '.')
+            {
+                out.push(Tok::Punct(format!("CAST({n} AS double precision)")));
+                i += 1;
+                continue;
+            }
+        }
+        // Labeled durations (Db2 for i SQL Reference, datetime arithmetic):
+        // `expr + 1 MONTH`, `(n) DAYS` as intervals; a month added to the
+        // 31st ends at the month's last day, as in Db2.
+        if let Some(unit) = w.as_deref().and_then(|w| match w {
+            "YEAR" | "YEARS" => Some("year"),
+            "MONTH" | "MONTHS" => Some("month"),
+            "DAY" | "DAYS" => Some("day"),
+            "HOUR" | "HOURS" => Some("hour"),
+            "MINUTE" | "MINUTES" => Some("minute"),
+            "SECOND" | "SECONDS" => Some("second"),
+            "MICROSECOND" | "MICROSECONDS" => Some("microsecond"),
+            _ => None,
+        }) {
+            let after_value = matches!(
+                out.iter().rev().find(|t| !matches!(t, Tok::Space(_))),
+                Some(Tok::Number(_))
+            ) || matches!(
+                out.iter().rev().find(|t| !matches!(t, Tok::Space(_))),
+                Some(Tok::Punct(p)) if p == ")"
+            );
+            let call =
+                next_non_space(&toks, i + 1).is_some_and(|o| toks[o] == Tok::Punct("(".into()));
+            if after_value && !call {
+                out.push(Tok::Punct(format!("* interval '1 {unit}'")));
+                i += 1;
+                continue;
+            }
+        }
+        let prev_word = out
+            .iter()
+            .rev()
+            .find(|t| !matches!(t, Tok::Space(_)))
+            .and_then(|t| match t {
+                Tok::Punct(p) if p.ends_with(" AS") => Some("AS".to_string()),
+                t => word(t),
+            });
+        let call_open = next_non_space(&toks, i + 1).filter(|&o| toks[o] == Tok::Punct("(".into()));
         match w.as_deref() {
+            // CAST(x AS INTEGER | SMALLINT | BIGINT | DECIMAL(p, s) |
+            // NUMERIC(p, s)): Db2 for i cuts off the fraction digits that do
+            // not fit (Db2 for i SQL Reference, numeric assignments: "the
+            // fractional part of the number is eliminated"; trailing digits
+            // of a decimal are eliminated); PostgreSQL would round.
+            Some("CAST") if call_open.is_some() => {
+                let o = call_open.unwrap();
+                if let Some((c, _)) = paren_span(&toks, o) {
+                    let mut depth = 0i32;
+                    let as_at = (o..c).find(|&j| {
+                        match &toks[j] {
+                            Tok::Punct(p) if p == "(" => depth += 1,
+                            Tok::Punct(p) if p == ")" => depth -= 1,
+                            t if depth == 1 && word(t).as_deref() == Some("AS") => return true,
+                            _ => {}
+                        }
+                        false
+                    });
+                    if let Some(a) = as_at {
+                        let target = next_non_space(&toks, a + 1).and_then(|j| word(&toks[j]));
+                        let scale = || -> Option<String> {
+                            let t = next_non_space(&toks, a + 1)?;
+                            let open = next_non_space(&toks, t + 1)
+                                .filter(|&k| toks[k] == Tok::Punct("(".into()));
+                            let Some(open) = open else {
+                                return Some("0".into());
+                            };
+                            let (close, commas) = paren_span(&toks, open)?;
+                            if commas.is_empty() {
+                                return Some("0".into());
+                            }
+                            let v: Vec<&Tok> = toks[commas[0] + 1..close]
+                                .iter()
+                                .filter(|t| !matches!(t, Tok::Space(_)))
+                                .collect();
+                            match v.as_slice() {
+                                [Tok::Number(n)] => Some(n.clone()),
+                                _ => None,
+                            }
+                        };
+                        let rewrite = match target.as_deref() {
+                            Some("INTEGER" | "INT" | "SMALLINT" | "BIGINT") => {
+                                Some(") AS numeric)) AS".to_string())
+                            }
+                            Some("DECIMAL" | "DEC" | "NUMERIC") => {
+                                scale().map(|sc| format!(") AS numeric), {sc}) AS"))
+                            }
+                            _ => None,
+                        };
+                        if let Some(r) = rewrite {
+                            out.push(Tok::Punct("CAST(trunc(CAST((".into()));
+                            close_with.push((a, r));
+                            i = o + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            // CHAR(value [, ISO | USA | EUR | JIS | LOCAL | length]) as a
+            // function (not a data type after AS): Db2's formats
+            // (sqlfn.rs).
+            Some("CHAR" | "CHARACTER")
+                if call_open.is_some() && prev_word.as_deref() != Some("AS") =>
+            {
+                let o = call_open.unwrap();
+                if let Some((_, commas)) = paren_span(&toks, o) {
+                    if let [comma] = commas.as_slice() {
+                        if let Some(f) = next_non_space(&toks, comma + 1) {
+                            if let Some(fmt) = word(&toks[f]) {
+                                if ["ISO", "USA", "EUR", "JIS", "LOCAL"].contains(&fmt.as_str()) {
+                                    let fmt = if fmt == "LOCAL" {
+                                        "ISO".to_string()
+                                    } else {
+                                        fmt
+                                    };
+                                    close_with.push((f, format!("'{fmt}'")));
+                                }
+                            }
+                        }
+                    }
+                }
+                out.push(Tok::Word("as4tainr_svc.char".into()));
+                i += 1;
+                continue;
+            }
+            // DIGITS(x): the precision of DECIMAL(x, p, s) or CAST(x AS
+            // DECIMAL(p, s)) gives the number of digits (Db2 for i SQL
+            // Reference, DIGITS).
+            Some("DIGITS") if call_open.is_some() => {
+                let o = call_open.unwrap();
+                if let Some((c, _)) = paren_span(&toks, o) {
+                    let inner = next_non_space(&toks, o + 1);
+                    let number_at = |k: usize| -> Option<String> {
+                        let j = next_non_space(&toks, k + 1)?;
+                        match &toks[j] {
+                            Tok::Number(n) if n.chars().all(|c| c.is_ascii_digit()) => {
+                                Some(n.clone())
+                            }
+                            _ => None,
+                        }
+                    };
+                    let p = inner.and_then(|f| match word(&toks[f]).as_deref() {
+                        Some("DEC" | "DECIMAL") => {
+                            let open = next_non_space(&toks, f + 1)?;
+                            let (_, commas) = paren_span(&toks, open)?;
+                            match commas.first() {
+                                Some(&k) => number_at(k),
+                                None => Some("15".into()),
+                            }
+                        }
+                        Some("CAST") => {
+                            let open = next_non_space(&toks, f + 1)?;
+                            let (close, _) = paren_span(&toks, open)?;
+                            let a = (open..close)
+                                .rev()
+                                .find(|&j| word(&toks[j]).as_deref() == Some("AS"))?;
+                            let t = next_non_space(&toks, a + 1)?;
+                            if !matches!(
+                                word(&toks[t]).as_deref(),
+                                Some("DEC" | "DECIMAL" | "NUMERIC")
+                            ) {
+                                return None;
+                            }
+                            let tp = next_non_space(&toks, t + 1)?;
+                            if toks[tp] != Tok::Punct("(".into()) {
+                                return Some("5".into());
+                            }
+                            number_at(tp)
+                        }
+                        _ => None,
+                    });
+                    out.push(Tok::Word("as4tainr_svc.digits".into()));
+                    if let Some(p) = p {
+                        close_with.push((c, format!(", {p})")));
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
+            // TIMESTAMP(string | date [, time]) as a function: the Db2
+            // string form yyyy-mm-dd-hh.mm.ss.nnnnnn (sqlfn.rs); TIMESTAMP(6)
+            // after AS is the data type.
+            Some("TIMESTAMP")
+                if call_open.is_some()
+                    && prev_word.as_deref() != Some("AS")
+                    && !matches!(
+                        next_non_space(&toks, call_open.unwrap() + 1).map(|j| &toks[j]),
+                        Some(Tok::Number(_))
+                    ) =>
+            {
+                out.push(Tok::Word("as4tainr_svc.timestamp".into()));
+                i += 1;
+                continue;
+            }
+            Some("VARCHAR_FORMAT") if call_open.is_some() => {
+                out.push(Tok::Word("as4tainr_svc.varchar_format".into()));
+                i += 1;
+                continue;
+            }
             Some("CURRENT") => {
                 if let Some(j) = next_non_space(&toks, i + 1) {
                     if let Some(n) = word(&toks[j]) {
@@ -527,7 +932,7 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
                     .is_some_and(|o| toks[o] == Tok::Punct("(".into()))
                     && match out.iter().rev().find(|t| !matches!(t, Tok::Space(_))) {
                         None => true,
-                        Some(Tok::Punct(p)) => p != ")",
+                        Some(Tok::Punct(p)) => p != ")" && !p.ends_with(" AS"),
                         Some(t) => word(t).is_some_and(|w| {
                             matches!(
                                 w.as_str(),
@@ -619,7 +1024,14 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
                     depth == 0
                 });
                 if let (Some(_), Some(k)) = (close, comma) {
-                    let name = if f == "ROUND" { "round" } else { "trunc" };
+                    // The result keeps the argument's precision and scale
+                    // (Db2 for i SQL Reference, ROUND and TRUNCATE;
+                    // ROUND(2.675, 2) is 2.680 on IBM i 7.5).
+                    let name = if f == "ROUND" {
+                        "as4tainr_svc.round"
+                    } else {
+                        "as4tainr_svc.truncate"
+                    };
                     out.push(Tok::Punct(format!("{name}(CAST((")));
                     close_with.push((k, ") AS numeric),".into()));
                     i = o + 1;

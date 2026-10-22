@@ -649,7 +649,7 @@ with Tn5250(HOST) as t:
     command(t, "dsppfm contacts/qrpglesrc mbr(contcnt)", "Display Physical File Member")
     check("1.00" in t.text() and "CONTCNT" in t.text(), "DSPPFM shows a source member's lines", t)
     t.fkey(3); t.wait_for("Command Entry")
-    command(t, "crtbndrpg contacts/contcnt", "Program CONTCNT was created in library CONTACTS.")
+    command(t, "crtbndrpg contacts/contcnt", "Program CONTCNT was created in library CONTACTS")
     check(True, "CRTBNDRPG creates a program from QRPGLESRC (SRCMBR(*PGM))", t)
     command(t, "call contacts/contcnt", "DSPLY  Barbara Liskov", timeout=90)
     check("DSPLY  5" in t.text() and "DSPLY  Grace Hopper" in t.text(),

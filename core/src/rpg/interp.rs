@@ -1212,12 +1212,28 @@ impl<'a> Machine<'a> {
                     Some(t) if t.is_numeric() => t.precision(),
                     _ => (v.int_digits() + v.scale() as u32, v.scale() as u32),
                 };
-                Value::str(&edit_code(
-                    &v,
-                    digits,
-                    decs,
-                    code.chars().next().unwrap_or('Z'),
-                ))
+                let mut out = edit_code(&v, digits, decs, code.chars().next().unwrap_or('Z'));
+                // The third argument (ILE RPG Reference, %EDITC): *ASTFILL
+                // replaces the leading blanks with asterisks; *CURSYM (the
+                // currency symbol, '$' unless CURSYM says otherwise) or a
+                // one-character literal floats left of the first digit,
+                // the result one position longer.
+                if let Some(third) = args.get(2) {
+                    let special = match third {
+                        Expr::Name { parts, .. } if parts.len() == 1 => Some(parts[0].as_str()),
+                        _ => None,
+                    };
+                    let lead = out.len() - out.trim_start().len();
+                    match special {
+                        Some("*ASTFILL") => out = format!("{}{}", "*".repeat(lead), &out[lead..]),
+                        Some("*CURSYM") => out = format!("{}${}", &out[..lead], &out[lead..]),
+                        _ => {
+                            let sym = a(&arg(self, 2)?.chars()?);
+                            out = format!("{}{}{}", &out[..lead], sym.trim_end(), &out[lead..]);
+                        }
+                    }
+                }
+                Value::str(&out)
             }
             "ADDR" => {
                 // %ADDR(name), %ADDR(array(i)), %ADDR(varying: *DATA).
@@ -5560,8 +5576,23 @@ pub fn edit_code(v: &Dec, digits: u32, decs: u32, code: char) -> String {
     let (int, frac) = raw.split_at(raw.len() - decs as usize);
     let commas = matches!(code, '1' | '2' | 'A' | 'B' | 'J' | 'K' | 'N' | 'O');
     let zero_blank = matches!(code, '2' | '4' | 'B' | 'D' | 'K' | 'M' | 'O' | 'Q' | 'Z');
+    // X: the digits unedited, a negative value's sign in the last digit as
+    // in zoned decimal (IBM i 7.5: %EDITC(-1234.56: 'X') of a 9,2 field is
+    // '00012345O').
     if code == 'X' {
+        if d.is_negative() {
+            let last = raw.as_bytes()[raw.len() - 1] - b'0';
+            let zoned = b"}JKLMNOPQR"[last as usize] as char;
+            return format!("{}{zoned}", &raw[..raw.len() - 1]);
+        }
         return raw;
+    }
+    // Z: every digit, the decimal positions too, leading zeros blanked, no
+    // decimal point and no sign (IBM i 7.5: -1234.56 in 9,2 is '   123456').
+    if code == 'Z' {
+        let all = format!("{int}{frac}");
+        let t = all.trim_start_matches('0');
+        return format!("{:>w$}", t, w = digits as usize);
     }
     if code == 'Y' {
         // Date edit (ILE RPG Reference, edit codes): nn/nn/nn for six
@@ -5617,10 +5648,13 @@ pub fn edit_code(v: &Dec, digits: u32, decs: u32, code: char) -> String {
         'N' | 'O' | 'P' | 'Q' => "",
         _ => "",
     };
-    let lead = if matches!(code, 'N' | 'O' | 'P' | 'Q') && neg {
-        "-"
-    } else {
-        ""
+    // N-Q: a position for the floating minus sign, blank when the value is
+    // not negative (IBM i 7.5: %EDITC(0: 'N') of a 9,2 field is 13
+    // positions, '          .00').
+    let lead = match (matches!(code, 'N' | 'O' | 'P' | 'Q'), neg) {
+        (true, true) => "-",
+        (true, false) => " ",
+        _ => "",
     };
     let width = digits as usize
         + if decs > 0 && code != 'Z' { 1 } else { 0 }
@@ -5741,6 +5775,16 @@ mod tests {
             " 1,234.50-"
         );
         assert_eq!(edit_code(&Dec::parse("0").unwrap(), 3, 0, 'Z'), "   ");
+        // Observed on IBM i 7.5 (PUB400, tools/golden/rpg-sql.txt): X keeps
+        // a negative sign in the last digit, Z keeps the decimal digits.
+        assert_eq!(
+            edit_code(&Dec::parse("-1234.56").unwrap(), 9, 2, 'X'),
+            "00012345O"
+        );
+        assert_eq!(
+            edit_code(&Dec::parse("-1234.56").unwrap(), 9, 2, 'Z'),
+            "   123456"
+        );
         // J does not blank a zero value: one zero, then the sign position.
         assert_eq!(edit_code(&Dec::parse("0").unwrap(), 3, 0, 'J'), "  0 ");
         // Y: nn/nn/nn, nn/nn/nnnn for eight digits, leftmost zero

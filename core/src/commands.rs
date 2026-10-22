@@ -2444,7 +2444,13 @@ impl Job<'_> {
             .await?;
         crate::ile::set_program_binding(self.client, &lib, &name, binding.as_ref()).await?;
         authority::set_owner(self.client, &lib, &name, "*PGM", &self.user).await?;
-        // A CL program: CPC0815 (observed on IBM i 7.5).
+        // A CL program: CPC0815; an ILE RPG program: RNS9304 with the
+        // highest severity (observed on IBM i 7.5).
+        if cmd.def.name == "CRTBNDRPG" {
+            return Ok(Outcome::Messages(vec![format!(
+                "RNS9304: Program {name} was created in library {lib}; highest severity 00."
+            )]));
+        }
         let id = if matches!(cmd.def.name, "CRTBNDCL" | "CRTCLPGM") {
             "CPC0815: "
         } else {

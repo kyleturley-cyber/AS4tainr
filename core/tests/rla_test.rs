@@ -4166,7 +4166,12 @@ async fn import_an_application() {
         _ => String::new(),
     };
     let m = msgs(job.run("CRTBNDRPG PGM(CONTCNT)").await.unwrap());
-    assert_eq!(m, format!("Program CONTCNT was created in library {lib}."));
+    // CRTBNDRPG's completion message is RNS9304 (observed on IBM i 7.5,
+    // tools/golden/rpg-sql.txt).
+    assert_eq!(
+        m,
+        format!("RNS9304: Program CONTCNT was created in library {lib}; highest severity 00.")
+    );
     let e = job
         .run("CRTBNDRPG PGM(CONTCNT) REPLACE(*NO)")
         .await
@@ -6773,6 +6778,45 @@ async fn sql_db2_scalar_functions() {
         .await,
         "1|61|1|31|3|2024|8|15"
     );
+    // CHAR (Db2 for i SQL Reference, CHAR): a decimal with a minus sign, no
+    // leading zeros, the decimal point when the scale is not 0 and its
+    // trailing zeros; an integer's digits (EDLEVEL 18 is '18'); a floating
+    // point number as '-9.8765432100000002E-33' (the reference's example);
+    // a date in the format named (CHAR(PRSTDATE, USA) of 1988-12-25 is
+    // '12/25/1988').
+    assert_eq!(
+        run(
+            "SELECT CHAR(DEC(-12.5, 5, 2)), CHAR(DEC(0.5, 5, 2)), CHAR(DEC(7, 5, 0)), CHAR(18), \
+             CHAR(-9.8765432100000002E-33), CHAR(DATE('1988-12-25'), USA), \
+             CHAR(DATE('1988-12-25'), EUR), CHAR(DATE('1988-12-25'), ISO) FROM SYSIBM.SYSDUMMY1"
+        )
+        .await,
+        "-12.50|.50|7|18|-9.8765432100000002E-33|12/25/1988|25.12.1988|1988-12-25"
+    );
+    // CAST to an integer or a decimal of smaller scale cuts off the
+    // fraction digits (Db2 for i SQL Reference, numeric assignments: "the
+    // fractional part of the number is eliminated"); DIGITS gives the
+    // absolute value's digits to the precision (DIGITS); TIMESTAMP reads
+    // Db2's yyyy-mm-dd-hh.mm.ss.nnnnnn form and CHAR writes it back.
+    assert_eq!(
+        run(
+            "SELECT CAST(-1.5 AS INTEGER), CAST(7.9 AS SMALLINT), CAST(7.59 AS DEC(5, 1)), \
+             CAST('-3.77' AS DECIMAL(5, 1)), DIGITS(DEC(-12.5, 5, 2)), DIGITS(CAST(42 AS INTEGER)), \
+             CHAR(TIMESTAMP('2026-10-22-20.05.09.123456')) FROM SYSIBM.SYSDUMMY1"
+        )
+        .await,
+        "-1|7|7.5|-3.7|01250|0000000042|2026-10-22-20.05.09.123456"
+    );
+    // Labeled durations (Db2 for i SQL Reference, datetime arithmetic):
+    // a month added to January 31 ends on the month's last day.
+    assert_eq!(
+        run(
+            "SELECT CHAR(DATE('2026-01-31') + 1 MONTH, ISO), CHAR(DATE('2024-02-29') + 1 YEAR, ISO), \
+             CHAR(DATE('2026-10-22') + 10 DAYS, ISO) FROM SYSIBM.SYSDUMMY1"
+        )
+        .await,
+        "2026-02-28|2025-02-28|2026-11-01"
+    );
 }
 
 /// A service program whose NOMAIN module holds an SQL cursor (Db2 for i
@@ -7844,6 +7888,33 @@ exec sql rollback;
         entries("WHERE JOURNAL_CODE = 'R'").await.len(),
         rows.iter().filter(|r| r[0].starts_with('R')).count() + 1
     );
+}
+
+/// %EDITC with *ASTFILL, *CURSYM or a currency symbol; %CHAR(date: *MDY-).
+#[tokio::test]
+async fn rpg_editc_third_argument() {
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "EDITC3",
+        include_str!("rpg/editc3.rpgle"),
+        None,
+        None,
+    )
+    .await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let m: Vec<String> = r
+        .messages
+        .iter()
+        .map(|m| m.trim_start_matches("DSPLY").trim_start().to_string())
+        .collect();
+    // 'J' edits 1234.56 in 9,2 as '    1,234.56 ' (12 positions and the
+    // sign position): the four leading blanks become asterisks; the
+    // currency symbol takes the place left of the first digit.
+    assert_eq!(m, ["****1,234.56", "$1,234.56", "X1,234.56", "10-22-26",]);
 }
 
 /// Date and time formats (ILE RPG Reference, "Date Data Type", "Time

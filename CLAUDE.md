@@ -29,6 +29,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/sqljson.rs` | JSON_TABLE rewritten for PostgreSQL's SQL/JSON path functions |
 | `core/src/sqljsonfn.rs` | JSON_OBJECT, JSON_ARRAY, JSON_ARRAYAGG, JSON_OBJECTAGG, JSON_VALUE, JSON_QUERY, JSON_EXISTS rewritten to PostgreSQL json with Db2's compact text (the `as4tainr_svc.json_*` functions) |
 | `core/src/sqlcat.rs` | Catalog views SYSSEQUENCES, SYSCST, SYSKEYCST, SYSCHKCST, SYSREFCST, SYSTRIGGERS and services JOB_INFO, OUTPUT_QUEUE_ENTRIES(_BASIC), OBJECT_PRIVILEGES (made with the services) |
+| `core/src/sqlfn.rs` | Db2 scalar functions PostgreSQL does differently: CHAR of numbers, dates and times, DIGITS, TIMESTAMP of a Db2 timestamp string, VARCHAR_FORMAT (`as4tainr_svc` functions made with the services; `sql.rs` rewrites the calls) |
 | `core/src/sql.rs` | SQL in the DB2 for i dialect: translation to PostgreSQL, run on a separate connection as the restricted `as4tainr_sql` login |
 | `core/src/runtime.rs` | What a running program shares with its job: database sessions (`connect_db`, `job_session`: application name and record wait), the display channel (`DisplayRequest`) |
 | `core/src/dspf.rs` | DDS display files: parser, drawing a record on a 5250 screen, input validation, response indicators |

@@ -52,6 +52,7 @@ pub mod source;
 pub mod spool;
 pub mod sql;
 pub mod sqlcat;
+pub mod sqlfn;
 pub mod sqljson;
 pub mod sqljsonfn;
 pub mod sqlpl;

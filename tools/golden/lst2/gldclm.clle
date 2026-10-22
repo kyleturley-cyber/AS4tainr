@@ -1,0 +1,7 @@
+/* Golden listing of a CL module (tools/golden/listings2.txt). */
+PGM
+  DCL        VAR(&N) TYPE(*DEC) LEN(3 0) VALUE(1)
+LOOP:
+  CHGVAR     VAR(&N) VALUE(&N + 1)
+  IF         COND(&N < 3) THEN(GOTO CMDLBL(LOOP))
+ENDPGM

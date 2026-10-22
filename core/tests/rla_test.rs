@@ -9314,3 +9314,242 @@ async fn compiler_listings_and_dspmsgd_reports() {
     ));
     assert_eq!(o.stdout.len(), 1, "{o:?}");
 }
+
+/// More compiler listings: a module (CRTRPGMOD), /COPY members, an update
+/// file's generated input and output specifications, fixed-form RPG IV,
+/// the SQL precompiler (CRTSQLRPGI), a CL module (CRTCLMOD) and RPG/400
+/// (CRTRPGPGM). Expected layouts: PUB400 (IBM i 7.5) output of
+/// tools/golden/listings2.txt, 2026-10-22 (target/ibmi/golden: k_*),
+/// with dates, times and IBM's message texts left out.
+#[tokio::test]
+async fn more_compiler_listings() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::pase_system;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let mask = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| {
+                let mut s = String::new();
+                for c in l.replace(&lib, "LIB").chars() {
+                    s.push(if c.is_ascii_digit() { '9' } else { c });
+                }
+                s
+            })
+            .collect()
+    };
+    let has = |m: &[String], l: &str| {
+        assert!(m.iter().any(|x| x == l), "missing: {l}\n{}", m.join("\n"));
+    };
+    let dir = format!("/tmp/{lib}x");
+    let _ = as4tainr_core::ifs::mkdir_all(&client, &dir, "QSECOFR").await;
+    for (f, text) in [
+        (
+            "gldcpy.rpgle",
+            include_str!("../../tools/golden/lst2/gldcpy.rpgle"),
+        ),
+        (
+            "gldmod.rpgle",
+            include_str!("../../tools/golden/lst2/gldmod.rpgle"),
+        ),
+        (
+            "gldupd.rpgle",
+            include_str!("../../tools/golden/lst2/gldupd.rpgle"),
+        ),
+        (
+            "gldfix.rpgle",
+            include_str!("../../tools/golden/lst2/gldfix.rpgle"),
+        ),
+        (
+            "gldsql.sqlrpgle",
+            include_str!("../../tools/golden/lst2/gldsql.sqlrpgle"),
+        ),
+        (
+            "gldclm.clle",
+            include_str!("../../tools/golden/lst2/gldclm.clle"),
+        ),
+        (
+            "gldold.rpg",
+            include_str!("../../tools/golden/lst2/gldold.rpg"),
+        ),
+    ] {
+        as4tainr_core::ifs::write_file(
+            &client,
+            &format!("{dir}/{f}"),
+            text.as_bytes(),
+            819,
+            0o644,
+            "QSECOFR",
+        )
+        .await
+        .unwrap();
+    }
+    for c in [
+        format!("RUNSQL SQL('CREATE TABLE {lib}/GLDLSTF (ID CHAR(10) NOT NULL, AMT DEC(7, 2) NOT NULL) RCDFMT GLDLSTR') COMMIT(*NONE)"),
+        format!("CRTSRCPF FILE({lib}/GLDLSRC) RCDLEN(112)"),
+        format!("CPYFRMSTMF FROMSTMF('{dir}/gldcpy.rpgle') TOMBR('/QSYS.LIB/{lib}.LIB/GLDLSRC.FILE/GLDCPY.MBR') MBROPT(*REPLACE) STMFCCSID(819)"),
+        format!("CPYFRMSTMF FROMSTMF('{dir}/gldfix.rpgle') TOMBR('/QSYS.LIB/{lib}.LIB/GLDLSRC.FILE/GLDFIX.MBR') MBROPT(*REPLACE) STMFCCSID(819)"),
+        format!("CPYFRMSTMF FROMSTMF('{dir}/gldold.rpg') TOMBR('/QSYS.LIB/{lib}.LIB/GLDLSRC.FILE/GLDOLD.MBR') MBROPT(*REPLACE) STMFCCSID(819)"),
+        format!("CHGPFM FILE({lib}/GLDLSRC) MBR(GLDOLD) SRCTYPE(RPG)"),
+    ] {
+        let o = pase_system::run(&mut job, std::slice::from_ref(&c)).await;
+        assert_eq!(o.status, 0, "{c}: {o:?}");
+    }
+    macro_rules! sys {
+        ($c:expr) => {
+            pase_system::run(&mut job, &[$c.to_string()]).await
+        };
+    }
+
+    // A module: RNS9305, its prologue, the copy member's box and lines,
+    // the /COPY section, a prototype defined in the copy (9D).
+    let o = sys!(format!(
+        "CRTRPGMOD MODULE({lib}/GLDMOD) SRCSTMF('{dir}/gldmod.rpgle')"
+    ));
+    assert_eq!(o.status, 0, "{o:?}");
+    assert!(o.stdout[0].starts_with("RNS9305:"));
+    let m = mask(&o.stdout);
+    for l in [
+        "  Command  . . . . . . . . . . . . :   CRTRPGMOD",
+        "  Module . . . . . . . . . . . . . :   GLDMOD",
+        "  Replace module . . . . . . . . . :   *YES",
+        "  Storage model . . .  . . . . . . :   *INHERIT",
+        "  Binding directory  . . . . . . . :   *NONE",
+        "     9 /copy GLDLSRC,GLDCPY                                                                                                 999999",
+        "Line   <---------------------- Source Specifications ----------------------------><---- Comments ----> Do  Page  Change Src Seq",
+        "        * RPG member name  . . . . . :  GLDCPY                                                       *                     9",
+        "     9+**FREE                                                                                                    999999    9999999",
+        "     9+dcl-c GREETING 'Hello';                                                                                   999999    9999999",
+        "                            / C o p y   M e m b e r s",
+        "         GLDMSG            A(99)                   9D     99",
+        "         GREETING          CONST                   9D     99",
+        "         TEXT              A(99)                  99D     99M     99",
+    ] {
+        has(&m, l);
+    }
+    // No compiler options box in a module's listing.
+    assert!(!m.iter().any(|l| l.contains("Compiler Options in Effect")));
+
+    // An update file: input specifications before the calculations, output
+    // specifications after them, each group with its own source ID; names
+    // defined and not used: RNF7031; prototypes bound statically.
+    let o = sys!(format!(
+        "CRTBNDRPG PGM({lib}/GLDUPD) SRCSTMF('{dir}/gldupd.rpgle')"
+    ));
+    assert_eq!(o.status, 0, "{o:?}");
+    let m = mask(&o.stdout);
+    for l in [
+        "    99=IGLDLSTR                                                                                                            9999999",
+        "    99=I                             A    9   99  ID                                                                       9999999",
+        "    99=I                             P   99   99 9AMT                                                                      9999999",
+        "    99=OGLDLSTR                                                                                                            9999999",
+        "*RNF9999 GLDMSG            A(99)                   9D",
+        "*RNF9999 GREETING          CONST                   9D",
+        "         ID                A(99)                  99M     99",
+        "         GLDMSG                                    9",
+        "    Information  (99) . . . . . . . :        9",
+    ] {
+        has(&m, l);
+    }
+    assert!(o
+        .stdout
+        .iter()
+        .any(|l| l.starts_with("*RNF7031 00      2 ")));
+
+    // Fixed form: columns 6-100 of the source, resulting indicators with
+    // "--" for the ones not used, the Do column; indicators set: D.
+    let o = sys!(format!(
+        "CRTBNDRPG PGM({lib}/GLDFIX) SRCFILE({lib}/GLDLSRC) SRCMBR(GLDFIX)"
+    ));
+    assert_eq!(o.status, 0, "{o:?}");
+    let m = mask(&o.stdout);
+    for l in [
+        "     9 C                   READ      GLDLSTR                            ----99                                   999999     999999",
+        "    99 C                   DOW       *IN99 = *OFF                                                      B99       999999     999999",
+        "    99 C                   SETON                                        LR----                                   999999     999999",
+        "         99                                        9D     99      99D",
+        "         LR                                       99D",
+        "*RNF9999 ID                A(99)                   9D",
+        "    Specifications  . . . . . . . . :       99",
+    ] {
+        has(&m, l);
+    }
+
+    // CL module: CPC0816, its prologue, the labels it defines and uses.
+    let o = sys!(format!(
+        "CRTCLMOD MODULE({lib}/GLDCLM) SRCSTMF('{dir}/gldclm.clle')"
+    ));
+    assert_eq!(o.status, 0, "{o:?}");
+    assert!(o.stdout[0].starts_with("CPC0816:"));
+    let m = mask(&o.stdout);
+    for l in [
+        " Module  . . . . . . . . . . . . . . . . . . . :   GLDCLM",
+        " Source printing options . . . . . . . . . . . :   *XREF  *GEN  *NOSECLVL  *NOEVENTF  *NODOSLTLVL",
+        " Replace module object . . . . . . . . . . . . :   *YES",
+        " Label            Defined     References",
+        " LOOP                999         999",
+        "     9           9      9      9      9      9      9      9      9      9      9",
+    ] {
+        has(&m, l);
+    }
+
+    // SQL precompiler: its options, the source, the cross reference of
+    // host variables, tables and columns; then the compiler's listing.
+    let o = sys!(format!("CRTSQLRPGI OBJ({lib}/GLDSQL) SRCSTMF('{dir}/gldsql.sqlrpgle') OBJTYPE(*PGM) COMMIT(*NONE) OUTPUT(*PRINT)"));
+    assert_eq!(o.status, 0, "{o:?}");
+    assert!(o.stdout[0].starts_with("RNS9304:"));
+    let m = mask(&o.stdout);
+    for l in [
+        "Source type...............RPG",
+        "To source file............QTEMP/QSQLTEMP9",
+        "Commit....................*NONE",
+        "Concurrent access",
+        "  resolution..............*DFT",
+        "    9   exec sql select count(*) into :n from GLDLSTF;",
+        "AMT                              9        DECIMAL(9,9) COLUMN (NOT NULL) IN GLDLSTF",
+        "GLDLSTF                          ****     TABLE",
+        "N                                9        INTEGER PRECISION(9,9)",
+        "No errors found in source",
+        "    9 Source records processed",
+        "  Command  . . . . . . . . . . . . :   CRTBNDRPG",
+    ] {
+        has(&m, l);
+    }
+
+    // RPG/400: QRG0003, its source with indicator usage and DO levels,
+    // the input fields, the cross reference.
+    let o = sys!(format!(
+        "CRTRPGPGM PGM({lib}/GLDOLD) SRCFILE({lib}/GLDLSRC) SRCMBR(GLDOLD)"
+    ));
+    assert_eq!(o.status, 0, "{o:?}");
+    assert!(o.stdout[0].starts_with("QRG0003:"));
+    let m = mask(&o.stdout);
+    for l in [
+        "           H                                                                                              *****",
+        "  A999999                                           9  99 ID",
+        "  A999999                                       P  99  999AMT",
+        "      999  C                     READ GLDLSTR                  99                    9",
+        "      999  C           *IN99     DOWEQ'9'                                               B999",
+        "      999  C                     SETON                     LR                    9",
+        "        TOTAL       P(9,9)      999D     999",
+        "* 9999  ID          A(99)   A999999D",
+        "        '9'         LITERAL     999",
+        "        99             999M     999      999M",
+    ] {
+        has(&m, l);
+    }
+}

@@ -94,7 +94,14 @@ struct Lines<'a> {
     units: Vec<Unit>,
     ctdata: Vec<(Option<String>, Vec<String>)>,
     depth: usize,
+    /// /COPY and /INCLUDE members read so far: the lines of the n-th are
+    /// numbered n * COPY_LINES + its line (as the compiler listing's
+    /// source ID and sequence number).
+    copies: usize,
 }
+
+/// Line numbers of /COPY members start at their order times this.
+pub const COPY_LINES: usize = 1_000_000;
 
 /// Strip `//` comments (outside literals) from free-form text.
 fn strip_comment(s: &str) -> String {
@@ -267,7 +274,9 @@ impl Lines<'_> {
                                     bail!("line {lineno}: /{w} nested too deep");
                                 }
                                 self.depth += 1;
-                                self.read(&text, lineno)?;
+                                self.copies += 1;
+                                let base = self.copies * COPY_LINES;
+                                self.read(&text, base + 1)?;
                                 self.depth -= 1;
                             }
                             // /TITLE, /EJECT, /SPACE, /SET, /RESTORE:
@@ -707,6 +716,7 @@ pub fn parse(source: &str, includes: &dyn Fn(&str) -> Option<String>) -> Result<
         units: Vec::new(),
         ctdata: Vec::new(),
         depth: 0,
+        copies: 0,
     };
     lines.read(source, 1)?;
     let mut ctx = Ctx {

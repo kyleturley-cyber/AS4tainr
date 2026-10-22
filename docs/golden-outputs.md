@@ -91,6 +91,8 @@ powershell -ExecutionPolicy Bypass -File tools\golden\golden.ps1 -List tools\gol
 powershell -ExecutionPolicy Bypass -File tools\golden\golden.ps1 -List tools\golden\listings.txt -Files tools\golden\lst
 ```
 
+`tools/golden/listings2.txt` (sources in `tools/golden/lst2`) adds a module (CRTRPGMOD), /COPY members, an update file, fixed-form RPG IV, embedded SQL (CRTSQLRPGI), a CL module (CRTCLMOD) and RPG/400 (CRTRPGPGM); test `more_compiler_listings`.
+
 The sources in `tools/golden/lst` (as4tainr's own) are compiled from stream files and from source members, with and without errors, and a message file of our own is printed with DSPMSGD (formatted, unformatted, basic, a range, a missing ID). First run (2026-10-22): the layouts of the CL and ILE RPG listings and of DSPMSGD's reports; as4tainr's output is the same line for line except message texts, the compiler's name, the job's user and CCSID, and IBM's internal names (`BASED(_QRNL_PST+)`). Test: `compiler_listings_and_dspmsgd_reports`.
 
 ## What the PASE `system` utility does (PUB400, 2026-10-21)

@@ -1,0 +1,9 @@
+     H* Golden listing of RPG III (tools/golden/listings2.txt).
+     FGLDLSTF IF  E                    DISK
+     C                     READ GLDLSTR                  90
+     C           *IN90     DOWEQ'0'
+     C                     ADD  AMT       TOTAL   92
+     C                     READ GLDLSTR                  90
+     C                     END
+     C           TOTAL     DSPLY
+     C                     SETON                     LR

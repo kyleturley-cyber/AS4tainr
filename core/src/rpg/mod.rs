@@ -19,6 +19,8 @@ pub mod mem;
 pub mod parse;
 pub mod program;
 pub mod rpg3;
+pub mod rpg3list;
+pub mod sqllist;
 pub mod tofree;
 
 use anyhow::{anyhow, Result};
@@ -69,6 +71,63 @@ pub async fn load_includes(
             todo.extend(parse::includes(&text));
             out.insert(id, text);
         }
+    }
+    out
+}
+
+/// The /COPY and /INCLUDE members a source brings in (and theirs), with
+/// what the compiler listing shows of them.
+pub async fn listing_copies(client: &Client, libl: &[String], source: &str) -> Vec<listing::Copy> {
+    let mut out: Vec<listing::Copy> = Vec::new();
+    let mut todo: Vec<String> = parse::includes(source);
+    todo.reverse();
+    while let Some(id) = todo.pop() {
+        if out.iter().any(|c| c.id == id) {
+            continue;
+        }
+        let up = id.to_ascii_uppercase();
+        let member = if id.contains('.') && !id.contains(',') || id.starts_with('/') {
+            None
+        } else {
+            let (libs, file, member) = match up.split_once(',') {
+                Some((f, m)) => match f.split_once('/') {
+                    Some((l, f)) => (vec![l.to_string()], f.to_string(), m.to_string()),
+                    None => (libl.to_vec(), f.to_string(), m.to_string()),
+                },
+                None => (libl.to_vec(), "QRPGLESRC".to_string(), up.clone()),
+            };
+            crate::source::find_member(client, &libs, &file, &member)
+                .await
+                .ok()
+        };
+        let member = match member {
+            Some(m) => m,
+            None => match crate::source::find_stream_file(client, &id).await {
+                Ok(Some((path, text))) => {
+                    let stat = crate::ifs::stat(client, &path).await.ok().flatten();
+                    crate::source::Member {
+                        name: path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&path)
+                            .split('.')
+                            .next()
+                            .unwrap_or("")
+                            .to_ascii_uppercase(),
+                        source: text,
+                        ccsid: stat.as_ref().map(|s| s.ccsid).unwrap_or(37),
+                        changed_us: stat.map(|s| s.changed_us),
+                        stmf: path,
+                        ..Default::default()
+                    }
+                }
+                _ => continue,
+            },
+        };
+        let mut inner = parse::includes(&member.source);
+        inner.reverse();
+        todo.extend(inner);
+        out.push(listing::Copy { id, member });
     }
     out
 }

@@ -43,6 +43,8 @@ pub struct Analysis {
     pub refs: BTreeMap<String, Vec<usize>>,
     /// Labels: (name, line).
     pub labels: Vec<(String, usize)>,
+    /// References to each label (GOTO CMDLBL...): statement lines.
+    pub label_refs: BTreeMap<String, Vec<usize>>,
 }
 
 impl Analysis {
@@ -224,6 +226,30 @@ pub fn analyze(source: &str, known: &dyn Fn(&str) -> bool, file_vars: &FileVars)
             uses.push((*line, v));
         }
     }
+    // Label references: a word of a statement (after its own label)
+    // that names a label.
+    let names: Vec<String> = a.labels.iter().map(|(l, _)| l.clone()).collect();
+    for (line, text) in &lines {
+        let body = match parse_statement(*line, text) {
+            Ok(st) if st.label.is_some() => text.split_once(':').map(|x| x.1).unwrap_or(text),
+            _ => text.as_str(),
+        };
+        let mut in_q = false;
+        let mut word = String::new();
+        for c in body.chars().chain(std::iter::once(' ')) {
+            if c == '\'' {
+                in_q = !in_q;
+            }
+            if !in_q && (c.is_ascii_alphanumeric() || "@#$_".contains(c)) {
+                word.push(c.to_ascii_uppercase());
+            } else {
+                if names.contains(&word) {
+                    a.label_refs.entry(word.clone()).or_default().push(*line);
+                }
+                word.clear();
+            }
+        }
+    }
     let declared = |n: &str| a.vars.iter().any(|d| d.name == n);
     let mut undeclared: Vec<(usize, String)> = Vec::new();
     for (line, v) in &uses {
@@ -255,6 +281,8 @@ pub struct Prologue {
     pub replace: String,
     pub text: String,
     pub dbgview: String,
+    /// CRTCLMOD: a module.
+    pub module: bool,
 }
 
 /// Lines on a listing page, the page header included (as the ILE RPG
@@ -302,10 +330,8 @@ pub fn listing(p: &Prologue, a: &Analysis, created: bool, stamp: &Stamp) -> Vec<
     let changed = stamp_of(m.changed_us)
         .map(|s| format!("{} {}", s.date, s.time))
         .unwrap_or_default();
-    let mut first = vec![
-        label(2, "Program", &p.program),
-        label(4, "Library", &p.library),
-    ];
+    let what = if p.module { "Module" } else { "Program" };
+    let mut first = vec![label(2, what, &p.program), label(4, "Library", &p.library)];
     if !m.stmf.is_empty() {
         first.push(label(2, "Source stream file", &m.stmf));
         // (IBM i 7.5 leaves three blanks after this label.)
@@ -320,29 +346,52 @@ pub fn listing(p: &Prologue, a: &Analysis, created: bool, stamp: &Stamp) -> Vec<
         ));
     }
     let activation = if p.dftactgrp == "*YES" { "" } else { &p.actgrp };
-    for (t, v) in [
-        (
-            "Source printing options",
-            "*XREF  *NOSECLVL  *NOEVENTF  *NODOSLTLVL",
-        ),
-        ("User profile", "*USER"),
-        ("Program logging", "*JOB"),
-        ("Allow RTVCLSRC command", "*YES"),
-        ("Default activation group", &p.dftactgrp),
-        ("Activation group", activation),
-        ("Replace program", &p.replace),
-        ("Target release", "V7R5M0"),
-        ("Authority", "*LIBCRTAUT"),
-        ("Sort sequence", "*HEX"),
-        ("Language identifier", "*JOBRUN"),
-        ("Text", &p.text),
-        ("Optimization", "*NONE"),
-        ("Debugging view", &p.dbgview),
-        ("Debug encryption key", "*NONE"),
-        ("Enable performance collection", "*PEP"),
-        ("Storage model", "*SNGLVL"),
-        ("Compiler", "as4tainr CL compiler"),
-    ] {
+    let items: Vec<(&str, &str)> = if p.module {
+        vec![
+            (
+                "Source printing options",
+                "*XREF  *GEN  *NOSECLVL  *NOEVENTF  *NODOSLTLVL",
+            ),
+            ("Module logging", "*JOB"),
+            ("Allow RTVCLSRC command", "*YES"),
+            ("Replace module object", &p.replace),
+            ("Target release", "V7R5M0"),
+            ("Authority", "*LIBCRTAUT"),
+            ("Sort sequence", "*HEX"),
+            ("Language identifier", "*JOBRUN"),
+            ("Text", &p.text),
+            ("Optimization", "*NONE"),
+            ("Debugging view", &p.dbgview),
+            ("Debug encryption key", "*NONE"),
+            ("Enable performance collection", "*PEP"),
+            ("Compiler", "as4tainr CL compiler"),
+        ]
+    } else {
+        vec![
+            (
+                "Source printing options",
+                "*XREF  *NOSECLVL  *NOEVENTF  *NODOSLTLVL",
+            ),
+            ("User profile", "*USER"),
+            ("Program logging", "*JOB"),
+            ("Allow RTVCLSRC command", "*YES"),
+            ("Default activation group", &p.dftactgrp),
+            ("Activation group", activation),
+            ("Replace program", &p.replace),
+            ("Target release", "V7R5M0"),
+            ("Authority", "*LIBCRTAUT"),
+            ("Sort sequence", "*HEX"),
+            ("Language identifier", "*JOBRUN"),
+            ("Text", &p.text),
+            ("Optimization", "*NONE"),
+            ("Debugging view", &p.dbgview),
+            ("Debug encryption key", "*NONE"),
+            ("Enable performance collection", "*PEP"),
+            ("Storage model", "*SNGLVL"),
+            ("Compiler", "as4tainr CL compiler"),
+        ]
+    };
+    for (t, v) in items {
         first.push(label(2, t, v));
     }
     // The source, with each statement's messages after its last line.
@@ -437,12 +486,22 @@ pub fn listing(p: &Prologue, a: &Analysis, created: bool, stamp: &Stamp) -> Vec<
         xref.push(diag_line(&d));
         xdiags.push(d);
     } else {
+        // Layout observed on IBM i 7.5 (CRTCLMOD, tools/golden/listings2.txt).
         xref.push(" Defined Labels".into());
-        xref.push(" Label                       Defined".into());
+        xref.push(" Label            Defined     References".into());
         let mut labels = a.labels.clone();
         labels.sort_by_cached_key(|(l, _)| crate::rpg::data::e(l));
         for (l, line) in labels {
-            xref.push(at(&[(2, &l), (29, &format!("{:>7}", line * 100))]));
+            let refs: String = a
+                .label_refs
+                .get(&l)
+                .map(|r| r.iter().map(|n| format!("{:>12}", n * 100)).collect())
+                .unwrap_or_default();
+            xref.push(
+                format!(" {l:<16}{:>7}{refs}", line * 100)
+                    .trim_end()
+                    .to_string(),
+            );
         }
     }
     xref.push(END_XREF.into());
@@ -459,7 +518,12 @@ pub fn listing(p: &Prologue, a: &Analysis, created: bool, stamp: &Stamp) -> Vec<
         at(&[(16, "Severity")]),
         " Total         0-9  10-19  20-29  30-39  40-49  50-59  60-69  70-79  80-89  90-99".into(),
     ];
-    let mut row = format!("{:>7}    ", all.len());
+    // No messages: the total one column to the left (observed).
+    let mut row = if all.is_empty() {
+        format!("{:>6}     ", 0)
+    } else {
+        format!("{:>7}    ", all.len())
+    };
     for c in counts.iter() {
         row.push_str(&format!("{c:>7}"));
     }
@@ -467,15 +531,15 @@ pub fn listing(p: &Prologue, a: &Analysis, created: bool, stamp: &Stamp) -> Vec<
     let (pgm, lib) = (&p.program, &p.library);
     if created {
         summary.push(format!(
-            " Program {pgm} was created in library {lib} on {} at {}.",
+            " {what} {pgm} was created in library {lib} on {} at {}.",
             stamp.date, stamp.time
         ));
         summary.push(format!(
-            " Program {pgm} was created in library {lib}; highest error severity {max:02}."
+            " {what} {pgm} was created in library {lib}; highest error severity {max:02}."
         ));
     } else {
         summary.push(format!(
-            " Program {pgm} was not created in library {lib}; highest error severity {max:02}."
+            " {what} {pgm} was not created in library {lib}; highest error severity {max:02}."
         ));
     }
     summary.push(END_SUMMARY.into());

@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::ast::{keyword, CalcLine, Expr, Line, Source, Stmt};
 use super::check::Diag;
 use super::data::DType;
+use super::parse::COPY_LINES;
 use super::program::{Program, Sym};
 use crate::report::{at, Stamp};
 
@@ -35,6 +36,11 @@ pub struct Opts {
     pub alwnull: String,
     pub bnddir: String,
     pub genlvl: u8,
+    /// CRTRPGMOD: a module.
+    pub module: bool,
+    /// Sort sequence and language identifier ("": *HEX and *JOBRUN).
+    pub srtseq: String,
+    pub langid: String,
 }
 
 /// Lines on a listing page, the page header included (observed: 52).
@@ -53,12 +59,41 @@ const END_COMPILE: &str = "          * * * * *   E N D   O F   C O M P I L A T I
 
 /// A row of the source section.
 enum Row {
-    /// A source line: its number in the source.
+    /// A main source line: its number in the source.
     Src(usize),
-    /// A generated output specification line (its text after "=").
-    Gen(String),
-    /// A box line; `true`: it belongs to generated specifications.
-    Box(String, bool),
+    /// A line of /COPY member `c` (an index into the copies): its line,
+    /// and which copy directive this is (1 for the first).
+    Copy(usize, usize, usize),
+    /// A generated specification (its text after "=") with its source ID
+    /// and what it is.
+    Gen(String, usize, Gen),
+    /// A box line, with the source ID it belongs to (if any).
+    Box(String, Option<usize>),
+    /// The two ruler lines (fixed form: with the comments columns).
+    Ruler(bool),
+}
+
+/// A group of generated specifications: record format, external format
+/// and its field lines.
+type GenGroup<F> = (String, String, Vec<F>);
+
+/// What a generated specification line is.
+#[derive(Clone)]
+enum Gen {
+    /// A record format.
+    Record(String),
+    /// An input field; true: of an update file (its references are M).
+    Input(String, bool),
+    /// An output field, with its positions in the buffer.
+    Output(String, u32, u32),
+}
+
+/// A /COPY or /INCLUDE member the source brings in.
+#[derive(Debug, Clone)]
+pub struct Copy {
+    /// The id as the directive writes it.
+    pub id: String,
+    pub member: crate::source::Member,
 }
 
 /// A field or other name in the cross reference.
@@ -74,6 +109,8 @@ struct XName {
 
 pub struct Input<'a> {
     pub opts: &'a Opts,
+    /// The /COPY members, by the id their directives write.
+    pub copies: &'a [Copy],
     pub member: &'a crate::source::Member,
     pub src: Option<&'a Source>,
     pub prog: Option<&'a Program>,
@@ -226,6 +263,59 @@ fn modified(c: &CalcLine) -> Vec<String> {
     }
 }
 
+/// The two ruler lines of free-form source.
+const RULER_FREE: [&str; 2] = [
+    "Line   <---------------------- Source Specifications ----------------------------------------------------->  Do  Change Src Seq",
+    "Number ....+....1....+....2....+....3....+....4....+....5....+....6....+....7....+....8....+....9....+...10  Num Date   Id  Number",
+];
+/// The two ruler lines of fixed-form source (with the comments columns).
+const RULER_FIXED: [&str; 2] = [
+    "Line   <---------------------- Source Specifications ----------------------------><---- Comments ----> Do  Page  Change Src Seq",
+    "Number ....1....+....2....+....3....+....4....+....5....+....6....+....7....+....8....+....9....+...10 Num Line  Date   Id  Number",
+];
+
+/// A source line of a fixed-form calculation with resulting indicators
+/// (positions 71-76): the blank ones shown as "--" (observed).
+fn fixed_text(line: &str) -> String {
+    let mut cs: Vec<char> = line.chars().collect();
+    let is_calc =
+        cs.get(5).is_some_and(|c| c.eq_ignore_ascii_case(&'C')) && cs.get(6) != Some(&'*');
+    if is_calc && cs.len() > 70 {
+        let ind: String = cs[70..cs.len().min(76)].iter().collect();
+        if !ind.trim().is_empty() {
+            while cs.len() < 76 {
+                cs.push(' ');
+            }
+            for k in [70, 72, 74] {
+                if cs[k] == ' ' && cs[k + 1] == ' ' {
+                    cs[k] = '-';
+                    cs[k + 1] = '-';
+                }
+            }
+        }
+    }
+    cs.iter().skip(5).take(95).collect()
+}
+
+/// Is a source line a comment (or blank) for the final summary?
+fn is_comment(line: &str, free: bool) -> bool {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with("//") {
+        return true;
+    }
+    !free && line.chars().nth(6) == Some('*')
+}
+
+/// The id of a /COPY or /INCLUDE directive on a line, if it is one.
+fn copy_directive(line: &str, free: bool) -> Option<String> {
+    let text = if free {
+        format!("**FREE\n{line}")
+    } else {
+        line.to_string()
+    };
+    super::parse::includes(&text).into_iter().next()
+}
+
 /// The listing.
 pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
     let o = input.opts;
@@ -244,9 +334,7 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
         ])
     };
     let src_lines: Vec<&str> = m.source.lines().collect();
-    let free = src_lines
-        .first()
-        .is_some_and(|l| l.trim_start().to_ascii_uppercase().starts_with("**FREE"));
+    let free = super::parse::is_fully_free(&m.source);
     let member = m.stmf.is_empty();
 
     // ---------------------------------------------------------- prologue
@@ -270,10 +358,11 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
         "*UNREF",
         "*NOEVENTF",
     ];
+    let what = if o.module { "Module" } else { "Program" };
     let mut pro = vec![
         label(3, "Command", &o.command),
         label(5, "Issued by", &o.user),
-        label(3, "Program", &o.program),
+        label(3, what, &o.program),
         label(5, "Library", &o.library),
         label(3, "Text 'description'", &o.text),
     ];
@@ -286,18 +375,23 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
         pro.push(label(3, "Source stream file  ", &m.stmf));
         pro.push(label(5, "CCSID", &m.ccsid.to_string()));
         // The EBCDIC CCSID the source is converted to (observed: 500 for
-        // a stream file in CCSID 819).
+        // a stream file in CCSID 819; none for a member named by its IFS
+        // path, as the SQL precompiler's output).
         let target = match m.ccsid {
             819 | 850 | 437 | 1252 => 500,
             1208 | 1200 | 13488 => 37,
             c => c,
         };
-        pro.push(label(3, "Target CCSID", &format!("*SRC ({target})")));
+        if !m.stmf.to_ascii_uppercase().starts_with("/QSYS.LIB/") {
+            pro.push(label(3, "Target CCSID", &format!("*SRC ({target})")));
+        }
     }
     pro.push(label(3, "Text 'description'", &m.text));
     pro.push(label(3, "Last Change", &changed));
     pro.push(label(3, "Generation severity level", &o.genlvl.to_string()));
-    pro.push(label(3, "Default activation group", &o.dftactgrp));
+    if !o.module {
+        pro.push(label(3, "Default activation group", &o.dftactgrp));
+    }
     for (k, chunk) in options.chunks(4).enumerate() {
         let v: String = chunk
             .iter()
@@ -311,22 +405,60 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
             pro.push(at(&[(40, &v)]));
         }
     }
-    for (t, v) in [
+    let replace = if o.module {
+        "Replace module"
+    } else {
+        "Replace program"
+    };
+    let mut rest: Vec<(&str, &str)> = vec![
         ("Debugging views", o.dbgview.as_str()),
         ("Debug encryption key", "*NONE"),
         ("Output", "*PRINT"),
         ("Optimization level", "*NONE"),
         ("Source listing indentation", "*NONE"),
         ("Type conversion options", "*NONE"),
-        ("Sort sequence", "*HEX"),
-        ("Language identifier", "*JOBRUN"),
-        ("Replace program", o.replace.as_str()),
-        ("User profile", "*USER"),
+        (
+            "Sort sequence",
+            if o.srtseq.is_empty() {
+                "*HEX"
+            } else {
+                &o.srtseq
+            },
+        ),
+        (
+            "Language identifier",
+            if o.langid.is_empty() {
+                "*JOBRUN"
+            } else {
+                &o.langid
+            },
+        ),
+        (replace, o.replace.as_str()),
+    ];
+    if !o.module {
+        rest.push(("User profile", "*USER"));
+    }
+    rest.extend([
         ("Authority", "*LIBCRTAUT"),
         ("Truncate numeric", "*YES"),
         ("Fix numeric", "*NONE"),
         ("Target release", o.tgtrls.as_str()),
         ("Allow null values", o.alwnull.as_str()),
+    ]);
+    for (t, v) in rest {
+        pro.push(label(3, t, v));
+    }
+    if o.module {
+        // IBM i 7.5 prints this label with two blanks before its dots.
+        pro.push("  Storage model . . .  . . . . . . :   *INHERIT".into());
+        let dir = if o.bnddir.is_empty() {
+            "*NONE"
+        } else {
+            &o.bnddir
+        };
+        pro.push(label(3, "Binding directory", dir));
+    }
+    for (t, v) in [
         ("Define condition names", "*NONE"),
         ("Enable performance collection", "*PEP"),
         ("Profiling data", "*NOCOL"),
@@ -340,19 +472,46 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
     }
 
     // ------------------------------------------------------------ source
-    let mut rows: Vec<Row> = Vec::new();
+    // The n-th /COPY directive of the main source (its line), for the
+    // parsed line numbers of copied lines (n * COPY_LINES + line).
+    let directives: Vec<usize> = src_lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| copy_directive(l, free).is_some())
+        .map(|(i, _)| i + 1)
+        .collect();
+    // Where a parsed line comes in the listing: (main line, copy line).
+    let order_key = |l: usize| -> (usize, usize) {
+        if l >= COPY_LINES {
+            let k = l / COPY_LINES;
+            (
+                directives.get(k - 1).copied().unwrap_or(usize::MAX),
+                l % COPY_LINES,
+            )
+        } else {
+            (l, 0)
+        }
+    };
     let mut dos: HashMap<usize, String> = HashMap::new();
     let mut after: HashMap<usize, Vec<Row>> = HashMap::new();
     let mut before: HashMap<usize, Vec<Row>> = HashMap::new();
-    // Generated output specifications: (record format, file, fields).
-    let mut generated: Vec<Row> = Vec::new();
-    let mut gen_refs: Vec<(usize, String)> = Vec::new(); // (index in generated, name)
-    let mut buffer: Vec<(usize, u32, u32, String)> = Vec::new(); // (gen index, start, end, field)
+    // Generated specifications: input (before the first calculation) and
+    // output (after the main source), each group with its fields.
+    let mut gen_in: Vec<GenGroup<(String, String)>> = Vec::new();
+    let mut gen_out: Vec<GenGroup<(String, String, u32, u32)>> = Vec::new();
+    let mut in_update: HashMap<String, bool> = HashMap::new();
+    let mut first_calc: Option<usize> = None;
     if let Some(src) = input.src {
         do_numbers(&src.calcs, &mut dos);
         for p in &src.procs {
             do_numbers(&p.calcs, &mut dos);
         }
+        first_calc = src
+            .calcs
+            .iter()
+            .map(|c| c.line)
+            .filter(|l| *l > 0 && *l < COPY_LINES)
+            .min();
         // The compiler options in effect, before the first specification
         // after the control specifications (when the source has some).
         let has_ctl = src_lines.iter().any(|l| {
@@ -373,18 +532,22 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
             .chain(src.outputs.iter().map(|r| r.line))
             .chain(src.inputs.iter().map(|r| r.line))
             .filter(|l| *l > 0)
-            .min();
-        if has_ctl {
+            .min_by_key(|l| order_key(*l));
+        // (Not in a module's listing, as observed.)
+        if has_ctl && !o.module {
             if let Some(l) = first_spec {
-                before.insert(l, options_box(o, &m.text, src, &options));
+                before
+                    .entry(l)
+                    .or_default()
+                    .extend(options_box(o, &m.text, src, &options));
             }
         }
-        // A box after each externally described file.
         if let Some(prog) = input.prog {
             for f in &prog.files {
                 if !f.decl.external || f.decl.line == 0 {
                     continue;
                 }
+                // A box after each externally described file.
                 let ext = match (&f.fref, &f.display) {
                     (Some(r), _) => format!("{}/{}", r.library, r.file.name),
                     (None, Some(d)) => format!("{}/{}", d.library, f.decl.name),
@@ -407,17 +570,17 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
                 };
                 let dash = format!("        *{}*", "-".repeat(92));
                 let mut b = vec![
-                    Row::Box(dash.clone(), false),
+                    Row::Box(dash.clone(), None),
                     Row::Box(
                         boxed(&format!("{:31}RPG name         External name", ""), 102),
-                        false,
+                        None,
                     ),
                     Row::Box(
                         boxed(
                             &format!(" File name. . . . . . . . . :  {:<17}{ext}", f.decl.name),
                             102,
                         ),
-                        false,
+                        None,
                     ),
                 ];
                 for (k, (rpg, external)) in formats.iter().enumerate() {
@@ -428,41 +591,16 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
                     };
                     b.push(Row::Box(
                         boxed(&format!("{l}{rpg:<17}{external}"), 102),
-                        false,
+                        None,
                     ));
                 }
-                b.push(Row::Box(dash, false));
+                b.push(Row::Box(dash, None));
                 after.entry(f.decl.line).or_default().extend(b);
-            }
-            // Output specifications for the records of externally
-            // described output files (*EXPDDS), after the main source.
-            for f in &prog.files {
+                // Generated specifications (*EXPDDS) of a database file.
                 let Some(r) = &f.fref else { continue };
-                if !f.decl.external || !(f.decl.usage == 'O' || f.decl.add) {
+                if f.decl.device != "DISK" {
                     continue;
                 }
-                generated.push(Row::Gen(format!("O{}", f.format)));
-                gen_refs.push((generated.len() - 1, f.format.clone()));
-                let dash = format!("        *{}*", "-".repeat(92));
-                generated.push(Row::Box(dash.clone(), true));
-                generated.push(Row::Box(
-                    boxed(&format!(" RPG record format  . . . . :  {}", f.format), 102),
-                    true,
-                ));
-                generated.push(Row::Box(
-                    boxed(
-                        &format!(
-                            " External format  . . . . . :  {} : {}/{}",
-                            r.file.format, r.library, r.file.name
-                        ),
-                        102,
-                    ),
-                    true,
-                ));
-                generated.push(Row::Box(dash, true));
-                let mut end = 0u32;
-                // Each field as stored in the record (the record format's
-                // fields, by their program names).
                 let stored: Vec<DType> = r
                     .file
                     .fields
@@ -471,30 +609,97 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
                         super::program::program_type(fd, true, false).unwrap_or(DType::Char(0))
                     })
                     .collect();
-                for (name, t) in f.fields.iter().zip(&stored) {
-                    let (c, ext, len) = out_type(t);
-                    end += t.size() as u32;
-                    let text = format!("O{:23}{:<20}{:>2}{c} {:<10}{:>3}", "", name, end, ext, len);
-                    generated.push(Row::Gen(text));
-                    gen_refs.push((generated.len() - 1, name.clone()));
-                    buffer.push((
-                        generated.len() - 1,
-                        end + 1 - t.size() as u32,
-                        end,
-                        name.clone(),
-                    ));
+                let ext_fmt = format!("{} : {}/{}", r.file.format, r.library, r.file.name);
+                if matches!(f.decl.usage, 'I' | 'U' | 'C') {
+                    let mut fields = Vec::new();
+                    let mut end = 0u32;
+                    for (name, t) in f.fields.iter().zip(&stored) {
+                        let start = end + 1;
+                        end += t.size() as u32;
+                        let (c, _, _) = out_type(t);
+                        let dec = match t {
+                            DType::Packed(_, d) | DType::Zoned(_, d) | DType::Binary(_, d) => {
+                                d.to_string()
+                            }
+                            DType::Int(_) | DType::Uns(_) => "0".into(),
+                            _ => String::new(),
+                        };
+                        fields.push((
+                            name.clone(),
+                            format!("I{:29}{c}{start:>5}{end:>5} {dec:<1}{name}", ""),
+                        ));
+                    }
+                    in_update.insert(f.format.clone(), f.decl.usage == 'U');
+                    gen_in.push((f.format.clone(), ext_fmt.clone(), fields));
+                }
+                if f.decl.usage == 'O' || f.decl.usage == 'U' || f.decl.add {
+                    let mut fields = Vec::new();
+                    let mut end = 0u32;
+                    for (name, t) in f.fields.iter().zip(&stored) {
+                        let (c, ext, len) = out_type(t);
+                        end += t.size() as u32;
+                        let text =
+                            format!("O{:23}{:<20}{:>2}{c} {:<10}{:>3}", "", name, end, ext, len);
+                        fields.push((name.clone(), text, end + 1 - t.size() as u32, end));
+                    }
+                    gen_out.push((f.format.clone(), ext_fmt, fields));
                 }
             }
         }
     }
-    // Where the generated specifications go: before the first procedure.
-    let gen_at = input
+    // Where the generated output specifications go: before the first
+    // procedure; the input specifications: before the first calculation.
+    let gen_out_at = input
         .src
         .and_then(|s| s.procs.iter().map(|p| p.line).filter(|l| *l > 0).min())
         .unwrap_or(src_lines.len() + 1);
+    let gen_in_at = first_calc.unwrap_or(gen_out_at);
+    let mut next_id = 0usize;
+    let gen_box = |rows: &mut Vec<Row>, id: usize, fmt: &str, ext: &str| {
+        let dash = format!("        *{}*", "-".repeat(92));
+        rows.push(Row::Box(dash.clone(), Some(id)));
+        rows.push(Row::Box(
+            boxed(&format!(" RPG record format  . . . . :  {fmt}"), 102),
+            Some(id),
+        ));
+        rows.push(Row::Box(
+            boxed(&format!(" External format  . . . . . :  {ext}"), 102),
+            Some(id),
+        ));
+        rows.push(Row::Box(dash, Some(id)));
+    };
+    let mut rows: Vec<Row> = Vec::new();
+    // Copies used: (index into input.copies, src id, line of the directive).
+    let mut copies_used: Vec<(usize, usize, usize)> = Vec::new();
     for n in 1..=src_lines.len() + 1 {
-        if n == gen_at {
-            rows.append(&mut generated);
+        if n == gen_in_at && !gen_in.is_empty() {
+            for (fmt, ext, fields) in std::mem::take(&mut gen_in) {
+                next_id += 1;
+                rows.push(Row::Gen(
+                    format!("I{fmt}"),
+                    next_id,
+                    Gen::Record(fmt.clone()),
+                ));
+                gen_box(&mut rows, next_id, &fmt, &ext);
+                let upd = in_update.get(&fmt).copied().unwrap_or(false);
+                for (name, text) in fields {
+                    rows.push(Row::Gen(text, next_id, Gen::Input(name, upd)));
+                }
+            }
+        }
+        if n == gen_out_at && !gen_out.is_empty() {
+            for (fmt, ext, fields) in std::mem::take(&mut gen_out) {
+                next_id += 1;
+                rows.push(Row::Gen(
+                    format!("O{fmt}"),
+                    next_id,
+                    Gen::Record(fmt.clone()),
+                ));
+                gen_box(&mut rows, next_id, &fmt, &ext);
+                for (name, text, s, e) in fields {
+                    rows.push(Row::Gen(text, next_id, Gen::Output(name, s, e)));
+                }
+            }
         }
         if n > src_lines.len() {
             break;
@@ -506,13 +711,68 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
         if let Some(a) = after.remove(&n) {
             rows.extend(a);
         }
+        // A /COPY member: its box, then its lines.
+        if let Some(id) = copy_directive(src_lines[n - 1], free) {
+            if let Some(k) = input.copies.iter().position(|c| c.id == id) {
+                next_id += 1;
+                copies_used.push((k, next_id, n));
+                let c = &input.copies[k].member;
+                let dash = format!("        *{}*", "-".repeat(92));
+                let external = if c.stmf.is_empty() {
+                    format!("{}/{}({})", c.library, c.file, c.name)
+                } else {
+                    c.stmf.clone()
+                };
+                let when = changed_stamp(c.changed_us)
+                    .map(|s| format!("{}  {}", s.date, s.time))
+                    .unwrap_or_default();
+                rows.push(Row::Ruler(true));
+                rows.push(Row::Box(dash.clone(), None));
+                for (l, v) in [
+                    (" RPG member name  . . . . . :  ", c.name.as_str()),
+                    (" External name  . . . . . . :  ", external.as_str()),
+                    (" Last change  . . . . . . . :  ", when.as_str()),
+                ] {
+                    rows.push(Row::Box(boxed(&format!("{l}{v}"), 102), Some(next_id)));
+                }
+                rows.push(Row::Box(dash, None));
+                rows.push(Row::Ruler(!super::parse::is_fully_free(&c.source)));
+                let ordinal = copies_used.len();
+                for (i, _) in c.source.lines().enumerate() {
+                    if let Some(b) = before.remove(&(ordinal * COPY_LINES + i + 1)) {
+                        rows.extend(b);
+                    }
+                    rows.push(Row::Copy(k, i + 1, ordinal));
+                    if let Some(a) = after.remove(&(ordinal * COPY_LINES + i + 1)) {
+                        rows.extend(a);
+                    }
+                }
+                // The ID of each copy line is this copy's.
+                let last = rows.len();
+                let _ = last;
+            }
+        }
     }
-    // Number the rows: listing line numbers.
-    let mut number: HashMap<usize, usize> = HashMap::new(); // source line → listing line
-    let mut gen_number: HashMap<usize, usize> = HashMap::new(); // generated index → listing line
+    // The source ID of each copy, by index into input.copies (the first
+    // use).
+    let copy_id = |k: usize| {
+        copies_used
+            .iter()
+            .find(|(c, _, _)| *c == k)
+            .map(|x| x.1)
+            .unwrap_or(0)
+    };
+    // Number the rows.
+    let mut number: HashMap<usize, usize> = HashMap::new();
+    let mut copy_number: HashMap<(usize, usize), usize> = HashMap::new();
+    // Text of each numbered line, for the references: (number, text,
+    // free form).
+    let mut texts: Vec<(usize, String, bool)> = Vec::new();
+    let mut gens: Vec<(usize, Gen)> = Vec::new();
     let mut listing_no = 0usize;
-    let mut gen_index = 0usize;
-    let mut gen_seen = 0usize;
+    let mut comments = 0usize;
+    let mut not_specs = 0usize;
+    let mut gen_seq: HashMap<usize, usize> = HashMap::new();
     let mut lines_out: Vec<String> = Vec::new();
     let seq_of = |n: usize| -> String {
         if member {
@@ -521,36 +781,91 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
             format!("{n:06}")
         }
     };
+    let count_line = |text: &str, form_free: bool, comments: &mut usize, not_specs: &mut usize| {
+        let t = text.trim().to_ascii_uppercase();
+        if t.starts_with("**FREE") {
+            *not_specs += 1;
+        } else if is_comment(text, form_free) {
+            *comments += 1;
+        } else if form_free
+            && matches!(
+                t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                    .next()
+                    .unwrap_or(""),
+                "END-DS" | "END-PI" | "END-PR"
+            )
+        {
+            *not_specs += 1;
+        }
+    };
     for r in &rows {
         match r {
             Row::Src(n) => {
                 listing_no += 1;
                 number.insert(*n, listing_no);
-                let text: String = src_lines[n - 1].chars().take(100).collect();
+                let raw = src_lines[n - 1];
+                count_line(raw, free, &mut comments, &mut not_specs);
+                texts.push((listing_no, raw.to_string(), free));
                 let d = dos.get(n).cloned().unwrap_or_default();
                 let date = if member { "000000" } else { "" };
-                let s = format!(
-                    "{listing_no:>6} {text:<100} {d:<3}  {date:<6}     {}",
-                    seq_of(*n)
-                );
-                lines_out.push(s.trim_end().to_string());
-                gen_index += 0;
-            }
-            Row::Gen(t) => {
-                listing_no += 1;
-                gen_seen += 1;
-                gen_number.insert(gen_index, listing_no);
-                let s = format!("{listing_no:>6}={t:<116}1{gen_seen:06}");
-                lines_out.push(s);
-                gen_index += 1;
-            }
-            Row::Box(t, gen) => {
-                if *gen {
-                    lines_out.push(format!("{t:<123}1"));
-                    gen_index += 1;
+                let s = if free {
+                    let text: String = raw.chars().take(100).collect();
+                    format!(
+                        "{listing_no:>6} {text:<100} {d:<3}  {date:<6}     {}",
+                        seq_of(*n)
+                    )
                 } else {
-                    lines_out.push(t.clone());
-                }
+                    format!(
+                        "{listing_no:>6} {:<95} {d:<3}       {date:<6}     {}",
+                        fixed_text(raw),
+                        seq_of(*n)
+                    )
+                };
+                lines_out.push(s.trim_end().to_string());
+            }
+            Row::Copy(k, line, ordinal) => {
+                listing_no += 1;
+                copy_number.insert((*ordinal, *line), listing_no);
+                let c = &input.copies[*k].member;
+                let cfree = super::parse::is_fully_free(&c.source);
+                let raw = c.source.lines().nth(line - 1).unwrap_or("");
+                count_line(raw, cfree, &mut comments, &mut not_specs);
+                texts.push((listing_no, raw.to_string(), cfree));
+                let (date, seq) = if c.stmf.is_empty() {
+                    ("000000", format!("{:06}", line * 100))
+                } else {
+                    ("", format!("{line:06}"))
+                };
+                let id = copy_id(*k);
+                let d = dos
+                    .get(&(ordinal * COPY_LINES + line))
+                    .cloned()
+                    .unwrap_or_default();
+                let s = if cfree {
+                    let text: String = raw.chars().take(100).collect();
+                    format!("{listing_no:>6}+{text:<100} {d:<3}  {date:<6}    {id}{seq}")
+                } else {
+                    format!(
+                        "{listing_no:>6}+{:<95} {d:<3}       {date:<6}    {id}{seq}",
+                        fixed_text(raw)
+                    )
+                };
+                lines_out.push(s.trim_end().to_string());
+            }
+            Row::Gen(t, id, g) => {
+                listing_no += 1;
+                let k = gen_seq.entry(*id).or_insert(0);
+                *k += 1;
+                gens.push((listing_no, g.clone()));
+                lines_out.push(format!("{listing_no:>6}={t:<116}{id}{k:06}"));
+            }
+            Row::Box(t, id) => match id {
+                Some(id) => lines_out.push(format!("{t:<123}{id}")),
+                None => lines_out.push(t.clone()),
+            },
+            Row::Ruler(fixed) => {
+                let r = if *fixed { RULER_FIXED } else { RULER_FREE };
+                lines_out.extend(r.iter().map(|x| x.to_string()));
             }
         }
     }
@@ -558,41 +873,92 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
     let mut source_section = vec![at(&[(27, "S o u r c e   L i s t i n g")])];
     source_section.extend(lines_out);
     source_section.push(END_SOURCE.into());
-    let lno = |line: usize| number.get(&line).copied().unwrap_or(line);
+    // The listing line of a parsed line (copied lines: n * COPY_LINES +
+    // line).
+    let lno = |line: usize| {
+        if line >= COPY_LINES {
+            copy_number
+                .get(&(line / COPY_LINES, line % COPY_LINES))
+                .copied()
+                .unwrap_or(0)
+        } else {
+            number.get(&line).copied().unwrap_or(line)
+        }
+    };
+    let def_line = |line: usize, _name: &str| -> usize { lno(line) };
 
     // ------------------------------------------------------ diagnostics
-    let mut diag_section = Vec::new();
-    if !input.diags.is_empty() {
-        diag_section.push(at(&[(
+    let mut diag_section = vec![
+        at(&[(
             11,
             "A d d i t i o n a l   D i a g n o s t i c   M e s s a g e s",
-        )]));
-        diag_section.push(" Msg id  Sv Number Seq     Message text".into());
-        for d in input.diags {
-            let (n, seq) = if d.line > 0 {
-                (lno(d.line).to_string(), seq_of(d.line))
-            } else {
-                (String::new(), String::new())
-            };
-            let head = format!("*{:<7} {:02} {:>6} {:<6}  ", d.id, d.sev, n, seq);
-            diag_section.extend(wrapped(&head, &d.text, 27, 86));
-        }
-        diag_section.push(END_DIAG.into());
+        )]),
+        " Msg id  Sv Number Seq     Message text".to_string(),
+    ];
+    for d in input.diags {
+        let (n, seq) = if d.line >= COPY_LINES {
+            (
+                lno(d.line).to_string(),
+                format!("{}{:06}", d.line / COPY_LINES, (d.line % COPY_LINES) * 100),
+            )
+        } else if d.line > 0 {
+            (lno(d.line).to_string(), seq_of(d.line))
+        } else {
+            (String::new(), String::new())
+        };
+        let head = format!("*{:<7} {:02} {:>6} {:<6}  ", d.id, d.sev, n, seq);
+        diag_section.extend(wrapped(&head, &d.text, 27, 86));
     }
+    diag_section.push(END_DIAG.into());
+    let buffer: Vec<(usize, u32, u32, String)> = gens
+        .iter()
+        .filter_map(|(n, g)| match g {
+            Gen::Output(name, s, e) => Some((*n, *s, *e, name.clone())),
+            _ => None,
+        })
+        .collect();
     if !buffer.is_empty() {
         diag_section.push(at(&[(18, "O u t p u t   B u f f e r   P o s i t i o n s")]));
         diag_section.push("Line   Start End   Field or Constant".into());
         diag_section.push("Number Pos   Pos".into());
-        for (g, start, end, name) in &buffer {
-            let n = gen_number.get(g).copied().unwrap_or(0);
+        for (n, start, end, name) in &buffer {
             diag_section.push(format!("{n:>6}{start:>6}{end:>6} {name}"));
         }
         diag_section.push(END_BUFFER.into());
     }
+    if !copies_used.is_empty() {
+        diag_section.push(at(&[(29, "/ C o p y   M e m b e r s")]));
+        diag_section.push(
+            "Line   Src  RPG name   <-------- External name -------> CCSID  <- Last change ->"
+                .into(),
+        );
+        diag_section.push(
+            "Number Id              Library    File       Member            Date     Time".into(),
+        );
+        for (k, id, line) in &copies_used {
+            let c = &input.copies[*k].member;
+            let when = changed_stamp(c.changed_us)
+                .map(|s| format!("{} {}", s.date, s.time))
+                .unwrap_or_default();
+            diag_section.push(format!(
+                "{:>6}{id:>5} {:<10} {:<10} {:<10} {:<10}{:>6}  {when}",
+                lno(*line),
+                c.name,
+                c.library,
+                c.file,
+                c.name,
+                c.ccsid
+            ));
+        }
+        diag_section.push(
+            "         * * * * *   E N D   O F   / C O P Y   M E M B E R S   * * * * *".into(),
+        );
+    }
 
     // -------------------------------------------------- cross reference
-    // References: (name → [(listing line, flag)]).
+    // References: name → [(listing line, flag)]; indicators apart.
     let mut refs: BTreeMap<String, Vec<(usize, char)>> = BTreeMap::new();
+    let mut inds: BTreeMap<String, Vec<(usize, char)>> = BTreeMap::new();
     let mut mods: HashSet<(usize, String)> = HashSet::new();
     if let Some(src) = input.src {
         for c in src
@@ -601,14 +967,13 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
             .chain(src.procs.iter().flat_map(|p| p.calcs.iter()))
         {
             for n in modified(c) {
-                mods.insert((c.line, n));
+                mods.insert((lno(c.line), n));
             }
         }
     }
-    for (i, l) in src_lines.iter().enumerate() {
-        let n = i + 1;
+    for (n, l, lfree) in &texts {
         let mut seen_mod: HashSet<String> = HashSet::new();
-        for w in names_in(l, free) {
+        for w in names_in(l, *lfree) {
             let parts: Vec<&str> = w.split('.').collect();
             for (k, p) in parts.iter().enumerate() {
                 let key = if k == 0 {
@@ -617,26 +982,50 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
                     format!("{}.{}", parts[..k].join("."), p)
                 };
                 let flag = if k == 0
-                    && mods.contains(&(n, p.to_string()))
+                    && mods.contains(&(*n, p.to_string()))
                     && seen_mod.insert(p.to_string())
                 {
                     'M'
                 } else {
                     ' '
                 };
-                refs.entry(key.clone()).or_default().push((lno(n), flag));
+                refs.entry(key.clone()).or_default().push((*n, flag));
                 if k > 0 {
-                    refs.entry(p.to_string()).or_default().push((lno(n), ' '));
+                    refs.entry(p.to_string()).or_default().push((*n, ' '));
+                }
+                if let Some(i) = p.strip_prefix("*IN") {
+                    if i.len() == 2 {
+                        inds.entry(i.to_string()).or_default().push((*n, flag));
+                    }
+                }
+            }
+        }
+        // Fixed form: resulting indicators (71-76) are set here (D).
+        if !*lfree {
+            let cs: Vec<char> = l.chars().collect();
+            if cs.get(5).is_some_and(|c| c.eq_ignore_ascii_case(&'C')) && cs.get(6) != Some(&'*') {
+                for k in [70usize, 72, 74] {
+                    let i: String = cs.iter().skip(k).take(2).collect();
+                    let i = i.trim().to_ascii_uppercase();
+                    if !i.is_empty() {
+                        inds.entry(i).or_default().push((*n, 'D'));
+                    }
                 }
             }
         }
     }
-    for (g, name) in &gen_refs {
-        if let Some(n) = gen_number.get(g) {
-            refs.entry(name.clone()).or_default().push((*n, ' '));
+    for (n, g) in &gens {
+        match g {
+            Gen::Record(f) => refs.entry(f.clone()).or_default().push((*n, ' ')),
+            Gen::Input(f, upd) => refs
+                .entry(f.clone())
+                .or_default()
+                .push((*n, if *upd { 'M' } else { 'D' })),
+            Gen::Output(f, _, _) => refs.entry(f.clone()).or_default().push((*n, ' ')),
         }
     }
-    let xref = cross_reference(input, &refs, &lno);
+    let mut unreferenced = 0usize;
+    let xref = cross_reference(input, &refs, &inds, &lno, &def_line, &mut unreferenced);
     let ext = external_references(input, &refs);
 
     // --------------------------------------------------- message summary
@@ -646,6 +1035,12 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
             .entry(d.id.clone())
             .or_insert((d.sev, 0, general_text(d)));
         e.1 += 1;
+    }
+    if unreferenced > 0 {
+        by_id.insert(
+            "RNF7031".into(),
+            (0, unreferenced, "A name or indicator is not used.".into()),
+        );
     }
     let mut msgs = vec![
         at(&[(27, "M e s s a g e   S u m m a r y")]),
@@ -665,35 +1060,11 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
             .filter(|d| d.sev >= lo && d.sev <= hi)
             .count()
     };
-    let comments = src_lines
-        .iter()
-        .enumerate()
-        .filter(|(i, l)| {
-            let t = l.trim();
-            *i > 0 || !t.to_ascii_uppercase().starts_with("**FREE")
-        })
-        .filter(|(_, l)| {
-            let t = l.trim();
-            if free {
-                t.is_empty() || t.starts_with("//")
-            } else {
-                t.is_empty() || l.chars().nth(6) == Some('*') || t.starts_with("//")
-            }
-        })
-        .count();
     let ctdata: usize = input
         .src
         .map(|s| s.ctdata.iter().map(|(_, l)| l.len()).sum())
         .unwrap_or(0);
-    let directives = src_lines
-        .iter()
-        .filter(|l| l.trim_start().to_ascii_uppercase().starts_with("**FREE"))
-        .count();
-    let gen_records = gen_refs
-        .iter()
-        .filter(|(g, _)| matches!(rows_gen_is_record(&rows, *g), Some(true)))
-        .count();
-    let specs = src_lines.len() - comments - directives - ctdata + gen_records;
+    let specs = total_records - comments - not_specs - ctdata;
     let sum = |t: &str, v: usize| {
         let l = crate::commands::dsp_label(t, 30);
         at(&[(5, &l), (39, &format!("{v:>8}"))])
@@ -702,12 +1073,12 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
     let mut fin = vec![
         at(&[(29, "F i n a l   S u m m a r y")]),
         "  Message Totals:".into(),
-        sum("Information  (00)", count(0, 9)),
+        sum("Information  (00)", count(0, 9) + unreferenced),
         sum("Warning      (10)", count(10, 19)),
         sum("Error        (20)", count(20, 29)),
         sum("Severe Error (30+)", count(30, 99)),
         "    ---------------------------------  -------".into(),
-        sum("Total", input.diags.len()),
+        sum("Total", input.diags.len() + unreferenced),
         "  Source Totals:".into(),
         sum("Records", total_records),
         sum("Specifications", specs),
@@ -717,7 +1088,7 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
     ];
     fin.push(if input.created {
         format!(
-            "Program {} was created in library {}; highest severity {max:02}. Created on {} at {}.",
+            "{what} {} was created in library {}; highest severity {max:02}. Created on {} at {}.",
             o.program, o.library, stamp.date, stamp.time
         )
     } else {
@@ -738,34 +1109,14 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
         }
     };
     paged(pro, &[], &mut out);
-    let h1 = "Line   <---------------------- Source Specifications ----------------------------------------------------->  Do  Change Src Seq";
-    let h2 = "Number ....+....1....+....2....+....3....+....4....+....5....+....6....+....7....+....8....+....9....+...10  Num Date   Id  Number";
-    paged(source_section, &[h1, h2], &mut out);
-    if !diag_section.is_empty() {
-        paged(diag_section, &[], &mut out);
-    }
+    let rulers = if free { RULER_FREE } else { RULER_FIXED };
+    paged(source_section, &rulers, &mut out);
+    paged(diag_section, &[], &mut out);
     paged(xref, &[], &mut out);
     paged(ext, &[], &mut out);
     paged(msgs, &[], &mut out);
     paged(fin, &[], &mut out);
     out
-}
-
-fn rows_gen_is_record(rows: &[Row], g: usize) -> Option<bool> {
-    let mut k = 0usize;
-    for r in rows {
-        match r {
-            Row::Gen(t) => {
-                if k == g {
-                    return Some(!t[1..].starts_with(' '));
-                }
-                k += 1;
-            }
-            Row::Box(_, true) => k += 1,
-            _ => {}
-        }
-    }
-    None
 }
 
 /// A box line: `text` after "        *", the closing "*" in column `end`.
@@ -800,6 +1151,7 @@ fn general_text(d: &Diag) -> String {
         "RNF7416" => {
             "The types of the target and the value of the EVAL operation do not match.".into()
         }
+        "RNF7031" => "A name or indicator is not used.".into(),
         "RNF7086" => {
             "RPG blocks the records of the file; its INFDS changes only when a block is read or written."
                 .into()
@@ -829,13 +1181,13 @@ fn options_box(o: &Opts, text: &str, src: &Source, options: &[&str]) -> Vec<Row>
     let srcdir = ctl("BNDDIR").unwrap_or_else(|| "*NONE".into());
     let line = |label: &str, value: &str| -> Row {
         let l = crate::commands::dsp_label(label, 31);
-        Row::Box(boxed(&format!("  {l}   {value}"), 78), false)
+        Row::Box(boxed(&format!("  {l}   {value}"), 78), None)
     };
     let dash = format!("        *{}*", "-".repeat(68));
     let mut b = vec![
-        Row::Box(dash.clone(), false),
-        Row::Box(boxed(" Compiler Options in Effect:", 78), false),
-        Row::Box(dash.clone(), false),
+        Row::Box(dash.clone(), None),
+        Row::Box(boxed(" Compiler Options in Effect:", 78), None),
+        Row::Box(dash.clone(), None),
         line("Text 'description'", text),
         line("Generation severity level", &o.genlvl.to_string()),
         line("Default activation group", &dftactgrp),
@@ -847,7 +1199,7 @@ fn options_box(o: &Opts, text: &str, src: &Source, options: &[&str]) -> Vec<Row>
         } else {
             b.push(Row::Box(
                 boxed(&format!("{:39}{}", "", v.trim_end()), 78),
-                false,
+                None,
             ));
         }
     }
@@ -855,8 +1207,22 @@ fn options_box(o: &Opts, text: &str, src: &Source, options: &[&str]) -> Vec<Row>
         ("Optimization level", "*NONE"),
         ("Source listing indentation", "*NONE"),
         ("Type conversion options", "*NONE"),
-        ("Sort sequence", "*HEX"),
-        ("Language identifier", "*JOBRUN"),
+        (
+            "Sort sequence",
+            if o.srtseq.is_empty() {
+                "*HEX"
+            } else {
+                &o.srtseq
+            },
+        ),
+        (
+            "Language identifier",
+            if o.langid.is_empty() {
+                "*JOBRUN"
+            } else {
+                &o.langid
+            },
+        ),
         ("User profile", "*USER"),
         ("Authority", "*LIBCRTAUT"),
         ("Truncate numeric", "*YES"),
@@ -868,7 +1234,7 @@ fn options_box(o: &Opts, text: &str, src: &Source, options: &[&str]) -> Vec<Row>
     // IBM i 7.5 prints this label with two blanks before its dots.
     b.push(Row::Box(
         boxed("  Storage model . . .  . . . . . . :   *SNGLVL", 78),
-        false,
+        None,
     ));
     let cmd_dir = if o.bnddir.is_empty() {
         "*NONE"
@@ -886,13 +1252,14 @@ fn options_box(o: &Opts, text: &str, src: &Source, options: &[&str]) -> Vec<Row>
     ] {
         b.push(line(t, v));
     }
-    b.push(Row::Box(dash, false));
+    b.push(Row::Box(dash, None));
     b
 }
 
-/// Reference columns: each reference in 8 columns from column 46.
+/// Reference columns: each reference in 8 columns from column 46, four
+/// on a line (observed).
 fn ref_lines(refs: &[(usize, char)]) -> Vec<String> {
-    refs.chunks(10)
+    refs.chunks(4)
         .map(|c| {
             c.iter()
                 .map(|(n, f)| format!("{n:>7}{f}"))
@@ -939,7 +1306,10 @@ fn name_rows(prefix: &str, indent: usize, x: &XName, refs: &[(usize, char)]) -> 
 fn cross_reference(
     input: &Input,
     refs: &BTreeMap<String, Vec<(usize, char)>>,
+    inds: &BTreeMap<String, Vec<(usize, char)>>,
     lno: &dyn Fn(usize) -> usize,
+    def_line: &dyn Fn(usize, &str) -> usize,
+    unreferenced: &mut usize,
 ) -> Vec<String> {
     let mut out = vec![
         at(&[(27, "C r o s s   R e f e r e n c e")]),
@@ -959,13 +1329,7 @@ fn cross_reference(
     }
     for f in &files {
         let d = Some(lno(f.decl.line));
-        let r = with_def(
-            get(&f.decl.name)
-                .into_iter()
-                .filter(|x| Some(x.0) == d)
-                .collect(),
-            d,
-        );
+        let r = with_def(get(&f.decl.name), d);
         let l = ref_lines(&r);
         out.push(
             format!(
@@ -976,6 +1340,9 @@ fn cross_reference(
             .trim_end()
             .to_string(),
         );
+        for x in l.iter().skip(1) {
+            out.push(format!("{:45}{x}", ""));
+        }
         let mut formats: Vec<String> = match &f.display {
             Some(d) => d.formats.iter().map(|(n, _)| n.clone()).collect(),
             None => vec![f.format.clone()],
@@ -1010,8 +1377,9 @@ fn cross_reference(
     let mut defs: HashMap<String, usize> = HashMap::new();
     if let Some(s) = src {
         for d in &s.defs {
-            defs.entry(d.name.to_ascii_uppercase())
-                .or_insert(lno(d.line));
+            let n = d.name.to_ascii_uppercase();
+            let l = def_line(d.line, &n);
+            defs.entry(n).or_insert(l);
         }
     }
     let mut names = global_names(prog, &defs, refs);
@@ -1027,16 +1395,32 @@ fn cross_reference(
         }
     }
     names.sort_by_cached_key(|x| ebc(&x.name));
+    // A name defined and never used: RNF7031 (00), in the cross
+    // reference and the summaries (observed on IBM i 7.5).
+    let mut unused = |r: &[(usize, char)]| -> bool {
+        let u = !r.is_empty() && r.iter().all(|x| x.1 == 'D');
+        if u {
+            *unreferenced += 1;
+        }
+        u
+    };
     for x in &names {
         let r = with_def(get(&x.name), x.def);
-        let prefix = if x.undefined { "*RNF7030" } else { "" };
+        let prefix = if x.undefined {
+            "*RNF7030"
+        } else if !x.name.starts_with('*') && unused(&r) {
+            "*RNF7031"
+        } else {
+            ""
+        };
         out.extend(name_rows(prefix, 0, x, &r));
         let mut kids = x.children.clone();
         kids.sort_by_cached_key(|k| ebc(&k.name));
         for k in &kids {
             let q = format!("{}.{}", x.name, k.name);
             let r = with_def(refs.get(&q).cloned().unwrap_or_else(|| get(&k.name)), k.def);
-            out.extend(name_rows("", 2, k, &r));
+            let prefix = if unused(&r) { "*RNF7031" } else { "" };
+            out.extend(name_rows(prefix, 2, k, &r));
         }
     }
     // Each procedure's own fields.
@@ -1055,7 +1439,7 @@ fn cross_reference(
                     .defs
                     .iter()
                     .find(|d| d.name.eq_ignore_ascii_case(n))
-                    .map(|d| lno(d.line));
+                    .map(|d| def_line(d.line, n));
                 let attrs = match sym {
                     Sym::Var(v) => vec![attr(&v.dtype)],
                     Sym::Ds(d) => vec![format!("DS({})", d.size)],
@@ -1083,7 +1467,9 @@ fn cross_reference(
                     .into_iter()
                     .filter(|(l, _)| *l >= span.0 && *l <= span.1)
                     .collect();
-                out.extend(name_rows("", 0, x, &with_def(r, x.def)));
+                let r = with_def(r, x.def);
+                let prefix = if unused(&r) { "*RNF7031" } else { "" };
+                out.extend(name_rows(prefix, 0, x, &r));
             }
         }
     }
@@ -1092,23 +1478,16 @@ fn cross_reference(
     out.push(
         "         Indicator                            References (D=Defined M=Modified)".into(),
     );
-    let mut inds: Vec<String> = refs
-        .keys()
-        .filter_map(|k| k.strip_prefix("*IN"))
-        .filter(|i| i.len() == 2 && !i.starts_with('('))
-        .map(|i| i.to_string())
-        .collect();
-    inds.sort_by_cached_key(|i| ebc(i));
-    if inds.is_empty() {
-        out.push("         No references in the source.".into());
-    }
-    for i in inds {
-        let r = get(&format!("*IN{i}"));
-        let l = ref_lines(&with_def(r, None));
+    let mut list: Vec<&String> = inds.keys().collect();
+    list.sort_by_cached_key(|i| ebc(i));
+    for i in list {
+        let mut r = inds[i].clone();
+        r.sort_by_key(|x| x.0);
+        let l = ref_lines(&r);
         out.push(
             format!(
                 "{:<45}{}",
-                at(&[(10, &i)]),
+                at(&[(10, i)]),
                 l.first().cloned().unwrap_or_default()
             )
             .trim_end()
@@ -1248,13 +1627,32 @@ fn external_references(input: &Input, refs: &BTreeMap<String, Vec<(usize, char)>
         "         Procedure                            References".into(),
     ];
     let prog = input.prog;
-    let imports: Vec<String> = prog.map(|p| p.imports.clone()).unwrap_or_default();
+    // Prototypes of procedures that are not in this module (EXTPROC or
+    // the name), whether called or not.
+    let mut imports: Vec<String> = prog
+        .map(|p| {
+            p.protos
+                .values()
+                .filter(|x| x.extpgm.is_none())
+                .filter(|x| {
+                    let t = x.extproc.clone().unwrap_or_else(|| x.name.clone());
+                    !p.procs.contains_key(&t.to_ascii_uppercase()) && !p.procs.contains_key(&x.name)
+                })
+                .map(|x| x.name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    imports.sort_by_cached_key(|n| crate::rpg::data::e(n));
     if imports.is_empty() {
         out.push(none.clone());
     }
     for i in imports {
-        let r = refs.get(&i).cloned().unwrap_or_default();
-        let l = ref_lines(&with_def(r, None));
+        let mut r = refs.get(&i).cloned().unwrap_or_default();
+        r.sort_by_key(|x| x.0);
+        for x in r.iter_mut() {
+            x.1 = ' ';
+        }
+        let l = ref_lines(&r);
         out.push(
             format!(
                 "{:<45}{}",

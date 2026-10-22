@@ -107,8 +107,10 @@ def main():
             # Left from an earlier run? Start clean.
             command(sec, f"dltusrprf {user}", f"> dltusrprf {user}")
             sec.pump(1)
-            if f"User profile {user} deleted." not in sec.text() and "CPF2204" not in sec.text():
-                sec.wait_for("CPF2204", 10)
+            # Command Entry shows message texts, not IDs (IBM i 7.5, PUB400):
+            # CPF2204 is "User profile ... not found."
+            if f"User profile {user} deleted." not in sec.text() and f"User profile {user} not found." not in sec.text():
+                sec.wait_for(f"User profile {user} not found.", 10)
             command(sec, f"crtusrprf {user} password(Order{user[-1]}x) text('Order clerk')", f"{user} created")
         check(True, "QSECOFR creates three clerk profiles")
 

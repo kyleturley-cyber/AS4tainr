@@ -3,6 +3,13 @@
 
 Expects a fresh database (QSECOFR with its initial, expired password) and
 the sample objects in QGPL (scripts/samples.sh).
+
+Command Entry follows IBM i 7.5 as captured on PUB400 (tools/golden/screens.txt,
+docs/golden-outputs.md): no user name on it, the previous commands with their
+messages as texts without message IDs, nothing on line 24 after a command, a
+command line on rows 18-21, and a command missing a required parameter is
+prompted. So checks look for message texts in the log, not IDs on line 24.
+
 Usage:
 
     TN5250=/path/to/tn5250 python3 tools/e2e_5250.py 127.0.0.1:2323
@@ -76,13 +83,17 @@ with Tn5250(HOST) as t:
           and "90. Sign off" in t.text(),
           "signed on (blanks ignored, password not case sensitive): the initial menu MAIN is shown", t)
     command(t, "call qcmd", "Command Entry")
-    check("QSECOFR" in t.line(2), "CALL QCMD from the menu's command line shows Command Entry", t)
+    check("Request level:" in t.line(2) and "(No previous commands or messages)" in t.text(),
+          "CALL QCMD from the menu's command line shows Command Entry with no previous commands", t)
 
     command(t, "crtlib mylib text('My first library')", "Library MYLIB was created.")
-    check("Library MYLIB was created." in t.line(24), "CRTLIB creates a library", t)
+    check("> crtlib mylib" in t.text() and "Library MYLIB was created." in t.text() and t.line(24).strip() == "",
+          "CRTLIB creates a library: the command and its message in the log, line 24 empty", t)
 
-    command(t, "CRTLIB LIB(MYLIB)", "CPF2111")
-    check("CPF2111" in t.line(24), "CRTLIB of an existing library fails with CPF2111", t)
+    command(t, "CRTLIB LIB(MYLIB)", "already exists")
+    check("Library MYLIB already exists." in t.text() and "CPF2111" not in t.text()
+          and "CRTLIB LIB(MYLIB)" in t.line(18),
+          "CRTLIB of an existing library fails (CPF2111, shown as text); the command stays on the command line", t)
     t.fkey(12)  # clear the retained command
 
     command(t, "dsplib qsys", "Display Library")
@@ -134,8 +145,8 @@ with Tn5250(HOST) as t:
     t.wait_for("3 rows selected.")
     check(True, "back on the SQL screen, the row count is shown", t)
     t.type("select * from nosuch"); t.enter()
-    t.wait_for("SQL0204")
-    check(True, "an unknown table gives SQL0204", t)
+    t.wait_for("NOSUCH not found.")
+    check("SQL0204" not in t.text(), "an unknown table gives SQL0204, shown as its text", t)
     t.fkey(3)
     t.wait_for("Command Entry")
     # RUNSQL sends no completion message; a statement it cannot run ends
@@ -145,16 +156,17 @@ with Tn5250(HOST) as t:
     check("Ames" in t.text(), "RUNSQL runs an UPDATE", t)
     t.fkey(3); t.wait_for("Command Entry")
     command(t, "runsql sql('update custmast set cusctY = ''Des Moines'' where cusno = 1')", "where cusno = 1')")
-    command(t, "runsql sql('select * from custmast')", "SQL9010")
+    command(t, "runsql sql('select * from custmast')", "RUNSQL failed")
     check(True, "RUNSQL does not run SELECT (SQL9010)", t)
     t.fkey(12)
 
-    command(t, "dsplib nosuch", "CPF2110")
-    check("CPF2110" in t.line(24), "DSPLIB of a missing library fails with CPF2110", t)
+    command(t, "dsplib nosuch", "Library NOSUCH does not exist.")
+    check(True, "DSPLIB of a missing library fails (CPF2110)", t)
     t.fkey(12)
 
-    command(t, "foo bar", "CPD0030")
-    check("CPD0030" in t.line(24), "an unknown command gives CPD0030", t)
+    command(t, "foo bar", "Command FOO was not found")
+    check("The command has errors and was not run." in t.text(),
+          "an unknown command: its diagnostic (CPD0030), then CPF0006, both in the log", t)
     t.fkey(12)
 
     command(t, "call custlist parm('3')", "Found Bluebird Supply in Omaha", timeout=90)
@@ -162,7 +174,7 @@ with Tn5250(HOST) as t:
 
     t.fkey(9)
     t.pump(0.5)
-    check("call custlist" in t.line(20), "F9 retrieves the previous command", t)
+    check("call custlist" in t.line(18), "F9 retrieves the previous command", t)
     t.fkey(12)
 
     # DSPLY with a response asks the operator.
@@ -327,21 +339,30 @@ with Tn5250(HOST) as t:
     t.type("dspusrprf"); t.fkey(4)
     t.wait_for("Display User Profile (DSPUSRPRF)")
     t.enter()
-    t.wait_for("CPD0071")
+    t.wait_for("needs a value")
     check(True, "the prompt checks required parameters", t)
     t.fkey(12)
     t.wait_for("Command Entry")
-    check("dspusrprf" in t.line(20), "F12 on the prompt returns with the command as typed", t)
-    t.fkey(12)
+    # IBM i 7.5 (PUB400): F12 on a prompt logs the command and CPF6801,
+    # and the command line is empty.
+    check("> DSPUSRPRF" in t.text() and "Command prompting was ended" in t.text()
+          and t.line(18).strip() == "===>",
+          "F12 on the prompt: the command and 'prompting ended' in the log, the command line empty", t)
+    # A command without a required parameter is prompted (CRTDTAARA
+    # without TYPE on PUB400 shows the prompt, the cursor on TYPE).
+    command(t, "dspusrprf", "Display User Profile (DSPUSRPRF)")
+    check("needs a value" in t.line(24), "a command missing a required parameter is prompted, with the message", t)
+    t.fkey(12); t.wait_for("Command Entry")
     # A command with more parameters than one screen holds: Page Down and
     # Page Up move between the prompt's pages.
     t.type("crtprtf"); t.fkey(4)
+    # "More..." or "Bottom" on row 21 of a prompt (IBM i 7.5, PUB400 CRTDTAARA prompt).
     t.wait_for("Create Printer File (CRTPRTF)")
-    check("More..." in t.line(22) and "Replace file" not in t.text(),
+    check("More..." in t.line(21) and "Replace file" not in t.text(),
           "a long prompt shows More... on its first page", t)
     t.page_down()
     t.wait_for("Replace file")
-    check("Bottom" in t.line(22), "Page Down shows the prompt's next page", t)
+    check("Bottom" in t.line(21), "Page Down shows the prompt's next page", t)
     t.page_up()
     t.wait_for("More...")
     check("Source file" in t.text(), "Page Up goes back to the first page", t)
@@ -397,10 +418,11 @@ with Tn5250(HOST) as t:
     with Tn5250(HOST) as t2:
         t2.wait_for("Sign On")
         t2.type("bob"); t2.tab(); t2.type("secret42"); t2.enter()
-        qcmd(t2)
+        t2.wait_for("as4tainr Main Menu", 30)
         check("BOB" in t2.line(2), "a second session signs on as BOB while QSECOFR is signed on", t2)
+        command(t2, "call qcmd", "Command Entry")
         command(t2, "sbmjob cmd(call pgm(custrpt) parm(L)) job(rpt)", "was put on job queue QBATCH")
-        check("CPC1221" in t2.line(24) and "/BOB/RPT" in t2.line(24),
+        check("/BOB/RPT was put on job queue QBATCH" in t2.text(),
               "SBMJOB puts job RPT on job queue QBATCH (CPC1221)", t2)
         command(t, "wrkactjob", "Work with Active Jobs")
         screen = t.text()
@@ -470,8 +492,8 @@ with Tn5250(HOST) as t:
         # Object authority: with *PUBLIC *USE, BOB cannot open CUSTMAST
         # for update; a private *CHANGE lets him.
         command(t, "grtobjaut obj(custmast) objtype(*file) user(*public) aut(*use)", "*PUBLIC has authority *USE")
-        command(t2, "call custmnt", "CPF9802", timeout=90)
-        check("CPF9802: Not authorized" in t2.text(),
+        command(t2, "call custmnt", "Not authorized", timeout=90)
+        check("Not authorized" in t2.text(),
               "with *PUBLIC *USE, BOB's program cannot open CUSTMAST for update (CPF9802)", t2)
         command(t, "grtobjaut custmast *file user(bob) aut(*change)", "BOB has authority *CHANGE")
         command(t, "dspobjaut custmast *file", "Display Object Authority")
@@ -504,10 +526,11 @@ with Tn5250(HOST) as t:
 
     # The new user: no *SECADM, so no CRTUSRPRF; CHGPWD shows the screen.
     t.type("bob"); t.tab(); t.type("secret42"); t.enter()
-    qcmd(t)
+    t.wait_for("as4tainr Main Menu", 30)
     check("BOB" in t.line(2), "the new profile signs on", t)
+    command(t, "call qcmd", "Command Entry")
     command(t, "crtusrprf eve", "Not authorized")
-    check("*SECADM" in t.line(24), "CRTUSRPRF needs *SECADM special authority", t)
+    check("*SECADM" in t.text(), "CRTUSRPRF needs *SECADM special authority", t)
     t.fkey(12)
     command(t, "chgpwd", "Change Password")
     t.fkey(12)

@@ -148,7 +148,8 @@ with sync_playwright() as pw:
     check("not-it" not in t.text(), "the password field is not displayed (nondisplay attribute)", t)
 
     sign_on(t)
-    check("QSECOFR" in t.line(2), "signed on from the browser: command entry shows the user", t)
+    # Command Entry shows the request level, not the user (IBM i 7.5, PUB400).
+    check("Request level:" in t.line(2), "signed on from the browser: command entry is shown", t)
     labels = {k: fkey_label(page, k) for k in ("F3", "F4", "F9", "F12", "F5")}
     check(labels["F3"] == {"label": "Exit", "active": True} and labels["F4"]["label"] == "Prompt"
           and labels["F9"]["label"] == "Retrieve" and labels["F12"]["label"] == "Cancel",
@@ -156,7 +157,8 @@ with sync_playwright() as pw:
     check(labels["F5"] == {"label": "", "active": False}, "keys the screen does not name are dimmed", t)
 
     t.command(f"crtlib {LIB.lower()} text('Made in a browser')", f"Library {LIB} was created.")
-    check(f"Library {LIB} was created." in t.line(24), "CRTLIB from the browser", t)
+    check(f"Library {LIB} was created." in t.text() and t.line(24).strip() == "",
+          "CRTLIB from the browser: its message in the Command Entry log", t)
 
     t.command(f"dsplib {LIB}", "Display Library")
     check(LIB in t.line(3) and "Made in a browser" in t.text(), "DSPLIB shows the new library and its text", t)

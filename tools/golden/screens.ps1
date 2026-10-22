@@ -44,15 +44,32 @@ if (-not $same) {
 $tunnel = $null
 try {
   $password = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
-  Write-Host "opening the tunnel (local port $Port to $HostAlias port 23)"
-  $tunnel = Start-Process ssh -ArgumentList @('-N', '-o', 'ExitOnForwardFailure=yes', '-L', "${Port}:localhost:23", $HostAlias) -PassThru -WindowStyle Hidden
-  $ok = $false
-  for ($t = 0; $t -lt 30; $t++) {
-    Start-Sleep 1
-    try { $c = New-Object Net.Sockets.TcpClient('127.0.0.1', $Port); $c.Close(); $ok = $true; break } catch { }
-    if ($tunnel.HasExited) { break }
+  # A tunnel left from an earlier run still holds the port.
+  $busy = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+  if ($busy) {
+    $ids = ($busy | ForEach-Object { $_.OwningProcess } | Sort-Object -Unique) -join ', '
+    throw "local port $Port is in use (process $ids; an old ssh tunnel?). End it (Stop-Process -Id $ids) or use -Port"
   }
-  if (-not $ok) { throw "the tunnel did not open (ssh exited: $($tunnel.HasExited)); try again" }
+  # PUB400's sshd drops some new connections: try a few times. What ssh
+  # says goes to target\ibmi\tunnel.err.
+  $err = [IO.Path]::GetFullPath((Join-Path $Out '..\tunnel.err'))
+  New-Item -ItemType Directory -Force (Split-Path $err -Parent) | Out-Null
+  $ok = $false
+  for ($try = 1; $try -le 4 -and -not $ok; $try++) {
+    Write-Host "opening the tunnel (local port $Port to $HostAlias port 23), try $try"
+    $tunnel = Start-Process ssh -ArgumentList @('-N', '-o', 'ExitOnForwardFailure=yes', '-o', 'ConnectTimeout=20', '-L', "${Port}:localhost:23", $HostAlias) -PassThru -NoNewWindow -RedirectStandardError $err
+    for ($t = 0; $t -lt 30; $t++) {
+      Start-Sleep 1
+      if ($tunnel.HasExited) { break }
+      try { $c = New-Object Net.Sockets.TcpClient('127.0.0.1', $Port); $c.Close(); $ok = $true; break } catch { }
+    }
+    if (-not $ok) {
+      if (-not $tunnel.HasExited) { Stop-Process -Id $tunnel.Id -Force }
+      Write-Host ("  ssh: " + ((Get-Content $err -ErrorAction SilentlyContinue) -join ' / '))
+      if ($try -lt 4) { Start-Sleep 10 }
+    }
+  }
+  if (-not $ok) { throw "the tunnel did not open after 4 tries (see $err)" }
   $out = [IO.Path]::GetFullPath($Out)
   try {
     $n = [Tn5250Capture]::RunList('127.0.0.1', $Port, (Resolve-Path $List).Path, $out, $User, $password, $QuietMs)

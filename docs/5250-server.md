@@ -52,16 +52,16 @@ Sign-on:
               as4tainr - legacy RPG and 5250 applications in a container
 ```
 
-Command entry, after CRTLIB and a CALL of an RPG program:
+Command entry, after CRTLIB and a CALL of an RPG program. The layout follows IBM i 7.5's Command Entry as captured on a real system (docs/golden-outputs.md): the request level on line 2, the previous commands from column 5 with their messages under them as texts (no message IDs), "Bottom", and a command line of four rows. A command's messages are not repeated on line 24.
 
 ```
-                                Command Entry                            AS4TAINR
-                                                                        QSECOFR
- Signed on to AS4TAINR as QSECOFR.
- > crtlib salesx text('Sales applications')
-   Library SALESX was created.
- > call ordtotal parm('1002')
-   DSPLY  Order 1002: 3 lines, total 24.00
+                                 Command Entry                         AS4TAINR
+                                                           Request level:   2
+ Previous commands and messages:
+    > crtlib salesx text('Sales applications')
+      Library SALESX was created.
+    > call ordtotal parm('1002')
+      DSPLY  Order 1002: 3 lines, total 24.00
 
 
 
@@ -70,45 +70,45 @@ Command entry, after CRTLIB and a CALL of an RPG program:
 
 
 
-
-
-
+                                                                         Bottom
  Type command, press Enter.
  ===>
 
+
+
  F3=Exit   F4=Prompt   F9=Retrieve   F12=Cancel
 
- DSPLY  Order 1002: 3 lines, total 24.00
 ```
 
 An error keeps the command on the command line so it can be corrected:
 
 ```
-                                Command Entry                            AS4TAINR
-                                                                        QSECOFR
- Signed on to AS4TAINR as QSECOFR.
- > crtlib salesx text('Sales applications')
-   Library SALESX was created.
- > call ordtotal parm('1002')
-   DSPLY  Order 1002: 3 lines, total 24.00
- > crtlib salesx
-   CPF2111: Library SALESX already exists.
+                                 Command Entry                         AS4TAINR
+                                                           Request level:   2
+ Previous commands and messages:
+    > crtlib salesx text('Sales applications')
+      Library SALESX was created.
+    > call ordtotal parm('1002')
+      DSPLY  Order 1002: 3 lines, total 24.00
+    > crtlib salesx
+      Library SALESX already exists.
 
 
 
 
 
 
-
-
-
+                                                                         Bottom
  Type command, press Enter.
  ===> crtlib salesx
 
+
+
  F3=Exit   F4=Prompt   F9=Retrieve   F12=Cancel
 
- CPF2111: Library SALESX already exists.
 ```
+
+A command typed without a required parameter is not run: its prompt is shown, with the missing parameter's message on line 24 and the cursor on it, as IBM i does in an interactive job. F3 or F12 on a prompt puts the command into the log with "Command prompting was ended by F3 or F12." (CPF6801) and leaves the command line empty.
 
 DSPLIB:
 
@@ -201,7 +201,7 @@ Keys on the command entry screen:
 
 **Command menu (F4 on an empty line).** A numbered menu of command groups (Library, Object, File, User profile, Program, Session). Type a number and press Enter to open a group's menu of commands, then a number to prompt that command. The "Selection or command" line also takes a command name: Enter runs it, F4 prompts it. F12 goes back one menu, F3 returns to the command line. A menu longer than one screen shows More... and pages with Page Down and Page Up. The groups are `cl::GROUPS`; a unit test checks that every command is in exactly one.
 
-**Prompting (F4).** The prompt has one line per parameter with its current value or default and the allowed values; required parameters are highlighted, qualified names get a separate Library line. Enter builds the command (parameters left at their default are left out), checks it, and runs it; the command as built appears in the log, so F9 retrieves it. F5 resets the values, F12 returns to the command line with what was typed, F3 returns to an empty command line. The prompt comes from the same command table (`cl::COMMANDS`) as parsing.
+**Prompting (F4).** The prompt is laid out like IBM i's with keywords shown: one line per parameter with its prompt text and dots to column 33, the keyword in column 35, a `>` in column 48 before a value that was typed, and the field in column 50 (a qualified name's Library line below it, its field in column 52); "More..." or "Bottom" on line 21, the keys on line 22. Required parameters are highlighted. Enter builds the command (parameters left at their default are left out), checks it, and runs it; the command as built appears in the log, so F9 retrieves it. F5 resets the values, F3 and F12 return to an empty command line, the command and CPF6801 in the log. The prompt comes from the same command table (`cl::COMMANDS`) as parsing.
 
 On list screens, Page Down / Page Up (Roll Up / Roll Down) page through the list. Lists with options (DSPLIBL) have an Opt column: type an option number next to one or more entries and press Enter to run it on each, then you come back to the list. F12 goes back one screen, F3 goes back to the command line.
 

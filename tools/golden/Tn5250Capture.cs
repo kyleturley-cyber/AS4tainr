@@ -235,7 +235,16 @@ public class Tn5250Capture
         if (start >= rec.Length) return;
         byte[] data = new byte[rec.Length - start];
         Array.Copy(rec, start, data, 0, data.Length);
-        string skipped = Apply(data);
+        string skipped;
+        try { skipped = Apply(data); }
+        catch (Exception e)
+        {
+            // A record this client does not read right: keep going (the rest
+            // of the record is lost) and write the record to session.log to
+            // fix the client. Host records after the sign-on hold no password.
+            skipped = e.GetType().Name + ": " + e.Message + " at " + e.StackTrace.Replace("\n", " / ");
+            Log.AppendLine("record hex: " + BitConverter.ToString(data).Replace("-", ""));
+        }
         if (skipped != null) Log.AppendLine("skipped: " + skipped);
     }
 
@@ -342,7 +351,7 @@ public class Tn5250Capture
                         while (true) { int at = addr; Put(0); if (at == to || addr == 0) break; }
                         break;
                     }
-                case 0x01: { int n = d[i + 1]; i += 1 + Math.Max(n, 1); break; } // SOH
+                case 0x01: { int n = d[i + 1]; i += 2 + n; break; } // SOH: order, length, then that many bytes (as tn5250 reads it)
                 case 0x12: i += 3; break; // WEA
                 case 0x10: case 0x15: // TD, WDSF
                     {
@@ -558,6 +567,8 @@ public class Tn5250Capture
                               string user, string password, int quietMs)
     {
         Directory.CreateDirectory(outDir);
+        // Screens of an earlier run would be mistaken for this run's.
+        foreach (string old in Directory.GetFiles(outDir, "*.txt")) File.Delete(old);
         Tn5250Capture t = new Tn5250Capture();
         t.Connect(host, port);
         int done = 0;
@@ -590,6 +601,11 @@ public class Tn5250Capture
                 if (signOn && t.HasNonDisplayInput())
                     throw new InvalidOperationException("stopped after " + name + ": the sign-on was not accepted (see " + name + ".txt); nothing else is typed, so no more sign-on attempts are made");
             }
+        }
+        catch (Exception e)
+        {
+            if (!(e is InvalidOperationException)) t.Log.AppendLine("error: " + e);
+            throw;
         }
         finally
         {

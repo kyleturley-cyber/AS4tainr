@@ -88,9 +88,15 @@ fn describe_secret(raw: &str) -> String {
     )
 }
 
+/// A title centered as IBM i centers them: (80 - length) / 2 blanks, so
+/// "Command Entry" starts in column 34 and "Display Library" in 33
+/// (observed on IBM i 7.5, PUB400 screen captures).
 fn centered(s: &mut Screen, row: u8, text: &str) {
-    let col = ((80 - text.chars().count() as u8) / 2).max(2);
-    s.text(row, col, attr::HIGH, text);
+    s.text(row, center_col(text), attr::HIGH, text);
+}
+
+fn center_col(text: &str) -> u8 {
+    ((80 - text.chars().count().min(78) as u8) / 2 + 1).max(2)
 }
 
 fn keys(s: &mut Screen, row: u8, text: &str) {
@@ -326,8 +332,12 @@ async fn change_password(
     }
 }
 
-const LOG_TOP: u8 = 3;
-const LOG_ROWS: usize = 16; // rows 3..=18
+// Command Entry as IBM i 7.5 draws it (PUB400 captures): the log on rows
+// 4-15 (commands from column 5, their messages from column 7), "Bottom"
+// on row 16, the command line on rows 18-21.
+const LOG_TOP: u8 = 4;
+const LOG_ROWS: usize = 12;
+const COMMAND_LINE_LEN: u16 = 313;
 
 /// A display the operator can come back to: a menu, or Command Entry
 /// (CALL QCMD). The session keeps a stack of them.
@@ -373,6 +383,9 @@ impl Requests {
 struct Done {
     /// For the message line.
     message: String,
+    /// The message is in the Command Entry log too (Command Entry does
+    /// not repeat it on line 24).
+    in_log: bool,
     /// For the command line (the request, when it failed).
     prefill: String,
     next: Next,
@@ -394,10 +407,7 @@ async fn workstation(
     display_rx: &mut tokio::sync::mpsc::Receiver<runtime::DisplayRequest>,
     profile: &users::Profile,
 ) -> Result<()> {
-    let mut rq = Requests {
-        log: vec![format!("Signed on to {} as {}.", cfg.system_name, job.user)],
-        ..Default::default()
-    };
+    let mut rq = Requests::default();
     let mut stack: Vec<Place> = Vec::new();
     let mut message = String::new();
     let mut prefill = String::new();
@@ -441,10 +451,11 @@ async fn workstation(
     }
     while let Some(top) = stack.last() {
         let bottom = stack.len() == 1;
+        let level = stack.len();
         let action = match top {
             Place::Menu(m) => menu_display(term, m, cfg, job, &mut rq, &message, &prefill).await?,
             Place::CommandEntry => {
-                command_entry(term, job, cfg, &mut rq, &message, &prefill).await?
+                command_entry(term, cfg, &mut rq, level, &message, &prefill).await?
             }
         };
         message.clear();
@@ -474,7 +485,10 @@ async fn workstation(
             }
             Action::Run(line) => {
                 let done = request(term, job, cfg, display_rx, &mut rq, &line).await?;
-                message = done.message;
+                let on_entry = matches!(stack.last(), Some(Place::CommandEntry));
+                if !(done.in_log && on_entry && matches!(done.next, Next::Stay)) {
+                    message = done.message;
+                }
                 prefill = done.prefill;
                 match done.next {
                     Next::SignOff => return Ok(()),
@@ -487,12 +501,14 @@ async fn workstation(
     Ok(())
 }
 
-/// The Command Entry display (CALL QCMD).
+/// The Command Entry display (CALL QCMD), laid out as on IBM i 7.5: the
+/// request level, the previous commands with their messages (texts
+/// without IDs), and a four-line command line.
 async fn command_entry(
     term: &mut Term,
-    job: &mut Job<'_>,
     cfg: &ServerConfig,
     rq: &mut Requests,
+    level: usize,
     first_message: &str,
     first_prefill: &str,
 ) -> Result<Action> {
@@ -502,14 +518,19 @@ async fn command_entry(
         let mut s = Screen::new();
         centered(&mut s, 1, "Command Entry");
         s.put(1, 66, &format!("{:>14}", cfg.system_name));
-        s.put(2, 66, &format!("{:>14}", job.user));
+        s.put(2, 60, &format!("Request level:{level:>4}"));
+        s.put(3, 2, "Previous commands and messages:");
+        if rq.log.is_empty() {
+            s.put(LOG_TOP + 1, 4, "(No previous commands or messages)");
+        }
         let start = rq.log.len().saturating_sub(LOG_ROWS);
         for (i, line) in rq.log[start..].iter().enumerate() {
-            s.put(LOG_TOP + i as u8, 2, line);
+            s.put(LOG_TOP + i as u8, 5, line);
         }
-        s.put(19, 2, "Type command, press Enter.");
-        s.text(20, 2, attr::HIGH, "===>");
-        s.field("CMD", 20, 7, 74, FieldKind::Text, &prefill);
+        s.put(LOG_TOP + LOG_ROWS as u8, 74, "Bottom");
+        s.put(17, 2, "Type command, press Enter.");
+        s.text(18, 2, attr::HIGH, "===>");
+        s.field("CMD", 18, 7, COMMAND_LINE_LEN, FieldKind::Text, &prefill);
         keys(&mut s, 22, "F3=Exit   F4=Prompt   F9=Retrieve   F12=Cancel");
         s.message(&message);
         prefill.clear();
@@ -634,13 +655,38 @@ async fn request(
 ) -> Result<Done> {
     let mut done = Done {
         message: String::new(),
+        in_log: false,
         prefill: String::new(),
         next: Next::Stay,
     };
-    let line = match line.strip_prefix('?') {
+    // What to prompt, and the message the prompt starts with: F4 (`?`),
+    // or a command typed without a required parameter, which an
+    // interactive job prompts for instead of running it (IBM i 7.5 on
+    // PUB400: CRTDTAARA without TYPE shows the CRTDTAARA prompt with the
+    // missing parameter's message on line 24).
+    let (to_prompt, first) = match line.strip_prefix('?') {
+        Some(typed) => (Some(typed.trim().to_string()), String::new()),
+        None => {
+            let l = line.trim();
+            match cl::parse(l) {
+                Err(e)
+                    if e.to_string()
+                        .lines()
+                        .any(|m| crate::jobs::message_id(m) == "CPD0071") =>
+                {
+                    (
+                        Some(l.to_string()),
+                        crate::jobs::display_text(&e.to_string()),
+                    )
+                }
+                _ => (None, String::new()),
+            }
+        }
+    };
+    let line = match to_prompt {
         None => line.trim().to_string(),
         Some(typed) => {
-            let typed = typed.trim();
+            let typed = typed.as_str();
             let chosen = if typed.is_empty() {
                 command_menu(term).await?
             } else {
@@ -650,15 +696,42 @@ async fn request(
                 }
                 match cl::parse_partial(typed) {
                     Err(e) => {
-                        done.message = crate::jobs::display_message(&e.to_string());
+                        done.message = crate::jobs::display_text(&e.to_string());
                         done.prefill = typed.to_string();
                         return Ok(done);
                     }
-                    Ok((def, vals)) => match prompt(term, def, &vals).await? {
+                    Ok((def, vals)) => match prompt(term, def, &vals, &first).await? {
                         PromptResult::Run(line) => Some(line),
-                        PromptResult::Exit => None,
-                        PromptResult::Cancel => {
-                            done.prefill = typed.to_string();
+                        PromptResult::Exit | PromptResult::Cancel => {
+                            // The command as given goes into the log with
+                            // CPF6801 (prompting ended by F3 or F12), and
+                            // the command line is empty again (observed
+                            // on IBM i 7.5, PUB400).
+                            let given: std::collections::BTreeMap<String, String> = def
+                                .params
+                                .iter()
+                                .filter_map(|pd| {
+                                    vals.get(pd.keyword).map(|v| {
+                                        (pd.keyword.to_string(), cl::prompt_text(pd.kind, v))
+                                    })
+                                })
+                                .collect();
+                            let shown = cl::build(def, &given).to_ascii_uppercase();
+                            let text = "Command prompting was ended by F3 or F12.";
+                            rq.log.push(format!("> {shown}"));
+                            rq.log.push(format!("  {text}"));
+                            if let Some(id) = &job.id {
+                                crate::jobs::log(job.client, id, "*RQS", &shown).await;
+                                crate::jobs::log(
+                                    job.client,
+                                    id,
+                                    "*ESCAPE",
+                                    &format!("CPF6801: {text}"),
+                                )
+                                .await;
+                            }
+                            done.message = text.to_string();
+                            done.in_log = true;
                             return Ok(done);
                         }
                     },
@@ -728,9 +801,13 @@ async fn request(
     match result {
         Ok(Outcome::Messages(msgs)) => {
             if let Some(last) = msgs.last() {
-                done.message = last.clone();
+                done.message = crate::jobs::shown_text(last).to_string();
+                done.in_log = true;
             }
-            rq.log.extend(msgs.into_iter().map(|m| format!("  {m}")));
+            rq.log.extend(
+                msgs.iter()
+                    .map(|m| format!("  {}", crate::jobs::shown_text(m))),
+            );
         }
         Ok(Outcome::Display(d)) => {
             show_list(term, job, d).await?;
@@ -742,12 +819,20 @@ async fn request(
                 "Password not changed.".into()
             };
             rq.log.push(format!("  {}", done.message));
+            done.in_log = true;
         }
         Ok(Outcome::StartSql) => {
             sql_session(term, job).await?;
         }
         Ok(Outcome::SignOff) => done.next = Next::SignOff,
-        Ok(Outcome::CommandEntry) => done.next = Next::Show(Place::CommandEntry),
+        Ok(Outcome::CommandEntry) => {
+            // CALL QCMD itself is not one of Command Entry's previous
+            // commands: it starts with none (IBM i 7.5, PUB400).
+            if rq.log.last().is_some_and(|l| l.starts_with("> ")) {
+                rq.log.pop();
+            }
+            done.next = Next::Show(Place::CommandEntry)
+        }
         Ok(Outcome::Menu(menus::Menu::Builtin(m))) => done.next = Next::Show(Place::Menu(m)),
         Ok(Outcome::Menu(menus::Menu::Program { program, .. })) => {
             // A *PGM menu: the program shows the menu; when it returns,
@@ -765,8 +850,13 @@ async fn request(
         Err(e) => {
             let text = e.to_string();
             let lines: Vec<&str> = text.lines().collect();
-            done.message = crate::jobs::display_message(&text);
-            rq.log.extend(lines.iter().map(|m| format!("  {m}")));
+            done.message = crate::jobs::display_text(&text);
+            done.in_log = true;
+            rq.log.extend(
+                lines
+                    .iter()
+                    .map(|m| format!("  {}", crate::jobs::shown_text(m))),
+            );
             done.prefill = line.clone();
         }
     }
@@ -979,7 +1069,7 @@ async fn command_menu(term: &mut Term) -> Result<Option<String>> {
                 Some(g) => {
                     let def =
                         cl::find(cl::GROUPS[g].commands[i]).expect("groups list known commands");
-                    match prompt(term, def, &Default::default()).await? {
+                    match prompt(term, def, &Default::default(), "").await? {
                         PromptResult::Run(line) => return Ok(Some(line)),
                         PromptResult::Exit => return Ok(None),
                         PromptResult::Cancel => {}
@@ -988,8 +1078,8 @@ async fn command_menu(term: &mut Term) -> Result<Option<String>> {
             },
             MenuChoice::Command(line, false) => return Ok(Some(line)),
             MenuChoice::Command(line, true) => match cl::parse_partial(&line) {
-                Err(e) => message = crate::jobs::display_message(&e.to_string()),
-                Ok((def, vals)) => match prompt(term, def, &vals).await? {
+                Err(e) => message = crate::jobs::display_text(&e.to_string()),
+                Ok((def, vals)) => match prompt(term, def, &vals, "").await? {
                     PromptResult::Run(line) => return Ok(Some(line)),
                     PromptResult::Exit => return Ok(None),
                     PromptResult::Cancel => {}
@@ -1008,18 +1098,53 @@ enum PromptResult {
     Exit,
 }
 
+// The command prompt as IBM i 7.5 draws it (PUB400 captures): prompt
+// texts from column 2 with dots to column 33, the keyword in column 35,
+// the field in column 50 (a qualifier's in 52), "Bottom" on row 21.
 const PROMPT_FIRST_ROW: u8 = 5;
-/// Lines of parameters on one prompt page (5-21).
-const PROMPT_LINES: usize = 17;
+const PROMPT_LAST_ROW: u8 = 20;
+/// Lines of parameters on one prompt page (5-20).
+const PROMPT_LINES: usize = 16;
 const PROMPT_LABEL_COL: u8 = 2;
-const PROMPT_FIELD_COL: u8 = 37;
+const PROMPT_KEYWORD_COL: u8 = 35;
+const PROMPT_FIELD_COL: u8 = 50;
+
+/// A prompt text (indented by `indent`) with dots in the odd columns up to
+/// column 33, as on IBM i's command prompts.
+fn prompt_label(text: &str, indent: usize) -> String {
+    let mut s = format!("{}{}", " ".repeat(indent), text);
+    // Columns are 1-based from PROMPT_LABEL_COL (2): s[k] is column k + 2.
+    let mut col = s.chars().count() + 2 + 1; // a blank after the text
+    if col % 2 == 0 {
+        col += 1;
+    }
+    while s.chars().count() + 2 < col {
+        s.push(' ');
+    }
+    while col <= 33 {
+        s.push('.');
+        if col < 33 {
+            s.push(' ');
+        }
+        col += 2;
+    }
+    s
+}
+
+/// Rows a parameter takes on the prompt: its field from column 50 may go
+/// on to the next rows; a qualified name has a row for its library.
+fn prompt_rows(pd: &cl::ParamDef) -> usize {
+    let end = PROMPT_FIELD_COL as usize - 1 + prompt_width(pd.kind) as usize - 1;
+    end / 80 + 1 + usize::from(pd.kind == cl::Kind::Qualified)
+}
 
 fn prompt_width(kind: cl::Kind) -> u16 {
     match kind {
         cl::Kind::Name | cl::Kind::Qualified => 10,
         cl::Kind::Password => users::MAX_PASSWORD as u16,
-        cl::Kind::Text | cl::Kind::List => 42,
-        cl::Kind::Command => 60,
+        // To the end of the row (IBM i's are 32 for a data area value).
+        cl::Kind::Text | cl::Kind::List => 30,
+        cl::Kind::Command => 190,
     }
 }
 
@@ -1029,6 +1154,7 @@ async fn prompt(
     term: &mut Term,
     def: &'static cl::CommandDef,
     typed: &std::collections::BTreeMap<&'static str, Vec<cl::Value>>,
+    first_message: &str,
 ) -> Result<PromptResult> {
     use std::collections::BTreeMap;
     let initial = || -> BTreeMap<String, String> {
@@ -1049,13 +1175,13 @@ async fn prompt(
         v
     };
     let mut values = initial();
-    let mut message = String::new();
-    // Pages of parameters: lines 5-21, a qualified name takes two; the
+    let mut message = first_message.to_string();
+    // Pages of parameters: lines 5-20, a qualified name takes two; the
     // Page Down and Page Up keys (Roll Up, Roll Down) move between them.
     let mut pages: Vec<Vec<&cl::ParamDef>> = vec![vec![]];
     let mut used = 0;
     for pd in def.params {
-        let n = if pd.kind == cl::Kind::Qualified { 2 } else { 1 };
+        let n = prompt_rows(pd);
         if used + n > PROMPT_LINES {
             pages.push(vec![]);
             used = 0;
@@ -1063,19 +1189,43 @@ async fn prompt(
         pages.last_mut().unwrap().push(pd);
         used += n;
     }
+    // The page and field the message is about: a parameter's keyword in
+    // the message puts the cursor on that parameter, as IBM i does.
     let mut page = 0usize;
+    let mut focus: Option<&'static str> = None;
     loop {
+        if let Some(pd) = def.params.iter().find(|pd| {
+            message
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|w| w == pd.keyword)
+        }) {
+            focus = Some(pd.keyword);
+            if let Some(p) = pages
+                .iter()
+                .position(|pg| pg.iter().any(|x| x.keyword == pd.keyword))
+            {
+                page = p;
+            }
+        }
         let mut s = Screen::new();
         centered(&mut s, 1, &format!("{} ({})", def.description, def.name));
         s.put(3, 2, "Type choices, press Enter.");
         let mut row = PROMPT_FIRST_ROW;
+        let mut cursor = None;
         for pd in pages[page].iter().copied() {
             let a = if pd.required {
                 attr::HIGH
             } else {
                 attr::NORMAL
             };
-            s.text(row, PROMPT_LABEL_COL, a, &label(pd.prompt, 33));
+            // Prompt text, keyword, '>' before a value that was typed,
+            // field: IBM i 7.5's prompt with keywords shown (PUB400).
+            s.text(row, PROMPT_LABEL_COL, a, &prompt_label(pd.prompt, 0));
+            s.put(row, PROMPT_KEYWORD_COL, pd.keyword);
+            let given = typed.contains_key(pd.keyword);
+            if given {
+                s.put(row, PROMPT_FIELD_COL - 2, ">");
+            }
             let w = prompt_width(pd.kind);
             let kind = match pd.kind {
                 cl::Kind::Password => FieldKind::Hidden,
@@ -1084,30 +1234,34 @@ async fn prompt(
             };
             let v = values.get(pd.keyword).cloned().unwrap_or_default();
             s.field(pd.keyword, row, PROMPT_FIELD_COL, w, kind, &v);
-            // Allowed values to the right, when they fit on the line.
-            if !pd.choices.is_empty()
-                && PROMPT_FIELD_COL as usize + w as usize + 2 + pd.choices.len() <= 80
-            {
-                s.put(row, PROMPT_FIELD_COL + w as u8 + 2, pd.choices);
+            if focus == Some(pd.keyword) {
+                cursor = Some((row, PROMPT_FIELD_COL));
             }
-            row += 1;
+            row += prompt_rows(pd) as u8;
             if pd.kind == cl::Kind::Qualified {
-                s.put(row, PROMPT_LABEL_COL + 2, &label("Library", 31));
+                row -= 1;
+                s.put(row, PROMPT_LABEL_COL, &prompt_label("Library", 2));
+                if given {
+                    s.put(row, PROMPT_FIELD_COL - 2, ">");
+                }
                 let key = format!("{}.LIB", pd.keyword);
                 let v = values.get(&key).cloned().unwrap_or_default();
-                s.field(&key, row, PROMPT_FIELD_COL, 10, FieldKind::Upper, &v);
-                s.put(row, PROMPT_FIELD_COL + 12, "Name, *LIBL, *CURLIB");
+                s.field(&key, row, PROMPT_FIELD_COL + 2, 10, FieldKind::Upper, &v);
                 row += 1;
             }
         }
-        if page + 1 < pages.len() {
-            s.put(22, 73, "More...");
-        } else {
-            s.put(22, 74, "Bottom");
+        if let Some((r, c)) = cursor {
+            s.cursor_at(r, c);
         }
-        keys(&mut s, 23, "F3=Exit   F5=Refresh   F12=Cancel");
+        if page + 1 < pages.len() {
+            s.put(PROMPT_LAST_ROW + 1, 73, "More...");
+        } else {
+            s.put(PROMPT_LAST_ROW + 1, 74, "Bottom");
+        }
+        keys(&mut s, 22, "F3=Exit   F5=Refresh   F12=Cancel");
         s.message(&message);
         message.clear();
+        focus = None;
         let inp = term.show(&s).await?;
         for (name, v) in &inp.values {
             values.insert(name.clone(), v.trim_end().to_string());
@@ -1164,7 +1318,7 @@ async fn prompt(
         let line = cl::build(def, &flat);
         match cl::parse(&line) {
             Ok(_) => return Ok(PromptResult::Run(line)),
-            Err(e) => message = crate::jobs::display_message(&e.to_string()),
+            Err(e) => message = crate::jobs::display_text(&e.to_string()),
         }
     }
 }
@@ -1248,7 +1402,7 @@ async fn sql_session(term: &mut Term, job: &mut Job<'_>) -> Result<()> {
             }
             Ok(None) => {}
             Err(e) => {
-                message = crate::jobs::display_message(&e.to_string());
+                message = crate::jobs::display_text(&e.to_string());
                 prefill = stmt;
                 log.push(format!("  {message}"));
                 continue;
@@ -1299,7 +1453,7 @@ async fn sql_session(term: &mut Term, job: &mut Job<'_>) -> Result<()> {
             }
             Ok(crate::sql::Outcome::Message(m)) => message = m,
             Err(e) => {
-                message = crate::jobs::display_message(&e.to_string());
+                message = crate::jobs::display_text(&e.to_string());
                 prefill = stmt;
             }
         }
@@ -1344,7 +1498,7 @@ async fn show_list(term: &mut Term, job: &mut Job<'_>, d: ListDisplay) -> Result
                         Ok(Outcome::Display(d)) => shown.push(d),
                         Ok(Outcome::Messages(m)) => message = m.last().cloned().unwrap_or_default(),
                         Ok(_) => {}
-                        Err(e) => message = crate::jobs::display_message(&e.to_string()),
+                        Err(e) => message = crate::jobs::display_text(&e.to_string()),
                     }
                 }
                 // Options change what the list shows (ENDJOB, DLTSPLF, ...).
@@ -1373,7 +1527,7 @@ async fn refresh_top(job: &mut Job<'_>, stack: &mut [ListDisplay], message: &mut
             }
         }
         Ok(_) => {}
-        Err(e) => *message = crate::jobs::display_message(&e.to_string()),
+        Err(e) => *message = crate::jobs::display_text(&e.to_string()),
     }
 }
 
@@ -1527,6 +1681,39 @@ async fn list_display(term: &mut Term, d: &ListDisplay, first_message: &str) -> 
                 }
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_labels_and_titles_as_ibm_i_draws_them() {
+        // Columns observed on IBM i 7.5 (PUB400, CRTDTAARA and CHGDTAARA
+        // prompts): dots in the odd columns from the first one after a
+        // blank, up to column 33; the label starts in column 2.
+        let col_of_first_dot = |l: &str| l.find('.').unwrap() + PROMPT_LABEL_COL as usize;
+        let data_area = prompt_label("Data area", 0);
+        assert_eq!(col_of_first_dot(&data_area), 13);
+        assert_eq!(data_area.len() + 1, 33);
+        assert_eq!(col_of_first_dot(&prompt_label("Library", 2)), 13);
+        assert_eq!(col_of_first_dot(&prompt_label("Type", 0)), 7);
+        assert_eq!(col_of_first_dot(&prompt_label("Data area", 2)), 15);
+        assert_eq!(
+            col_of_first_dot(&prompt_label("Substring starting position", 2)),
+            33
+        );
+        // Titles: "Command Entry" in column 34, "Display Library" in 33,
+        // "Create Data Area (CRTDTAARA)" in 27.
+        for (title, col) in [
+            ("Command Entry", 34u8),
+            ("Display Library", 33),
+            ("Create Data Area (CRTDTAARA)", 27),
+            ("Display Data Area", 32),
+        ] {
+            assert_eq!(center_col(title), col, "{title}");
         }
     }
 }

@@ -274,6 +274,26 @@ pub fn display_message(text: &str) -> String {
     lines.last().map(|l| l.to_string()).unwrap_or_default()
 }
 
+/// A message as a 5250 display shows it: the text without its message ID.
+/// Command Entry's log and the message line of IBM i 7.5 show texts only
+/// (observed on PUB400: "Parameter TYPE required." on line 24 of a command
+/// prompt, the messages under each command on Command Entry).
+pub fn shown_text(line: &str) -> &str {
+    let id = message_id(line);
+    if id.is_empty() {
+        return line;
+    }
+    line[id.len()..]
+        .strip_prefix(':')
+        .map(str::trim_start)
+        .unwrap_or(line)
+}
+
+/// [`display_message`] without the message ID, for 5250 displays.
+pub fn display_text(text: &str) -> String {
+    shown_text(&display_message(text)).to_string()
+}
+
 /// Add a message to a job's log.
 pub async fn log(client: &Client, id: &JobId, kind: &str, text: &str) {
     // A command's messages: CPCxxxx are completion messages, CPDxxxx

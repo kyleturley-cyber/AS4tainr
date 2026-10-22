@@ -6,6 +6,8 @@
 03_cmd_entry|call qcmd{ERASEEOF}{ENTER}
 04_unknown_cmd|nosuchcmd{ERASEEOF}{ENTER}
 05_missing_parm|crtdtaara as4trainr1/scrda{ERASEEOF}{ENTER}
+# IBM i prompts for a missing required parameter: F12 back to command entry.
+05c_missing_parm_cancel|{F12}
 06_crtdtaara|crtdtaara as4trainr1/scrda *char len(10) value(abc){ERASEEOF}{ENTER}
 07_dspdtaara|dspdtaara as4trainr1/scrda{ERASEEOF}{ENTER}
 08_dspdtaara_exit|{F3}

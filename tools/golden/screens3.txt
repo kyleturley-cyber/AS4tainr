@@ -1,0 +1,45 @@
+# 5250 screens of PUB400 (IBM i 7.5), round 3: element lists and F10 on
+# prompts, a long prompt, work-with displays, DSPUSRPRF, the system menus.
+# Objects: data area SCR3DA in the current library (created and deleted here).
+# Run: screens.ps1 -List tools\golden\screens3.txt -Out target\ibmi\screens3
+01_signon|{USER}{TAB}{PASSWORD}{ENTER}
+02_after_signon|{ENTER}
+03_cmd_entry|call qcmd{ERASEEOF}{ENTER}
+# CRTDTAARA *DEC: the LEN element list (length, decimal positions).
+04_dec_prompt|crtdtaara{ERASEEOF}{F4}
+05_dec_type|scr3da{TAB}{TAB}*dec{ENTER}
+06_dec_len|7{TAB}2{ENTER}
+07_dec_run|{ENTER}
+08_dspdtaara_dec|dspdtaara scr3da{ERASEEOF}{ENTER}
+09_dspdtaara_enter|{ENTER}
+10_dltdtaara|dltdtaara scr3da{ERASEEOF}{ENTER}
+# CRTLIB's prompt and its additional parameters (not run).
+11_crtlib_prompt|crtlib{ERASEEOF}{F4}
+12_crtlib_f10|{F10}
+13_crtlib_down|{PAGEDOWN}
+14_crtlib_cancel|{F12}
+# A long prompt over several pages (not run).
+15_crtprtf_prompt|crtprtf{ERASEEOF}{F4}
+16_crtprtf_down|{PAGEDOWN}
+17_crtprtf_down2|{PAGEDOWN}
+18_crtprtf_cancel|{F12}
+19_wrkobj|wrkobj as4trainr1/*all{ERASEEOF}{ENTER}
+20_wrkobj_f11|{F11}
+21_wrkobj_exit|{F3}
+22_wrkactjob|wrkactjob{ERASEEOF}{ENTER}
+23_wrkactjob_exit|{F3}
+24_wrksbmjob|wrksbmjob{ERASEEOF}{ENTER}
+25_wrksbmjob_exit|{F3}
+26_dspusrprf|dspusrprf as4trainr{ERASEEOF}{ENTER}
+27_dspusrprf_down|{PAGEDOWN}
+28_dspusrprf_exit|{F3}
+29_go_user|go user{ERASEEOF}{ENTER}
+30_go_user_exit|{F3}
+31_go_program|go program{ERASEEOF}{ENTER}
+32_go_program_exit|{F3}
+33_go_security|go security{ERASEEOF}{ENTER}
+34_go_security_exit|{F3}
+35_go_file|go file{ERASEEOF}{ENTER}
+36_go_file_exit|{F3}
+37_exit_cmd_entry|{F3}
+38_signoff|signoff{ERASEEOF}{ENTER}

@@ -363,8 +363,15 @@ with Tn5250(HOST) as t:
     t.type("crtprtf"); t.fkey(4)
     # "More..." or "Bottom" on row 21 of a prompt (IBM i 7.5, PUB400 CRTDTAARA prompt).
     t.wait_for("Create Printer File (CRTPRTF)")
+    # CRTPRTF's first screen has FILE, SRCFILE, SRCMBR, GENLVL, FLAG, DEV,
+    # DEVTYPE and TEXT; F10 adds the others (IBM i 7.5, PUB400).
+    check("Bottom" in t.line(21) and "Printer device type" in t.text() and "Page size" not in t.text()
+          and "F10=Additional parameters" in t.text(),
+          "CRTPRTF's prompt shows its main parameters first", t)
+    t.fkey(10)
+    t.wait_for("Additional Parameters")
     check("More..." in t.line(21) and "Replace file" not in t.text(),
-          "a long prompt shows More... on its first page", t)
+          "F10 adds the additional parameters: the prompt is now longer than a screen", t)
     t.page_down()
     t.wait_for("Replace file")
     check("Bottom" in t.line(21), "Page Down shows the prompt's next page", t)
@@ -592,7 +599,9 @@ with Tn5250(HOST) as t:
     command(t, "crtusrprf carl password(Menus123) inlpgm(qgpl/ordentc) inlmnu(*signoff)",
             "User profile CARL created.")
     command(t, "dspusrprf carl", "Display User Profile")
-    check("QGPL/ORDENTC" in t.text() and "*SIGNOFF" in t.text(),
+    # IBM i 7.5's DSPUSRPRF (PUB400): the program, its library on the next
+    # line ("Initial program ... SETLANG", "Library ... PUB400SYS").
+    check("ORDENTC" in t.text() and "QGPL" in t.text() and "*SIGNOFF" in t.text(),
           "DSPUSRPRF shows the initial program and the initial menu", t)
     t.fkey(3); t.wait_for("Command Entry")
     with Tn5250(HOST) as t2:

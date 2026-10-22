@@ -95,6 +95,10 @@ fn centered(s: &mut Screen, row: u8, text: &str) {
     s.text(row, center_col(text), attr::HIGH, text);
 }
 
+fn prompt_title_col(text: &str) -> u8 {
+    ((81 - text.chars().count().min(78) as u8) / 2 + 1).max(2)
+}
+
 fn center_col(text: &str) -> u8 {
     ((80 - text.chars().count().min(78) as u8) / 2 + 1).max(2)
 }
@@ -521,6 +525,9 @@ async fn command_entry(
     // F10: all requests and messages, of every request level, each
     // command with its level (IBM i 7.5, PUB400); otherwise this level's.
     let mut all = false;
+    // Page Up and Page Down move through the log; `back` is how many lines
+    // the last one shown is above the newest.
+    let mut back = 0usize;
     loop {
         let mut s = Screen::new();
         centered(&mut s, 1, "Command Entry");
@@ -548,11 +555,17 @@ async fn command_entry(
         if shown.is_empty() {
             s.put(LOG_TOP + 1, 4, "(No previous commands or messages)");
         }
-        let start = shown.len().saturating_sub(LOG_ROWS);
-        for (i, line) in shown[start..].iter().enumerate() {
+        back = back.min(shown.len().saturating_sub(LOG_ROWS));
+        let end = shown.len() - back;
+        let start = end.saturating_sub(LOG_ROWS);
+        for (i, line) in shown[start..end].iter().enumerate() {
             s.put(LOG_TOP + i as u8, 2, line);
         }
-        s.put(LOG_TOP + LOG_ROWS as u8, 74, "Bottom");
+        if back == 0 {
+            s.put(LOG_TOP + LOG_ROWS as u8, 74, "Bottom");
+        } else {
+            s.put(LOG_TOP + LOG_ROWS as u8, 73, "More...");
+        }
         s.put(17, 2, "Type command, press Enter.");
         s.text(18, 2, attr::HIGH, "===>");
         s.field("CMD", 18, 7, COMMAND_LINE_LEN, FieldKind::Text, &prefill);
@@ -576,6 +589,21 @@ async fn command_entry(
             Aid::F(12) => continue,
             Aid::F(10) => {
                 all = !all;
+                back = 0;
+                prefill = typed;
+                continue;
+            }
+            Aid::RollUp => {
+                if back == 0 {
+                    message = "This is the last page.".into();
+                } else {
+                    back = back.saturating_sub(LOG_ROWS);
+                }
+                prefill = typed;
+                continue;
+            }
+            Aid::RollDown => {
+                back += LOG_ROWS;
                 prefill = typed;
                 continue;
             }
@@ -628,6 +656,11 @@ async fn menu_display(
         s.text(20, 2, attr::HIGH, "===>");
         s.field("SEL", 20, 7, 74, FieldKind::Text, &prefill);
         keys(&mut s, 22, "F3=Exit   F4=Prompt   F9=Retrieve   F12=Cancel");
+        // The other system menus have F16 back to MAIN (IBM i 7.5, PUB400:
+        // USER, PROGRAM, SECURITY, FILE).
+        if m.name != "MAIN" {
+            keys(&mut s, 23, "F16=Main menu");
+        }
         s.message(&message);
         message.clear();
         prefill.clear();
@@ -636,6 +669,7 @@ async fn menu_display(
         match inp.aid {
             Aid::F(3) => return Ok(Action::Exit),
             Aid::F(12) => return Ok(Action::Cancel),
+            Aid::F(16) if m.name != "MAIN" => return Ok(Action::Run("GO MAIN".into())),
             Aid::F(9) => {
                 match rq.previous() {
                     Some(l) => prefill = l,
@@ -1025,7 +1059,7 @@ async fn menu(
                 if page + 1 < pages {
                     page += 1;
                 } else {
-                    *message = "Already at bottom of area.".into();
+                    *message = "This is the last page.".into();
                 }
                 continue;
             }
@@ -1033,7 +1067,7 @@ async fn menu(
                 if page > 0 {
                     page -= 1;
                 } else {
-                    *message = "Already at top of area.".into();
+                    *message = "This is the first page.".into();
                 }
                 continue;
             }
@@ -1176,18 +1210,39 @@ fn prompt_width(pd: &cl::ParamDef) -> u16 {
     match pd.kind {
         cl::Kind::Name | cl::Kind::Qualified => 10,
         cl::Kind::Password => users::MAX_PASSWORD as u16,
-        // TEXT is 50 characters (it goes on to the next row, as on IBM i);
-        // other text values to the end of the row.
+        // TEXT is 50 characters and VALUE 32 (they go on to the next row,
+        // as on IBM i); other text values to the end of the row.
         cl::Kind::Text if pd.keyword == "TEXT" => 50,
+        cl::Kind::Text if pd.keyword == "VALUE" => 32,
         cl::Kind::Text | cl::Kind::List => 30,
         cl::Kind::Command => 190,
     }
 }
 
 /// Parameters IBM i's prompt shows only after F10 (Additional
-/// parameters): AUT on the create commands (CRTDTAARA on PUB400).
-fn additional_parameter(pd: &cl::ParamDef) -> bool {
-    pd.keyword == "AUT"
+/// parameters): AUT on the create commands (CRTDTAARA on PUB400), and for
+/// commands whose first screen is known, all but the ones it shows
+/// (CRTPRTF on PUB400: FILE, SRCFILE, SRCMBR, GENLVL, FLAG, DEV, DEVTYPE,
+/// TEXT).
+fn additional_parameter(def: &cl::CommandDef, pd: &cl::ParamDef) -> bool {
+    let basic: &[&str] = match def.name {
+        "CRTPRTF" => &[
+            "FILE", "SRCFILE", "SRCMBR", "GENLVL", "FLAG", "DEV", "DEVTYPE", "TEXT",
+        ],
+        _ => return pd.keyword == "AUT",
+    };
+    !basic.contains(&pd.keyword)
+}
+
+/// A parameter prompted as a list of elements, each on its own line under
+/// "Prompt:" (IBM i 7.5, PUB400: CRTDTAARA LEN, CRTPRTF DEV): (element
+/// prompt, field length).
+fn elements(command: &str, keyword: &str) -> &'static [(&'static str, u16)] {
+    match (command, keyword) {
+        ("CRTDTAARA", "LEN") => &[("Length", 6), ("Decimal positions", 6)],
+        ("CRTPRTF", "DEV") => &[("Printer", 10)],
+        _ => &[],
+    }
 }
 
 /// Prompt control: a parameter shown only once another one has a value
@@ -1231,14 +1286,40 @@ async fn prompt(
     let initial = || -> BTreeMap<String, String> {
         let mut v = BTreeMap::new();
         for pd in def.params {
+            // A *DFT default shows as a blank field (IBM i 7.5, PUB400:
+            // CRTDTAARA LEN and VALUE); left blank, the default applies.
             let text = match typed.get(pd.keyword) {
                 Some(vals) => cl::prompt_text(pd.kind, vals),
+                None if pd.default == Some("*DFT") => String::new(),
                 None => pd.default.unwrap_or("").to_string(),
             };
+            let els = elements(def.name, pd.keyword);
             if pd.kind == cl::Kind::Qualified {
-                let (lib, obj) = text.split_once('/').unwrap_or((lib_default, &text));
+                // A special value (*NONE) has no library: the field is
+                // blank (CRTPRTF SRCFILE on PUB400).
+                let (lib, obj) = text.split_once('/').unwrap_or(if text.starts_with('*') {
+                    ("", &text)
+                } else {
+                    (lib_default, &text)
+                });
                 v.insert(format!("{}.LIB", pd.keyword), lib.to_string());
                 v.insert(pd.keyword.to_string(), obj.to_string());
+            } else if !els.is_empty() {
+                // Elements: the values given, one to a field; a default
+                // special value (*DFT) leaves them blank, as IBM i shows it,
+                // unless it is the only element.
+                let parts: Vec<String> = if text.starts_with('*') && els.len() > 1 {
+                    vec![]
+                } else {
+                    text.split_whitespace().map(str::to_string).collect()
+                };
+                for (i, _) in els.iter().enumerate() {
+                    v.insert(
+                        format!("{}.{}", pd.keyword, i + 1),
+                        parts.get(i).cloned().unwrap_or_default(),
+                    );
+                }
+                v.insert(pd.keyword.to_string(), text);
             } else {
                 v.insert(pd.keyword.to_string(), text);
             }
@@ -1259,14 +1340,14 @@ async fn prompt(
         let mut items: Vec<PromptItem> = def
             .params
             .iter()
-            .filter(|pd| !additional_parameter(pd) && shown(pd))
+            .filter(|pd| !additional_parameter(def, pd) && shown(pd))
             .map(PromptItem::Param)
             .collect();
         if additional {
             let more: Vec<PromptItem> = def
                 .params
                 .iter()
-                .filter(|pd| additional_parameter(pd) && shown(pd))
+                .filter(|pd| additional_parameter(def, pd) && shown(pd))
                 .map(PromptItem::Param)
                 .collect();
             if !more.is_empty() {
@@ -1276,9 +1357,12 @@ async fn prompt(
         }
         items
     };
-    let has_additional = def.params.iter().any(additional_parameter);
+    let has_additional = def.params.iter().any(|pd| additional_parameter(def, pd));
     let item_rows = |it: &PromptItem| match it {
-        PromptItem::Param(pd) => prompt_rows(pd),
+        PromptItem::Param(pd) => match elements(def.name, pd.keyword).len() {
+            0 => prompt_rows(pd),
+            n => 1 + n,
+        },
         PromptItem::Additional => 3,
     };
     // Pages of parameters: lines 5-20; the Page Down and Page Up keys
@@ -1323,7 +1407,12 @@ async fn prompt(
         }
         page = page.min(pages.len() - 1);
         let mut s = Screen::new();
-        centered(&mut s, 1, &format!("{} ({})", def.description, def.name));
+        // A prompt's title: an odd number of blanks left over goes to the
+        // left (IBM i 7.5, PUB400: "Create Printer File (CRTPRTF)", 29
+        // characters, starts in column 27 as the 28 of "Create Data Area
+        // (CRTDTAARA)" do).
+        let title = format!("{} ({})", def.description, def.name);
+        s.text(1, prompt_title_col(&title), attr::HIGH, &title);
         s.put(3, 2, "Type choices, press Enter.");
         let mut row = PROMPT_FIRST_ROW;
         let mut cursor = None;
@@ -1341,6 +1430,32 @@ async fn prompt(
             } else {
                 attr::NORMAL
             };
+            let els = elements(def.name, pd.keyword);
+            if !els.is_empty() {
+                // "Prompt:", the keyword, then one line per element.
+                s.text(row, PROMPT_LABEL_COL, a, &format!("{}:", pd.prompt));
+                s.put(row, PROMPT_KEYWORD_COL, pd.keyword);
+                let changed = typed.contains_key(pd.keyword)
+                    || (1..=els.len()).any(|i| {
+                        let k = format!("{}.{i}", pd.keyword);
+                        values.get(&k) != start_values.get(&k)
+                    });
+                if changed {
+                    s.put(row, PROMPT_FIELD_COL - 2, ">");
+                }
+                if focus == Some(pd.keyword) {
+                    cursor = Some((row + 1, PROMPT_FIELD_COL));
+                }
+                row += 1;
+                for (i, (label, len)) in els.iter().enumerate() {
+                    s.put(row, PROMPT_LABEL_COL, &prompt_label(label, 2));
+                    let k = format!("{}.{}", pd.keyword, i + 1);
+                    let v = values.get(&k).cloned().unwrap_or_default();
+                    s.field(&k, row, PROMPT_FIELD_COL, *len, FieldKind::Upper, &v);
+                    row += 1;
+                }
+                continue;
+            }
             // Prompt text, keyword, '>' before a value that was typed,
             // field: IBM i 7.5's prompt with keywords shown (PUB400).
             s.text(row, PROMPT_LABEL_COL, a, &prompt_label(pd.prompt, 0));
@@ -1423,7 +1538,7 @@ async fn prompt(
                 if page + 1 < pages.len() {
                     page += 1;
                 } else {
-                    message = "Already at bottom of area.".into();
+                    message = "This is the last page.".into();
                 }
                 continue;
             }
@@ -1431,7 +1546,7 @@ async fn prompt(
                 if page > 0 {
                     page -= 1;
                 } else {
-                    message = "Already at top of area.".into();
+                    message = "This is the first page.".into();
                 }
                 continue;
             }
@@ -1462,6 +1577,28 @@ async fn prompt(
         let mut flat = BTreeMap::new();
         for pd in def.params {
             let v = values.get(pd.keyword).cloned().unwrap_or_default();
+            let els = elements(def.name, pd.keyword);
+            if !els.is_empty() {
+                let parts: Vec<String> = (1..=els.len())
+                    .map(|i| {
+                        values
+                            .get(&format!("{}.{i}", pd.keyword))
+                            .map(|v| v.trim().to_string())
+                            .unwrap_or_default()
+                    })
+                    .filter(|v| !v.is_empty())
+                    .collect();
+                // No element typed: the parameter's default.
+                flat.insert(
+                    pd.keyword.to_string(),
+                    if parts.is_empty() {
+                        pd.default.unwrap_or("").to_string()
+                    } else {
+                        parts.join(" ")
+                    },
+                );
+                continue;
+            }
             if pd.kind == cl::Kind::Qualified {
                 let lib = values
                     .get(&format!("{}.LIB", pd.keyword))
@@ -1950,7 +2087,7 @@ async fn ibm_list_display(
     };
     let options_row = first;
     if has_options {
-        first += 1 + option_lines.len() as u8 + 1;
+        first += 1 + option_lines.len() as u8 + u8::from(!l.tight);
     } else if !l.instruction.is_empty() {
         first += 1;
     }
@@ -1979,6 +2116,9 @@ async fn ibm_list_display(
         if let Some(col) = l.system_col {
             s.put(2, col, &format!("System:   {system}"));
         }
+        if l.system_row1 {
+            s.put(1, 80 - system.chars().count() as u8, system);
+        }
         if !l.right2.is_empty() {
             s.put(2, 80 - l.right2.chars().count() as u8, &l.right2);
         }
@@ -1993,7 +2133,7 @@ async fn ibm_list_display(
             for (i, o) in option_lines.iter().enumerate() {
                 s.text(row + 1 + i as u8, 4, attr::BLUE, o);
             }
-            row += 1 + option_lines.len() as u8 + 1;
+            row += 1 + option_lines.len() as u8 + u8::from(!l.tight);
         } else if !l.instruction.is_empty() {
             s.put(row, 2, &l.instruction);
             row += 1;
@@ -2009,7 +2149,7 @@ async fn ibm_list_display(
             s.text(row, text_col, attr::HIGH, &cut(heading, left));
         }
         let end = (top + page_rows).min(d.rows.len());
-        if d.rows.is_empty() {
+        if d.rows.is_empty() && !l.no_list {
             s.put(first, 4, "(No entries)");
         }
         for (i, idx) in (top.min(d.rows.len())..end).enumerate() {
@@ -2031,7 +2171,8 @@ async fn ibm_list_display(
                 &cut(rows.get(idx).map(String::as_str).unwrap_or(""), left),
             );
         }
-        if end < d.rows.len() {
+        if l.no_list {
+        } else if end < d.rows.len() {
             s.put(bottom_row, 73, "More...");
         } else {
             s.put(bottom_row, 74, "Bottom");
@@ -2162,5 +2303,7 @@ mod tests {
         ] {
             assert_eq!(center_col(title), col, "{title}");
         }
+        assert_eq!(prompt_title_col("Create Data Area (CRTDTAARA)"), 27);
+        assert_eq!(prompt_title_col("Create Printer File (CRTPRTF)"), 27);
     }
 }

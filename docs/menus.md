@@ -49,7 +49,7 @@ These menus are built into as4tainr and belong to QSYS. Their texts are as4tainr
 | MAIN | as4tainr Main Menu | the menus below; 6 prompts GO; 7 is Command Entry |
 | USER | User Tasks | DSPMSG, SNDMSG, WRKSPLF, WRKSBMJOB, DSPJOBLOG, CHGPWD, DSPLIBL |
 | JOBS | Jobs and Printed Output | WRKACTJOB, WRKSBMJOB, SBMJOB, ENDJOB, WRKSPLF, DSPJOBLOG |
-| FILES | Files, Libraries and Objects | DSPLIBL, DSPLIB, CRTLIB, WRKOBJ, DSPPFM, DSPDTAARA, STRSQL |
+| FILE | Files, Libraries and Objects (named FILE like IBM i's file menu) | DSPLIBL, DSPLIB, CRTLIB, WRKOBJ, DSPPFM, DSPDTAARA, STRSQL |
 | PROGRAM | Programming | Command Entry, CALL, STRSQL, CRTMNU, CRTDTAARA |
 | SECURITY | Security | CRTUSRPRF, CHGUSRPRF, DSPUSRPRF, DLTUSRPRF, DSPOBJAUT, GRTOBJAUT, RVKOBJAUT, CHGOBJOWN |
 

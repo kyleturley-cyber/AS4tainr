@@ -64,7 +64,7 @@ pub const BUILTIN: &[BuiltinMenu] = &[
         options: &[
             o(1, "User tasks", "GO USER"),
             o(2, "Jobs and printed output", "GO JOBS"),
-            o(3, "Files, libraries and objects", "GO FILES"),
+            o(3, "Files, libraries and objects", "GO FILE"),
             o(4, "Programming", "GO PROGRAM"),
             o(5, "Security", "GO SECURITY"),
             o(6, "Display a menu", "?GO"),
@@ -100,7 +100,7 @@ pub const BUILTIN: &[BuiltinMenu] = &[
         ],
     },
     BuiltinMenu {
-        name: "FILES",
+        name: "FILE",
         title: "Files, Libraries and Objects",
         options: &[
             o(1, "Display your library list", "DSPLIBL"),

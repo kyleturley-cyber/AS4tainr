@@ -1261,7 +1261,8 @@ pub static COMMANDS: &[CommandDef] = &[
             p("TYPE", Kind::Name, true, None, "Type").ch("*DEC, *CHAR, *LGL"),
             p("LEN", Kind::List, false, Some("*DFT"), "Length").ch("1-2000, digits decimals"),
             p("VALUE", Kind::Text, false, Some("*DFT"), "Initial value"),
-            p("TEXT", Kind::Text, false, Some(""), "Text 'description'"),
+            // *BLANK, as IBM i's CRTDTAARA prompt shows it (PUB400).
+            p("TEXT", Kind::Text, false, Some("*BLANK"), "Text 'description'"),
         ],
     },
     CommandDef {

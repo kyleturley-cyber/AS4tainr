@@ -3231,9 +3231,17 @@ async fn data_areas_commands_and_rtvdtaara() {
     let Outcome::Display(d) = run("DSPDTAARA DFT".into()).await.unwrap() else {
         panic!()
     };
+    // A *DEC value is a header line, not a list (IBM i 7.5's DSPDTAARA of
+    // a *DEC data area on PUB400: "Value . . . :   0,00" with QDECFMT J).
     let lines = &d.ibm.as_ref().unwrap().lines;
     assert!(lines.iter().any(|l| l.ends_with(":   15 5")), "{lines:?}");
-    assert_eq!(d.rows, ["    0      0.00000"]);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("Value") && l.ends_with(":   0.00000")),
+        "{lines:?}"
+    );
+    assert!(d.rows.is_empty());
     run("CRTDTAARA FLAG *LGL".into()).await.unwrap();
     // Values that do not fit, and substrings of a *DEC data area.
     assert!(run("CHGDTAARA NEXTNO VALUE(12345678)".into())

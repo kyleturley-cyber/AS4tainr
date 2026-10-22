@@ -91,6 +91,13 @@ pub struct IbmLayout {
     /// A second view of the same rows (F11), as (heading line above,
     /// heading, rows): WRKSPLF's job names.
     pub view2: Option<(String, String, Vec<String>)>,
+    /// Everything is in the header lines: no list, no "Bottom" (DSPDTAARA
+    /// of a *DEC or *LGL data area).
+    pub no_list: bool,
+    /// The system name at the right of line 1 (WRKACTJOB, WRKSBMJOB).
+    pub system_row1: bool,
+    /// No blank line between the options and the headings (WRKACTJOB).
+    pub tight: bool,
 }
 
 impl IbmLayout {
@@ -1567,30 +1574,58 @@ impl Job<'_> {
             bail!("CPF2204: User profile {name} not found.");
         };
         let yes_no = |b: bool| if b { "*YES" } else { "*NO" }.to_string();
-        Ok(Outcome::Display(ListDisplay {
-            title: "Display User Profile".into(),
-            info: vec![
-                ("User profile".into(), p.name),
-                ("User class".into(), p.usrcls),
-                ("Status".into(), p.status),
-                ("Password is *NONE".into(), yes_no(p.no_password)),
-                ("Set password to expired".into(), yes_no(p.pwd_expired)),
-                ("Current library".into(), p.curlib),
-                ("Initial program to call".into(), p.inlpgm),
-                ("Initial menu".into(), p.inlmnu),
-                ("Text".into(), p.text),
-                (
-                    "Previous sign-on".into(),
-                    p.last_signon.unwrap_or_else(|| "*NONE".into()),
-                ),
-                ("Created".into(), p.created),
-            ],
-            heading: "Special authority".into(),
-            rows: if p.special_auth.is_empty() {
-                vec!["*NONE".into()]
+        // IBM i 7.5's DSPUSRPRF display (PUB400): "Display User Profile -
+        // Basic", one attribute to a line, labels with their colon in
+        // column 45, paged under the "User profile" line.
+        let line = |label: &str, value: &str| format!("{}   {value}", dsp_label(label, 41));
+        let (inlpgm_lib, inlpgm) = match p.inlpgm.split_once('/') {
+            Some((l, n)) => (l.to_string(), n.to_string()),
+            None => (String::new(), p.inlpgm.clone()),
+        };
+        let (inlmnu_lib, inlmnu) = match p.inlmnu.split_once('/') {
+            Some((l, n)) => (l.to_string(), n.to_string()),
+            None => (String::new(), p.inlmnu.clone()),
+        };
+        let mut rows = vec![
+            line("Previous sign-on", p.last_signon.as_deref().unwrap_or("")),
+            line("Status", &p.status),
+            line("Password is *NONE", &yes_no(p.no_password)),
+            line("Password set expired by command", &yes_no(p.pwd_expired)),
+            line("User class", &p.usrcls),
+            line("Creation date/time", &p.created),
+        ];
+        let special = if p.special_auth.is_empty() {
+            vec!["*NONE".to_string()]
+        } else {
+            p.special_auth.clone()
+        };
+        for (i, a) in special.iter().enumerate() {
+            if i == 0 {
+                rows.push(line("Special authority", a));
             } else {
-                p.special_auth
-            },
+                rows.push(format!("{:47}{a}", ""));
+            }
+        }
+        rows.push(line("Current library", &p.curlib));
+        rows.push(line("Initial program", &inlpgm));
+        if !inlpgm_lib.is_empty() {
+            rows.push(format!("{}     {inlpgm_lib}", dsp_label("  Library", 41)));
+        }
+        rows.push(line("Initial menu", &inlmnu));
+        if !inlmnu_lib.is_empty() {
+            rows.push(format!("{}     {inlmnu_lib}", dsp_label("  Library", 41)));
+        }
+        rows.push(line("Text", &p.text));
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display User Profile - Basic".into(),
+            info: vec![],
+            heading: String::new(),
+            rows,
+            ibm: IbmLayout::some(IbmLayout {
+                lines: vec![line("User profile", &p.name)],
+                enter_line: true,
+                ..Default::default()
+            }),
             ..Default::default()
         }))
     }
@@ -3490,8 +3525,13 @@ impl Job<'_> {
         let active = jobs::active(self.client).await?;
         let mut rows = Vec::new();
         let mut keys = Vec::new();
+        // IBM i 7.5's WRKACTJOB (PUB400): subsystem/job, user, type, CPU %
+        // (not measured here: blank), function, status.
         let fmt = |job: &str, user: &str, ty: &str, func: &str, status: &str| {
-            format!("{job:<12}  {user:<10}  {ty:<4}  {func:<16}  {status}")
+            format!(
+                "{job:<13}  {user:<10}  {ty:<4}  {:>5}  {func:<14}  {status}",
+                ""
+            )
         };
         for sbs in [jobs::BATCH_QUEUE, jobs::INTERACTIVE_SUBSYSTEM] {
             rows.push(fmt(sbs, "QSYS", "SBS", "", "DEQW"));
@@ -3509,21 +3549,38 @@ impl Job<'_> {
         }
         Ok(Outcome::Display(ListDisplay {
             title: "Work with Active Jobs".into(),
-            info: vec![("Active jobs".into(), active.len().to_string())],
-            heading: fmt("Subsystem/Job", "User", "Type", "Function", "Status"),
+            info: vec![],
+            heading: format!(
+                "{:<13}  {:<10}  {:<4}  {:>5}  {:<14}  {}",
+                "Subsystem/Job", "User", "Type", "CPU %", "Function", "Status"
+            ),
             rows,
             options: vec![(5, "Display job log".into(), "DSPJOBLOG JOB({})".into())],
             keys,
             refresh: Some("WRKACTJOB".into()),
             print: vec![],
-            ibm: None,
+            ibm: IbmLayout::some(IbmLayout {
+                system_row1: true,
+                right2: {
+                    let st = crate::report::Stamp::now();
+                    format!("{}  {} {}", st.date, st.time, st.zone)
+                        .trim_end()
+                        .to_string()
+                },
+                lines: vec![format!("{:48}Active jobs:   {}", "", active.len())],
+                heading2: format!("{:15}Current", ""),
+                command_line: Some("Parameters or command".into()),
+                tight: true,
+                ..Default::default()
+            }),
         }))
     }
 
     async fn wrksbmjob(&mut self) -> Result<Outcome> {
         let list = jobs::submitted_by(self.client, &self.user).await?;
-        let fmt = |job: &str, user: &str, number: &str, status: &str, func: &str| {
-            format!("{job:<10}  {user:<10}  {number:<6}  {status:<6}  {func}")
+        // IBM i 7.5's WRKSBMJOB (PUB400): job, user, type, status, function.
+        let fmt = |job: &str, user: &str, ty: &str, status: &str, func: &str| {
+            format!("{job:<10}  {user:<10}  {ty:<7}  {status:<16}  {func}")
         };
         let rows = list
             .iter()
@@ -3533,19 +3590,13 @@ impl Job<'_> {
                 } else {
                     j.status.clone()
                 };
-                fmt(
-                    &j.id.name,
-                    &j.id.user,
-                    &format!("{:06}", j.id.number),
-                    &status,
-                    &j.function,
-                )
+                fmt(&j.id.name, &j.id.user, "BATCH", &status, &j.function)
             })
             .collect();
         Ok(Outcome::Display(ListDisplay {
             title: "Work with Submitted Jobs".into(),
-            info: vec![("Submitted from".into(), format!("*USER ({})", self.user))],
-            heading: fmt("Job", "User", "Number", "Status", "Function"),
+            info: vec![],
+            heading: fmt("Job", "User", "Type", "-----Status-----", "Function"),
             rows,
             options: vec![
                 (4, "End".into(), "ENDJOB JOB({})".into()),
@@ -3554,7 +3605,19 @@ impl Job<'_> {
             keys: list.iter().map(|j| j.id.to_string()).collect(),
             refresh: Some("WRKSBMJOB".into()),
             print: vec![],
-            ibm: None,
+            ibm: IbmLayout::some(IbmLayout {
+                system_row1: true,
+                right2: {
+                    let st = crate::report::Stamp::now();
+                    format!("{}  {} {}", st.date, st.time, st.zone)
+                        .trim_end()
+                        .to_string()
+                },
+                lines: vec![format!("{}   *USER", dsp_label("Submitted from", 29))],
+                command_line: Some("Parameters or command".into()),
+                top_bottom_keys: true,
+                ..Default::default()
+            }),
         }))
     }
 
@@ -4014,7 +4077,10 @@ impl Job<'_> {
             length,
             decimals,
             value,
-            cmd.get("TEXT"),
+            match cmd.get("TEXT") {
+                "*BLANK" => "",
+                t => t,
+            },
         )
         .await?;
         authority::set_owner(self.client, &d.library, &d.name, "*DTAARA", &self.user).await?;
@@ -4091,6 +4157,7 @@ impl Job<'_> {
             .await?;
             d
         };
+        let is_char = matches!(d.ty, dtaara::Type::Char);
         // Character values a line of 50 at a time, with their offsets.
         let rows: Vec<String> = match d.ty {
             dtaara::Type::Char => d
@@ -4163,22 +4230,39 @@ impl Job<'_> {
             info: vec![],
             // IBM i 7.5's DSPDTAARA display (PUB400): the value under a
             // ruler, 50 positions to a line, then "Press Enter to continue."
-            heading: format!(
-                "{:<12}{}",
-                "Offset", "*...+....1....+....2....+....3....+....4....+....5"
-            ),
-            rows,
+            heading: if is_char {
+                format!(
+                    "{:<12}{}",
+                    "Offset", "*...+....1....+....2....+....3....+....4....+....5"
+                )
+            } else {
+                String::new()
+            },
+            rows: if is_char { rows } else { vec![] },
             ibm: IbmLayout::some(IbmLayout {
                 system_col: Some(62),
-                lines: vec![
-                    format!("{}   {}", dsp_label("Data area", 22), d.name),
-                    format!("{}     {}", dsp_label("  Library", 22), d.library),
-                    format!("{}   {}", dsp_label("Type", 22), d.ty.code()),
-                    format!("{}   {}", dsp_label("Length", 22), d.length_text()),
-                    format!("{}   {}", dsp_label("Text", 22), d.text),
-                ],
-                heading2: format!("{:11}Value", ""),
+                lines: {
+                    let mut l = vec![
+                        format!("{}   {}", dsp_label("Data area", 22), d.name),
+                        format!("{}     {}", dsp_label("  Library", 22), d.library),
+                        format!("{}   {}", dsp_label("Type", 22), d.ty.code()),
+                        format!("{}   {}", dsp_label("Length", 22), d.length_text()),
+                        format!("{}   {}", dsp_label("Text", 22), d.text),
+                    ];
+                    // A *DEC or *LGL value is one more header line (IBM i
+                    // 7.5, PUB400: "Value . . . :   0,00" with QDECFMT J).
+                    if !is_char {
+                        l.push(format!("{}   {}", dsp_label("Value", 22), d.value));
+                    }
+                    l
+                },
+                heading2: if is_char {
+                    format!("{:11}Value", "")
+                } else {
+                    String::new()
+                },
                 enter_line: true,
+                no_list: !is_char,
                 ..Default::default()
             }),
             ..Default::default()

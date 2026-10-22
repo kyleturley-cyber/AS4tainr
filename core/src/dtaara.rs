@@ -156,7 +156,7 @@ impl Type {
             "*CHAR" => Ok(Type::Char),
             "*DEC" => Ok(Type::Dec),
             "*LGL" => Ok(Type::Lgl),
-            other => bail!("Data area type {other} is not valid; use *CHAR, *DEC or *LGL."),
+            other => bail!("CPD0084: TYPE({other}) is not *CHAR, *DEC or *LGL."),
         }
     }
 

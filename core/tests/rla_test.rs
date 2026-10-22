@@ -3059,7 +3059,9 @@ ENDPGM";
     let m = cl_job_run(&client, &url, &lib, &[("CLMK", mk)], "CALL CLMK")
         .await
         .unwrap();
-    assert_eq!(m, ["Library CLMADE created.", "found CLMADE"]);
+    // CRTLIB's completion message is CPC2102 (message IDs as `system`
+    // shows them on PUB400, IBM i 7.5, 2026-10-21).
+    assert_eq!(m, ["CPC2102: Library CLMADE created.", "found CLMADE"]);
     let m = cl_job_run(&client, &url, &lib, &[], "CALL CLMK")
         .await
         .unwrap();
@@ -3189,7 +3191,13 @@ async fn data_areas_commands_and_rtvdtaara() {
         .await
         .unwrap(),
     );
-    assert_eq!(m, [format!("Data area NEXTNO created in library {lib}.")]);
+    // CPC0904 (PUB400, IBM i 7.5: `system "CRTDTAARA ..."`, 2026-10-21).
+    assert_eq!(
+        m,
+        [format!(
+            "CPC0904: Data area NEXTNO created in library {lib}."
+        )]
+    );
     let e = run(format!("CRTDTAARA {lib}/NEXTNO *DEC"))
         .await
         .unwrap_err();
@@ -3256,7 +3264,11 @@ ENDPGM
     assert!(e.to_string().contains("must be a *DEC variable"), "{e}");
 
     let m = msgs(run("DLTDTAARA CO".into()).await.unwrap());
-    assert_eq!(m, [format!("Data area CO deleted from library {lib}.")]);
+    // CPC2191 (PUB400, IBM i 7.5: `system "DLTDTAARA ..."`, 2026-10-21).
+    assert_eq!(
+        m,
+        [format!("CPC2191: Object CO in {lib} type *DTAARA deleted.")]
+    );
     let e = run("DSPDTAARA CO".into()).await.unwrap_err();
     assert!(e.to_string().starts_with("CPF1015"), "{e}");
 }
@@ -3410,7 +3422,7 @@ async fn submitted_jobs_run_in_qbatch() {
         .any(|e| e.kind == "*RQS" && e.text.starts_with("CRTDTAARA")));
     assert!(log
         .iter()
-        .any(|e| e.text == format!("Data area D1 created in library {lib}.")));
+        .any(|e| e.text == format!("CPC0904: Data area D1 created in library {lib}.")));
     assert!(log.last().unwrap().text.starts_with("CPF1241"));
 
     // A job that fails ends abnormally.
@@ -3422,7 +3434,8 @@ async fn submitted_jobs_run_in_qbatch() {
     let done = run(n2).await;
     assert_eq!(done.end_code, "ABNORMAL");
     let log = jobs::job_log(&client, n2).await.unwrap();
-    assert!(log.iter().any(|e| e.msgid == "CPF1015"), "{log:?}");
+    // DLTDTAARA of a missing data area: CPF2105 (PUB400, IBM i 7.5).
+    assert!(log.iter().any(|e| e.msgid == "CPF2105"), "{log:?}");
 
     // The completion messages are on QSECOFR's message queue.
     let msgs = jobs::messages(&client, "QSECOFR", false).await.unwrap();
@@ -3771,7 +3784,9 @@ async fn spooled_files() {
     )
     .await
     .unwrap();
-    assert!(log[0].iter().any(|l| l.contains("CPF1015")), "{log:?}");
+    // DLTDTAARA of a data area that is not there: CPF2105 (PUB400, IBM i
+    // 7.5, `system "DLTDTAARA ..."` twice, 2026-10-21).
+    assert!(log[0].iter().any(|l| l.contains("CPF2105")), "{log:?}");
     let Outcome::Display(d) = job.run("WRKSPLF").await.unwrap() else {
         panic!()
     };
@@ -4414,7 +4429,8 @@ async fn native_rpg_engine_runs_a_program() {
     assert_eq!(
         got,
         [
-            "Library RPGLIB1 created.",
+            // CPC2102: CRTLIB's completion message (PUB400, IBM i 7.5).
+            "CPC2102: Library RPGLIB1 created.",
             "CRTLIB failed",
             "ascii",
             "AB",
@@ -8587,4 +8603,224 @@ async fn save_and_restore_libraries_and_objects() {
     for l in [&rl, &jl] {
         cl_cmd(&mut job, format!("DLTLIB {l}")).await.unwrap();
     }
+}
+
+/// The PASE `system` utility (`as4tainr system`) and the printed reports
+/// of display commands. Expected values: output of `system` on PUB400
+/// (IBM i 7.5) over SSH, 2026-10-21 (target/ibmi/golden; message texts
+/// are ours, so only message IDs, streams and exit statuses are compared;
+/// report lines are IBM's layout with our values).
+#[tokio::test]
+async fn pase_system_utility_and_printed_reports() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::pase_system;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let ids = |l: &[String]| -> Vec<String> {
+        l.iter()
+            .map(|m| m.split_once(':').map(|x| x.0).unwrap_or(m).to_string())
+            .collect()
+    };
+    let a = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    macro_rules! sys {
+        ($v:expr) => {
+            pase_system::run(&mut job, $v)
+        };
+    }
+
+    // No command: usage on standard error, status 2.
+    let o = sys!(&[]).await;
+    assert_eq!(o.stderr, ["Usage: system [-beEhiIkKnOpqsv] command"]);
+    assert_eq!(o.status, 2);
+
+    // An escape message: standard error, status 255; -n drops the ID; -v
+    // shows the command first.
+    let chk = format!("CHKOBJ OBJ({lib}/NOSUCH) OBJTYPE(*FILE)");
+    let o = sys!(std::slice::from_ref(&chk)).await;
+    assert_eq!((ids(&o.stderr), o.status), (a(&["CPF9801"]), 255));
+    assert!(o.stdout.is_empty());
+    let o = sys!(&["-n".into(), chk.clone()]).await;
+    assert!(!o.stderr[0].starts_with("CPF9801"), "{o:?}");
+    let o = sys!(&["-v".into(), chk.clone()]).await;
+    assert_eq!(o.stdout, [format!("Command is > {chk}  <")]);
+
+    // Command checking: the diagnostic, then CPF0006.
+    let o = sys!(&["NOSUCHCMD".into()]).await;
+    assert_eq!(
+        (ids(&o.stderr), o.status),
+        (a(&["CPD0030", "CPF0006"]), 255)
+    );
+    let o = sys!(&[format!("CRTDTAARA DTAARA({lib}/X) TYPE(*BAD)")]).await;
+    assert_eq!(ids(&o.stderr), a(&["CPD0084", "CPF0006"]));
+
+    // Completion messages on standard output, status 0.
+    let o = sys!(&[format!(
+        "CRTDTAARA DTAARA({lib}/GOLDDA) TYPE(*CHAR) LEN(10) VALUE(ABC)"
+    )])
+    .await;
+    assert_eq!((ids(&o.stdout), o.status), (a(&["CPC0904"]), 0));
+
+    // DSPDTAARA's printed report (after its page header).
+    let o = sys!(&[format!("DSPDTAARA DTAARA({lib}/GOLDDA)")]).await;
+    assert_eq!(o.status, 0);
+    assert!(
+        o.stdout[0].contains("Display Data Area") && o.stdout[0].contains(&format!("{lib}/GOLDDA"))
+    );
+    assert_eq!(
+        o.stdout[1..],
+        [
+            " Data area . . . . . . . . . . . :   DTAARA      GOLDDA".to_string(),
+            format!("   Library . . . . . . . . . . . :                 {lib}"),
+            " Type  . . . . . . . . . . . . . :   TYPE        *CHAR".into(),
+            " Length  . . . . . . . . . . . . :   LEN         10".into(),
+            " Text description  . . . . . . . :   TEXT".into(),
+            "    Offset      Value".into(),
+            "                 *...+....1....+....2....+....3....+....4....+....5".into(),
+            "     0          'ABC       '".into(),
+            "                          * * * * *  E N D  O F  L I S T I N G  * * * * *".into(),
+        ]
+    );
+    // -s: no printed output.
+    let o = sys!(&["-s".into(), format!("DSPDTAARA DTAARA({lib}/GOLDDA)")]).await;
+    assert!(o.stdout.is_empty() && o.status == 0);
+
+    // DLTDTAARA: CPC2191, then CPF2105 the second time.
+    let dlt = format!("DLTDTAARA DTAARA({lib}/GOLDDA)");
+    assert_eq!(
+        ids(&sys!(std::slice::from_ref(&dlt)).await.stdout),
+        a(&["CPC2191"])
+    );
+    let o = sys!(&[dlt]).await;
+    assert_eq!((ids(&o.stderr), o.status), (a(&["CPF2105"]), 255));
+
+    // CRTPF RCDLEN: file and member created; DSPFD TYPE(*ATR).
+    let o = sys!(&[format!("CRTPF FILE({lib}/GOLDTEST) RCDLEN(80)")]).await;
+    assert_eq!(ids(&o.stdout), a(&["CPC7301", "CPC7305"]));
+    let o = sys!(&[format!("DSPFD FILE({lib}/GOLDTEST) TYPE(*ATR)")]).await;
+    assert_eq!(o.status, 0, "{o:?}");
+    let file_line = format!(
+        " File . : GOLDTEST     Library . : {lib:<10}   Type of file . : Physical *DATA            Auxiliary Storage Pool ID . : 00001"
+    );
+    let lines: Vec<&str> = o.stdout.iter().map(String::as_str).collect();
+    let want_page1 = [
+        "   File  . . . . . . . . . . . : GOLDTEST",
+        &format!("     Library . . . . . . . . . : {lib}"),
+        "   Type of information . . . . : *ATR",
+        "   File attributes . . . . . . : *ALL",
+        "   System  . . . . . . . . . . : *LCL",
+    ];
+    assert_eq!(lines[1..6], want_page1);
+    assert_eq!(lines[7], file_line);
+    let want = [
+        "                                    Data Base File Attributes",
+        "   Externally described file . . . . . . . . . :            No",
+    ];
+    assert_eq!(lines[8..10], want);
+    // From "Text 'description'" to the page break (WAITFILE: CRTPF's
+    // shipped default *IMMED; PUB400 shows 30, a changed default).
+    let want = [
+        "   Text 'description'  . . . . . . . . . . . . : TEXT",
+        "   Distributed file  . . . . . . . . . . . . . :            No",
+        "   Partitioned SQL Table . . . . . . . . . . . :            No",
+        "   DBCS capable  . . . . . . . . . . . . . . . :            No",
+        "   Maximum members . . . . . . . . . . . . . . : MAXMBRS        1",
+        "   Number of constraints . . . . . . . . . . . :                0",
+        "   Number of triggers  . . . . . . . . . . . . :                0",
+        "   Number of members . . . . . . . . . . . . . :                1",
+        "   Member size                                   SIZE",
+        "     Initial number of records . . . . . . . . :                 10000",
+        "     Increment number of records . . . . . . . :             1000",
+        "     Maximum number of increments  . . . . . . :                3",
+        "   Record capacity . . . . . . . . . . . . . . :                 13000",
+        "   Allocate storage  . . . . . . . . . . . . . : ALLOCATE   *NO",
+        "   Contiguous storage  . . . . . . . . . . . . : CONTIG     *NO",
+        "   Preferred storage unit  . . . . . . . . . . : UNIT       *ANY",
+        "   Records to force a write  . . . . . . . . . : FRCRATIO   *NONE",
+        "   Maximum file wait time  . . . . . . . . . . : WAITFILE   *IMMED",
+        "   Maximum record wait time  . . . . . . . . . : WAITRCD       60",
+        "   Max % deleted records allowed . . . . . . . : DLTPCT     *NONE",
+        "   Reuse deleted records . . . . . . . . . . . : REUSEDLT   *NO",
+    ];
+    assert_eq!(lines[12..33], want);
+    assert!(lines[33].contains("Display File Description") && lines[33].ends_with("Page    2"));
+    assert_eq!(lines[34], file_line);
+    let want = [
+        "                                    Data Base File Attributes",
+        "   Sort Sequence . . . . . . . . . . . . . . . : SRTSEQ     *HEX",
+        "   Language identifier . . . . . . . . . . . . : LANGID     ENU",
+        "   Coded character set identifier  . . . . . . : CCSID      65535",
+        "   Allow read operation  . . . . . . . . . . . :            Yes",
+        "   Allow write operation . . . . . . . . . . . :            Yes",
+        "   Allow update operation  . . . . . . . . . . : ALWUPD     *YES",
+        "   Allow delete operation  . . . . . . . . . . : ALWDLT     *YES",
+        "   Restrict on drop  . . . . . . . . . . . . . :            No",
+        "   Record format level check . . . . . . . . . : LVLCHK     *YES",
+        "   Access path . . . . . . . . . . . . . . . . :            Arrival",
+        "   Maximum record length . . . . . . . . . . . :               80",
+        "   Volatile  . . . . . . . . . . . . . . . . . :            No",
+        "   Keep in memory  . . . . . . . . . . . . . . : KEEPINMEM  *NO",
+        "   File is currently journaled . . . . . . . . :            No",
+    ];
+    assert_eq!(lines[35..], want);
+    let o = sys!(&[format!("DLTF FILE({lib}/GOLDTEST)")]).await;
+    assert_eq!(ids(&o.stdout), a(&["CPC2191"]));
+
+    // CHKOBJ of an object that is there: no message, status 0.
+    let o = sys!(&[format!("CHKOBJ OBJ({lib}/CUSTMAST) OBJTYPE(*FILE)")]).await;
+    assert_eq!(o, pase_system::Output::default());
+    let o = sys!(&["CHKOBJ OBJ(NOSUCHLIB/CUSTMAST) OBJTYPE(*FILE)".to_string()]).await;
+    assert_eq!(ids(&o.stderr), a(&["CPF9810"]));
+    let o = sys!(&[format!(
+        "CHKOBJ OBJ({lib}/CUSTMAST) OBJTYPE(*FILE) MBR(NOPE)"
+    )])
+    .await;
+    assert_eq!(ids(&o.stderr), a(&["CPF9815"]));
+
+    // DSPSYSVAL: the layout's column lines (values are ours: shipped).
+    let o = sys!(&["DSPSYSVAL SYSVAL(QCCSID)".into()]).await;
+    assert_eq!(
+        o.stdout[2],
+        "                Current                         Shipped"
+    );
+    assert_eq!(
+        o.stdout[3],
+        " Name           value                           value                           Description"
+    );
+    assert!(o.stdout[4].starts_with(
+        " QCCSID         65535                           65535                           "
+    ));
+    assert_eq!(
+        o.stdout[5],
+        "                                         * * * * *   E N D  O F  L I S T I N G   * * * * *"
+    );
+    let o = sys!(&["DSPSYSVAL SYSVAL(QNOSUCH)".into()]).await;
+    assert_eq!(ids(&o.stderr), a(&["CPF1028"]));
+
+    // DSPOBJD: the column heading and one object's line.
+    let o = sys!(&[format!("DSPOBJD OBJ({lib}/CUSTMAST) OBJTYPE(*FILE)")]).await;
+    assert_eq!(o.status, 0, "{o:?}");
+    assert!(o.stdout[2].starts_with(&format!(" Library . . . . . . . :   {lib:<10}")));
+    assert_eq!(o.stdout[3], "                                                                    Library ASP group . . :   *SYSBAS");
+    assert_eq!(
+        o.stdout[4],
+        " Object         Type         Attribute                  Size     Text"
+    );
+    assert!(
+        o.stdout[5].starts_with(" CUSTMAST       *FILE        PF  "),
+        "{:?}",
+        o.stdout[5]
+    );
 }

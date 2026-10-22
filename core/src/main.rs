@@ -132,12 +132,16 @@ enum Cmd {
         #[arg(long)]
         csv: PathBuf,
     },
-    /// Run one CL command as QSECOFR, as the IBM i `system` utility does
-    /// (e.g. `as4tainr system "CRTDTAARA DTAARA(QGPL/X) TYPE(*DEC)"`).
-    /// Messages go to standard output; a failure exits with status 1.
+    /// Run one CL command as QSECOFR, as the IBM i PASE `system` utility
+    /// does (e.g. `as4tainr system "CRTDTAARA DTAARA(QGPL/X) TYPE(*DEC)"`):
+    /// messages and printed output on standard output, a failure's
+    /// messages on standard error with exit status 255. Options -n (no
+    /// message IDs), -v (show the command), -s (no printed output).
+    #[command(disable_help_flag = true)]
     System {
-        /// The command, as typed on a command line.
-        command: String,
+        /// Options, then the command as typed on a command line.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Run the TN5250 display server (5250 green-screen sessions).
     Tn5250 {
@@ -409,7 +413,7 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             println!("All objects created.");
         }
-        Cmd::System { command } => {
+        Cmd::System { args } => {
             let client = runtime::connect_db(&cli.database_url).await?;
             catalog::init(&client).await?;
             let env = commands::Environment {
@@ -425,28 +429,14 @@ async fn run(cli: Cli) -> Result<u8> {
                 id: None,
                 calls: Default::default(),
             };
-            match job.run(&command).await {
-                Ok(commands::Outcome::Messages(m)) => {
-                    for l in m {
-                        println!("{l}");
-                    }
-                }
-                Ok(commands::Outcome::Display(d)) => {
-                    println!("{}", d.title);
-                    for (k, v) in &d.info {
-                        println!("{k}: {v}");
-                    }
-                    println!("{}", d.heading);
-                    for r in &d.rows {
-                        println!("{r}");
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("as4tainr: {e:#}");
-                    return Ok(1);
-                }
+            let out = as4tainr_core::pase_system::run(&mut job, &args).await;
+            for l in &out.stdout {
+                println!("{l}");
             }
+            for l in &out.stderr {
+                eprintln!("{l}");
+            }
+            return Ok(out.status);
         }
         Cmd::Tn5250 {
             listen,

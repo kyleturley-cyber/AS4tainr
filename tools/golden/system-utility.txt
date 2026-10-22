@@ -1,0 +1,12 @@
+# How PASE `system` itself behaves (stdout vs stderr, exit codes, options)
+sys_usage|!system
+sys_ok_messages|!system "CRTDTAARA DTAARA(AS4TRAINR1/GOLDDA) TYPE(*CHAR) LEN(10) VALUE(ABC)"
+sys_escape|!system "CHKOBJ OBJ(AS4TRAINR1/NOSUCH) OBJTYPE(*FILE)"
+sys_escape_n|!system -n "CHKOBJ OBJ(AS4TRAINR1/NOSUCH) OBJTYPE(*FILE)"
+sys_escape_v|!system -v "CHKOBJ OBJ(AS4TRAINR1/NOSUCH) OBJTYPE(*FILE)"
+sys_badcmd|!system "NOSUCHCMD"
+sys_syntax|!system "CRTDTAARA DTAARA(AS4TRAINR1/X) TYPE(*BAD)"
+sys_print|!system "DSPDTAARA DTAARA(AS4TRAINR1/GOLDDA)"
+sys_print_s|!system -s "DSPDTAARA DTAARA(AS4TRAINR1/GOLDDA)"
+sys_dlt|!system "DLTDTAARA DTAARA(AS4TRAINR1/GOLDDA)"
+sys_dlt_again|!system "DLTDTAARA DTAARA(AS4TRAINR1/GOLDDA)"

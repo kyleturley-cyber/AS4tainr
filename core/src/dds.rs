@@ -268,6 +268,40 @@ impl FieldDef {
 
     /// The PostgreSQL column holding this field: the SQL name when it has
     /// one (so SQL statements use it), else the system name; quoted.
+    /// Bytes the field takes in a record buffer (what DSPFD's maximum
+    /// record length adds up; as4tainr_svc.field_bytes in SQL).
+    pub fn buffer_bytes(&self) -> u32 {
+        let v = if self.varlen { 2 } else { 0 };
+        match self.data_type {
+            DataType::Char | DataType::Hex => self.length + v,
+            DataType::Graphic => 2 * self.length + v,
+            DataType::Packed => self.length / 2 + 1,
+            DataType::Binary => match self.length {
+                0..=4 => 2,
+                5..=9 => 4,
+                _ => 8,
+            },
+            DataType::Float => {
+                if self.double || self.length > 9 {
+                    8
+                } else {
+                    4
+                }
+            }
+            DataType::Date => 10,
+            DataType::Time => 8,
+            DataType::Decfloat => {
+                if self.length == 16 {
+                    8
+                } else {
+                    16
+                }
+            }
+            DataType::Boolean => 1,
+            _ => self.length,
+        }
+    }
+
     pub fn column(&self) -> String {
         crate::catalog::ident(self.alias.as_deref().unwrap_or(&self.name))
     }

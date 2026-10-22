@@ -682,13 +682,19 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
         Ok(crate::commands::Outcome::Display(d)) => {
             // A display command in batch prints what it would show, as on
             // IBM i (spooled file QSYSPRT).
-            let mut lines = vec![d.title.clone(), String::new()];
-            lines.extend(d.info.iter().map(|(k, v)| format!("{k}: {v}")));
-            if !d.info.is_empty() {
-                lines.push(String::new());
-            }
-            lines.push(d.heading.clone());
-            lines.extend(d.rows.iter().cloned());
+            // Commands with IBM's report layout print it (report.rs).
+            let lines = if d.print.is_empty() {
+                let mut lines = vec![d.title.clone(), String::new()];
+                lines.extend(d.info.iter().map(|(k, v)| format!("{k}: {v}")));
+                if !d.info.is_empty() {
+                    lines.push(String::new());
+                }
+                lines.push(d.heading.clone());
+                lines.extend(d.rows.iter().cloned());
+                lines
+            } else {
+                d.print.clone()
+            };
             crate::spool::print_lines(&client, &id, "QSYSPRT", first.as_str(), &lines).await?;
             log(
                 &client,

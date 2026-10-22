@@ -45,6 +45,8 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/prtf.rs` | Printer files (CRTPRTF): page size and overflow line, DDS record formats and their layout |
 | `core/src/dtaara.rs` | Data areas: CRTDTAARA/CHGDTAARA/RTVDTAARA values, RPG `IN *LOCK`/`OUT` (PostgreSQL advisory locks), the local data area `*LDA` (`as4tainr.local_data_areas`) |
 | `core/src/jobs.rs` | Work management: jobs (`as4tainr.jobs`), job logs, job queue QBATCH and its subsystem loop, user message queues |
+| `core/src/report.rs` | Printed reports in IBM's layouts (page headers A and B, columns, end-of-listing lines) for display commands with OUTPUT(*PRINT), batch and `system` |
+| `core/src/pase_system.rs` | The PASE `system` utility (`as4tainr system`): options -n -v -s, messages to standard output or error, exit status 0/255/2 |
 | `core/src/spool.rs` | Spooled files (`as4tainr.spooled_files`, `as4tainr.spool_lines`): printer output, QSYSPRT listings of batch display commands, QPJOBLOG |
 | `core/src/source.rs` | Source physical files (`PF-SRC` objects) and members (`as4tainr.source_members`), include files found in the IFS, CL `INCLUDE` expansion |
 | `core/src/ifs.rs` | The integrated file system: directories and stream files (`as4tainr.ifs`), errno values, CCSID conversion (docs/ifs.md) |
@@ -64,6 +66,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `tools/gate3_5250.py` | Phase 3 gate: three clerks enter orders at once with batch jobs running; the files must add up. Run after e2e_5250.py |
 | `samples/` | DDS, CSV data, RPG and CL programs, golden outputs in `expected/`. `samples/apps/contacts` is an application laid out as a git repository, imported with `as4tainr import` (into CONTACTS by samples.sh). The order entry app (Phase 2 gate) is described in `docs/order-entry.md` |
 | `scripts/samples.sh` | Creates every sample object in QGPL (used by demo.sh, the Docker entrypoint and CI). Add new sample objects here |
+| `tools/golden/`, `tools/golden_compare.py` | Capture output on a real IBM i (PUB400 over SSH, outputs kept in target/ibmi/golden, never committed) and compare it with `as4tainr system` (docs/golden-outputs.md) |
 | `tools/corpus.sh` | Clone a public repository of IBM i source and import it (real-world test; never vendored) |
 | `tools/legacy.sh` | Install real applications (Northwind for IBM i, COM order management) the way their READMEs say, on an empty database (cloned at test time; never vendored). docs/import.md |
 

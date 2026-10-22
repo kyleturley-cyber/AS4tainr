@@ -28,7 +28,6 @@ use anyhow::{anyhow, bail, Result};
 use rust_decimal::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 
-use crate::catalog;
 use crate::commands::{Job, Outcome};
 use crate::jobs;
 
@@ -3005,6 +3004,45 @@ pub(crate) const SYSTEM_VALUE_NAMES: &[&str] = &[
     "QSRLNBR",
 ];
 
+/// What a system value is for (DSPSYSVAL), in our own words. None: not
+/// a system value this system has.
+pub(crate) fn system_value_description(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "QDATE" => "Current date",
+        "QYEAR" => "Year of the current date",
+        "QMONTH" => "Month of the current date",
+        "QDAY" => "Day of the current date",
+        "QCENTURY" => "Century of the current date",
+        "QTIME" => "Current time",
+        "QHOUR" => "Hour of the current time",
+        "QMINUTE" => "Minute of the current time",
+        "QSECOND" => "Second of the current time",
+        "QDAYOFWEEK" => "Day of the week",
+        "QDATFMT" => "Order of year, month and day in dates",
+        "QDATSEP" => "Character between date parts",
+        "QTIMSEP" => "Character between time parts",
+        "QDECFMT" => "Decimal point and zero suppression",
+        "QCURSYM" => "Currency sign",
+        "QLANGID" => "Language of the system",
+        "QCNTRYID" => "Country or region of the system",
+        "QCCSID" => "Coded character set of the system",
+        "QUTCOFFSET" => "Hours and minutes from UTC",
+        "QTIMZON" => "Time zone description",
+        "QSECURITY" => "Security level",
+        "QSYSLIBL" => "System part of the library list",
+        "QUSRLIBL" => "User part of the library list",
+        "QMODEL" => "System model",
+        "QSRLNBR" => "System serial number",
+        _ => return None,
+    })
+}
+
+/// A system value as IBM ships it. This system's system values cannot be
+/// changed yet (no CHGSYSVAL), so it is the current value.
+pub(crate) fn shipped_system_value_text(name: &str) -> Option<Result<String, i64>> {
+    system_value_text(name)
+}
+
 /// A system value as text, or as a number (QSYS2.SYSTEM_VALUE_INFO).
 pub(crate) fn system_value_text(name: &str) -> Option<Result<String, i64>> {
     match system_value(name).ok()? {
@@ -3778,19 +3816,15 @@ async fn command(
                 .get("OBJTYPE")
                 .map(|t| t.trim().to_ascii_uppercase())
                 .ok_or_else(|| anyhow!("line {}: CHKOBJ needs OBJTYPE", st.line))?;
-            let (libs, name) = match obj.split_once('/') {
-                Some(("*LIBL", n)) => (job.library_list(), n.to_string()),
-                Some(("*CURLIB", n)) => (vec![job.current_library()], n.to_string()),
-                Some((l, n)) => (vec![l.to_string()], n.to_string()),
-                None => (job.library_list(), obj.clone()),
+            let mbr = match p.get("MBR") {
+                Some(m) => substitute_text(m, vars)?,
+                None => "*NONE".into(),
             };
-            let lib_label = match obj.split_once('/') {
-                Some((l, _)) => l.to_string(),
-                None => "*LIBL".into(),
-            };
-            if !catalog::object_exists(job.client, &libs, &name, &objtype).await? {
-                bail!("CPF9801: Object {name} in library {lib_label} not found.");
-            }
+            let aut = p
+                .get("AUT")
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "*NONE".into());
+            job.chkobj(&obj, &objtype, &mbr, &aut).await?;
             Ok(None)
         }
         "RTVJOBA" => {

@@ -1283,6 +1283,35 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[p("DTAARA", Kind::Qualified, true, None, "Data area").ch("Name")],
     },
     CommandDef {
+        name: "CHKOBJ",
+        description: "Check Object",
+        params: &[
+            p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
+            p("OBJTYPE", Kind::Name, true, None, "Object type").ch("*ALRTBL, *BNDDIR, *CMD, *DTAARA, *FILE, *JRN, *JRNRCV, *LIB, *MENU, *MODULE, *MSGF, *PGM, *SRVPGM, ..."),
+            p("MBR", Kind::Name, false, Some("*NONE"), "Member, if data base file").ch("Name, *NONE, *FIRST"),
+            p("AUT", Kind::List, false, Some("*NONE"), "Authority").ch("*NONE, *ALL, *CHANGE, *USE, *EXCLUDE"),
+        ],
+    },
+    CommandDef {
+        name: "DSPSYSVAL",
+        description: "Display System Value",
+        params: &[
+            p("SYSVAL", Kind::Name, true, None, "System value").ch("QCCSID, QDATFMT, QDATSEP, ..."),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
+    },
+    CommandDef {
+        name: "DSPOBJD",
+        description: "Display Object Description",
+        params: &[
+            p("OBJ", Kind::Qualified, true, None, "Object").ch("Name, generic*, *ALL"),
+            p("OBJTYPE", Kind::List, true, None, "Object type").ch("*ALL, *CMD, *DTAARA, *FILE, *LIB, *MSGF, *PGM, ..."),
+            p("DETAIL", Kind::Name, false, Some("*BASIC"), "Detail").ch("*BASIC"),
+            p("ASPDEV", Kind::Name, false, Some("*"), "ASP device").ch("*").keyword_only(),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT, *OUTFILE"),
+        ],
+    },
+    CommandDef {
         name: "DLTF",
         description: "Delete File",
         params: &[p("FILE", Kind::Qualified, true, None, "File").ch("Name")],
@@ -1348,7 +1377,7 @@ pub static COMMANDS: &[CommandDef] = &[
                 Some("*MBRLIST"),
                 "Type of information",
             )
-            .ch("*MBRLIST"),
+            .ch("*MBRLIST, *ATR"),
         ],
     },
     CommandDef {
@@ -1365,6 +1394,7 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("Name"),
             p("SRCMBR", Kind::Name, false, Some("*FILE"), "Source member").ch("Name, *FILE"),
+            p("RCDLEN", Kind::Text, false, Some("*NONE"), "Record length, if no DDS").ch("Number, *NONE"),
         ],
     },
     CommandDef {
@@ -3068,7 +3098,15 @@ pub static GROUPS: &[Group] = &[
     Group {
         item: "Object commands",
         title: "Object Commands",
-        commands: &["WRKOBJ", "CRTDTAARA", "CHGDTAARA", "DSPDTAARA", "DLTDTAARA"],
+        commands: &[
+            "WRKOBJ",
+            "DSPOBJD",
+            "CHKOBJ",
+            "CRTDTAARA",
+            "CHGDTAARA",
+            "DSPDTAARA",
+            "DLTDTAARA",
+        ],
     },
     Group {
         item: "File commands",
@@ -3107,6 +3145,7 @@ pub static GROUPS: &[Group] = &[
             "SNDMSG",
             "DSPMSG",
             "DLYJOB",
+            "DSPSYSVAL",
         ],
     },
     Group {

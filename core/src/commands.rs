@@ -54,6 +54,10 @@ pub struct ListDisplay {
     /// The command that shows this list again with fresh data (F5), if
     /// the list can change while it is shown.
     pub refresh: Option<String>,
+    /// The report the command prints instead (OUTPUT(*PRINT), batch, the
+    /// `system` utility), in IBM's layout (`report.rs`). Empty: the list
+    /// is printed as shown.
+    pub print: Vec<String>,
 }
 
 /// The system part of the library list (system value QSYSLIBL as shipped).
@@ -230,6 +234,18 @@ impl Job<'_> {
             "CHGDTAARA" => self.chgdtaara(&cmd).await,
             "DSPDTAARA" => self.dspdtaara(&cmd).await,
             "DLTDTAARA" => self.dltdtaara(&cmd).await,
+            "CHKOBJ" => {
+                self.chkobj(
+                    cmd.get("OBJ"),
+                    cmd.get("OBJTYPE"),
+                    cmd.get("MBR"),
+                    cmd.get("AUT"),
+                )
+                .await?;
+                Ok(Outcome::Messages(vec![]))
+            }
+            "DSPSYSVAL" => self.dspsysval(&cmd),
+            "DSPOBJD" => self.dspobjd(&cmd).await,
             "SBMJOB" => self.sbmjob(&cmd).await,
             "WRKACTJOB" => self.wrkactjob().await,
             "WRKSBMJOB" => self.wrksbmjob().await,
@@ -261,7 +277,9 @@ impl Job<'_> {
     async fn crtlib(&mut self, cmd: &Command) -> Result<Outcome> {
         let lib = catalog::create_library_new(self.client, cmd.get("LIB"), cmd.get("TEXT")).await?;
         authority::set_owner(self.client, "QSYS", &lib, "*LIB", &self.user).await?;
-        Ok(Outcome::Messages(vec![format!("Library {lib} created.")]))
+        Ok(Outcome::Messages(vec![format!(
+            "CPC2102: Library {lib} created."
+        )]))
     }
 
     async fn dsplib(&mut self, cmd: &Command) -> Result<Outcome> {
@@ -304,13 +322,27 @@ impl Job<'_> {
     async fn dsplibl(&mut self) -> Result<Outcome> {
         let mut rows = Vec::new();
         let mut keys = Vec::new();
+        // Printed layout: PUB400 (IBM i 7.5) `system "DSPLIBL"`, 2026-10-21.
+        let stamp = crate::report::Stamp::now();
+        let mut print = vec![
+            crate::report::header_a(18, 44, "Library List", 0, "", &stamp, 1),
+            crate::report::at(&[(27, "ASP")]),
+            crate::report::at(&[
+                (4, "Library"),
+                (16, "Type"),
+                (27, "Device"),
+                (39, "Text Description"),
+            ]),
+        ];
         for (lib, kind) in self.library_list_entries() {
             let text = catalog::library_text(self.client, &lib)
                 .await
                 .unwrap_or_default();
             rows.push(format!("{lib:<10}  {kind:<4}  {text}"));
+            print.push(crate::report::at(&[(4, &lib), (16, kind), (39, &text)]));
             keys.push(lib);
         }
+        print.push(crate::report::END_A.into());
         Ok(Outcome::Display(ListDisplay {
             title: "Display Library List".into(),
             info: vec![],
@@ -323,6 +355,7 @@ impl Job<'_> {
             )],
             keys,
             refresh: None,
+            print,
         }))
     }
 
@@ -1286,8 +1319,9 @@ impl Job<'_> {
                     bail!("CPF2189: Not authorized to delete {name} in {l} type {objtype}.");
                 }
                 crate::ile::delete_object(self.client, l, &name, objtype).await?;
+                let _ = what;
                 return Ok(Outcome::Messages(vec![format!(
-                    "{what} {name} in library {l} deleted."
+                    "CPC2191: Object {name} in {l} type {objtype} deleted."
                 )]));
             }
         }
@@ -1327,7 +1361,7 @@ impl Job<'_> {
         let mut c = runtime::connect_db(&self.env.database_url).await?;
         catalog::delete_file(&mut c, &lib, &name, false).await?;
         Ok(Outcome::Messages(vec![format!(
-            "File {name} in library {lib} deleted."
+            "CPC2191: Object {name} in {lib} type *FILE deleted."
         )]))
     }
 
@@ -1556,12 +1590,339 @@ impl Job<'_> {
         let name = name.to_ascii_uppercase();
         authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
         Ok(Outcome::Messages(vec![format!(
-            "Source file {name} created in library {lib}."
+            "CPC7301: File {name} created in library {lib}."
         )]))
+    }
+
+    /// DSPFD TYPE(*ATR) of a database physical file: its printed report
+    /// (layout from PUB400, IBM i 7.5, `system "DSPFD
+    /// FILE(AS4TRAINR1/GOLDTEST) TYPE(*ATR)"` of a CRTPF RCDLEN(80) file,
+    /// 2026-10-21). Attributes this system does not keep show CRTPF's
+    /// shipped defaults (SIZE, ALLOCATE, WAITFILE ...; fidelity-gaps.md).
+    async fn dspfd_atr(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (libs, name) = self.search(cmd.get("FILE"));
+        let name = name.to_ascii_uppercase();
+        let mut found = None;
+        for l in &libs {
+            if catalog::object_exists(self.client, std::slice::from_ref(l), &name, "*FILE").await? {
+                found = Some(l.clone());
+                break;
+            }
+        }
+        let Some(lib) = found else {
+            bail!(
+                "CPF9812: File {name} in library {} not found.",
+                cmd.get("FILE")
+                    .split_once('/')
+                    .map(|x| x.0)
+                    .unwrap_or("*LIBL")
+            );
+        };
+        authority::check(self.client, &self.user, &lib, &name, "*FILE", Aut::Use).await?;
+        let row = self
+            .client
+            .query_one(
+                "SELECT attribute, text, extract(year FROM created)::int,
+                        to_char(created AT TIME ZONE 'UTC', 'YYMMDDHH24MISS'),
+                        extract(month FROM created)::int, extract(day FROM created)::int
+                   FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+                &[&lib, &name],
+            )
+            .await?;
+        let attr: String = row.get(0);
+        if attr != "PF" {
+            bail!("CPF0006: Errors occurred in command. DSPFD TYPE(*ATR) shows physical files only yet; {name} is {attr}.");
+        }
+        let text: String = row.get(1);
+        let year: i32 = row.get(2);
+        let level_id = format!(
+            "{}{}",
+            if year >= 2000 { 1 } else { 0 },
+            row.get::<_, String>(3)
+        );
+        let created = crate::report::Stamp::of(
+            (
+                year,
+                row.get::<_, i32>(4) as u32,
+                row.get::<_, i32>(5) as u32,
+            ),
+            (0, 0, 0),
+        )
+        .date;
+        let fr = catalog::resolve_file(self.client, std::slice::from_ref(&lib), &name).await?;
+        let pf = &fr.file;
+        // CRTPF RCDLEN(n): one field and format named like the file.
+        let external = !(pf.fields.len() == 1 && pf.fields[0].name == name && pf.format == name);
+        let reclen: u32 = pf.fields.iter().map(|f| f.buffer_bytes()).sum();
+        let mut counts = Vec::new();
+        for sql in [
+            "SELECT count(*) FROM as4tainr.file_triggers WHERE library=$1 AND file=$2",
+            "SELECT count(*) FROM as4tainr.journaled_files WHERE library=$1 AND file=$2",
+        ] {
+            counts.push(
+                self.client
+                    .query_one(sql, &[&lib, &name])
+                    .await
+                    .map(|r| r.get::<_, i64>(0))
+                    .unwrap_or(0),
+            );
+        }
+        let (triggers, journaled) = (counts[0], counts[1] > 0);
+        let yn = |b: bool| if b { "Yes" } else { "No" };
+        // "label . . . : KEYWORD", value from column 61 (numbers right
+        // aligned to column 65, record counts to column 70).
+        let kv = |label: &str, kw: &str, value: &str| {
+            let head = if kw.is_empty() {
+                label.to_string()
+            } else {
+                format!("{label} {kw}")
+            };
+            format!("{head:<60}{value}").trim_end().to_string()
+        };
+        let num = |label: &str, kw: &str, n: i64, end: usize| {
+            let head = if kw.is_empty() {
+                label.to_string()
+            } else {
+                format!("{label} {kw}")
+            };
+            format!("{head:<60}{:>w$}", n, w = end - 60)
+        };
+        let stamp = crate::report::Stamp::now();
+        let header = |page: u32| {
+            let when = format!("{}  {}", stamp.date, stamp.time);
+            crate::report::at(&[
+                (2, crate::report::PRODUCT),
+                (18, crate::report::LEVEL),
+                (39, "Display File Description"),
+                (97, &when),
+                (122, &format!("Page {page:>4}")),
+            ])
+        };
+        let file_line = format!(
+            " File . : {name:<10}   Library . : {lib:<10}   Type of file . : {:<26}Auxiliary Storage Pool ID . : 00001",
+            "Physical *DATA"
+        );
+        let attrs = "                                    Data Base File Attributes".to_string();
+        let mut print = vec![
+            header(1),
+            format!("   File  . . . . . . . . . . . : {name}"),
+            format!("     Library . . . . . . . . . : {lib}"),
+            "   Type of information . . . . : *ATR".into(),
+            "   File attributes . . . . . . : *ALL".into(),
+            "   System  . . . . . . . . . . : *LCL".into(),
+            "   Processor . . . . . . . . . : AS4TAINR Display File Description Processor".into(),
+            file_line.clone(),
+            attrs.clone(),
+            kv(
+                "   Externally described file . . . . . . . . . :",
+                "",
+                yn(external),
+            ),
+            kv(
+                "   File level identifier . . . . . . . . . . . :",
+                "",
+                &level_id,
+            ),
+            kv(
+                "   Creation date . . . . . . . . . . . . . . . :",
+                "",
+                &created,
+            ),
+            kv(
+                "   Text 'description'  . . . . . . . . . . . . :",
+                "TEXT",
+                &text,
+            ),
+            kv("   Distributed file  . . . . . . . . . . . . . :", "", "No"),
+            kv("   Partitioned SQL Table . . . . . . . . . . . :", "", "No"),
+            kv("   DBCS capable  . . . . . . . . . . . . . . . :", "", "No"),
+            num(
+                "   Maximum members . . . . . . . . . . . . . . :",
+                "MAXMBRS",
+                1,
+                65,
+            ),
+            num(
+                "   Number of constraints . . . . . . . . . . . :",
+                "",
+                if pf.unique { 1 } else { 0 },
+                65,
+            ),
+            num(
+                "   Number of triggers  . . . . . . . . . . . . :",
+                "",
+                triggers,
+                65,
+            ),
+            num(
+                "   Number of members . . . . . . . . . . . . . :",
+                "",
+                1,
+                65,
+            ),
+            "   Member size                                   SIZE".into(),
+            num(
+                "     Initial number of records . . . . . . . . :",
+                "",
+                10000,
+                70,
+            ),
+            num(
+                "     Increment number of records . . . . . . . :",
+                "",
+                1000,
+                65,
+            ),
+            num(
+                "     Maximum number of increments  . . . . . . :",
+                "",
+                3,
+                65,
+            ),
+            num(
+                "   Record capacity . . . . . . . . . . . . . . :",
+                "",
+                13000,
+                70,
+            ),
+            kv(
+                "   Allocate storage  . . . . . . . . . . . . . :",
+                "ALLOCATE",
+                "*NO",
+            ),
+            kv(
+                "   Contiguous storage  . . . . . . . . . . . . :",
+                "CONTIG",
+                "*NO",
+            ),
+            kv(
+                "   Preferred storage unit  . . . . . . . . . . :",
+                "UNIT",
+                "*ANY",
+            ),
+            kv(
+                "   Records to force a write  . . . . . . . . . :",
+                "FRCRATIO",
+                "*NONE",
+            ),
+            kv(
+                "   Maximum file wait time  . . . . . . . . . . :",
+                "WAITFILE",
+                "*IMMED",
+            ),
+            num(
+                "   Maximum record wait time  . . . . . . . . . :",
+                "WAITRCD",
+                60,
+                65,
+            ),
+            kv(
+                "   Max % deleted records allowed . . . . . . . :",
+                "DLTPCT",
+                "*NONE",
+            ),
+            kv(
+                "   Reuse deleted records . . . . . . . . . . . :",
+                "REUSEDLT",
+                "*NO",
+            ),
+            header(2),
+            file_line,
+            attrs,
+            kv(
+                "   Sort Sequence . . . . . . . . . . . . . . . :",
+                "SRTSEQ",
+                "*HEX",
+            ),
+            kv(
+                "   Language identifier . . . . . . . . . . . . :",
+                "LANGID",
+                "ENU",
+            ),
+        ];
+        let ccsid = crate::clpgm::system_value_text("QCCSID")
+            .map(|v| match v {
+                Ok(s) => s,
+                Err(n) => n.to_string(),
+            })
+            .unwrap_or_else(|| "65535".into());
+        print.extend([
+            kv(
+                "   Coded character set identifier  . . . . . . :",
+                "CCSID",
+                &ccsid,
+            ),
+            kv(
+                "   Allow read operation  . . . . . . . . . . . :",
+                "",
+                "Yes",
+            ),
+            kv(
+                "   Allow write operation . . . . . . . . . . . :",
+                "",
+                "Yes",
+            ),
+            kv(
+                "   Allow update operation  . . . . . . . . . . :",
+                "ALWUPD",
+                "*YES",
+            ),
+            kv(
+                "   Allow delete operation  . . . . . . . . . . :",
+                "ALWDLT",
+                "*YES",
+            ),
+            kv("   Restrict on drop  . . . . . . . . . . . . . :", "", "No"),
+            kv(
+                "   Record format level check . . . . . . . . . :",
+                "LVLCHK",
+                "*YES",
+            ),
+            kv(
+                "   Access path . . . . . . . . . . . . . . . . :",
+                "",
+                if pf.keys.is_empty() {
+                    "Arrival"
+                } else {
+                    "Keyed"
+                },
+            ),
+            num(
+                "   Maximum record length . . . . . . . . . . . :",
+                "",
+                reclen as i64,
+                65,
+            ),
+            kv("   Volatile  . . . . . . . . . . . . . . . . . :", "", "No"),
+            kv(
+                "   Keep in memory  . . . . . . . . . . . . . . :",
+                "KEEPINMEM",
+                "*NO",
+            ),
+            kv(
+                "   File is currently journaled . . . . . . . . :",
+                "",
+                yn(journaled),
+            ),
+        ]);
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display File Description".into(),
+            info: vec![
+                ("File".into(), name.clone()),
+                ("Library".into(), lib.clone()),
+                ("Type of information".into(), "*ATR".into()),
+            ],
+            rows: print[1..].to_vec(),
+            print,
+            ..Default::default()
+        }))
     }
 
     /// DSPFD TYPE(*MBRLIST) of a source file.
     async fn dspfd(&mut self, cmd: &Command) -> Result<Outcome> {
+        if cmd.get("TYPE").eq_ignore_ascii_case("*ATR") {
+            return self.dspfd_atr(cmd).await;
+        }
         let (libs, name) = self.search(cmd.get("FILE"));
         let name = name.to_ascii_uppercase();
         let mut found = None;
@@ -1639,18 +2000,46 @@ impl Job<'_> {
         let (lib, name) = self.create_target(cmd.get("FILE"));
         let lib = lib.to_ascii_uppercase();
         let name = name.to_ascii_uppercase();
-        let m = self.source_member(cmd, &name).await?;
+        let rcdlen = cmd.get("RCDLEN").trim().to_ascii_uppercase();
+        let program_described = cmd.def.name == "CRTPF" && !rcdlen.is_empty() && rcdlen != "*NONE";
+        let m = if program_described {
+            // CRTPF RCDLEN(n), no DDS: one record format and one character
+            // field of n bytes, both named like the file (CRTPF
+            // documentation, RCDLEN parameter).
+            let len = number(&rcdlen, "RCDLEN")?;
+            if !(1..=32766).contains(&len) {
+                bail!("CPD0084: RCDLEN({rcdlen}) is not a record length from 1 to 32766.");
+            }
+            crate::source::Member {
+                source: format!(
+                    "{:<16}R {name}\n{:<18}{name:<10} {len:>5}A\n",
+                    "     A", "     A"
+                ),
+                ..Default::default()
+            }
+        } else {
+            self.source_member(cmd, &name).await?
+        };
         let mut c = runtime::connect_db(&self.env.database_url).await?;
+        let added = format!("CPC7305: Member {name} added to file {name} in {lib}.");
         let msg = match cmd.def.name {
             "CRTPF" => {
                 let pf = crate::dds::parse_pf(&name, &m.source)?;
                 catalog::create_physical_file(&mut c, &lib, &pf).await?;
-                format!("File {name} created in library {lib}.")
+                authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
+                return Ok(Outcome::Messages(vec![
+                    format!("CPC7301: File {name} created in library {lib}."),
+                    added,
+                ]));
             }
             "CRTLF" => {
                 let lf = crate::dds::parse_lf(&name, &m.source)?;
                 catalog::create_logical_file(&mut c, &self.library_list(), &lib, &lf).await?;
-                format!("File {name} created in library {lib} over {}.", lf.based_on)
+                authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
+                return Ok(Outcome::Messages(vec![
+                    format!("CPC7301: File {name} created in library {lib}."),
+                    added,
+                ]));
             }
             _ => {
                 if cmd.get("REPLACE") == "*NO" {
@@ -2904,6 +3293,7 @@ impl Job<'_> {
             options: vec![(5, "Display job log".into(), "DSPJOBLOG JOB({})".into())],
             keys,
             refresh: Some("WRKACTJOB".into()),
+            print: vec![],
         }))
     }
 
@@ -2940,6 +3330,7 @@ impl Job<'_> {
             ],
             keys: list.iter().map(|j| j.id.to_string()).collect(),
             refresh: Some("WRKSBMJOB".into()),
+            print: vec![],
         }))
     }
 
@@ -3238,6 +3629,7 @@ impl Job<'_> {
                 .map(|f| format!("FILE({}) JOB({}) SPLNBR({})", f.file, f.job_name, f.number))
                 .collect(),
             refresh: Some(format!("WRKSPLF SELECT({user})")),
+            print: vec![],
         }))
     }
 
@@ -3322,7 +3714,7 @@ impl Job<'_> {
         .await?;
         authority::set_owner(self.client, &d.library, &d.name, "*DTAARA", &self.user).await?;
         Ok(Outcome::Messages(vec![format!(
-            "Data area {} created in library {}.",
+            "CPC0904: Data area {} created in library {}.",
             d.name, d.library
         )]))
     }
@@ -3407,7 +3799,62 @@ impl Job<'_> {
                 .collect(),
             _ => vec![format!("{:>6}   {}", 0, d.value)],
         };
+        // Printed layout: PUB400 (IBM i 7.5) `system "DSPDTAARA
+        // DTAARA(AS4TRAINR1/GOLDDA)"` (*CHAR, LEN 10), 2026-10-21. *DEC
+        // and *LGL values use the same lines (not yet compared).
+        use crate::report::at;
+        let qual = format!("{}/{}", d.library, d.name);
+        let mut print = vec![
+            crate::report::header_a(
+                17,
+                51,
+                "Display Data Area",
+                73,
+                &qual,
+                &crate::report::Stamp::now(),
+                1,
+            ),
+            at(&[
+                (2, "Data area . . . . . . . . . . . :"),
+                (38, "DTAARA"),
+                (50, &d.name),
+            ]),
+            at(&[(4, "Library . . . . . . . . . . . :"), (52, &d.library)]),
+            at(&[
+                (2, "Type  . . . . . . . . . . . . . :"),
+                (38, "TYPE"),
+                (50, d.ty.code()),
+            ]),
+            at(&[
+                (2, "Length  . . . . . . . . . . . . :"),
+                (38, "LEN"),
+                (50, &d.length_text()),
+            ]),
+            at(&[
+                (2, "Text description  . . . . . . . :"),
+                (38, "TEXT"),
+                (50, &d.text),
+            ]),
+            at(&[(5, "Offset"), (17, "Value")]),
+            at(&[(18, "*...+....1....+....2....+....3....+....4....+....5")]),
+        ];
+        let chunks: Vec<(usize, String)> = match d.ty {
+            dtaara::Type::Char => d
+                .value
+                .chars()
+                .collect::<Vec<_>>()
+                .chunks(50)
+                .enumerate()
+                .map(|(i, c)| (i * 50, format!("'{}'", c.iter().collect::<String>())))
+                .collect(),
+            _ => vec![(0, d.value.clone())],
+        };
+        for (off, v) in &chunks {
+            print.push(at(&[(2, &format!("{off:>5}")), (17, v)]));
+        }
+        print.push(crate::report::END_A.into());
         Ok(Outcome::Display(ListDisplay {
+            print,
             title: "Display Data Area".into(),
             info: vec![
                 ("Data area".into(), d.name.clone()),
@@ -3422,14 +3869,292 @@ impl Job<'_> {
         }))
     }
 
+    /// CHKOBJ: does the object exist (and the member, MBR), and has the
+    /// user the authority AUT to it? No message when it does; escape
+    /// messages CPF9810 (library), CPF9801 (object), CPF9815 (member),
+    /// CPF9802 (authority) as IBM's CHKOBJ documentation lists them.
+    pub async fn chkobj(&mut self, obj: &str, objtype: &str, mbr: &str, aut: &str) -> Result<()> {
+        let obj = obj.trim().to_ascii_uppercase();
+        let objtype = objtype.trim().to_ascii_uppercase();
+        let (label, name) = match obj.split_once('/') {
+            Some((l, n)) => (l.to_string(), n.to_string()),
+            None => ("*LIBL".to_string(), obj.clone()),
+        };
+        let libs = match label.as_str() {
+            "*LIBL" => self.library_list(),
+            "*CURLIB" => vec![self.current_library()],
+            l => {
+                if !catalog::library_exists(self.client, l).await? {
+                    bail!("CPF9810: Library {l} not found.");
+                }
+                vec![l.to_string()]
+            }
+        };
+        let libs = if objtype == "*LIB" {
+            vec!["QSYS".to_string()]
+        } else {
+            libs
+        };
+        let mut found = None;
+        for lib in &libs {
+            if catalog::object_exists(self.client, std::slice::from_ref(lib), &name, &objtype)
+                .await?
+            {
+                found = Some(lib.clone());
+                break;
+            }
+        }
+        let Some(lib) = found else {
+            bail!("CPF9801: Object {name} in library {label} not found.");
+        };
+        let mbr = mbr.trim().to_ascii_uppercase();
+        if !mbr.is_empty() && mbr != "*NONE" && objtype == "*FILE" {
+            let source = crate::source::members(self.client, &lib, &name).await.ok();
+            let ok = match &source {
+                Some(ms) if !ms.is_empty() => {
+                    mbr == "*FIRST" || ms.iter().any(|(m, _, _)| m.eq_ignore_ascii_case(&mbr))
+                }
+                _ => mbr == "*FIRST" || mbr == name,
+            };
+            if !ok {
+                bail!("CPF9815: Member {mbr} file {name} in library {lib} not found.");
+            }
+        }
+        let aut = aut.trim().to_ascii_uppercase();
+        if !aut.is_empty() && aut != "*NONE" {
+            let need = Aut::parse(&aut)?;
+            authority::check(self.client, &self.user, &lib, &name, &objtype, need).await?;
+        }
+        Ok(())
+    }
+
+    /// DSPSYSVAL: a system value, its shipped value and what it is for.
+    fn dspsysval(&mut self, cmd: &Command) -> Result<Outcome> {
+        let name = cmd.get("SYSVAL").trim().to_ascii_uppercase();
+        let Some(desc) = crate::clpgm::system_value_description(&name) else {
+            bail!("CPF1028: System value {name} not found.");
+        };
+        let show = |v: Result<String, i64>| match v {
+            Ok(s) => s.split_whitespace().collect::<Vec<_>>().join(" "),
+            Err(n) => n.to_string(),
+        };
+        let current = crate::clpgm::system_value_text(&name)
+            .map(show)
+            .unwrap_or_default();
+        let shipped = crate::clpgm::shipped_system_value_text(&name)
+            .map(show)
+            .unwrap_or_default();
+        // Printed layout: PUB400 (IBM i 7.5) `system "DSPSYSVAL
+        // SYSVAL(QCCSID)"`, 2026-10-21.
+        use crate::report::at;
+        let [h1, h2] = crate::report::header_b(
+            52,
+            "System Values",
+            &crate::report::system_name(),
+            &crate::report::Stamp::now(),
+            1,
+        );
+        let differs = current != shipped;
+        let mut print = vec![
+            h1,
+            h2,
+            at(&[(17, "Current"), (49, "Shipped")]),
+            at(&[
+                (2, "Name"),
+                (17, "value"),
+                (49, "value"),
+                (81, "Description"),
+            ]),
+            at(&[
+                (2, &name),
+                (14, if differs { ">" } else { "" }),
+                (17, &current),
+                (49, &shipped),
+                (81, desc),
+            ]),
+        ];
+        if differs {
+            print.push(at(&[
+                (6, "Note:"),
+                (
+                    13,
+                    "> means current value is different from the shipped value",
+                ),
+            ]));
+        }
+        print.push(crate::report::END_SYSVAL.into());
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display System Value".into(),
+            info: vec![
+                ("System value".into(), name.clone()),
+                ("Description".into(), desc.into()),
+                ("Value".into(), current),
+                ("Shipped value".into(), shipped),
+            ],
+            print,
+            ..Default::default()
+        }))
+    }
+
+    /// DSPOBJD DETAIL(*BASIC): objects by name (generic, *ALL) and type
+    /// in a library or the library list.
+    async fn dspobjd(&mut self, cmd: &Command) -> Result<Outcome> {
+        let obj = cmd.get("OBJ").trim().to_ascii_uppercase();
+        let objtype = cmd.get("OBJTYPE").trim().to_ascii_uppercase();
+        let objtype = if objtype.is_empty() {
+            "*ALL".to_string()
+        } else {
+            objtype
+        };
+        let detail = cmd.get("DETAIL").trim().to_ascii_uppercase();
+        if !detail.is_empty() && detail != "*BASIC" {
+            bail!("CPF0006: Errors occurred in command. DETAIL({detail}) is not supported yet; *BASIC is.");
+        }
+        let (label, name) = match obj.split_once('/') {
+            Some((l, n)) => (l.to_string(), n.to_string()),
+            None => ("*LIBL".to_string(), obj.clone()),
+        };
+        let libs = match label.as_str() {
+            "*LIBL" => self.library_list(),
+            "*CURLIB" => vec![self.current_library()],
+            "*ALL" | "*USRLIBL" | "*ALLUSR" => catalog::list_libraries(self.client).await?,
+            l => {
+                if !catalog::library_exists(self.client, l).await? {
+                    bail!("CPF9810: Library {l} not found.");
+                }
+                vec![l.to_string()]
+            }
+        };
+        let mut types: Vec<String> = cmd
+            .list("OBJTYPE")
+            .iter()
+            .map(|t| t.trim().to_ascii_uppercase())
+            .collect();
+        if types.is_empty() {
+            types.push(objtype.clone());
+        }
+        let matches_name = |n: &str| {
+            if name == "*ALL" {
+                true
+            } else if let Some(prefix) = name.strip_suffix('*') {
+                n.starts_with(prefix)
+            } else {
+                n == name
+            }
+        };
+        let mut groups: Vec<(String, Vec<catalog::ObjectEntry>)> = Vec::new();
+        for lib in &libs {
+            let list = if types.iter().any(|t| t == "*LIB") && lib != "QSYS" {
+                vec![]
+            } else {
+                catalog::list_objects(self.client, lib)
+                    .await
+                    .unwrap_or_default()
+            };
+            let mut hits = Vec::new();
+            for o in list {
+                if !matches_name(&o.name) {
+                    continue;
+                }
+                if !(types.iter().any(|t| t == "*ALL") || types.contains(&o.objtype)) {
+                    continue;
+                }
+                if authority::check(self.client, &self.user, lib, &o.name, &o.objtype, Aut::Use)
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                hits.push(o);
+            }
+            if !hits.is_empty() {
+                groups.push((lib.clone(), hits));
+                if name != "*ALL" && !name.ends_with('*') && label == "*LIBL" {
+                    // A specific name in the library list: the first found.
+                    break;
+                }
+            }
+        }
+        if groups.is_empty() {
+            bail!("CPF2123: No objects named {name} of type {objtype} found in library {label}.");
+        }
+        // Printed layout: PUB400 (IBM i 7.5) `system "DSPOBJD
+        // OBJ(QSYS/QCMD) OBJTYPE(*PGM)"`, 2026-10-21. Size: what this
+        // system stores for the object (fidelity-gaps.md).
+        use crate::report::at;
+        let [h1, h2] = crate::report::header_b(
+            42,
+            "Display Object Description - Basic",
+            &crate::report::system_name(),
+            &crate::report::Stamp::now(),
+            1,
+        );
+        let mut print = vec![h1, h2];
+        let mut rows = Vec::new();
+        for (lib, objs) in &groups {
+            print.push(at(&[
+                (2, "Library . . . . . . . :"),
+                (28, lib),
+                (69, "Library ASP device  . :"),
+                (95, "*SYSBAS"),
+            ]));
+            print.push(at(&[(69, "Library ASP group . . :"), (95, "*SYSBAS")]));
+            print.push(at(&[
+                (2, "Object"),
+                (17, "Type"),
+                (30, "Attribute"),
+                (57, "Size"),
+                (66, "Text"),
+            ]));
+            for o in objs {
+                let size = catalog::object_size(self.client, lib, &o.name, &o.objtype)
+                    .await
+                    .unwrap_or(0);
+                print.push(at(&[
+                    (2, &o.name),
+                    (17, &o.objtype),
+                    (30, &o.attribute),
+                    (49, &format!("{size:>12}")),
+                    (66, &o.text),
+                ]));
+                rows.push(format!(
+                    "{:<10}  {:<10}  {:<10}  {:<10}  {}",
+                    o.name, lib, o.objtype, o.attribute, o.text
+                ));
+            }
+        }
+        print.push(crate::report::END_OBJD.into());
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display Object Description".into(),
+            heading: format!(
+                "{:<10}  {:<10}  {:<10}  {:<10}  {}",
+                "Object", "Library", "Type", "Attribute", "Text"
+            ),
+            rows,
+            print,
+            ..Default::default()
+        }))
+    }
+
     async fn dltdtaara(&mut self, cmd: &Command) -> Result<Outcome> {
-        let found = dtaara::resolve(
+        // DLTDTAARA of a data area that is not there: CPF2105, as for
+        // other delete commands (PUB400, IBM i 7.5, 2026-10-21).
+        let found = match dtaara::resolve(
             self.client,
             cmd.get("DTAARA"),
             &self.library_list(),
             &self.current_library(),
         )
-        .await?;
+        .await
+        {
+            Ok(f) => f,
+            Err(e) if e.to_string().starts_with("CPF1015") => {
+                let q = cmd.get("DTAARA").to_ascii_uppercase();
+                let (l, n) = q.split_once('/').unwrap_or(("*LIBL", q.as_str()));
+                bail!("CPF2105: Object {n} in {l} type *DTAARA not found.");
+            }
+            Err(e) => return Err(e),
+        };
         authority::check(
             self.client,
             &self.user,
@@ -3448,7 +4173,7 @@ impl Job<'_> {
         )
         .await?;
         Ok(Outcome::Messages(vec![format!(
-            "Data area {} deleted from library {}.",
+            "CPC2191: Object {} in {} type *DTAARA deleted.",
             d.name, d.library
         )]))
     }

@@ -58,7 +58,7 @@ pub fn type_for_extension(ext: &str) -> Option<&'static str> {
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Member {
     pub library: String,
     pub file: String,

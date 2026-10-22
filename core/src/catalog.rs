@@ -571,6 +571,22 @@ pub async fn object_exists(
         .is_some())
 }
 
+/// An object's size in bytes as DSPOBJD shows it: for a database file,
+/// the PostgreSQL storage of its table (or view); 0 for objects whose
+/// size this system does not keep (fidelity-gaps.md).
+pub async fn object_size(client: &Client, library: &str, name: &str, objtype: &str) -> Result<i64> {
+    if objtype != "*FILE" {
+        return Ok(0);
+    }
+    let row = client
+        .query_one(
+            "SELECT COALESCE(pg_total_relation_size(to_regclass(format('%I.%I', lower($1::text), lower($2::text)))), 0)::bigint",
+            &[&library, &name],
+        )
+        .await?;
+    Ok(row.get(0))
+}
+
 /// All libraries, by name.
 pub async fn list_libraries(client: &Client) -> Result<Vec<String>> {
     Ok(client

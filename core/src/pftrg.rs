@@ -681,7 +681,7 @@ where
 
 /// The PostgreSQL triggers that note changes, on a file with trigger
 /// programs; dropped when it has none left.
-async fn sync_capture(client: &Client, lib: &str, file: &str) -> Result<()> {
+pub(crate) async fn sync_capture(client: &Client, lib: &str, file: &str) -> Result<()> {
     let any: bool = client
         .query_one(
             "SELECT EXISTS (SELECT 1 FROM as4tainr.file_triggers WHERE library=$1 AND file=$2)",

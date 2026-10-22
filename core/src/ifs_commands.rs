@@ -23,6 +23,19 @@ fn cl_error(e: anyhow::Error, path: &str) -> anyhow::Error {
 }
 
 /// A library member path: /QSYS.LIB/LIB.LIB/FILE.FILE/MBR.MBR.
+/// A save file's path: /QSYS.LIB/lib.LIB/file.FILE.
+fn savf_path(p: &str) -> Option<(String, String)> {
+    let up = p.trim().to_ascii_uppercase();
+    let parts: Vec<&str> = up.trim_start_matches('/').split('/').collect();
+    match parts.as_slice() {
+        ["QSYS.LIB", lib, file] => Some((
+            lib.strip_suffix(".LIB")?.to_string(),
+            file.strip_suffix(".FILE")?.to_string(),
+        )),
+        _ => None,
+    }
+}
+
 fn member_path(p: &str) -> Result<(String, String, String)> {
     let up = p.trim().to_ascii_uppercase();
     let parts: Vec<&str> = up.trim_start_matches('/').split('/').collect();
@@ -112,6 +125,34 @@ impl Job<'_> {
                     o => o,
                 };
                 Ok(Some(self.link_list(obj).await?))
+            }
+            "CPYTOSTMF" if savf_path(cmd.get("FROMMBR")).is_some() => {
+                // A save file is copied as it is (binary, CCSID 65535).
+                let (lib, name) = savf_path(cmd.get("FROMMBR")).unwrap_or_default();
+                let to = cmd.get("TOSTMF");
+                let data = self.save_file_data(&lib, &name).await?;
+                let opt = cmd.get("STMFOPT").to_ascii_uppercase();
+                if ifs::stat(self.client, to).await?.is_some() && opt != "*REPLACE" {
+                    bail!("CPFA097: Save file {name} not copied: stream file {to} exists (STMFOPT(*NONE)).");
+                }
+                ifs::write_file(self.client, to, &data, 65535, 0o644, &self.user)
+                    .await
+                    .map_err(|e| cl_error(e, to))?;
+                msg(format!("Save file {name} copied to stream file {to}."))
+            }
+            "CPYFRMSTMF" if savf_path(cmd.get("TOMBR")).is_some() => {
+                let (lib, name) = savf_path(cmd.get("TOMBR")).unwrap_or_default();
+                let from = cmd.get("FROMSTMF");
+                let (bytes, _) = ifs::read_file(self.client, from).await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "CPFA095: Stream file {from} not copied: {}",
+                        ifs::errno_text(errno_of(&e))
+                    )
+                })?;
+                let opt = cmd.get("MBROPT").to_ascii_uppercase();
+                self.put_save_file_data(&lib, &name, &bytes, opt == "*REPLACE")
+                    .await?;
+                msg(format!("Stream file {from} copied to save file {name}."))
             }
             "CPYTOSTMF" => {
                 let (lib, file, mbr) = member_path(cmd.get("FROMMBR"))?;

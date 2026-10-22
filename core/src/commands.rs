@@ -134,6 +134,9 @@ impl Job<'_> {
         if let Some(o) = self.pftrg_command(&cmd).await? {
             return Ok(o);
         }
+        if let Some(o) = self.save_command(&cmd).await? {
+            return Ok(o);
+        }
         match cmd.def.name {
             "CRTLIB" => self.crtlib(&cmd).await,
             "DSPLIB" => self.dsplib(&cmd).await,
@@ -1314,6 +1317,12 @@ impl Job<'_> {
         }
         if crate::source::is_source_file(self.client, &lib, &name).await? {
             bail!("CPF2105: File {name} in library {lib} is a source file; deleting source files is not supported yet.");
+        }
+        if crate::save::is_save_file(self.client, &lib, &name).await? {
+            crate::save::delete_save_file(self.client, &lib, &name).await?;
+            return Ok(Outcome::Messages(vec![format!(
+                "File {name} in library {lib} deleted."
+            )]));
         }
         let mut c = runtime::connect_db(&self.env.database_url).await?;
         catalog::delete_file(&mut c, &lib, &name, false).await?;

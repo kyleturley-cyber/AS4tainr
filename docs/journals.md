@@ -41,7 +41,14 @@ RMVJRNCHG JRN(MYLIB/MYJRN) FILE(MYLIB/ORDHDR) RCVRNG(*CURRENT) FROMENT(*LAST) TO
 
 APYJRNCHG goes through a file's entries from FROMENT (`*FIRST` or a sequence number) to TOENT (`*LAST` or a sequence number), oldest first: PT and PX add the record at its relative record number, UP and UR change it to the after-image, DL and DR delete it, F CR clears the member; UB and BR are ignored. RMVJRNCHG goes from FROMENT (`*LAST` or a sequence number) back to TOENT (`*FIRST` or a sequence number), newest first: PT and PX delete the record, UB and BR change it to the before-image, DL and DR put it back; UP and UR are ignored; it needs a file journaled with `IMAGES(*BOTH)`, and an F CR in the range cannot be removed (CPF9898; nothing is removed). FROMENTLRG and TOENTLRG are taken as well. RCVRNG is `*CURRENT` (the attached receiver's entries) or `*CURCHAIN` (all). With `CMTBDY(*YES)` (the default) a change made under commitment control is applied or removed only when its commit cycle was committed within the range. Trigger programs are not called, and the changes are not journaled one by one: the journal gets F SA (SR) when the command starts and F AY (RC) for each file. The whole command is one transaction: an entry that cannot be applied (a record that is already there) undoes it.
 
-as4tainr keeps no saves (there is no SAVOBJ or RSTOBJ), so the IBM defaults `RCVRNG(*LASTSAVE)` and `FROMENT(*LASTSAVE)` end in CPF9898; `TOENT(*LASTRST)` is taken as `*LAST`. To rebuild a file, clear it and apply its entries from the first.
+The IBM defaults work with saves (docs/save-restore.md): SAVOBJ and SAVLIB write an F MS entry for each journaled file they save (with `UPDHST(*YES)`, the default), and RSTOBJ and RSTLIB journal a restored file again and write F MR. `FROMENT(*LASTSAVE)` starts with the entry after the file's last F MS; a file with no save in the journal gets CPF9898. `RCVRNG(*LASTSAVE)` takes the receivers from the save on, which in as4tainr is the whole chain (`*CURCHAIN`). `TOENT(*LASTRST)` is taken as `*LAST`. So the usual recovery is:
+
+```
+RSTOBJ    OBJ(ORDHDR) SAVLIB(MYLIB) DEV(*SAVF) SAVF(BACKUP/NIGHTLY)
+APYJRNCHG JRN(JRNLIB/MYJRN) FILE(MYLIB/ORDHDR)
+```
+
+Without a save, clear the file and apply its entries from the first (`FROMENT(*FIRST) RCVRNG(*CURCHAIN)`).
 
 ### Reading the entries
 

@@ -676,7 +676,7 @@ pub fn next_receiver_name(name: &str) -> String {
 /// Write a journal entry from as4tainr (F JM, F EJ, J PR...) for a job
 /// (its name "number/user/name") and user.
 #[allow(clippy::too_many_arguments)]
-async fn entry(
+pub(crate) async fn entry(
     client: &Client,
     jlib: &str,
     jname: &str,
@@ -706,7 +706,7 @@ async fn entry(
     Ok(())
 }
 
-fn member_object(lib: &str, file: &str) -> String {
+pub(crate) fn member_object(lib: &str, file: &str) -> String {
     format!("{file:<10}{lib:<10}{file:<10}")
 }
 
@@ -751,7 +751,7 @@ async fn file_deleted(client: &Client, lib: &str, file: &str, who: (&str, &str))
 
 impl Job<'_> {
     /// The job's name, number/user/name (empty outside a job).
-    fn job_name(&self) -> String {
+    pub(crate) fn job_name(&self) -> String {
         self.id.as_ref().map(|i| i.to_string()).unwrap_or_default()
     }
 
@@ -1515,12 +1515,10 @@ fn entry_limit(v: &str, first: i64, last: i64) -> Result<i64> {
     match v.trim().to_ascii_uppercase().as_str() {
         "*FIRST" => Ok(first),
         "*LAST" | "*LASTRST" | "*COMPLETE" => Ok(last),
-        "*LASTSAVE" => bail!(
-            "CPF9898: No save of the file is recorded (as4tainr keeps no saves); give FROMENT(*FIRST) or a sequence number, and RCVRNG(*CURRENT) or RCVRNG(*CURCHAIN)."
-        ),
-        n => n
-            .parse()
-            .map_err(|_| anyhow::anyhow!("CPF0006: Errors occurred in command. {v} is not a sequence number.")),
+        "*LASTSAVE" => bail!("CPF0006: Errors occurred in command. *LASTSAVE is not valid here."),
+        n => n.parse().map_err(|_| {
+            anyhow::anyhow!("CPF0006: Errors occurred in command. {v} is not a sequence number.")
+        }),
     }
 }
 
@@ -1546,13 +1544,10 @@ impl Job<'_> {
         let (jlib, jname, _, rlib, rname) = self.journal(cmd.get("JRN")).await?;
         let files = self.physical_files(&cmd.list("FILE")).await?;
         let rcvrng = cmd.list("RCVRNG").join(" ").to_ascii_uppercase();
-        let current = if rcvrng.contains("*LASTSAVE") {
-            bail!(
-                "CPF9898: No save of the file is recorded (as4tainr keeps no saves); give RCVRNG(*CURRENT) or RCVRNG(*CURCHAIN)."
-            );
-        } else {
-            !rcvrng.contains("*CURCHAIN")
-        };
+        // RCVRNG(*LASTSAVE): the receivers from the one attached when the
+        // file was saved to the one attached now. Every receiver keeps its
+        // entries here, so that is the chain (*CURCHAIN).
+        let current = !(rcvrng.contains("*CURCHAIN") || rcvrng.contains("*LASTSAVE"));
         let pick = |a: &str, b: &str| -> String {
             match cmd.get(b) {
                 "" => cmd.get(a).to_string(),
@@ -1563,17 +1558,26 @@ impl Job<'_> {
         let to = pick("TOENT", "TOENTLRG");
         // Apply: from the older to the newer entry; remove: from the
         // newer back to the older.
-        let (lo, hi) = if remove {
-            (
-                entry_limit(&to, 0, 0)?,
-                entry_limit(&from, i64::MAX, i64::MAX)?,
-            )
-        } else {
-            (
-                entry_limit(&from, 0, 0)?,
-                entry_limit(&to, i64::MAX, i64::MAX)?,
-            )
+        let limits = |from: &str, to: &str| -> Result<(i64, i64)> {
+            Ok(if remove {
+                (
+                    entry_limit(to, 0, 0)?,
+                    entry_limit(from, i64::MAX, i64::MAX)?,
+                )
+            } else {
+                (
+                    entry_limit(from, 0, 0)?,
+                    entry_limit(to, i64::MAX, i64::MAX)?,
+                )
+            })
         };
+        // FROMENT(*LASTSAVE) (APYJRNCHG): from the entry after the file's
+        // last save, its F MS entry (written by SAVOBJ/SAVLIB). RMVJRNCHG
+        // has no *LASTSAVE.
+        let lastsave = !remove && from.trim().eq_ignore_ascii_case("*LASTSAVE");
+        if !lastsave {
+            limits(&from, &to)?;
+        }
         let cmtbdy = !cmd.get("CMTBDY").eq_ignore_ascii_case("*NO");
         let job = self.job_name();
         let who = (job.as_str(), self.user.as_str());
@@ -1594,6 +1598,24 @@ impl Job<'_> {
             )
             .await?;
             for (lib, file) in &files {
+                let (lo, hi) = if lastsave {
+                    let saved: Option<i64> = tx
+                        .query_one(
+                            "SELECT max(seq) FROM as4tainr.journal_entries
+                              WHERE journal_lib=$1 AND journal=$2 AND object=$3 AND code='F' AND type='MS'",
+                            &[&jlib, &jname, &member_object(lib, file)],
+                        )
+                        .await?
+                        .get(0);
+                    let Some(saved) = saved else {
+                        bail!(
+                            "CPF9898: No save of file {file} in {lib} is in journal {jname}; give FROMENT(*FIRST) or a sequence number."
+                        );
+                    };
+                    (saved + 1, limits("*FIRST", &to)?.1)
+                } else {
+                    limits(&from, &to)?
+                };
                 let n = self
                     .apply_file(
                         &jlib,

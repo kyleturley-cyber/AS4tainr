@@ -25,6 +25,11 @@ CREATE TABLE IF NOT EXISTS as4tainr.ifs (
 );
 INSERT INTO as4tainr.ifs (path_key, path, kind, mode) VALUES ('/', '/', 'D', 493)
   ON CONFLICT DO NOTHING;
+-- The directories an IBM i system has from the start: /home (users'
+-- home directories) and /tmp (everyone's; restricted rename and unlink,
+-- mode 1777).
+INSERT INTO as4tainr.ifs (path_key, path, kind, mode) VALUES ('/home', '/home', 'D', 493), ('/tmp', '/tmp', 'D', 1023)
+  ON CONFLICT DO NOTHING;
 "#;
 
 /// Create the IFS table; include files kept by earlier versions (in

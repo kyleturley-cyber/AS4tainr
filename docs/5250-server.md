@@ -161,6 +161,7 @@ DSPLIB:
 | `RUNSQLSTM SRCFILE(LIB/QSQLSRC) SRCMBR(NAME)` or `SRCSTMF(path)` | Runs the SQL statements in a source member, or in a stream file (converted from its CCSID; a byte order mark is skipped) ([sql.md](sql.md)). |
 | `CHGPFM FILE(LIB/FILE) MBR(name) SRCTYPE(type) TEXT('...')` | Changes a source member's type and text (CPF3141 if the member does not exist). |
 | `CRTJRNRCV`, `CRTJRN`, `CHGJRN`, `DLTJRN`, `DLTJRNRCV`, `STRJRNPF`, `ENDJRNPF`, `DSPJRN` | Journals: see [journals.md](journals.md). |
+| `CRTSAVF`, `CLRSAVF`, `DSPSAVF`, `SAVOBJ`, `SAVLIB`, `RSTOBJ`, `RSTLIB`, `DLTLIB`, `CLRLIB` | Save and restore: see [save-restore.md](save-restore.md). |
 | `ADDPFTRG`, `RMVPFTRG` | Trigger programs on physical files ([journals.md](journals.md)). |
 | `DLTF FILE(LIB/NAME)` | Deletes a database or display file (not a physical file with logical files over it: CPF3203). |
 | `CRTRPGPGM PGM(LIB/NAME)` | Creates a program from RPG/400 (RPG III) source in QRPGSRC: converted to RPG IV as CVTRPGSRC does, then compiled. |

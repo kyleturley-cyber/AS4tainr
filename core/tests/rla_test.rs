@@ -7622,8 +7622,8 @@ exec sql commit;
 /// committed is left out (CMTBDY(*YES), the default). CLRPFM journals F
 /// CR. APYJRNCHG works from the oldest: PT adds the record at its
 /// relative record number, UP updates it, DL deletes it. The commands
-/// journal F SR and RC, F SA and AY; *LASTSAVE needs a save, which
-/// as4tainr does not record (CPF9898).
+/// journal F SR and RC, F SA and AY; *LASTSAVE needs a save of the file
+/// in the journal (F MS); with none, CPF9898.
 #[tokio::test]
 async fn journal_rollback_apply_and_remove() {
     use as4tainr_core::commands::{Environment, Job};
@@ -8298,4 +8298,293 @@ dsply (%char(a) + ' ' + %char(b));
     );
     as4tainr_core::jobs::end(&client, &id, true).await.unwrap();
     cl_cmd(&mut job, format!("DLTUSRPRF {user}")).await.unwrap();
+}
+
+/// Save and restore (CL reference: CRTSAVF, SAVLIB, SAVOBJ, RSTLIB,
+/// RSTOBJ, DLTLIB, CLRSAVF; IBM i "Journal entry information finder": F
+/// MS is written when a journaled object is saved and F MR when it is
+/// restored; APYJRNCHG FROMENT(*LASTSAVE) applies the entries after the
+/// last save). A library saved to a save file, deleted and restored has
+/// its files with their records at the same relative record numbers,
+/// logical files, SQL views, sequences (continuing after the last value
+/// used), SQL triggers, data areas and programs back. RSTOBJ RSTLIB(...)
+/// restores an object into another library; restoring a physical file
+/// that exists replaces its data (MBROPT(*MATCH)). A restored file that
+/// was journaled is journaled again, and the changes journaled after the
+/// save are applied with APYJRNCHG's defaults (RCVRNG(*LASTSAVE)
+/// FROMENT(*LASTSAVE)). Save files themselves are not saved; one is
+/// copied to and from a stream file by its path
+/// (/QSYS.LIB/lib.LIB/name.FILE) with CPYTOSTMF and CPYFRMSTMF.
+#[tokio::test]
+async fn save_and_restore_libraries_and_objects() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    crtlf(
+        &mut client,
+        &lib,
+        "CUSTNAME",
+        include_str!("../../samples/qddssrc/CUSTNAME.lf"),
+    )
+    .await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let jl = format!("{lib}J");
+    let rl = format!("{lib}R");
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    for l in [&jl, &rl] {
+        let _ = cl_cmd(&mut job, format!("DLTLIB {l}")).await;
+    }
+    let sql = |s: String| format!("RUNSQL SQL('{}') COMMIT(*NONE)", s.replace('\'', "''"));
+    source::create_file(&client, &lib, "QCLSRC", "")
+        .await
+        .unwrap();
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QCLSRC".into(),
+            name: "SETDA".into(),
+            srctype: "CLLE".into(),
+            text: String::new(),
+            source: "PGM\n CHGDTAARA DTAARA(*LIBL/DA1) VALUE('ran')\nENDPGM\n".into(),
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    for c in [
+        format!("CRTLIB {jl}"),
+        format!("CRTLIB {rl}"),
+        format!("CRTJRNRCV JRNRCV({jl}/RCV0001)"),
+        format!("CRTJRN JRN({jl}/JRN) JRNRCV({jl}/RCV0001)"),
+        format!("STRJRNPF FILE({lib}/CUSTMAST) JRN({jl}/JRN) IMAGES(*BOTH)"),
+        sql(format!("CREATE VIEW {lib}.OWING AS SELECT CUSNO FROM {lib}.CUSTMAST WHERE CUSBAL > 0")),
+        sql(format!("CREATE SEQUENCE {lib}.ORDSEQ START WITH 100")),
+        sql(format!(
+            "CREATE TABLE {lib}.NOTES (ID INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, TXT VARCHAR(20) NOT NULL, N DECIMAL(5, 0) DEFAULT 0 CHECK (N >= 0))"
+        )),
+        sql(format!(
+            "CREATE TRIGGER {lib}.NOTEUP BEFORE INSERT ON {lib}.NOTES REFERENCING NEW AS X FOR EACH ROW SET X.N = X.N + 1"
+        )),
+        sql(format!("INSERT INTO {lib}.NOTES (TXT) VALUES ('a'), ('b')")),
+        format!("CRTDTAARA DTAARA({lib}/DA1) TYPE(*CHAR) LEN(10) VALUE('saved')"),
+        format!("CRTBNDCL PGM({lib}/SETDA) SRCFILE({lib}/QCLSRC)"),
+        format!("CRTSAVF FILE({jl}/SV)"),
+    ] {
+        cl_cmd(&mut job, c.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    let q = |s: String| {
+        let (client, url, lib) = (&client, &url, &lib);
+        async move { sql_rows(client, url, lib, &s).await }
+    };
+    assert_eq!(
+        q(format!("VALUES NEXT VALUE FOR {lib}.ORDSEQ")).await,
+        ["100"]
+    );
+    let custs = format!("SELECT RRN(C), CUSNO, CUSNAM FROM {lib}.CUSTMAST C ORDER BY CUSNO");
+    let before = q(custs.clone()).await;
+    assert_eq!(before.len(), 5);
+
+    let m = cl_cmd(
+        &mut job,
+        format!("SAVLIB LIB({lib}) DEV(*SAVF) SAVF({jl}/SV)"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        m[0].ends_with(&format!("objects saved from library {lib}.")),
+        "{m:?}"
+    );
+    // Saving again needs CLEAR (the save file has data).
+    assert!(cl_cmd(
+        &mut job,
+        format!("SAVLIB LIB({lib}) DEV(*SAVF) SAVF({jl}/SV)")
+    )
+    .await
+    .is_err());
+    let dj = format!(
+        "SELECT JOURNAL_CODE || JOURNAL_ENTRY_TYPE FROM TABLE(QSYS2.DISPLAY_JOURNAL('{jl}', 'JRN')) X \
+         WHERE JOURNAL_CODE = 'F' ORDER BY SEQUENCE_NUMBER"
+    );
+    assert!(q(dj.clone()).await.contains(&"FMS".to_string()));
+
+    // A change after the save, journaled.
+    cl_cmd(
+        &mut job,
+        sql(format!(
+            "UPDATE {lib}.CUSTMAST SET CUSNAM = 'Renamed' WHERE CUSNO = 1"
+        )),
+    )
+    .await
+    .unwrap();
+
+    cl_cmd(&mut job, format!("DLTLIB {lib}")).await.unwrap();
+    assert!(!catalog::library_exists(&client, &lib).await.unwrap());
+    let m = cl_cmd(
+        &mut job,
+        format!("RSTLIB SAVLIB({lib}) DEV(*SAVF) SAVF({jl}/SV)"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        m[0].ends_with(&format!("objects restored from {lib} to {lib}.")),
+        "{m:?}"
+    );
+
+    // The records as saved, at the same relative record numbers.
+    assert_eq!(q(custs.clone()).await, before);
+    // The logical file, by name.
+    let mut by_name = open(&client, &lib, "CUSTNAME").await;
+    assert_eq!(
+        names(&client, &mut by_name).await,
+        [
+            "Acme Tooling",
+            "Bluebird Supply",
+            "Lake, Pine & Co",
+            "Midwest Fasteners",
+            "Prairie Freight"
+        ]
+    );
+    // The view: balances 1250.50, 310.00, 9999999.99 are over 0.
+    assert_eq!(
+        q(format!("SELECT CUSNO FROM {lib}.OWING ORDER BY CUSNO")).await,
+        ["1", "2", "4"]
+    );
+    // The sequence continues; the identity column too; the trigger and
+    // the check constraint are there.
+    assert_eq!(
+        q(format!("VALUES NEXT VALUE FOR {lib}.ORDSEQ")).await,
+        ["101"]
+    );
+    cl_cmd(
+        &mut job,
+        sql(format!("INSERT INTO {lib}.NOTES (TXT) VALUES ('c')")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        q(format!("SELECT ID, TXT, N FROM {lib}.NOTES ORDER BY ID")).await,
+        ["1|a|1", "2|b|1", "3|c|1"]
+    );
+    assert!(cl_cmd(
+        &mut job,
+        sql(format!("INSERT INTO {lib}.NOTES (TXT, N) VALUES ('d', -5)"))
+    )
+    .await
+    .is_err());
+    // The program runs and changes the restored data area.
+    cl_cmd(&mut job, format!("CALL PGM({lib}/SETDA)"))
+        .await
+        .unwrap();
+    let da = as4tainr_core::dtaara::find(&client, std::slice::from_ref(&lib), "DA1", &lib)
+        .await
+        .unwrap();
+    assert_eq!(da.value.trim(), "ran");
+
+    // Journaled again (F MR), and the change after the save applied.
+    let f = q(dj.clone()).await;
+    assert_eq!(f.last().map(String::as_str), Some("FMR"), "{f:?}");
+    let m = cl_cmd(
+        &mut job,
+        format!("APYJRNCHG JRN({jl}/JRN) FILE({lib}/CUSTMAST)"),
+    )
+    .await
+    .unwrap();
+    assert!(m[0].contains("applied to member CUSTMAST"), "{m:?}");
+    assert_eq!(
+        q(format!("SELECT CUSNAM FROM {lib}.CUSTMAST WHERE CUSNO = 1")).await,
+        ["Renamed"]
+    );
+
+    // RSTOBJ over an existing physical file: its data as saved.
+    cl_cmd(&mut job, sql(format!("DELETE FROM {lib}.CUSTMAST")))
+        .await
+        .unwrap();
+    cl_cmd(
+        &mut job,
+        format!("RSTOBJ OBJ(CUSTMAST) SAVLIB({lib}) DEV(*SAVF) SAVF({jl}/SV)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(q(custs.clone()).await, before);
+
+    // RSTOBJ into another library.
+    let m = cl_cmd(
+        &mut job,
+        format!("RSTOBJ OBJ(CUST* NOTES) SAVLIB({lib}) DEV(*SAVF) OBJTYPE(*FILE) SAVF({jl}/SV) RSTLIB({rl})"),
+    )
+    .await
+    .unwrap();
+    assert!(m[0].starts_with("3 objects restored"), "{m:?}");
+    assert_eq!(
+        q(format!("SELECT COUNT(*) FROM {rl}.CUSTMAST")).await,
+        ["5"]
+    );
+    assert_eq!(q(format!("SELECT COUNT(*) FROM {rl}.NOTES")).await, ["2"]);
+    let mut by_name = open(&client, &rl, "CUSTNAME").await;
+    assert_eq!(names(&client, &mut by_name).await.len(), 5);
+
+    // A save file copied to a stream file and into another save file
+    // (CPYTOSTMF and CPYFRMSTMF with a save file path, as for moving a
+    // save to another system), then deleted with DLTF.
+    let stmf = format!("/tmp/{lib}.savf");
+    for c in [
+        format!(
+            "CPYTOSTMF FROMMBR('/QSYS.LIB/{jl}.LIB/SV.FILE') TOSTMF('{stmf}') STMFOPT(*REPLACE)"
+        ),
+        format!("CRTSAVF FILE({jl}/SV2)"),
+        format!("CPYFRMSTMF FROMSTMF('{stmf}') TOMBR('/QSYS.LIB/{jl}.LIB/SV2.FILE')"),
+        format!("RSTOBJ OBJ(DA1) SAVLIB({lib}) DEV(*SAVF) SAVF({jl}/SV2) RSTLIB({rl})"),
+        format!("DLTF FILE({jl}/SV2)"),
+        format!("RMVLNK OBJLNK('{stmf}')"),
+    ] {
+        cl_cmd(&mut job, c.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    let da = as4tainr_core::dtaara::find(&client, std::slice::from_ref(&rl), "DA1", &rl)
+        .await
+        .unwrap();
+    assert_eq!(da.value.trim(), "saved");
+    assert!(
+        !catalog::object_exists(&client, std::slice::from_ref(&jl), "SV2", "*FILE")
+            .await
+            .unwrap()
+    );
+
+    // An object not in the save file; an empty save file.
+    assert!(cl_cmd(
+        &mut job,
+        format!("RSTOBJ OBJ(NOSUCH) SAVLIB({lib}) DEV(*SAVF) SAVF({jl}/SV)")
+    )
+    .await
+    .unwrap_err()
+    .contains("CPF3770"));
+    cl_cmd(&mut job, format!("CLRSAVF FILE({jl}/SV)"))
+        .await
+        .unwrap();
+    assert!(cl_cmd(
+        &mut job,
+        format!("RSTLIB SAVLIB({lib}) DEV(*SAVF) SAVF({jl}/SV)")
+    )
+    .await
+    .is_err());
+
+    for l in [&rl, &jl] {
+        cl_cmd(&mut job, format!("DLTLIB {l}")).await.unwrap();
+    }
 }

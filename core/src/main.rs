@@ -116,6 +116,15 @@ enum Cmd {
         #[arg(long, default_value_t = 1208)]
         ccsid: i32,
     },
+    /// Copy a stream file out of the integrated file system to a local
+    /// file, its bytes as they are (e.g. a save file copied with CPYTOSTMF,
+    /// to restore on another system).
+    Get {
+        /// The IFS path.
+        from: String,
+        /// The local file it becomes.
+        to: PathBuf,
+    },
     /// Load records from a CSV file (header row = field names) with WRITE.
     Load {
         /// File name, optionally qualified LIB/FILE.
@@ -357,6 +366,17 @@ async fn run(cli: Cli) -> Result<u8> {
                 }
             }
             println!("{n} stream files copied to {to}.");
+        }
+        Cmd::Get { from, to } => {
+            let client = runtime::connect_db(&cli.database_url).await?;
+            catalog::init(&client).await?;
+            let (data, _) = as4tainr_core::ifs::read_file(&client, &from).await?;
+            std::fs::write(&to, &data)?;
+            println!(
+                "{} bytes copied from {from} to {}.",
+                data.len(),
+                to.display()
+            );
         }
         Cmd::Import { dir, lib } => {
             let client = runtime::connect_db(&cli.database_url).await?;

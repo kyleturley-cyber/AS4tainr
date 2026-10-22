@@ -167,6 +167,8 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [ ] Remaining SQL: external functions, more scalar functions (CHAR, VARCHAR_FORMAT...), more IBM i services, LABEL ON SEQUENCE.
 - [x] C runtime and IFS procedures (open, read, write, close) for RPG, with pointers.
 - [ ] IFS beyond the basics: stat() and directory APIs, CPYTOIMPF/CPYFRMIMPF, procedure pointers, pointers between programs, IFS authority checks.
-- [ ] Packaging: TLS on port 992, SAVLIB and RSTLIB with a portable archive format, multi-arch images (amd64, arm64).
+- [x] Save and restore: SAVOBJ, SAVLIB, RSTOBJ, RSTLIB to save files in a portable archive format, DLTLIB/CLRLIB, save files moved between systems with CPYTOSTMF/CPYFRMSTMF; APYJRNCHG's *LASTSAVE defaults work (docs/save-restore.md).
+- [ ] Save extras: SAVCHGOBJ, saving journals and receivers, ALWOBJDIF checks.
+- [ ] Packaging: TLS on port 992, multi-arch images (amd64, arm64).
 - [ ] Get a trademark opinion on the name before the public launch.
 - [ ] Phase 4: ODBC/JDBC and ACS host servers, so existing tools connect.

@@ -25,3 +25,7 @@ argon2 = { version = "0.5", features = ["std"] }
 password-hash = { version = "0.5", features = ["getrandom"] }
 rust_decimal = "1"
 roxmltree = "0.20"
+base64 = "0.22"
+bytes = "1"
+futures-util = { version = "0.3", features = ["sink"] }
+flate2 = "1"

@@ -2905,6 +2905,138 @@ pub static COMMANDS: &[CommandDef] = &[
             p("TRGLIB", Kind::Name, false, Some("*ALL"), "Trigger library").keyword_only(),
         ],
     },
+    CommandDef {
+        name: "CRTSAVF",
+        description: "Create Save File",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "Save file").ch("Name"),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*BLANK"),
+                "Text 'description'",
+            ),
+        ],
+    },
+    CommandDef {
+        name: "CLRSAVF",
+        description: "Clear Save File",
+        params: &[p("FILE", Kind::Qualified, true, None, "Save file").ch("Name")],
+    },
+    CommandDef {
+        name: "DSPSAVF",
+        description: "Display Save File",
+        params: &[p("FILE", Kind::Qualified, true, None, "Save file").ch("Name")],
+    },
+    CommandDef {
+        name: "SAVOBJ",
+        description: "Save Object",
+        params: &[
+            p("OBJ", Kind::List, true, None, "Objects").ch("Name, generic*, *ALL"),
+            p("LIB", Kind::List, true, None, "Library").ch("Name, generic*"),
+            p("DEV", Kind::List, true, None, "Device").ch("*SAVF"),
+            p("OBJTYPE", Kind::List, false, Some("*ALL"), "Object types")
+                .ch("*ALL, *FILE, *PGM..."),
+            p("SAVF", Kind::Qualified, false, None, "Save file")
+                .ch("Name")
+                .keyword_only(),
+            p("UPDHST", Kind::Name, false, Some("*YES"), "Update history")
+                .ch("*YES, *NO")
+                .keyword_only(),
+            p("CLEAR", Kind::Name, false, Some("*NONE"), "Clear")
+                .ch("*NONE, *ALL, *REPLACE")
+                .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "SAVLIB",
+        description: "Save Library",
+        params: &[
+            p("LIB", Kind::List, true, None, "Library").ch("Name"),
+            p("DEV", Kind::List, true, None, "Device").ch("*SAVF"),
+            p("SAVF", Kind::Qualified, false, None, "Save file")
+                .ch("Name")
+                .keyword_only(),
+            p("UPDHST", Kind::Name, false, Some("*YES"), "Update history")
+                .ch("*YES, *NO")
+                .keyword_only(),
+            p("CLEAR", Kind::Name, false, Some("*NONE"), "Clear")
+                .ch("*NONE, *ALL, *REPLACE")
+                .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "RSTOBJ",
+        description: "Restore Object",
+        params: &[
+            p("OBJ", Kind::List, true, None, "Objects").ch("Name, generic*, *ALL"),
+            p("SAVLIB", Kind::List, true, None, "Saved library").ch("Name"),
+            p("DEV", Kind::List, true, None, "Device").ch("*SAVF"),
+            p("OBJTYPE", Kind::List, false, Some("*ALL"), "Object types")
+                .ch("*ALL, *FILE, *PGM..."),
+            p("SAVF", Kind::Qualified, false, None, "Save file")
+                .ch("Name")
+                .keyword_only(),
+            p(
+                "MBROPT",
+                Kind::Name,
+                false,
+                Some("*MATCH"),
+                "Data base member option",
+            )
+            .ch("*MATCH, *ALL")
+            .keyword_only(),
+            p(
+                "ALWOBJDIF",
+                Kind::List,
+                false,
+                Some("*NONE"),
+                "Allow object differences",
+            )
+            .ch("*NONE, *ALL")
+            .keyword_only(),
+            p(
+                "RSTLIB",
+                Kind::Name,
+                false,
+                Some("*SAVLIB"),
+                "Restore to library",
+            )
+            .ch("Name, *SAVLIB")
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "RSTLIB",
+        description: "Restore Library",
+        params: &[
+            p("SAVLIB", Kind::List, true, None, "Saved library").ch("Name"),
+            p("DEV", Kind::List, true, None, "Device").ch("*SAVF"),
+            p("SAVF", Kind::Qualified, false, None, "Save file")
+                .ch("Name")
+                .keyword_only(),
+            p(
+                "RSTLIB",
+                Kind::Name,
+                false,
+                Some("*SAVLIB"),
+                "Restore to library",
+            )
+            .ch("Name, *SAVLIB")
+            .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "DLTLIB",
+        description: "Delete Library",
+        params: &[p("LIB", Kind::Name, true, None, "Library").ch("Name")],
+    },
+    CommandDef {
+        name: "CLRLIB",
+        description: "Clear Library",
+        params: &[p("LIB", Kind::Name, true, None, "Library").ch("Name")],
+    },
 ];
 
 /// A group of commands on the F4 menu.
@@ -2923,6 +3055,8 @@ pub static GROUPS: &[Group] = &[
         title: "Library Commands",
         commands: &[
             "CRTLIB",
+            "DLTLIB",
+            "CLRLIB",
             "DSPLIB",
             "DSPLIBL",
             "ADDLIBLE",
@@ -3076,6 +3210,13 @@ pub static GROUPS: &[Group] = &[
             "RNM",
             "CPYTOSTMF",
             "CPYFRMSTMF",
+        ],
+    },
+    Group {
+        item: "Save and restore commands",
+        title: "Save and Restore Commands",
+        commands: &[
+            "CRTSAVF", "CLRSAVF", "DSPSAVF", "SAVOBJ", "SAVLIB", "RSTOBJ", "RSTLIB",
         ],
     },
     Group {

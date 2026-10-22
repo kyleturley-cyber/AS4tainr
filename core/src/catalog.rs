@@ -299,6 +299,10 @@ pub async fn init(client: &Client) -> Result<()> {
             .batch_execute(crate::pftrg::DDL)
             .await
             .context("creating catalog")?;
+        client
+            .batch_execute(crate::save::DDL)
+            .await
+            .context("creating catalog")?;
         for (lib, text) in SYSTEM_LIBRARIES {
             create_library(client, lib, text).await?;
             // Catalogs made by older versions gave every one the same text.

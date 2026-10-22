@@ -1,6 +1,6 @@
 # The integrated file system
 
-as4tainr has the "root" (`/`) file system of IBM i's integrated file system (IFS): directories and stream files. Each object is a row of `as4tainr.ifs` (`core/src/ifs.rs`) with its path, its bytes, the CCSID it is tagged with, its permission bits and its owner. Names keep their case and are found ignoring case, as in the root file system. Include files that `as4tainr import` brings in are stream files under `/<library>/` (UTF-8, CCSID 1208), and RPG `/INCLUDE` and CL `INCLUDE SRCSTMF` read them from here.
+as4tainr has the "root" (`/`) file system of IBM i's integrated file system (IFS): directories and stream files. Each object is a row of `as4tainr.ifs` (`core/src/ifs.rs`) with its path, its bytes, the CCSID it is tagged with, its permission bits and its owner. Names keep their case and are found ignoring case, as in the root file system. As on IBM i, `/home` and `/tmp` are there from the start (`/tmp` with mode 1777; the restricted rename and unlink bit is kept but not enforced). Include files that `as4tainr import` brings in are stream files under `/<library>/` (UTF-8, CCSID 1208), and RPG `/INCLUDE` and CL `INCLUDE SRCSTMF` read them from here.
 
 ## From programs
 
@@ -27,10 +27,11 @@ File descriptors belong to the job: a descriptor one program opened can be used 
 | `WRKLNK`, `DSPLNK` `OBJ(path)` | The objects in a directory, with options 4 (remove) and 5 (display) |
 | `CPYTOSTMF FROMMBR('/QSYS.LIB/lib.LIB/file.FILE/mbr.MBR') TOSTMF(path)` | A source member's records as lines: trailing blanks removed and ENDLINFMT's line end added (*CRLF by default; *FIXED keeps the records whole); STMFOPT(*NONE, *ADD, *REPLACE); STMFCCSID (a number, *STMF: the existing file's CCSID or 37 for a new file, *PCASCII 1252, *STDASCII 819). CPFA097 when the file exists with STMFOPT(*NONE) |
 | `CPYFRMSTMF FROMSTMF(path) TOMBR('/QSYS.LIB/...')` | Lines into a source member: any combination of CR and LF ends a line, tabs become blanks to the next stop of 8 (TABEXPN(*YES)); MBROPT(*NONE, *ADD, *REPLACE); CPFA095 when it cannot copy |
+| `CPYTOSTMF FROMMBR('/QSYS.LIB/lib.LIB/savf.FILE') TOSTMF(path)`, `CPYFRMSTMF FROMSTMF(path) TOMBR('/QSYS.LIB/lib.LIB/savf.FILE')` | A save file's contents as they are (CCSID 65535), to move a save to another system (docs/save-restore.md). CPYFRMSTMF needs the save file to exist, and MBROPT(*REPLACE) when it has data |
 
 ## From outside
 
-`as4tainr put LOCAL PATH [--ccsid N]` copies a file, or a folder and everything in it, from the machine as4tainr runs on into the IFS (as copying files to an IBM i with FTP or a mapped drive would), tagged with CCSID 1208 unless `--ccsid` says otherwise. `tools/legacy.sh` uses it to install applications the way their READMEs say.
+`as4tainr put LOCAL PATH [--ccsid N]` copies a file, or a folder and everything in it, from the machine as4tainr runs on into the IFS (as copying files to an IBM i with FTP or a mapped drive would), tagged with CCSID 1208 unless `--ccsid` says otherwise. `tools/legacy.sh` uses it to install applications the way their READMEs say. `as4tainr get PATH LOCAL` copies a stream file out, its bytes as they are.
 
 ## From SQL
 

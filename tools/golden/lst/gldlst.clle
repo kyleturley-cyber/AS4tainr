@@ -1,0 +1,10 @@
+/* Golden compiler listing (tools/golden/listings.txt). */
+PGM        PARM(&NAME)
+  DCL        VAR(&NAME) TYPE(*CHAR) LEN(10)
+  DCL        VAR(&COUNT) TYPE(*DEC) LEN(5 0) VALUE(0)
+  DCL        VAR(&TEXT) TYPE(*CHAR) LEN(40)
+  CHGVAR     VAR(&COUNT) VALUE(&COUNT + 1)
+  CHGVAR     VAR(&TEXT) VALUE('Hello ' *CAT &NAME)
+  SNDPGMMSG  MSG(&TEXT)
+  MONMSG     MSGID(CPF0000)
+ENDPGM

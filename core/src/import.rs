@@ -355,6 +355,7 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
                 srctype: m.srctype.clone(),
                 text: m.text.chars().take(50).collect(),
                 source: text,
+                ..Default::default()
             },
             true,
         )

@@ -2720,6 +2720,7 @@ async fn ifs_commands() {
             srctype: "TXT".into(),
             text: String::new(),
             source: "line one   \nline two".into(),
+            ..Default::default()
         },
         true,
     )
@@ -4729,6 +4730,7 @@ async fn sql_tables_indexes_and_runsqlstm() {
             srctype: "RPGLE".into(),
             text: String::new(),
             source: "**FREE\ndcl-f personix keyed;\nchain ('Nobody') personix;\ndsply %char(dob);\n*inlr = *on;\n".into(),
+            ..Default::default()
         },
         false,
     )
@@ -4759,6 +4761,7 @@ async fn sql_tables_indexes_and_runsqlstm() {
             srctype: "SQL".into(),
             text: String::new(),
             source: "DROP TABLE PERSON; DROP TABLE PERSON; CREATE TABLE AFTER (A INT);".into(),
+            ..Default::default()
         },
         false,
     )
@@ -5241,6 +5244,7 @@ async fn ile_modules_service_programs_bnddir() {
         srctype: srctype.into(),
         text: String::new(),
         source: text.into(),
+        ..Default::default()
     };
     let members = [
         put("QRPGLESRC", "MATHMOD", "RPGLE", "**FREE\nctl-opt nomain;\ndcl-s calls int(10);\ndcl-proc addTwo export;\n  dcl-pi *n packed(9:2);\n    a packed(9:2) const;\n    b packed(9:2) const;\n  end-pi;\n  calls += 1;\n  return a + b;\nend-proc;\ndcl-proc callCount export;\n  dcl-pi *n int(10) end-pi;\n  return calls;\nend-proc;\ndcl-proc double export;\n  dcl-pi *n;\n    v packed(9:2);\n  end-pi;\n  v = v * 2;\nend-proc;\n"),
@@ -5409,6 +5413,7 @@ async fn rpg3_crtrpgpgm_and_cvtrpgsrc() {
             srctype: "RPG".into(),
             text: "RPG III test".into(),
             source: src.into(),
+            ..Default::default()
         },
         false,
     )
@@ -5572,6 +5577,7 @@ async fn rpg_cycle_control_levels_and_program_described_files() {
                 srctype: "RPG".into(),
                 text: String::new(),
                 source: src.into(),
+                ..Default::default()
             },
             false,
         )
@@ -5704,6 +5710,7 @@ async fn rpg_cycle_matching_records() {
             srctype: "RPG".into(),
             text: String::new(),
             source: include_str!("rpg/matchrec.rpg").into(),
+            ..Default::default()
         },
         false,
     )
@@ -5899,6 +5906,7 @@ async fn ile_activation_groups_and_signatures() {
                 srctype: (*t).into(),
                 text: String::new(),
                 source: text.clone(),
+                ..Default::default()
             },
             false,
         )
@@ -6049,6 +6057,7 @@ async fn ile_exported_data() {
                 srctype: "RPGLE".into(),
                 text: String::new(),
                 source: text.into(),
+                ..Default::default()
             },
             false,
         )
@@ -6112,6 +6121,7 @@ async fn ile_cl_module_callprc() {
                 srctype: t.into(),
                 text: String::new(),
                 source: text.into(),
+                ..Default::default()
             },
             false,
         )
@@ -6470,6 +6480,7 @@ QO:          QUAL       TYPE(*NAME) LEN(10) DFT(X)
             srctype: "CMD".into(),
             text: "Say hello".into(),
             source: cmdsrc.into(),
+            ..Default::default()
         },
         false,
     )
@@ -6562,6 +6573,7 @@ async fn printer_files_crtprtf_and_rpg() {
             srctype: "PRTF".into(),
             text: "Customer balances".into(),
             source: include_str!("rpg/custrpt.prtf").into(),
+            ..Default::default()
         },
         false,
     )
@@ -6868,6 +6880,7 @@ async fn ile_service_program_sql_cursor_across_calls() {
         srctype: srctype.into(),
         text: String::new(),
         source: text.into(),
+        ..Default::default()
     };
     let members = [
         put("QRPGLESRC", "UTIL", "RPGLE", "**FREE\nctl-opt nomain;\ndcl-proc twice export;\n  dcl-pi *n int(10);\n    n int(10) const;\n  end-pi;\n  return n * 2;\nend-proc;\n"),
@@ -7132,6 +7145,7 @@ dsply %char(n);
             srctype: "RPGLE".into(),
             text: String::new(),
             source: src,
+            ..Default::default()
         },
         false,
     )
@@ -7287,6 +7301,7 @@ async fn journals_and_display_journal() {
             srctype: "SQLRPGLE".into(),
             text: String::new(),
             source: src,
+            ..Default::default()
         },
         false,
     )
@@ -7448,6 +7463,7 @@ async fn trigger_programs_addpftrg() {
         srctype: srctype.into(),
         text: String::new(),
         source: src.into(),
+        ..Default::default()
     };
     let msg = "dcl-pr SndPgmMsg extpgm('QMHSNDPM');
   id char(7) const; f char(20) const; d char(40) const; l int(10) const;
@@ -7764,6 +7780,7 @@ exec sql rollback;
 *inlr = *on;
 "
             .into(),
+            ..Default::default()
         },
         false,
     )
@@ -8109,6 +8126,7 @@ async fn rpg_likefile_extfile_halt_and_psds() {
         srctype: "RPGLE".into(),
         text: String::new(),
         source: src.into(),
+        ..Default::default()
     };
     let caller = "**FREE
 dcl-pr halt extpgm('HALT') end-pr;
@@ -8277,6 +8295,7 @@ dsply (%char(a) + ' ' + %char(b));
 *inlr = *on;
 "
             .into(),
+            ..Default::default()
         },
         false,
     )
@@ -8519,6 +8538,7 @@ async fn save_and_restore_libraries_and_objects() {
             srctype: "CLLE".into(),
             text: String::new(),
             source: "PGM\n CHGDTAARA DTAARA(*LIBL/DA1) VALUE('ran')\nENDPGM\n".into(),
+            ..Default::default()
         },
         false,
     )
@@ -8973,4 +8993,324 @@ async fn pase_system_utility_and_printed_reports() {
         "{:?}",
         o.stdout[5]
     );
+}
+
+/// DSPMSGD's printed reports and the CL and ILE RPG compiler listings,
+/// as `system` shows them. Expected layouts: PUB400 (IBM i 7.5) output
+/// of tools/golden/listings.txt, 2026-10-22 (target/ibmi/golden: m_*,
+/// l_*), with IBM's message texts left out (ours differ) and dates and
+/// times masked.
+#[tokio::test]
+async fn compiler_listings_and_dspmsgd_reports() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::pase_system;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    // Dates and times masked; the library name replaced by LIB.
+    let mask = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| {
+                let mut s = String::new();
+                for c in l.replace(&lib, "LIB").chars() {
+                    s.push(if c.is_ascii_digit() { '9' } else { c });
+                }
+                s
+            })
+            .collect()
+    };
+    macro_rules! sys {
+        ($c:expr) => {
+            pase_system::run(&mut job, &[$c.to_string()]).await
+        };
+    }
+
+    // ------------------------------------------------------- DSPMSGD
+    sys!(format!(
+        "CRTMSGF MSGF({lib}/GLDMSGF) TEXT('Golden messages')"
+    ));
+    for a in [
+        format!("ADDMSGD MSGID(GLD0001) MSGF({lib}/GLDMSGF) MSG('Order &1 was not found in file &2.') SECLVL('&N Cause . . . . . :   The order number &1 does not exist in file &2. &N Recovery  . . . :   Enter an existing order number, &B or press F3 to end the program. &P Example: 0001234.') SEV(30) FMT((*CHAR 10) (*CHAR 10))"),
+        format!("ADDMSGD MSGID(GLD0002) MSGF({lib}/GLDMSGF) MSG('Amount &1 is over the limit.') SEV(20) FMT((*DEC 9 2))"),
+        format!("ADDMSGD MSGID(GLD0003) MSGF({lib}/GLDMSGF) MSG('Continue processing (Y N)?') SEV(99) TYPE(*CHAR) LEN(1) VALUES('Y' 'N') DFT('N')"),
+        format!("ADDMSGD MSGID(GLD00A1) MSGF({lib}/GLDMSGF) MSG('Count &1 by user &2 in &3.') FMT((*BIN 4) (*CHAR 10) (*CHAR *VARY 2))"),
+    ] {
+        assert_eq!(
+            pase_system::run(&mut job, std::slice::from_ref(&a)).await.status,
+            0,
+            "{a}"
+        );
+    }
+    let o = sys!(format!("DSPMSGD RANGE(*ALL) MSGF({lib}/GLDMSGF)"));
+    assert_eq!(o.status, 0);
+    let m = mask(&o.stdout);
+    assert_eq!(m[0], "CPC9999: Printer output created.");
+    assert!(
+        m[1].contains("Message Description (Formatted Text)") && m[1].ends_with("Page       9")
+    );
+    // m_full.txt lines 3-38 (page 1), then the page 2 header.
+    let want = [
+        " Message file  . . . . . . . . . :   GLDMSGF       Library . . . . . . . . . . . . :   LIB",
+        " Start message ID  . . . . . . . :   *ALL          Ending message ID . . . . . . . :   GLDMSGF",
+        " GLD99A9",
+        "   Message . . . . :   Count &9 by user &9 in &9.",
+        "   Severity . . . . . . . . . . . . . . . . . :    SEV         9",
+        "   Message data field formats . . . . . . . . :    FMT",
+        "     Field        Data Type          Length            Vary Bytes Or Dec Pos",
+        "      &9            *BIN                  9",
+        "      &9            *CHAR                99",
+        "      &9            *CHAR             *VARY                     9",
+        "   Data to be dumped  . . . . . . . . . . . . :    DMPLST     *JOB",
+        "   Message level  . . . . . . . . . . . . . . :    LVL        99/99/99 99",
+        "   Alert option . . . . . . . . . . . . . . . :    ALROPT     *NO",
+        "   Log problem  . . . . . . . . . . . . . . . :    LOGPRB     *NO",
+        "   Coded character set ID . . . . . . . . . . :    CCSID      99999",
+        " GLD9999",
+        "   Message . . . . :   Order &9 was not found in file &9.",
+        "   Cause . . . . . :   The order number &9 does not exist in file &9.",
+        "   Recovery  . . . :   Enter an existing order number,",
+        "     or press F9 to end the program.",
+        "       Example: 9999999.",
+        "   Severity . . . . . . . . . . . . . . . . . :    SEV        99",
+    ];
+    assert_eq!(&m[2..2 + want.len()], &want);
+    assert!(
+        m[38].contains("Message Description (Formatted Text)") && m[38].ends_with("Page       9")
+    );
+    assert_eq!(
+        m[39],
+        "      &9            *DEC                  9                     9"
+    );
+    let tail = [
+        "   Reply specifications:",
+        "     Reply type . . . . . . . . . . . . . . . :    TYPE       *CHAR",
+        "     Reply length . . . . . . . . . . . . . . :    LEN            9",
+        "     Valid reply values . . . . . . . . . . . :    VALUES",
+        "        Y                                 N",
+        "     Default reply  . . . . . . . . . . . . . :    DFT        N",
+    ];
+    let k = m.iter().position(|l| l == tail[0]).unwrap();
+    assert_eq!(&m[k..k + tail.len()], &tail);
+    assert_eq!(
+        m.last().unwrap(),
+        "                        * * * * *  E N D  O F  L I S T I N G * * * * *"
+    );
+    // DETAIL(*BASIC) with one identifier: from it to the end, "*ONLY".
+    let o = sys!(format!(
+        "DSPMSGD RANGE(GLD0002) MSGF({lib}/GLDMSGF) DETAIL(*BASIC)"
+    ));
+    let m = mask(&o.stdout);
+    assert_eq!(
+        &m[2..],
+        [
+            " Message file  . . . . . . . . . :   GLDMSGF       Library . . . . . . . . . . . . :   LIB",
+            " Start message ID  . . . . . . . :   GLD9999       Ending message ID . . . . . . . :   *ONLY",
+            " MSGID   SEV   MSG",
+            " GLD9999  99   Amount &9 is over the limit.",
+            " GLD9999  99   Continue processing (Y N)?",
+            "                        * * * * *  E N D  O F  L I S T I N G * * * * *",
+        ]
+    );
+    // FMTTXT(*NO): the texts in pieces of 76.
+    let o = sys!(format!(
+        "DSPMSGD RANGE(GLD0001) MSGF({lib}/GLDMSGF) FMTTXT(*NO)"
+    ));
+    let m = mask(&o.stdout);
+    assert_eq!(m[3], " Message IDs:          GLD9999");
+    assert_eq!(
+        &m[5..10],
+        [
+            "   First level message text . . . . . . . . . :    MSG",
+            "     Order &9 was not found in file &9.",
+            "   Second level message text  . . . . . . . . :    SECLVL",
+            "     &N Cause . . . . . :   The order number &9 does not exist in file &9. &N Rec",
+            "     overy  . . . :   Enter an existing order number, &B or press F9 to end the p",
+        ]
+    );
+    // A missing identifier: CPF2419, then CPF2519; a missing file: CPF2407.
+    let ids = |v: &[String]| -> Vec<String> {
+        v.iter()
+            .map(|l| l.split(':').next().unwrap_or("").to_string())
+            .collect()
+    };
+    let o = sys!(format!("DSPMSGD RANGE(GLD9999) MSGF({lib}/GLDMSGF)"));
+    assert_eq!(
+        (ids(&o.stderr), o.status),
+        (vec!["CPF2419".to_string(), "CPF2519".into()], 255)
+    );
+    let o = sys!(format!("DSPMSGD RANGE(*ALL) MSGF({lib}/NOSUCHMSGF)"));
+    assert_eq!(ids(&o.stderr), ["CPF2407"]);
+
+    // ---------------------------------------------------- CL listing
+    let put = |path: &str, text: &str| {
+        let (c, p, t) = (&client, path.to_string(), text.to_string());
+        async move {
+            as4tainr_core::ifs::write_file(c, &p, t.as_bytes(), 819, 0o644, "QSECOFR")
+                .await
+                .unwrap();
+        }
+    };
+    let dir = format!("/tmp/{lib}");
+    let _ = as4tainr_core::ifs::mkdir_all(&client, &dir, "QSECOFR").await;
+    put(&format!("{dir}/gldlst.clle"), "/* Golden compiler listing (tools/golden/listings.txt). */\nPGM        PARM(&NAME)\n  DCL        VAR(&NAME) TYPE(*CHAR) LEN(10)\n  DCL        VAR(&COUNT) TYPE(*DEC) LEN(5 0) VALUE(0)\n  DCL        VAR(&TEXT) TYPE(*CHAR) LEN(40)\n  CHGVAR     VAR(&COUNT) VALUE(&COUNT + 1)\n  CHGVAR     VAR(&TEXT) VALUE('Hello ' *CAT &NAME)\n  SNDPGMMSG  MSG(&TEXT)\n  MONMSG     MSGID(CPF0000)\nENDPGM\n").await;
+    put(&format!("{dir}/gldlste.clle"), "/* Golden compiler listing with errors (tools/golden/listings.txt). */\nPGM\n  DCL        VAR(&A) TYPE(*CHAR) LEN(5)\n  CHGVAR     VAR(&B) VALUE('X')\n  NOSUCHCMD  PARM(1)\nENDPGM\n").await;
+    let o = sys!(format!(
+        "CRTBNDCL PGM({lib}/GLDLCL) SRCSTMF('{dir}/gldlst.clle')"
+    ));
+    assert_eq!(o.status, 0, "{o:?}");
+    let m = mask(&o.stdout);
+    assert!(m[0].starts_with("CPC9999:"));
+    assert!(
+        m[1].contains("Control Language")
+            && m[1].contains("LIB/GLDLCL")
+            && m[1].ends_with("Page    9")
+    );
+    for l in [
+        " Program . . . . . . . . . . . . . . . . . . . :   GLDLCL",
+        " Source printing options . . . . . . . . . . . :   *XREF  *NOSECLVL  *NOEVENTF  *NODOSLTLVL",
+        " SEQNBR  *...+... 9 ...+... 9 ...+... 9 ...+... 9 ...+... 9 ...+... 9 ...+... 9 ...+... 9 ...+... 9 ...+.  DATE",
+        "    999-   DCL        VAR(&COUNT) TYPE(*DEC) LEN(9 9) VALUE(9)",
+        "   9999- ENDPGM",
+        " &COUNT                         999      *DEC                9 9         999    999",
+        " &NAME                          999      *CHAR              99           999    999",
+        " Total         9-9  99-99  99-99  99-99  99-99  99-99  99-99  99-99  99-99  99-99",
+        "      9          9      9      9      9      9      9      9      9      9      9",
+    ] {
+        assert!(m.iter().any(|x| x == l), "{l}\n{}", m.join("\n"));
+    }
+    let o = sys!(format!(
+        "CRTBNDCL PGM({lib}/GLDLCLE) SRCSTMF('{dir}/gldlste.clle')"
+    ));
+    assert_eq!(
+        (ids(&o.stderr), o.status),
+        (vec!["CPF0820".to_string()], 255)
+    );
+    let ids_in = |v: &[String]| -> Vec<String> {
+        v.iter()
+            .filter(|l| l.starts_with("* "))
+            .map(|l| l[2..9].to_string())
+            .collect()
+    };
+    // Under the statements: CPD0727 (40), CPD0030 (30); in the cross
+    // reference: CPD0726 (10), CPD0791 (00).
+    assert_eq!(
+        ids_in(&o.stdout),
+        ["CPD0727", "CPD0030", "CPD0726", "CPD0791"]
+    );
+    let m = mask(&o.stdout);
+    assert!(m.iter().any(|l| l.starts_with("* CPD9999 99  ")));
+    assert!(m.contains(
+        &"      9          9      9      9      9      9      9      9      9      9      9"
+            .to_string()
+    ));
+    let counts: Vec<&str> = o
+        .stdout
+        .iter()
+        .find(|l| l.starts_with("      4"))
+        .unwrap()
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        counts,
+        ["4", "1", "1", "0", "1", "1", "0", "0", "0", "0", "0"]
+    );
+
+    // --------------------------------------------------- RPG listing
+    let o = sys!(format!("RUNSQL SQL('CREATE TABLE {lib}/GLDLSTF (ID CHAR(10) NOT NULL, AMT DEC(7, 2) NOT NULL) RCDFMT GLDLSTR') COMMIT(*NONE)"));
+    assert_eq!(o.status, 0, "{o:?}");
+    put(
+        &format!("{dir}/gldlst.rpgle"),
+        include_str!("../../tools/golden/lst/gldlst.rpgle"),
+    )
+    .await;
+    put(
+        &format!("{dir}/gldlste.rpgle"),
+        include_str!("../../tools/golden/lst/gldlste.rpgle"),
+    )
+    .await;
+    let o = sys!(format!(
+        "CRTBNDRPG PGM({lib}/GLDLST) SRCSTMF('{dir}/gldlst.rpgle')"
+    ));
+    assert_eq!(o.status, 0, "{o:?}");
+    assert!(o.stdout[0].starts_with("RNS9304:") && o.stdout[0].contains("00"));
+    let m = mask(&o.stdout);
+    for l in [
+        "  Compiler options . . . . . . . . :   *XREF      *GEN       *NOSECLVL  *SHOWCPY",
+        "                                       *EXPDDS    *EXT       *NOSHOWSKP *NOSRCSTMT",
+        "Line   <---------------------- Source Specifications ----------------------------------------------------->  Do  Change Src Seq",
+        "    99 for i = 9 to 9;                                                                                      B99             999999",
+        "    99   write GLDLSTR;                                                                                      99             999999",
+        "    99 endfor;                                                                                              E99             999999",
+        "        *  Default activation group . . . . :   *NO                          *",
+        "        *  Activation group . . . . . . . . :   *NEW                         *",
+        "    99=OGLDLSTR                                                                                                            9999999",
+        "    99=O                       ID                  99A CHAR       99                                                       9999999",
+        "    99=O                       AMT                 99P PACK      9,9                                                       9999999",
+        "    99    99    99 AMT",
+        "         GLDLSTF           DISK                    9D",
+        "           GLDLSTR                                 9D     99      99",
+        "         AMT               P(9,9)                 99M     99      99",
+        "         TOTALS            DS(9)                   9D     99M     99M     99",
+        "           COUNT           I(99,9)                99D     99      99",
+        "         LR                                       99M",
+        "    Records . . . . . . . . . . . . :       99",
+        "    Specifications  . . . . . . . . :       99",
+        "    Comments  . . . . . . . . . . . :        9",
+    ] {
+        assert!(m.iter().any(|x| x == l), "{l}\n{}", m.join("\n"));
+    }
+    // The file box ends in column 102.
+    assert!(o.stdout.iter().any(|l| l
+        == &format!(
+            "        * File name. . . . . . . . . :  GLDLSTF          {:<44}*",
+            format!("{lib}/GLDLSTF")
+        )));
+    // RNF7086 (00) for the output-only file at line 7.
+    assert!(o
+        .stdout
+        .iter()
+        .any(|l| l.starts_with("*RNF7086 00      7 000007  ")));
+    let o = sys!(format!(
+        "CRTBNDRPG PGM({lib}/GLDLSTE) SRCSTMF('{dir}/gldlste.rpgle')"
+    ));
+    assert_eq!(
+        (ids(&o.stderr), o.status),
+        (vec!["RNS9308".to_string(), "RNS9310".into()], 255)
+    );
+    let diags: Vec<&str> = o
+        .stdout
+        .iter()
+        .filter(|l| l.starts_with("*RNF") && l.contains("00000"))
+        .map(|l| &l[..25])
+        .collect();
+    assert_eq!(
+        diags,
+        [
+            "*RNF7030 30      7 000007",
+            "*RNF7503 30      7 000007",
+            "*RNF7416 30      8 000008"
+        ]
+    );
+    assert!(o
+        .stdout
+        .iter()
+        .any(|l| l.starts_with("*RNF7030 NOSUCH            **UNDEF**               7")));
+    // OUTPUT(*NONE): no listing.
+    let o = sys!(format!(
+        "CRTBNDRPG PGM({lib}/GLDLST) SRCSTMF('{dir}/gldlst.rpgle') OUTPUT(*NONE)"
+    ));
+    assert_eq!(o.stdout.len(), 1, "{o:?}");
 }

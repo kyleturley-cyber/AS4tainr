@@ -60,6 +60,9 @@ pub struct CallStack {
     /// parameters are passed by reference, so the caller's variables get
     /// them back.
     pub returned: Option<Vec<String>>,
+    /// The printed output (a compiler listing) of the last command, for
+    /// the `system` utility to show.
+    pub printed: Vec<String>,
 }
 
 impl CallStack {

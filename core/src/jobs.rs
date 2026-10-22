@@ -748,6 +748,9 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
                 d.print.clone()
             };
             crate::spool::print_lines(&client, &id, "QSYSPRT", first.as_str(), &lines).await?;
+            if let Some(m) = &d.print_msg {
+                log(&client, &id, "*COMP", m).await;
+            }
             log(
                 &client,
                 &id,

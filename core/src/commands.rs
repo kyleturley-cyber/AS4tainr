@@ -61,6 +61,9 @@ pub struct ListDisplay {
     /// The display laid out as IBM i draws it (header lines instead of
     /// `info`, the list's place, the keys); `None`: the plain layout.
     pub ibm: Option<Box<IbmLayout>>,
+    /// A completion message the command sends when it prints its report
+    /// (DSPMSGD: CPC9802), before the report.
+    pub print_msg: Option<String>,
 }
 
 /// How IBM i 7.5 lays out a list display (observed on PUB400: DSPLIB,
@@ -498,6 +501,7 @@ impl Job<'_> {
                 heading2: format!("{:22}ASP", ""),
                 ..Default::default()
             }),
+            print_msg: None,
         }))
     }
 
@@ -1695,6 +1699,9 @@ impl Job<'_> {
             let text = crate::ifs::codec::text(ccsid, &bytes);
             let text = text.trim_start_matches('\u{FEFF}').replace("\r\n", "\n");
             let ext = stmf.rsplit('.').next().unwrap_or("").to_ascii_uppercase();
+            let changed_us = crate::ifs::stat(self.client, stmf)
+                .await?
+                .map(|e| e.changed_us);
             return Ok(crate::source::Member {
                 library: String::new(),
                 file: String::new(),
@@ -1702,6 +1709,9 @@ impl Job<'_> {
                 srctype: ext,
                 text: String::new(),
                 source: text,
+                stmf: stmf.to_string(),
+                ccsid,
+                changed_us,
             });
         }
         let (libs, file) = self.search(cmd.get("SRCFILE"));
@@ -2196,6 +2206,7 @@ impl Job<'_> {
                     "{:5}A{:10}R {name:<10}\n{:5}A{:12}{name:<10} {len:>5}A\n",
                     "", "", "", ""
                 ),
+                ..Default::default()
             }
         } else {
             // No source member: CPF9815, then the file is not created,
@@ -2343,6 +2354,8 @@ impl Job<'_> {
             m.source = c.source;
         }
         let mut binding: Option<crate::ile::Binding> = None;
+        let mut cl_listing: Option<(crate::source::Member, crate::cllist::Analysis)> = None;
+        let mut rpg_severity = 0u8;
         // Compile options from the command (CRTBNDRPG ALWNULL).
         let mut options = match cmd.def.name {
             "CRTBNDRPG" if cmd.get("ALWNULL") != "*NO" => {
@@ -2368,8 +2381,60 @@ impl Job<'_> {
             if !libl.contains(&lib) {
                 libl.insert(0, lib.clone());
             }
-            let prog =
-                crate::rpg::compile_with(self.client, &libl, &name, &m.source, &options).await?;
+            let (parsed, compiled) =
+                crate::rpg::compile_parts(self.client, &libl, &name, &m.source, &options, &[])
+                    .await;
+            // The compiler's checks (rpg/check.rs) and its listing
+            // (rpg/listing.rs): no program when a message is more severe
+            // than the generation severity level (GENLVL 10).
+            let mut checked = crate::rpg::check::Checked::default();
+            if let (Some(src), Ok(prog)) = (&parsed, &compiled) {
+                checked = crate::rpg::check::check(src, prog);
+            }
+            if let Err(e) = &compiled {
+                checked.diags.push(crate::rpg::check::Diag {
+                    line: 0,
+                    id: crate::jobs::message_id(&format!("{e:#}")).to_string(),
+                    sev: 30,
+                    text: format!("{e:#}"),
+                });
+            }
+            let max = checked.diags.iter().map(|d| d.sev).max().unwrap_or(0);
+            let ok = compiled.is_ok() && max <= 10;
+            if cmd.def.name == "CRTBNDRPG" {
+                self.rpg_listing(
+                    cmd,
+                    &lib,
+                    &name,
+                    &m,
+                    parsed.as_ref(),
+                    compiled.as_ref().ok(),
+                    &checked,
+                    ok,
+                )
+                .await?;
+            }
+            rpg_severity = max;
+            if !ok {
+                if cmd.def.name == "CRTBNDRPG" {
+                    bail!(
+                        "RNS9308: Compilation stopped: errors of severity {max} were found in the program.\nRNS9310: Program {name} was not created in library {lib}."
+                    );
+                }
+                match compiled {
+                    Err(e) => return Err(e),
+                    Ok(_) => {
+                        let d = checked
+                            .diags
+                            .iter()
+                            .find(|d| d.sev > 10)
+                            .cloned()
+                            .unwrap_or_default();
+                        bail!("{}: {} (line {})", d.id, d.text, d.line);
+                    }
+                }
+            }
+            let prog = compiled?;
             // Procedures the program calls that are elsewhere: bound from
             // the binding directories (BNDDIR, ctl-opt BNDDIR).
             if !prog.imports.is_empty() || !prog.data_imports.is_empty() {
@@ -2420,7 +2485,60 @@ impl Job<'_> {
             if !libl.contains(&lib) {
                 libl.insert(0, lib.clone());
             }
-            crate::clpgm::compile_in(self.client, &libl, &name, &src).await?;
+            // The compiler's checks and its listing (cllist.rs); the
+            // program is not created when a message has severity 30 or
+            // more: CPF0820 (observed on IBM i 7.5).
+            let files = crate::clpgm::resolve_files(self.client, &libl, &src)
+                .await
+                .unwrap_or_default();
+            let user_cmds: Vec<String> = self
+                .client
+                .query(
+                    "SELECT name FROM as4tainr.objects WHERE objtype='*CMD' AND library = ANY($1)",
+                    &[&libl],
+                )
+                .await?
+                .iter()
+                .map(|r| r.get(0))
+                .collect();
+            let known = |c: &str| {
+                crate::cl::find(c).is_some()
+                    || crate::ibmcmds::is_ibm(c)
+                    || user_cmds.iter().any(|u| u == c)
+            };
+            let mut analysis = crate::cllist::analyze(&src, &known, &|st| {
+                crate::clpgm::dclf_variables(st, &files)
+            });
+            if analysis.max_sev() < 30 {
+                if let Err(e) = crate::clpgm::compile_with(&name, &src, &files) {
+                    let text = format!("{e:#}");
+                    let line = text
+                        .strip_prefix("line ")
+                        .and_then(|r| r.split_once(':'))
+                        .and_then(|(n, _)| n.trim().parse().ok())
+                        .unwrap_or(0);
+                    let id = crate::jobs::message_id(&text).to_string();
+                    let text = if id.is_empty() {
+                        text
+                    } else {
+                        text[id.len() + 1..].trim().to_string()
+                    };
+                    analysis.diags.push(crate::cllist::Diag {
+                        line,
+                        id,
+                        sev: 30,
+                        text,
+                    });
+                }
+            }
+            let mut shown = m.clone();
+            shown.source = src.clone();
+            if analysis.max_sev() >= 30 {
+                self.cl_listing(cmd, &lib, &name, &shown, &analysis, false)
+                    .await?;
+                bail!("CPF0820: Program {name} was not created.");
+            }
+            cl_listing = Some((shown, analysis));
             src
         };
         let text = match cmd.get("TEXT") {
@@ -2448,8 +2566,12 @@ impl Job<'_> {
         // highest severity (observed on IBM i 7.5).
         if cmd.def.name == "CRTBNDRPG" {
             return Ok(Outcome::Messages(vec![format!(
-                "RNS9304: Program {name} was created in library {lib}; highest severity 00."
+                "RNS9304: Program {name} was created in library {lib}; highest severity {rpg_severity:02}."
             )]));
+        }
+        if let Some((shown, analysis)) = &cl_listing {
+            self.cl_listing(cmd, &lib, &name, shown, analysis, true)
+                .await?;
         }
         let id = if matches!(cmd.def.name, "CRTBNDCL" | "CRTCLPGM") {
             "CPC0815: "
@@ -2459,6 +2581,109 @@ impl Job<'_> {
         Ok(Outcome::Messages(vec![format!(
             "{id}Program {name} was created in library {lib}."
         )]))
+    }
+
+    /// A CL compiler listing (OUTPUT(*PRINT), the default): a spooled
+    /// file named after the program, and the printed output `system`
+    /// shows.
+    async fn cl_listing(
+        &mut self,
+        cmd: &Command,
+        lib: &str,
+        name: &str,
+        member: &crate::source::Member,
+        analysis: &crate::cllist::Analysis,
+        created: bool,
+    ) -> Result<()> {
+        if cmd.get("OUTPUT") == "*NONE" {
+            return Ok(());
+        }
+        let or = |k: &str, d: &str| -> String {
+            match cmd.get(k) {
+                "" => d.to_string(),
+                v => v.to_string(),
+            }
+        };
+        let text = match cmd.get("TEXT") {
+            "*SRCMBRTXT" | "" => member.text.clone(),
+            "*BLANK" => String::new(),
+            t => t.to_string(),
+        };
+        let p = crate::cllist::Prologue {
+            program: name.to_string(),
+            library: lib.to_string(),
+            member: member.clone(),
+            dftactgrp: or("DFTACTGRP", "*YES"),
+            actgrp: or("ACTGRP", "*ENTMOD"),
+            replace: or("REPLACE", "*YES"),
+            text,
+            dbgview: or("DBGVIEW", "*STMT"),
+        };
+        let lines = crate::cllist::listing(&p, analysis, created, &crate::report::Stamp::now());
+        self.print_listing(name, lines).await
+    }
+
+    /// The ILE RPG compiler listing (OUTPUT(*PRINT), the default).
+    #[allow(clippy::too_many_arguments)]
+    async fn rpg_listing(
+        &mut self,
+        cmd: &Command,
+        lib: &str,
+        name: &str,
+        member: &crate::source::Member,
+        src: Option<&crate::rpg::ast::Source>,
+        prog: Option<&crate::rpg::program::Program>,
+        checked: &crate::rpg::check::Checked,
+        created: bool,
+    ) -> Result<()> {
+        if cmd.get("OUTPUT") == "*NONE" {
+            return Ok(());
+        }
+        let or = |k: &str, d: &str| -> String {
+            match cmd.get(k) {
+                "" => d.to_string(),
+                v => v.to_string(),
+            }
+        };
+        let opts = crate::rpg::listing::Opts {
+            command: cmd.def.name.to_string(),
+            user: self.user.clone(),
+            program: name.to_string(),
+            library: lib.to_string(),
+            text: or("TEXT", "*SRCMBRTXT"),
+            dftactgrp: or("DFTACTGRP", "*YES"),
+            actgrp: or("ACTGRP", "QILE"),
+            replace: or("REPLACE", "*YES"),
+            dbgview: or("DBGVIEW", "*STMT"),
+            tgtrls: or("TGTRLS", "*CURRENT"),
+            alwnull: or("ALWNULL", "*NO"),
+            bnddir: match cmd.list("BNDDIR").join(" ") {
+                b if b.is_empty() || b == "*NONE" => String::new(),
+                b => b,
+            },
+            genlvl: 10,
+        };
+        let input = crate::rpg::listing::Input {
+            opts: &opts,
+            member,
+            src,
+            prog,
+            diags: &checked.diags,
+            undefined: &checked.undefined,
+            created,
+        };
+        let lines = crate::rpg::listing::listing(&input, &crate::report::Stamp::now());
+        self.print_listing(name, lines).await
+    }
+
+    /// A compiler listing: spooled (a file named after the program) when
+    /// the job has an identity, and kept for `system` to show.
+    async fn print_listing(&mut self, name: &str, lines: Vec<String>) -> Result<()> {
+        if let Some(id) = self.id.clone() {
+            crate::spool::print_lines(self.client, &id, name, "", &lines).await?;
+        }
+        self.calls.printed = lines;
+        Ok(())
     }
 
     /// CVTRPGSRC: RPG III members to RPG IV members (ILE RPG
@@ -2547,6 +2772,7 @@ impl Job<'_> {
                         srctype: new_type.into(),
                         text: text.clone(),
                         source: c.source,
+                        ..Default::default()
                     },
                     false,
                 )
@@ -2629,6 +2855,7 @@ impl Job<'_> {
                     srctype: srctype.clone(),
                     text,
                     source: c.source,
+                    ..Default::default()
                 },
                 false,
             )
@@ -3171,9 +3398,92 @@ impl Job<'_> {
             seclvl,
             sev,
             fmt,
+            attrs: self.msgd_attrs(cmd, old.as_ref().map(|d| &d.attrs))?,
         };
         crate::msgf::add(self.client, &d, change).await?;
         Ok(Outcome::Messages(vec![]))
+    }
+
+    /// The reply and other attributes ADDMSGD and CHGMSGD set (`old`:
+    /// CHGMSGD's description, whose values *SAME keeps). The message
+    /// level is today's date and 01, or the next number when the
+    /// description was already changed today.
+    fn msgd_attrs(
+        &self,
+        cmd: &Command,
+        old: Option<&crate::msgf::Attrs>,
+    ) -> Result<crate::msgf::Attrs> {
+        let mut a = old.cloned().unwrap_or_default();
+        let set = |v: &str| v != "*SAME";
+        let ty = cmd.get("TYPE").to_ascii_uppercase();
+        if set(&ty) {
+            a.reply_type = ty.clone();
+        }
+        let len = cmd.list("LEN");
+        let len_given = len.first().is_some_and(|v| set(v) && v != "*TYPE");
+        if len_given {
+            let n = |s: Option<&String>| -> Result<u32> {
+                match s {
+                    None => Ok(0),
+                    Some(v) => v.trim().parse().map_err(|_| {
+                        anyhow!("CPF0006: The command has errors and was not run. LEN({v}) is not valid.")
+                    }),
+                }
+            };
+            a.reply_len = (n(len.first())?, n(len.get(1))?);
+        } else if set(&ty) || len.first().is_some_and(|v| v == "*TYPE") {
+            // LEN(*TYPE): the reply type's own length (ADDMSGD).
+            a.reply_len = match a.reply_type.as_str() {
+                "*DEC" => (15, 5),
+                "*NAME" => (10, 0),
+                "*NONE" => (0, 0),
+                _ => (32, 0),
+            };
+        }
+        let values = cmd.list("VALUES");
+        if values.first().is_some_and(|v| set(v)) {
+            a.values = if values.first().is_some_and(|v| v == "*NONE") {
+                vec![]
+            } else {
+                values
+                    .iter()
+                    .map(|v| v.trim().trim_matches('\'').to_string())
+                    .collect()
+            };
+        }
+        let dft = cmd.get("DFT");
+        if set(dft) {
+            a.dft = if dft == "*NONE" {
+                String::new()
+            } else {
+                dft.trim().trim_matches('\'').to_string()
+            };
+        }
+        let alr = cmd.list("ALROPT");
+        if let Some(v) = alr.first().filter(|v| set(v)) {
+            a.alropt = v.to_ascii_uppercase();
+        }
+        let logprb = cmd.get("LOGPRB");
+        if set(logprb) {
+            a.logprb = logprb.to_ascii_uppercase();
+        }
+        let ccsid = cmd.get("CCSID");
+        if set(ccsid) {
+            // *JOB and *HEX: the text is kept as it is (shown as 65535,
+            // observed on IBM i 7.5).
+            a.ccsid = match ccsid.to_ascii_uppercase().as_str() {
+                "*JOB" | "*HEX" => "65535".into(),
+                v => v.to_string(),
+            };
+        }
+        let today = crate::msgf::today();
+        if old.is_some() && a.changed == today {
+            a.level += 1;
+        } else {
+            a.level = 1;
+        }
+        a.changed = today;
+        Ok(a)
     }
 
     /// RMVMSGD.
@@ -3185,23 +3495,87 @@ impl Job<'_> {
         Ok(Outcome::Messages(vec![]))
     }
 
-    /// DSPMSGD: the descriptions in a range of identifiers.
+    /// DSPMSGD: the descriptions in a range of identifiers, shown as a
+    /// list or printed in IBM's layout (`msgf::report`).
     async fn dspmsgd(&mut self, cmd: &Command) -> Result<Outcome> {
+        use crate::msgf::{ReportIds, ReportKind};
         let (lib, name) = self.message_file(cmd.get("MSGF")).await?;
         authority::check(self.client, &self.user, &lib, &name, "*MSGF", Aut::Use).await?;
-        let range = cmd.list("RANGE");
-        let (from, to) = match range.as_slice() {
-            [] => ("*FIRST".to_string(), "*LAST".to_string()),
-            [a] if a == "*ALL" || a == "*FIRST" => ("*FIRST".into(), "*LAST".into()),
-            [a] => (a.clone(), a.clone()),
-            [a, b, ..] => (a.clone(), b.clone()),
+        let kind = if cmd.get("DETAIL") == "*BASIC" {
+            ReportKind::Basic
+        } else if cmd.get("FMTTXT") == "*NO" {
+            ReportKind::Unformatted
+        } else {
+            ReportKind::Formatted
         };
-        let ds: Vec<_> = crate::msgf::list(self.client, &lib, &name)
-            .await?
-            .into_iter()
-            .filter(|d| from == "*FIRST" || d.msgid >= from)
-            .filter(|d| to == "*LAST" || d.msgid <= to)
+        let range: Vec<String> = cmd
+            .list("RANGE")
+            .iter()
+            .map(|v| v.to_ascii_uppercase())
             .collect();
+        let all = crate::msgf::list(self.client, &lib, &name).await?;
+        let key = |id: &str| crate::rpg::data::e(id);
+        // Observed on IBM i 7.5: RANGE(*ALL) heads the report "*ALL" to
+        // the message file's name; one identifier is the only one shown,
+        // except DETAIL(*BASIC), which lists from it to the end (heading
+        // "*ONLY"); two are a range.
+        let (from, to, ids): (Option<String>, Option<String>, ReportIds) = match range.as_slice() {
+            [] => (
+                None,
+                None,
+                ReportIds::Range("*FIRST".into(), "*LAST".into()),
+            ),
+            [a] | [a, _] if a == "*ALL" => {
+                (None, None, ReportIds::Range("*ALL".into(), name.clone()))
+            }
+            [a] if a == "*FIRST" => (
+                None,
+                None,
+                ReportIds::Range("*FIRST".into(), "*LAST".into()),
+            ),
+            [a] | [a, _] if range.get(1).is_none_or(|b| b == "*ONLY") => {
+                let a = crate::msgf::check_msgid(a)?;
+                if !all.iter().any(|d| d.msgid == a) {
+                    bail!(
+                            "CPF2419: Message {a} is not in message file {name} in library {lib}.\nCPF2519: Errors occurred while processing the list of message identifiers."
+                        );
+                }
+                if kind == ReportKind::Basic {
+                    (Some(a.clone()), None, ReportIds::Range(a, "*ONLY".into()))
+                } else {
+                    (Some(a.clone()), Some(a.clone()), ReportIds::One(a))
+                }
+            }
+            [a] => (Some(a.clone()), Some(a.clone()), ReportIds::One(a.clone())),
+            [a, b, ..] => {
+                let f = (a != "*FIRST").then(|| a.clone());
+                let t = (b != "*LAST").then(|| b.clone());
+                (f, t, ReportIds::Range(a.clone(), b.clone()))
+            }
+        };
+        let ds: Vec<_> = all
+            .into_iter()
+            .filter(|d| from.as_ref().is_none_or(|f| key(&d.msgid) >= key(f)))
+            .filter(|d| to.as_ref().is_none_or(|t| key(&d.msgid) <= key(t)))
+            .collect();
+        let stamp = crate::report::Stamp::now();
+        let print = crate::msgf::report(
+            kind,
+            &lib,
+            &name,
+            &ids,
+            &ds,
+            &stamp,
+            &crate::report::system_name(),
+        );
+        // CPC9802 comes with the printed report (observed with `system`).
+        let printed = "CPC9802: Printer output created.".to_string();
+        if cmd.get("OUTPUT") == "*PRINT" {
+            if let Some(me) = self.id.clone() {
+                crate::spool::print_lines(self.client, &me, "QPMSGD", &name, &print).await?;
+                return Ok(Outcome::Messages(vec![printed]));
+            }
+        }
         Ok(Outcome::Display(ListDisplay {
             title: "Display Message Descriptions".into(),
             info: vec![
@@ -3213,6 +3587,8 @@ impl Job<'_> {
                 .iter()
                 .map(|d| format!("{:<7}  {:>3}  {}", d.msgid, format!("{:02}", d.sev), d.msg))
                 .collect(),
+            print,
+            print_msg: Some(printed),
             ..Default::default()
         }))
     }
@@ -3579,6 +3955,7 @@ impl Job<'_> {
                 tight: true,
                 ..Default::default()
             }),
+            print_msg: None,
         }))
     }
 
@@ -3624,6 +4001,7 @@ impl Job<'_> {
                 top_bottom_keys: true,
                 ..Default::default()
             }),
+            print_msg: None,
         }))
     }
 
@@ -4004,6 +4382,7 @@ impl Job<'_> {
                 )),
                 ..Default::default()
             }),
+            print_msg: None,
         }))
     }
 

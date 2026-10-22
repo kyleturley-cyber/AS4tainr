@@ -634,6 +634,12 @@ pub fn now() -> Ts {
     from_ts_us(us)
 }
 
+/// A moment given in microseconds since 1970 (UTC, the job's time zone
+/// here).
+pub fn from_epoch_us(us: i64) -> Ts {
+    from_ts_us(us as i128 + (days((1970, 1, 1)) as i128) * 86_400_000_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

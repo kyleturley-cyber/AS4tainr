@@ -1,0 +1,6 @@
+/* Golden compiler listing with errors (tools/golden/listings.txt). */
+PGM
+  DCL        VAR(&A) TYPE(*CHAR) LEN(5)
+  CHGVAR     VAR(&B) VALUE('X')
+  NOSUCHCMD  PARM(1)
+ENDPGM

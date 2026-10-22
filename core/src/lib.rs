@@ -19,6 +19,7 @@
 pub mod authority;
 pub mod catalog;
 pub mod cl;
+pub mod cllist;
 pub mod clpgm;
 pub mod cmd;
 pub mod cmtctl;
@@ -28,6 +29,7 @@ pub mod ddl;
 pub mod dds;
 pub mod dspf;
 pub mod dtaara;
+pub mod ibmcmds;
 pub mod ifs;
 pub mod ifs_commands;
 pub mod ile;

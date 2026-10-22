@@ -170,13 +170,16 @@ pub struct Entry {
     pub mode: i32,
     pub owner: String,
     pub size: i64,
+    /// Last change, microseconds since 1970 (UTC).
+    pub changed_us: i64,
 }
 
 pub async fn stat(client: &Client, path: &str) -> Result<Option<Entry>> {
     let path = normalize(path)?;
     Ok(client
         .query_opt(
-            "SELECT path, kind, ccsid, mode, owner, octet_length(data)::bigint
+            "SELECT path, kind, ccsid, mode, owner, octet_length(data)::bigint,
+                    (extract(epoch FROM changed) * 1000000)::bigint
                FROM as4tainr.ifs WHERE path_key = $1",
             &[&key(&path)],
         )
@@ -188,6 +191,7 @@ pub async fn stat(client: &Client, path: &str) -> Result<Option<Entry>> {
             mode: r.get(3),
             owner: r.get(4),
             size: r.get(5),
+            changed_us: r.get(6),
         }))
 }
 

@@ -264,6 +264,7 @@ impl Job<'_> {
                     srctype: old.as_ref().map(|o| o.srctype.clone()).unwrap_or_default(),
                     text: old.as_ref().map(|o| o.text.clone()).unwrap_or_default(),
                     source,
+                    ..Default::default()
                 };
                 crate::source::put_member(self.client, &m, true).await?;
                 msg(format!(
@@ -362,6 +363,7 @@ impl Job<'_> {
             refresh: Some(format!("WRKLNK OBJ('{obj}')")),
             print: vec![],
             ibm: None,
+            print_msg: None,
         }))
     }
 }

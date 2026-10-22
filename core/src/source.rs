@@ -66,6 +66,13 @@ pub struct Member {
     pub srctype: String,
     pub text: String,
     pub source: String,
+    /// The stream file the source came from (SRCSTMF), or "".
+    pub stmf: String,
+    /// The CCSID of the source (a stream file's, or 37 for a member).
+    pub ccsid: i32,
+    /// When the source was last changed (microseconds since 1970, UTC),
+    /// for compiler listings.
+    pub changed_us: Option<i64>,
 }
 
 /// CRTSRCPF. Fails with CPF7302 when the file exists.
@@ -149,7 +156,9 @@ pub async fn find_member(
         }
         let Some(r) = client
             .query_opt(
-                "SELECT srctype, text, source FROM as4tainr.source_members
+                "SELECT srctype, text, source,
+                        (extract(epoch FROM changed) * 1000000)::bigint
+                   FROM as4tainr.source_members
                  WHERE library=$1 AND file=$2 AND member=$3",
                 &[lib, &file, &member],
             )
@@ -164,6 +173,9 @@ pub async fn find_member(
             srctype: r.get(0),
             text: r.get(1),
             source: r.get(2),
+            stmf: String::new(),
+            ccsid: 37,
+            changed_us: r.get(3),
         });
     }
     bail!("CPF9812: File {file} in library *LIBL not found.");

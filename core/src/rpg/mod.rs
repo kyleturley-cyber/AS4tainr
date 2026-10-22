@@ -7,12 +7,14 @@
 //! - [`interp`]: the cycle, operations, built-in functions, file I/O
 
 pub mod ast;
+pub mod check;
 pub mod code;
 pub mod data;
 pub mod dates;
 pub mod dec;
 pub mod expr;
 pub mod interp;
+pub mod listing;
 pub mod mem;
 pub mod parse;
 pub mod program;
@@ -146,12 +148,44 @@ pub async fn compile_ovr(
     options: &str,
     ovr: &[crate::ovr::Override],
 ) -> Result<program::Program> {
-    use crate::ovr::{self, Kind};
+    let (_, prog) = compile_parts(client, libl, name, source, options, ovr).await;
+    prog
+}
+
+/// Parse and bind a program, keeping the parsed source (for the compiler
+/// listing) even when binding fails.
+pub async fn compile_parts(
+    client: &Client,
+    libl: &[String],
+    name: &str,
+    source: &str,
+    options: &str,
+    ovr: &[crate::ovr::Override],
+) -> (Option<ast::Source>, Result<program::Program>) {
     let includes = load_includes(client, libl, source).await;
-    let mut src = parse::parse(source, &|id| includes.get(id).cloned())?;
+    let mut src = match parse::parse(source, &|id| includes.get(id).cloned()) {
+        Ok(s) => s,
+        Err(e) => return (None, Err(e)),
+    };
     if !options.trim().is_empty() {
-        src.control.extend(parse::keywords(options)?);
+        match parse::keywords(options) {
+            Ok(k) => src.control.extend(k),
+            Err(e) => return (Some(src), Err(e)),
+        }
     }
+    let prog = bind_source(client, libl, name, &src, ovr).await;
+    (Some(src), prog)
+}
+
+async fn bind_source(
+    client: &Client,
+    libl: &[String],
+    name: &str,
+    src: &ast::Source,
+    ovr: &[crate::ovr::Override],
+) -> Result<program::Program> {
+    use crate::ovr::{self, Kind};
+    let src = src.clone();
     let mut externals = HashMap::new();
     for f in program::external_files(&src) {
         let fr = crate::catalog::resolve_file(client, libl, &ovr::file_name(ovr, Kind::Db, &f))

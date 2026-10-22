@@ -2075,6 +2075,55 @@ fn file_variables(f: &DeclaredFile, formats: &[String]) -> Result<Vec<(String, V
     Ok(out)
 }
 
+/// The variables a DCLF statement declares, as the compiler listing
+/// shows them: (name, type, length), for a file found in `files`.
+pub(crate) fn dclf_variables(
+    st: &Statement,
+    files: &HashMap<String, (String, ClFile)>,
+) -> Vec<(String, String, String)> {
+    let Ok(p) = named(st, DCLF_KEYWORDS) else {
+        return vec![];
+    };
+    let Some(file) = p.get("FILE").map(|f| f.trim().to_ascii_uppercase()) else {
+        return vec![];
+    };
+    let Some((library, kind)) = files.get(&file).cloned() else {
+        return vec![];
+    };
+    let d = DeclaredFile {
+        name: file.rsplit('/').next().unwrap_or(&file).to_string(),
+        library,
+        opnid: p
+            .get("OPNID")
+            .map(|o| o.trim().to_ascii_uppercase())
+            .filter(|o| o != "*NONE"),
+        kind,
+    };
+    let formats: Vec<String> = p
+        .get("RCDFMT")
+        .map(|r| {
+            r.split_whitespace()
+                .map(|x| x.to_ascii_uppercase())
+                .filter(|x| x != "*ALL")
+                .collect()
+        })
+        .unwrap_or_default();
+    file_variables(&d, &formats)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(n, v)| {
+            let (ty, len) = match v.ty {
+                VarType::Dec => ("*DEC", format!("{} {}", v.len, v.decimals)),
+                VarType::Lgl => ("*LGL", "1".into()),
+                VarType::Int => ("*INT", v.len.to_string()),
+                VarType::Ptr => ("*PTR", "16".into()),
+                VarType::Char => ("*CHAR", v.len.to_string()),
+            };
+            (n, ty.to_string(), len)
+        })
+        .collect()
+}
+
 fn new_var(ty: VarType, len: u32, decimals: u32) -> Var {
     Var {
         ty,

@@ -29,7 +29,7 @@ Character data is kept in EBCDIC, as on IBM i. Comparisons and sorting follow th
 
 ## How it plugs in
 
-- **CRTBNDRPG** parses and checks the program. Errors are reported with line numbers at create time, as IBM's compiler does, instead of at CALL. The checked program is kept with the object.
+- **CRTBNDRPG** parses and checks the program. Errors are reported with line numbers at create time, as IBM's compiler does, instead of at CALL. The checked program is kept with the object. `check.rs` adds the checks IBM's listing shows (RNF7030 names not defined, RNF7503, RNF7416 EVAL type mismatch, RNF7086 blocking) and `listing.rs` prints the compiler listing (OUTPUT(*PRINT)) in IBM i 7.5's layout; a message above severity 10 (GENLVL) stops the compile with RNS9308 and RNS9310.
 - **CALL** of an RPG program object runs it in the job's own process. It uses the job's database connection, display and spooled files.
 - **No switch any more:** the native engine is the only one. Jariko, the JVM runner and the JSON bridge it used were removed in milestone R5 (Oct 19, 2026).
 

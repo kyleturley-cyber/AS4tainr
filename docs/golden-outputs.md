@@ -85,6 +85,14 @@ powershell -ExecutionPolicy Bypass -File tools\golden\golden.ps1 -List tools\gol
 
 `tools/golden/files/gldcalc.rpgle` (as4tainr's own test program) writes about 100 results to a table: decimal truncation and half adjust, %DEC, %DECH, %REM, %DIV, %INT(H), %CHAR of decimals, integers and zoned values, every edit code on a negative value and zero, *CURSYM, *ASTFILL and floating currency, edit words, dates and times in each format, %DIFF, %SUBDT, month and year arithmetic. The list adds 25 SQL expressions with RUNSQL and prints the table with CPYF. `-Files` copies the source to `/home/AS4TRAINR/gld` in the same scp as the script; `tools/golden.py --files tools/golden/files` puts it in the sandbox, and `--save DIR` keeps our output of each command for comparing values. First run (2026-10-22): 121 of 122 values the same. `tools/golden/rpg-prec.txt` (with `files/gldprec.rpgle`) then pinned down the RPG precision rules: IBM i 7.5 computes intermediate results with 30 digits and counts a literal's own digits (`%CHAR(10 / 3)` has 28 decimals, `%CHAR(100 / 3)` 27, a 7,2 field divided by 3 25); all values the same after that. PUB400's decimal comma (QDECFMT J) shows in SQL's CHAR of decimals (`-12,50`) and makes `DEC(10,7,2)` a syntax error there (`7,2` reads as one number); written `DEC(10, 7, 2)` it works.
 
+### Compiler listings and DSPMSGD
+
+```
+powershell -ExecutionPolicy Bypass -File tools\golden\golden.ps1 -List tools\golden\listings.txt -Files tools\golden\lst
+```
+
+The sources in `tools/golden/lst` (as4tainr's own) are compiled from stream files and from source members, with and without errors, and a message file of our own is printed with DSPMSGD (formatted, unformatted, basic, a range, a missing ID). First run (2026-10-22): the layouts of the CL and ILE RPG listings and of DSPMSGD's reports; as4tainr's output is the same line for line except message texts, the compiler's name, the job's user and CCSID, and IBM's internal names (`BASED(_QRNL_PST+)`). Test: `compiler_listings_and_dspmsgd_reports`.
+
 ## What the PASE `system` utility does (PUB400, 2026-10-21)
 
 | Case | Standard output | Standard error | Exit status |

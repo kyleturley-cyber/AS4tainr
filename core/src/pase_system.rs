@@ -86,10 +86,25 @@ pub async fn run(job: &mut Job<'_>, args: &[String]) -> Output {
             m.to_string()
         }
     };
-    match job.run(&command).await {
-        Ok(Outcome::Messages(m)) if !opts.quiet => out.stdout.extend(m.iter().map(|l| msg(l))),
-        Ok(Outcome::Messages(_)) => {}
+    job.calls.printed.clear();
+    let result = job.run(&command).await;
+    // A compiler listing: after the completion message, or before the
+    // failure's messages (observed on IBM i 7.5).
+    let printed = std::mem::take(&mut job.calls.printed);
+    let printed = if opts.no_spool { vec![] } else { printed };
+    if result.is_err() {
+        out.stdout.extend(printed.iter().cloned());
+    }
+    match result {
+        Ok(Outcome::Messages(m)) if !opts.quiet => {
+            out.stdout.extend(m.iter().map(|l| msg(l)));
+            out.stdout.extend(printed);
+        }
+        Ok(Outcome::Messages(_)) => out.stdout.extend(printed),
         Ok(Outcome::Display(d)) => {
+            if let Some(m) = d.print_msg.as_ref().filter(|_| !opts.quiet) {
+                out.stdout.push(msg(m));
+            }
             if !opts.no_spool {
                 if d.print.is_empty() {
                     out.stdout.push(d.title.clone());

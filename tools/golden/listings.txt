@@ -1,0 +1,35 @@
+# Compiler listings (CRTBNDRPG, CRTBNDCL: printed output of `system`
+# without -s) and DSPMSGD's printed reports for a message file of our own.
+# Capture with: golden.ps1 -List tools\golden\listings.txt -Files tools\golden\lst
+# (the sources go to /home/AS4TRAINR/gld first). Outputs: target\ibmi\golden.
+l_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLDLST)" "DLTPGM PGM(AS4TRAINR1/GLDLSTM)" "DLTPGM PGM(AS4TRAINR1/GLDLCL)" "DLTPGM PGM(AS4TRAINR1/GLDLCLM)" "DLTPGM PGM(AS4TRAINR1/GLDLSTE)" "DLTPGM PGM(AS4TRAINR1/GLDLCLE)" "DLTF FILE(AS4TRAINR1/GLDLSTF)" "DLTF FILE(AS4TRAINR1/GLDLSRC)" "DLTMSGF MSGF(AS4TRAINR1/GLDMSGF)"; do system -q "$c"; done; echo cleaned
+l_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLDLSTF (ID CHAR(10) NOT NULL, AMT DEC(7, 2) NOT NULL) RCDFMT GLDLSTR') COMMIT(*NONE)
+l_tag|!setccsid 819 /home/AS4TRAINR/gld/gldlst.rpgle /home/AS4TRAINR/gld/gldlste.rpgle /home/AS4TRAINR/gld/gldlst.clle /home/AS4TRAINR/gld/gldlste.clle; ls -l /home/AS4TRAINR/gld
+# Listings from stream files.
+l_rpg|!system "CRTBNDRPG PGM(AS4TRAINR1/GLDLST) SRCSTMF('/home/AS4TRAINR/gld/gldlst.rpgle')"
+l_rpg_err|!system "CRTBNDRPG PGM(AS4TRAINR1/GLDLSTE) SRCSTMF('/home/AS4TRAINR/gld/gldlste.rpgle')"
+l_rpg_nolist|!system "CRTBNDRPG PGM(AS4TRAINR1/GLDLST) SRCSTMF('/home/AS4TRAINR/gld/gldlst.rpgle') OUTPUT(*NONE) REPLACE(*YES)"
+l_cl|!system "CRTBNDCL PGM(AS4TRAINR1/GLDLCL) SRCSTMF('/home/AS4TRAINR/gld/gldlst.clle')"
+l_cl_err|!system "CRTBNDCL PGM(AS4TRAINR1/GLDLCLE) SRCSTMF('/home/AS4TRAINR/gld/gldlste.clle')"
+# Listings from source members (sequence numbers and change dates).
+l_srcpf|CRTSRCPF FILE(AS4TRAINR1/GLDLSRC) RCDLEN(112)
+l_cpy_rpg|CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gldlst.rpgle') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLDLSRC.FILE/GLDLSTM.MBR') MBROPT(*REPLACE) STMFCCSID(819)
+l_cpy_cl|CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gldlst.clle') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLDLSRC.FILE/GLDLCLM.MBR') MBROPT(*REPLACE) STMFCCSID(819)
+l_chgpfm|!system "CHGPFM FILE(AS4TRAINR1/GLDLSRC) MBR(GLDLSTM) SRCTYPE(RPGLE) TEXT('Golden listing RPG')"; system "CHGPFM FILE(AS4TRAINR1/GLDLSRC) MBR(GLDLCLM) SRCTYPE(CLLE) TEXT('Golden listing CL')"
+l_rpg_mbr|!system "CRTBNDRPG PGM(AS4TRAINR1/GLDLSTM) SRCFILE(AS4TRAINR1/GLDLSRC) SRCMBR(GLDLSTM)"
+l_cl_mbr|!system "CRTBNDCL PGM(AS4TRAINR1/GLDLCLM) SRCFILE(AS4TRAINR1/GLDLSRC) SRCMBR(GLDLCLM)"
+l_cl_mbr_ok|!system -s "CALL PGM(AS4TRAINR1/GLDLCLM) PARM('World')"
+# DSPMSGD on a message file of our own (the texts here are ours).
+m_crtmsgf|CRTMSGF MSGF(AS4TRAINR1/GLDMSGF) TEXT('Golden messages')
+m_add1|ADDMSGD MSGID(GLD0001) MSGF(AS4TRAINR1/GLDMSGF) MSG('Order &1 was not found in file &2.') SECLVL('&N Cause . . . . . :   The order number &1 does not exist in file &2. &N Recovery  . . . :   Enter an existing order number, &B or press F3 to end the program. &P Example: 0001234.') SEV(30) FMT((*CHAR 10) (*CHAR 10))
+m_add2|ADDMSGD MSGID(GLD0002) MSGF(AS4TRAINR1/GLDMSGF) MSG('Amount &1 is over the limit.') SEV(20) FMT((*DEC 9 2))
+m_add3|ADDMSGD MSGID(GLD0003) MSGF(AS4TRAINR1/GLDMSGF) MSG('Continue processing (Y N)?') SEV(99) TYPE(*CHAR) LEN(1) VALUES('Y' 'N') DFT('N')
+m_add4|ADDMSGD MSGID(GLD00A1) MSGF(AS4TRAINR1/GLDMSGF) MSG('Count &1 by user &2 in &3.') FMT((*BIN 4) (*CHAR 10) (*CHAR *VARY 2))
+m_full|DSPMSGD RANGE(*ALL) MSGF(AS4TRAINR1/GLDMSGF)
+m_basic|DSPMSGD RANGE(*ALL) MSGF(AS4TRAINR1/GLDMSGF) DETAIL(*BASIC)
+m_nofmt|DSPMSGD RANGE(GLD0001) MSGF(AS4TRAINR1/GLDMSGF) FMTTXT(*NO)
+m_range|DSPMSGD RANGE(GLD0002 GLD0003) MSGF(AS4TRAINR1/GLDMSGF)
+m_one_basic|DSPMSGD RANGE(GLD0002) MSGF(AS4TRAINR1/GLDMSGF) DETAIL(*BASIC)
+m_missing|DSPMSGD RANGE(GLD9999) MSGF(AS4TRAINR1/GLDMSGF)
+m_nomsgf|DSPMSGD RANGE(*ALL) MSGF(AS4TRAINR1/NOSUCHMSGF)
+l_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLDLST)" "DLTPGM PGM(AS4TRAINR1/GLDLSTM)" "DLTPGM PGM(AS4TRAINR1/GLDLCL)" "DLTPGM PGM(AS4TRAINR1/GLDLCLM)" "DLTPGM PGM(AS4TRAINR1/GLDLSTE)" "DLTPGM PGM(AS4TRAINR1/GLDLCLE)" "DLTF FILE(AS4TRAINR1/GLDLSTF)" "DLTF FILE(AS4TRAINR1/GLDLSRC)" "DLTMSGF MSGF(AS4TRAINR1/GLDMSGF)"; do system -q "$c"; done; echo cleaned

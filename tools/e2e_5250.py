@@ -78,8 +78,8 @@ with Tn5250(HOST) as t:
     command(t, "call qcmd", "Command Entry")
     check("QSECOFR" in t.line(2), "CALL QCMD from the menu's command line shows Command Entry", t)
 
-    command(t, "crtlib mylib text('My first library')", "Library MYLIB created.")
-    check("Library MYLIB created." in t.line(24), "CRTLIB creates a library", t)
+    command(t, "crtlib mylib text('My first library')", "Library MYLIB was created.")
+    check("Library MYLIB was created." in t.line(24), "CRTLIB creates a library", t)
 
     command(t, "CRTLIB LIB(MYLIB)", "CPF2111")
     check("CPF2111" in t.line(24), "CRTLIB of an existing library fails with CPF2111", t)
@@ -138,10 +138,15 @@ with Tn5250(HOST) as t:
     check(True, "an unknown table gives SQL0204", t)
     t.fkey(3)
     t.wait_for("Command Entry")
-    command(t, "runsql sql('update custmast set cusctY = ''Des Moines'' where cusno = 1')", "1 rows updated.")
-    check(True, "RUNSQL runs an UPDATE and reports the rows changed", t)
-    command(t, "runsql sql('select * from custmast')", "SQL0084")
-    check(True, "RUNSQL does not run SELECT", t)
+    # RUNSQL sends no completion message; a statement it cannot run ends
+    # with SQL9010 (observed on IBM i 7.5).
+    command(t, "runsql sql('update custmast set cusctY = ''Ames'' where cusno = 1')", "where cusno = 1')")
+    command(t, "dsppfm custmast", "Display Physical File Member")
+    check("Ames" in t.text(), "RUNSQL runs an UPDATE", t)
+    t.fkey(3); t.wait_for("Command Entry")
+    command(t, "runsql sql('update custmast set cusctY = ''Des Moines'' where cusno = 1')", "where cusno = 1')")
+    command(t, "runsql sql('select * from custmast')", "SQL9010")
+    check(True, "RUNSQL does not run SELECT (SQL9010)", t)
     t.fkey(12)
 
     command(t, "dsplib nosuch", "CPF2110")
@@ -284,8 +289,8 @@ with Tn5250(HOST) as t:
 
     # Spooled files: a printed RPG report (O specs, EXCEPT) and a display
     # command in batch both become spooled files QSYSPRT.
-    command(t, "sbmjob cmd(call custprt) job(custprt)", "submitted to job queue QBATCH")
-    command(t, "sbmjob cmd(dsppfm custmast) job(listing)", "submitted to job queue QBATCH")
+    command(t, "sbmjob cmd(call custprt) job(custprt)", "was put on job queue QBATCH")
+    command(t, "sbmjob cmd(dsppfm custmast) job(listing)", "was put on job queue QBATCH")
     command(t, "wrksplf", "Work with All Spooled Files")
     for _ in range(60):
         if t.text().count("QSYSPRT") >= 2:
@@ -316,13 +321,13 @@ with Tn5250(HOST) as t:
     t.wait_for("Create Library (CRTLIB)")
     check("Library" in t.line(5) and "*PROD" in t.line(6), "F4 prompts CRTLIB with its parameters and defaults", t)
     t.type("prmlib"); t.tab(); t.tab(); t.type("Made with F4"); t.enter()
-    t.wait_for("Library PRMLIB created.")
+    t.wait_for("Library PRMLIB was created.")
     check("CRTLIB LIB(PRMLIB) TEXT('Made with F4')" in t.text(),
           "Enter on the prompt runs the command it built", t)
     t.type("dspusrprf"); t.fkey(4)
     t.wait_for("Display User Profile (DSPUSRPRF)")
     t.enter()
-    t.wait_for("required parameter USRPRF")
+    t.wait_for("CPD0071")
     check(True, "the prompt checks required parameters", t)
     t.fkey(12)
     t.wait_for("Command Entry")
@@ -394,7 +399,7 @@ with Tn5250(HOST) as t:
         t2.type("bob"); t2.tab(); t2.type("secret42"); t2.enter()
         qcmd(t2)
         check("BOB" in t2.line(2), "a second session signs on as BOB while QSECOFR is signed on", t2)
-        command(t2, "sbmjob cmd(call pgm(custrpt) parm(L)) job(rpt)", "submitted to job queue QBATCH")
+        command(t2, "sbmjob cmd(call pgm(custrpt) parm(L)) job(rpt)", "was put on job queue QBATCH")
         check("CPC1221" in t2.line(24) and "/BOB/RPT" in t2.line(24),
               "SBMJOB puts job RPT on job queue QBATCH (CPC1221)", t2)
         command(t, "wrkactjob", "Work with Active Jobs")
@@ -532,7 +537,7 @@ with Tn5250(HOST) as t:
     check(True, "F12 goes back one menu", t)
     command(t, "99", "not one of the options")
     check("99" in t.line(24), "a number that is not an option is rejected on the message line", t)
-    command(t, "crtlib menulib", "Library MENULIB created.")
+    command(t, "crtlib menulib", "Library MENULIB was created.")
     check("as4tainr Main Menu" in t.text(), "a command typed on a menu's command line runs there, the menu stays", t)
     command(t, "6", "Go to Menu (GO)")
     check(True, "option 6 prompts GO (a ? in front of the command prompts it)", t)
@@ -598,14 +603,14 @@ with Tn5250(HOST) as t:
     t.fkey(3)
     t.wait_for("Contact list ended (CONTACTS).", 60)
     check("Command Entry" in t.text(), "F3 sets *INKC and ends the program; the CL INCLUDE declared &APP", t)
-    command(t, "dspfd contacts/qrpglesrc", "Display File Description")
+    command(t, "dspfd contacts/qrpglesrc type(*mbrlist)", "Display File Description")
     check("CONTLST" in t.text() and "List contacts" in t.text() and "RPGLE" in t.text(),
           "DSPFD lists a source file's members, types and texts", t)
     t.fkey(3); t.wait_for("Command Entry")
     command(t, "dsppfm contacts/qrpglesrc mbr(contcnt)", "Display Physical File Member")
     check("1.00" in t.text() and "CONTCNT" in t.text(), "DSPPFM shows a source member's lines", t)
     t.fkey(3); t.wait_for("Command Entry")
-    command(t, "crtbndrpg contacts/contcnt", "Program CONTCNT created in library CONTACTS.")
+    command(t, "crtbndrpg contacts/contcnt", "Program CONTCNT was created in library CONTACTS.")
     check(True, "CRTBNDRPG creates a program from QRPGLESRC (SRCMBR(*PGM))", t)
     command(t, "call contacts/contcnt", "DSPLY  Barbara Liskov", timeout=90)
     check("DSPLY  5" in t.text() and "DSPLY  Grace Hopper" in t.text(),

@@ -181,7 +181,7 @@ pub async fn run(stream: tokio::net::TcpStream, cfg: &ServerConfig, device: &str
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     return Ok(());
                 }
-                message = e.to_string();
+                message = crate::jobs::display_message(&e.to_string());
                 continue;
             }
         };
@@ -210,7 +210,7 @@ pub async fn run(stream: tokio::net::TcpStream, cfg: &ServerConfig, device: &str
                 .await
                 .unwrap_or(false)
             {
-                message = format!("CPF2110: Library {curlib} not found.");
+                message = format!("CPF2110: Library {curlib} does not exist.");
                 continue;
             }
             Some(curlib)
@@ -321,7 +321,7 @@ async fn change_password(
         .await
         {
             Ok(()) => return Ok(true),
-            Err(e) => message = e.to_string(),
+            Err(e) => message = crate::jobs::display_message(&e.to_string()),
         }
     }
 }
@@ -650,7 +650,7 @@ async fn request(
                 }
                 match cl::parse_partial(typed) {
                     Err(e) => {
-                        done.message = e.to_string();
+                        done.message = crate::jobs::display_message(&e.to_string());
                         done.prefill = typed.to_string();
                         return Ok(done);
                     }
@@ -765,7 +765,7 @@ async fn request(
         Err(e) => {
             let text = e.to_string();
             let lines: Vec<&str> = text.lines().collect();
-            done.message = lines.last().copied().unwrap_or("").to_string();
+            done.message = crate::jobs::display_message(&text);
             rq.log.extend(lines.iter().map(|m| format!("  {m}")));
             done.prefill = line.clone();
         }
@@ -988,7 +988,7 @@ async fn command_menu(term: &mut Term) -> Result<Option<String>> {
             },
             MenuChoice::Command(line, false) => return Ok(Some(line)),
             MenuChoice::Command(line, true) => match cl::parse_partial(&line) {
-                Err(e) => message = e.to_string(),
+                Err(e) => message = crate::jobs::display_message(&e.to_string()),
                 Ok((def, vals)) => match prompt(term, def, &vals).await? {
                     PromptResult::Run(line) => return Ok(Some(line)),
                     PromptResult::Exit => return Ok(None),
@@ -1164,7 +1164,7 @@ async fn prompt(
         let line = cl::build(def, &flat);
         match cl::parse(&line) {
             Ok(_) => return Ok(PromptResult::Run(line)),
-            Err(e) => message = e.to_string(),
+            Err(e) => message = crate::jobs::display_message(&e.to_string()),
         }
     }
 }
@@ -1248,7 +1248,7 @@ async fn sql_session(term: &mut Term, job: &mut Job<'_>) -> Result<()> {
             }
             Ok(None) => {}
             Err(e) => {
-                message = e.to_string();
+                message = crate::jobs::display_message(&e.to_string());
                 prefill = stmt;
                 log.push(format!("  {message}"));
                 continue;
@@ -1299,7 +1299,7 @@ async fn sql_session(term: &mut Term, job: &mut Job<'_>) -> Result<()> {
             }
             Ok(crate::sql::Outcome::Message(m)) => message = m,
             Err(e) => {
-                message = e.to_string();
+                message = crate::jobs::display_message(&e.to_string());
                 prefill = stmt;
             }
         }
@@ -1344,7 +1344,7 @@ async fn show_list(term: &mut Term, job: &mut Job<'_>, d: ListDisplay) -> Result
                         Ok(Outcome::Display(d)) => shown.push(d),
                         Ok(Outcome::Messages(m)) => message = m.last().cloned().unwrap_or_default(),
                         Ok(_) => {}
-                        Err(e) => message = e.to_string().lines().last().unwrap_or("").to_string(),
+                        Err(e) => message = crate::jobs::display_message(&e.to_string()),
                     }
                 }
                 // Options change what the list shows (ENDJOB, DLTSPLF, ...).
@@ -1373,7 +1373,7 @@ async fn refresh_top(job: &mut Job<'_>, stack: &mut [ListDisplay], message: &mut
             }
         }
         Ok(_) => {}
-        Err(e) => *message = e.to_string().lines().last().unwrap_or("").to_string(),
+        Err(e) => *message = crate::jobs::display_message(&e.to_string()),
     }
 }
 

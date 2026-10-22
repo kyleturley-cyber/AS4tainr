@@ -1354,10 +1354,10 @@ impl Job<'_> {
         let (lib, name) = self.create_target(&cmd.get("FILE").to_ascii_uppercase());
         let name = catalog::validate_name("file", &name)?;
         if !catalog::library_exists(self.client, &lib).await? {
-            bail!("CPF2110: Library {lib} not found.");
+            bail!("CPF2110: Library {lib} does not exist.");
         }
         if catalog::object_exists(self.client, std::slice::from_ref(&lib), &name, "*FILE").await? {
-            bail!("CPF7302: File {name} not created in library {lib}: it already exists.");
+            return Err(crate::catalog::file_exists_error(&name, &lib));
         }
         let text = match cmd.get("TEXT") {
             "*BLANK" | "" => String::new(),
@@ -1553,7 +1553,7 @@ impl Job<'_> {
         let mut c = crate::runtime::connect_db(&self.env.database_url).await?;
         for lib in &libs {
             if !catalog::library_exists(self.client, lib).await? {
-                bail!("CPF2110: Library {lib} not found.");
+                bail!("CPF2110: Library {lib} does not exist.");
             }
             // The objects: by name (generic, *ALL) and type.
             let rows = self
@@ -1678,7 +1678,7 @@ impl Job<'_> {
             l => catalog::validate_name("library", l)?,
         };
         if cmd.def.name == "RSTOBJ" && !catalog::library_exists(self.client, &to).await? {
-            bail!("CPF2110: Library {to} not found.");
+            bail!("CPF2110: Library {to} does not exist.");
         }
         let all = cmd.def.name == "RSTLIB";
         let objs: Vec<String> = if all {
@@ -1723,7 +1723,7 @@ impl Job<'_> {
     async fn dltlib(&mut self, cmd: &Command) -> Result<Vec<String>> {
         let lib = cmd.get("LIB").to_ascii_uppercase();
         if !catalog::library_exists(self.client, &lib).await? {
-            bail!("CPF2110: Library {lib} not found.");
+            bail!("CPF2110: Library {lib} does not exist.");
         }
         if matches!(
             lib.as_str(),

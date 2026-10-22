@@ -537,7 +537,7 @@ pub async fn create_bnddir(client: &Client, library: &str, name: &str, text: &st
     let lib = validate_name("library", library)?;
     let name = validate_name("binding directory", name)?;
     if !crate::catalog::library_exists(client, &lib).await? {
-        bail!("CPF2110: Library {lib} not found.");
+        bail!("CPF2110: Library {lib} does not exist.");
     }
     let n = client
         .execute(
@@ -614,7 +614,7 @@ pub async fn remove_bnddir_entries(
     Ok(n)
 }
 
-/// Delete a module, service program or binding directory object.
+/// Delete a program, module, service program or binding directory object.
 pub async fn delete_object(
     client: &Client,
     library: &str,
@@ -628,11 +628,12 @@ pub async fn delete_object(
         )
         .await?;
     if n == 0 {
-        bail!("CPF2105: Object {name} in {library} type {objtype} not found.");
+        bail!("CPF2105: Object {name} of type {objtype} in library {library} not found.");
     }
     let table = match objtype {
         "*MODULE" => "DELETE FROM as4tainr.modules WHERE library=$1 AND name=$2",
         "*SRVPGM" => "DELETE FROM as4tainr.service_programs WHERE library=$1 AND name=$2",
+        "*PGM" => "DELETE FROM as4tainr.programs WHERE library=$1 AND name=$2",
         _ => "DELETE FROM as4tainr.bnddir_entries WHERE library=$1 AND bnddir=$2",
     };
     client.execute(table, &[&library, &name]).await?;
@@ -670,7 +671,7 @@ pub async fn store(
         .await?
         .is_none()
     {
-        bail!("CPF2110: Library {lib} not found.");
+        bail!("CPF2110: Library {lib} does not exist.");
     }
     tx.execute(
         "DELETE FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype=$3",

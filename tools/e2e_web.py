@@ -155,8 +155,8 @@ with sync_playwright() as pw:
           "keys named on the screen show their function on the key bar", t)
     check(labels["F5"] == {"label": "", "active": False}, "keys the screen does not name are dimmed", t)
 
-    t.command(f"crtlib {LIB.lower()} text('Made in a browser')", f"Library {LIB} created.")
-    check(f"Library {LIB} created." in t.line(24), "CRTLIB from the browser", t)
+    t.command(f"crtlib {LIB.lower()} text('Made in a browser')", f"Library {LIB} was created.")
+    check(f"Library {LIB} was created." in t.line(24), "CRTLIB from the browser", t)
 
     t.command(f"dsplib {LIB}", "Display Library")
     check(LIB in t.line(3) and "Made in a browser" in t.text(), "DSPLIB shows the new library and its text", t)

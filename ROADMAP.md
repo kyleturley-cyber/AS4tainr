@@ -155,6 +155,7 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 ## Next steps
 
 - [x] Get access to a real system and capture golden outputs: PUB400 (IBM i 7.5) over SSH, `tools/golden/`, `tools/golden_compare.py`, docs/golden-outputs.md. First results: the PASE `system` utility's streams and exit statuses, completion message IDs, and the printed reports of DSPLIBL, DSPDTAARA, DSPSYSVAL, DSPOBJD and DSPFD *ATR.
+- [x] Golden comparison of command messages: `tools/golden.py` over whole capture lists (exit statuses, message IDs on each stream), a clean-room audit of message texts, the command analyzer's diagnostics (CPD0013...CPD0170) before CPF0006, completion message IDs of the create, change and delete commands captured, CPYF, DSPFFD, DLTPGM, SRCSTMF on the compilers.
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).
 - [x] Journals and trigger programs: COM's SETUPJRN, ORDAUDJV (QSYS2.DISPLAY_JOURNAL) and ORDTRG (ADDPFTRG) run (docs/journals.md).

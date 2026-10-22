@@ -121,6 +121,11 @@ BEGIN
                  WHERE table_schema='as4tainr' AND table_name='files' AND column_name='view') THEN
     ALTER TABLE as4tainr.files ADD COLUMN IF NOT EXISTS view text;
   END IF;
+  -- false: a program-described file (CRTPF RCDLEN), no DDS or SQL description.
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='files' AND column_name='described') THEN
+    ALTER TABLE as4tainr.files ADD COLUMN IF NOT EXISTS described boolean NOT NULL DEFAULT true;
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns
                  WHERE table_schema='as4tainr' AND table_name='files' AND column_name='view_def') THEN
     ALTER TABLE as4tainr.files ADD COLUMN IF NOT EXISTS view_def text;
@@ -191,8 +196,19 @@ pub fn validate_name(kind: &str, name: &str) -> Result<String> {
     let mut chars = up.chars();
     match chars.next() {
         Some(c) if ok_first(c) && up.len() <= 10 && chars.all(ok_rest) => Ok(up),
+        _ if up.len() > 10 => {
+            bail!("'{name}' is not a valid {kind} name: it is longer than 10 characters")
+        }
         _ => bail!("'{name}' is not a valid {kind} name"),
     }
+}
+
+/// A file that is not created because one of the name exists: CPF5813,
+/// then CPF7302 (observed on IBM i 7.5 for CRTPF, CRTSRCPF, CRTSAVF).
+pub fn file_exists_error(name: &str, lib: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "CPF5813: File {name} already exists in library {lib}.\nCPF7302: File {name} was not created in library {lib}."
+    )
 }
 
 /// A physical file as resolved through the library list.
@@ -314,6 +330,17 @@ pub async fn init(client: &Client) -> Result<()> {
                 )
                 .await?;
         }
+        // Programs of QSYS that as4tainr provides itself: QCMD (the
+        // command processor; CALL QCMD shows Command Entry).
+        client
+            .execute(
+                "INSERT INTO as4tainr.objects (library, name, objtype, attribute, text)
+                 SELECT 'QSYS', 'QCMD', '*PGM', '', ''
+                 WHERE NOT EXISTS (SELECT 1 FROM as4tainr.objects
+                                    WHERE library = 'QSYS' AND name = 'QCMD' AND objtype = '*PGM')",
+                &[],
+            )
+            .await?;
         crate::users::init(client).await?;
         // SQL runs as a restricted role. A database user who may not
         // create roles still gets a working system, without SQL.
@@ -380,7 +407,7 @@ pub async fn library_text(client: &Client, library: &str) -> Result<String> {
 pub async fn list_objects(client: &Client, library: &str) -> Result<Vec<ObjectEntry>> {
     let lib = validate_name("library", library)?;
     if !library_exists(client, &lib).await? {
-        bail!("CPF2110: Library {lib} not found.");
+        bail!("CPF2110: Library {lib} does not exist.");
     }
     Ok(client
         .query(
@@ -428,7 +455,7 @@ pub async fn create_program(
         .await?
         .is_none()
     {
-        bail!("CPF2110: Library {lib} not found.");
+        bail!("CPF2110: Library {lib} does not exist.");
     }
     let exists = tx
         .query_opt(
@@ -694,7 +721,7 @@ pub async fn create_physical_file(
         )
         .await?;
     if exists.is_some() {
-        bail!("CPF7302: file {name} already exists in library {lib}");
+        return Err(file_exists_error(&name, &lib));
     }
     let lib_exists = tx
         .query_opt(
@@ -794,7 +821,7 @@ pub async fn create_display_file(
         .await?
         .is_none()
     {
-        bail!("CPF2110: Library {lib} not found.");
+        bail!("CPF2110: Library {lib} does not exist.");
     }
     if tx
         .query_opt(
@@ -804,7 +831,7 @@ pub async fn create_display_file(
         .await?
         .is_some()
     {
-        bail!("CPF7302: File {name} already exists in library {lib}.");
+        return Err(file_exists_error(&name, &lib));
     }
     tx.execute(
         "INSERT INTO as4tainr.objects (library, name, objtype, attribute, text) VALUES ($1,$2,'*FILE','DSPF','')",
@@ -1062,7 +1089,7 @@ pub async fn create_logical_file(
         .await?
         .is_some()
     {
-        bail!("CPF7302: file {name} already exists in library {lib}");
+        return Err(file_exists_error(&name, &lib));
     }
     if tx
         .query_opt(
@@ -1252,7 +1279,7 @@ pub const ROLE_DDL_UNLOCK: &str = "SELECT pg_advisory_unlock(1095979828, 1)";
 /// Delete a database or display file: its description, its authorities
 /// and its data. A physical file with logical files over it is deleted
 /// only with `dependents` (SQL DROP TABLE drops the indexes and views
-/// over a table; DLTF refuses, CPF3203).
+/// over a table; DLTF refuses, CPF3219).
 pub async fn delete_file(
     client: &mut Client,
     library: &str,
@@ -1294,7 +1321,7 @@ pub async fn delete_file(
     over.extend(sql_views_over(&tx, &lib, &name).await?);
     if !over.is_empty() && !dependents {
         bail!(
-            "CPF3203: File {name} in library {lib} cannot be deleted: logical file {}/{} is built over it.",
+            "CPF3219: File {name} in library {lib} cannot be deleted: logical file {}/{} is built over it.",
             over[0].0,
             over[0].1
         );

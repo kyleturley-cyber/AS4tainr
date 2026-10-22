@@ -73,7 +73,7 @@ pub async fn create_file(client: &Client, library: &str, name: &str, text: &str)
     let lib = validate_name("library", library)?;
     let name = validate_name("file", name)?;
     if !crate::catalog::library_exists(client, &lib).await? {
-        bail!("CPF2110: Library {lib} not found.");
+        bail!("CPF2110: Library {lib} does not exist.");
     }
     let n = client
         .execute(
@@ -83,7 +83,7 @@ pub async fn create_file(client: &Client, library: &str, name: &str, text: &str)
         )
         .await?;
     if n == 0 {
-        bail!("CPF7302: File {name} not created in library {lib}: it already exists.");
+        return Err(crate::catalog::file_exists_error(&name, &lib));
     }
     Ok(())
 }
@@ -155,7 +155,7 @@ pub async fn find_member(
             )
             .await?
         else {
-            bail!("CPF9815: Member {member} file {file} in library {lib} not found.");
+            bail!("CPF9815: Member {member} of file {file} in library {lib} does not exist.");
         };
         return Ok(Member {
             library: lib.clone(),

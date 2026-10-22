@@ -764,7 +764,7 @@ impl Job<'_> {
             }
         }
         let lib = q.split_once('/').map(|x| x.0).unwrap_or("*LIBL");
-        bail!("CPF9801: Object {name} in library {lib} not found.");
+        bail!("CPF9801: Object {name} was not found in library {lib}.");
     }
 
     pub(crate) async fn journal_command(&mut self, cmd: &Command) -> Result<Option<Outcome>> {
@@ -788,7 +788,7 @@ impl Job<'_> {
         let (lib, name) = self.create_target(&cmd.get("JRNRCV").to_ascii_uppercase());
         let name = catalog::validate_name("journal receiver", &name)?;
         if !catalog::library_exists(self.client, &lib).await? {
-            bail!("CPF2110: Library {lib} not found.");
+            bail!("CPF2110: Library {lib} does not exist.");
         }
         if catalog::object_exists(self.client, std::slice::from_ref(&lib), &name, "*JRNRCV").await?
         {
@@ -814,7 +814,7 @@ impl Job<'_> {
             .await?;
         crate::authority::set_owner(self.client, &lib, &name, "*JRNRCV", &self.user).await?;
         Ok(vec![format!(
-            "Journal receiver {name} created in library {lib}."
+            "CPC7011: Journal receiver {name} was created in library {lib}."
         )])
     }
 
@@ -850,7 +850,7 @@ impl Job<'_> {
         let (lib, name) = self.create_target(&cmd.get("JRN").to_ascii_uppercase());
         let name = catalog::validate_name("journal", &name)?;
         if !catalog::library_exists(self.client, &lib).await? {
-            bail!("CPF2110: Library {lib} not found.");
+            bail!("CPF2110: Library {lib} does not exist.");
         }
         if catalog::object_exists(self.client, std::slice::from_ref(&lib), &name, "*JRN").await? {
             bail!("CPF7010: Object {name} in {lib} type *JRN already exists.");
@@ -882,7 +882,9 @@ impl Job<'_> {
             .await?;
         self.attach(&lib, &name, &rlib, &rname).await?;
         crate::authority::set_owner(self.client, &lib, &name, "*JRN", &self.user).await?;
-        Ok(vec![format!("Journal {name} created in library {lib}.")])
+        Ok(vec![format!(
+            "CPC7010: Journal {name} was created in library {lib}."
+        )])
     }
 
     async fn journal(&self, q: &str) -> Result<(String, String, i32, String, String)> {
@@ -1000,7 +1002,9 @@ impl Job<'_> {
         self.client
             .batch_execute(&format!("DROP SEQUENCE IF EXISTS {}", seq_name(jid)))
             .await?;
-        Ok(vec![format!("Journal {name} in {lib} deleted.")])
+        Ok(vec![format!(
+            "CPC2191: Object {name} of type *JRN in library {lib} was deleted."
+        )])
     }
 
     async fn dltjrnrcv(&mut self, cmd: &Command) -> Result<Vec<String>> {
@@ -1039,7 +1043,9 @@ impl Job<'_> {
                 &[&lib, &name],
             )
             .await?;
-        Ok(vec![format!("Journal receiver {name} in {lib} deleted.")])
+        Ok(vec![format!(
+            "CPC2191: Object {name} of type *JRNRCV in library {lib} was deleted."
+        )])
     }
 
     /// The physical files a FILE list names (generic names and *ALL).
@@ -1092,7 +1098,10 @@ impl Job<'_> {
             "*OPNCLO" => "*OPNCLO",
             _ => "*NONE",
         };
-        let mut msgs = Vec::new();
+        // One completion message, CPC7031 with how many of the files
+        // started; a file already journaled is left as it is (observed on
+        // IBM i 7.5: "0 of 1", no escape message).
+        let mut started = 0;
         for (lib, file) in &files {
             crate::authority::check(
                 self.client,
@@ -1103,8 +1112,8 @@ impl Job<'_> {
                 crate::authority::Aut::All,
             )
             .await?;
-            if let Some((l, j)) = journal_of(self.client, lib, file).await? {
-                bail!("CPF7030: Object {file} in {lib} of type *FILE is already being journaled (to {l}/{j}).");
+            if journal_of(self.client, lib, file).await?.is_some() {
+                continue;
             }
             self.client
                 .execute(
@@ -1139,16 +1148,12 @@ impl Job<'_> {
                 (&job, &self.user),
             )
             .await?;
-            msgs.push(format!(
-                "Journaling started for file {lib}/{file} (journal {jlib}/{jname})."
-            ));
+            started += 1;
         }
-        msgs.push(format!(
-            "{} of {} objects have started journaling.",
-            files.len(),
+        Ok(vec![format!(
+            "CPC7031: Journaling was started for {started} of {} files.",
             files.len()
-        ));
-        Ok(msgs)
+        )])
     }
 
     /// ENDJRNPF FILE(... | *ALL) JRN(*FILE | journal).
@@ -1174,11 +1179,12 @@ impl Job<'_> {
         } else {
             self.physical_files(&items).await?
         };
-        let mut msgs = Vec::new();
+        // CPC7033 with how many files ended (observed on IBM i 7.5).
+        let mut ended = 0;
         for (lib, file) in &files {
-            let Some((jl, jn)) = journal_of(self.client, lib, file).await? else {
-                bail!("CPF9898: File {file} in library {lib} is not journaled.");
-            };
+            if journal_of(self.client, lib, file).await?.is_none() {
+                continue;
+            }
             self.client
                 .batch_execute(&format!(
                     "DROP TRIGGER IF EXISTS \"as4tainr~journal\" ON {}.{}",
@@ -1188,11 +1194,12 @@ impl Job<'_> {
                 .await?;
             let job = self.job_name();
             file_deleted(self.client, lib, file, (&job, &self.user)).await?;
-            msgs.push(format!(
-                "Journaling ended for file {lib}/{file} (journal {jl}/{jn})."
-            ));
+            ended += 1;
         }
-        Ok(msgs)
+        Ok(vec![format!(
+            "CPC7033: Journaling was ended for {ended} of {} files.",
+            files.len()
+        )])
     }
 
     /// DSPJRN JRN(...) [FILE(...)] [RCVRNG(*CURRENT | *CURCHAIN)]
@@ -1515,9 +1522,13 @@ fn entry_limit(v: &str, first: i64, last: i64) -> Result<i64> {
     match v.trim().to_ascii_uppercase().as_str() {
         "*FIRST" => Ok(first),
         "*LAST" | "*LASTRST" | "*COMPLETE" => Ok(last),
-        "*LASTSAVE" => bail!("CPF0006: Errors occurred in command. *LASTSAVE is not valid here."),
+        "*LASTSAVE" => {
+            bail!("CPF0006: The command has errors and was not run. *LASTSAVE is not valid here.")
+        }
         n => n.parse().map_err(|_| {
-            anyhow::anyhow!("CPF0006: Errors occurred in command. {v} is not a sequence number.")
+            anyhow::anyhow!(
+                "CPF0006: The command has errors and was not run. {v} is not a sequence number."
+            )
         }),
     }
 }

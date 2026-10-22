@@ -276,7 +276,7 @@ pub async fn describe(
             let Some(d) =
                 crate::msgf::find(client, std::slice::from_ref(&found), &name, &msgid).await?
             else {
-                bail!("CPF2419: Message identifier {msgid} not found in message file {name} in {found}.");
+                bail!("CPF2419: Message {msgid} is not in message file {name} in library {found}.");
             };
             let (text, seclvl) = d.format(data);
             m.msgflib = found;

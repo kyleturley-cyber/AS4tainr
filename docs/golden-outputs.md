@@ -35,12 +35,16 @@ as4tainr's expected values come from IBM's documentation or from a real system (
 powershell -ExecutionPolicy Bypass -File tools\golden\golden.ps1 -List tools\golden\basics.txt
 ```
 
-A list has one `name|CL command` per line (run with `system`, standard output and error together) or `name|!shell line` (standard error lines prefixed `2> `). One SSH connection runs the whole list; the script retries when the run is cut short. It prints each command's name as it starts and writes what comes back to `target\ibmi\attempt<N>.out` as it arrives. A command still running after `-Timeout` seconds (default 120) is killed, and its output ends with `TIMEOUT after N s`. A command that sends an inquiry message waits for a reply forever in this job. Results go to `target\ibmi\golden\<name>.txt`. They hold IBM's message texts and are never committed: tests take values from them (message IDs, report layouts, exit statuses) and say so in a comment.
+A list has one `name|CL command` per line (run with `system`, standard output and error together) or `name|!shell line` (standard error lines prefixed `2> `). The script is copied to the IBM i with `scp` and run there over one SSH connection (piping a long script into `ssh` deadlocks in Windows PowerShell); the script retries when the run is cut short. It prints each command's name as it starts and writes what comes back to `target\ibmi\attempt<N>.out` as it arrives. A command still running after `-Timeout` seconds (default 120) is killed, and its output ends with `TIMEOUT after N s`. A command that sends an inquiry message waits for a reply forever in this job. Results go to `target\ibmi\golden\<name>.txt`. They hold IBM's message texts and are never committed: tests take values from them (message IDs, report layouts, exit statuses) and say so in a comment.
 
 The lists:
 
 - `tools/golden/basics.txt`: display commands and their printed reports (DSPLIBL, DSPSYSVAL, DSPOBJD, DSPMSGD, DSPFD), CHKOBJ, CRTPF RCDLEN, DLTF.
 - `tools/golden/system-utility.txt`: the `system` utility itself (options, streams, exit statuses).
+- `tools/golden/messages.txt`: completion and escape message IDs and exit statuses of most commands as4tainr has, the command analyzer's diagnostics, shipped system values.
+- `tools/golden/files-and-programs.txt`: CPYF, DSPFFD, DSPFD, DSPOBJD, save files, CL and RPG programs from stream files, MONMSG of a failed CALL.
+
+Object names in a list are its own (GOLD*, GLD*), so a run that is stopped halfway (an inquiry message, a dropped connection) leaves objects that only that list uses. A job stopped that way can keep holding locks on them until it is ended (`WRKUSRJOB USER(...) STATUS(*ACTIVE)`, then `ENDJOB`).
 
 ## Comparing
 
@@ -49,7 +53,17 @@ AS4TAINR_BIN=target/debug/as4tainr python3 tools/golden_compare.py \
     tools/golden/basics.txt target/ibmi/golden --setup "CRTLIB AS4TRAINR1"
 ```
 
-It runs each line through `as4tainr system`, writes `<name>.ours.txt` next to the golden file and lists the lines that differ. Before comparing it masks report header dates, times, product and system name, object creation stamps and PUB400's own page footer (`-=* https://pub400.com *=-`), and it reduces messages to their IDs, because our message texts are written fresh.
+It runs each line through `as4tainr system`, writes `<name>.ours.txt` next to the golden file and lists the lines that differ. Before comparing it masks report header dates, times, product and system name, object creation stamps and PUB400's own page footer (`-=* https://pub400.com *=-`), and it reduces messages to their IDs, because our message texts are written fresh. Use it for printed report layouts.
+
+`tools/golden.py` checks behavior across whole lists:
+
+```sh
+AS4TAINR_DATABASE_URL=postgres://... python3 tools/golden.py target/ibmi/golden tools/golden/*.txt
+```
+
+It works in a fresh library named like the capture's (`--lib`, default AS4TRAINR1) and a fresh `/home` directory, with `system` being `as4tainr system` (a shell line's files under `/home` are copied into the IFS before each command). For each command it compares the exit status, the message IDs on standard output and on standard error in order, and whether a listing was printed. It never matches message texts; it reports the opposite, a message whose text is the same as IBM's (clean room). `python3 tools/golden.py target/ibmi/golden --audit core/src` looks for IBM's texts in the source: each captured message becomes a pattern with names and numbers taken out, and so does each `"ID: text"` string literal; a match is a text to write again.
+
+Tests built from captures compare IDs, exit codes, values and layouts (core/tests/system_cli.rs, `pase_system_utility_and_printed_reports`) and say "observed on IBM i 7.5" or name the capture in a comment.
 
 ## What the PASE `system` utility does (PUB400, 2026-10-21)
 
@@ -58,11 +72,13 @@ It runs each line through `as4tainr system`, writes `<name>.ours.txt` next to th
 | Completion messages | `MSGID: text`, one per message | | 0 |
 | A display command | its printed report | | 0 |
 | An escape message | | `MSGID: text` | 255 |
-| Command not found, a parameter not valid | | the diagnostic (CPD0030, CPD0084), then CPF0006 | 255 |
+| Command not found, a parameter not valid | | the diagnostic (CPD0013, CPD0030, CPD0031, CPD0043, CPD0065 for each extra value, CPD0071, CPD0074, CPD0075, CPD0084, CPD0170), then CPF0006 | 255 |
+| RUNSQL that fails | | SQL9010 only | 255 |
 | `-n` | messages without IDs | messages without IDs | |
-| `-v` | `Command is > command  <` first | | |
+| `-v` | the command first, in a line of IBM's own words (as4tainr: `Command: ...`) | | |
 | `-s` | printed output left out | | |
-| No command | | `Usage: system [-beEhiIkKnOpqsv] command` | 2 |
+| `-q` | no messages | no messages | |
+| No command | | a usage line (as4tainr's own text) | 2 |
 
 ## Differences that come from PUB400, not from IBM i
 

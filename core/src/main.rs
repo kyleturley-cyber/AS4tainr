@@ -132,14 +132,17 @@ enum Cmd {
         #[arg(long)]
         csv: PathBuf,
     },
-    /// Run one CL command as QSECOFR, as the IBM i PASE `system` utility
-    /// does (e.g. `as4tainr system "CRTDTAARA DTAARA(QGPL/X) TYPE(*DEC)"`):
-    /// messages and printed output on standard output, a failure's
-    /// messages on standard error with exit status 255. Options -n (no
-    /// message IDs), -v (show the command), -s (no printed output).
+    /// Run one CL command as QSECOFR, as IBM i's PASE `system` utility
+    /// does: `as4tainr system [-beEhiIkKnOpqsv] CL-command [CL-parameters...]`
+    /// (e.g. `as4tainr system "CRTDTAARA DTAARA(QGPL/X) TYPE(*DEC)"`).
+    /// Completion messages and printed output go to standard output, the
+    /// messages of a failed command to standard error, as `CPF9801: text`
+    /// (-n: text only; -q: no messages; -s: no printed output; -v: the
+    /// command first). Exit status 255 when the command sends an escape
+    /// message, 2 for a usage error, else 0.
     #[command(disable_help_flag = true)]
     System {
-        /// Options, then the command as typed on a command line.
+        /// Options, then the command and its parameters (joined with spaces).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -206,7 +209,7 @@ async fn run(cli: Cli) -> Result<u8> {
         Cmd::Crtlib { library, text } => {
             let client = runtime::connect_db(&cli.database_url).await?;
             catalog::create_library(&client, &library, &text).await?;
-            println!("Library {} created.", library.to_ascii_uppercase());
+            println!("Library {} was created.", library.to_ascii_uppercase());
         }
         Cmd::Crtbndcl { program, src, text } => {
             let (lib, name) = split_lib_file(&program)?;

@@ -250,8 +250,40 @@ pub fn message_id(text: &str) -> &str {
     }
 }
 
+/// The escape message's ID in an error's text: the messages of a failed
+/// command are its diagnostics, one per line, then the escape message
+/// (e.g. "CPD0030: ...\nCPF0006: ..."), so the last line with an ID.
+pub fn escape_id(text: &str) -> &str {
+    text.lines()
+        .rev()
+        .map(message_id)
+        .find(|id| !id.is_empty())
+        .unwrap_or("")
+}
+
+/// The message a display shows for an error: a command the command
+/// analyzer refused shows its first diagnostic (CPDxxxx), which says why;
+/// otherwise the escape message (the last line).
+pub fn display_message(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if escape_id(text) == "CPF0006" {
+        if let Some(d) = lines.iter().find(|l| message_id(l).starts_with("CPD")) {
+            return d.to_string();
+        }
+    }
+    lines.last().map(|l| l.to_string()).unwrap_or_default()
+}
+
 /// Add a message to a job's log.
 pub async fn log(client: &Client, id: &JobId, kind: &str, text: &str) {
+    // A command's messages: CPCxxxx are completion messages, CPDxxxx
+    // diagnostics (IBM i message ID prefixes).
+    let msgid = message_id(text);
+    let kind = match (kind, &msgid.get(..3)) {
+        ("*INFO", Some("CPC")) => "*COMP",
+        ("*INFO" | "*ESCAPE", Some("CPD")) => "*DIAG",
+        _ => kind,
+    };
     let _ = client
         .execute(
             "INSERT INTO as4tainr.job_log (job, msgid, kind, text) VALUES ($1, $2, $3, $4)",
@@ -812,5 +844,11 @@ mod tests {
         assert_eq!(message_id("CPF1241: Job ..."), "CPF1241");
         assert_eq!(message_id("Library MYLIB created."), "");
         assert_eq!(message_id("Note: x"), "");
+        assert_eq!(
+            escape_id("CPD0030: Command X not found.\nCPF0006: Not run."),
+            "CPF0006"
+        );
+        assert_eq!(escape_id("CPF5026: Duplicate key.\nmore text"), "CPF5026");
+        assert_eq!(escape_id("plain"), "");
     }
 }

@@ -1225,7 +1225,7 @@ ENDPGM"
     assert_eq!(
         m,
         [
-            format!("Message file APPMSG created in library {lib}."),
+            format!("CPC9801: Object APPMSG of type *MSGF was created in library {lib}."),
             "duplicate refused".to_string()
         ]
     );
@@ -1321,8 +1321,10 @@ ENDPGM";
     .await
     .unwrap_err()
     .to_string();
+    // The resent escape message: CPF9801 with as4tainr's text for CHKOBJ
+    // (the text is not IBM's; clean room).
     assert!(
-        e.starts_with("CPF9801: Object NOSUCH in library *LIBL not found."),
+        e.starts_with("CPF9801: Object NOSUCH was not found in library *LIBL."),
         "{e}"
     );
     // A message file that does not exist.
@@ -1563,7 +1565,7 @@ ENDPGM"
     assert_eq!(
         m,
         [
-            format!("Member CUSTMAST of file CUSTMAST in library {lib2} cleared."),
+            format!("CPC3101: Member CUSTMAST of file CUSTMAST in library {lib2} was cleared."),
             "DSPLY  count 0".to_string(),
             "DSPLY  count 5".to_string(),
             "overridden file is empty".to_string(),
@@ -3061,7 +3063,7 @@ ENDPGM";
         .unwrap();
     // CRTLIB's completion message is CPC2102 (message IDs as `system`
     // shows them on PUB400, IBM i 7.5, 2026-10-21).
-    assert_eq!(m, ["CPC2102: Library CLMADE created.", "found CLMADE"]);
+    assert_eq!(m, ["CPC2102: Library CLMADE was created.", "found CLMADE"]);
     let m = cl_job_run(&client, &url, &lib, &[], "CALL CLMK")
         .await
         .unwrap();
@@ -3191,11 +3193,12 @@ async fn data_areas_commands_and_rtvdtaara() {
         .await
         .unwrap(),
     );
-    // CPC0904 (PUB400, IBM i 7.5: `system "CRTDTAARA ..."`, 2026-10-21).
+    // CPC0904 is the completion message's ID (observed on IBM i 7.5 with
+    // the PASE `system` utility); the text is as4tainr's.
     assert_eq!(
         m,
         [format!(
-            "CPC0904: Data area NEXTNO created in library {lib}."
+            "CPC0904: Data area NEXTNO was created in library {lib}."
         )]
     );
     let e = run(format!("CRTDTAARA {lib}/NEXTNO *DEC"))
@@ -3264,10 +3267,12 @@ ENDPGM
     assert!(e.to_string().contains("must be a *DEC variable"), "{e}");
 
     let m = msgs(run("DLTDTAARA CO".into()).await.unwrap());
-    // CPC2191 (PUB400, IBM i 7.5: `system "DLTDTAARA ..."`, 2026-10-21).
+    // CPC2191 (observed on IBM i 7.5).
     assert_eq!(
         m,
-        [format!("CPC2191: Object CO in {lib} type *DTAARA deleted.")]
+        [format!(
+            "CPC2191: Object CO of type *DTAARA in library {lib} was deleted."
+        )]
     );
     let e = run("DSPDTAARA CO".into()).await.unwrap_err();
     assert!(e.to_string().starts_with("CPF1015"), "{e}");
@@ -3406,7 +3411,7 @@ async fn submitted_jobs_run_in_qbatch() {
         .unwrap());
     assert!(m.starts_with("CPC1221: Job "), "{m}");
     assert!(
-        m.contains("/QSECOFR/MAKEDTA submitted to job queue QBATCH"),
+        m.contains("/QSECOFR/MAKEDTA was put on job queue QBATCH"),
         "{m}"
     );
     let n1 = number_in(&m);
@@ -3422,7 +3427,7 @@ async fn submitted_jobs_run_in_qbatch() {
         .any(|e| e.kind == "*RQS" && e.text.starts_with("CRTDTAARA")));
     assert!(log
         .iter()
-        .any(|e| e.text == format!("CPC0904: Data area D1 created in library {lib}.")));
+        .any(|e| e.msgid == "CPC0904" && e.text.contains("D1")));
     assert!(log.last().unwrap().text.starts_with("CPF1241"));
 
     // A job that fails ends abnormally.
@@ -4144,7 +4149,7 @@ async fn import_an_application() {
         _ => String::new(),
     };
     let m = msgs(job.run("CRTBNDRPG PGM(CONTCNT)").await.unwrap());
-    assert_eq!(m, format!("Program CONTCNT created in library {lib}."));
+    assert_eq!(m, format!("Program CONTCNT was created in library {lib}."));
     let e = job
         .run("CRTBNDRPG PGM(CONTCNT) REPLACE(*NO)")
         .await
@@ -4161,7 +4166,7 @@ async fn import_an_application() {
     let e = job.run("CRTPF FILE(NOSUCH)").await.unwrap_err().to_string();
     assert!(e.starts_with("CPF9815"), "{e}");
     // DSPFD *MBRLIST and DSPPFM of a source member.
-    let Outcome::Display(d) = job.run("DSPFD QRPGLESRC").await.unwrap() else {
+    let Outcome::Display(d) = job.run("DSPFD QRPGLESRC TYPE(*MBRLIST)").await.unwrap() else {
         panic!()
     };
     assert_eq!(d.rows.len(), 2);
@@ -4430,7 +4435,7 @@ async fn native_rpg_engine_runs_a_program() {
         got,
         [
             // CPC2102: CRTLIB's completion message (PUB400, IBM i 7.5).
-            "CPC2102: Library RPGLIB1 created.",
+            "CPC2102: Library RPGLIB1 was created.",
             "CRTLIB failed",
             "ascii",
             "AB",
@@ -4530,7 +4535,7 @@ async fn rpg_embedded_sql() {
 /// TEXT IS the field text; PRIMARY KEY rejects a duplicate (SQL0803) and
 /// CHECK a row that fails it (SQL0545 from SQL, CPF502F from a WRITE);
 /// DROP TABLE drops the indexes over it; DLTF refuses a physical file
-/// that a logical file is built over (CPF3203); RUNSQLSTM with ERRLVL(10)
+/// that a logical file is built over (CPF3219, observed on IBM i 7.5); RUNSQLSTM with ERRLVL(10)
 /// stops at the first failing statement (SQL9010). An RPG program sees
 /// SQL INTEGER as binary 9,0, DATE/TIME/TIMESTAMP in *ISO form
 /// (YYYY-MM-DD, HH.MM.SS, YYYY-MM-DD-HH.MM.SS.ffffff) and VARCHAR as a
@@ -4719,7 +4724,7 @@ async fn sql_tables_indexes_and_runsqlstm() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(e.starts_with("CPF3203"), "{e}");
+    assert!(e.starts_with("CPF3219"), "{e}");
     source::create_file(&client, &lib, "QSQLSRC", "")
         .await
         .unwrap();
@@ -6550,7 +6555,14 @@ async fn printer_files_crtprtf_and_rpg() {
     let as4tainr_core::commands::Outcome::Messages(m) = m else {
         panic!()
     };
-    assert_eq!(m, [format!("File CUSTRPT created in library {lib}.")]);
+    // as4tainr's own text (the completion message's ID is not captured
+    // yet).
+    assert_eq!(
+        m,
+        [format!(
+            "Printer file CUSTRPT was created in library {lib}."
+        )]
+    );
     let r = run_rpg(
         &url,
         &lib,
@@ -7126,7 +7138,8 @@ async fn sql_rows(client: &tokio_postgres::Client, url: &str, lib: &str, q: &str
 /// C SC, the changes, C CM (COMMIT) or C RB (ROLLBACK), the cycle number
 /// in COMMIT_CYCLE. CHGJRN JRNRCV(*GEN) attaches RCV0002; the default
 /// receiver range is the current receiver, *CURCHAIN all of them.
-/// Existing objects: CPF7010; journaling a journaled file: CPF7030.
+/// Existing objects: CPF7010; journaling a journaled file again is not an
+/// error: CPC7031 says 0 of 1 files started (observed on IBM i 7.5).
 #[tokio::test]
 async fn journals_and_display_journal() {
     use as4tainr_core::commands::{Environment, Job};
@@ -7164,13 +7177,16 @@ async fn journals_and_display_journal() {
     .await
     .unwrap_err();
     assert!(e.contains("CPF7010"), "{e}");
-    let e = cl_cmd(
+    let m = cl_cmd(
         &mut job,
         format!("STRJRNPF FILE({lib}/ITEMS) JRN({lib}/JRN)"),
     )
     .await
-    .unwrap_err();
-    assert!(e.contains("CPF7030"), "{e}");
+    .unwrap();
+    assert!(
+        m.len() == 1 && m[0].starts_with("CPC7031: ") && m[0].contains(" 0 of 1 "),
+        "{m:?}"
+    );
     let dj = format!("TABLE(QSYS2.DISPLAY_JOURNAL('{lib}', 'JRN')) X");
     assert_eq!(
         sql_rows(&client, &url, &lib, &format!("SELECT JOURNAL_CODE, JOURNAL_ENTRY_TYPE, RTRIM(SUBSTR(\"OBJECT\", 1, 10)), COUNT_OR_RRN FROM {dj} ORDER BY SEQUENCE_NUMBER")).await,
@@ -8641,9 +8657,10 @@ async fn pase_system_utility_and_printed_reports() {
         };
     }
 
-    // No command: usage on standard error, status 2.
+    // No command: how to use it, on standard error, status 2 (the text is
+    // as4tainr's own).
     let o = sys!(&[]).await;
-    assert_eq!(o.stderr, ["Usage: system [-beEhiIkKnOpqsv] command"]);
+    assert_eq!(o.stderr, [pase_system::USAGE]);
     assert_eq!(o.status, 2);
 
     // An escape message: standard error, status 255; -n drops the ID; -v
@@ -8654,8 +8671,11 @@ async fn pase_system_utility_and_printed_reports() {
     assert!(o.stdout.is_empty());
     let o = sys!(&["-n".into(), chk.clone()]).await;
     assert!(!o.stderr[0].starts_with("CPF9801"), "{o:?}");
+    // -v: one line with the command on standard output (IBM's line frames
+    // the command in its own words; ours says it in ours).
     let o = sys!(&["-v".into(), chk.clone()]).await;
-    assert_eq!(o.stdout, [format!("Command is > {chk}  <")]);
+    assert_eq!(o.stdout.len(), 1);
+    assert!(o.stdout[0].contains(&chk), "{o:?}");
 
     // Command checking: the diagnostic, then CPF0006.
     let o = sys!(&["NOSUCHCMD".into()]).await;

@@ -156,7 +156,9 @@ impl Type {
             "*CHAR" => Ok(Type::Char),
             "*DEC" => Ok(Type::Dec),
             "*LGL" => Ok(Type::Lgl),
-            other => bail!("CPD0084: TYPE({other}) is not *CHAR, *DEC or *LGL."),
+            other => Err(crate::cl::value_error(&format!(
+                "TYPE({other}) is not one of the data area types *CHAR, *DEC and *LGL."
+            ))),
         }
     }
 
@@ -431,7 +433,7 @@ pub async fn find<C: GenericClient>(
             return from_row(&r);
         }
     }
-    bail!("CPF1015: Data area {name} in {label} not found.")
+    bail!("CPF1015: Data area {name} in library {label} does not exist.")
 }
 
 /// Find a data area by a qualified name through a library list.
@@ -469,7 +471,8 @@ pub async fn create<C: GenericClient>(
         .await?
         .is_none()
     {
-        bail!("CPF2110: Library {lib} not found.");
+        // CPF1021 (observed on IBM i 7.5 for CRTDTAARA).
+        bail!("CPF1021: Library {lib} for data area {name} does not exist.");
     }
     // One statement, so the object and its value appear together.
     let r = client
@@ -491,7 +494,7 @@ pub async fn create<C: GenericClient>(
         )
         .await?;
     if r == 0 {
-        bail!("CPF1023: Data area {name} exists in {lib}.");
+        bail!("CPF1023: Data area {name} already exists in library {lib}.");
     }
     Ok(DataArea {
         library: lib,

@@ -87,7 +87,7 @@ impl Job<'_> {
                 ifs::mkdir(self.client, dir, 0o755, &self.user)
                     .await
                     .map_err(|e| cl_error(e, dir))?;
-                msg(format!("Directory {dir} created."))
+                msg(format!("CPCA083: Directory {dir} was created."))
             }
             "RMVDIR" | "RMDIR" | "RD" => {
                 let dir = cmd.get("DIR");
@@ -98,7 +98,7 @@ impl Job<'_> {
                         .await
                         .map_err(|e| cl_error(e, dir))?;
                 }
-                msg(format!("Directory {dir} removed."))
+                msg(format!("CPCA085: Directory {dir} was removed."))
             }
             "RMVLNK" | "DEL" | "ERASE" => {
                 let obj = cmd.get("OBJLNK");
@@ -152,7 +152,9 @@ impl Job<'_> {
                 let opt = cmd.get("MBROPT").to_ascii_uppercase();
                 self.put_save_file_data(&lib, &name, &bytes, opt == "*REPLACE")
                     .await?;
-                msg(format!("Stream file {from} copied to save file {name}."))
+                msg(format!(
+                    "CPCA081: Stream file {from} was copied to save file {name}."
+                ))
             }
             "CPYTOSTMF" => {
                 let (lib, file, mbr) = member_path(cmd.get("FROMMBR"))?;
@@ -248,7 +250,8 @@ impl Job<'_> {
                     .await
                     .ok();
                 if old.is_some() && !(opt == "*REPLACE" || opt == "*ADD") {
-                    bail!("CPFA095: Stream file {from} not copied: member {mbr} exists in file {lib}/{file} (MBROPT(*NONE)).");
+                    // CPDA089, then CPFA095 (observed on IBM i 7.5).
+                    bail!("CPDA089: Member {mbr} is already in file {lib}/{file}; MBROPT(*NONE) does not replace it.\nCPFA095: Stream file {from} was not copied.");
                 }
                 let source = match (&old, opt.as_str()) {
                     (Some(o), "*ADD") if !o.source.is_empty() => format!("{}\n{body}", o.source),
@@ -263,7 +266,9 @@ impl Job<'_> {
                     source,
                 };
                 crate::source::put_member(self.client, &m, true).await?;
-                msg(format!("Stream file {from} copied to member {mbr}."))
+                msg(format!(
+                    "CPCA081: Stream file {from} was copied to member {mbr}."
+                ))
             }
             _ => Ok(None),
         }

@@ -141,6 +141,9 @@ impl Job<'_> {
         if let Some(o) = self.save_command(&cmd).await? {
             return Ok(o);
         }
+        if let Some(o) = self.objdesc_command(&cmd).await? {
+            return Ok(o);
+        }
         match cmd.def.name {
             "CRTLIB" => self.crtlib(&cmd).await,
             "DSPLIB" => self.dsplib(&cmd).await,
@@ -156,7 +159,6 @@ impl Job<'_> {
             "GO" => self.go(&cmd).await,
             "CRTSRCPF" => self.crtsrcpf(&cmd).await,
             "CHGPFM" => self.chgpfm(&cmd).await,
-            "DSPFD" => self.dspfd(&cmd).await,
             "CRTPF" | "CRTLF" | "CRTDSPF" => self.crtfile(&cmd).await,
             "CRTPRTF" => self.crtprtf(&cmd).await,
             "CRTBNDCL" | "CRTCLPGM" | "CRTBNDRPG" | "CRTSQLRPGI" | "CRTRPGPGM" => {
@@ -186,7 +188,12 @@ impl Job<'_> {
             "DLTUSRPRF" => self.dltusrprf(&cmd).await,
             "CHGPWD" => Ok(Outcome::ChangePassword),
             "STRSQL" => Ok(Outcome::StartSql),
-            "RUNSQL" => self.runsql(&cmd).await,
+            // A statement RUNSQL cannot run: one escape message, SQL9010,
+            // with the SQL error in its text (observed on IBM i 7.5).
+            "RUNSQL" => self.runsql(&cmd).await.map_err(|e| {
+                let t = format!("{e:#}").replace('\n', " ");
+                anyhow::anyhow!("SQL9010: RUNSQL failed: {t}")
+            }),
             "RUNSQLSTM" => self.runsqlstm(&cmd).await,
             "CRTRPGMOD" | "CRTCLMOD" => self.crtrpgmod(&cmd).await,
             "CALLPRC" => bail!("CALLPRC can only be used in a CL program or procedure."),
@@ -195,7 +202,7 @@ impl Job<'_> {
             "CRTBNDDIR" => self.crtbnddir(&cmd).await,
             "ADDBNDDIRE" | "RMVBNDDIRE" => self.bnddire(&cmd).await,
             "DSPBNDDIR" => self.dspbnddir(&cmd).await,
-            "DLTMOD" | "DLTSRVPGM" | "DLTBNDDIR" => self.dlt_ile(&cmd).await,
+            "DLTPGM" | "DLTMOD" | "DLTSRVPGM" | "DLTBNDDIR" => self.dlt_ile(&cmd).await,
             "DSPPGM" => self.dsppgm(&cmd).await,
             "DSPSRVPGM" => self.dspsrvpgm(&cmd).await,
             "UPDPGM" | "UPDSRVPGM" => self.updpgm(&cmd).await,
@@ -278,7 +285,7 @@ impl Job<'_> {
         let lib = catalog::create_library_new(self.client, cmd.get("LIB"), cmd.get("TEXT")).await?;
         authority::set_owner(self.client, "QSYS", &lib, "*LIB", &self.user).await?;
         Ok(Outcome::Messages(vec![format!(
-            "CPC2102: Library {lib} created."
+            "CPC2102: Library {lib} was created."
         )]))
     }
 
@@ -369,6 +376,10 @@ impl Job<'_> {
             {
                 bail!("Library {lib} is not in the user part of the library list and was not removed.");
             }
+            // A library that does not exist: CPF2110 (observed on IBM i 7.5).
+            if !catalog::library_exists(self.client, &lib).await? {
+                bail!("CPF2110: Library {lib} does not exist.");
+            }
             bail!("Library {lib} is not in the library list.");
         }
         Ok(Outcome::Messages(vec![format!(
@@ -386,7 +397,7 @@ impl Job<'_> {
             }
             lib => {
                 if !catalog::library_exists(self.client, lib).await? {
-                    bail!("CPF2110: Library {lib} not found.");
+                    bail!("CPF2110: Library {lib} does not exist.");
                 }
                 self.curlib = Some(lib.to_string());
                 Ok(Outcome::Messages(vec![format!(
@@ -406,7 +417,7 @@ impl Job<'_> {
                 for l in libs {
                     let l = catalog::validate_name("library", l)?;
                     if !catalog::library_exists(self.client, &l).await? {
-                        bail!("CPF2110: Library {l} not found.");
+                        bail!("CPF2110: Library {l} does not exist.");
                     }
                     if v.contains(&l) {
                         bail!("Library {l} is in the list more than once.");
@@ -421,7 +432,7 @@ impl Job<'_> {
             "*CRTDFT" => self.curlib = None,
             lib => {
                 if !catalog::library_exists(self.client, lib).await? {
-                    bail!("CPF2110: Library {lib} not found.");
+                    bail!("CPF2110: Library {lib} does not exist.");
                 }
                 self.curlib = Some(lib.to_string());
             }
@@ -435,10 +446,10 @@ impl Job<'_> {
     async fn addlible(&mut self, cmd: &Command) -> Result<Outcome> {
         let lib = cmd.get("LIB").to_string();
         if !catalog::library_exists(self.client, &lib).await? {
-            bail!("CPF2110: Library {lib} not found.");
+            bail!("CPF2110: Library {lib} does not exist.");
         }
         if self.library_list().contains(&lib) {
-            bail!("CPF2103: Library {lib} already exists in library list.");
+            bail!("CPF2103: Library {lib} is already in the library list.");
         }
         // Only the user part of the library list can be changed.
         match cmd.get("POSITION") {
@@ -464,7 +475,8 @@ impl Job<'_> {
         )
         .await?
         {
-            return Ok(Outcome::Messages(vec![msg]));
+            let _ = msg;
+            return Ok(Outcome::Messages(vec![]));
         }
         if crate::sqlpl::parse_call(stmt)?.is_none() && !crate::sqlpl::is_compound(stmt) {
             let t = crate::sql::translate(stmt, &|_| false)?;
@@ -483,11 +495,10 @@ impl Job<'_> {
         )
         .await?
         {
-            crate::sql::Outcome::Count(kind, n) => {
-                Ok(Outcome::Messages(vec![crate::sql::count_message(kind, n)]))
-            }
-            crate::sql::Outcome::Message(m) => Ok(Outcome::Messages(vec![m])),
-            crate::sql::Outcome::Rows { .. } => Ok(Outcome::Messages(vec![])),
+            // RUNSQL sends no completion message (observed on IBM i 7.5).
+            crate::sql::Outcome::Count(..)
+            | crate::sql::Outcome::Message(_)
+            | crate::sql::Outcome::Rows { .. } => Ok(Outcome::Messages(vec![])),
         }
     }
 
@@ -1191,7 +1202,7 @@ impl Job<'_> {
         crate::ile::set_program_binding(self.client, &lib, &name, Some(&binding)).await?;
         authority::set_owner(self.client, &lib, &name, "*PGM", &self.user).await?;
         Ok(Outcome::Messages(vec![format!(
-            "Program {name} created in library {lib}."
+            "Program {name} was created in library {lib}."
         )]))
     }
 
@@ -1305,6 +1316,7 @@ impl Job<'_> {
     /// DLTMOD, DLTSRVPGM, DLTBNDDIR.
     async fn dlt_ile(&mut self, cmd: &Command) -> Result<Outcome> {
         let (kw, objtype, what) = match cmd.def.name {
+            "DLTPGM" => ("PGM", "*PGM", "Program"),
             "DLTMOD" => ("MODULE", "*MODULE", "Module"),
             "DLTSRVPGM" => ("SRVPGM", "*SRVPGM", "Service program"),
             _ => ("BNDDIR", "*BNDDIR", "Binding directory"),
@@ -1319,17 +1331,19 @@ impl Job<'_> {
                     bail!("CPF2189: Not authorized to delete {name} in {l} type {objtype}.");
                 }
                 crate::ile::delete_object(self.client, l, &name, objtype).await?;
+                // CPC2191; not found, CPF2105 (observed on IBM i 7.5).
                 let _ = what;
                 return Ok(Outcome::Messages(vec![format!(
-                    "CPC2191: Object {name} in {l} type {objtype} deleted."
+                    "CPC2191: Object {name} of type {objtype} in library {l} was deleted."
                 )]));
             }
         }
-        bail!("CPF2105: {what} {name} not found.")
+        let label = cmd.get(kw).split_once('/').map(|x| x.0).unwrap_or("*LIBL");
+        bail!("CPF2105: Object {name} of type {objtype} in library {label} not found.")
     }
 
     /// DLTF: delete a file (not a physical file that logical files are
-    /// built over: CPF3203).
+    /// built over: CPF3219, observed on IBM i 7.5).
     async fn dltf(&mut self, cmd: &Command) -> Result<Outcome> {
         let (libs, name) = self.search(cmd.get("FILE"));
         let name = name.to_ascii_uppercase();
@@ -1355,13 +1369,13 @@ impl Job<'_> {
         if crate::save::is_save_file(self.client, &lib, &name).await? {
             crate::save::delete_save_file(self.client, &lib, &name).await?;
             return Ok(Outcome::Messages(vec![format!(
-                "File {name} in library {lib} deleted."
+                "CPC2191: Object {name} of type *FILE in library {lib} was deleted."
             )]));
         }
         let mut c = runtime::connect_db(&self.env.database_url).await?;
         catalog::delete_file(&mut c, &lib, &name, false).await?;
         Ok(Outcome::Messages(vec![format!(
-            "CPC2191: Object {name} in {lib} type *FILE deleted."
+            "CPC2191: Object {name} of type *FILE in library {lib} was deleted."
         )]))
     }
 
@@ -1390,7 +1404,7 @@ impl Job<'_> {
             "*CRTDFT" => "*CRTDFT".to_string(),
             lib => {
                 if !catalog::library_exists(self.client, lib).await? {
-                    bail!("CPF2110: Library {lib} not found.");
+                    bail!("CPF2110: Library {lib} does not exist.");
                 }
                 lib.to_string()
             }
@@ -1463,7 +1477,7 @@ impl Job<'_> {
         let curlib = match same("CURLIB") {
             Some(lib) if lib != "*CRTDFT" => {
                 if !catalog::library_exists(self.client, &lib).await? {
-                    bail!("CPF2110: Library {lib} not found.");
+                    bail!("CPF2110: Library {lib} does not exist.");
                 }
                 Some(lib)
             }
@@ -1508,6 +1522,25 @@ impl Job<'_> {
     /// SRCFILE and SRCMBR of a create command (SRCMBR(*FILE), (*PGM): the
     /// member named like the object).
     async fn source_member(&self, cmd: &Command, object: &str) -> Result<crate::source::Member> {
+        // SRCSTMF: the source in a stream file instead of a member (the
+        // compile commands; SRCFILE and SRCMBR are then not used).
+        let stmf = cmd.get("SRCSTMF");
+        if !stmf.is_empty() && cmd.def.params.iter().any(|p| p.keyword == "SRCSTMF") {
+            let (bytes, ccsid) = crate::ifs::read_file(self.client, stmf)
+                .await
+                .map_err(|e| anyhow!("CPFA0A9: Stream file {stmf} cannot be read: {e}"))?;
+            let text = crate::ifs::codec::text(ccsid, &bytes);
+            let text = text.trim_start_matches('\u{FEFF}').replace("\r\n", "\n");
+            let ext = stmf.rsplit('.').next().unwrap_or("").to_ascii_uppercase();
+            return Ok(crate::source::Member {
+                library: String::new(),
+                file: String::new(),
+                name: object.to_string(),
+                srctype: ext,
+                text: String::new(),
+                source: text,
+            });
+        }
         let (libs, file) = self.search(cmd.get("SRCFILE"));
         let member = match cmd.get("SRCMBR") {
             "*FILE" | "*PGM" | "*OBJ" | "*MODULE" | "*CMD" => object.to_string(),
@@ -1579,7 +1612,7 @@ impl Job<'_> {
             bail!("CPF9812: File {file} in library {lib} not found.");
         }
         Ok(Outcome::Messages(vec![format!(
-            "Member {mbr} file {file} in {lib} changed."
+            "CPC3201: Member {mbr} of file {file} in library {lib} was changed."
         )]))
     }
 
@@ -1590,7 +1623,7 @@ impl Job<'_> {
         let name = name.to_ascii_uppercase();
         authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
         Ok(Outcome::Messages(vec![format!(
-            "CPC7301: File {name} created in library {lib}."
+            "CPC7301: File {name} was created in library {lib}."
         )]))
     }
 
@@ -1599,7 +1632,7 @@ impl Job<'_> {
     /// FILE(AS4TRAINR1/GOLDTEST) TYPE(*ATR)"` of a CRTPF RCDLEN(80) file,
     /// 2026-10-21). Attributes this system does not keep show CRTPF's
     /// shipped defaults (SIZE, ALLOCATE, WAITFILE ...; fidelity-gaps.md).
-    async fn dspfd_atr(&mut self, cmd: &Command) -> Result<Outcome> {
+    pub(crate) async fn dspfd_atr(&mut self, cmd: &Command) -> Result<Outcome> {
         let (libs, name) = self.search(cmd.get("FILE"));
         let name = name.to_ascii_uppercase();
         let mut found = None;
@@ -1631,7 +1664,9 @@ impl Job<'_> {
             .await?;
         let attr: String = row.get(0);
         if attr != "PF" {
-            bail!("CPF0006: Errors occurred in command. DSPFD TYPE(*ATR) shows physical files only yet; {name} is {attr}.");
+            bail!(
+                "CPF9898: DSPFD TYPE(*ATR) prints physical files only for now; {name} is {attr}."
+            );
         }
         let text: String = row.get(1);
         let year: i32 = row.get(2);
@@ -1918,41 +1953,6 @@ impl Job<'_> {
         }))
     }
 
-    /// DSPFD TYPE(*MBRLIST) of a source file.
-    async fn dspfd(&mut self, cmd: &Command) -> Result<Outcome> {
-        if cmd.get("TYPE").eq_ignore_ascii_case("*ATR") {
-            return self.dspfd_atr(cmd).await;
-        }
-        let (libs, name) = self.search(cmd.get("FILE"));
-        let name = name.to_ascii_uppercase();
-        let mut found = None;
-        for l in &libs {
-            if crate::source::is_source_file(self.client, l, &name).await? {
-                found = Some(l.clone());
-                break;
-            }
-        }
-        let Some(lib) = found else {
-            bail!("CPF9812: File {name} in library *LIBL not found, or it is not a source file (DSPFD shows the members of source files only).");
-        };
-        authority::check(self.client, &self.user, &lib, &name, "*FILE", Aut::Use).await?;
-        let members = crate::source::members(self.client, &lib, &name).await?;
-        Ok(Outcome::Display(ListDisplay {
-            title: "Display File Description".into(),
-            info: vec![
-                ("File".into(), name.clone()),
-                ("Library".into(), lib.clone()),
-                ("Members".into(), members.len().to_string()),
-            ],
-            heading: format!("{:<10}  {:<10}  Text", "Member", "Type"),
-            rows: members
-                .iter()
-                .map(|(m, t, x)| format!("{m:<10}  {t:<10}  {x}"))
-                .collect(),
-            ..Default::default()
-        }))
-    }
-
     /// CRTPRTF: a printer file, described by DDS or not (SRCFILE(*NONE):
     /// program-described), with its page size and overflow line.
     async fn crtprtf(&mut self, cmd: &Command) -> Result<Outcome> {
@@ -1988,10 +1988,16 @@ impl Job<'_> {
             cmd.get("REPLACE") != "*NO",
         )
         .await
-        .map_err(|e| anyhow!("CPF7302: File {name} not created in library {lib}. {e:#}"))?;
+        .map_err(|e| {
+            if crate::jobs::escape_id(&e.to_string()) == "CPF7302" {
+                e
+            } else {
+                anyhow!("{e:#}\nCPF7302: File {name} was not created in library {lib}.")
+            }
+        })?;
         authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
         Ok(Outcome::Messages(vec![format!(
-            "File {name} created in library {lib}."
+            "Printer file {name} was created in library {lib}."
         )]))
     }
 
@@ -2000,45 +2006,87 @@ impl Job<'_> {
         let (lib, name) = self.create_target(cmd.get("FILE"));
         let lib = lib.to_ascii_uppercase();
         let name = name.to_ascii_uppercase();
-        let rcdlen = cmd.get("RCDLEN").trim().to_ascii_uppercase();
-        let program_described = cmd.def.name == "CRTPF" && !rcdlen.is_empty() && rcdlen != "*NONE";
-        let m = if program_described {
-            // CRTPF RCDLEN(n), no DDS: one record format and one character
-            // field of n bytes, both named like the file (CRTPF
-            // documentation, RCDLEN parameter).
-            let len = number(&rcdlen, "RCDLEN")?;
-            if !(1..=32766).contains(&len) {
-                bail!("CPD0084: RCDLEN({rcdlen}) is not a record length from 1 to 32766.");
-            }
+        // CRTPF RCDLEN(n): a program-described file, without DDS: one
+        // record format and one character field of that length, both
+        // named for the file (CL reference, CRTPF RCDLEN).
+        let rcdlen = cmd.def.name == "CRTPF" && !matches!(cmd.get("RCDLEN"), "" | "*NONE");
+        let m = if rcdlen {
+            let len: u32 = cmd
+                .get("RCDLEN")
+                .parse()
+                .ok()
+                .filter(|n| (1..=32766).contains(n))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "CPD0084: RCDLEN({}) must be a record length from 1 to 32766.\n{}",
+                        cmd.get("RCDLEN"),
+                        crate::cl::CPF0006
+                    )
+                })?;
             crate::source::Member {
+                library: lib.clone(),
+                file: String::new(),
+                name: name.clone(),
+                srctype: "PF".into(),
+                text: String::new(),
                 source: format!(
-                    "{:<16}R {name}\n{:<18}{name:<10} {len:>5}A\n",
-                    "     A", "     A"
+                    "{:5}A{:10}R {name:<10}\n{:5}A{:12}{name:<10} {len:>5}A\n",
+                    "", "", "", ""
                 ),
-                ..Default::default()
             }
         } else {
-            self.source_member(cmd, &name).await?
+            // No source member: CPF9815, then the file is not created,
+            // CPF7302 (observed on IBM i 7.5).
+            self.source_member(cmd, &name).await.map_err(|e| {
+                if crate::jobs::escape_id(&e.to_string()) == "CPF9815" {
+                    anyhow!("{e:#}\nCPF7302: File {name} was not created in library {lib}.")
+                } else {
+                    e
+                }
+            })?
         };
         let mut c = runtime::connect_db(&self.env.database_url).await?;
-        let added = format!("CPC7305: Member {name} added to file {name} in {lib}.");
         let msg = match cmd.def.name {
             "CRTPF" => {
-                let pf = crate::dds::parse_pf(&name, &m.source)?;
+                let mut pf = crate::dds::parse_pf(&name, &m.source)?;
+                match cmd.get("TEXT") {
+                    "" | "*SRCMBRTXT" => {}
+                    "*BLANK" => pf.text = String::new(),
+                    t => pf.text = t.to_string(),
+                }
                 catalog::create_physical_file(&mut c, &lib, &pf).await?;
-                authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
-                return Ok(Outcome::Messages(vec![
-                    format!("CPC7301: File {name} created in library {lib}."),
-                    added,
-                ]));
+                if rcdlen {
+                    self.client
+                        .execute(
+                            "UPDATE as4tainr.files SET described = false WHERE library=$1 AND name=$2",
+                            &[&lib, &name],
+                        )
+                        .await?;
+                }
+                // A physical file gets its member (MBR(*FILE)), named for
+                // the file: CPC7301 then CPC7305 (observed on IBM i 7.5).
+                return {
+                    authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
+                    Ok(Outcome::Messages(vec![
+                        format!("CPC7301: File {name} was created in library {lib}."),
+                        format!(
+                            "CPC7305: Member {name} was added to file {name} in library {lib}."
+                        ),
+                    ]))
+                };
             }
             "CRTLF" => {
                 let lf = crate::dds::parse_lf(&name, &m.source)?;
                 catalog::create_logical_file(&mut c, &self.library_list(), &lib, &lf).await?;
+                // CPC7301 and CPC7305, as for a physical file (observed on
+                // IBM i 7.5).
                 authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
                 return Ok(Outcome::Messages(vec![
-                    format!("CPC7301: File {name} created in library {lib}."),
-                    added,
+                    format!(
+                        "CPC7301: File {name} was created in library {lib} over {}.",
+                        lf.based_on
+                    ),
+                    format!("CPC7305: Member {name} was added to file {name} in library {lib}."),
                 ]));
             }
             _ => {
@@ -2233,8 +2281,14 @@ impl Job<'_> {
             .await?;
         crate::ile::set_program_binding(self.client, &lib, &name, binding.as_ref()).await?;
         authority::set_owner(self.client, &lib, &name, "*PGM", &self.user).await?;
+        // A CL program: CPC0815 (observed on IBM i 7.5).
+        let id = if matches!(cmd.def.name, "CRTBNDCL" | "CRTCLPGM") {
+            "CPC0815: "
+        } else {
+            ""
+        };
         Ok(Outcome::Messages(vec![format!(
-            "Program {name} created in library {lib}."
+            "{id}Program {name} was created in library {lib}."
         )]))
     }
 
@@ -2265,7 +2319,7 @@ impl Job<'_> {
             })
             .collect();
         if chosen.is_empty() {
-            bail!("CPF9815: Member {pattern} file {file} in library {lib} not found.");
+            bail!("CPF9815: Member {pattern} of file {file} in library {lib} does not exist.");
         }
         let to = cmd.get("TOFILE").to_ascii_uppercase();
         let to_target = if to == "*NONE" {
@@ -2371,7 +2425,7 @@ impl Job<'_> {
             })
             .collect();
         if chosen.is_empty() {
-            bail!("CPF9815: Member {pattern} file {file} in library {lib} not found.");
+            bail!("CPF9815: Member {pattern} of file {file} in library {lib} does not exist.");
         }
         let to_mbr = cmd.get("TOMBR").to_ascii_uppercase();
         if chosen.len() > 1 && to_mbr != "*FROMMBR" {
@@ -2553,7 +2607,7 @@ impl Job<'_> {
         let (libs, name) = self.search(cmd.get("CMD"));
         let name = name.to_ascii_uppercase();
         let Some(d) = crate::cmd::find(self.client, &libs, &name).await? else {
-            bail!("CPF2105: Object {name} in *LIBL type *CMD not found.");
+            bail!("CPF2105: Object {name} of type *CMD in library *LIBL not found.");
         };
         authority::check(self.client, &self.user, &d.library, &name, "*CMD", Aut::All).await?;
         crate::cmd::delete(self.client, &d.library, &name).await?;
@@ -2579,7 +2633,7 @@ impl Job<'_> {
                     .unwrap_or_default(),
                 ..Default::default()
             },
-            None => bail!("CPF2105: Object {name} in *LIBL type *CMD not found."),
+            None => bail!("CPF2105: Object {name} of type *CMD in library *LIBL not found."),
         };
         authority::check(self.client, &self.user, &d.library, &name, "*CMD", Aut::Use).await?;
         Ok(Outcome::Display(ListDisplay {
@@ -2621,7 +2675,7 @@ impl Job<'_> {
         let lcklvl = cmd.get("LCKLVL").to_ascii_uppercase();
         if !matches!(lcklvl.as_str(), "*CHG" | "*CS" | "*ALL") {
             bail!(
-                "CPF0006: Errors occurred in command. LCKLVL({lcklvl}) is not *CHG, *CS or *ALL."
+                "CPF0006: The command has errors and was not run. LCKLVL({lcklvl}) is not *CHG, *CS or *ALL."
             );
         }
         crate::cmtctl::start(
@@ -2680,7 +2734,7 @@ impl Job<'_> {
             match cmd.get(k) {
                 "*NONE" | "" => Ok(None),
                 v => v.trim().parse().map(Some).map_err(|_| {
-                    anyhow!("CPF0006: Errors occurred in command. {k}({v}) is not a number.")
+                    anyhow!("CPF0006: The command has errors and was not run. {k}({v}) is not a number.")
                 }),
             }
         };
@@ -2688,12 +2742,12 @@ impl Job<'_> {
             [l, w, ..] => Some((
                 l.parse().map_err(|_| {
                     anyhow!(
-                        "CPF0006: Errors occurred in command. PAGESIZE length {l} is not a number."
+                        "CPF0006: The command has errors and was not run. PAGESIZE length {l} is not a number."
                     )
                 })?,
                 w.parse().map_err(|_| {
                     anyhow!(
-                        "CPF0006: Errors occurred in command. PAGESIZE width {w} is not a number."
+                        "CPF0006: The command has errors and was not run. PAGESIZE width {w} is not a number."
                     )
                 })?,
             )),
@@ -2728,6 +2782,7 @@ impl Job<'_> {
             self.calls.level()
         };
         let files = cmd.list("FILE");
+        let before = self.calls.overrides.len();
         self.calls.overrides.retain(|o| {
             o.level != level
                 || !files.iter().any(|f| {
@@ -2736,6 +2791,16 @@ impl Job<'_> {
                         || f.eq_ignore_ascii_case(&o.file)
                 })
         });
+        // A file with no override at the level: CPF9841 (CL reference,
+        // DLTOVR; observed on IBM i 7.5).
+        if self.calls.overrides.len() == before
+            && !files.iter().any(|f| f == "*ALL" || f == "*PRTF")
+        {
+            bail!(
+                "CPF9841: There is no override of file {} at this call level.",
+                files.join(" ")
+            );
+        }
         Ok(Outcome::Messages(vec![]))
     }
 
@@ -2804,7 +2869,7 @@ impl Job<'_> {
             m => m.to_ascii_uppercase(),
         };
         Ok(Outcome::Messages(vec![format!(
-            "Member {mbr} of file {name} in library {} cleared.",
+            "CPC3101: Member {mbr} of file {name} in library {} was cleared.",
             fr.library
         )]))
     }
@@ -2814,13 +2879,13 @@ impl Job<'_> {
     async fn dlyjob(&mut self, cmd: &Command) -> Result<Outcome> {
         let secs: u64 = match (cmd.get("DLY"), cmd.get("RSMTIME")) {
             (d, _) if d != "*NONE" && !d.is_empty() => d.trim().parse().map_err(|_| {
-                anyhow!("CPF0006: Errors occurred in command. DLY({d}) is not a number of seconds.")
+                anyhow!("CPF0006: The command has errors and was not run. DLY({d}) is not a number of seconds.")
             })?,
             (_, t) if t != "*NONE" && !t.is_empty() => {
                 let t: String = t.chars().filter(|c| c.is_ascii_digit()).collect();
                 if t.len() != 6 {
                     bail!(
-                        "CPF0006: Errors occurred in command. RSMTIME({t}) is not a time hhmmss."
+                        "CPF0006: The command has errors and was not run. RSMTIME({t}) is not a time hhmmss."
                     );
                 }
                 let target = t[0..2].parse::<u64>()? * 3600
@@ -2832,7 +2897,7 @@ impl Job<'_> {
                     .unwrap_or(0);
                 (target + 86400 - now) % 86400
             }
-            _ => bail!("CPF0006: Errors occurred in command. DLY or RSMTIME is needed."),
+            _ => bail!("CPF0006: The command has errors and was not run. DLY or RSMTIME is needed."),
         };
         if let Some(id) = &self.id {
             jobs::set_function(self.client, id, "DLYJOB", "DLY").await;
@@ -2852,7 +2917,7 @@ impl Job<'_> {
         crate::msgf::create(self.client, &lib, &name, text).await?;
         authority::set_owner(self.client, &lib, &name, "*MSGF", &self.user).await?;
         Ok(Outcome::Messages(vec![format!(
-            "Message file {name} created in library {lib}."
+            "CPC9801: Object {name} of type *MSGF was created in library {lib}."
         )]))
     }
 
@@ -2877,7 +2942,7 @@ impl Job<'_> {
         crate::msgf::delete(self.client, &lib, &name).await?;
         authority::forget(self.client, &lib, &name, "*MSGF").await?;
         Ok(Outcome::Messages(vec![format!(
-            "Message file {name} deleted from library {lib}."
+            "CPC2191: Object {name} of type *MSGF in library {lib} was deleted."
         )]))
     }
 
@@ -2889,7 +2954,7 @@ impl Job<'_> {
         let old = if change {
             let all = crate::msgf::list(self.client, &lib, &name).await?;
             Some(all.into_iter().find(|d| d.msgid == msgid).ok_or_else(|| {
-                anyhow!("CPF2419: Message identifier {msgid} not found in message file {name} in {lib}.")
+                anyhow!("CPF2419: Message {msgid} is not in message file {name} in library {lib}.")
             })?)
         } else {
             None
@@ -2908,7 +2973,9 @@ impl Job<'_> {
             v if same(v) => old.as_ref().map(|d| d.sev).unwrap_or(0),
             v => match v.trim().parse::<i32>() {
                 Ok(n) if (0..=99).contains(&n) => n,
-                _ => bail!("CPF0006: Errors occurred in command. SEV({v}) is not 0-99."),
+                _ => {
+                    bail!("CPF0006: The command has errors and was not run. SEV({v}) is not 0-99.")
+                }
             },
         };
         let fmt_vals = cmd.list("FMT");
@@ -3035,7 +3102,7 @@ impl Job<'_> {
                 .collect(),
             l => {
                 if !catalog::library_exists(self.client, l).await? {
-                    bail!("CPF2110: Library {l} not found.");
+                    bail!("CPF2110: Library {l} does not exist.");
                 }
                 vec![l.to_string()]
             }
@@ -3234,7 +3301,7 @@ impl Job<'_> {
             "*CRTDFT" => None,
             l => {
                 if !catalog::library_exists(self.client, l).await? {
-                    bail!("CPF2110: Library {l} not found.");
+                    bail!("CPF2110: Library {l} does not exist.");
                 }
                 Some(l.to_string())
             }
@@ -3260,7 +3327,7 @@ impl Job<'_> {
         )
         .await?;
         Ok(Outcome::Messages(vec![format!(
-            "CPC1221: Job {id} submitted to job queue {jobq} in library QGPL."
+            "CPC1221: Job {id} was put on job queue {jobq} in library QGPL."
         )]))
     }
 
@@ -3545,7 +3612,7 @@ impl Job<'_> {
         let (lib, name, objtype) = self.object_named(cmd).await?;
         let a = authority::get(self.client, &lib, &name, &objtype)
             .await?
-            .ok_or_else(|| anyhow!("CPF9801: Object {name} in library {lib} not found."))?;
+            .ok_or_else(|| anyhow!("CPF9801: Object {name} was not found in library {lib}."))?;
         let mut rows = vec![format!("{:<10}  {}", a.owner, "*ALL (owner)")];
         for (u, aut) in &a.private {
             rows.push(format!("{u:<10}  {}", aut.code()));
@@ -3714,7 +3781,7 @@ impl Job<'_> {
         .await?;
         authority::set_owner(self.client, &d.library, &d.name, "*DTAARA", &self.user).await?;
         Ok(Outcome::Messages(vec![format!(
-            "CPC0904: Data area {} created in library {}.",
+            "CPC0904: Data area {} was created in library {}.",
             d.name, d.library
         )]))
     }
@@ -3759,10 +3826,9 @@ impl Job<'_> {
             cmd.get("VALUE"),
         )
         .await?;
-        Ok(Outcome::Messages(vec![format!(
-            "Data area {} in {} changed.",
-            d.name, d.library
-        )]))
+        // CHGDTAARA sends no completion message (observed on IBM i 7.5).
+        let _ = d;
+        Ok(Outcome::Messages(vec![]))
     }
 
     async fn dspdtaara(&mut self, cmd: &Command) -> Result<Outcome> {
@@ -3885,7 +3951,7 @@ impl Job<'_> {
             "*CURLIB" => vec![self.current_library()],
             l => {
                 if !catalog::library_exists(self.client, l).await? {
-                    bail!("CPF9810: Library {l} not found.");
+                    bail!("CPF9810: Library {l} does not exist.");
                 }
                 vec![l.to_string()]
             }
@@ -3905,7 +3971,7 @@ impl Job<'_> {
             }
         }
         let Some(lib) = found else {
-            bail!("CPF9801: Object {name} in library {label} not found.");
+            bail!("CPF9801: Object {name} was not found in library {label}.");
         };
         let mbr = mbr.trim().to_ascii_uppercase();
         if !mbr.is_empty() && mbr != "*NONE" && objtype == "*FILE" {
@@ -3917,7 +3983,7 @@ impl Job<'_> {
                 _ => mbr == "*FIRST" || mbr == name,
             };
             if !ok {
-                bail!("CPF9815: Member {mbr} file {name} in library {lib} not found.");
+                bail!("CPF9815: Member {mbr} of file {name} in library {lib} does not exist.");
             }
         }
         let aut = aut.trim().to_ascii_uppercase();
@@ -4008,7 +4074,10 @@ impl Job<'_> {
         };
         let detail = cmd.get("DETAIL").trim().to_ascii_uppercase();
         if !detail.is_empty() && detail != "*BASIC" {
-            bail!("CPF0006: Errors occurred in command. DETAIL({detail}) is not supported yet; *BASIC is.");
+            return Err(crate::cl::diag_error(
+                "CPD0084",
+                &format!("DETAIL({detail}) is not supported yet; *BASIC is."),
+            ));
         }
         let (label, name) = match obj.split_once('/') {
             Some((l, n)) => (l.to_string(), n.to_string()),
@@ -4020,7 +4089,7 @@ impl Job<'_> {
             "*ALL" | "*USRLIBL" | "*ALLUSR" => catalog::list_libraries(self.client).await?,
             l => {
                 if !catalog::library_exists(self.client, l).await? {
-                    bail!("CPF9810: Library {l} not found.");
+                    bail!("CPF9810: Library {l} does not exist.");
                 }
                 vec![l.to_string()]
             }
@@ -4137,8 +4206,8 @@ impl Job<'_> {
     }
 
     async fn dltdtaara(&mut self, cmd: &Command) -> Result<Outcome> {
-        // DLTDTAARA of a data area that is not there: CPF2105, as for
-        // other delete commands (PUB400, IBM i 7.5, 2026-10-21).
+        // Not found: CPF2105, as for other objects DLTxxx deletes
+        // (observed on IBM i 7.5).
         let found = match dtaara::resolve(
             self.client,
             cmd.get("DTAARA"),
@@ -4148,10 +4217,10 @@ impl Job<'_> {
         .await
         {
             Ok(f) => f,
-            Err(e) if e.to_string().starts_with("CPF1015") => {
+            Err(e) if crate::jobs::escape_id(&e.to_string()) == "CPF1015" => {
                 let q = cmd.get("DTAARA").to_ascii_uppercase();
-                let (l, n) = q.split_once('/').unwrap_or(("*LIBL", q.as_str()));
-                bail!("CPF2105: Object {n} in {l} type *DTAARA not found.");
+                let (lib, name) = q.split_once('/').unwrap_or(("*LIBL", &q));
+                bail!("CPF2105: Object {name} of type *DTAARA in library {lib} not found.");
             }
             Err(e) => return Err(e),
         };
@@ -4173,7 +4242,7 @@ impl Job<'_> {
         )
         .await?;
         Ok(Outcome::Messages(vec![format!(
-            "CPC2191: Object {} in {} type *DTAARA deleted.",
+            "CPC2191: Object {} of type *DTAARA in library {} was deleted.",
             d.name, d.library
         )]))
     }
@@ -4275,6 +4344,13 @@ impl Job<'_> {
                     _ => self.call_rpg(&name, Some(&p.library), args).await,
                 }
             }
+            // Not in a library named on the command: CPD0170, CPF0006.
+            None if matches!(pgm.split_once('/'), Some((l, _)) if !l.starts_with('*')) => {
+                Err(crate::cl::diag_error(
+                    "CPD0170",
+                    &format!("Program {name} was not found in library {}.", libs[0]),
+                ))
+            }
             // Not a program object: the source in AS4TAINR_PGM_PATH (the
             // samples).
             None => self.call_rpg(&name, None, args).await,
@@ -4303,7 +4379,17 @@ impl Job<'_> {
                 ..Default::default()
             }),
         }
-        .ok_or_else(|| anyhow!("CPF4101: Program {pgm} not found."))?;
+        // A program that is not there: the command analyzer's CPD0170, then
+        // CPF0006 (observed on IBM i 7.5 for CALL on a command line).
+        .ok_or_else(|| {
+            crate::cl::diag_error(
+                "CPD0170",
+                &format!(
+                    "Program {pgm} was not found in library {}.",
+                    library.unwrap_or("*LIBL")
+                ),
+            )
+        })?;
         let r = crate::rpg::call_with(
             &self.env.database_url,
             self.library_list(),
@@ -4337,7 +4423,7 @@ impl Job<'_> {
 /// A whole number in a command parameter.
 fn number(s: &str, keyword: &str) -> Result<u32> {
     s.trim().parse().map_err(|_| {
-        anyhow!("CPF0006: Errors occurred in command. {keyword} value '{s}' is not a number.")
+        anyhow!("CPF0006: The command has errors and was not run. {keyword} value '{s}' is not a number.")
     })
 }
 

@@ -23,16 +23,7 @@ const MAX_HANDLER_DEPTH: u32 = 20;
 
 /// The message identifier an error starts with (`CPF5026: ...`), if any.
 pub(super) fn message_id(err: &anyhow::Error) -> String {
-    let t = err.root_cause().to_string();
-    let id: String = t.chars().take(7).collect();
-    let ok = id.len() == 7
-        && id[..3].chars().all(|c| c.is_ascii_uppercase())
-        && id[3..].chars().all(|c| c.is_ascii_hexdigit());
-    if ok && t[7..].starts_with(':') {
-        id
-    } else {
-        String::new()
-    }
+    crate::jobs::escape_id(&err.root_cause().to_string()).to_string()
 }
 
 /// The RPG status code of an error (ILE RPG Reference, "Program Status

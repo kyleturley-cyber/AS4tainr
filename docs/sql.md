@@ -5,7 +5,7 @@ as4tainr runs SQL in the DB2 for i dialect against the same files RPG programs u
 | Where | How |
 | --- | --- |
 | 5250 session | `STRSQL`: type a statement, press Enter. A SELECT shows its rows on a Display Data screen (Page Up/Down, F19/F20 to shift wide results); other statements report how many rows they changed. F9 retrieves the previous statement, F3 ends. |
-| Command line | `RUNSQL SQL('UPDATE CUSTMAST SET CUSBAL = 0 WHERE CUSNO = 3')`: one statement that does not return rows (as on IBM i, RUNSQL does not run SELECT). |
+| Command line | `RUNSQL SQL('UPDATE CUSTMAST SET CUSBAL = 0 WHERE CUSNO = 3')`: one statement that does not return rows (as on IBM i, RUNSQL does not run SELECT). It sends no completion message; a statement that fails ends with SQL9010, with the SQL error in its text (as observed on IBM i 7.5). |
 | Scripts | `RUNSQLSTM SRCFILE(LIB/QSQLSRC) SRCMBR(NAME)`: the statements of a source member, separated by semicolons (`--` and `/* */` comments). A statement that fails stops the run with SQL9010 unless `ERRLVL(30)` (SQL errors have severity 30), which runs every statement and reports the ones that failed. `DFTRDBCOL(LIB)` is the default schema. SELECT is not valid in a script. |
 | Shell | `as4tainr sql "SELECT * FROM QGPL/CUSTMAST"`, with the library list from `AS4TAINR_LIBL`. In Docker: `docker compose exec as4tainr as4tainr sql "..."`. |
 

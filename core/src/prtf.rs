@@ -522,7 +522,7 @@ pub async fn create(
         .await?
         .is_none()
     {
-        bail!("CPF2110: Library {lib} not found.");
+        bail!("CPF2110: Library {lib} does not exist.");
     }
     let existing = tx
         .query_opt(
@@ -538,7 +538,7 @@ pub async fn create(
             )
             .await?;
         }
-        Some(_) => bail!("CPF7302: File {name} already exists in library {lib}."),
+        Some(_) => return Err(crate::catalog::file_exists_error(&name, &lib)),
         None => {}
     }
     tx.execute(

@@ -65,7 +65,13 @@ pub fn check_msgid(id: &str) -> Result<String> {
         && id.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
         && id[3..].chars().all(|c| c.is_ascii_hexdigit());
     if !ok {
-        bail!("CPF0006: Errors occurred in command. '{id}' is not a valid message identifier.");
+        // CPD0075, then CPF0006 (observed on IBM i 7.5 for ADDMSGD).
+        return Err(crate::cl::diag_error(
+            "CPD0075",
+            &format!(
+                "MSGID({id}) must be 7 characters: 3 letters or digits, then 4 hexadecimal digits."
+            ),
+        ));
     }
     Ok(id)
 }
@@ -108,17 +114,19 @@ pub fn parse_fmt(items: &[String]) -> Result<Vec<Field>> {
                 | "*SPP"
                 | "*SYP"
         ) {
-            bail!("CPF0006: Errors occurred in command. FMT type {ty} is not valid.");
+            bail!("CPF0006: The command has errors and was not run. FMT type {ty} is not valid.");
         }
         let num = |s: &str| -> Result<u32> {
             s.parse().map_err(|_| {
-                anyhow!("CPF0006: Errors occurred in command. FMT length {s} is not valid.")
+                anyhow!(
+                    "CPF0006: The command has errors and was not run. FMT length {s} is not valid."
+                )
             })
         };
         let (len, extra) = match (ty.as_str(), w.get(1).copied(), w.get(2).copied()) {
             ("*DEC", Some(l), d) => (Some(num(l)?), d.map(num).transpose()?.unwrap_or(0)),
             ("*DEC", None, _) => {
-                bail!("CPF0006: Errors occurred in command. FMT(*DEC) needs a length.")
+                bail!("CPF0006: The command has errors and was not run. FMT(*DEC) needs a length.")
             }
             ("*BIN" | "*UBIN", l, _) => (Some(l.map(num).transpose()?.unwrap_or(2)), 0),
             ("*DTS" | "*ITV" | "*UTC" | "*UTCD" | "*UTCT", _, _) => (Some(8), 0),
@@ -132,7 +140,7 @@ pub fn parse_fmt(items: &[String]) -> Result<Vec<Field>> {
         out.push(Field { ty, len, extra });
     }
     if out.len() > 99 {
-        bail!("CPF0006: Errors occurred in command. A message has at most 99 data fields.");
+        bail!("CPF0006: The command has errors and was not run. A message has at most 99 data fields.");
     }
     Ok(out)
 }
@@ -262,7 +270,7 @@ async fn library_exists(client: &Client, lib: &str) -> Result<()> {
         .await?
         .is_none()
     {
-        bail!("CPF2110: Library {lib} not found.");
+        bail!("CPF2110: Library {lib} does not exist.");
     }
     Ok(())
 }
@@ -344,7 +352,7 @@ pub async fn add(client: &Client, d: &Description, replace: bool) -> Result<()> 
     if n == 0 {
         if replace {
             bail!(
-                "CPF2419: Message identifier {} not found in message file {} in {}.",
+                "CPF2419: Message {} is not in message file {} in library {}.",
                 d.msgid,
                 d.msgf,
                 d.library
@@ -369,7 +377,7 @@ pub async fn remove(client: &Client, library: &str, msgf: &str, msgid: &str) -> 
         )
         .await?;
     if n == 0 {
-        bail!("CPF2419: Message identifier {msgid} not found in message file {msgf} in {library}.");
+        bail!("CPF2419: Message {msgid} is not in message file {msgf} in library {library}.");
     }
     Ok(())
 }

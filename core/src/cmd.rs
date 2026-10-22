@@ -164,7 +164,7 @@ fn parse_values(s: &str) -> Result<Vec<(Option<String>, Vec<Item>)>> {
             }
             match cs.get(*i) {
                 None => {
-                    bail!("CPF0006: Errors occurred in command. A closing parenthesis is missing.")
+                    bail!("CPF0006: The command has errors and was not run. A closing parenthesis is missing.")
                 }
                 Some(')') => {
                     *i += 1;
@@ -182,7 +182,7 @@ fn parse_values(s: &str) -> Result<Vec<(Option<String>, Vec<Item>)>> {
             loop {
                 match cs.get(*i) {
                     None => bail!(
-                        "CPF0006: Errors occurred in command. A closing apostrophe is missing."
+                        "CPF0006: The command has errors and was not run. A closing apostrophe is missing."
                     ),
                     Some('\'') if cs.get(*i + 1) == Some(&'\'') => {
                         v.push('\'');
@@ -229,7 +229,7 @@ fn parse_values(s: &str) -> Result<Vec<(Option<String>, Vec<Item>)>> {
             continue;
         }
         if cs[i] == ')' {
-            bail!("CPF0006: Errors occurred in command. Unexpected parenthesis.");
+            bail!("CPF0006: The command has errors and was not run. Unexpected parenthesis.");
         }
         let a = atom(&cs, &mut i)?;
         match (&a, cs.get(i)) {
@@ -659,7 +659,7 @@ pub async fn create(client: &mut Client, d: &Definition, text: &str, replace: bo
         .await?
         .is_none()
     {
-        bail!("CPF2110: Library {} not found.", d.library);
+        bail!("CPF2110: Library {} does not exist.", d.library);
     }
     let exists = tx
         .query_opt(
@@ -733,7 +733,7 @@ pub async fn delete(client: &Client, library: &str, name: &str) -> Result<bool> 
 // ------------------------------------------------------------ running
 
 fn bad(kwd: &str, msg: impl std::fmt::Display) -> anyhow::Error {
-    anyhow!("CPF0006: Errors occurred in command. {kwd}: {msg}")
+    anyhow!("CPF0006: The command has errors and was not run. {kwd}: {msg}")
 }
 
 /// A PARM and its values as typed (None when not given).
@@ -765,7 +765,7 @@ pub fn bind<'a>(d: &'a Definition, line: &str) -> Result<Vec<Bound<'a>>> {
                 .position(|p| p.kwd == k && p.constant.is_none())
                 .ok_or_else(|| {
                     anyhow!(
-                        "CPF0006: Errors occurred in command. Keyword {k} not valid for command {}.",
+                        "CPF0006: The command has errors and was not run. Keyword {k} not valid for command {}.",
                         d.name
                     )
                 })?,
@@ -773,14 +773,14 @@ pub fn bind<'a>(d: &'a Definition, line: &str) -> Result<Vec<Bound<'a>>> {
                 .find(|i| !vals.contains_key(i))
                 .ok_or_else(|| {
                     anyhow!(
-                        "CPF0006: Errors occurred in command. Too many positional parameters for command {}.",
+                        "CPF0006: The command has errors and was not run. Too many positional parameters for command {}.",
                         d.name
                     )
                 })?,
         };
         if vals.insert(i, v).is_some() {
             bail!(
-                "CPF0006: Errors occurred in command. Keyword {} specified more than once.",
+                "CPF0006: The command has errors and was not run. Keyword {} specified more than once.",
                 d.parms[i].kwd
             );
         }
@@ -823,7 +823,7 @@ fn encode_parm(d: &Definition, p: &Parm, given: Option<Vec<Item>>) -> Result<Arg
         (None, None) => match &p.dft {
             Some(dft) => Some(raw_items(dft)?),
             None if p.min > 0 => bail!(
-                "CPF0006: Errors occurred in command. Value for required parameter {} is missing.",
+                "CPF0006: The command has errors and was not run. Value for required parameter {} is missing.",
                 p.kwd
             ),
             None => None,

@@ -17,7 +17,7 @@
 //! - `MONMSG MSGID EXEC` after a command, or program-level (right after
 //!   the declarations); generic IDs like `CPF0000` and `CPF9800`
 //! - `SNDPGMMSG` (MSG, MSGID/MSGDTA, MSGTYPE *INFO *COMP *DIAG *ESCAPE),
-//!   `CHKOBJ`, `RTVJOBA` (JOB, USER, NBR, CURLIB, TYPE), `RTVDTAARA`
+//!   `RTVJOBA` (JOB, USER, NBR, CURLIB, TYPE), `RTVDTAARA`
 //! - `CALL PGM PARM` (CL programs here, others through the RPG runner)
 //! - any other command the job knows, with `&variables` replaced by
 //!   their values
@@ -1153,11 +1153,9 @@ pub fn msgid_matches(monitor: &str, id: &str) -> bool {
 /// error without one.
 pub fn error_id(e: &anyhow::Error) -> String {
     let s = e.to_string();
-    let head = s.split(':').next().unwrap_or("");
-    if is_msgid(head) {
-        head.to_string()
-    } else {
-        "CPF9898".into()
+    match crate::jobs::escape_id(&s) {
+        "" => "CPF9898".into(),
+        id => id.to_string(),
     }
 }
 
@@ -3002,6 +3000,8 @@ pub(crate) const SYSTEM_VALUE_NAMES: &[&str] = &[
     "QUSRLIBL",
     "QMODEL",
     "QSRLNBR",
+    "QMAXSIGN",
+    "QPWDEXPITV",
 ];
 
 /// What a system value is for (DSPSYSVAL), in our own words. None: not
@@ -3033,6 +3033,8 @@ pub(crate) fn system_value_description(name: &str) -> Option<&'static str> {
         "QUSRLIBL" => "User part of the library list",
         "QMODEL" => "System model",
         "QSRLNBR" => "System serial number",
+        "QMAXSIGN" => "Sign-on attempts before the device or profile is disabled",
+        "QPWDEXPITV" => "Days before a password must be changed",
         _ => return None,
     })
 }
@@ -3093,6 +3095,9 @@ fn system_value(name: &str) -> Result<Value> {
         "QUSRLIBL" => c(list(crate::commands::USER_LIBRARY_LIST, 250)),
         "QMODEL" => c("0000".into()),
         "QSRLNBR" => c("00000000".into()),
+        // Shipped values (DSPSYSVAL on IBM i 7.5 shows them).
+        "QMAXSIGN" => c("3".into()),
+        "QPWDEXPITV" => c("*NOMAX".into()),
         other => bail!("CPF1028: System value {other} not found."),
     })
 }
@@ -3593,7 +3598,7 @@ async fn command(
                 }
             }
             let Some(r) = row else {
-                bail!("CPF9801: Object {name} in library {label} not found.");
+                bail!("CPF9801: Object {name} was not found in library {label}.");
             };
             let lib: String = r.get(0);
             crate::authority::check(
@@ -3741,7 +3746,7 @@ async fn command(
                     m => rows.iter().find(|r| r.get::<_, String>(0) == m),
                 };
                 let Some(m) = pick else {
-                    bail!("CPF9815: Member {mbr_arg} file {fname} in library {lib} not found.");
+                    bail!("CPF9815: Member {mbr_arg} of file {fname} in library {lib} does not exist.");
                 };
                 text = m.get(2);
                 stamp = format!("{}{}", cent(m.get(5)), m.get::<_, String>(4));
@@ -3749,7 +3754,7 @@ async fn command(
                 (m.get(0), m.get(1), lines)
             } else {
                 if !matches!(mbr_arg.as_str(), "*FIRST" | "*LAST") && mbr_arg != fname {
-                    bail!("CPF9815: Member {mbr_arg} file {fname} in library {lib} not found.");
+                    bail!("CPF9815: Member {mbr_arg} of file {fname} in library {lib} does not exist.");
                 }
                 let count = if attr == "PF" || attr == "LF" {
                     let fr = crate::catalog::resolve_file(
@@ -3801,30 +3806,6 @@ async fn command(
                 };
                 set_var(vars, target, v)?;
             }
-            Ok(None)
-        }
-        "CHKOBJ" => {
-            let p = named(st, &["OBJ", "OBJTYPE", "MBR", "AUT"])?;
-            let obj = substitute_text(
-                p.get("OBJ")
-                    .ok_or_else(|| anyhow!("line {}: CHKOBJ needs OBJ", st.line))?,
-                vars,
-            )?
-            .trim_matches('\'')
-            .to_ascii_uppercase();
-            let objtype = p
-                .get("OBJTYPE")
-                .map(|t| t.trim().to_ascii_uppercase())
-                .ok_or_else(|| anyhow!("line {}: CHKOBJ needs OBJTYPE", st.line))?;
-            let mbr = match p.get("MBR") {
-                Some(m) => substitute_text(m, vars)?,
-                None => "*NONE".into(),
-            };
-            let aut = p
-                .get("AUT")
-                .map(|a| a.to_string())
-                .unwrap_or_else(|| "*NONE".into());
-            job.chkobj(&obj, &objtype, &mbr, &aut).await?;
             Ok(None)
         }
         "RTVJOBA" => {
@@ -4166,6 +4147,18 @@ mod tests {
             "{:?}",
             c.value
         );
+        // Observed on IBM i 7.5: DCL &D *DEC (7 2) VALUE(-12.5) assigned to
+        // a *CHAR 10 is '-000012,50' with QDECFMT(J); with the shipped
+        // QDECFMT (blank) the decimal point is a period.
+        let mut d = dec(7, 2);
+        assign("&D", &mut d, Value::Dec("-12.5".parse().unwrap())).unwrap();
+        let mut c = chr(10);
+        assign("&C", &mut c, d.value.clone()).unwrap();
+        assert!(
+            matches!(&c.value, Value::Char(s) if s == "-000012.50"),
+            "{:?}",
+            c.value
+        );
     }
 
     use super::*;
@@ -4300,7 +4293,7 @@ mod tests {
         assert!(msgid_matches("CPF2110", "CPF2110"));
         assert!(!msgid_matches("CPF0000", "MCH1210"));
         assert_eq!(
-            error_id(&anyhow!("CPF2110: Library X not found.")),
+            error_id(&anyhow!("CPF2110: Library X does not exist.")),
             "CPF2110"
         );
         assert_eq!(error_id(&anyhow!("no id here")), "CPF9898");

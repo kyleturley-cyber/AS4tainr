@@ -121,9 +121,9 @@ def main():
             check(True, "three clerks are signed on at the same time as QSECOFR")
 
             # Batch work while the clerks type.
-            command(sec, "sbmjob cmd(call custprt) job(rpt1)", "submitted to job queue QBATCH")
-            command(sec, "sbmjob cmd(dsppfm itemmast) job(stock)", "submitted to job queue QBATCH")
-            command(sec, "sbmjob cmd(call custprt) job(rpt2)", "submitted to job queue QBATCH")
+            command(sec, "sbmjob cmd(call custprt) job(rpt1)", "was put on job queue QBATCH")
+            command(sec, "sbmjob cmd(dsppfm itemmast) job(stock)", "was put on job queue QBATCH")
+            command(sec, "sbmjob cmd(call custprt) job(rpt2)", "was put on job queue QBATCH")
 
             errors = []
             threads = [threading.Thread(target=clerk, args=(sessions[u], CLERKS[u], errors, u))

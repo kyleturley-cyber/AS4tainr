@@ -1,0 +1,49 @@
+# CPYF, DSPFFD/DSPFD/DSPOBJD, save files, programs from stream files (round 4). Objects GLD* in AS4TRAINR1, IFS /home/AS4TRAINR/gld.
+c_cleanup|!for o in GLDPF GLDCPY GLDCPY2 GLDSRC GLDSAVF; do system -q "DLTF FILE(AS4TRAINR1/$o)"; done; for o in GLDDA GLDDA2; do system -q "DLTDTAARA DTAARA(AS4TRAINR1/$o)"; done; for o in GLDCL1 GLDCL2 GLDRPG1; do system -q "DLTPGM PGM(AS4TRAINR1/$o)"; done; rm -rf /home/AS4TRAINR/gld; mkdir -p /home/AS4TRAINR/gld; echo cleaned
+# a DDS physical file and records
+f_src|!printf '     A          R GLDR\n     A            CODE           5P 0\n     A            NAME          20A\n     A          K CODE\n' > /home/AS4TRAINR/gld/gldpf.pf && echo ok
+f_crtsrcpf|!system "CRTSRCPF FILE(AS4TRAINR1/GLDSRC) RCDLEN(112)"
+f_member|!system "CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gldpf.pf') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLDSRC.FILE/GLDPF.MBR')"
+f_crtpf|!system -s "CRTPF FILE(AS4TRAINR1/GLDPF) SRCFILE(AS4TRAINR1/GLDSRC)"
+f_ins|!system "RUNSQL SQL('INSERT INTO AS4TRAINR1.GLDPF VALUES(2, ''Beta''), (1, ''Alpha'')') COMMIT(*NONE)"
+f_dspfd_atr|!system "DSPFD FILE(AS4TRAINR1/GLDPF) TYPE(*ATR)"
+f_dspffd|!system "DSPFFD FILE(AS4TRAINR1/GLDPF)"
+f_dspobjd|!system "DSPOBJD OBJ(AS4TRAINR1/GLDPF) OBJTYPE(*FILE)"
+f_dspobjd_missing|!system "DSPOBJD OBJ(AS4TRAINR1/NOSUCH) OBJTYPE(*FILE)"
+f_chkobj_aut|!system "CHKOBJ OBJ(AS4TRAINR1/GLDPF) OBJTYPE(*FILE) AUT(*CHANGE)"
+f_chkobj_mbr|!system "CHKOBJ OBJ(AS4TRAINR1/GLDPF) OBJTYPE(*FILE) MBR(NOSUCH)"
+# CPYF
+y_crtfile|!system "CPYF FROMFILE(AS4TRAINR1/GLDPF) TOFILE(AS4TRAINR1/GLDCPY) CRTFILE(*YES)"
+y_none_full|!system "CPYF FROMFILE(AS4TRAINR1/GLDPF) TOFILE(AS4TRAINR1/GLDCPY)"
+y_add|!system "CPYF FROMFILE(AS4TRAINR1/GLDPF) TOFILE(AS4TRAINR1/GLDCPY) MBROPT(*ADD)"
+y_replace|!system "CPYF FROMFILE(AS4TRAINR1/GLDPF) TOFILE(AS4TRAINR1/GLDCPY) MBROPT(*REPLACE)"
+y_missing_to|!system "CPYF FROMFILE(AS4TRAINR1/GLDPF) TOFILE(AS4TRAINR1/NOSUCH)"
+y_missing_from|!system "CPYF FROMFILE(AS4TRAINR1/NOSUCH) TOFILE(AS4TRAINR1/GLDCPY)"
+y_rcdlen|!system "CRTPF FILE(AS4TRAINR1/GLDCPY2) RCDLEN(30)"
+y_fmt_none|!system "CPYF FROMFILE(AS4TRAINR1/GLDPF) TOFILE(AS4TRAINR1/GLDCPY2) MBROPT(*ADD)"
+y_fmt_nochk|!system "CPYF FROMFILE(AS4TRAINR1/GLDPF) TOFILE(AS4TRAINR1/GLDCPY2) MBROPT(*ADD) FMTOPT(*NOCHK)"
+y_print|!system "CPYF FROMFILE(AS4TRAINR1/GLDCPY2) TOFILE(*PRINT)"
+# programs from stream files (no quotes in the RPG source)
+g_src|!printf 'PGM\n DCL VAR(&D) TYPE(*DEC) LEN(7 2) VALUE(-12.5)\n DCL VAR(&C) TYPE(*CHAR) LEN(10)\n CHGVAR VAR(&C) VALUE(&D)\n SNDPGMMSG MSG(&C) MSGTYPE(*COMP)\n CALL PGM(AS4TRAINR1/NOSUCH)\n MONMSG MSGID(CPF0001) EXEC(SNDPGMMSG MSG(CPF0001) MSGTYPE(*COMP))\n MONMSG MSGID(CPF0006) EXEC(SNDPGMMSG MSG(CPF0006) MSGTYPE(*COMP))\n MONMSG MSGID(CPD0170) EXEC(SNDPGMMSG MSG(CPD0170) MSGTYPE(*COMP))\nENDPGM\n' > /home/AS4TRAINR/gld/gldcl1.clle && printf 'PGM\n SNDPGMMSG MSGID(CPF9898) MSGF(QCPFMSG) MSGDTA(GOLDEN) MSGTYPE(*ESCAPE)\nENDPGM\n' > /home/AS4TRAINR/gld/gldcl2.clle && printf '**FREE\ndcl-s GLDDA2 char(20) dtaara(*auto);\ndcl-s n packed(5:2) inz(0.5);\ndcl-s m packed(5:2) inz(-0.25);\nGLDDA2 = %%char(n) + %%char(m);\n*inlr = *on;\n' > /home/AS4TRAINR/gld/gldrpg1.rpgle && echo ok
+g_crtda|!system "CRTDTAARA DTAARA(AS4TRAINR1/GLDDA2) TYPE(*CHAR) LEN(20)"
+g_crtbndcl|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLDCL1) SRCSTMF('/home/AS4TRAINR/gld/gldcl1.clle')"
+g_call_cl|!system "CALL PGM(AS4TRAINR1/GLDCL1)"
+g_crtbndcl2|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLDCL2) SRCSTMF('/home/AS4TRAINR/gld/gldcl2.clle')"
+g_call_escape|!system "CALL PGM(AS4TRAINR1/GLDCL2)"
+g_crtbndrpg|!system -s "CRTBNDRPG PGM(AS4TRAINR1/GLDRPG1) SRCSTMF('/home/AS4TRAINR/gld/gldrpg1.rpgle')"
+g_call_rpg|!system "CALL PGM(AS4TRAINR1/GLDRPG1)"
+g_dsp_rpg|!system "DSPDTAARA DTAARA(AS4TRAINR1/GLDDA2)"
+# save files (SAVOBJ is allowed on PUB400; RSTOBJ is not)
+s_crtsavf|!system "CRTSAVF FILE(AS4TRAINR1/GLDSAVF)"
+s_crtsavf_dup|!system "CRTSAVF FILE(AS4TRAINR1/GLDSAVF)"
+s_dspsavf_empty|!system "DSPSAVF FILE(AS4TRAINR1/GLDSAVF)"
+s_savobj|!system "SAVOBJ OBJ(GLDPF GLDDA2) LIB(AS4TRAINR1) DEV(*SAVF) SAVF(AS4TRAINR1/GLDSAVF)"
+s_dspsavf|!system "DSPSAVF FILE(AS4TRAINR1/GLDSAVF)"
+s_savobj_clear|!system "SAVOBJ OBJ(GLDPF) LIB(AS4TRAINR1) DEV(*SAVF) SAVF(AS4TRAINR1/GLDSAVF) CLEAR(*ALL)"
+s_savobj_none|!system "SAVOBJ OBJ(NOSUCH) LIB(AS4TRAINR1) DEV(*SAVF) SAVF(AS4TRAINR1/GLDSAVF) CLEAR(*ALL)"
+s_clrsavf|!system "CLRSAVF FILE(AS4TRAINR1/GLDSAVF)"
+s_dltf_savf|!system "DLTF FILE(AS4TRAINR1/GLDSAVF)"
+# overrides and other errors
+o_dltovr_all|!system "DLTOVR FILE(*ALL)"
+o_ovr_dlt|!system "OVRDBF FILE(X) TOFILE(AS4TRAINR1/GLDPF)"
+z_cleanup|!for o in GLDCPY GLDCPY2 GLDPF GLDSRC GLDSAVF; do system -q "DLTF FILE(AS4TRAINR1/$o)"; done; for o in GLDDA GLDDA2; do system -q "DLTDTAARA DTAARA(AS4TRAINR1/$o)"; done; for o in GLDCL1 GLDCL2 GLDRPG1; do system -q "DLTPGM PGM(AS4TRAINR1/$o)"; done; rm -rf /home/AS4TRAINR/gld; echo cleaned

@@ -1374,10 +1374,11 @@ pub static COMMANDS: &[CommandDef] = &[
                 "TYPE",
                 Kind::Name,
                 false,
-                Some("*MBRLIST"),
+                Some("*ALL"),
                 "Type of information",
             )
-            .ch("*MBRLIST, *ATR"),
+            .ch("*ALL, *ATR, *MBRLIST, *ACCPTH"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
         ],
     },
     CommandDef {
@@ -1394,7 +1395,22 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("Name"),
             p("SRCMBR", Kind::Name, false, Some("*FILE"), "Source member").ch("Name, *FILE"),
-            p("RCDLEN", Kind::Text, false, Some("*NONE"), "Record length, if no DDS").ch("Number, *NONE"),
+            p(
+                "RCDLEN",
+                Kind::Text,
+                false,
+                Some("*NONE"),
+                "Record length, if no DDS",
+            )
+            .ch("Number, *NONE"),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*SRCMBRTXT"),
+                "Text 'description'",
+            )
+            .keyword_only(),
         ],
     },
     CommandDef {
@@ -1542,6 +1558,9 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("Name"),
             p("SRCMBR", Kind::Name, false, Some("*PGM"), "Source member").ch("Name, *PGM"),
+            p("SRCSTMF", Kind::Text, false, None, "Source stream file")
+                .ch("Path name")
+                .keyword_only(),
             p(
                 "TEXT",
                 Kind::Text,
@@ -1638,6 +1657,9 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("Name"),
             p("SRCMBR", Kind::Name, false, Some("*PGM"), "Source member").ch("Name, *PGM"),
+            p("SRCSTMF", Kind::Text, false, None, "Source stream file")
+                .ch("Path name")
+                .keyword_only(),
             p(
                 "DFTACTGRP",
                 Kind::Name,
@@ -1744,6 +1766,9 @@ pub static COMMANDS: &[CommandDef] = &[
                 "Source member",
             )
             .ch("Name, *MODULE"),
+            p("SRCSTMF", Kind::Text, false, None, "Source stream file")
+                .ch("Path name")
+                .keyword_only(),
             p(
                 "TEXT",
                 Kind::Text,
@@ -1817,6 +1842,9 @@ pub static COMMANDS: &[CommandDef] = &[
                 "Source member",
             )
             .ch("Name, *MODULE"),
+            p("SRCSTMF", Kind::Text, false, None, "Source stream file")
+                .ch("Path name")
+                .keyword_only(),
             p(
                 "TEXT",
                 Kind::Text,
@@ -2024,6 +2052,11 @@ pub static COMMANDS: &[CommandDef] = &[
         name: "DSPBNDDIR",
         description: "Display Binding Directory",
         params: &[p("BNDDIR", Kind::Qualified, true, None, "Binding directory").ch("Name")],
+    },
+    CommandDef {
+        name: "DLTPGM",
+        description: "Delete Program",
+        params: &[p("PGM", Kind::Qualified, true, None, "Program").ch("Name")],
     },
     CommandDef {
         name: "DLTMOD",
@@ -2237,6 +2270,9 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("Name"),
             p("SRCMBR", Kind::Name, false, Some("*OBJ"), "Source member").ch("Name, *OBJ"),
+            p("SRCSTMF", Kind::Text, false, None, "Source stream file")
+                .ch("Path name")
+                .keyword_only(),
             p(
                 "COMMIT",
                 Kind::Name,
@@ -3067,7 +3103,63 @@ pub static COMMANDS: &[CommandDef] = &[
         description: "Clear Library",
         params: &[p("LIB", Kind::Name, true, None, "Library").ch("Name")],
     },
+    CommandDef {
+        name: "DSPFFD",
+        description: "Display File Field Description",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "File").ch("Name"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
+    },
+    CommandDef {
+        name: "CPYF",
+        description: "Copy File",
+        params: &[
+            p("FROMFILE", Kind::Qualified, true, None, "From file").ch("Name"),
+            p("TOFILE", Kind::Qualified, true, None, "To file").ch("Name, *PRINT"),
+            p("FROMMBR", Kind::Name, false, Some("*FIRST"), "From member").ch("Name, *FIRST"),
+            p(
+                "TOMBR",
+                Kind::Name,
+                false,
+                Some("*FIRST"),
+                "To member or label",
+            )
+            .ch("Name, *FIRST, *FROMMBR"),
+            p(
+                "MBROPT",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "Replace or add records",
+            )
+            .ch("*NONE, *ADD, *REPLACE"),
+            p("CRTFILE", Kind::Name, false, Some("*NO"), "Create file").ch("*NO, *YES"),
+            p("PRINT", Kind::List, false, Some("*NONE"), "Print format")
+                .ch("*NONE, *COPIED, *EXCLD")
+                .keyword_only(),
+            p(
+                "FMTOPT",
+                Kind::List,
+                false,
+                Some("*NONE"),
+                "Record format field mapping",
+            )
+            .ch("*NONE, *NOCHK, *MAP, *DROP")
+            .keyword_only(),
+        ],
+    },
 ];
+
+/// The escape message that ends a command the command analyzer found
+/// errors in (after its diagnostic messages).
+pub const CPF0006: &str = "CPF0006: The command has errors and was not run.";
+
+/// A value the command analyzer does not take: diagnostic CPD0084, then
+/// CPF0006 (observed on IBM i 7.5: `CRTDTAARA ... TYPE(*BAD)`).
+pub fn value_error(detail: &str) -> anyhow::Error {
+    anyhow::anyhow!("CPD0084: {detail}\n{CPF0006}")
+}
 
 /// A group of commands on the F4 menu.
 pub struct Group {
@@ -3111,7 +3203,7 @@ pub static GROUPS: &[Group] = &[
     Group {
         item: "File commands",
         title: "File Commands",
-        commands: &["DSPPFM", "DLTF"],
+        commands: &["DSPPFM", "DSPFFD", "CPYF", "DLTF"],
     },
     Group {
         item: "User profile commands",
@@ -3179,6 +3271,7 @@ pub static GROUPS: &[Group] = &[
             "ADDBNDDIRE",
             "RMVBNDDIRE",
             "DSPBNDDIR",
+            "DLTPGM",
             "DLTMOD",
             "DLTSRVPGM",
             "DLTBNDDIR",
@@ -3388,7 +3481,7 @@ fn tokenize(s: &str) -> Result<Vec<Tok>> {
                 loop {
                     match cs.get(i) {
                         None => bail!(
-                            "CPF0006: Errors occurred in command. A closing apostrophe is missing."
+                            "CPF0006: The command has errors and was not run. A closing apostrophe is missing."
                         ),
                         Some('\'') if cs.get(i + 1) == Some(&'\'') => {
                             v.push('\'');
@@ -3495,9 +3588,83 @@ fn quote_command_values(line: &str) -> Result<String> {
     Ok(out)
 }
 
-fn err(msg: impl std::fmt::Display) -> anyhow::Error {
-    anyhow::anyhow!("CPF0006: Errors occurred in command. {msg}")
+/// A command analyzer error: its diagnostic message, then the escape
+/// message CPF0006 (observed on IBM i 7.5). `id` is the diagnostic's
+/// message ID when it is known (CPD0013, CPD0043, CPD0065, CPD0071,
+/// CPD0074, CPD0084...), else the diagnostic has none.
+fn diag(id: &str, msg: impl std::fmt::Display) -> anyhow::Error {
+    if id.is_empty() {
+        anyhow::anyhow!("{msg}\n{CPF0006}")
+    } else {
+        anyhow::anyhow!("{id}: {msg}\n{CPF0006}")
+    }
 }
+
+/// A command analyzer diagnostic and CPF0006, for the checks commands
+/// make themselves (CPD0170 for CALL of a program that is not there...).
+pub fn diag_error(id: &str, msg: &str) -> anyhow::Error {
+    diag(id, msg)
+}
+
+fn err(msg: impl std::fmt::Display) -> anyhow::Error {
+    diag("", msg)
+}
+
+/// A name that is not valid: CPD0074 when it is too long, else CPD0084.
+fn name_err(e: anyhow::Error) -> anyhow::Error {
+    let t = e.to_string();
+    if t.contains("longer than 10") {
+        diag("CPD0074", t)
+    } else {
+        diag("CPD0084", t)
+    }
+}
+
+/// Commands that are only statements of CL programs: on a command line,
+/// CPD0031 (observed on IBM i 7.5 for SNDPGMMSG).
+pub const CL_PROGRAM_ONLY: &[&str] = &[
+    "SNDPGMMSG",
+    "RCVMSG",
+    "MONMSG",
+    "DCL",
+    "DCLF",
+    "CHGVAR",
+    "RTVJOBA",
+    "RTVSYSVAL",
+    "RTVDTAARA",
+    "RTVOBJD",
+    "RTVMBRD",
+    "RTVMSG",
+    "RCVF",
+    "SNDF",
+    "SNDRCVF",
+    "PGM",
+    "ENDPGM",
+    "IF",
+    "ELSE",
+    "DO",
+    "ENDDO",
+    "DOWHILE",
+    "DOUNTIL",
+    "DOFOR",
+    "LEAVE",
+    "ITERATE",
+    "SELECT",
+    "WHEN",
+    "OTHERWISE",
+    "ENDSELECT",
+    "GOTO",
+    "RETURN",
+    "SUBR",
+    "ENDSUBR",
+    "CALLSUBR",
+    "RTNSUBR",
+    "INCLUDE",
+    "DCLPRCOPT",
+    "COPYRIGHT",
+    "TFRCTL",
+    "CLOSE",
+];
 
 /// Parse a command without checking for required parameters or filling in
 /// defaults: what F4 prompting starts from.
@@ -3509,10 +3676,19 @@ pub fn parse_partial(
     let mut it = toks.into_iter().peekable();
     let name = match it.next() {
         Some(Tok::Word(w)) => w,
-        _ => bail!("CPF0006: Errors occurred in command. A command name is expected."),
+        _ => return Err(err("A command name is expected.")),
     };
     let Some(def) = find(&name) else {
-        bail!("CPD0030: Command {name} in library *LIBL not found.");
+        if CL_PROGRAM_ONLY.contains(&name.to_ascii_uppercase().as_str()) {
+            return Err(diag(
+                "CPD0031",
+                format!("Command {name} can only be used in a CL program."),
+            ));
+        }
+        return Err(diag(
+            "CPD0030",
+            format!("Command {name} was not found in library *LIBL."),
+        ));
     };
     let mut params: BTreeMap<&'static str, Vec<Value>> = BTreeMap::new();
     let mut next_positional = def.params.iter().filter(|p| p.positional);
@@ -3522,10 +3698,10 @@ pub fn parse_partial(
             Tok::Word(w) if it.peek() == Some(&Tok::Open) => {
                 it.next();
                 let Some(pd) = def.params.iter().find(|p| p.keyword == w) else {
-                    return Err(err(format!(
-                        "Keyword {w} not valid for command {}.",
-                        def.name
-                    )));
+                    return Err(diag(
+                        "CPD0043",
+                        format!("Command {} has no keyword {w}.", def.name),
+                    ));
                 };
                 let mut vals = Vec::new();
                 loop {
@@ -3570,16 +3746,20 @@ pub fn parse_partial(
                                         text.push_str(&format!("'{}' ", v.replace('\'', "''")));
                                     }
                                     None => {
-                                        return Err(err(format!(
-                                            "A closing parenthesis is missing after {w}."
-                                        )))
+                                        return Err(diag(
+                                            "CPD0013",
+                                            format!("A closing parenthesis is missing after {w}."),
+                                        ))
                                     }
                                 }
                             }
                             vals.push(Value::Word(text.trim_end().to_string()));
                         }
                         None => {
-                            return Err(err(format!("A closing parenthesis is missing after {w}.")))
+                            return Err(diag(
+                                "CPD0013",
+                                format!("A closing parenthesis is missing after {w}."),
+                            ))
                         }
                     }
                 }
@@ -3594,10 +3774,26 @@ pub fn parse_partial(
                     _ => unreachable!(),
                 };
                 let Some(pd) = next_positional.find(|p| !params.contains_key(p.keyword)) else {
-                    return Err(err(format!(
-                        "Too many positional parameters for command {}.",
+                    // One CPD0065 for each value past the last positional
+                    // parameter (observed on IBM i 7.5).
+                    let mut extra = 1;
+                    let mut depth = 0;
+                    for t in it.by_ref() {
+                        match t {
+                            Tok::Open => depth += 1,
+                            Tok::Close => depth -= 1,
+                            Tok::Word(_) | Tok::Quoted(_) if depth == 0 => extra += 1,
+                            _ => {}
+                        }
+                    }
+                    let n = def.params.iter().filter(|p| p.positional).count();
+                    let line = format!(
+                        "CPD0065: Command {} takes at most {n} values without a keyword.",
                         def.name
-                    )));
+                    );
+                    let mut lines = vec![line; extra];
+                    lines.push(CPF0006.to_string());
+                    return Err(anyhow::anyhow!(lines.join("\n")));
                 };
                 params.insert(pd.keyword, vec![v]);
             }
@@ -3614,7 +3810,7 @@ fn check_qualified(pd: &ParamDef, v: &str) -> Result<()> {
     };
     if let Some(l) = lib {
         if !LIBRARY_SPECIALS.contains(&l) {
-            crate::catalog::validate_name("library", l).map_err(err)?;
+            crate::catalog::validate_name("library", l).map_err(name_err)?;
         }
     }
     let what = pd.prompt.to_ascii_lowercase();
@@ -3632,7 +3828,7 @@ fn check_qualified(pd: &ParamDef, v: &str) -> Result<()> {
         Some(b) if pd.choices.contains("generic") && !b.is_empty() => b,
         _ => obj,
     };
-    crate::catalog::validate_name(&what, base).map_err(err)?;
+    crate::catalog::validate_name(&what, base).map_err(name_err)?;
     Ok(())
 }
 
@@ -3645,10 +3841,10 @@ pub fn parse(line: &str) -> Result<Command> {
             }
             Some(_) => {}
             None if pd.required => {
-                return Err(err(format!(
-                    "Value for required parameter {} is missing.",
-                    pd.keyword
-                )));
+                return Err(diag(
+                    "CPD0071",
+                    format!("Parameter {} needs a value.", pd.keyword),
+                ));
             }
             None => {
                 if let Some(d) = pd.default {
@@ -3661,7 +3857,7 @@ pub fn parse(line: &str) -> Result<Command> {
             match pd.kind {
                 Kind::Name if !t.starts_with('*') && !t.is_empty() => {
                     crate::catalog::validate_name(&pd.prompt.to_ascii_lowercase(), t)
-                        .map_err(err)?;
+                        .map_err(name_err)?;
                 }
                 Kind::Qualified => check_qualified(pd, t)?,
                 _ => {}
@@ -3870,11 +4066,32 @@ mod tests {
     fn errors() {
         let e = |s: &str| parse(s).unwrap_err().to_string();
         assert!(e("NOSUCH").starts_with("CPD0030"), "{}", e("NOSUCH"));
-        assert!(e("CRTLIB").contains("required parameter LIB"));
-        assert!(e("CRTLIB LIB(A) FOO(B)").contains("Keyword FOO not valid"));
+        // The command analyzer's diagnostics, then CPF0006 (observed on
+        // IBM i 7.5 with the PASE system utility): CPD0071 for a missing
+        // required parameter, CPD0043 for a keyword the command does not
+        // have, CPD0065 for each value past the positional parameters,
+        // CPD0074 for a name over 10 characters, CPD0013 for a missing
+        // closing parenthesis, CPD0031 for a CL-program-only command.
+        let ids = |s: &str| -> Vec<String> {
+            e(s).lines()
+                .map(|l| crate::jobs::message_id(l).to_string())
+                .collect()
+        };
+        assert_eq!(ids("CRTLIB"), ["CPD0071", "CPF0006"]);
+        assert_eq!(ids("CRTLIB LIB(A) FOO(B)"), ["CPD0043", "CPF0006"]);
+        assert_eq!(ids("DLTDTAARA A/X Y Z"), ["CPD0065", "CPD0065", "CPF0006"]);
+        assert_eq!(
+            ids("CRTDTAARA DTAARA(A/ABCDEFGHIJK) TYPE(*CHAR)"),
+            ["CPD0074", "CPF0006"]
+        );
+        assert_eq!(
+            ids("CRTDTAARA DTAARA(A/X TYPE(*CHAR)"),
+            ["CPD0013", "CPF0006"]
+        );
+        assert_eq!(ids("SNDPGMMSG MSG(X)"), ["CPD0031", "CPF0006"]);
         assert!(e("CRTLIB LIB(A B)").contains("Too many values"));
         assert!(e("CRTLIB LIB(1ABC)").contains("not a valid"));
         assert!(e("CRTLIB TEXT('x").contains("apostrophe"));
-        assert!(e("DSPLIB A B").contains("Too many positional"));
+        assert_eq!(crate::jobs::escape_id(&e("CRTLIB TEXT('x")), "CPF0006");
     }
 }

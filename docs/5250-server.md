@@ -59,7 +59,7 @@ Command entry, after CRTLIB and a CALL of an RPG program:
                                                                         QSECOFR
  Signed on to AS4TAINR as QSECOFR.
  > crtlib salesx text('Sales applications')
-   Library SALESX created.
+   Library SALESX was created.
  > call ordtotal parm('1002')
    DSPLY  Order 1002: 3 lines, total 24.00
 
@@ -88,7 +88,7 @@ An error keeps the command on the command line so it can be corrected:
                                                                         QSECOFR
  Signed on to AS4TAINR as QSECOFR.
  > crtlib salesx text('Sales applications')
-   Library SALESX created.
+   Library SALESX was created.
  > call ordtotal parm('1002')
    DSPLY  Order 1002: 3 lines, total 24.00
  > crtlib salesx
@@ -157,13 +157,13 @@ DSPLIB:
 | `CHGPWD` | Shows the Change Password screen. |
 | `WRKOBJ OBJ(lib/name) OBJTYPE(*ALL\|*LIB\|*FILE)` | Lists objects. The name can be generic (`CUST*`) or `*ALL`; the library `*LIBL`, `*CURLIB`, `*USRLIBL`, `*ALL`, `*ALLUSR` or a name. List only for now: no options. |
 | `STRSQL` | Interactive SQL: type a statement, see the rows (see [sql.md](sql.md)). |
-| `RUNSQL SQL('...')` | Runs one INSERT, UPDATE or DELETE (not SELECT) and reports the rows changed, or a data definition statement such as CREATE TABLE. |
+| `RUNSQL SQL('...')` | Runs one INSERT, UPDATE or DELETE (not SELECT), or a data definition statement such as CREATE TABLE. No completion message; SQL9010 when it fails. |
 | `RUNSQLSTM SRCFILE(LIB/QSQLSRC) SRCMBR(NAME)` or `SRCSTMF(path)` | Runs the SQL statements in a source member, or in a stream file (converted from its CCSID; a byte order mark is skipped) ([sql.md](sql.md)). |
 | `CHGPFM FILE(LIB/FILE) MBR(name) SRCTYPE(type) TEXT('...')` | Changes a source member's type and text (CPF3141 if the member does not exist). |
 | `CRTJRNRCV`, `CRTJRN`, `CHGJRN`, `DLTJRN`, `DLTJRNRCV`, `STRJRNPF`, `ENDJRNPF`, `DSPJRN` | Journals: see [journals.md](journals.md). |
 | `CRTSAVF`, `CLRSAVF`, `DSPSAVF`, `SAVOBJ`, `SAVLIB`, `RSTOBJ`, `RSTLIB`, `DLTLIB`, `CLRLIB` | Save and restore: see [save-restore.md](save-restore.md). |
 | `ADDPFTRG`, `RMVPFTRG` | Trigger programs on physical files ([journals.md](journals.md)). |
-| `DLTF FILE(LIB/NAME)` | Deletes a database or display file (not a physical file with logical files over it: CPF3203). |
+| `DLTF FILE(LIB/NAME)` | Deletes a database, display or save file (not a physical file with logical files over it: CPF3219). |
 | `CRTRPGPGM PGM(LIB/NAME)` | Creates a program from RPG/400 (RPG III) source in QRPGSRC: converted to RPG IV as CVTRPGSRC does, then compiled. |
 | `CVTRPGSRC FROMFILE(LIB/QRPGSRC) FROMMBR(name\|generic*\|*ALL) TOFILE(LIB/QRPGLESRC)` | Converts RPG III members to RPG IV members (type RPGLE) and lists the conversion messages. |
 | `CVTRPGFREE FROMFILE(LIB/QRPGLESRC) FROMMBR(name) TOMBR(name)` | as4tainr's own command: converts a fixed-form RPGLE member to free form (what has no free form stays fixed). |
@@ -171,12 +171,18 @@ DSPLIB:
 | `CRTSRVPGM SRVPGM(LIB/NAME) MODULE(...) EXPORT(*SRCFILE\|*ALL) SRCFILE SRCMBR BNDSRVPGM BNDDIR` | Creates a service program from modules (`BNDSRVPGM((LIB/NAME *IMMED))` element lists too); its exports come from binder language (`STRPGMEXP`/`EXPORT`/`ENDPGMEXP` in QSRVSRC) or all exported procedures. |
 | `CRTPGM PGM(LIB/NAME) MODULE(...) ENTMOD BNDSRVPGM BNDDIR` | Binds modules and service programs into a program. |
 | `CRTBNDDIR`, `ADDBNDDIRE`, `RMVBNDDIRE`, `DSPBNDDIR` | Binding directories: lists of modules and service programs searched for imports by CRTPGM, CRTSRVPGM and CRTBNDRPG (`BNDDIR`, or `ctl-opt bnddir`). |
-| `DLTMOD`, `DLTSRVPGM`, `DLTBNDDIR` | Delete ILE objects. |
+| `DLTPGM`, `DLTMOD`, `DLTSRVPGM`, `DLTBNDDIR` | Delete programs and ILE objects (CPC2191; CPF2105 when not found). |
 | `RCLACTGRP ACTGRP(*ELIGIBLE\|name)` | Ends an activation group of the job (*ELIGIBLE: all but the default one): its service programs and the programs active in it start over at their next call. |
 | `RCLRSC` | Ends the programs of the default activation group that are still active (they ended without LR). |
 | `DSPPGM PGM(LIB/NAME)`, `DSPSRVPGM SRVPGM(LIB/NAME)` | Show a program's or service program's modules, bound service programs, signatures and activation group. |
 | `UPDPGM PGM(LIB/NAME) MODULE(names\|*NONE)`, `UPDSRVPGM` | Replace modules and bind again (taking the service programs' current signatures). |
 | `CRTCLMOD MODULE(LIB/NAME)` | Creates a CL module (QCLSRC); bound by CRTPGM, it calls RPG procedures with CALLPRC. |
+| `CHKOBJ OBJ(lib/name) OBJTYPE(type) [MBR] [AUT]` | No message when the object is there; CPF9801 (object), CPF9810 (library), CPF9802 (authority), CPF9815 (member). |
+| `DSPOBJD OBJ(lib/name) OBJTYPE(types)` | The objects with attribute, size and text (DETAIL(*BASIC)). |
+| `DSPSYSVAL SYSVAL(name)` | A system value's current and shipped values. |
+| `DSPFD FILE(lib/name) [TYPE(*ALL\|*ATR\|*MBRLIST\|*ACCPTH)]` | A file's attributes, members and access path. |
+| `DSPFFD FILE(lib/name)` | A file's fields: type, length, bytes and position in the record. |
+| `CPYF FROMFILE TOFILE(file\|*PRINT) [MBROPT] [CRTFILE] [FMTOPT]` | Copies records (CPC2955), into an empty member unless MBROPT(*ADD) or *REPLACE; CRTFILE(*YES) creates the to-file; FMTOPT(*MAP *DROP) or *NOCHK when the fields differ (else CPF2817). |
 | `DSPPFM FILE(lib/name)` | Shows a physical file's records in arrival order, one line each with the field names above. F19/F20 shift left/right on wide files. |
 
 Keyword and positional forms both work (`CRTLIB MYLIB` = `CRTLIB LIB(MYLIB)`). Unquoted values are folded to upper case; quoted values keep their case, with `''` for an apostrophe.

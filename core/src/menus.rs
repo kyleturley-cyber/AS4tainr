@@ -218,7 +218,7 @@ pub async fn create(
         bail!("Menus cannot be created in QSYS.");
     }
     if !crate::catalog::library_exists(client, &lib).await? {
-        bail!("CPF2110: Library {lib} not found.");
+        bail!("CPF2110: Library {lib} does not exist.");
     }
     let r = client
         .execute(

@@ -13,7 +13,10 @@ param(
   [string]$List = (Join-Path $PSScriptRoot 'basics.txt'),
   [string]$Out  = (Join-Path $PSScriptRoot '..\..\target\ibmi\golden'),
   [string]$HostAlias = 'pub400',
-  [int]$Tries = 6
+  [int]$Tries = 6,
+  # Seconds one command may run before it is killed (a command waiting
+  # for a reply to an inquiry message waits forever in this job).
+  [int]$Timeout = 120
 )
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 New-Item -ItemType Directory -Force $Out | Out-Null
@@ -23,23 +26,38 @@ $items = Get-Content $List | Where-Object { $_ -match '\S' -and $_ -notmatch '^\
   [pscustomobject]@{ Name = $n.Trim(); Cmd = $c.Trim() }
 }
 # One remote sh script for all commands: PUB400 drops many new
-# connections. `system` gets an empty stdin, or it reads the rest of the
-# script.
+# connections. Each command gets an empty stdin (`system` would read the
+# rest of the script) and runs in the background under a watchdog that
+# kills it after $Timeout seconds ("TIMEOUT after N s" in its output).
 $sh = foreach ($i in $items) {
   "echo '=====BEGIN $($i.Name)'"
   if ($i.Cmd.StartsWith('!')) {
-    "{ $($i.Cmd.Substring(1)) ; } </dev/null 2>/tmp/golden_err.`$`$; echo `"rc=`$?`"; sed 's/^/2> /' /tmp/golden_err.`$`$; rm -f /tmp/golden_err.`$`$"
+    "( $($i.Cmd.Substring(1)) ) </dev/null >/tmp/golden_out.`$`$ 2>/tmp/golden_err.`$`$ &"
   } else {
     $q = $i.Cmd -replace "'", "'\''"
-    "system '$q' </dev/null 2>&1; echo `"rc=`$?`""
+    "( system '$q' ) </dev/null >/tmp/golden_out.`$`$ 2>&1 &"
   }
+  "p=`$!; rm -f /tmp/golden_to.`$`$; ( sleep $Timeout; kill -9 `$p && echo x >/tmp/golden_to.`$`$ ) </dev/null >/dev/null 2>&1 &"
+  "w=`$!; wait `$p; rc=`$?; kill `$w 2>/dev/null"
+  "cat /tmp/golden_out.`$`$; [ -f /tmp/golden_to.`$`$ ] && echo 'TIMEOUT after $Timeout s'; echo `"rc=`$rc`""
+  if ($i.Cmd.StartsWith('!')) { "sed 's/^/2> /' /tmp/golden_err.`$`$" }
+  "rm -f /tmp/golden_out.`$`$ /tmp/golden_err.`$`$ /tmp/golden_to.`$`$"
   "echo '=====END $($i.Name)'"
 }
 $sh = ($sh + "echo '=====DONE'") -join "`n"
 for ($t = 1; $t -le $Tries; $t++) {
   $log = Join-Path $logs "attempt$t"
-  $res = $sh | ssh -o ConnectTimeout=20 $HostAlias "tr -d '\r' | sh" 2> "$log.err"
-  $res | Set-Content "$log.out"
+  # Lines are written to attempt<N>.out as they arrive (UTF-8), so a run
+  # can be followed while it goes.
+  $w = [IO.StreamWriter]::new("$log.out", $false, [Text.UTF8Encoding]::new($false))
+  $w.AutoFlush = $true
+  $res = $sh | ssh -o ConnectTimeout=20 $HostAlias "tr -d '\r' | sh" 2> "$log.err" | ForEach-Object {
+    $w.WriteLine($_)
+    if ($_ -like '=====BEGIN *') { Write-Host "running $($_.Substring(11))" }
+    elseif ($_ -like 'TIMEOUT after*') { Write-Host "  $_" }
+    $_
+  }
+  $w.Close()
   "exit=$LASTEXITCODE" | Add-Content "$log.err"
   if ($res -contains '=====DONE') { break }
   Write-Host "attempt $t incomplete (see $log.out/.err); retrying in 15 s"

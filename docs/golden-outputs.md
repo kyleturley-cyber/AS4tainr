@@ -35,7 +35,7 @@ as4tainr's expected values come from IBM's documentation or from a real system (
 powershell -ExecutionPolicy Bypass -File tools\golden\golden.ps1 -List tools\golden\basics.txt
 ```
 
-A list has one `name|CL command` per line (run with `system`, standard output and error together) or `name|!shell line` (standard error lines prefixed `2> `). One SSH connection runs the whole list; the script retries when the run is cut short. Results go to `target\ibmi\golden\<name>.txt`. They hold IBM's message texts and are never committed: tests take values from them (message IDs, report layouts, exit statuses) and say so in a comment.
+A list has one `name|CL command` per line (run with `system`, standard output and error together) or `name|!shell line` (standard error lines prefixed `2> `). One SSH connection runs the whole list; the script retries when the run is cut short. It prints each command's name as it starts and writes what comes back to `target\ibmi\attempt<N>.out` as it arrives. A command still running after `-Timeout` seconds (default 120) is killed, and its output ends with `TIMEOUT after N s`. A command that sends an inquiry message waits for a reply forever in this job. Results go to `target\ibmi\golden\<name>.txt`. They hold IBM's message texts and are never committed: tests take values from them (message IDs, report layouts, exit statuses) and say so in a comment.
 
 The lists:
 

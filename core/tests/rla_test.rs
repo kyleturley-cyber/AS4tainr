@@ -8438,7 +8438,9 @@ async fn save_and_restore_libraries_and_objects() {
     .await
     .unwrap();
     assert!(
-        m[0].ends_with(&format!("objects saved from library {lib}.")),
+        // CPC3722 (observed on IBM i 7.5 for SAVOBJ).
+        m[0].starts_with("CPC3722: ")
+            && m[0].ends_with(&format!("objects were saved from library {lib}.")),
         "{m:?}"
     );
     // Saving again needs CLEAR (the save file has data).
@@ -8473,7 +8475,7 @@ async fn save_and_restore_libraries_and_objects() {
     .await
     .unwrap();
     assert!(
-        m[0].ends_with(&format!("objects restored from {lib} to {lib}.")),
+        m[0].ends_with(&format!("objects were restored from {lib} to {lib}.")),
         "{m:?}"
     );
 
@@ -8561,7 +8563,7 @@ async fn save_and_restore_libraries_and_objects() {
     )
     .await
     .unwrap();
-    assert!(m[0].starts_with("3 objects restored"), "{m:?}");
+    assert!(m[0].starts_with("3 objects were restored"), "{m:?}");
     assert_eq!(
         q(format!("SELECT COUNT(*) FROM {rl}.CUSTMAST")).await,
         ["5"]

@@ -27,7 +27,7 @@ impl Job<'_> {
             .await
             .map_err(|_| {
                 anyhow!(
-                    "CPF2817: The copy was not done: file {from_name} in library {from_label} does not exist."
+                    "CPF2802: From-file {from_name} in library {from_label} does not exist.\nCPF2817: The copy was not done."
                 )
             })?;
         crate::authority::check(
@@ -119,6 +119,11 @@ impl Job<'_> {
             .map(|x| x.0)
             .unwrap_or("*LIBL")
             .to_string();
+        // Messages before CPC2955 (observed on IBM i 7.5: CPF2880 and
+        // CPF2889 when CRTFILE(*YES) creates the to-file, CPF4011 when the
+        // from-records are shorter).
+        let mut infos = Vec::new();
+        let mut created = false;
         let to = match catalog::resolve_file(self.client, &to_libs, &to_name).await {
             Ok(t) => t,
             Err(_) if cmd.get("CRTFILE").eq_ignore_ascii_case("*YES") => {
@@ -133,10 +138,17 @@ impl Job<'_> {
                 let mut c = crate::runtime::connect_db(&self.env.database_url).await?;
                 catalog::create_physical_file(&mut c, &lib, &pf).await?;
                 crate::authority::set_owner(self.client, &lib, &to_name, "*FILE", &self.user).await?;
+                infos.push(format!(
+                    "CPF2880: Physical file {to_name} was created in library {lib}."
+                ));
+                infos.push(format!(
+                    "CPF2889: Member {from_name} was added to file {to_name} in library {lib}."
+                ));
+                created = true;
                 catalog::resolve_file(self.client, std::slice::from_ref(&lib), &to_name).await?
             }
             Err(_) => bail!(
-                "CPF2817: The copy was not done: file {to_name} in library {to_label} does not exist (CRTFILE(*YES) creates it)."
+                "CPF2861: To-file {to_name} in library {to_label} does not exist, and CRTFILE(*NO) does not create it.\nCPF2817: The copy was not done."
             ),
         };
         crate::authority::check(
@@ -158,7 +170,7 @@ impl Job<'_> {
             b.sort();
             if a != b {
                 bail!(
-                    "The record formats of {from_name} and {to_name} have different fields; FMTOPT(*MAP *DROP) or FMTOPT(*NOCHK) copies them.\nCPF2817: The copy was not done."
+                    "CPF2963: The record formats of {from_name} and {to_name} differ; FMTOPT(*MAP *DROP) or FMTOPT(*NOCHK) copies them.\nCPF2817: The copy was not done."
                 );
             }
         }
@@ -175,10 +187,28 @@ impl Job<'_> {
                     .await?;
             }
             "*ADD" => {}
-            _ if n_before > 0 => bail!(
-                "Member {to_name} of file {to_name} already has records; MBROPT(*ADD) or MBROPT(*REPLACE) copies into it.\nCPF2817: The copy was not done."
+            // MBROPT(*NONE): only into a to-file this copy creates.
+            _ if !created => bail!(
+                "CPF2863: File {to_name} exists; MBROPT(*ADD) or MBROPT(*REPLACE) copies into it.\nCPF2817: The copy was not done."
             ),
             _ => {}
+        }
+        let _ = n_before;
+        if positional {
+            let len = |f: &crate::dds::PhysicalFile| -> usize {
+                f.fields
+                    .iter()
+                    .filter_map(|x| crate::rpg::program::program_type(x, true, false))
+                    .map(|t| t.size())
+                    .sum()
+            };
+            // A from-record shorter than the to-file's record: CPF4011
+            // (observed on IBM i 7.5, a 23-byte record into RCDLEN(30)).
+            if len(&from.file) < len(&to.file) {
+                infos.push(format!(
+                    "CPF4011: The records of member {from_name} are shorter than the records of file {to_name}."
+                ));
+            }
         }
         let mut writer = rla::OpenFile::new(to.clone());
         for r in &records {
@@ -196,6 +226,7 @@ impl Job<'_> {
             };
             writer.write(self.client, &rec).await?;
         }
-        Ok(Outcome::Messages(vec![copied]))
+        infos.push(copied);
+        Ok(Outcome::Messages(infos))
     }
 }

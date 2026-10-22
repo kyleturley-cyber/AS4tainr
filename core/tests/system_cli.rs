@@ -163,7 +163,120 @@ fn pase_system_utility() {
             "CPYF FROMFILE({lib}/T1) TOFILE({lib}/T2) CRTFILE(*YES)"
         )],
     );
-    assert_eq!((r.rc, ids(&r.out)), (0, vec!["CPC2955"]), "{:?}", r.err);
+    assert_eq!(
+        (r.rc, ids(&r.out)),
+        (0, vec!["CPF2880", "CPF2889", "CPC2955"]),
+        "{:?}",
+        r.err
+    );
+
+    // Round 4 captures (IBM i 7.5, tools/golden/files-and-programs.txt):
+    // CPYF CRTFILE(*YES) sends CPF2880 and CPF2889 before CPC2955;
+    // MBROPT(*NONE) into a file that exists is CPF2863, CPF2817; a from-
+    // file that is not there CPF2802, CPF2817; a to-file CPF2861, CPF2817;
+    // different formats without FMTOPT CPF2963, CPF2817; FMTOPT(*NOCHK)
+    // into longer records CPF4011, CPC2955. SAVOBJ completes with CPC3722,
+    // CLRSAVF with CPC3725, CRTSAVF with CPC7301; DLTOVR FILE(*ALL) with no
+    // overrides is CPF5809 (informational, status 0); DSPOBJD of a missing
+    // object CPF2105; a CALL of a missing program inside a CL program is
+    // CPF0001 there (MONMSG CPF0001 catches it).
+    let r = system(
+        &url,
+        &[&format!(
+            "CPYF FROMFILE({lib}/T1) TOFILE({lib}/T3) CRTFILE(*YES)"
+        )],
+    );
+    assert_eq!(ids(&r.out), ["CPF2880", "CPF2889", "CPC2955"]);
+    let r = system(
+        &url,
+        &[&format!("CPYF FROMFILE({lib}/T1) TOFILE({lib}/T3)")],
+    );
+    assert_eq!((r.rc, ids(&r.err)), (255, vec!["CPF2863", "CPF2817"]));
+    let r = system(
+        &url,
+        &[&format!("CPYF FROMFILE({lib}/NOSUCH) TOFILE({lib}/T3)")],
+    );
+    assert_eq!(ids(&r.err), ["CPF2802", "CPF2817"]);
+    let r = system(
+        &url,
+        &[&format!(
+            "CPYF FROMFILE({lib}/T1) TOFILE({lib}/NOSUCH) MBROPT(*ADD)"
+        )],
+    );
+    assert_eq!(ids(&r.err), ["CPF2861", "CPF2817"]);
+    assert_eq!(
+        system(&url, &[&format!("CRTPF FILE({lib}/P30) RCDLEN(30)")]).rc,
+        0
+    );
+    let r = system(
+        &url,
+        &[&format!(
+            "CPYF FROMFILE({lib}/T1) TOFILE({lib}/P30) MBROPT(*ADD)"
+        )],
+    );
+    assert_eq!(ids(&r.err), ["CPF2963", "CPF2817"]);
+    let r = system(
+        &url,
+        &[&format!(
+            "CPYF FROMFILE({lib}/T1) TOFILE({lib}/P30) MBROPT(*ADD) FMTOPT(*NOCHK)"
+        )],
+    );
+    assert_eq!(
+        (r.rc, ids(&r.out)),
+        (0, vec!["CPF4011", "CPC2955"]),
+        "{:?}",
+        r.err
+    );
+    assert_eq!(
+        ids(&system(&url, &[&format!("CRTSAVF FILE({lib}/SV)")]).out),
+        ["CPC7301"]
+    );
+    let r = system(
+        &url,
+        &[&format!(
+            "SAVOBJ OBJ(T1) LIB({lib}) DEV(*SAVF) SAVF({lib}/SV)"
+        )],
+    );
+    assert_eq!(ids(&r.out), ["CPC3722"], "{:?}", r.err);
+    assert_eq!(
+        ids(&system(&url, &[&format!("CLRSAVF FILE({lib}/SV)")]).out),
+        ["CPC3725"]
+    );
+    let r = system(&url, &["DLTOVR FILE(*ALL)"]);
+    assert_eq!((r.rc, ids(&r.out)), (0, vec!["CPF5809"]));
+    let r = system(
+        &url,
+        &[&format!("DSPOBJD OBJ({lib}/NOSUCH) OBJTYPE(*FILE)")],
+    );
+    assert_eq!((r.rc, ids(&r.err)), (255, vec!["CPF2105"]));
+    // CL program: CALL of a missing program, MONMSG CPF0001.
+    let src = format!(
+        "PGM\n CALL PGM({lib}/NOSUCH)\n MONMSG MSGID(CPF0001) EXEC(SNDPGMMSG MSG(GOT0001) MSGTYPE(*COMP))\n MONMSG MSGID(CPF0006) EXEC(SNDPGMMSG MSG(GOT0006) MSGTYPE(*COMP))\nENDPGM\n"
+    );
+    let dir = std::env::temp_dir().join(format!("syscli{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("t.clle"), src).unwrap();
+    let put = Command::new(env!("CARGO_BIN_EXE_as4tainr"))
+        .args(["--database-url", &url, "put"])
+        .arg(dir.join("t.clle"))
+        .arg(format!("/tmp/{lib}.clle"))
+        .output()
+        .unwrap();
+    assert!(put.status.success());
+    let r = system(
+        &url,
+        &[&format!(
+            "CRTBNDCL PGM({lib}/MON1) SRCSTMF('/tmp/{lib}.clle')"
+        )],
+    );
+    assert_eq!(r.rc, 0, "{:?}", r.err);
+    let r = system(&url, &[&format!("CALL PGM({lib}/MON1)")]);
+    assert_eq!(
+        (r.rc, r.out.clone()),
+        (0, vec!["GOT0001".to_string()]),
+        "{:?}",
+        r.err
+    );
 
     assert_eq!(system(&url, &[&format!("DLTLIB {lib}")]).rc, 0);
 }

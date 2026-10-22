@@ -44,6 +44,16 @@ The lists:
 - `tools/golden/messages.txt`: completion and escape message IDs and exit statuses of most commands as4tainr has, the command analyzer's diagnostics, shipped system values.
 - `tools/golden/files-and-programs.txt`: CPYF, DSPFFD, DSPFD, DSPOBJD, save files, CL and RPG programs from stream files, MONMSG of a failed CALL.
 
+Rounds so far (2026-10): basics, system utility, messages (130 commands), files and programs (43 commands; 40 match, the other 3 are a stream file PUB400 could not open and the CALL that depends on it).
+
+### 5250 screens
+
+```
+powershell -ExecutionPolicy Bypass -File tools\golden\screens.ps1 [-List tools\golden\screens.txt]
+```
+
+`tools/golden/Tn5250Capture.cs` is a small TN5250 client (C# 5, loaded by `screens.ps1` with `Add-Type`, so nothing has to be installed on Windows). The script opens an SSH tunnel to PUB400's telnet port (`ssh -N -L 50023:localhost:23 pub400`), asks for the password with `Read-Host -AsSecureString` (it goes only to PUB400, is never written anywhere and is zeroed after use), then plays the steps of the list. A step is `name|keys`: text to type and `{ENTER}`, `{F1}`-`{F24}`, `{PAGEUP}`, `{PAGEDOWN}`, `{TAB}`, `{FIELDEXIT}`, `{ERASEEOF}`, `{WAIT n}`, `{USER}`, `{PASSWORD}`. After each step the screen is written to `target\ibmi\screens\<name>.txt` (24 lines, then the cursor, the input fields and the error line); non-display fields are blanked. `session.log` lists what the client received. The same client runs against as4tainr (mono, or `Add-Type` on Windows), so screens can be compared line by line.
+
 Object names in a list are its own (GOLD*, GLD*), so a run that is stopped halfway (an inquiry message, a dropped connection) leaves objects that only that list uses. A job stopped that way can keep holding locks on them until it is ended (`WRKUSRJOB USER(...) STATUS(*ACTIVE)`, then `ENDJOB`).
 
 ## Comparing

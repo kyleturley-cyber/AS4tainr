@@ -67,7 +67,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `tools/gate3_5250.py` | Phase 3 gate: three clerks enter orders at once with batch jobs running; the files must add up. Run after e2e_5250.py |
 | `samples/` | DDS, CSV data, RPG and CL programs, golden outputs in `expected/`. `samples/apps/contacts` is an application laid out as a git repository, imported with `as4tainr import` (into CONTACTS by samples.sh). The order entry app (Phase 2 gate) is described in `docs/order-entry.md` |
 | `scripts/samples.sh` | Creates every sample object in QGPL (used by demo.sh, the Docker entrypoint and CI). Add new sample objects here |
-| `tools/golden/`, `tools/golden_compare.py` | Capture output on a real IBM i (PUB400 over SSH, outputs kept in target/ibmi/golden, never committed) and compare it with `as4tainr system` (docs/golden-outputs.md) |
+| `tools/golden/`, `tools/golden_compare.py`, `tools/golden.py` | Capture output on a real IBM i (PUB400 over SSH, outputs kept in target/ibmi/golden, never committed) and compare it with `as4tainr system`; `screens.ps1` with `Tn5250Capture.cs` captures 5250 screens (docs/golden-outputs.md) |
 | `tools/golden.py` | Compares as4tainr with captures from a real IBM i (exit status, message IDs, printed output) and looks for IBM's message texts in the source (`--audit`); the captures stay in `target/ibmi/golden` (docs/golden-outputs.md) |
 | `tools/corpus.sh` | Clone a public repository of IBM i source and import it (real-world test; never vendored) |
 | `tools/legacy.sh` | Install real applications (Northwind for IBM i, COM order management) the way their READMEs say, on an empty database (cloned at test time; never vendored). docs/import.md |

@@ -1,0 +1,25 @@
+# 5250 screens of PUB400 (IBM i 7.5) for comparing with as4tainr's.
+# Objects: data area SCRDA in AS4TRAINR1 (created and deleted here).
+# 00_initial.txt (the sign-on screen) is written before the first step.
+01_signon|{USER}{TAB}{PASSWORD}{ENTER}
+02_after_signon|{ENTER}
+03_cmd_entry|call qcmd{ERASEEOF}{ENTER}
+04_unknown_cmd|nosuchcmd{ERASEEOF}{ENTER}
+05_missing_parm|crtdtaara as4trainr1/scrda{ERASEEOF}{ENTER}
+06_crtdtaara|crtdtaara as4trainr1/scrda *char len(10) value(abc){ERASEEOF}{ENTER}
+07_dspdtaara|dspdtaara as4trainr1/scrda{ERASEEOF}{ENTER}
+08_dspdtaara_exit|{F3}
+09_prompt|chgdtaara{ERASEEOF}{F4}
+10_prompt_enter_empty|{ENTER}
+11_prompt_cancel|{F12}
+12_dltdtaara|dltdtaara as4trainr1/scrda{ERASEEOF}{ENTER}
+13_dltdtaara_again|dltdtaara as4trainr1/scrda{ERASEEOF}{ENTER}
+14_chkobj|chkobj as4trainr1/nosuch *file{ERASEEOF}{ENTER}
+15_dsplib|dsplib as4trainr1{ERASEEOF}{ENTER}
+16_dsplib_pagedown|{PAGEDOWN}
+17_dsplib_exit|{F3}
+18_dsplibl|dsplibl{ERASEEOF}{ENTER}
+19_dsplibl_exit|{F3}
+20_retrieve|{F9}
+21_exit_cmd_entry|{F3}
+22_signoff|signoff{ERASEEOF}{ENTER}

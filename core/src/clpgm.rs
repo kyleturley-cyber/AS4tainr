@@ -3123,6 +3123,26 @@ fn message_data(d: &str, vars: &HashMap<String, Var>) -> Result<Vec<u8>> {
     ))
 }
 
+/// A command the command analyzer refused (its diagnostics, then
+/// CPF0006) inside a CL program ends with CPF0001 there instead (observed
+/// on IBM i 7.5: MONMSG CPF0001 catches a CALL of a program that is not
+/// there; CPF0006 and CPD0170 do not).
+fn analyzer_in_program(e: anyhow::Error, name: &str) -> anyhow::Error {
+    let text = format!("{e:#}");
+    if crate::jobs::escape_id(&text) != "CPF0006" {
+        return e;
+    }
+    let mut lines: Vec<&str> = text.lines().collect();
+    if crate::jobs::message_id(lines.last().copied().unwrap_or("")) == "CPF0006" {
+        lines.pop();
+    }
+    anyhow!(
+        "{}\nCPF0001: The {} command in the program has errors and was not run.",
+        lines.join("\n"),
+        name.to_ascii_uppercase()
+    )
+}
+
 /// Run one command of a program. Ok(Some(..)) ends the program (SIGNOFF).
 async fn command(
     job: &mut Job<'_>,
@@ -4015,7 +4035,10 @@ async fn command(
                 }
             }
             job.calls.returned = None;
-            let o = job.call_program_boxed(&pgm, args).await?;
+            let o = job
+                .call_program_boxed(&pgm, args)
+                .await
+                .map_err(|e| analyzer_in_program(e, "CALL"))?;
             // Parameters are passed by reference: a variable gets back
             // the value the called program left in it (a character
             // parameter shorter than the variable changes only its first
@@ -4054,7 +4077,11 @@ async fn command(
         }
         _ => {
             let line = substitute(st, vars)?;
-            match job.run_boxed(&line).await? {
+            match job
+                .run_boxed(&line)
+                .await
+                .map_err(|e| analyzer_in_program(e, &st.name))?
+            {
                 Outcome::Messages(m) => {
                     // The command's messages go on the program's queue
                     // (completion messages, for RCVMSG).

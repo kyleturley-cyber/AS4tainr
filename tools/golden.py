@@ -224,7 +224,12 @@ def main():
         if printed(g_out) != printed(o_out):
             diffs.append("printed output %s, ours %s" % (printed(g_out), printed(o_out)))
         # Clean room: our text must not be IBM's.
-        ibm = {(i, re.sub(r"\s+", " ", t)) for i, t in messages(g_out) + messages(g_err)}
+        # (Texts that are only message data, like CPF9898's, do not count.)
+        ibm = {
+            (i, re.sub(r"\s+", " ", t))
+            for i, t in messages(g_out) + messages(g_err)
+            if len(skeleton(t)) > 8
+        }
         same = [
             i
             for i, t in messages(o_out) + messages(o_err)

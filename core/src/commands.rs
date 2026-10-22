@@ -2801,6 +2801,13 @@ impl Job<'_> {
                 files.join(" ")
             );
         }
+        // FILE(*ALL) with no overrides: CPF5809, an informational message
+        // (observed on IBM i 7.5).
+        if self.calls.overrides.len() == before && files.iter().any(|f| f == "*ALL") {
+            return Ok(Outcome::Messages(vec![
+                "CPF5809: There are no overrides at this call level.".into(),
+            ]));
+        }
         Ok(Outcome::Messages(vec![]))
     }
 
@@ -4145,7 +4152,9 @@ impl Job<'_> {
             }
         }
         if groups.is_empty() {
-            bail!("CPF2123: No objects named {name} of type {objtype} found in library {label}.");
+            // DSPOBJD of an object that is not there: CPF2105 (observed on IBM
+            // i 7.5).
+            bail!("CPF2105: Object {name} of type {objtype} in library {label} not found.");
         }
         // Printed layout: PUB400 (IBM i 7.5) `system "DSPOBJD
         // OBJ(QSYS/QCMD) OBJTYPE(*PGM)"`, 2026-10-21. Size: what this

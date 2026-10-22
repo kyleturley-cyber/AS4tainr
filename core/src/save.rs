@@ -1339,7 +1339,9 @@ impl Job<'_> {
                         &[&lib, &name],
                     )
                     .await?;
-                vec![format!("Save file {name} in {lib} cleared.")]
+                vec![format!(
+                    "CPC3725: Save file {name} in library {lib} was cleared."
+                )]
             }
             "DSPSAVF" => return self.dspsavf(cmd).await.map(Some),
             "SAVOBJ" | "SAVLIB" => self.save(cmd).await?,
@@ -1376,7 +1378,9 @@ impl Job<'_> {
             )
             .await?;
         crate::authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
-        Ok(vec![format!("File {name} created in library {lib}.")])
+        Ok(vec![format!(
+            "CPC7301: File {name} was created in library {lib}."
+        )])
     }
 
     /// A save file by qualified name.
@@ -1590,14 +1594,14 @@ impl Job<'_> {
                 chosen.insert((n, t));
             }
             if chosen.is_empty() && !whole {
-                bail!("CPF3770: No objects saved or restored for library {lib}.");
+                bail!("CPF3770: No objects were saved or restored for library {lib}.");
             }
             let pick = Pick {
                 objects: if whole { None } else { Some(chosen) },
             };
             let saved = save_library(&mut c, lib, &pick, whole).await?;
             msgs.push(format!(
-                "{} objects saved from library {lib}.",
+                "CPC3722: {} objects were saved from library {lib}.",
                 saved.objects.len()
             ));
             for s in not_saved {
@@ -1704,7 +1708,7 @@ impl Job<'_> {
         };
         if !saved.objects.iter().any(pick) {
             bail!(
-                "CPF3770: No objects saved or restored for library {}.",
+                "CPF3770: No objects were saved or restored for library {}.",
                 saved.name
             );
         }
@@ -1712,7 +1716,7 @@ impl Job<'_> {
         let user = self.user.clone();
         let (done, mut notes) = restore_library(&mut c, &saved, &to, &pick, &user).await?;
         let mut msgs = vec![format!(
-            "{} objects restored from {} to {to}.",
+            "{} objects were restored from {} to {to}.",
             done.len(),
             saved.name
         )];

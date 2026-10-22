@@ -19,7 +19,10 @@ use tokio_postgres::Client;
 use crate::sql::SQL_ROLE;
 
 /// The services' version: change it whenever a definition below changes.
-const VERSION: &str = "as4tainr services 8";
+// 9: character columns of the catalog views in the "C" collation, so
+// ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
+// names), whatever the database's default collation is.
+const VERSION: &str = "as4tainr services 9";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -94,14 +97,14 @@ LEFT JOIN as4tainr.files f ON o.objtype = '*FILE' AND f.library = o.library AND 
 
 -- SYSSCHEMAS: one row per library.
 CREATE OR REPLACE VIEW qsys2.sysschemas AS
-SELECT CAST(o.name AS varchar(128)) AS schema_name,
-       CAST(o.owner AS varchar(128)) AS schema_owner,
-       CAST(o.owner AS varchar(128)) AS schema_creator,
+SELECT CAST(o.name AS varchar(128)) COLLATE "C" AS schema_name,
+       CAST(o.owner AS varchar(128)) COLLATE "C" AS schema_owner,
+       CAST(o.owner AS varchar(128)) COLLATE "C" AS schema_creator,
        CAST(o.created AS timestamp) AS creation_timestamp,
        CAST(coalesce((SELECT sum(s.size) FROM as4tainr_svc.objects s WHERE s.library = o.name), 0)
             AS decimal(15,0)) AS schema_size,
-       CAST(nullif(o.text, '') AS varchar(50)) AS schema_text,
-       CAST(o.name AS char(10)) AS system_schema_name,
+       CAST(nullif(o.text, '') AS varchar(50)) COLLATE "C" AS schema_text,
+       CAST(o.name AS char(10)) COLLATE "C" AS system_schema_name,
        CAST(0 AS smallint) AS iasp_number
 FROM as4tainr_svc.objects o
 WHERE o.library = 'QSYS' AND o.objtype = '*LIB';
@@ -109,12 +112,12 @@ WHERE o.library = 'QSYS' AND o.objtype = '*LIB';
 -- SYSTABLES: tables, physical files, views and logical files (not SQL
 -- indexes, which are in SYSINDEXES).
 CREATE OR REPLACE VIEW qsys2.systables AS
-SELECT CAST(coalesce(f.sql_name, o.name) AS varchar(128)) AS table_name,
-       CAST(o.owner AS varchar(128)) AS table_owner,
+SELECT CAST(coalesce(f.sql_name, o.name) AS varchar(128)) COLLATE "C" AS table_name,
+       CAST(o.owner AS varchar(128)) COLLATE "C" AS table_owner,
        CAST(CASE WHEN f.view IS NOT NULL THEN 'V'
                  WHEN f.sql_type = 'TABLE' THEN 'T'
                  WHEN o.attribute = 'LF' THEN 'L'
-                 ELSE 'P' END AS char(1)) AS table_type,
+                 ELSE 'P' END AS char(1)) COLLATE "C" AS table_type,
        CAST(CASE WHEN o.attribute = 'PF-SRC' THEN 3
                  ELSE (SELECT count(*) FROM as4tainr.file_fields ff
                        WHERE ff.library = o.library AND ff.file = o.name) END AS integer) AS column_count,
@@ -122,35 +125,35 @@ SELECT CAST(coalesce(f.sql_name, o.name) AS varchar(128)) AS table_name,
                  ELSE coalesce((SELECT sum(as4tainr_svc.field_bytes(ff.data_type, ff.length, ff.decimals, ff.flt_double, ff.varlen))
                                 FROM as4tainr.file_fields ff
                                 WHERE ff.library = o.library AND ff.file = o.name), 0) END AS integer) AS row_length,
-       CAST(nullif(o.text, '') AS varchar(50)) AS table_text,
-       CAST(NULL AS varchar(2000)) AS long_comment,
-       CAST(o.library AS varchar(128)) AS table_schema,
+       CAST(nullif(o.text, '') AS varchar(50)) COLLATE "C" AS table_text,
+       CAST(NULL AS varchar(2000)) COLLATE "C" AS long_comment,
+       CAST(o.library AS varchar(128)) COLLATE "C" AS table_schema,
        CAST(o.created AS timestamp) AS last_altered_timestamp,
-       CAST(o.name AS char(10)) AS system_table_name,
-       CAST(o.library AS char(10)) AS system_table_schema,
-       CAST(CASE WHEN o.attribute = 'PF-SRC' THEN 'S' ELSE 'D' END AS char(1)) AS file_type,
-       CAST(NULL AS varchar(18)) AS base_table_catalog,
-       CAST(NULL AS varchar(128)) AS base_table_schema,
-       CAST(NULL AS varchar(128)) AS base_table_name,
-       CAST(NULL AS varchar(10)) AS base_table_member,
-       CAST(CASE WHEN o.library IN ('QSYS', 'QSYS2') THEN 'Y' ELSE 'N' END AS char(1)) AS system_table,
+       CAST(o.name AS char(10)) COLLATE "C" AS system_table_name,
+       CAST(o.library AS char(10)) COLLATE "C" AS system_table_schema,
+       CAST(CASE WHEN o.attribute = 'PF-SRC' THEN 'S' ELSE 'D' END AS char(1)) COLLATE "C" AS file_type,
+       CAST(NULL AS varchar(18)) COLLATE "C" AS base_table_catalog,
+       CAST(NULL AS varchar(128)) COLLATE "C" AS base_table_schema,
+       CAST(NULL AS varchar(128)) COLLATE "C" AS base_table_name,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS base_table_member,
+       CAST(CASE WHEN o.library IN ('QSYS', 'QSYS2') THEN 'Y' ELSE 'N' END AS char(1)) COLLATE "C" AS system_table,
        CAST(CASE WHEN o.attribute = 'LF' AND EXISTS (
                    SELECT 1 FROM as4tainr.logical_files lf
                    WHERE lf.library = o.library AND lf.name = o.name AND lf.selection <> 'TRUE')
-                 THEN 'Y' ELSE 'N' END AS char(1)) AS select_omit,
-       CAST(CASE WHEN f.view IS NOT NULL THEN 'NO' ELSE 'YES' END AS varchar(3)) AS is_insertable_into,
+                 THEN 'Y' ELSE 'N' END AS char(1)) COLLATE "C" AS select_omit,
+       CAST(CASE WHEN f.view IS NOT NULL THEN 'NO' ELSE 'YES' END AS varchar(3)) COLLATE "C" AS is_insertable_into,
        CAST(0 AS smallint) AS iasp_number,
-       CAST(NULL AS varchar(3)) AS enabled,
-       CAST(NULL AS varchar(6)) AS maintenance,
-       CAST(NULL AS varchar(9)) AS refresh,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS enabled,
+       CAST(NULL AS varchar(6)) COLLATE "C" AS maintenance,
+       CAST(NULL AS varchar(9)) COLLATE "C" AS refresh,
        CAST(NULL AS timestamp) AS refresh_time,
        CAST(NULL AS text) AS mqt_definition,
-       CAST(NULL AS char(2)) AS isolation,
-       CAST('NO' AS varchar(11)) AS partition_table,
-       CAST(o.owner AS varchar(128)) AS table_definer,
-       CAST(NULL AS char(1)) AS mqt_restore_deferred,
-       CAST(NULL AS char(1)) AS rounding_mode,
-       CAST(' ' AS char(1)) AS control
+       CAST(NULL AS char(2)) COLLATE "C" AS isolation,
+       CAST('NO' AS varchar(11)) COLLATE "C" AS partition_table,
+       CAST(o.owner AS varchar(128)) COLLATE "C" AS table_definer,
+       CAST(NULL AS char(1)) COLLATE "C" AS mqt_restore_deferred,
+       CAST(NULL AS char(1)) COLLATE "C" AS rounding_mode,
+       CAST(' ' AS char(1)) COLLATE "C" AS control
 FROM as4tainr.objects o
 LEFT JOIN as4tainr.files f ON f.library = o.library AND f.name = o.name
 WHERE o.objtype = '*FILE' AND o.attribute IN ('PF', 'LF', 'PF-SRC')
@@ -158,11 +161,11 @@ WHERE o.objtype = '*FILE' AND o.attribute IN ('PF', 'LF', 'PF-SRC')
 
 -- SYSCOLUMNS: the columns of tables, physical and logical files and views.
 CREATE OR REPLACE VIEW qsys2.syscolumns AS
-SELECT CAST(coalesce(ff.alias, ff.name) AS varchar(128)) AS column_name,
-       CAST(coalesce(f.sql_name, o.name) AS varchar(128)) AS table_name,
-       CAST(o.owner AS varchar(128)) AS table_owner,
+SELECT CAST(coalesce(ff.alias, ff.name) AS varchar(128)) COLLATE "C" AS column_name,
+       CAST(coalesce(f.sql_name, o.name) AS varchar(128)) COLLATE "C" AS table_name,
+       CAST(o.owner AS varchar(128)) COLLATE "C" AS table_owner,
        CAST(ff.seq + 1 AS integer) AS ordinal_position,
-       CAST(as4tainr_svc.sql_type(ff.data_type, ff.length, ff.decimals, ff.varlen) AS varchar(8)) AS data_type,
+       CAST(as4tainr_svc.sql_type(ff.data_type, ff.length, ff.decimals, ff.varlen) AS varchar(8)) COLLATE "C" AS data_type,
        CAST(CASE WHEN ff.data_type IN ('P', 'S') OR (ff.data_type = 'B' AND ff.decimals > 0) THEN ff.length
                  WHEN ff.data_type IN ('B', 'F', 'DECFLOAT')
                  THEN as4tainr_svc.field_bytes(ff.data_type, ff.length, ff.decimals, ff.flt_double, ff.varlen)
@@ -171,17 +174,17 @@ SELECT CAST(coalesce(ff.alias, ff.name) AS varchar(128)) AS column_name,
                  WHEN ff.data_type = 'Z' THEN 10
                  ELSE ff.length END AS integer) AS length,
        CAST(CASE WHEN ff.data_type IN ('P', 'S', 'B') THEN ff.decimals END AS integer) AS numeric_scale,
-       CAST(CASE WHEN ff.null_capable THEN 'Y' ELSE 'N' END AS char(1)) AS is_nullable,
-       CAST(CASE WHEN f.view IS NOT NULL THEN 'N' ELSE 'Y' END AS char(1)) AS is_updatable,
-       CAST(NULL AS varchar(2000)) AS long_comment,
+       CAST(CASE WHEN ff.null_capable THEN 'Y' ELSE 'N' END AS char(1)) COLLATE "C" AS is_nullable,
+       CAST(CASE WHEN f.view IS NOT NULL THEN 'N' ELSE 'Y' END AS char(1)) COLLATE "C" AS is_updatable,
+       CAST(NULL AS varchar(2000)) COLLATE "C" AS long_comment,
        CAST(CASE WHEN f.view IS NOT NULL THEN 'N'
                  WHEN ff.identity IS NOT NULL THEN
                    CASE WHEN ff.identity LIKE '%"always":true%' THEN 'I' ELSE 'J' END
                  -- No default only for NOT NULL without DEFAULT; a DDS
                  -- field without DFT gets blanks or zero.
                  WHEN ff.dft = '"Required"' THEN 'N'
-                 ELSE 'Y' END AS char(1)) AS has_default,
-       CAST(NULL AS varchar(60)) AS column_heading,
+                 ELSE 'Y' END AS char(1)) COLLATE "C" AS has_default,
+       CAST(NULL AS varchar(60)) COLLATE "C" AS column_heading,
        CAST(as4tainr_svc.field_bytes(ff.data_type, ff.length, ff.decimals, ff.flt_double, ff.varlen) AS integer) AS storage,
        CAST(CASE WHEN ff.data_type IN ('P', 'S') THEN ff.length
                  WHEN ff.data_type = 'B' THEN CASE WHEN ff.decimals > 0 THEN ff.length
@@ -192,9 +195,9 @@ SELECT CAST(coalesce(ff.alias, ff.name) AS varchar(128)) AS column_name,
        CAST(CASE WHEN ff.data_type IN ('A', 'L', 'T', 'Z', 'CLOB', 'XML') THEN 1208
                  WHEN ff.data_type IN ('G', 'DBCLOB') THEN 1200
                  WHEN ff.data_type IN ('H', 'BLOB') THEN 65535 END AS integer) AS ccsid,
-       CAST(o.library AS varchar(128)) AS table_schema,
+       CAST(o.library AS varchar(128)) COLLATE "C" AS table_schema,
        CAST(CASE WHEN ff.dft = '"Null"' THEN 'NULL'
-                 WHEN ff.dft LIKE '{"Value":%' THEN ff.dft::jsonb ->> 'Value' END AS varchar(2000)) AS column_default,
+                 WHEN ff.dft LIKE '{"Value":%' THEN ff.dft::jsonb ->> 'Value' END AS varchar(2000)) COLLATE "C" AS column_default,
        CAST(CASE WHEN ff.data_type IN ('A', 'H', 'G', 'CLOB', 'BLOB', 'DBCLOB', 'XML') THEN ff.length END AS integer)
             AS character_maximum_length,
        CAST(CASE WHEN ff.data_type IN ('A', 'H', 'CLOB', 'BLOB', 'XML') THEN ff.length
@@ -203,13 +206,13 @@ SELECT CAST(coalesce(ff.alias, ff.name) AS varchar(128)) AS column_name,
                  WHEN ff.data_type IN ('P', 'S', 'B', 'DECFLOAT') THEN 10 END AS integer) AS numeric_precision_radix,
        CAST(CASE WHEN ff.data_type IN ('L', 'T') THEN 0
                  WHEN ff.data_type = 'Z' THEN greatest(ff.length - 20, 0) END AS integer) AS datetime_precision,
-       CAST(nullif(ff.text, '') AS varchar(50)) AS column_text,
-       CAST(ff.name AS char(10)) AS system_column_name,
-       CAST(o.name AS char(10)) AS system_table_name,
-       CAST(o.library AS char(10)) AS system_table_schema,
-       CAST(NULL AS varchar(128)) AS user_defined_type_schema,
-       CAST(NULL AS varchar(128)) AS user_defined_type_name,
-       CAST(CASE WHEN ff.identity IS NOT NULL THEN 'YES' ELSE 'NO' END AS varchar(3)) AS is_identity,
+       CAST(nullif(ff.text, '') AS varchar(50)) COLLATE "C" AS column_text,
+       CAST(ff.name AS char(10)) COLLATE "C" AS system_column_name,
+       CAST(o.name AS char(10)) COLLATE "C" AS system_table_name,
+       CAST(o.library AS char(10)) COLLATE "C" AS system_table_schema,
+       CAST(NULL AS varchar(128)) COLLATE "C" AS user_defined_type_schema,
+       CAST(NULL AS varchar(128)) COLLATE "C" AS user_defined_type_name,
+       CAST(CASE WHEN ff.identity IS NOT NULL THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS is_identity,
        CAST(CASE WHEN ff.identity IS NULL THEN NULL
                  WHEN ff.identity LIKE '%"always":true%' THEN 'ALWAYS' ELSE 'BY DEFAULT' END AS varchar(10))
             AS identity_generation,
@@ -217,12 +220,12 @@ SELECT CAST(coalesce(ff.alias, ff.name) AS varchar(128)) AS column_name,
        CAST(NULL AS decimal(31,0)) AS identity_increment,
        CAST(NULL AS decimal(31,0)) AS identity_minimum,
        CAST(NULL AS decimal(31,0)) AS identity_maximum,
-       CAST(NULL AS varchar(3)) AS identity_cycle,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS identity_cycle,
        CAST(NULL AS integer) AS identity_cache,
-       CAST(NULL AS varchar(3)) AS identity_order,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS identity_order,
        CAST(NULL AS text) AS column_expression,
-       CAST('N' AS char(1)) AS hidden,
-       CAST('N' AS char(1)) AS has_fldproc
+       CAST('N' AS char(1)) COLLATE "C" AS hidden,
+       CAST('N' AS char(1)) COLLATE "C" AS has_fldproc
 FROM as4tainr.file_fields ff
 JOIN as4tainr.objects o ON o.library = ff.library AND o.name = ff.file AND o.objtype = '*FILE'
 LEFT JOIN as4tainr.files f ON f.library = ff.library AND f.name = ff.file
@@ -230,29 +233,29 @@ WHERE coalesce(f.sql_type, '') <> 'INDEX';
 
 -- SYSINDEXES: indexes made by SQL CREATE INDEX.
 CREATE OR REPLACE VIEW qsys2.sysindexes AS
-SELECT CAST(coalesce(f.sql_name, o.name) AS varchar(128)) AS index_name,
-       CAST(o.owner AS varchar(128)) AS index_owner,
-       CAST(coalesce(pf.sql_name, lf.pf_name) AS varchar(128)) AS table_name,
-       CAST(coalesce(po.owner, o.owner) AS varchar(128)) AS table_owner,
-       CAST(lf.pf_library AS varchar(128)) AS table_schema,
-       CAST(CASE WHEN f.is_unique THEN 'U' ELSE 'D' END AS char(1)) AS is_unique,
+SELECT CAST(coalesce(f.sql_name, o.name) AS varchar(128)) COLLATE "C" AS index_name,
+       CAST(o.owner AS varchar(128)) COLLATE "C" AS index_owner,
+       CAST(coalesce(pf.sql_name, lf.pf_name) AS varchar(128)) COLLATE "C" AS table_name,
+       CAST(coalesce(po.owner, o.owner) AS varchar(128)) COLLATE "C" AS table_owner,
+       CAST(lf.pf_library AS varchar(128)) COLLATE "C" AS table_schema,
+       CAST(CASE WHEN f.is_unique THEN 'U' ELSE 'D' END AS char(1)) COLLATE "C" AS is_unique,
        CAST((SELECT count(*) FROM as4tainr.file_keys k
              WHERE k.library = o.library AND k.file = o.name) AS integer) AS column_count,
-       CAST(o.library AS varchar(128)) AS index_schema,
-       CAST(o.name AS char(10)) AS system_index_name,
-       CAST(o.library AS char(10)) AS system_index_schema,
-       CAST(lf.pf_name AS char(10)) AS system_table_name,
-       CAST(lf.pf_library AS char(10)) AS system_table_schema,
-       CAST(NULL AS varchar(2000)) AS long_comment,
+       CAST(o.library AS varchar(128)) COLLATE "C" AS index_schema,
+       CAST(o.name AS char(10)) COLLATE "C" AS system_index_name,
+       CAST(o.library AS char(10)) COLLATE "C" AS system_index_schema,
+       CAST(lf.pf_name AS char(10)) COLLATE "C" AS system_table_name,
+       CAST(lf.pf_library AS char(10)) COLLATE "C" AS system_table_schema,
+       CAST(NULL AS varchar(2000)) COLLATE "C" AS long_comment,
        CAST(0 AS smallint) AS iasp_number,
-       CAST(nullif(o.text, '') AS varchar(50)) AS index_text,
-       CAST(NULL AS varchar(3)) AS is_spanning_index,
-       CAST(o.owner AS varchar(128)) AS index_definer,
-       CAST(NULL AS char(1)) AS rounding_mode,
-       CAST('N' AS char(1)) AS index_has_search_condition,
-       CAST('N' AS char(1)) AS search_condition_has_udf,
+       CAST(nullif(o.text, '') AS varchar(50)) COLLATE "C" AS index_text,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS is_spanning_index,
+       CAST(o.owner AS varchar(128)) COLLATE "C" AS index_definer,
+       CAST(NULL AS char(1)) COLLATE "C" AS rounding_mode,
+       CAST('N' AS char(1)) COLLATE "C" AS index_has_search_condition,
+       CAST('N' AS char(1)) COLLATE "C" AS search_condition_has_udf,
        CAST(NULL AS text) AS search_condition,
-       CAST('N' AS char(1)) AS index_has_include_expression,
+       CAST('N' AS char(1)) COLLATE "C" AS index_has_include_expression,
        CAST(NULL AS text) AS include_expression,
        CAST(o.created AS timestamp) AS created
 FROM as4tainr.objects o
@@ -264,18 +267,18 @@ WHERE o.objtype = '*FILE';
 
 -- SYSKEYS: the key columns of the indexes in SYSINDEXES.
 CREATE OR REPLACE VIEW qsys2.syskeys AS
-SELECT CAST(coalesce(f.sql_name, k.file) AS varchar(128)) AS index_name,
-       CAST(o.owner AS varchar(128)) AS index_owner,
-       CAST(coalesce(pff.alias, k.field) AS varchar(128)) AS column_name,
+SELECT CAST(coalesce(f.sql_name, k.file) AS varchar(128)) COLLATE "C" AS index_name,
+       CAST(o.owner AS varchar(128)) COLLATE "C" AS index_owner,
+       CAST(coalesce(pff.alias, k.field) AS varchar(128)) COLLATE "C" AS column_name,
        CAST(pff.seq + 1 AS integer) AS column_position,
        CAST(k.seq + 1 AS integer) AS ordinal_position,
-       CAST(CASE WHEN k.descending THEN 'D' ELSE 'A' END AS char(1)) AS ordering,
-       CAST(k.library AS varchar(128)) AS index_schema,
-       CAST(k.field AS char(10)) AS system_column_name,
-       CAST(k.file AS char(10)) AS system_index_name,
-       CAST(k.library AS char(10)) AS system_index_schema,
-       CAST('N' AS char(1)) AS column_is_expression,
-       CAST(NULL AS char(1)) AS expression_has_udf,
+       CAST(CASE WHEN k.descending THEN 'D' ELSE 'A' END AS char(1)) COLLATE "C" AS ordering,
+       CAST(k.library AS varchar(128)) COLLATE "C" AS index_schema,
+       CAST(k.field AS char(10)) COLLATE "C" AS system_column_name,
+       CAST(k.file AS char(10)) COLLATE "C" AS system_index_name,
+       CAST(k.library AS char(10)) COLLATE "C" AS system_index_schema,
+       CAST('N' AS char(1)) COLLATE "C" AS column_is_expression,
+       CAST(NULL AS char(1)) COLLATE "C" AS expression_has_udf,
        CAST(NULL AS text) AS key_expression
 FROM as4tainr.file_keys k
 JOIN as4tainr.files f ON f.library = k.library AND f.name = k.file AND f.sql_type = 'INDEX'
@@ -285,20 +288,20 @@ LEFT JOIN as4tainr.file_fields pff ON pff.library = lf.pf_library AND pff.file =
 
 -- SYSVIEWS: SQL views and their queries.
 CREATE OR REPLACE VIEW qsys2.sysviews AS
-SELECT CAST(coalesce(f.sql_name, o.name) AS varchar(128)) AS table_name,
-       CAST(o.owner AS varchar(128)) AS view_owner,
+SELECT CAST(coalesce(f.sql_name, o.name) AS varchar(128)) COLLATE "C" AS table_name,
+       CAST(o.owner AS varchar(128)) COLLATE "C" AS view_owner,
        CAST(1 AS integer) AS seqno,
-       CAST(CASE WHEN f.view_def::jsonb ->> 'check_option' = 'true' THEN 'C' ELSE 'N' END AS char(1)) AS check_option,
-       CAST(f.view_def::jsonb ->> 'query' AS varchar(5000)) AS view_definition,
-       CAST('N' AS char(1)) AS is_updatable,
-       CAST(o.library AS varchar(128)) AS table_schema,
-       CAST(o.name AS char(10)) AS system_view_name,
-       CAST(o.library AS char(10)) AS system_view_schema,
-       CAST('NO' AS varchar(3)) AS is_insertable_into,
+       CAST(CASE WHEN f.view_def::jsonb ->> 'check_option' = 'true' THEN 'C' ELSE 'N' END AS char(1)) COLLATE "C" AS check_option,
+       CAST(f.view_def::jsonb ->> 'query' AS varchar(5000)) COLLATE "C" AS view_definition,
+       CAST('N' AS char(1)) COLLATE "C" AS is_updatable,
+       CAST(o.library AS varchar(128)) COLLATE "C" AS table_schema,
+       CAST(o.name AS char(10)) COLLATE "C" AS system_view_name,
+       CAST(o.library AS char(10)) COLLATE "C" AS system_view_schema,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS is_insertable_into,
        CAST(0 AS smallint) AS iasp_number,
-       CAST('N' AS char(1)) AS is_deletable,
-       CAST(o.owner AS varchar(128)) AS view_definer,
-       CAST(NULL AS char(1)) AS rounding_mode
+       CAST('N' AS char(1)) COLLATE "C" AS is_deletable,
+       CAST(o.owner AS varchar(128)) COLLATE "C" AS view_definer,
+       CAST(NULL AS char(1)) COLLATE "C" AS rounding_mode
 FROM as4tainr.objects o
 JOIN as4tainr.files f ON f.library = o.library AND f.name = o.name AND f.view IS NOT NULL
 WHERE o.objtype = '*FILE';
@@ -435,6 +438,42 @@ fn object_statistics() -> String {
     )
 }
 
+/// Drop the views of an earlier version: CREATE OR REPLACE VIEW cannot
+/// change a column's collation or type. A view that others depend on
+/// (a user's view over a catalog view) is dropped once they are gone, or
+/// kept and replaced as before.
+async fn drop_views(client: &Client) {
+    let Ok(rows) = client
+        .query(
+            "SELECT schemaname, viewname FROM pg_views WHERE schemaname IN ('qsys2', 'as4tainr_svc')",
+            &[],
+        )
+        .await
+    else {
+        return;
+    };
+    let mut left: Vec<(String, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    // Views over views: drop the ones nothing depends on, then again.
+    loop {
+        let before = left.len();
+        let mut still = Vec::new();
+        for (schema, view) in left {
+            let sql = format!(
+                "DROP VIEW IF EXISTS {}.{}",
+                crate::catalog::ident(&schema),
+                crate::catalog::ident(&view)
+            );
+            if client.batch_execute(&sql).await.is_err() {
+                still.push((schema, view));
+            }
+        }
+        left = still;
+        if left.is_empty() || left.len() == before {
+            break;
+        }
+    }
+}
+
 /// Create (or replace) the services. Called from `sql::init`, after the
 /// SQL login exists.
 pub async fn init(client: &Client) -> Result<()> {
@@ -449,6 +488,9 @@ pub async fn init(client: &Client) -> Result<()> {
         .and_then(|r| r.get(0));
     if have.as_deref() == Some(VERSION) {
         return Ok(());
+    }
+    if have.is_some() {
+        drop_views(client).await;
     }
     client
         .batch_execute(&format!(
@@ -502,13 +544,13 @@ fn library_list_info() -> String {
     format!(
         "CREATE OR REPLACE VIEW qsys2.library_list_info AS
          SELECT CAST(x.n AS integer) AS ordinal_position,
-                CAST(upper(x.s) AS varchar(128)) AS schema_name,
-                CAST(upper(x.s) AS varchar(10)) AS system_schema_name,
+                CAST(upper(x.s) AS varchar(128)) COLLATE \"C\" AS schema_name,
+                CAST(upper(x.s) AS varchar(10)) COLLATE \"C\" AS system_schema_name,
                 CAST(CASE WHEN upper(x.s) IN ({sys}) THEN 'SYSTEM'
                           WHEN upper(x.s) = current_setting('as4tainr.curlib', true) THEN 'CURRENT'
-                          ELSE 'USER' END AS varchar(15)) AS type,
+                          ELSE 'USER' END AS varchar(15)) COLLATE \"C\" AS type,
                 CAST(0 AS smallint) AS iasp_number,
-                CAST(nullif(o.text, '') AS varchar(50)) AS text_description
+                CAST(nullif(o.text, '') AS varchar(50)) COLLATE \"C\" AS text_description
          FROM unnest(current_schemas(false)) WITH ORDINALITY AS x(s, n)
          LEFT JOIN as4tainr.objects o
            ON o.library = 'QSYS' AND o.objtype = '*LIB' AND o.name = upper(x.s);",
@@ -645,9 +687,9 @@ fn system_value_info() -> String {
         .collect();
     format!(
         "CREATE OR REPLACE VIEW qsys2.system_value_info AS
-         SELECT CAST(v.n AS varchar(10)) AS system_value_name,
+         SELECT CAST(v.n AS varchar(10)) COLLATE \"C\" AS system_value_name,
                 CAST(v.num AS bigint) AS current_numeric_value,
-                CAST(v.ch AS varchar(4096)) AS current_character_value
+                CAST(v.ch AS varchar(4096)) COLLATE \"C\" AS current_character_value
          FROM (VALUES {}) AS v(n, num, ch);",
         rows.join(", ")
     )
@@ -874,21 +916,21 @@ CREATE OR REPLACE VIEW as4tainr_svc.routines AS
 SELECT r.library, r.name, r.kind, r.created, d.def
   FROM as4tainr.routines r CROSS JOIN LATERAL (SELECT r.definition::jsonb AS def) d;
 CREATE OR REPLACE VIEW qsys2.sysroutines AS
-SELECT CAST(r.library AS varchar(128)) AS specific_schema,
-       CAST(r.name AS varchar(128)) AS specific_name,
-       CAST(r.library AS varchar(128)) AS routine_schema,
-       CAST(r.name AS varchar(128)) AS routine_name,
-       CAST(r.kind AS varchar(9)) AS routine_type,
+SELECT CAST(r.library AS varchar(128)) COLLATE "C" AS specific_schema,
+       CAST(r.name AS varchar(128)) COLLATE "C" AS specific_name,
+       CAST(r.library AS varchar(128)) COLLATE "C" AS routine_schema,
+       CAST(r.name AS varchar(128)) COLLATE "C" AS routine_name,
+       CAST(r.kind AS varchar(9)) COLLATE "C" AS routine_type,
        CAST(r.created AS timestamp) AS routine_created,
-       CAST(NULL AS varchar(128)) AS routine_definer,
-       CAST(CASE WHEN r.def ->> 'external' IS NOT NULL THEN 'EXTERNAL' ELSE 'SQL' END AS varchar(8)) AS routine_body,
-       CAST(r.def ->> 'external' AS varchar(279)) AS external_name,
-       CAST(NULL AS varchar(8)) AS external_language,
-       CAST(CASE WHEN r.def ->> 'external' IS NOT NULL THEN 'GENERAL' END AS varchar(7)) AS parameter_style,
-       CAST('NO' AS varchar(3)) AS is_deterministic,
-       CAST(CASE r.kind WHEN 'PROCEDURE' THEN 'MODIFIES' ELSE 'READS' END AS varchar(8)) AS sql_data_access,
-       CAST(NULL AS varchar(3483)) AS sql_path,
-       CAST(NULL AS varchar(2048)) AS parm_signature,
+       CAST(NULL AS varchar(128)) COLLATE "C" AS routine_definer,
+       CAST(CASE WHEN r.def ->> 'external' IS NOT NULL THEN 'EXTERNAL' ELSE 'SQL' END AS varchar(8)) COLLATE "C" AS routine_body,
+       CAST(r.def ->> 'external' AS varchar(279)) COLLATE "C" AS external_name,
+       CAST(NULL AS varchar(8)) COLLATE "C" AS external_language,
+       CAST(CASE WHEN r.def ->> 'external' IS NOT NULL THEN 'GENERAL' END AS varchar(7)) COLLATE "C" AS parameter_style,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS is_deterministic,
+       CAST(CASE r.kind WHEN 'PROCEDURE' THEN 'MODIFIES' ELSE 'READS' END AS varchar(8)) COLLATE "C" AS sql_data_access,
+       CAST(NULL AS varchar(3483)) COLLATE "C" AS sql_path,
+       CAST(NULL AS varchar(2048)) COLLATE "C" AS parm_signature,
        CAST(CASE WHEN r.kind = 'FUNCTION' THEN 1 ELSE 0 END AS smallint) AS number_of_results,
        CAST(coalesce((r.def ->> 'result_sets')::int, 0) AS smallint) AS max_dynamic_result_sets,
        CAST((SELECT count(*) FROM jsonb_array_elements(r.def -> 'parms') p WHERE p ->> 'mode' = 'IN') AS smallint) AS in_parms,
@@ -896,31 +938,31 @@ SELECT CAST(r.library AS varchar(128)) AS specific_schema,
        CAST((SELECT count(*) FROM jsonb_array_elements(r.def -> 'parms') p WHERE p ->> 'mode' = 'INOUT') AS smallint) AS inout_parms,
        CAST(NULL AS bytea) AS parse_tree,
        CAST(NULL AS bytea) AS parm_array,
-       CAST(NULL AS varchar(2000)) AS long_comment,
+       CAST(NULL AS varchar(2000)) COLLATE "C" AS long_comment,
        CAST(nullif(r.def ->> 'body', '') AS text) AS routine_definition,
-       CAST(CASE WHEN r.kind = 'PROCEDURE' THEN ' ' END AS char(1)) AS function_origin,
+       CAST(CASE WHEN r.kind = 'PROCEDURE' THEN ' ' END AS char(1)) COLLATE "C" AS function_origin,
        CAST(CASE WHEN r.kind = 'PROCEDURE' THEN ' '
-                 WHEN r.def ->> 'returns' LIKE 'TABLE(%' THEN 'T' ELSE 'S' END AS char(1)) AS function_type,
-       CAST(NULL AS char(1)) AS external_action,
-       CAST(NULL AS varchar(3)) AS is_null_call,
+                 WHEN r.def ->> 'returns' LIKE 'TABLE(%' THEN 'T' ELSE 'S' END AS char(1)) COLLATE "C" AS function_type,
+       CAST(NULL AS char(1)) COLLATE "C" AS external_action,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS is_null_call,
        CAST(NULL AS integer) AS scratch_pad,
-       CAST(NULL AS varchar(3)) AS final_call,
-       CAST(NULL AS varchar(3)) AS parallelizable,
-       CAST(NULL AS varchar(3)) AS dbinfo,
-       CAST(NULL AS varchar(128)) AS source_specific_schema,
-       CAST(NULL AS varchar(128)) AS source_specific_name,
-       CAST(NULL AS varchar(3)) AS is_user_defined_cast,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS final_call,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS parallelizable,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS dbinfo,
+       CAST(NULL AS varchar(128)) COLLATE "C" AS source_specific_schema,
+       CAST(NULL AS varchar(128)) COLLATE "C" AS source_specific_name,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS is_user_defined_cast,
        CAST(NULL AS bigint) AS cardinality,
-       CAST(NULL AS varchar(3)) AS fenced,
-       CAST(NULL AS varchar(3)) AS commit_on_return,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS fenced,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS commit_on_return,
        CAST(0 AS smallint) AS iasp_number,
-       CAST(NULL AS varchar(3)) AS new_savepoint_level,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS new_savepoint_level,
        CAST(r.created AS timestamp) AS last_altered,
-       CAST(NULL AS char(1)) AS debug_mode,
+       CAST(NULL AS char(1)) COLLATE "C" AS debug_mode,
        CAST(NULL AS text) AS debug_data,
-       CAST(NULL AS char(1)) AS rounding_mode,
-       CAST(NULL AS varchar(50)) AS routine_text,
-       CAST(NULL AS char(1)) AS secure,
+       CAST(NULL AS char(1)) COLLATE "C" AS rounding_mode,
+       CAST(NULL AS varchar(50)) COLLATE "C" AS routine_text,
+       CAST(NULL AS char(1)) COLLATE "C" AS secure,
        CAST(NULL AS bytea) AS routine_environment,
        CAST(NULL AS bytea) AS routine_default_qdt
   FROM as4tainr_svc.routines r;
@@ -937,12 +979,12 @@ WITH p AS (
     FROM as4tainr_svc.routines r
    WHERE r.kind = 'FUNCTION' AND r.def ->> 'returns' NOT LIKE 'TABLE(%'
 )
-SELECT CAST(p.library AS varchar(128)) AS specific_schema,
-       CAST(p.name AS varchar(128)) AS specific_name,
+SELECT CAST(p.library AS varchar(128)) COLLATE "C" AS specific_schema,
+       CAST(p.name AS varchar(128)) COLLATE "C" AS specific_name,
        p.pos AS ordinal_position,
-       CAST(p.mode AS varchar(5)) AS parameter_mode,
-       CAST(p.pname AS varchar(128)) AS parameter_name,
-       CAST(upper(trim(regexp_replace(p.ty, '\s*\(.*$', ''))) AS varchar(128)) AS data_type,
+       CAST(p.mode AS varchar(5)) COLLATE "C" AS parameter_mode,
+       CAST(p.pname AS varchar(128)) COLLATE "C" AS parameter_name,
+       CAST(upper(trim(regexp_replace(p.ty, '\s*\(.*$', ''))) AS varchar(128)) COLLATE "C" AS data_type,
        CAST(CASE WHEN upper(p.ty) ~ '^(DEC|DECIMAL|NUMERIC|NUM)\y'
                  THEN coalesce((regexp_match(p.ty, '\(\s*\d+\s*,\s*(\d+)'))[1]::int, 0) END AS integer) AS numeric_scale,
        CAST(CASE WHEN upper(p.ty) ~ '^(DEC|DECIMAL|NUMERIC|NUM)\y'
@@ -956,14 +998,14 @@ SELECT CAST(p.library AS varchar(128)) AS specific_schema,
        CAST(NULL AS integer) AS character_octet_length,
        CAST(CASE WHEN upper(p.ty) ~ '^(DEC|DECIMAL|NUMERIC|NUM|SMALLINT|INT|INTEGER|BIGINT)\y' THEN 10 END AS integer) AS numeric_precision_radix,
        CAST(NULL AS integer) AS datetime_precision,
-       CAST('YES' AS varchar(3)) AS is_nullable,
-       CAST(NULL AS varchar(2000)) AS long_comment,
-       CAST(p.row_type AS char(1)) AS row_type,
-       CAST(NULL AS varchar(128)) AS data_type_schema,
-       CAST(NULL AS varchar(128)) AS data_type_name,
-       CAST('NO' AS varchar(3)) AS as_locator,
+       CAST('YES' AS varchar(3)) COLLATE "C" AS is_nullable,
+       CAST(NULL AS varchar(2000)) COLLATE "C" AS long_comment,
+       CAST(p.row_type AS char(1)) COLLATE "C" AS row_type,
+       CAST(NULL AS varchar(128)) COLLATE "C" AS data_type_schema,
+       CAST(NULL AS varchar(128)) COLLATE "C" AS data_type_name,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS as_locator,
        CAST(0 AS smallint) AS iasp_number,
-       CAST('NO' AS varchar(3)) AS normalize_data,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS normalize_data,
        CAST(p.dft AS text) AS "default"
   FROM p;
 "#;

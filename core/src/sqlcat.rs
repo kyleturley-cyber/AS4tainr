@@ -54,38 +54,38 @@ SELECT c.library, c.file, c.name, c.kind, c.created, coalesce(fl.sql_name, c.fil
                      WHERE ns.nspname = lower(c.library) AND pc.conname = lower(c.file || '_' || c.name)));
 
 CREATE OR REPLACE VIEW qsys2.syscst AS
-SELECT CAST(c.library AS varchar(128)) AS constraint_schema,
-       CAST(c.name AS varchar(128)) AS constraint_name,
-       CAST(c.kind AS varchar(11)) AS constraint_type,
-       CAST(c.library AS varchar(128)) AS table_schema,
-       CAST(c.table_name AS varchar(128)) AS table_name,
-       CAST(c.library AS char(10)) AS system_constraint_schema,
-       CAST(c.library AS char(10)) AS system_table_schema,
-       CAST(c.file AS char(10)) AS system_table_name,
-       CAST('NO' AS varchar(3)) AS is_deferrable,
-       CAST('NO' AS varchar(3)) AS initially_deferred,
+SELECT CAST(c.library AS varchar(128)) COLLATE "C" AS constraint_schema,
+       CAST(c.name AS varchar(128)) COLLATE "C" AS constraint_name,
+       CAST(c.kind AS varchar(11)) COLLATE "C" AS constraint_type,
+       CAST(c.library AS varchar(128)) COLLATE "C" AS table_schema,
+       CAST(c.table_name AS varchar(128)) COLLATE "C" AS table_name,
+       CAST(c.library AS char(10)) COLLATE "C" AS system_constraint_schema,
+       CAST(c.library AS char(10)) COLLATE "C" AS system_table_schema,
+       CAST(c.file AS char(10)) COLLATE "C" AS system_table_name,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS is_deferrable,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS initially_deferred,
        CAST((SELECT count(*) FROM as4tainr_svc.cst_columns(c.library, c.file, c.name, c.kind)) AS integer)
          AS constraint_keys,
-       CAST('ESTABLISHED' AS varchar(11)) AS constraint_state,
-       CAST('YES' AS varchar(3)) AS enabled,
-       CAST('NO' AS varchar(3)) AS check_pending,
-       CAST(NULL AS varchar(50)) AS constraint_text,
-       CAST(NULL AS varchar(2000)) AS long_comment,
+       CAST('ESTABLISHED' AS varchar(11)) COLLATE "C" AS constraint_state,
+       CAST('YES' AS varchar(3)) COLLATE "C" AS enabled,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS check_pending,
+       CAST(NULL AS varchar(50)) COLLATE "C" AS constraint_text,
+       CAST(NULL AS varchar(2000)) COLLATE "C" AS long_comment,
        CAST(0 AS smallint) AS iasp_number
   FROM as4tainr_svc.constraints c;
 
 CREATE OR REPLACE VIEW qsys2.syskeycst AS
-SELECT CAST(c.library AS varchar(128)) AS constraint_schema,
-       CAST(c.name AS varchar(128)) AS constraint_name,
-       CAST(coalesce(ff.alias, ff.name, upper(k.col)) AS varchar(128)) AS column_name,
+SELECT CAST(c.library AS varchar(128)) COLLATE "C" AS constraint_schema,
+       CAST(c.name AS varchar(128)) COLLATE "C" AS constraint_name,
+       CAST(coalesce(ff.alias, ff.name, upper(k.col)) AS varchar(128)) COLLATE "C" AS column_name,
        k.pos AS ordinal_position,
        CAST(ff.seq + 1 AS integer) AS column_position,
-       CAST(c.library AS varchar(128)) AS table_schema,
-       CAST(c.table_name AS varchar(128)) AS table_name,
-       CAST(coalesce(ff.name, upper(k.col)) AS char(10)) AS system_column_name,
-       CAST(c.library AS char(10)) AS system_constraint_schema,
-       CAST(c.library AS char(10)) AS system_table_schema,
-       CAST(c.file AS char(10)) AS system_table_name,
+       CAST(c.library AS varchar(128)) COLLATE "C" AS table_schema,
+       CAST(c.table_name AS varchar(128)) COLLATE "C" AS table_name,
+       CAST(coalesce(ff.name, upper(k.col)) AS char(10)) COLLATE "C" AS system_column_name,
+       CAST(c.library AS char(10)) COLLATE "C" AS system_constraint_schema,
+       CAST(c.library AS char(10)) COLLATE "C" AS system_table_schema,
+       CAST(c.file AS char(10)) COLLATE "C" AS system_table_name,
        CAST(0 AS smallint) AS iasp_number
   FROM as4tainr_svc.constraints c
  CROSS JOIN LATERAL as4tainr_svc.cst_columns(c.library, c.file, c.name, c.kind) k
@@ -94,13 +94,13 @@ SELECT CAST(c.library AS varchar(128)) AS constraint_schema,
  WHERE c.kind <> 'CHECK';
 
 CREATE OR REPLACE VIEW qsys2.syschkcst AS
-SELECT CAST(c.library AS varchar(128)) AS constraint_schema,
-       CAST(c.name AS varchar(128)) AS constraint_name,
-       CAST(CASE WHEN d.cond LIKE '%''%' THEN d.cond ELSE upper(d.cond) END AS varchar(2000)) AS check_clause,
-       CAST(NULL AS char(1)) AS rounding_mode,
-       CAST(c.library AS char(10)) AS system_constraint_schema,
-       CAST(NULL AS varchar(500)) AS insert_action,
-       CAST(NULL AS varchar(500)) AS update_action
+SELECT CAST(c.library AS varchar(128)) COLLATE "C" AS constraint_schema,
+       CAST(c.name AS varchar(128)) COLLATE "C" AS constraint_name,
+       CAST(CASE WHEN d.cond LIKE '%''%' THEN d.cond ELSE upper(d.cond) END AS varchar(2000)) COLLATE "C" AS check_clause,
+       CAST(NULL AS char(1)) COLLATE "C" AS rounding_mode,
+       CAST(c.library AS char(10)) COLLATE "C" AS system_constraint_schema,
+       CAST(NULL AS varchar(500)) COLLATE "C" AS insert_action,
+       CAST(NULL AS varchar(500)) COLLATE "C" AS update_action
   FROM as4tainr_svc.constraints c
   JOIN pg_namespace ns ON ns.nspname = lower(c.library)
   JOIN pg_constraint pc ON pc.connamespace = ns.oid AND pc.conname = lower(c.file || '_' || c.name)
@@ -111,17 +111,17 @@ SELECT CAST(c.library AS varchar(128)) AS constraint_schema,
 -- A foreign key's parent key: the unique constraint (or keyed file) its
 -- PostgreSQL index is.
 CREATE OR REPLACE VIEW qsys2.sysrefcst AS
-SELECT CAST(c.library AS varchar(128)) AS constraint_schema,
-       CAST(c.name AS varchar(128)) AS constraint_name,
-       CAST(upper(pns.nspname) AS varchar(128)) AS unique_constraint_schema,
-       CAST(coalesce(pk.name, upper(ic.relname)) AS varchar(128)) AS unique_constraint_name,
-       CAST(CASE pc.confmatchtype WHEN 'f' THEN 'FULL' WHEN 'p' THEN 'PARTIAL' ELSE 'NONE' END AS varchar(7)) AS match_option,
+SELECT CAST(c.library AS varchar(128)) COLLATE "C" AS constraint_schema,
+       CAST(c.name AS varchar(128)) COLLATE "C" AS constraint_name,
+       CAST(upper(pns.nspname) AS varchar(128)) COLLATE "C" AS unique_constraint_schema,
+       CAST(coalesce(pk.name, upper(ic.relname)) AS varchar(128)) COLLATE "C" AS unique_constraint_name,
+       CAST(CASE pc.confmatchtype WHEN 'f' THEN 'FULL' WHEN 'p' THEN 'PARTIAL' ELSE 'NONE' END AS varchar(7)) COLLATE "C" AS match_option,
        CAST(CASE pc.confupdtype WHEN 'r' THEN 'RESTRICT' WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL'
-                                WHEN 'd' THEN 'SET DEFAULT' ELSE 'NO ACTION' END AS varchar(11)) AS update_rule,
+                                WHEN 'd' THEN 'SET DEFAULT' ELSE 'NO ACTION' END AS varchar(11)) COLLATE "C" AS update_rule,
        CAST(CASE pc.confdeltype WHEN 'r' THEN 'RESTRICT' WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL'
-                                WHEN 'd' THEN 'SET DEFAULT' ELSE 'NO ACTION' END AS varchar(11)) AS delete_rule,
+                                WHEN 'd' THEN 'SET DEFAULT' ELSE 'NO ACTION' END AS varchar(11)) COLLATE "C" AS delete_rule,
        CAST(cardinality(pc.conkey) AS integer) AS column_count,
-       CAST(c.library AS char(10)) AS system_constraint_schema,
+       CAST(c.library AS char(10)) COLLATE "C" AS system_constraint_schema,
        CAST(0 AS smallint) AS iasp_number
   FROM as4tainr_svc.constraints c
   JOIN pg_namespace ns ON ns.nspname = lower(c.library)
@@ -135,31 +135,31 @@ SELECT CAST(c.library AS varchar(128)) AS constraint_schema,
 
 -- SQL triggers (CREATE TRIGGER) and trigger programs (ADDPFTRG).
 CREATE OR REPLACE VIEW qsys2.systriggers AS
-SELECT CAST(t.library AS varchar(128)) AS trigger_schema,
-       CAST(t.name AS varchar(128)) AS trigger_name,
-       CAST(CASE WHEN t.events LIKE '% %' THEN 'MULTI' ELSE t.events END AS varchar(6)) AS event_manipulation,
+SELECT CAST(t.library AS varchar(128)) COLLATE "C" AS trigger_schema,
+       CAST(t.name AS varchar(128)) COLLATE "C" AS trigger_name,
+       CAST(CASE WHEN t.events LIKE '% %' THEN 'MULTI' ELSE t.events END AS varchar(6)) COLLATE "C" AS event_manipulation,
        CAST(1 AS bigint) AS action_order,
        CAST(t.condition AS text) AS action_condition,
        CAST(t.body AS text) AS action_statement,
-       CAST(CASE WHEN t.each_row THEN 'ROW' ELSE 'STATEMENT' END AS varchar(9)) AS action_orientation,
-       CAST(t.timing AS varchar(10)) AS action_timing,
-       CAST(t.file_lib AS varchar(128)) AS event_object_schema,
-       CAST(coalesce(f.sql_name, t.file) AS varchar(128)) AS event_object_table,
-       CAST(NULL AS varchar(128)) AS action_reference_old_table,
-       CAST(NULL AS varchar(128)) AS action_reference_new_table,
-       CAST(t.old_row AS varchar(128)) AS action_reference_old_row,
-       CAST(t.new_row AS varchar(128)) AS action_reference_new_row,
+       CAST(CASE WHEN t.each_row THEN 'ROW' ELSE 'STATEMENT' END AS varchar(9)) COLLATE "C" AS action_orientation,
+       CAST(t.timing AS varchar(10)) COLLATE "C" AS action_timing,
+       CAST(t.file_lib AS varchar(128)) COLLATE "C" AS event_object_schema,
+       CAST(coalesce(f.sql_name, t.file) AS varchar(128)) COLLATE "C" AS event_object_table,
+       CAST(NULL AS varchar(128)) COLLATE "C" AS action_reference_old_table,
+       CAST(NULL AS varchar(128)) COLLATE "C" AS action_reference_new_table,
+       CAST(t.old_row AS varchar(128)) COLLATE "C" AS action_reference_old_row,
+       CAST(t.new_row AS varchar(128)) COLLATE "C" AS action_reference_new_row,
        CAST(t.created AS timestamp) AS created,
-       CAST(t.name AS varchar(10)) AS trigger_program_name,
-       CAST(t.library AS varchar(10)) AS trigger_program_library,
-       CAST('Y' AS char(1)) AS operative,
-       CAST('DB2SQL' AS varchar(6)) AS trigger_mode,
-       CAST(NULL AS varchar(50)) AS trigger_text,
+       CAST(t.name AS varchar(10)) COLLATE "C" AS trigger_program_name,
+       CAST(t.library AS varchar(10)) COLLATE "C" AS trigger_program_library,
+       CAST('Y' AS char(1)) COLLATE "C" AS operative,
+       CAST('DB2SQL' AS varchar(6)) COLLATE "C" AS trigger_mode,
+       CAST(NULL AS varchar(50)) COLLATE "C" AS trigger_text,
        CAST(t.created AS timestamp) AS last_altered,
-       CAST(t.definer AS varchar(128)) AS trigger_definer,
-       CAST(t.library AS char(10)) AS system_trigger_schema,
-       CAST(t.file_lib AS char(10)) AS system_event_object_schema,
-       CAST(t.file AS char(10)) AS system_event_object_table
+       CAST(t.definer AS varchar(128)) COLLATE "C" AS trigger_definer,
+       CAST(t.library AS char(10)) COLLATE "C" AS system_trigger_schema,
+       CAST(t.file_lib AS char(10)) COLLATE "C" AS system_event_object_schema,
+       CAST(t.file AS char(10)) COLLATE "C" AS system_event_object_table
   FROM as4tainr.sql_triggers t
   LEFT JOIN as4tainr.files f ON f.library = t.file_lib AND f.name = t.file
  WHERE EXISTS (SELECT 1 FROM pg_trigger pt JOIN pg_class pc ON pc.oid = pt.tgrelid
@@ -179,28 +179,28 @@ SELECT CAST(x.trg_lib AS varchar(128)), CAST(x.trg AS varchar(128)),
   LEFT JOIN as4tainr.files f ON f.library = x.library AND f.name = x.file;
 
 CREATE OR REPLACE VIEW qsys2.syssequences AS
-SELECT CAST(s.library AS varchar(128)) AS sequence_schema,
-       CAST(s.name AS varchar(128)) AS sequence_name,
+SELECT CAST(s.library AS varchar(128)) COLLATE "C" AS sequence_schema,
+       CAST(s.name AS varchar(128)) COLLATE "C" AS sequence_name,
        CAST(ps.max_value AS decimal(63, 0)) AS maximum_value,
        CAST(ps.min_value AS decimal(63, 0)) AS minimum_value,
        CAST(ps.increment_by AS integer) AS increment,
-       CAST(CASE WHEN ps.cycle THEN 'YES' ELSE 'NO' END AS varchar(3)) AS cycle_option,
+       CAST(CASE WHEN ps.cycle THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS cycle_option,
        CAST(coalesce(s.cache, 0) AS integer) AS cache,
        CAST(CASE WHEN s.ordered THEN 'YES' ELSE 'NO' END AS varchar(3)) AS "order",
-       CAST(s.data_type AS varchar(128)) AS data_type,
+       CAST(s.data_type AS varchar(128)) COLLATE "C" AS data_type,
        CAST(CASE s.data_type WHEN 'SMALLINT' THEN 5 WHEN 'INTEGER' THEN 10 WHEN 'BIGINT' THEN 19
                              ELSE s.precision END AS integer) AS numeric_precision,
-       CAST(NULL AS varchar(128)) AS user_defined_type_schema,
-       CAST(NULL AS varchar(128)) AS user_defined_type_name,
+       CAST(NULL AS varchar(128)) COLLATE "C" AS user_defined_type_schema,
+       CAST(NULL AS varchar(128)) COLLATE "C" AS user_defined_type_name,
        CAST(ps.start_value AS decimal(63, 0)) AS start,
        CAST(ps.last_value AS decimal(63, 0)) AS maxassignedval,
-       CAST(o.owner AS varchar(128)) AS sequence_definer,
+       CAST(o.owner AS varchar(128)) COLLATE "C" AS sequence_definer,
        CAST(o.created AS timestamp) AS sequence_created,
        CAST(o.created AS timestamp) AS last_altered_timestamp,
-       CAST(nullif(o.text, '') AS varchar(50)) AS sequence_text,
-       CAST(NULL AS varchar(2000)) AS long_comment,
-       CAST(s.library AS char(10)) AS system_seq_schema,
-       CAST(s.name AS char(10)) AS system_seq_name,
+       CAST(nullif(o.text, '') AS varchar(50)) COLLATE "C" AS sequence_text,
+       CAST(NULL AS varchar(2000)) COLLATE "C" AS long_comment,
+       CAST(s.library AS char(10)) COLLATE "C" AS system_seq_schema,
+       CAST(s.name AS char(10)) COLLATE "C" AS system_seq_name,
        CAST(0 AS smallint) AS iasp_number
   FROM as4tainr.sequences s
   JOIN as4tainr.objects o ON o.library = s.library AND o.name = s.name AND o.objtype = '*DTAARA'
@@ -209,24 +209,24 @@ SELECT CAST(s.library AS varchar(128)) AS sequence_schema,
 -- OUTPUT_QUEUE_ENTRIES_BASIC (IBM i Services): the spooled files. Sizes
 -- are the lines' bytes in kilobytes; the output queue's library is QGPL.
 CREATE OR REPLACE VIEW qsys2.output_queue_entries_basic AS
-SELECT CAST(s.outq AS varchar(10)) AS output_queue_name,
-       CAST('QGPL' AS varchar(10)) AS output_queue_library_name,
+SELECT CAST(s.outq AS varchar(10)) COLLATE "C" AS output_queue_name,
+       CAST('QGPL' AS varchar(10)) COLLATE "C" AS output_queue_library_name,
        CAST(s.created AS timestamp) AS create_timestamp,
-       CAST(s.file AS varchar(10)) AS spooled_file_name,
-       CAST(s.user_name AS varchar(10)) AS user_name,
-       CAST(nullif(s.user_data, '') AS varchar(10)) AS user_data,
+       CAST(s.file AS varchar(10)) COLLATE "C" AS spooled_file_name,
+       CAST(s.user_name AS varchar(10)) COLLATE "C" AS user_name,
+       CAST(nullif(s.user_data, '') AS varchar(10)) COLLATE "C" AS user_data,
        CAST(CASE s.status WHEN 'OPN' THEN 'OPEN' WHEN 'HLD' THEN 'HELD' WHEN 'SAV' THEN 'SAVED'
-                          WHEN 'CLO' THEN 'CLOSED' ELSE 'READY' END AS varchar(15)) AS status,
+                          WHEN 'CLO' THEN 'CLOSED' ELSE 'READY' END AS varchar(15)) COLLATE "C" AS status,
        CAST(ceil(coalesce((SELECT sum(length(l.text) + 1) FROM as4tainr.spool_lines l WHERE l.spl = s.id), 0)
                  / 1024.0) AS integer) AS size,
        CAST(s.pages AS integer) AS total_pages,
        CAST(1 AS smallint) AS copies,
-       CAST('*STD' AS varchar(10)) AS form_type,
-       CAST(s.job_name AS varchar(28)) AS job_name,
-       CAST('*SCS' AS varchar(10)) AS device_type,
+       CAST('*STD' AS varchar(10)) COLLATE "C" AS form_type,
+       CAST(s.job_name AS varchar(28)) COLLATE "C" AS job_name,
+       CAST('*SCS' AS varchar(10)) COLLATE "C" AS device_type,
        CAST(5 AS smallint) AS output_priority,
        CAST(s.number AS integer) AS file_number,
-       CAST('AS4TAINR' AS varchar(8)) AS system
+       CAST('AS4TAINR' AS varchar(8)) COLLATE "C" AS system
   FROM as4tainr.spooled_files s;
 CREATE OR REPLACE VIEW qsys2.output_queue_entries AS
 SELECT * FROM qsys2.output_queue_entries_basic;
@@ -246,33 +246,33 @@ WITH a AS (
   UNION ALL
   SELECT o.library, o.name, o.objtype, o.owner, o.text, '*PUBLIC', o.public_aut FROM as4tainr.objects o
 )
-SELECT CAST(a.library AS varchar(128)) AS object_schema,
-       CAST(coalesce(f.sql_name, a.name) AS varchar(128)) AS object_name,
-       CAST(a.library AS varchar(10)) AS system_object_schema,
-       CAST(a.name AS varchar(10)) AS system_object_name,
-       CAST(a.objtype AS varchar(8)) AS object_type,
+SELECT CAST(a.library AS varchar(128)) COLLATE "C" AS object_schema,
+       CAST(coalesce(f.sql_name, a.name) AS varchar(128)) COLLATE "C" AS object_name,
+       CAST(a.library AS varchar(10)) COLLATE "C" AS system_object_schema,
+       CAST(a.name AS varchar(10)) COLLATE "C" AS system_object_name,
+       CAST(a.objtype AS varchar(8)) COLLATE "C" AS object_type,
        CAST(CASE WHEN a.objtype = '*FILE' THEN
               CASE f.sql_type WHEN 'TABLE' THEN 'TABLE' WHEN 'VIEW' THEN 'VIEW' WHEN 'INDEX' THEN 'INDEX' END
             WHEN a.objtype = '*DTAARA' AND EXISTS (SELECT 1 FROM as4tainr.sequences s
-                 WHERE s.library = a.library AND s.name = a.name) THEN 'SEQUENCE' END AS varchar(9)) AS sql_object_type,
-       CAST(a.who AS varchar(10)) AS authorization_name,
-       CAST(a.aut AS varchar(12)) AS object_authority,
-       CAST(a.owner AS varchar(10)) AS owner,
-       CAST(NULL AS varchar(10)) AS authorization_list,
-       CAST(NULL AS varchar(10)) AS primary_group,
-       CAST('NO' AS varchar(3)) AS authorization_list_management,
-       CAST(CASE WHEN a.who = a.owner THEN 'YES' ELSE 'NO' END AS varchar(3)) AS object_owner,
-       CAST(CASE WHEN a.aut IN ('*ALL', '*CHANGE', '*USE') THEN 'YES' ELSE 'NO' END AS varchar(3)) AS object_operational,
-       CAST(CASE WHEN a.aut = '*ALL' THEN 'YES' ELSE 'NO' END AS varchar(3)) AS object_management,
-       CAST(CASE WHEN a.aut = '*ALL' THEN 'YES' ELSE 'NO' END AS varchar(3)) AS object_existence,
-       CAST(CASE WHEN a.aut = '*ALL' THEN 'YES' ELSE 'NO' END AS varchar(3)) AS object_alter,
-       CAST(CASE WHEN a.aut = '*ALL' THEN 'YES' ELSE 'NO' END AS varchar(3)) AS object_reference,
-       CAST(CASE WHEN a.aut IN ('*ALL', '*CHANGE', '*USE') THEN 'YES' ELSE 'NO' END AS varchar(3)) AS data_read,
-       CAST(CASE WHEN a.aut IN ('*ALL', '*CHANGE') THEN 'YES' ELSE 'NO' END AS varchar(3)) AS data_add,
-       CAST(CASE WHEN a.aut IN ('*ALL', '*CHANGE') THEN 'YES' ELSE 'NO' END AS varchar(3)) AS data_update,
-       CAST(CASE WHEN a.aut IN ('*ALL', '*CHANGE') THEN 'YES' ELSE 'NO' END AS varchar(3)) AS data_delete,
-       CAST(CASE WHEN a.aut IN ('*ALL', '*CHANGE', '*USE') THEN 'YES' ELSE 'NO' END AS varchar(3)) AS data_execute,
-       CAST(nullif(a.text, '') AS varchar(50)) AS text_description
+                 WHERE s.library = a.library AND s.name = a.name) THEN 'SEQUENCE' END AS varchar(9)) COLLATE "C" AS sql_object_type,
+       CAST(a.who AS varchar(10)) COLLATE "C" AS authorization_name,
+       CAST(a.aut AS varchar(12)) COLLATE "C" AS object_authority,
+       CAST(a.owner AS varchar(10)) COLLATE "C" AS owner,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS authorization_list,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS primary_group,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS authorization_list_management,
+       CAST(CASE WHEN a.who = a.owner THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS object_owner,
+       CAST(CASE WHEN a.aut IN ('*ALL', '*CHANGE', '*USE') THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS object_operational,
+       CAST(CASE WHEN a.aut = '*ALL' THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS object_management,
+       CAST(CASE WHEN a.aut = '*ALL' THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS object_existence,
+       CAST(CASE WHEN a.aut = '*ALL' THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS object_alter,
+       CAST(CASE WHEN a.aut = '*ALL' THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS object_reference,
+       CAST(CASE WHEN a.aut IN ('*ALL', '*CHANGE', '*USE') THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS data_read,
+       CAST(CASE WHEN a.aut IN ('*ALL', '*CHANGE') THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS data_add,
+       CAST(CASE WHEN a.aut IN ('*ALL', '*CHANGE') THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS data_update,
+       CAST(CASE WHEN a.aut IN ('*ALL', '*CHANGE') THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS data_delete,
+       CAST(CASE WHEN a.aut IN ('*ALL', '*CHANGE', '*USE') THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS data_execute,
+       CAST(nullif(a.text, '') AS varchar(50)) COLLATE "C" AS text_description
   FROM a
   LEFT JOIN as4tainr.files f ON a.objtype = '*FILE' AND f.library = a.library AND f.name = a.name;
 

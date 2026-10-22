@@ -1,0 +1,39 @@
+# 5250 screens of PUB400 (IBM i 7.5), round 2: list displays, prompt
+# control, F10 on prompts and Command Entry, a few work-with displays.
+# Objects: data area SCR2DA in the current library (created and deleted here).
+# Run: screens.ps1 -List tools\golden\screens2.txt -Out target\ibmi\screens2
+01_signon|{USER}{TAB}{PASSWORD}{ENTER}
+02_after_signon|{ENTER}
+03_cmd_entry|call qcmd{ERASEEOF}{ENTER}
+# The prompt of CRTDTAARA with nothing typed, then with a name and a type
+# (which parameters appear once TYPE has a value), then F10.
+04_prompt_empty|crtdtaara{ERASEEOF}{F4}
+05_prompt_type|scr2da{TAB}{TAB}*char{ENTER}
+06_prompt_f10|{F10}
+07_prompt_run|{ENTER}
+08_dspdtaara|dspdtaara scr2da{ERASEEOF}{ENTER}
+09_dspdtaara_enter|{ENTER}
+10_dltdtaara|dltdtaara scr2da{ERASEEOF}{ENTER}
+# F10 on Command Entry: detailed messages.
+11_error|nosuchcmd{ERASEEOF}{ENTER}
+12_f10_detailed|{F10}
+13_f10_back|{F10}
+14_clear|{F12}
+15_dsplib_qgpl|dsplib qgpl{ERASEEOF}{ENTER}
+16_dsplib_qgpl_down|{PAGEDOWN}
+17_dsplib_qgpl_exit|{F3}
+18_wrkobj|wrkobj as4trainr1/*all{ERASEEOF}{ENTER}
+19_wrkobj_exit|{F3}
+20_dspobjd|dspobjd as4trainr1/goldda *dtaara{ERASEEOF}{ENTER}
+21_dspobjd_exit|{F3}
+22_wrksplf|wrksplf{ERASEEOF}{ENTER}
+23_wrksplf_exit|{F3}
+24_dspjoblog|dspjoblog{ERASEEOF}{ENTER}
+25_dspjoblog_f10|{F10}
+26_dspjoblog_exit|{F3}
+27_dspmsg|dspmsg{ERASEEOF}{ENTER}
+28_dspmsg_exit|{F3}
+29_go_main|go main{ERASEEOF}{ENTER}
+30_main_exit|{F3}
+31_exit_cmd_entry|{F3}
+32_signoff|signoff{ERASEEOF}{ENTER}

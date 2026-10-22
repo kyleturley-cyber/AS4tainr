@@ -133,6 +133,91 @@ pub(crate) enum Tok {
     Punct(String),
 }
 
+/// NEXT VALUE FOR seq (NEXTVAL FOR) and PREVIOUS VALUE FOR seq (PREVVAL
+/// FOR) (Db2 for i SQL Reference, sequence reference): the sequence's
+/// next value, and the last one NEXT VALUE gave in this session.
+fn sequence_values(toks: Vec<Tok>, is_library: &dyn Fn(&str) -> bool) -> Vec<Tok> {
+    let mut out: Vec<Tok> = Vec::with_capacity(toks.len());
+    let mut i = 0;
+    let at = |j: usize| -> Option<String> { toks.get(j).and_then(word) };
+    // The next word after j, skipping blanks.
+    let skip = |j: usize| -> usize {
+        let mut k = j;
+        while matches!(toks.get(k), Some(Tok::Space(_))) {
+            k += 1;
+        }
+        k
+    };
+    while i < toks.len() {
+        let w = at(i);
+        let (func, after) = match w.as_deref() {
+            Some("NEXT") | Some("PREVIOUS") => {
+                let v = skip(i + 1);
+                let f = skip(v + 1);
+                if at(v).as_deref() == Some("VALUE") && at(f).as_deref() == Some("FOR") {
+                    (
+                        if w.as_deref() == Some("NEXT") {
+                            "nextval"
+                        } else {
+                            "currval"
+                        },
+                        skip(f + 1),
+                    )
+                } else {
+                    ("", 0)
+                }
+            }
+            Some("NEXTVAL") | Some("PREVVAL") => {
+                let f = skip(i + 1);
+                if at(f).as_deref() == Some("FOR") {
+                    (
+                        if w.as_deref() == Some("NEXTVAL") {
+                            "nextval"
+                        } else {
+                            "currval"
+                        },
+                        skip(f + 1),
+                    )
+                } else {
+                    ("", 0)
+                }
+            }
+            _ => ("", 0),
+        };
+        if func.is_empty() {
+            out.push(toks[i].clone());
+            i += 1;
+            continue;
+        }
+        let name_of = |t: Option<&Tok>| -> Option<String> {
+            match t {
+                Some(Tok::Word(w)) => Some(crate::catalog::pg_name(w)),
+                Some(Tok::Quoted(q)) => Some(q.to_ascii_lowercase()),
+                _ => None,
+            }
+        };
+        let Some(first) = name_of(toks.get(after)) else {
+            out.push(toks[i].clone());
+            i += 1;
+            continue;
+        };
+        let (name, end) = match (toks.get(after + 1), name_of(toks.get(after + 2))) {
+            (Some(Tok::Punct(p)), Some(n))
+                if p == "." || (p == "/" && is_library(&first.to_ascii_uppercase())) =>
+            {
+                (format!("\"{first}\".\"{n}\""), after + 3)
+            }
+            _ => (format!("\"{first}\""), after + 1),
+        };
+        out.push(Tok::Punct(format!(
+            "{func}('{}')",
+            name.replace('\'', "''")
+        )));
+        i = end;
+    }
+    out
+}
+
 pub(crate) fn tokenize(sql: &str) -> Result<Vec<Tok>> {
     let cs: Vec<char> = sql.chars().collect();
     let mut out = Vec::new();
@@ -267,7 +352,10 @@ pub struct Translated {
 /// Translate one DB2 for i statement. `is_library` says whether a name is
 /// a library, for system naming (`LIB/FILE`).
 pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Translated> {
-    let mut toks = crate::sqljson::rewrite(tokenize(sql.trim())?)?;
+    let mut toks = sequence_values(
+        crate::sqljsonfn::rewrite(crate::sqljson::rewrite(tokenize(sql.trim())?)?)?,
+        is_library,
+    );
     // One statement: a trailing ';' is allowed, no other.
     while matches!(toks.last(), Some(Tok::Space(_))) {
         toks.pop();
@@ -810,11 +898,15 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
                     let mut depth = 0i32;
                     for t in &out[r..] {
                         match t {
-                            Tok::Punct(p) if p == "(" => depth += 1,
-                            Tok::Punct(p) if p == ")" => depth -= 1,
                             Tok::Punct(p) if p == "," && depth == 0 => {
                                 rows.push(vec![]);
                                 continue;
+                            }
+                            // Rewritten calls are punctuation with
+                            // parentheses in them.
+                            Tok::Punct(p) => {
+                                depth +=
+                                    p.matches('(').count() as i32 - p.matches(')').count() as i32
                             }
                             _ => {}
                         }
@@ -938,6 +1030,12 @@ pub(crate) fn map_error(e: &tokio_postgres::Error, sql: &str) -> anyhow::Error {
         "42501" => anyhow!("SQL0551: Not authorized to an object in the statement."),
         "22P02" | "22003" => anyhow!("SQL0302: A value does not fit its column: {msg}."),
         "22012" => anyhow!("SQL0802: Division by zero: {msg}."),
+        // Sequences: no more values (NO CYCLE); PREVIOUS VALUE before a
+        // NEXT VALUE in the session.
+        "2200H" => anyhow!("SQL0359: The range of values of the sequence is used up: {msg}."),
+        "55000" if msg.contains("currval") => {
+            anyhow!("SQL0845: PREVIOUS VALUE cannot be used before NEXT VALUE gives a value for the sequence in this job.")
+        }
         // An SQLSTATE an SQL function signaled (user-defined classes 7-9
         // and I-Z; 20000 CASE not found): SQLCODE -438.
         c if c.starts_with(['7', '8', '9'])

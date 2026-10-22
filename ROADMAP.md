@@ -163,7 +163,8 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] RPG language gaps: dates and times held in their DATFMT/TIMFMT (MOVE with formats, %CHAR, %DEC), XML-INTO, LIKEFILE/TEMPLATE/file parameters, EXTFILE, halt indicators, PSDS creation and source information (docs/rpg-engine.md).
 - [ ] RPG extras: XML-SAX, XML-INTO %HANDLER, DATA-INTO and DATA-GEN (the QrnDi* interface), /SET and /RESTORE, *GDA and *PDA.
 - [x] Close the SQL gaps: commitment control, compound statements, routines.
-- [ ] Remaining SQL: external functions, INSTEAD OF triggers, sequences, the other QSYS2 catalog views (constraints, triggers) and IBM i services (JOB_INFO, OUTPUT_QUEUE_ENTRIES, OBJECT_PRIVILEGES...), the other JSON functions (JSON_VALUE, JSON_OBJECT, JSON_ARRAYAGG).
+- [x] IBM i SQL services: sequences, INSTEAD OF triggers, SYSCST/SYSKEYCST/SYSCHKCST/SYSREFCST/SYSTRIGGERS/SYSSEQUENCES, JOB_INFO, OUTPUT_QUEUE_ENTRIES, OBJECT_PRIVILEGES, JSON_OBJECT/JSON_ARRAY/JSON_ARRAYAGG/JSON_OBJECTAGG/JSON_VALUE/JSON_QUERY/JSON_EXISTS (docs/sql.md).
+- [ ] Remaining SQL: external functions, more scalar functions (CHAR, VARCHAR_FORMAT...), more IBM i services, LABEL ON SEQUENCE.
 - [x] C runtime and IFS procedures (open, read, write, close) for RPG, with pointers.
 - [ ] IFS beyond the basics: stat() and directory APIs, CPYTOIMPF/CPYFRMIMPF, procedure pointers, pointers between programs, IFS authority checks.
 - [ ] Packaging: TLS on port 992, SAVLIB and RSTLIB with a portable archive format, multi-arch images (amd64, arm64).

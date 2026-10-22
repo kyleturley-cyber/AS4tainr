@@ -8005,3 +8005,297 @@ dsply (%char(%len(%trim(crtdate + crttime))));
         ]
     );
 }
+
+/// Sequences, the SQL/JSON functions, more catalog views and services,
+/// and INSTEAD OF triggers (Db2 for i SQL Reference: CREATE SEQUENCE,
+/// ALTER SEQUENCE, NEXT VALUE and PREVIOUS VALUE, JSON_OBJECT,
+/// JSON_ARRAY, JSON_ARRAYAGG, JSON_OBJECTAGG, JSON_VALUE, JSON_QUERY,
+/// JSON_EXISTS, CREATE TRIGGER, catalog views SYSSEQUENCES, SYSCST,
+/// SYSKEYCST, SYSREFCST, SYSCHKCST, SYSTRIGGERS; IBM i Services:
+/// OBJECT_PRIVILEGES, JOB_INFO, OUTPUT_QUEUE_ENTRIES_BASIC).
+///
+/// A sequence starts at START WITH and goes by INCREMENT BY; with CYCLE,
+/// past MAXVALUE it starts again at MINVALUE, which for an ascending
+/// sequence without MINVALUE is the START WITH value; without CYCLE the
+/// values run out (SQL0359); PREVIOUS VALUE is the last value NEXT
+/// VALUE gave in the job. JSON_OBJECT pairs keys and values (NULL ON
+/// NULL by default), JSON_ARRAY leaves nulls out (ABSENT ON NULL by
+/// default), FORMAT JSON values are JSON; JSON_VALUE gives the scalar at
+/// a path (cast by RETURNING, a DEFAULT ON EMPTY when there is none),
+/// JSON_QUERY JSON (WITH ARRAY WRAPPER for several values).
+#[tokio::test]
+async fn sql_sequences_json_catalog_services_instead_of() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let id = as4tainr_core::jobs::start_interactive(
+        &client,
+        &format!("Q{}", &lib[1..]),
+        "QSECOFR",
+        None,
+        std::slice::from_ref(&lib),
+    )
+    .await
+    .unwrap();
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: Some(id.clone()),
+        calls: Default::default(),
+    };
+    let sql = |s: &str| format!("RUNSQL SQL('{}') COMMIT(*NONE)", s.replace('\'', "''"));
+    let q = |s: String| {
+        let (client, url, lib) = (&client, &url, &lib);
+        async move { sql_rows(client, url, lib, &s).await }
+    };
+    for s in [
+        format!("CREATE SEQUENCE {lib}.ORDNO START WITH 10 INCREMENT BY 5 MAXVALUE 20 CYCLE"),
+        format!("CREATE SEQUENCE {lib}.ONCE AS SMALLINT START WITH 32766"),
+    ] {
+        cl_cmd(&mut job, sql(&s)).await.unwrap();
+    }
+    let mut got = Vec::new();
+    for _ in 0..4 {
+        got.extend(q("VALUES NEXT VALUE FOR ORDNO".into()).await);
+    }
+    assert_eq!(got, ["10", "15", "20", "10"]);
+    assert_eq!(q(format!("VALUES NEXTVAL FOR {lib}/ONCE")).await, ["32766"]);
+    assert_eq!(q("VALUES NEXT VALUE FOR ONCE".into()).await, ["32767"]);
+    let e = as4tainr_core::sql::run_as(
+        &client,
+        &url,
+        std::slice::from_ref(&lib),
+        "QSECOFR",
+        Some(lib.clone()),
+        None,
+        "VALUES NEXT VALUE FOR ONCE",
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{e}").starts_with("SQL0359"), "{e}");
+    cl_cmd(&mut job, sql("ALTER SEQUENCE ONCE RESTART"))
+        .await
+        .unwrap();
+    assert_eq!(q("VALUES NEXT VALUE FOR ONCE".into()).await, ["32766"]);
+    assert_eq!(
+        q(format!(
+            "SELECT SEQUENCE_NAME, START, MINIMUM_VALUE, MAXIMUM_VALUE, INCREMENT, CYCLE_OPTION, DATA_TYPE, NUMERIC_PRECISION \
+             FROM QSYS2.SYSSEQUENCES WHERE SEQUENCE_SCHEMA = '{lib}' ORDER BY 1"
+        ))
+        .await,
+        [
+            "ONCE|32766|32766|32767|1|NO|SMALLINT|5",
+            "ORDNO|10|10|20|5|YES|INTEGER|10"
+        ]
+    );
+    // PREVIOUS VALUE in the job's SQL session (embedded SQL).
+    source::create_file(&client, &lib, "QRPGLESRC", "")
+        .await
+        .unwrap();
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QRPGLESRC".into(),
+            name: "SEQPGM".into(),
+            srctype: "SQLRPGLE".into(),
+            text: String::new(),
+            source: "**FREE
+dcl-s a int(10);
+dcl-s b int(10);
+exec sql set :a = next value for ordno;
+exec sql values previous value for ordno into :b;
+dsply (%char(a) + ' ' + %char(b));
+*inlr = *on;
+"
+            .into(),
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    cl_cmd(
+        &mut job,
+        format!("CRTSQLRPGI OBJ({lib}/SEQPGM) SRCFILE({lib}/QRPGLESRC)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        cl_cmd(&mut job, format!("CALL PGM({lib}/SEQPGM)"))
+            .await
+            .unwrap(),
+        ["DSPLY  15 15"]
+    );
+
+    // JSON.
+    for s in [
+        format!("CREATE TABLE {lib}.EMP (ID INT NOT NULL, NAME VARCHAR(20), DEPT CHAR(2), CONSTRAINT EMP_PK PRIMARY KEY (ID))"),
+        format!("INSERT INTO {lib}.EMP VALUES (1, 'Ann', 'A1'), (2, 'Bo', 'B2'), (3, NULL, 'A1')"),
+    ] {
+        cl_cmd(&mut job, sql(&s)).await.unwrap();
+    }
+    assert_eq!(
+        q(format!(
+            "SELECT JSON_OBJECT(KEY 'id' VALUE ID, 'name' VALUE NAME, 'tags' VALUE JSON_ARRAY(DEPT, NULL)) \
+             FROM {lib}.EMP ORDER BY ID"
+        ))
+        .await,
+        [
+            r#"{"id":1,"name":"Ann","tags":["A1"]}"#,
+            r#"{"id":2,"name":"Bo","tags":["B2"]}"#,
+            r#"{"id":3,"name":null,"tags":["A1"]}"#
+        ]
+    );
+    assert_eq!(
+        q(format!(
+            "SELECT JSON_ARRAYAGG(NAME ORDER BY ID DESC) FROM {lib}.EMP"
+        ))
+        .await,
+        [r#"["Bo","Ann"]"#]
+    );
+    assert_eq!(
+        q(format!(
+            "SELECT DEPT, JSON_OBJECTAGG(KEY CAST(ID AS VARCHAR(5)) VALUE NAME ABSENT ON NULL) FROM {lib}.EMP GROUP BY DEPT ORDER BY DEPT"
+        ))
+        .await,
+        [r#"A1|{"1":"Ann"}"#, r#"B2|{"2":"Bo"}"#]
+    );
+    let doc = r#"'{"order":{"no":17,"lines":[{"item":"A","qty":2},{"item":"B","qty":5}]}}'"#;
+    assert_eq!(
+        q(format!(
+            "VALUES (JSON_VALUE({doc}, '$.order.no' RETURNING INTEGER), \
+             JSON_VALUE({doc}, '$.order.lines[1].item'), \
+             JSON_VALUE({doc}, '$.order.missing' DEFAULT 'none' ON EMPTY), \
+             JSON_QUERY({doc}, '$.order.lines[0]'), \
+             JSON_QUERY({doc}, '$.order.lines[*].qty' WITH ARRAY WRAPPER))"
+        ))
+        .await,
+        [r#"17|B|none|{"item":"A","qty":2}|[2,5]"#]
+    );
+    assert_eq!(
+        q(format!(
+            "SELECT COUNT(*) FROM {lib}.EMP WHERE JSON_EXISTS({doc}, '$.order.lines') AND NOT JSON_EXISTS({doc}, '$.x')"
+        ))
+        .await,
+        ["3"]
+    );
+
+    // Constraints in the catalog.
+    for s in [
+        format!("CREATE TABLE {lib}.SKILL (EMPID INT NOT NULL, CODE CHAR(4) NOT NULL, LVL INT CHECK (LVL BETWEEN 1 AND 5), \
+                 CONSTRAINT SKILL_PK PRIMARY KEY (EMPID, CODE), \
+                 CONSTRAINT SKILL_EMP FOREIGN KEY (EMPID) REFERENCES {lib}.EMP (ID) ON DELETE CASCADE)"),
+    ] {
+        cl_cmd(&mut job, sql(&s)).await.unwrap();
+    }
+    assert_eq!(
+        q(format!(
+            "SELECT CONSTRAINT_NAME, CONSTRAINT_TYPE, SYSTEM_TABLE_NAME, CONSTRAINT_KEYS, CONSTRAINT_STATE, ENABLED \
+             FROM QSYS2.SYSCST WHERE CONSTRAINT_SCHEMA = '{lib}' AND CONSTRAINT_TYPE <> 'CHECK' ORDER BY 1"
+        ))
+        .await,
+        [
+            "EMP_PK|PRIMARY KEY|EMP|1|ESTABLISHED|YES",
+            "SKILL_EMP|FOREIGN KEY|SKILL|1|ESTABLISHED|YES",
+            "SKILL_PK|PRIMARY KEY|SKILL|2|ESTABLISHED|YES"
+        ]
+    );
+    assert_eq!(
+        q(format!(
+            "SELECT CONSTRAINT_NAME, COLUMN_NAME, ORDINAL_POSITION FROM QSYS2.SYSKEYCST \
+             WHERE CONSTRAINT_SCHEMA = '{lib}' AND CONSTRAINT_NAME LIKE 'SKILL%' ORDER BY 1, 3"
+        ))
+        .await,
+        ["SKILL_EMP|EMPID|1", "SKILL_PK|EMPID|1", "SKILL_PK|CODE|2"]
+    );
+    assert_eq!(
+        q(format!(
+            "SELECT UNIQUE_CONSTRAINT_NAME, UPDATE_RULE, DELETE_RULE FROM QSYS2.SYSREFCST WHERE CONSTRAINT_SCHEMA = '{lib}'"
+        ))
+        .await,
+        ["EMP_PK|NO ACTION|CASCADE"]
+    );
+    assert_eq!(
+        q(format!(
+            "SELECT CHECK_CLAUSE FROM QSYS2.SYSCHKCST WHERE CONSTRAINT_SCHEMA = '{lib}'"
+        ))
+        .await,
+        ["(LVL >= 1) AND (LVL <= 5)"]
+    );
+
+    // INSTEAD OF: an insert through a view.
+    for s in [
+        format!("CREATE VIEW {lib}.EMPV AS SELECT ID, NAME FROM {lib}.EMP"),
+        format!(
+            "CREATE TRIGGER {lib}.EMPVI INSTEAD OF INSERT ON {lib}.EMPV REFERENCING NEW AS N FOR EACH ROW \
+             INSERT INTO {lib}.EMP VALUES (N.ID, UPPER(N.NAME), 'Z9')"
+        ),
+        format!("INSERT INTO {lib}.EMPV VALUES (9, 'zed')"),
+    ] {
+        cl_cmd(&mut job, sql(&s)).await.unwrap_or_else(|e| panic!("{s}: {e}"));
+    }
+    assert_eq!(
+        q(format!("SELECT NAME, DEPT FROM {lib}.EMP WHERE ID = 9")).await,
+        ["ZED|Z9"]
+    );
+    let e = cl_cmd(
+        &mut job,
+        sql(&format!("CREATE TRIGGER {lib}.EMPVA AFTER INSERT ON {lib}.EMPV FOR EACH ROW INSERT INTO {lib}.EMP VALUES (1, 'X', 'X')")),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("SQL0156"), "{e}");
+    assert_eq!(
+        q(format!(
+            "SELECT TRIGGER_NAME, EVENT_MANIPULATION, ACTION_TIMING, ACTION_ORIENTATION, EVENT_OBJECT_TABLE, TRIGGER_MODE \
+             FROM QSYS2.SYSTRIGGERS WHERE TRIGGER_SCHEMA = '{lib}'"
+        ))
+        .await,
+        ["EMPVI|INSERT|INSTEAD OF|ROW|EMPV|DB2SQL"]
+    );
+
+    // Object privileges: the owner, a private authority, *PUBLIC.
+    let user = format!("P{}", &lib[1..]);
+    let _ = cl_cmd(&mut job, format!("DLTUSRPRF {user}")).await;
+    cl_cmd(&mut job, format!("CRTUSRPRF {user} PASSWORD(*NONE)"))
+        .await
+        .unwrap();
+    cl_cmd(
+        &mut job,
+        format!("GRTOBJAUT OBJ({lib}/EMP) OBJTYPE(*FILE) USER({user}) AUT(*USE)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        q(format!(
+            "SELECT AUTHORIZATION_NAME, OBJECT_AUTHORITY, OBJECT_OWNER, DATA_READ, DATA_ADD, OBJECT_EXISTENCE, SQL_OBJECT_TYPE \
+             FROM QSYS2.OBJECT_PRIVILEGES WHERE SYSTEM_OBJECT_SCHEMA = '{lib}' AND SYSTEM_OBJECT_NAME = 'EMP' ORDER BY 1"
+        ))
+        .await,
+        [
+            "*PUBLIC|*CHANGE|NO|YES|YES|NO|TABLE".to_string(),
+            format!("{user}|*USE|NO|YES|NO|NO|TABLE"),
+            "QSECOFR|*ALL|YES|YES|YES|YES|TABLE".to_string(),
+        ]
+    );
+
+    // JOB_INFO: the job, active and interactive.
+    assert_eq!(
+        q(format!(
+            "SELECT JOB_STATUS, JOB_TYPE, JOB_TYPE_ENHANCED FROM TABLE(QSYS2.JOB_INFO(JOB_USER_FILTER => '*ALL')) X \
+             WHERE JOB_NAME = '{id}'"
+        ))
+        .await,
+        ["ACTIVE|INT|INTERACTIVE"]
+    );
+    as4tainr_core::jobs::end(&client, &id, true).await.unwrap();
+    cl_cmd(&mut job, format!("DLTUSRPRF {user}")).await.unwrap();
+}

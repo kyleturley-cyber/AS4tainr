@@ -48,6 +48,42 @@ CREATE TABLE IF NOT EXISTS as4tainr.file_keys (
     field   text NOT NULL,
     PRIMARY KEY (library, file, seq)
 );
+-- Constraints made by SQL (PRIMARY KEY, UNIQUE, CHECK, FOREIGN KEY):
+-- the PostgreSQL index or constraint is "{file}_{name}".
+CREATE TABLE IF NOT EXISTS as4tainr.constraints (
+    library    text NOT NULL,
+    file       text NOT NULL,
+    name       text NOT NULL,
+    kind       text NOT NULL,
+    created    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (library, file, name)
+);
+-- SQL triggers (CREATE TRIGGER), for QSYS2.SYSTRIGGERS.
+CREATE TABLE IF NOT EXISTS as4tainr.sql_triggers (
+    library    text NOT NULL,
+    name       text NOT NULL,
+    file_lib   text NOT NULL,
+    file       text NOT NULL,
+    timing     text NOT NULL,
+    events     text NOT NULL,
+    each_row   boolean NOT NULL,
+    old_row    text,
+    new_row    text,
+    condition  text,
+    body       text NOT NULL,
+    definer    text NOT NULL,
+    created    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (library, name)
+);
+CREATE TABLE IF NOT EXISTS as4tainr.sequences (
+    library    text NOT NULL,
+    name       text NOT NULL,
+    data_type  text NOT NULL,
+    precision  integer NOT NULL DEFAULT 0,
+    cache      bigint,
+    ordered    boolean NOT NULL DEFAULT false,
+    PRIMARY KEY (library, name)
+);
 CREATE TABLE IF NOT EXISTS as4tainr.programs (
     library   text NOT NULL,
     name      text NOT NULL,
@@ -1309,7 +1345,7 @@ pub async fn delete_file(
             )
             .await?;
         }
-        for table in ["file_fields", "file_keys"] {
+        for table in ["file_fields", "file_keys", "constraints"] {
             tx.execute(
                 &format!("DELETE FROM as4tainr.{table} WHERE library=$1 AND file=$2"),
                 &[l, n],
@@ -1440,6 +1476,24 @@ pub async fn resolve_sql_file(client: &Client, libl: &[String], name: &str) -> R
 }
 
 /// A unique constraint (SQL PRIMARY KEY or UNIQUE) on a physical file.
+/// A constraint made by SQL, for the catalog views (SYSCST...).
+pub async fn record_constraint(
+    client: &Client,
+    library: &str,
+    file: &str,
+    name: &str,
+    kind: &str,
+) -> Result<()> {
+    client
+        .execute(
+            "INSERT INTO as4tainr.constraints (library, file, name, kind) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (library, file, name) DO UPDATE SET kind = EXCLUDED.kind, created = now()",
+            &[&library, &file, &name, &kind],
+        )
+        .await?;
+    Ok(())
+}
+
 pub async fn add_unique_constraint(
     client: &Client,
     library: &str,

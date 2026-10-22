@@ -27,6 +27,8 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/cmtctl.rs` | Commitment control: commitment definitions per job and activation group (one PostgreSQL session with a transaction each), STRCMTCTL/ENDCMTCTL, COMMIT/ROLLBACK, the job's end |
 | `core/src/services.rs` | IBM i services for SQL: the QSYS2 catalog views (SYSTABLES, SYSCOLUMNS, SYSROUTINES...), OBJECT_STATISTICS, LIBRARY_LIST_INFO, USER_INFO, SYSTEM_VALUE_INFO, JOBLOG_INFO, ACTIVE_JOB_INFO, IFS_READ (IFS_WRITE and QCMDEXC are procedures in `sqlpl.rs`), as PostgreSQL views and functions over the catalog (made again when `VERSION` changes) |
 | `core/src/sqljson.rs` | JSON_TABLE rewritten for PostgreSQL's SQL/JSON path functions |
+| `core/src/sqljsonfn.rs` | JSON_OBJECT, JSON_ARRAY, JSON_ARRAYAGG, JSON_OBJECTAGG, JSON_VALUE, JSON_QUERY, JSON_EXISTS rewritten to PostgreSQL json with Db2's compact text (the `as4tainr_svc.json_*` functions) |
+| `core/src/sqlcat.rs` | Catalog views SYSSEQUENCES, SYSCST, SYSKEYCST, SYSCHKCST, SYSREFCST, SYSTRIGGERS and services JOB_INFO, OUTPUT_QUEUE_ENTRIES(_BASIC), OBJECT_PRIVILEGES (made with the services) |
 | `core/src/sql.rs` | SQL in the DB2 for i dialect: translation to PostgreSQL, run on a separate connection as the restricted `as4tainr_sql` login |
 | `core/src/runtime.rs` | What a running program shares with its job: database sessions (`connect_db`, `job_session`: application name and record wait), the display channel (`DisplayRequest`) |
 | `core/src/dspf.rs` | DDS display files: parser, drawing a record on a 5250 screen, input validation, response indicators |

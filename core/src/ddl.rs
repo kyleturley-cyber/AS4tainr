@@ -62,6 +62,8 @@ pub enum Ddl {
         file: PhysicalFile,
         /// PRIMARY KEY and UNIQUE constraints: (constraint name, columns).
         uniques: Vec<(String, Vec<String>)>,
+        /// The name of the PRIMARY KEY constraint among them.
+        primary: Option<String>,
         /// CHECK constraints: (constraint name, condition as SQL).
         checks: Vec<(String, String)>,
         /// FOREIGN KEY (referential) constraints.
@@ -135,6 +137,35 @@ pub enum Ddl {
     },
     /// SET SCHEMA: the default library for unqualified names.
     SetSchema(String),
+    /// CREATE SEQUENCE.
+    CreateSequence {
+        name: Name,
+        replace: bool,
+        opts: SeqOpts,
+    },
+    /// ALTER SEQUENCE.
+    AlterSequence {
+        name: Name,
+        opts: SeqOpts,
+    },
+}
+
+/// A sequence's attributes as written (Db2 for i SQL Reference, CREATE
+/// SEQUENCE, ALTER SEQUENCE).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SeqOpts {
+    /// AS data type: SMALLINT, INTEGER, BIGINT, DECIMAL(p), NUMERIC(p).
+    pub dtype: Option<(String, u32)>,
+    pub start: Option<i64>,
+    pub increment: Option<i64>,
+    /// MINVALUE n (Some(Some)), NO MINVALUE (Some(None)).
+    pub min: Option<Option<i64>>,
+    pub max: Option<Option<i64>>,
+    pub cycle: Option<bool>,
+    pub cache: Option<Option<i64>>,
+    pub order: Option<bool>,
+    /// ALTER: RESTART [WITH n].
+    pub restart: Option<Option<i64>>,
 }
 
 /// An SQL trigger (Db2 for i SQL Reference, CREATE TRIGGER).
@@ -214,6 +245,16 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
                 Some("TRIGGER") if !unique => {
                     return create_trigger(sql, replace).map(Some);
                 }
+                Some("SEQUENCE") if !unique => {
+                    p.i += 1;
+                    let name = p.name()?;
+                    let opts = sequence_options(&mut p, false)?;
+                    Ddl::CreateSequence {
+                        name,
+                        replace,
+                        opts,
+                    }
+                }
                 Some(other) => {
                     bail!("SQL0084: CREATE {other} is not supported yet.")
                 }
@@ -238,6 +279,7 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
                 Some("TABLE") => "TABLE",
                 Some("INDEX") => "INDEX",
                 Some("VIEW") => "VIEW",
+                Some("SEQUENCE") => "SEQUENCE",
                 Some(other) => bail!("SQL0084: DROP {other} is not supported yet."),
                 None => bail!("SQL0104: DROP needs an object type."),
             };
@@ -302,8 +344,14 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
         }
         "ALTER" => {
             p.i += 1;
-            p.expect("TABLE")?;
-            alter_table(&mut p)?
+            if p.eat("SEQUENCE") {
+                let name = p.name()?;
+                let opts = sequence_options(&mut p, true)?;
+                Ddl::AlterSequence { name, opts }
+            } else {
+                p.expect("TABLE")?;
+                alter_table(&mut p)?
+            }
         }
         "GRANT" | "REVOKE" => {
             p.i += 1;
@@ -1000,6 +1048,98 @@ fn identity(p: &mut P, f: &FieldDef) -> Result<crate::dds::Identity> {
     Ok(id)
 }
 
+/// CREATE SEQUENCE and ALTER SEQUENCE attributes, in any order.
+fn sequence_options(p: &mut P, alter: bool) -> Result<SeqOpts> {
+    let mut o = SeqOpts::default();
+    let int = |p: &mut P| -> Result<i64> {
+        let neg = p.punct("-");
+        let _ = p.punct("+");
+        match p.next() {
+            Some(Tok::Number(n)) => {
+                let v: i64 = n
+                    .parse()
+                    .map_err(|_| anyhow!("SQL0104: {n} is not an integer."))?;
+                Ok(if neg { -v } else { v })
+            }
+            _ => bail!("SQL0104: an integer is expected."),
+        }
+    };
+    loop {
+        if !alter && p.eat("AS") {
+            let t = p
+                .word()
+                .ok_or_else(|| anyhow!("SQL0104: AS needs a data type."))?;
+            p.i += 1;
+            let t = match t.as_str() {
+                "INT" | "INTEGER" => "INTEGER".to_string(),
+                "SMALLINT" | "BIGINT" => t,
+                "DEC" | "DECIMAL" | "NUMERIC" => {
+                    let mut prec = 5;
+                    if p.punct("(") {
+                        prec = p.number()?;
+                        if p.punct(",") && p.number()? != 0 {
+                            bail!("SQL0604: A sequence's decimal type has no decimal places.");
+                        }
+                        p.expect_punct(")")?;
+                    }
+                    o.dtype = Some((
+                        if t == "NUMERIC" {
+                            "NUMERIC".into()
+                        } else {
+                            "DECIMAL".into()
+                        },
+                        prec,
+                    ));
+                    continue;
+                }
+                other => bail!("SQL0604: {other} is not a data type for a sequence."),
+            };
+            o.dtype = Some((t, 0));
+        } else if !alter && p.eat("START") {
+            p.expect("WITH")?;
+            o.start = Some(int(p)?);
+        } else if alter && p.eat("RESTART") {
+            o.restart = Some(if p.eat("WITH") { Some(int(p)?) } else { None });
+        } else if p.eat("INCREMENT") {
+            p.expect("BY")?;
+            o.increment = Some(int(p)?);
+        } else if p.eat("MINVALUE") {
+            o.min = Some(Some(int(p)?));
+        } else if p.eat("MAXVALUE") {
+            o.max = Some(Some(int(p)?));
+        } else if p.eat("CYCLE") {
+            o.cycle = Some(true);
+        } else if p.eat("CACHE") {
+            o.cache = Some(Some(int(p)?));
+        } else if p.eat("ORDER") {
+            o.order = Some(true);
+        } else if p.eat("NO") {
+            if p.eat("MINVALUE") {
+                o.min = Some(None);
+            } else if p.eat("MAXVALUE") {
+                o.max = Some(None);
+            } else if p.eat("CYCLE") {
+                o.cycle = Some(false);
+            } else if p.eat("CACHE") {
+                o.cache = Some(None);
+            } else if p.eat("ORDER") {
+                o.order = Some(false);
+            } else {
+                bail!("SQL0104: NO must be followed by MINVALUE, MAXVALUE, CYCLE, CACHE or ORDER.");
+            }
+        } else if p.eat("DATA") {
+            // DATA TYPE type (an older form of AS).
+            p.expect("TYPE")?;
+            p.i -= 1;
+            p.t[p.i] = Tok::Word("AS".into());
+        } else {
+            break;
+        }
+        let _ = p.punct(",");
+    }
+    Ok(o)
+}
+
 fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
     let name = p.name()?;
     let system = if p.eat("FOR") {
@@ -1012,6 +1152,7 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
     p.expect_punct("(")?;
     let mut fields: Vec<FieldDef> = Vec::new();
     let mut uniques: Vec<(String, Vec<String>)> = Vec::new();
+    let mut primary_name: Option<String> = None;
     // (constraint name, condition tokens), checked once all columns are known.
     let mut checks: Vec<(Option<String>, Vec<Tok>)> = Vec::new();
     let mut not_null: Vec<String> = Vec::new();
@@ -1054,6 +1195,15 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
                         format!("U{}", uniques.len() + 1)
                     }
                 });
+                if primary {
+                    if primary_name.is_some() {
+                        bail!(
+                            "SQL0624: Table {} has more than one primary key.",
+                            name.name
+                        );
+                    }
+                    primary_name = Some(cname.clone());
+                }
                 uniques.push((cname, cols));
             }
             Some("CHECK") => {
@@ -1117,6 +1267,13 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
                     } else if p.eat("PRIMARY") {
                         p.expect("KEY")?;
                         not_null.push(sys.clone());
+                        if primary_name.is_some() {
+                            bail!(
+                                "SQL0624: Table {} has more than one primary key.",
+                                name.name
+                            );
+                        }
+                        primary_name = Some("PK".into());
                         uniques.push(("PK".into(), vec![sys.clone()]));
                     } else if p.eat("UNIQUE") {
                         uniques.push((format!("U{}", uniques.len() + 1), vec![sys.clone()]));
@@ -1234,6 +1391,7 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
         .collect::<Result<Vec<_>>>()?;
     Ok(Ddl::CreateTable {
         system,
+        primary: primary_name,
         file: PhysicalFile {
             name: name.name.clone(),
             format,
@@ -1403,6 +1561,7 @@ async fn add_foreign_key(
             ),
             _ => db(e),
         })?;
+    catalog::record_constraint(ctx.client, lib, sys, &cname, "FOREIGN KEY").await?;
     Ok(cname)
 }
 
@@ -2253,6 +2412,260 @@ impl Ctx<'_> {
     }
 }
 
+fn seq_not_found(n: &Name) -> anyhow::Error {
+    anyhow!(
+        "SQL0204: {} in {} type *DTAARA not found.",
+        n.name,
+        n.lib.as_deref().unwrap_or("*LIBL")
+    )
+}
+
+impl Ctx<'_> {
+    /// The library of an existing sequence.
+    async fn find_sequence(&self, n: &Name) -> Result<Option<String>> {
+        for lib in self.search(n) {
+            if self
+                .client
+                .query_opt(
+                    "SELECT 1 FROM as4tainr.sequences WHERE library=$1 AND name=$2",
+                    &[&lib, &n.name],
+                )
+                .await?
+                .is_some()
+            {
+                return Ok(Some(lib));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// The smallest and largest values of a sequence's data type.
+fn seq_range(dtype: &(String, u32)) -> (i64, i64) {
+    match dtype.0.as_str() {
+        "SMALLINT" => (i16::MIN as i64, i16::MAX as i64),
+        "INTEGER" => (i32::MIN as i64, i32::MAX as i64),
+        "BIGINT" => (i64::MIN, i64::MAX),
+        _ => {
+            let m = 10i128.pow(dtype.1.min(18)) - 1;
+            (-(m as i64), m as i64)
+        }
+    }
+}
+
+/// CREATE SEQUENCE (Db2 for i SQL Reference): a data area object (*DTAARA)
+/// with the sequence's attributes. Defaults: AS INTEGER, INCREMENT BY 1,
+/// an ascending sequence from START WITH (else MINVALUE, else 1) up to the
+/// type's largest value, a descending one from MAXVALUE (else -1) down to
+/// the type's smallest; NO CYCLE; CACHE 20.
+async fn create_sequence(
+    ctx: &mut Ctx<'_>,
+    name: &Name,
+    replace: bool,
+    o: &SeqOpts,
+) -> Result<String> {
+    let lib = ctx.target(name);
+    let seq = validate_name("sequence", &name.name).map_err(sql0104)?;
+    if !catalog::library_exists(ctx.client, &lib).await? {
+        bail!("SQL0204: Schema {lib} not found.");
+    }
+    if catalog::object_exists(ctx.client, std::slice::from_ref(&lib), &seq, "*DTAARA").await? {
+        let is_seq = ctx
+            .client
+            .query_opt(
+                "SELECT 1 FROM as4tainr.sequences WHERE library=$1 AND name=$2",
+                &[&lib, &seq],
+            )
+            .await?
+            .is_some();
+        if !replace || !is_seq {
+            bail!("SQL0601: {seq} in {lib} type *DTAARA already exists.");
+        }
+        drop_sequence(ctx, &lib, &seq).await?;
+    }
+    let dtype = o.dtype.clone().unwrap_or(("INTEGER".into(), 0));
+    let (tmin, tmax) = seq_range(&dtype);
+    let inc = o.increment.unwrap_or(1);
+    let up = inc >= 0;
+    let min = match o.min {
+        Some(Some(m)) => m,
+        _ if up => o.start.unwrap_or(1),
+        _ => tmin,
+    };
+    let max = match o.max {
+        Some(Some(m)) => m,
+        _ if up => tmax,
+        _ => o.start.unwrap_or(-1),
+    };
+    let start = o.start.unwrap_or(if up { min } else { max });
+    if min < tmin || max > tmax || min > max || start < min || start > max {
+        bail!("SQL0815: The values of the sequence's attributes are not valid for each other or for its data type.");
+    }
+    let cache = match o.cache {
+        Some(None) => None,
+        Some(Some(c)) => Some(c),
+        None => Some(20),
+    };
+    let pg_type = match dtype.0.as_str() {
+        "SMALLINT" => "smallint",
+        "INTEGER" => "integer",
+        _ => "bigint",
+    };
+    let table = format!("{}.{}", ident(&lib), ident(&seq));
+    ctx.client
+        .batch_execute(&format!(
+            "CREATE SEQUENCE {table} AS {pg_type} INCREMENT BY {inc} MINVALUE {min} MAXVALUE {max} START WITH {start} {};
+             GRANT USAGE, SELECT, UPDATE ON SEQUENCE {table} TO {role};",
+            if o.cycle == Some(true) { "CYCLE" } else { "NO CYCLE" },
+            role = crate::sql::SQL_ROLE
+        ))
+        .await?;
+    ctx.client
+        .execute(
+            "INSERT INTO as4tainr.objects (library, name, objtype, attribute) VALUES ($1, $2, '*DTAARA', 'SEQUENCE')",
+            &[&lib, &seq],
+        )
+        .await?;
+    ctx.client
+        .execute(
+            "INSERT INTO as4tainr.sequences (library, name, data_type, precision, cache, ordered)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                &lib,
+                &seq,
+                &dtype.0,
+                &(dtype.1 as i32),
+                &cache,
+                &o.order.unwrap_or(false),
+            ],
+        )
+        .await?;
+    authority::set_owner(ctx.client, &lib, &seq, "*DTAARA", ctx.user).await?;
+    Ok(format!("Sequence {seq} created in {lib}."))
+}
+
+/// ALTER SEQUENCE: RESTART [WITH n], INCREMENT BY, MIN/MAXVALUE, [NO]
+/// CYCLE, CACHE, ORDER.
+async fn alter_sequence(ctx: &mut Ctx<'_>, name: &Name, o: &SeqOpts) -> Result<String> {
+    let Some(lib) = ctx.find_sequence(name).await? else {
+        return Err(seq_not_found(name));
+    };
+    if authority::effective(ctx.client, ctx.user, &lib, &name.name, "*DTAARA").await? < Aut::Change
+    {
+        bail!("SQL0551: Not authorized to sequence {lib}/{}.", name.name);
+    }
+    let dtype: (String, i32) = {
+        let r = ctx
+            .client
+            .query_one(
+                "SELECT data_type, precision FROM as4tainr.sequences WHERE library=$1 AND name=$2",
+                &[&lib, &name.name],
+            )
+            .await?;
+        (r.get(0), r.get(1))
+    };
+    let (tmin, tmax) = seq_range(&(dtype.0.clone(), dtype.1 as u32));
+    let mut parts = Vec::new();
+    if let Some(i) = o.increment {
+        parts.push(format!("INCREMENT BY {i}"));
+    }
+    match o.min {
+        Some(Some(m)) => parts.push(format!("MINVALUE {m}")),
+        Some(None) => parts.push(format!(
+            "MINVALUE {}",
+            if o.increment.unwrap_or(1) >= 0 {
+                1
+            } else {
+                tmin
+            }
+        )),
+        None => {}
+    }
+    match o.max {
+        Some(Some(m)) => parts.push(format!("MAXVALUE {m}")),
+        Some(None) => parts.push(format!(
+            "MAXVALUE {}",
+            if o.increment.unwrap_or(1) >= 0 {
+                tmax
+            } else {
+                -1
+            }
+        )),
+        None => {}
+    }
+    match o.cycle {
+        Some(true) => parts.push("CYCLE".into()),
+        Some(false) => parts.push("NO CYCLE".into()),
+        None => {}
+    }
+    match o.restart {
+        Some(Some(n)) => parts.push(format!("RESTART WITH {n}")),
+        Some(None) => parts.push("RESTART".into()),
+        None => {}
+    }
+    if !parts.is_empty() {
+        ctx.client
+            .batch_execute(&format!(
+                "ALTER SEQUENCE {}.{} {}",
+                ident(&lib),
+                ident(&name.name),
+                parts.join(" ")
+            ))
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "SQL0815: The values of the sequence's attributes are not valid: {}.",
+                    e.as_db_error()
+                        .map(|d| d.message().to_string())
+                        .unwrap_or(e.to_string())
+                )
+            })?;
+    }
+    if let Some(c) = o.cache {
+        ctx.client
+            .execute(
+                "UPDATE as4tainr.sequences SET cache=$3 WHERE library=$1 AND name=$2",
+                &[&lib, &name.name, &c],
+            )
+            .await?;
+    }
+    if let Some(ord) = o.order {
+        ctx.client
+            .execute(
+                "UPDATE as4tainr.sequences SET ordered=$3 WHERE library=$1 AND name=$2",
+                &[&lib, &name.name, &ord],
+            )
+            .await?;
+    }
+    Ok(format!("Sequence {} in {lib} changed.", name.name))
+}
+
+async fn drop_sequence(ctx: &mut Ctx<'_>, lib: &str, name: &str) -> Result<()> {
+    if authority::effective(ctx.client, ctx.user, lib, name, "*DTAARA").await? < Aut::All {
+        bail!("SQL0551: Not authorized to drop {lib}/{name}.");
+    }
+    ctx.client
+        .batch_execute(&format!(
+            "DROP SEQUENCE IF EXISTS {}.{}",
+            ident(lib),
+            ident(name)
+        ))
+        .await?;
+    ctx.client
+        .execute(
+            "DELETE FROM as4tainr.sequences WHERE library=$1 AND name=$2",
+            &[&lib, &name],
+        )
+        .await?;
+    ctx.client
+        .execute(
+            "DELETE FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype='*DTAARA'",
+            &[&lib, &name],
+        )
+        .await?;
+    Ok(())
+}
+
 fn not_found(n: &Name, kind: &str) -> anyhow::Error {
     anyhow!(
         "SQL0204: {} in {} type *FILE not found ({kind}).",
@@ -2299,6 +2712,12 @@ async fn drop_trigger(ctx: &mut Ctx<'_>, lib: &str, name: &str) -> Result<bool> 
             ident(lib),
             ident(&table)
         ))
+        .await?;
+    ctx.client
+        .execute(
+            "DELETE FROM as4tainr.sql_triggers WHERE library=$1 AND name=$2",
+            &[&lib, &name],
+        )
         .await?;
     let url = ctx.database_url.clone();
     crate::sql::define_as_sql_role(
@@ -2363,14 +2782,33 @@ async fn create_trigger_run(ctx: &mut Ctx<'_>, t: &Trigger) -> Result<String> {
     let Some((lib, attr, sys)) = ctx.find(&t.table).await? else {
         return Err(not_found(&t.table, "table"));
     };
-    if attr != "PF" {
-        bail!("SQL0084: triggers on views (INSTEAD OF) are not supported yet.");
+    let is_view = attr == "LF"
+        && catalog::resolve_file(ctx.client, std::slice::from_ref(&lib), &sys)
+            .await
+            .map(|f| f.file.view.is_some())
+            .unwrap_or(false);
+    // INSTEAD OF triggers are on views, BEFORE and AFTER triggers on
+    // tables (Db2 for i SQL Reference, CREATE TRIGGER).
+    if attr != "PF" && !is_view {
+        bail!(
+            "SQL0156: {} is a logical file, not a table or a view.",
+            t.table.name
+        );
     }
-    if t.timing == "INSTEAD OF" {
+    if is_view && t.timing != "INSTEAD OF" {
+        bail!(
+            "SQL0156: {} is a view: only INSTEAD OF triggers are defined on views.",
+            t.table.name
+        );
+    }
+    if !is_view && t.timing == "INSTEAD OF" {
         bail!(
             "SQL0156: INSTEAD OF triggers are defined on views, and {} is a table.",
             t.table.name
         );
+    }
+    if is_view && !t.each_row {
+        bail!("SQL0104: An INSTEAD OF trigger is FOR EACH ROW.");
     }
     authority::check_manage(ctx.client, ctx.user, &lib, &sys, "*FILE").await?;
     let tlib = match &t.name.lib {
@@ -2479,6 +2917,8 @@ async fn create_trigger_run(ctx: &mut Ctx<'_>, t: &Trigger) -> Result<String> {
         }
     }
     let result = match (row, t.timing.as_str()) {
+        // INSTEAD OF: the row counts as changed.
+        (true, "INSTEAD OF") => "COALESCE(NEW, OLD)",
         (true, "BEFORE") if t.events.iter().all(|e| e == "DELETE") => "OLD",
         (true, "BEFORE") => "COALESCE(NEW, OLD)",
         _ => "NULL",
@@ -2554,12 +2994,57 @@ async fn create_trigger_run(ctx: &mut Ctx<'_>, t: &Trigger) -> Result<String> {
         ))
         .await
         .map_err(|e| anyhow!("SQL0104: the trigger cannot be created: {e}"))?;
+    ctx.client
+        .execute(
+            "INSERT INTO as4tainr.sql_triggers (library, name, file_lib, file, timing, events, each_row,
+                 old_row, new_row, condition, body, definer)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             ON CONFLICT (library, name) DO UPDATE SET file_lib = EXCLUDED.file_lib, file = EXCLUDED.file,
+                 timing = EXCLUDED.timing, events = EXCLUDED.events, each_row = EXCLUDED.each_row,
+                 old_row = EXCLUDED.old_row, new_row = EXCLUDED.new_row, condition = EXCLUDED.condition,
+                 body = EXCLUDED.body, definer = EXCLUDED.definer, created = now()",
+            &[
+                &tlib,
+                &tname,
+                &lib,
+                &sys,
+                &t.timing,
+                &t.events.join(" "),
+                &row,
+                &t.old,
+                &t.new,
+                &t.when,
+                &t.body.join("; "),
+                &ctx.user,
+            ],
+        )
+        .await?;
     Ok(format!("Trigger {tname} created in {tlib} on {lib}/{sys}."))
 }
 
 /// Run a data definition statement; the message says what was done.
 pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
     match ddl {
+        Ddl::CreateSequence {
+            name,
+            replace,
+            opts,
+        } => create_sequence(ctx, name, *replace, opts).await,
+        Ddl::AlterSequence { name, opts } => alter_sequence(ctx, name, opts).await,
+        Ddl::Drop {
+            kind: "SEQUENCE",
+            name,
+            if_exists,
+        } => {
+            let Some(lib) = ctx.find_sequence(name).await? else {
+                if *if_exists {
+                    return Ok(format!("{} does not exist; nothing dropped.", name.name));
+                }
+                return Err(seq_not_found(name));
+            };
+            drop_sequence(ctx, &lib, &name.name).await?;
+            Ok(format!("Sequence {} in {lib} dropped.", name.name))
+        }
         Ddl::SetSchema(s) => {
             if !catalog::library_exists(ctx.client, s).await? {
                 bail!("SQL0204: Schema {s} not found.");
@@ -2642,6 +3127,7 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
             replace,
             file,
             uniques,
+            primary,
             checks,
             foreign,
             preserve,
@@ -2684,7 +3170,8 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
                 file.format = sys.clone();
             }
             catalog::create_physical_file(ctx.client, &lib, &file).await?;
-            let mut done = constraints(ctx.client, &lib, &sys, uniques, checks).await;
+            let mut done =
+                constraints(ctx.client, &lib, &sys, uniques, primary.as_deref(), checks).await;
             for fk in foreign {
                 if done.is_ok() {
                     done = add_foreign_key(ctx, &lib, &sys, &name.name, fk)
@@ -2906,6 +3393,7 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
                 replace: *replace,
                 file,
                 uniques: vec![],
+                primary: None,
                 checks: vec![],
                 foreign: vec![],
                 preserve: false,
@@ -3346,7 +3834,7 @@ async fn alter(ctx: &mut Ctx<'_>, table: &Name, action: &Alter) -> Result<String
             .await
             .map_err(db)?;
             tx.commit().await?;
-            constraints(ctx.client, &lib, &sys, &uniques, checks).await?;
+            constraints(ctx.client, &lib, &sys, &uniques, Some("PK"), checks).await?;
             remake_alias(ctx.client, &alias_view, &tbl).await?;
             Ok(format!(
                 "Column {} added to {}.",
@@ -3367,7 +3855,8 @@ async fn alter(ctx: &mut Ctx<'_>, table: &Name, action: &Alter) -> Result<String
                 }
                 cols.push(fd.name);
             }
-            constraints(ctx.client, &lib, &sys, &[(name.clone(), cols)], &[]).await?;
+            let pk = primary.then_some(name.as_str());
+            constraints(ctx.client, &lib, &sys, &[(name.clone(), cols)], pk, &[]).await?;
             Ok(format!("Constraint {name} added to {}.", table.name))
         }
         Alter::AddForeign(fk) => {
@@ -3384,10 +3873,22 @@ async fn alter(ctx: &mut Ctx<'_>, table: &Name, action: &Alter) -> Result<String
             let cname = name
                 .clone()
                 .unwrap_or_else(|| format!("C_{}", std::process::id() % 100000));
-            constraints(ctx.client, &lib, &sys, &[], &[(cname.clone(), cond)]).await?;
+            constraints(ctx.client, &lib, &sys, &[], None, &[(cname.clone(), cond)]).await?;
             Ok(format!("Check constraint {cname} added to {}.", table.name))
         }
         Alter::DropConstraint { name } => {
+            // DROP PRIMARY KEY: the primary key's constraint, whatever its name.
+            let name = &match ctx
+                .client
+                .query_opt(
+                    "SELECT name FROM as4tainr.constraints WHERE library=$1 AND file=$2 AND kind='PRIMARY KEY'",
+                    &[&lib, &sys],
+                )
+                .await?
+            {
+                Some(r) if name == "PK" => r.get::<_, String>(0),
+                _ => name.clone(),
+            };
             let obj = format!("{sys}_{name}");
             let index = format!("{}.{}", ident(&lib), ident(&obj));
             let is_index = ctx
@@ -3422,6 +3923,12 @@ async fn alter(ctx: &mut Ctx<'_>, table: &Name, action: &Alter) -> Result<String
                     .await
                     .map_err(db)?;
             }
+            ctx.client
+                .execute(
+                    "DELETE FROM as4tainr.constraints WHERE library=$1 AND file=$2 AND name=$3",
+                    &[&lib, &sys, name],
+                )
+                .await?;
             Ok(format!("Constraint {name} dropped from {}.", table.name))
         }
         Alter::DropColumn { column, cascade } => {
@@ -3652,10 +4159,20 @@ async fn constraints(
     lib: &str,
     table: &str,
     uniques: &[(String, Vec<String>)],
+    primary: Option<&str>,
     checks: &[(String, String)],
 ) -> Result<()> {
     for (cname, cols) in uniques {
+        let pk = primary == Some(cname.as_str());
         catalog::add_unique_constraint(client, lib, table, cname, cols).await?;
+        catalog::record_constraint(
+            client,
+            lib,
+            table,
+            cname,
+            if pk { "PRIMARY KEY" } else { "UNIQUE" },
+        )
+        .await?;
     }
     for (cname, cond) in checks {
         // The condition was rebuilt from checked tokens: quoted columns of
@@ -3669,6 +4186,7 @@ async fn constraints(
             ))
             .await
             .map_err(|e| anyhow!("SQL0546: CHECK condition {cond} is not valid: {e}"))?;
+        catalog::record_constraint(client, lib, table, cname, "CHECK").await?;
     }
     Ok(())
 }

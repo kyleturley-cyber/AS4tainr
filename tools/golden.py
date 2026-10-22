@@ -170,6 +170,8 @@ def main():
     ap.add_argument("--report")
     ap.add_argument("--only", nargs="*")
     ap.add_argument("--keep", action="store_true", help="keep the sandbox directory")
+    ap.add_argument("--save", help="write our output of each command to SAVE/<name>.txt")
+    ap.add_argument("--files", help="files the commands use (golden.ps1 -Files), put in /home/HOME/gld")
     a = ap.parse_args()
     bin_ = os.path.abspath(a.bin)
     items = read_commands(a.commands)
@@ -179,6 +181,13 @@ def main():
     sb = tempfile.mkdtemp(prefix="golden-")
     os.makedirs(os.path.join(sb, "bin"))
     os.makedirs(os.path.join(sb, "home", a.home))
+    if a.files:
+        gld = os.path.join(sb, "home", a.home, "gld")
+        os.makedirs(gld)
+        for f in os.listdir(a.files):
+            src = os.path.join(a.files, f)
+            if os.path.isfile(src):
+                shutil.copy(src, gld)
     shim = os.path.join(sb, "bin", "system")
     with open(shim, "w") as f:
         f.write(SHIM.replace("{sb}", sb).replace("{bin}", bin_))
@@ -205,6 +214,10 @@ def main():
             ["sh", "-c", shell_for(cmd, sb)], env=env, capture_output=True, text=True, cwd=sb
         )
         ours = parse_result(r.stdout.splitlines(), raw)
+        if a.save:
+            os.makedirs(a.save, exist_ok=True)
+            with open(os.path.join(a.save, name + ".txt"), "w", encoding="utf-8") as f:
+                f.write(r.stdout)
         if not os.path.exists(gpath):
             counts["missing"] += 1
             report.append("?  %-22s no capture" % name)

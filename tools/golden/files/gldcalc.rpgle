@@ -1,0 +1,151 @@
+**FREE
+// Golden values for as4tainr's RPG engine (tools/golden/rpg-sql.txt):
+// decimal arithmetic, built-in functions, edit codes and words, dates and
+// times. Each result is one record of GLDOUT (ID, VAL), printed with CPYF.
+ctl-opt dftactgrp(*no) actgrp(*new);
+
+dcl-f GLDOUT usage(*output) rename(GLDOUT: OUTR);
+
+dcl-s p72 packed(7: 2);
+dcl-s p50 packed(5: 0);
+dcl-s p1510 packed(15: 10);
+dcl-s neg packed(9: 2) inz(-1234.56);
+dcl-s pos packed(9: 2) inz(1234.56);
+dcl-s zero packed(9: 2) inz(0);
+dcl-s half packed(5: 2) inz(0.5);
+dcl-s qneg packed(5: 2) inz(-0.25);
+dcl-s zn zoned(5: 2) inz(-1.5);
+dcl-s i10 int(10) inz(0);
+dcl-s u5 uns(5) inz(65535);
+dcl-s mdy packed(6: 0) inz(102226);
+dcl-s d date inz(d'2026-10-22');
+dcl-s d2 date;
+dcl-s t time inz(t'20.05.09');
+dcl-s ts timestamp inz(z'2026-10-22-20.05.09.123456');
+
+// Decimal arithmetic: truncation, half adjust, intermediate precision.
+p72 = 10 / 3;
+res('A01': %char(p72));
+eval(h) p72 = 2 / 3;
+res('A02': %char(p72));
+p72 = 2 / 3;
+res('A03': %char(p72));
+p50 = 7.5;
+res('A04': %char(p50));
+eval(h) p50 = 7.5;
+res('A05': %char(p50));
+eval(h) p50 = -7.5;
+res('A06': %char(p50));
+p1510 = 1 / 3 * 3;
+res('A07': %char(p1510));
+res('A08': %char(%dec(123.456: 5: 1)));
+res('A09': %char(%dech(123.456: 5: 1)));
+res('A10': %char(%dech(-0.05: 3: 1)));
+res('A11': %char(%rem(-7: 2)));
+res('A12': %char(%div(-7: 2)));
+res('A13': %char(%int(-3.7)));
+res('A14': %char(%inth(-3.5)));
+res('A15': %char(%abs(-5.25)));
+res('A16': %char(half));
+res('A17': %char(qneg));
+res('A18': %char(zero));
+res('A19': %char(zn));
+res('A20': %char(i10));
+res('A21': %char(u5));
+res('A22': %char(10 / 3));
+res('A23': %char(1.5 * 1.5));
+res('A24': %char(%dec(-0.005: 5: 2)));
+res('A25': %char(%dech(-0.005: 5: 2)));
+
+// Edit codes on a negative value, zero and a positive value.
+res('E1N': %editc(neg: '1'));
+res('E1Z': %editc(zero: '1'));
+res('E2N': %editc(neg: '2'));
+res('E2Z': %editc(zero: '2'));
+res('E3N': %editc(neg: '3'));
+res('E3Z': %editc(zero: '3'));
+res('E4N': %editc(neg: '4'));
+res('E4Z': %editc(zero: '4'));
+res('EAN': %editc(neg: 'A'));
+res('EAZ': %editc(zero: 'A'));
+res('EBN': %editc(neg: 'B'));
+res('EBZ': %editc(zero: 'B'));
+res('ECN': %editc(neg: 'C'));
+res('ECZ': %editc(zero: 'C'));
+res('EDN': %editc(neg: 'D'));
+res('EDZ': %editc(zero: 'D'));
+res('EJN': %editc(neg: 'J'));
+res('EJZ': %editc(zero: 'J'));
+res('EKN': %editc(neg: 'K'));
+res('EKZ': %editc(zero: 'K'));
+res('ELN': %editc(neg: 'L'));
+res('ELZ': %editc(zero: 'L'));
+res('EMN': %editc(neg: 'M'));
+res('EMZ': %editc(zero: 'M'));
+res('ENN': %editc(neg: 'N'));
+res('ENZ': %editc(zero: 'N'));
+res('EON': %editc(neg: 'O'));
+res('EOZ': %editc(zero: 'O'));
+res('EPN': %editc(neg: 'P'));
+res('EPZ': %editc(zero: 'P'));
+res('EQN': %editc(neg: 'Q'));
+res('EQZ': %editc(zero: 'Q'));
+res('EXN': %editc(neg: 'X'));
+res('EZN': %editc(neg: 'Z'));
+res('EZZ': %editc(zero: 'Z'));
+res('EYD': %editc(mdy: 'Y'));
+res('EJP': %editc(pos: 'J'));
+res('EJC': %editc(pos: 'J': *cursym));
+res('EJA': %editc(pos: 'J': *astfill));
+res('EAF': %editc(neg: 'A': '$'));
+res('EW1': %editw(neg: '  ,   ,  0.  -'));
+res('EW2': %editw(pos: '$  ,   ,  0.  '));
+res('EW3': %editw(zero: '  ,   ,  0.  CR'));
+
+// Dates and times in their formats, arithmetic, differences.
+res('D01': %char(d: *mdy));
+res('D02': %char(d: *dmy));
+res('D03': %char(d: *ymd));
+res('D04': %char(d: *jul));
+res('D05': %char(d: *iso));
+res('D06': %char(d: *usa));
+res('D07': %char(d: *eur));
+res('D08': %char(d: *jis));
+res('D09': %char(d: *cymd));
+res('D10': %char(d: *cmdy));
+res('D11': %char(d: *cdmy));
+res('D12': %char(d: *longjul));
+res('D13': %char(d: *iso0));
+res('D14': %char(d: *mdy-));
+res('D15': %char(d: *ymd0));
+res('D20': %char(%diff(d: d'2026-01-01': *days)));
+res('D21': %char(%diff(d: d'2025-12-31': *months)));
+d2 = d'2026-01-31' + %months(1);
+res('D22': %char(d2));
+d2 = d'2024-02-29' + %years(1);
+res('D23': %char(d2));
+res('D24': %char(%subdt(d: *days)));
+res('D25': %char(%date(mdy: *mdy)));
+res('D26': %char(%dec(d: *ymd)));
+res('D27': %char(%diff(d'2026-03-01': d'2026-02-28': *days)));
+res('T01': %char(t: *hms));
+res('T02': %char(t: *usa));
+res('T03': %char(t: *iso));
+res('T04': %char(t: *eur));
+res('T05': %char(t: *jis));
+res('T06': %char(ts));
+res('T07': %char(%diff(ts: z'2026-10-22-00.00.00.000000': *seconds)));
+res('T08': %char(%dec(t: *hms)));
+res('T09': %char(t + %minutes(70)));
+
+*inlr = *on;
+
+dcl-proc res;
+  dcl-pi *n;
+    key char(10) const;
+    v varchar(60) const;
+  end-pi;
+  ID = key;
+  VAL = v;
+  write OUTR;
+end-proc;

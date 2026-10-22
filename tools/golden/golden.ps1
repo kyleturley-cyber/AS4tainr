@@ -13,10 +13,14 @@ param(
   [string]$List = (Join-Path $PSScriptRoot 'basics.txt'),
   [string]$Out  = (Join-Path $PSScriptRoot '..\..\target\ibmi\golden'),
   [string]$HostAlias = 'pub400',
-  [int]$Tries = 6,
+  [int]$Tries = 3,
   # Seconds one command may run before it is killed (a command waiting
   # for a reply to an inquiry message waits forever in this job).
-  [int]$Timeout = 120
+  [int]$Timeout = 120,
+  # Files the commands use (source members, stream files): copied to
+  # $FilesTo on the IBM i before the run.
+  [string]$Files = '',
+  [string]$FilesTo = '/home/AS4TRAINR/gld'
 )
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 New-Item -ItemType Directory -Force $Out | Out-Null
@@ -48,15 +52,29 @@ $sh = (($sh + "echo '=====DONE'") -join "`n") + "`n"
 # The script goes over as a file and runs there: piping a long script into
 # ssh deadlocks (Windows PowerShell writes all of a command's input before
 # it reads any of its output, and ssh waits for its output to be read).
-$local = Join-Path $env:TEMP 'golden.sh'
-[IO.File]::WriteAllText($local, $sh, (New-Object Text.UTF8Encoding $false))
-$remote = '/tmp/golden_' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.sh'
-for ($t = 1; $t -le $Tries; $t++) {
-  scp -q -o ConnectTimeout=20 $local "${HostAlias}:$remote" 2>$null
-  if ($LASTEXITCODE -eq 0) { break }
-  Write-Host "copying the script failed (try $t); retrying in 10 s"; Start-Sleep 10
+# PUB400 limits the connections from one address: the script and the files
+# go over in one scp (a directory of their own under /tmp), the run is one
+# ssh, and the script removes its directory when it is done.
+$id = 'golden_' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+$dir = Join-Path $env:TEMP $id
+New-Item -ItemType Directory -Force $dir | Out-Null
+$copy = ''
+if ($Files) {
+  foreach ($f in Get-ChildItem -File $Files) {
+    Copy-Item $f.FullName (Join-Path $dir $f.Name)
+    $copy += "mkdir -p '$FilesTo' && cp '/tmp/$id/$($f.Name)' '$FilesTo/'`n"
+  }
 }
-if ($LASTEXITCODE -ne 0) { Write-Error 'could not copy the script to the IBM i'; exit 1 }
+$sh = $copy + $sh.Replace("echo '=====DONE'", "rm -rf /tmp/$id; echo '=====DONE'")
+[IO.File]::WriteAllText((Join-Path $dir 'golden.sh'), $sh, (New-Object Text.UTF8Encoding $false))
+$remote = "/tmp/$id/golden.sh"
+for ($t = 1; $t -le $Tries; $t++) {
+  scp -r -q -o ConnectTimeout=30 $dir "${HostAlias}:/tmp/" 2>$null
+  if ($LASTEXITCODE -eq 0) { break }
+  Write-Host "copying the script failed (try $t); retrying in 60 s"; Start-Sleep 60
+}
+Remove-Item -Recurse -Force $dir
+if ($LASTEXITCODE -ne 0) { Write-Error 'could not reach the IBM i (ssh port); try again later'; exit 1 }
 Write-Host "running $($items.Count) commands"
 for ($t = 1; $t -le $Tries; $t++) {
   $log = Join-Path $logs "attempt$t"
@@ -64,7 +82,7 @@ for ($t = 1; $t -le $Tries; $t++) {
   # can be followed while it goes.
   $w = [IO.StreamWriter]::new("$log.out", $false, [Text.UTF8Encoding]::new($false))
   $w.AutoFlush = $true
-  $res = ssh -o ConnectTimeout=20 -o ServerAliveInterval=30 $HostAlias "sh $remote" 2> "$log.err" | ForEach-Object {
+  $res = ssh -o ConnectTimeout=30 -o ServerAliveInterval=30 $HostAlias "sh $remote" 2> "$log.err" | ForEach-Object {
     $w.WriteLine($_)
     if ($_ -like '=====BEGIN *') { Write-Host "running $($_.Substring(11))" }
     elseif ($_ -like 'TIMEOUT after*') { Write-Host "  $_" }
@@ -73,10 +91,9 @@ for ($t = 1; $t -le $Tries; $t++) {
   $w.Close()
   "exit=$LASTEXITCODE" | Add-Content "$log.err"
   if ($res -contains '=====DONE') { break }
-  Write-Host "attempt $t incomplete (see $log.out/.err); retrying in 15 s"
-  Start-Sleep 15
+  Write-Host "attempt $t incomplete (see $log.out/.err); retrying in 60 s"
+  Start-Sleep 60
 }
-ssh -o ConnectTimeout=20 $HostAlias "rm -f $remote" 2>$null
 if ($res -notcontains '=====DONE') { Write-Error 'no complete run'; exit 1 }
 $name = $null; $buf = @()
 foreach ($line in $res) {

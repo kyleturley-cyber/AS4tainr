@@ -1,0 +1,20 @@
+# Golden values for decimal precision: an RPG program's quotients, products
+# and sums (ILE RPG precision rules) and SQL decimal division, written to
+# AS4TRAINR1/GLDOUT and printed with CPYF.
+# Capture with: golden.ps1 -List tools\golden\rpg-prec.txt -Files tools\golden\files
+# (constants written with blanks after commas: PUB400 uses a decimal comma).
+p_cleanup|!system -q "DLTPGM PGM(AS4TRAINR1/GLDPREC)"; system -q "DLTF FILE(AS4TRAINR1/GLDOUT)"; echo cleaned
+p_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLDOUT (ID CHAR(10) NOT NULL, VAL CHAR(60) NOT NULL)') COMMIT(*NONE)
+p_tag|!setccsid 819 /home/AS4TRAINR/gld/gldprec.rpgle; ls -l /home/AS4TRAINR/gld
+p_crtbndrpg|!system -s "CRTBNDRPG PGM(AS4TRAINR1/GLDPREC) SRCSTMF('/home/AS4TRAINR/gld/gldprec.rpgle')"
+p_call|CALL PGM(AS4TRAINR1/GLDPREC)
+p_s01|RUNSQL SQL('INSERT INTO AS4TRAINR1/GLDOUT VALUES(''S01'', CHAR(DEC(10, 7, 2) / 3))') COMMIT(*NONE)
+p_s02|RUNSQL SQL('INSERT INTO AS4TRAINR1/GLDOUT VALUES(''S02'', CHAR(DEC(10, 31, 2) / 3))') COMMIT(*NONE)
+p_s03|RUNSQL SQL('INSERT INTO AS4TRAINR1/GLDOUT VALUES(''S03'', CHAR(DEC(1, 5, 0) / DEC(3, 5, 2)))') COMMIT(*NONE)
+p_s04|RUNSQL SQL('INSERT INTO AS4TRAINR1/GLDOUT VALUES(''S04'', CHAR(10.25 / 100))') COMMIT(*NONE)
+p_s05|RUNSQL SQL('INSERT INTO AS4TRAINR1/GLDOUT VALUES(''S05'', CHAR(CAST(7.5 AS DEC(5, 0))))') COMMIT(*NONE)
+p_s06|RUNSQL SQL('INSERT INTO AS4TRAINR1/GLDOUT VALUES(''S06'', CHAR(CAST(''-3.77'' AS DEC(5, 1))))') COMMIT(*NONE)
+p_s07|RUNSQL SQL('INSERT INTO AS4TRAINR1/GLDOUT VALUES(''S07'', CHAR(DEC(2, 5, 1) * DEC(3, 5, 2)))') COMMIT(*NONE)
+p_s08|RUNSQL SQL('INSERT INTO AS4TRAINR1/GLDOUT VALUES(''S08'', CHAR(DEC(2, 5, 1) + DEC(3, 5, 2)))') COMMIT(*NONE)
+p_print|CPYF FROMFILE(AS4TRAINR1/GLDOUT) TOFILE(*PRINT)
+p_end|!system -q "DLTPGM PGM(AS4TRAINR1/GLDPREC)"; system -q "DLTF FILE(AS4TRAINR1/GLDOUT)"; echo cleaned

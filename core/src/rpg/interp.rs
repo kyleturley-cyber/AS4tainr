@@ -873,11 +873,14 @@ impl<'a> Machine<'a> {
                             s.extend(y.chars()?);
                             Value::Char(s)
                         }
-                        _ => Value::Num(x.num()?.add(&y.num()?)?),
+                        _ => Value::Num(self.to_rule_scale(ex, x.num()?.add(&y.num()?)?)),
                     },
-                    BinOp::Sub => Value::Num(x.num()?.sub(&y.num()?)?),
-                    BinOp::Mul => Value::Num(x.num()?.mul(&y.num()?)?),
-                    BinOp::Div => Value::Num(x.num()?.div(&y.num()?)?),
+                    BinOp::Sub => Value::Num(self.to_rule_scale(ex, x.num()?.sub(&y.num()?)?)),
+                    BinOp::Mul => Value::Num(self.to_rule_scale(ex, x.num()?.mul(&y.num()?)?)),
+                    BinOp::Div => {
+                        let (a, b) = (x.num()?, y.num()?);
+                        Value::Num(self.divide(l, r, &a, &b)?)
+                    }
                     BinOp::Pow => {
                         let base = x.num()?;
                         let n = y.num()?.to_i128().map_err(|_| {
@@ -910,6 +913,91 @@ impl<'a> Machine<'a> {
     }
 
     /// The type of what an expression names, when it names a field.
+    /// Division with the decimal places the ILE RPG precision rules give
+    /// the quotient (ILE RPG Reference, "Precision of Intermediate
+    /// Results": Dr = max(M - ((L1 - D1) + D2), 0)). The reference's table
+    /// has M = 63; IBM i 7.5 computes with M = 30 when no operand has more
+    /// digits (PUB400, tools/golden/rpg-prec.txt: %CHAR(10 / 3) has 28
+    /// decimals, %CHAR(100 / 3) 27, a 7,2 field / 3 25, an INT(10) / 3 20).
+    /// Operands whose precision is not known count their own digits. Fewer
+    /// places when the quotient would not fit in as4tainr's 38 digits.
+    fn divide(&self, l: &Expr, r: &Expr, a: &Dec, b: &Dec) -> Result<Dec> {
+        let (l1, d1) = self
+            .num_precision(l)
+            .unwrap_or(((a.int_digits() + a.scale() as u32).max(1), a.scale() as u32));
+        let (l2, d2) = self
+            .num_precision(r)
+            .unwrap_or(((b.int_digits() + b.scale() as u32).max(1), b.scale() as u32));
+        let m: u32 = if l1.max(l2) > 30 { 63 } else { 30 };
+        let mut dr = m.saturating_sub(l1.saturating_sub(d1) + d2).min(37);
+        loop {
+            match a.div_scale(b, dr as u8) {
+                Ok(q) => return Ok(q),
+                Err(e) if dr == 0 || e.to_string().starts_with("MCH1211") => return Err(e),
+                Err(_) => dr -= 1,
+            }
+        }
+    }
+
+    /// A sum, difference or product with the decimal places the precision
+    /// rules give it (IBM i 7.5: %CHAR(p * p) of two 7,2 fields holding 10
+    /// is 100.0000), when they are known; extra places cut off.
+    fn to_rule_scale(&self, ex: &Expr, v: Dec) -> Dec {
+        match self.num_precision(ex) {
+            Some((_, dr)) if dr <= 37 => v.rescale(dr as u8, false).unwrap_or(v),
+            _ => v,
+        }
+    }
+
+    /// The digits and decimal places of a numeric expression under the ILE
+    /// RPG precision rules, when they can be worked out: fields from their
+    /// definitions, literals by their digits, +, -, * and / by the rules'
+    /// table with 30 digits at most (63 with a longer operand), %DEC(x: p:
+    /// s). Checked on IBM i 7.5 (tools/golden/rpg-prec.txt).
+    fn num_precision(&self, ex: &Expr) -> Option<(u32, u32)> {
+        match ex {
+            Expr::Num(d) => {
+                let s = d.scale() as u32;
+                Some(((d.int_digits() + s).max(1), s))
+            }
+            Expr::Name { .. } | Expr::Path { .. } => match self.type_of(ex)? {
+                DType::Packed(p, s) | DType::Zoned(p, s) | DType::Binary(p, s) => Some((p, s)),
+                DType::Int(n) | DType::Uns(n) => Some((n, 0)),
+                _ => None,
+            },
+            Expr::Unary(UnOp::Neg | UnOp::Plus, e) => self.num_precision(e),
+            Expr::Bin(op, l, r) => {
+                let (l1, d1) = self.num_precision(l)?;
+                let (l2, d2) = self.num_precision(r)?;
+                let m: u32 = if l1.max(l2) > 30 { 63 } else { 30 };
+                match op {
+                    BinOp::Add | BinOp::Sub => {
+                        let t = (l1.saturating_sub(d1).max(l2.saturating_sub(d2)) + 1).min(m);
+                        let dr = d1.max(d2).min(m - t);
+                        Some((t + dr, dr))
+                    }
+                    BinOp::Mul => {
+                        let lr = (l1 + l2).min(m);
+                        let dr = (d1 + d2)
+                            .min(m - (l1.saturating_sub(d1) + l2.saturating_sub(d2)).min(m));
+                        Some((lr, dr))
+                    }
+                    BinOp::Div => Some((m, m.saturating_sub(l1.saturating_sub(d1) + d2))),
+                    _ => None,
+                }
+            }
+            Expr::Bif(b, args) if matches!(b.as_str(), "DEC" | "DECH") && args.len() >= 3 => {
+                let n = |e: &Expr| match e {
+                    Expr::Num(d) => d.to_i128().ok().map(|v| v as u32),
+                    _ => None,
+                };
+                Some((n(&args[1])?, n(&args[2])?))
+            }
+            Expr::Bif(b, args) if b == "ABS" => self.num_precision(args.first()?),
+            _ => None,
+        }
+    }
+
     fn type_of(&self, ex: &Expr) -> Option<DType> {
         match ex {
             Expr::Name { parts, .. } | Expr::Path { parts, .. } => {

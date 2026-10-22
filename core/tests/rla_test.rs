@@ -7890,6 +7890,46 @@ exec sql rollback;
     );
 }
 
+/// The decimal places of quotients, products and sums: the values IBM i
+/// 7.5 shows (PUB400, tools/golden/rpg-prec.txt, rows P01-P18).
+#[tokio::test]
+async fn rpg_precision_rules() {
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "PRECIS",
+        include_str!("rpg/precision.rpgle"),
+        None,
+        None,
+    )
+    .await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let m: Vec<String> = r
+        .messages
+        .iter()
+        .map(|m| m.trim_start_matches("DSPLY").trim().to_string())
+        .collect();
+    assert_eq!(
+        m,
+        [
+            "3.3333333333333333333333333333",
+            "33.333333333333333333333333333",
+            "3.3333333333333333333333333",
+            "33.333333333333333333333333",
+            "3.33333333333333333333",
+            ".11111111111111111111111111111",
+            "100.0000",
+            "1.9999999999999999999999999999",
+            "176.35714285714285714285714",
+            "1.23450",
+            "-3.50000000000000000000000000000",
+        ]
+    );
+}
+
 /// %EDITC with *ASTFILL, *CURSYM or a currency symbol; %CHAR(date: *MDY-).
 #[tokio::test]
 async fn rpg_editc_third_argument() {

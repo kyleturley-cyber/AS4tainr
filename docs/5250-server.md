@@ -110,33 +110,35 @@ An error keeps the command on the command line so it can be corrected:
 
 A command typed without a required parameter is not run: its prompt is shown, with the missing parameter's message on line 24 and the cursor on it, as IBM i does in an interactive job. F3 or F12 on a prompt puts the command into the log with "Command prompting was ended by F3 or F12." (CPF6801) and leaves the command line empty.
 
-DSPLIB:
+DSPLIB, laid out as IBM i 7.5 draws it (the library's attributes in two columns, option 5, the objects with their size and text, F17/F18 for the top and bottom):
 
 ```
-                               Display Library
+                                Display Library
 
- Library . . . . . . . . .:   QSYS
- Number of objects . . . .:   6
- Text  . . . . . . . . . .:   System library
+ Library  . . . . . . :   QGPL            Number of objects  . :   13
+ Type . . . . . . . . :   PROD            Library ASP number . :   1
+ Create authority . . :   *SYSVAL         Library ASP device . :   *SYSBAS
+                                          Library ASP group  . :   *SYSBAS
 
- Object      Type        Attribute   Text
- MYLIB       *LIB                    My first library
- QGPL        *LIB                    System library
- QSYS        *LIB                    System library
- QTEMP       *LIB                    System library
- SALES       *LIB                    Sales applications
- SALESX      *LIB                    Sales applications
+ Type options, press Enter.
+   5=Display description
 
-
-
-
-
-
-                                                                       Bottom
-
-
- F3=Exit   F12=Cancel
+ Opt  Object      Type      Attribute          Size  Text
+      CUSTINQD    *FILE     DSPF                  0
+      CUSTMAST    *FILE     PF                90112  Customer master
+      CUSTMNTD    *FILE     DSPF                  0
+      CUSTNAME    *FILE     LF                    0  Customers by name
+      CUSTOWE     *FILE     LF                    0  Customers who owe
+      CUSTRPT     *PGM      CLLE                  0  Customer report driver
+      CUSTWRKD    *FILE     DSPF                  0
+      ITEMMAST    *FILE     PF                57344  Item master
+      ORDENTC     *PGM      CLLE                  0  Order entry
+      ORDENTD     *FILE     DSPF                  0
+                                                                        More...
+ F3=Exit   F12=Cancel   F17=Top   F18=Bottom
 ```
+
+DSPLIBL, DSPDTAARA, DSPOBJD, WRKOBJ, WRKSPLF (F11 shows each file's job), DSPJOBLOG and DSPMSG follow IBM i's layouts the same way (`commands::IbmLayout`); the other list displays keep a plainer layout. On Command Entry, F10 shows every request level's commands and messages, each command with its level.
 
 ## Commands
 

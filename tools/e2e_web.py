@@ -161,7 +161,9 @@ with sync_playwright() as pw:
           "CRTLIB from the browser: its message in the Command Entry log", t)
 
     t.command(f"dsplib {LIB}", "Display Library")
-    check(LIB in t.line(3) and "Made in a browser" in t.text(), "DSPLIB shows the new library and its text", t)
+    # IBM i 7.5's DSPLIB display (PUB400) shows the library's attributes,
+    # not its text.
+    check(LIB in t.line(3) and "Number of objects" in t.line(3), "DSPLIB shows the new library", t)
     t.click_key("F3")
     t.wait_for("Command Entry")
     check(True, "clicking F3 on the key bar leaves DSPLIB", t)

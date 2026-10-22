@@ -361,6 +361,7 @@ impl Job<'_> {
             keys,
             refresh: Some(format!("WRKLNK OBJ('{obj}')")),
             print: vec![],
+            ibm: None,
         }))
     }
 }

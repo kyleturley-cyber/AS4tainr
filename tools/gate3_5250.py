@@ -161,11 +161,13 @@ def main():
               "the batch jobs ran while the clerks worked and ended normally", text)
         sec.fkey(3); sec.wait_for("Command Entry")
         command(sec, "wrksplf", "Work with All Spooled Files")
+        # The job names are on WRKSPLF's second view (F11), as on IBM i.
+        sec.fkey(11); sec.wait_for("Job")
         for _ in range(3):
-            if all(f"/{j}" in sec.text() for j in ("RPT1", "STOCK", "RPT2")):
+            if all(j in sec.text() for j in ("RPT1", "STOCK", "RPT2")):
                 break
             sec.page_down(); sec.pump(1)
-        check(all(f"/{j}" in sec.text() for j in ("RPT1", "STOCK", "RPT2")),
+        check(all(j in sec.text() for j in ("RPT1", "STOCK", "RPT2")),
               "the batch jobs' reports and listing are spooled files (WRKSPLF)", sec.text())
         sec.fkey(3); sec.wait_for("Command Entry")
         command(sec, "signoff", "Sign On")

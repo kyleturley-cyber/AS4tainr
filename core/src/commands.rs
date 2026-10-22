@@ -58,6 +58,75 @@ pub struct ListDisplay {
     /// `system` utility), in IBM's layout (`report.rs`). Empty: the list
     /// is printed as shown.
     pub print: Vec<String>,
+    /// The display laid out as IBM i draws it (header lines instead of
+    /// `info`, the list's place, the keys); `None`: the plain layout.
+    pub ibm: Option<Box<IbmLayout>>,
+}
+
+/// How IBM i 7.5 lays out a list display (observed on PUB400: DSPLIB,
+/// DSPLIBL, DSPDTAARA, WRKOBJ, DSPOBJD, WRKSPLF, DSPJOBLOG, DSPMSG). The
+/// title is on line 1; the keys end on line 23, "More..."/"Bottom" sits
+/// just above them, or above "Press Enter to continue." or the command
+/// line.
+#[derive(Debug, Clone, Default)]
+pub struct IbmLayout {
+    /// "System:   NAME" on line 2 from this column (62 on most displays).
+    pub system_col: Option<u8>,
+    /// Text on line 2, ending in column 79 ("Library 1 of 1").
+    pub right2: String,
+    /// Header lines from line 3, from column 2; a blank line follows them.
+    pub lines: Vec<String>,
+    /// The line above the list when there are no options ("Type reply
+    /// (if required), press Enter.").
+    pub instruction: String,
+    /// A first heading line above `heading` ("Device or", "ASP", "Value").
+    pub heading2: String,
+    /// "Parameters for options ... or command" and a command line.
+    pub command_line: Option<String>,
+    /// "Press Enter to continue." above the keys.
+    pub enter_line: bool,
+    /// F17=Top and F18=Bottom (the Display displays: DSPLIB, DSPLIBL,
+    /// DSPOBJD, DSPJOBLOG).
+    pub top_bottom_keys: bool,
+    /// A second view of the same rows (F11), as (heading line above,
+    /// heading, rows): WRKSPLF's job names.
+    pub view2: Option<(String, String, Vec<String>)>,
+}
+
+impl IbmLayout {
+    /// For `ListDisplay::ibm`.
+    pub fn some(self) -> Option<Box<IbmLayout>> {
+        Some(Box::new(self))
+    }
+}
+
+/// A label as IBM i's displays write it: the text, dots in every other
+/// column up to `last_dot` (an offset from the label's first column), a
+/// blank and a colon. The parity of `last_dot` decides the dots' columns:
+/// "Library  . . . . . . :" (DSPLIB, last dot at 19), "Data area . . . . . .
+/// . :" (DSPDTAARA, 22), observed on IBM i 7.5.
+pub fn dsp_label(text: &str, last_dot: usize) -> String {
+    let mut out = text.to_string();
+    let len = out.chars().count();
+    let mut col = len + 1;
+    if col % 2 != last_dot % 2 {
+        col += 1;
+    }
+    while out.chars().count() < col {
+        out.push(' ');
+    }
+    while col <= last_dot {
+        out.push('.');
+        if col < last_dot {
+            out.push(' ');
+        }
+        col += 2;
+    }
+    while out.chars().count() < last_dot + 2 {
+        out.push(' ');
+    }
+    out.push(':');
+    out
 }
 
 /// The system part of the library list (system value QSYSLIBL as shipped).
@@ -300,28 +369,76 @@ impl Job<'_> {
             lib.to_string()
         };
         let objects = catalog::list_objects(self.client, &lib).await?;
-        let text = catalog::library_text(self.client, &lib).await?;
-        let rows = objects
+        let kind: String = self
+            .client
+            .query_opt(
+                "SELECT attribute FROM as4tainr.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
+                &[&lib],
+            )
+            .await?
+            .map(|r| r.get(0))
+            .unwrap_or_default();
+        let kind = if kind.trim().is_empty() {
+            "PROD".to_string()
+        } else {
+            kind
+        };
+        // IBM i 7.5's DSPLIB display (PUB400): the library's attributes in
+        // two columns, then the objects with their size (what this system
+        // stores for them, fidelity-gaps.md) and text.
+        let mut rows: Vec<String> = Vec::new();
+        for o in &objects {
+            let size = catalog::object_size(self.client, &lib, &o.name, &o.objtype)
+                .await
+                .unwrap_or(0);
+            let text: String = o.text.chars().take(26).collect();
+            rows.push(format!(
+                "{:<10}  {:<8}  {:<10}  {:>11}  {}",
+                o.name, o.objtype, o.attribute, size, text
+            ));
+        }
+        let keys = objects
             .iter()
-            .map(|o| {
-                format!(
-                    "{:<10}  {:<10}  {:<10}  {}",
-                    o.name, o.objtype, o.attribute, o.text
-                )
-            })
+            .map(|o| format!("OBJ({lib}/{}) OBJTYPE({})", o.name, o.objtype))
             .collect();
+        let pair = |l: &str, v: &str, r: &str, rv: &str| {
+            let left = if l.is_empty() {
+                String::new()
+            } else {
+                format!("{}   {v}", dsp_label(l, 19))
+            };
+            format!("{left:<41}{}   {rv}", dsp_label(r, 19))
+        };
         Ok(Outcome::Display(ListDisplay {
             title: "Display Library".into(),
-            info: vec![
-                ("Library".into(), lib.clone()),
-                ("Number of objects".into(), objects.len().to_string()),
-                ("Text".into(), text),
-            ],
+            info: vec![],
             heading: format!(
-                "{:<10}  {:<10}  {:<10}  {}",
-                "Object", "Type", "Attribute", "Text"
+                "{:<10}  {:<8}  {:<10}  {:>11}  {}",
+                "Object", "Type", "Attribute", "Size", "Text"
             ),
             rows,
+            options: vec![(5, "Display description".into(), "DSPOBJD {}".into())],
+            keys,
+            ibm: IbmLayout::some(IbmLayout {
+                top_bottom_keys: true,
+                lines: vec![
+                    pair(
+                        "Library",
+                        &lib,
+                        "Number of objects",
+                        &objects.len().to_string(),
+                    ),
+                    pair("Type", &kind, "Library ASP number", "1"),
+                    pair(
+                        "Create authority",
+                        "*SYSVAL",
+                        "Library ASP device",
+                        "*SYSBAS",
+                    ),
+                    pair("", "", "Library ASP group", "*SYSBAS"),
+                ],
+                ..Default::default()
+            }),
             ..Default::default()
         }))
     }
@@ -345,7 +462,7 @@ impl Job<'_> {
             let text = catalog::library_text(self.client, &lib)
                 .await
                 .unwrap_or_default();
-            rows.push(format!("{lib:<10}  {kind:<4}  {text}"));
+            rows.push(format!("{lib:<10}  {kind:<8}  {:<10}  {text}", ""));
             print.push(crate::report::at(&[(4, &lib), (16, kind), (39, &text)]));
             keys.push(lib);
         }
@@ -353,7 +470,11 @@ impl Job<'_> {
         Ok(Outcome::Display(ListDisplay {
             title: "Display Library List".into(),
             info: vec![],
-            heading: format!("{:<10}  {:<4}  {}", "Library", "Type", "Text"),
+            // IBM i 7.5's DSPLIBL display (PUB400): an ASP device column.
+            heading: format!(
+                "{:<10}  {:<8}  {:<10}  {}",
+                "Library", "Type", "Device", "Text"
+            ),
             rows,
             options: vec![(
                 5,
@@ -363,6 +484,13 @@ impl Job<'_> {
             keys,
             refresh: None,
             print,
+            ibm: IbmLayout::some(IbmLayout {
+                system_col: Some(62),
+                top_bottom_keys: true,
+                lines: vec![String::new()],
+                heading2: format!("{:22}ASP", ""),
+                ..Default::default()
+            }),
         }))
     }
 
@@ -3115,6 +3243,7 @@ impl Job<'_> {
             }
         };
         let mut rows = Vec::new();
+        let mut keys = Vec::new();
         for l in &libs {
             let Ok(objects) = catalog::list_objects(self.client, l).await else {
                 continue; // a library in the list that no longer exists
@@ -3127,6 +3256,7 @@ impl Job<'_> {
                         "{:<10}  {:<8}  {:<10}  {:<10}  {}",
                         o.name, o.objtype, l, o.attribute, o.text
                     ));
+                    keys.push(format!("OBJ({l}/{}) OBJTYPE({})", o.name, o.objtype));
                 }
             }
         }
@@ -3141,6 +3271,24 @@ impl Job<'_> {
                 "Object", "Type", "Library", "Attribute", "Text"
             ),
             rows,
+            // IBM i 7.5's WRKOBJ (PUB400): options, the list, a command line.
+            options: vec![
+                (5, "Display authority".into(), "DSPOBJAUT {}".into()),
+                (8, "Display description".into(), "DSPOBJD {}".into()),
+            ],
+            keys,
+            refresh: Some(format!(
+                "WRKOBJ OBJ({}) OBJTYPE({objtype})",
+                if lib == "*LIBL" {
+                    obj.clone()
+                } else {
+                    format!("{lib}/{obj}")
+                }
+            )),
+            ibm: IbmLayout::some(IbmLayout {
+                command_line: Some("Parameters or command".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         }))
     }
@@ -3368,6 +3516,7 @@ impl Job<'_> {
             keys,
             refresh: Some("WRKACTJOB".into()),
             print: vec![],
+            ibm: None,
         }))
     }
 
@@ -3405,6 +3554,7 @@ impl Job<'_> {
             keys: list.iter().map(|j| j.id.to_string()).collect(),
             refresh: Some("WRKSBMJOB".into()),
             print: vec![],
+            ibm: None,
         }))
     }
 
@@ -3435,13 +3585,15 @@ impl Job<'_> {
             )]));
         }
         let entries = jobs::job_log(self.client, job.id.number).await?;
+        // IBM i 7.5's DSPJOBLOG display (PUB400): requests after '>',
+        // messages under them as texts (F1 on IBM i shows the message ID).
         let rows = entries
             .iter()
             .flat_map(|e| {
                 let first = if e.kind == "*RQS" {
-                    format!("{}  > {}", e.sent, e.text)
+                    format!("> {}", e.text)
                 } else {
-                    format!("{}    {}", e.sent, e.text)
+                    format!("    {}", jobs::shown_text(&e.text))
                 };
                 let mut out = Vec::new();
                 // Long messages continue on the next lines.
@@ -3455,7 +3607,7 @@ impl Job<'_> {
                     let at = rest[..cut].rfind(' ').filter(|&i| i > 20).unwrap_or(cut);
                     out.push(rest[..at].to_string());
                     rest = rest[at..].trim_start();
-                    let indent = "              ";
+                    let indent = "      ";
                     if rest.chars().count() <= 76 - indent.len() {
                         out.push(format!("{indent}{rest}"));
                         rest = "";
@@ -3470,13 +3622,19 @@ impl Job<'_> {
             .collect();
         Ok(Outcome::Display(ListDisplay {
             title: "Display Job Log".into(),
-            info: vec![
-                ("Job".into(), job.id.name.clone()),
-                ("User".into(), job.id.user.clone()),
-                ("Number".into(), format!("{:06}", job.id.number)),
-            ],
-            heading: "Time      Message".into(),
+            info: vec![],
+            heading: String::new(),
             rows,
+            ibm: IbmLayout::some(IbmLayout {
+                system_col: Some(62),
+                lines: vec![format!(
+                    "Job . . :   {:<10}    User . . :   {:<10}    Number . . . :   {:06}",
+                    job.id.name, job.id.user, job.id.number
+                )],
+                enter_line: true,
+                top_bottom_keys: true,
+                ..Default::default()
+            }),
             ..Default::default()
         }))
     }
@@ -3536,22 +3694,59 @@ impl Job<'_> {
             }
         };
         let msgs = jobs::messages(self.client, &q, q == self.user).await?;
+        // IBM i 7.5's DSPMSG display (PUB400): the queue's attributes, then
+        // each message, oldest first, under a "From" line with the sender,
+        // date and time; texts without message IDs.
         let mut rows = Vec::new();
-        for m in msgs.iter().rev() {
-            rows.push(format!("{}{}", if m.is_new { "* " } else { "  " }, m.text));
-            rows.push(format!("    From {} at {}", m.from_user, m.sent));
+        for m in &msgs {
+            let (date, time) = m.sent.split_once(' ').unwrap_or((m.sent.as_str(), ""));
+            rows.push(format!(
+                "  {}   {:<10}     {date}   {time}",
+                dsp_label("From", 10),
+                m.from_user
+            ));
+            let text = jobs::shown_text(&m.text);
+            let mut line = String::new();
+            for w in text.split(' ') {
+                if !line.is_empty() && 2 + line.len() + 1 + w.len() > 77 {
+                    rows.push(format!("  {line}"));
+                    line.clear();
+                }
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(w);
+            }
+            rows.push(format!("  {line}"));
         }
-        if rows.is_empty() {
-            rows.push("(no messages)".into());
-        }
+        let left = |l: &str, v: &str| format!("{:<44}", format!("{}   {v}", dsp_label(l, 14)));
         Ok(Outcome::Display(ListDisplay {
             title: "Display Messages".into(),
-            info: vec![
-                ("Queue".into(), q.clone()),
-                ("Messages".into(), msgs.len().to_string()),
-            ],
-            heading: "Newest first; * = new".into(),
+            info: vec![],
+            heading: String::new(),
             rows,
+            ibm: IbmLayout::some(IbmLayout {
+                system_col: Some(56),
+                lines: vec![
+                    format!(
+                        "{}{}   *DSPMSG",
+                        left("Queue", &q),
+                        dsp_label("Program", 14)
+                    ),
+                    format!(
+                        "{}{}",
+                        left("  Library", "  QUSRSYS"),
+                        dsp_label("  Library", 14)
+                    ),
+                    format!(
+                        "{}{}   *NOTIFY",
+                        left("Severity", "00"),
+                        dsp_label("Delivery", 14)
+                    ),
+                ],
+                instruction: "Type reply (if required), press Enter.".into(),
+                ..Default::default()
+            }),
             ..Default::default()
         }))
     }
@@ -3664,16 +3859,17 @@ impl Job<'_> {
             }
         };
         let files = crate::spool::for_user(self.client, &user).await?;
+        // IBM i 7.5's WRKSPLF display (PUB400): file, user, output queue,
+        // user data, status, total pages, current page, copies.
         let fmt = |file: &str,
                    user: &str,
+                   queue: &str,
                    data: &str,
-                   status: &str,
+                   sts: &str,
                    pages: &str,
-                   job: &str,
-                   nbr: &str| {
-            format!(
-                "{file:<10}  {user:<10}  {data:<10}  {status:<4}  {pages:>5}  {job:<24}  {nbr:>4}"
-            )
+                   cur: &str,
+                   copy: &str| {
+            format!("{file:<10}  {user:<10}  {queue:<10}  {data:<10}  {sts:<4}  {pages:>5}  {cur:>6}  {copy:>4}")
         };
         let rows = files
             .iter()
@@ -3681,18 +3877,28 @@ impl Job<'_> {
                 fmt(
                     &f.file,
                     &f.user,
+                    &f.outq,
                     &f.user_data,
                     &f.status,
                     &f.pages.to_string(),
-                    &f.job_name,
-                    &f.number.to_string(),
+                    "",
+                    "1",
                 )
             })
             .collect();
         Ok(Outcome::Display(ListDisplay {
             title: "Work with All Spooled Files".into(),
-            info: vec![("User".into(), user.clone())],
-            heading: fmt("File", "User", "User data", "Sts", "Pages", "Job", "Nbr"),
+            info: vec![],
+            heading: fmt(
+                "File",
+                "User",
+                "Queue",
+                "User Data",
+                "Sts",
+                "Pages",
+                "Page",
+                "Copy",
+            ),
             rows,
             options: vec![
                 (4, "Delete".into(), "DLTSPLF {}".into()),
@@ -3704,6 +3910,31 @@ impl Job<'_> {
                 .collect(),
             refresh: Some(format!("WRKSPLF SELECT({user})")),
             print: vec![],
+            ibm: IbmLayout::some(IbmLayout {
+                heading2: format!("{:24}{:<30}{:>5}{:>8}", "", "Device or", "Total", "Cur"),
+                command_line: Some("Parameters or command".into()),
+                // F11: the job each file belongs to (as4tainr's columns).
+                view2: Some((
+                    String::new(),
+                    format!(
+                        "{:<10}  {:<10}  {:<10}  {:>6}  {:>8}",
+                        "File", "Job", "User", "Number", "File Nbr"
+                    ),
+                    files
+                        .iter()
+                        .map(|f| {
+                            let (number, rest) =
+                                f.job_name.split_once('/').unwrap_or(("", &f.job_name));
+                            let job = rest.rsplit('/').next().unwrap_or(rest);
+                            format!(
+                                "{:<10}  {:<10}  {:<10}  {:>6}  {:>8}",
+                                f.file, job, f.user, number, f.number
+                            )
+                        })
+                        .collect(),
+                )),
+                ..Default::default()
+            }),
         }))
     }
 
@@ -3868,9 +4099,9 @@ impl Job<'_> {
                 .collect::<Vec<_>>()
                 .chunks(50)
                 .enumerate()
-                .map(|(i, c)| format!("{:>6}   '{}'", i * 50, c.iter().collect::<String>()))
+                .map(|(i, c)| format!("{:>5}      '{}'", i * 50, c.iter().collect::<String>()))
                 .collect(),
-            _ => vec![format!("{:>6}   {}", 0, d.value)],
+            _ => vec![format!("{:>5}      {}", 0, d.value)],
         };
         // Printed layout: PUB400 (IBM i 7.5) `system "DSPDTAARA
         // DTAARA(AS4TRAINR1/GOLDDA)"` (*CHAR, LEN 10), 2026-10-21. *DEC
@@ -3929,15 +4160,27 @@ impl Job<'_> {
         Ok(Outcome::Display(ListDisplay {
             print,
             title: "Display Data Area".into(),
-            info: vec![
-                ("Data area".into(), d.name.clone()),
-                ("Library".into(), d.library.clone()),
-                ("Type".into(), d.ty.code().into()),
-                ("Length".into(), d.length_text()),
-                ("Text".into(), d.text.clone()),
-            ],
-            heading: format!("{:>6}   {}", "Offset", "Value"),
+            info: vec![],
+            // IBM i 7.5's DSPDTAARA display (PUB400): the value under a
+            // ruler, 50 positions to a line, then "Press Enter to continue."
+            heading: format!(
+                "{:<12}{}",
+                "Offset", "*...+....1....+....2....+....3....+....4....+....5"
+            ),
             rows,
+            ibm: IbmLayout::some(IbmLayout {
+                system_col: Some(62),
+                lines: vec![
+                    format!("{}   {}", dsp_label("Data area", 22), d.name),
+                    format!("{}     {}", dsp_label("  Library", 22), d.library),
+                    format!("{}   {}", dsp_label("Type", 22), d.ty.code()),
+                    format!("{}   {}", dsp_label("Length", 22), d.length_text()),
+                    format!("{}   {}", dsp_label("Text", 22), d.text),
+                ],
+                heading2: format!("{:11}Value", ""),
+                enter_line: true,
+                ..Default::default()
+            }),
             ..Default::default()
         }))
     }
@@ -4195,21 +4438,57 @@ impl Job<'_> {
                     (49, &format!("{size:>12}")),
                     (66, &o.text),
                 ]));
-                rows.push(format!(
-                    "{:<10}  {:<10}  {:<10}  {:<10}  {}",
-                    o.name, lib, o.objtype, o.attribute, o.text
-                ));
+                let text: String = o.text.chars().take(26).collect();
+                if groups.len() == 1 {
+                    rows.push(format!(
+                        "{:<10}  {:<8}  {:<10}  {:>11}  {}",
+                        o.name, o.objtype, o.attribute, size, text
+                    ));
+                } else {
+                    rows.push(format!(
+                        "{:<10}  {:<10}  {:<8}  {:<10}  {}",
+                        o.name, lib, o.objtype, o.attribute, text
+                    ));
+                }
             }
         }
         print.push(crate::report::END_OBJD.into());
+        // IBM i 7.5's display (PUB400) shows one library at a time ("Library
+        // 1 of 1"); objects from several libraries are one list here.
+        let ibm = if groups.len() == 1 {
+            let lib = &groups[0].0;
+            IbmLayout::some(IbmLayout {
+                right2: "Library 1 of 1".into(),
+                lines: vec![
+                    format!(
+                        "{:<41}{}   *SYSBAS",
+                        format!("{}   {lib}", dsp_label("Library", 20)),
+                        dsp_label("Library ASP device", 20)
+                    ),
+                    format!("{:<41}{}   *SYSBAS", "", dsp_label("Library ASP group", 20)),
+                ],
+                top_bottom_keys: true,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
         Ok(Outcome::Display(ListDisplay {
-            title: "Display Object Description".into(),
-            heading: format!(
-                "{:<10}  {:<10}  {:<10}  {:<10}  {}",
-                "Object", "Library", "Type", "Attribute", "Text"
-            ),
+            title: "Display Object Description - Basic".into(),
+            heading: if groups.len() == 1 {
+                format!(
+                    "{:<10}  {:<8}  {:<10}  {:>11}  {}",
+                    "Object", "Type", "Attribute", "Size", "Text"
+                )
+            } else {
+                format!(
+                    "{:<10}  {:<10}  {:<8}  {:<10}  {}",
+                    "Object", "Library", "Type", "Attribute", "Text"
+                )
+            },
             rows,
             print,
+            ibm,
             ..Default::default()
         }))
     }
@@ -4497,5 +4776,24 @@ fn typed_parm(a: &str) -> String {
             format!("{value:<n$}")
         }
         _ => value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dsp_label;
+
+    #[test]
+    fn display_labels_as_ibm_i_writes_them() {
+        // Observed on IBM i 7.5 (PUB400 screens): DSPLIB's labels have their
+        // colon in column 23 (offset 21 from column 2), DSPDTAARA's in 26.
+        assert_eq!(dsp_label("Library", 19), "Library  . . . . . . :");
+        assert_eq!(dsp_label("Type", 19), "Type . . . . . . . . :");
+        assert_eq!(dsp_label("Create authority", 19), "Create authority . . :");
+        assert_eq!(dsp_label("Number of objects", 19), "Number of objects  . :");
+        assert_eq!(dsp_label("Data area", 22), "Data area . . . . . . . :");
+        assert_eq!(dsp_label("  Library", 22), "  Library . . . . . . . :");
+        assert_eq!(dsp_label("Type", 22), "Type  . . . . . . . . . :");
+        assert_eq!(dsp_label("From", 10), "From  . . . :");
     }
 }

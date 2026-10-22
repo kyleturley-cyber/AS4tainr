@@ -79,7 +79,8 @@ with Tn5250(HOST) as t:
     # The initial menu: CRTUSRPRF INLMNU is MAIN unless changed (IBM i CL
     # reference), and QSECOFR is shipped with INLMNU(MAIN).
     t.wait_for("as4tainr Main Menu")
-    check("MAIN" in t.line(1) and "QSECOFR" in t.line(2) and "Selection or command" in t.text()
+    # IBM i 7.5's menus show "System:" on line 2, not the user (PUB400, MAIN).
+    check("MAIN" in t.line(1) and "System:   AS4TAINR" in t.line(2) and "Selection or command" in t.text()
           and "90. Sign off" in t.text(),
           "signed on (blanks ignored, password not case sensitive): the initial menu MAIN is shown", t)
     command(t, "call qcmd", "Command Entry")
@@ -111,9 +112,12 @@ with Tn5250(HOST) as t:
 
     # DSPLIBL: system part, no current library (QSECOFR has *CRTDFT), user part.
     command(t, "dsplibl", "Display Library List")
-    check(t.line(8).split()[:2] == ["QSYS", "SYS"] and t.line(11).split()[:2] == ["QUSRSYS", "SYS"],
+    # IBM i 7.5's DSPLIBL (PUB400): "System:" on line 2, the options on
+    # lines 5-6, "ASP" and the column headings on lines 8-9, the list from 10.
+    check(t.line(10).split()[:2] == ["QSYS", "SYS"] and t.line(13).split()[:2] == ["QUSRSYS", "SYS"]
+          and "Device" in t.line(9) and "ASP" in t.line(8),
           "DSPLIBL starts with the system part of the library list", t)
-    check(t.line(12).split()[:2] == ["QGPL", "USR"] and t.line(13).split()[:2] == ["QTEMP", "USR"] and " CUR " not in t.text(),
+    check(t.line(14).split()[:2] == ["QGPL", "USR"] and t.line(15).split()[:2] == ["QTEMP", "USR"] and " CUR " not in t.text(),
           "the user part is QGPL and QTEMP, with no current library", t)
     t.tab(); t.tab(); t.tab(); t.tab(); t.type("5"); t.enter()
     t.wait_for("Display Library")
@@ -125,7 +129,7 @@ with Tn5250(HOST) as t:
     t.wait_for("Command Entry")
     command(t, "chgcurlib mylib", "Current library changed to MYLIB.")
     command(t, "dsplibl", "Display Library List")
-    check(t.line(12).split()[:2] == ["MYLIB", "CUR"], "CHGCURLIB puts the current library between the system and user parts", t)
+    check(t.line(14).split()[:2] == ["MYLIB", "CUR"], "CHGCURLIB puts the current library between the system and user parts", t)
     t.fkey(3); t.wait_for("Command Entry")
     command(t, "rmvlible qtemp", "Library QTEMP removed from library list.")
     check(True, "RMVLIBLE removes a library from the user part", t)
@@ -324,7 +328,8 @@ with Tn5250(HOST) as t:
     t.fkey(12); t.wait_for("Work with All Spooled Files")
     t.tab(); t.type("4"); t.enter()
     t.wait_for("deleted")
-    check("/LISTING" not in t.text() and "/CUSTPRT" in t.text(),
+    # WRKSPLF's first view shows no job names (IBM i 7.5, PUB400).
+    check(sum("QSYSPRT" in t.line(i) for i in range(8, 21)) == 1 and "CUSTPRT" in t.text(),
           "option 4 deletes the listing (DLTSPLF); the list is refreshed", t)
     t.fkey(3); t.wait_for("Command Entry")
 
@@ -419,7 +424,7 @@ with Tn5250(HOST) as t:
         t2.wait_for("Sign On")
         t2.type("bob"); t2.tab(); t2.type("secret42"); t2.enter()
         t2.wait_for("as4tainr Main Menu", 30)
-        check("BOB" in t2.line(2), "a second session signs on as BOB while QSECOFR is signed on", t2)
+        check("Selection or command" in t2.text(), "a second session signs on as BOB while QSECOFR is signed on", t2)
         command(t2, "call qcmd", "Command Entry")
         command(t2, "sbmjob cmd(call pgm(custrpt) parm(L)) job(rpt)", "was put on job queue QBATCH")
         check("/BOB/RPT was put on job queue QBATCH" in t2.text(),
@@ -442,15 +447,17 @@ with Tn5250(HOST) as t:
         screen = t2.text()
         check("> call pgm(custrpt) parm(L)" in screen and "started in subsystem QBATCH" in screen,
               "option 5 shows the batch job's log: the command it ran", t2)
+        # Job logs and message queues show message texts, not IDs (IBM i 7.5
+        # DSPJOBLOG and DSPMSG on PUB400); CPF1241 is "... completed normally".
         for _ in range(5):
-            if "CPF1241" in t2.text():
+            if "completed normally" in t2.text():
                 break
             t2.page_down(); t2.pump(0.5)
-        check("Report done for BOB" in t2.text() and "CPF1241" in t2.text(),
-              "the job log has the CL program's messages and the completion message", t2)
+        check("Report done for BOB" in t2.text() and "completed normally" in t2.text(),
+              "the job log has the CL program's messages and the completion message (CPF1241)", t2)
         t2.fkey(3); t2.wait_for("Command Entry")
         command(t2, "dspmsg", "Display Messages")
-        check("CPF1241" in t2.text() and "/BOB/RPT completed normally" in t2.text(),
+        check("/BOB/RPT completed normally" in t2.text() and "From  . . . :   QSYS" in t2.text(),
               "BOB gets CPF1241 on his message queue when the job ends", t2)
         t2.fkey(3); t2.wait_for("Command Entry")
         command(t2, "sndmsg msg('Report is ready') tousr(qsecofr)", "Message sent to QSECOFR.")
@@ -460,7 +467,7 @@ with Tn5250(HOST) as t:
         t.wait_for("new message")
         check("DSPMSG" in t.line(24), "QSECOFR's session says a new message is waiting", t)
         command(t, "dspmsg", "Display Messages")
-        check("Report is ready" in t.text() and "From BOB" in t.text(), "DSPMSG shows BOB's message", t)
+        check("Report is ready" in t.text() and "From  . . . :   BOB" in t.text(), "DSPMSG shows BOB's message", t)
         t.fkey(3); t.wait_for("Command Entry")
         # Record locks: QSECOFR changes customer 3, which locks its record
         # until the change is made; BOB's CHAIN of it waits.
@@ -527,7 +534,7 @@ with Tn5250(HOST) as t:
     # The new user: no *SECADM, so no CRTUSRPRF; CHGPWD shows the screen.
     t.type("bob"); t.tab(); t.type("secret42"); t.enter()
     t.wait_for("as4tainr Main Menu", 30)
-    check("BOB" in t.line(2), "the new profile signs on", t)
+    check("Selection or command" in t.text(), "the new profile signs on", t)
     command(t, "call qcmd", "Command Entry")
     command(t, "crtusrprf eve", "Not authorized")
     check("*SECADM" in t.text(), "CRTUSRPRF needs *SECADM special authority", t)

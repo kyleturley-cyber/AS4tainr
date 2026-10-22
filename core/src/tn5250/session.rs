@@ -360,7 +360,10 @@ enum Action {
 /// F9 retrieves.
 #[derive(Default)]
 struct Requests {
-    log: Vec<String>,
+    /// The log: (request level, "> command" or "  message").
+    log: Vec<(usize, String)>,
+    /// The request level the next request runs at (the displays stack).
+    level: usize,
     retrieve: Vec<String>,
     retrieve_pos: usize,
 }
@@ -453,7 +456,7 @@ async fn workstation(
         let bottom = stack.len() == 1;
         let level = stack.len();
         let action = match top {
-            Place::Menu(m) => menu_display(term, m, cfg, job, &mut rq, &message, &prefill).await?,
+            Place::Menu(m) => menu_display(term, m, cfg, &mut rq, &message, &prefill).await?,
             Place::CommandEntry => {
                 command_entry(term, cfg, &mut rq, level, &message, &prefill).await?
             }
@@ -484,6 +487,7 @@ async fn workstation(
                 }
             }
             Action::Run(line) => {
+                rq.level = level;
                 let done = request(term, job, cfg, display_rx, &mut rq, &line).await?;
                 let on_entry = matches!(stack.last(), Some(Place::CommandEntry));
                 if !(done.in_log && on_entry && matches!(done.next, Next::Stay)) {
@@ -514,24 +518,54 @@ async fn command_entry(
 ) -> Result<Action> {
     let mut message = first_message.to_string();
     let mut prefill = first_prefill.to_string();
+    // F10: all requests and messages, of every request level, each
+    // command with its level (IBM i 7.5, PUB400); otherwise this level's.
+    let mut all = false;
     loop {
         let mut s = Screen::new();
         centered(&mut s, 1, "Command Entry");
         s.put(1, 66, &format!("{:>14}", cfg.system_name));
         s.put(2, 60, &format!("Request level:{level:>4}"));
-        s.put(3, 2, "Previous commands and messages:");
-        if rq.log.is_empty() {
+        s.put(
+            3,
+            2,
+            if all {
+                "All previous commands and messages:"
+            } else {
+                "Previous commands and messages:"
+            },
+        );
+        let shown: Vec<String> = rq
+            .log
+            .iter()
+            .filter(|(l, _)| all || *l == level)
+            .map(|(l, line)| match line.strip_prefix("> ") {
+                Some(cmd) if all => format!("{l:>2} > {cmd}"),
+                Some(cmd) => format!("   > {cmd}"),
+                None => format!("   {line}"),
+            })
+            .collect();
+        if shown.is_empty() {
             s.put(LOG_TOP + 1, 4, "(No previous commands or messages)");
         }
-        let start = rq.log.len().saturating_sub(LOG_ROWS);
-        for (i, line) in rq.log[start..].iter().enumerate() {
-            s.put(LOG_TOP + i as u8, 5, line);
+        let start = shown.len().saturating_sub(LOG_ROWS);
+        for (i, line) in shown[start..].iter().enumerate() {
+            s.put(LOG_TOP + i as u8, 2, line);
         }
         s.put(LOG_TOP + LOG_ROWS as u8, 74, "Bottom");
         s.put(17, 2, "Type command, press Enter.");
         s.text(18, 2, attr::HIGH, "===>");
         s.field("CMD", 18, 7, COMMAND_LINE_LEN, FieldKind::Text, &prefill);
-        keys(&mut s, 22, "F3=Exit   F4=Prompt   F9=Retrieve   F12=Cancel");
+        keys(
+            &mut s,
+            22,
+            if all {
+                "F3=Exit   F4=Prompt   F9=Retrieve   F10=Exclude detailed messages"
+            } else {
+                "F3=Exit   F4=Prompt   F9=Retrieve   F10=Include detailed messages"
+            },
+        );
+        keys(&mut s, 23, "F12=Cancel");
         s.message(&message);
         prefill.clear();
         message.clear();
@@ -540,6 +574,11 @@ async fn command_entry(
         match inp.aid {
             Aid::F(3) => return Ok(Action::Exit),
             Aid::F(12) => continue,
+            Aid::F(10) => {
+                all = !all;
+                prefill = typed;
+                continue;
+            }
             Aid::F(4) => return Ok(Action::Run(format!("?{typed}"))),
             Aid::F(9) => {
                 match rq.previous() {
@@ -560,7 +599,6 @@ async fn menu_display(
     term: &mut Term,
     m: &menus::BuiltinMenu,
     cfg: &ServerConfig,
-    job: &Job<'_>,
     rq: &mut Requests,
     first_message: &str,
     first_prefill: &str,
@@ -569,14 +607,11 @@ async fn menu_display(
     let mut prefill = first_prefill.to_string();
     loop {
         let mut s = Screen::new();
+        // IBM i 7.5's menus (PUB400, MAIN): the menu name, the title, and
+        // "System:" on line 2.
         s.put(1, 2, m.name);
         centered(&mut s, 1, m.title);
-        s.put(
-            1,
-            55,
-            &format!("{}:   {}", label("System", 12), cfg.system_name),
-        );
-        s.put(2, 55, &format!("{}:   {}", label("User", 12), job.user));
+        s.put(2, 62, &format!("System:   {}", cfg.system_name));
         s.put(3, 2, "Select one of the following:");
         let mut row = 5u8;
         let mut last = 0u8;
@@ -718,8 +753,8 @@ async fn request(
                                 .collect();
                             let shown = cl::build(def, &given).to_ascii_uppercase();
                             let text = "Command prompting was ended by F3 or F12.";
-                            rq.log.push(format!("> {shown}"));
-                            rq.log.push(format!("  {text}"));
+                            rq.log.push((rq.level, format!("> {shown}")));
+                            rq.log.push((rq.level, format!("  {text}")));
                             if let Some(id) = &job.id {
                                 crate::jobs::log(job.client, id, "*RQS", &shown).await;
                                 crate::jobs::log(
@@ -746,7 +781,7 @@ async fn request(
     if line.is_empty() {
         return Ok(done);
     }
-    rq.log.push(format!("> {line}"));
+    rq.log.push((rq.level, format!("> {line}")));
     rq.retrieve.push(line.clone());
     rq.retrieve_pos = 0;
     if let Some(id) = &job.id {
@@ -804,13 +839,14 @@ async fn request(
                 done.message = crate::jobs::shown_text(last).to_string();
                 done.in_log = true;
             }
+            let level = rq.level;
             rq.log.extend(
                 msgs.iter()
-                    .map(|m| format!("  {}", crate::jobs::shown_text(m))),
+                    .map(|m| (level, format!("  {}", crate::jobs::shown_text(m)))),
             );
         }
         Ok(Outcome::Display(d)) => {
-            show_list(term, job, d).await?;
+            show_list(term, job, &cfg.system_name, d).await?;
         }
         Ok(Outcome::ChangePassword) => {
             done.message = if change_password(term, job.client, &job.user, false).await? {
@@ -818,7 +854,7 @@ async fn request(
             } else {
                 "Password not changed.".into()
             };
-            rq.log.push(format!("  {}", done.message));
+            rq.log.push((rq.level, format!("  {}", done.message)));
             done.in_log = true;
         }
         Ok(Outcome::StartSql) => {
@@ -826,11 +862,8 @@ async fn request(
         }
         Ok(Outcome::SignOff) => done.next = Next::SignOff,
         Ok(Outcome::CommandEntry) => {
-            // CALL QCMD itself is not one of Command Entry's previous
-            // commands: it starts with none (IBM i 7.5, PUB400).
-            if rq.log.last().is_some_and(|l| l.starts_with("> ")) {
-                rq.log.pop();
-            }
+            // CALL QCMD runs at the level below the new Command Entry, so
+            // only F10 (all messages) shows it (IBM i 7.5, PUB400).
             done.next = Next::Show(Place::CommandEntry)
         }
         Ok(Outcome::Menu(menus::Menu::Builtin(m))) => done.next = Next::Show(Place::Menu(m)),
@@ -852,10 +885,11 @@ async fn request(
             let lines: Vec<&str> = text.lines().collect();
             done.message = crate::jobs::display_text(&text);
             done.in_log = true;
+            let level = rq.level;
             rq.log.extend(
                 lines
                     .iter()
-                    .map(|m| format!("  {}", crate::jobs::shown_text(m))),
+                    .map(|m| (level, format!("  {}", crate::jobs::shown_text(m)))),
             );
             done.prefill = line.clone();
         }
@@ -1134,18 +1168,54 @@ fn prompt_label(text: &str, indent: usize) -> String {
 /// Rows a parameter takes on the prompt: its field from column 50 may go
 /// on to the next rows; a qualified name has a row for its library.
 fn prompt_rows(pd: &cl::ParamDef) -> usize {
-    let end = PROMPT_FIELD_COL as usize - 1 + prompt_width(pd.kind) as usize - 1;
+    let end = PROMPT_FIELD_COL as usize - 1 + prompt_width(pd) as usize - 1;
     end / 80 + 1 + usize::from(pd.kind == cl::Kind::Qualified)
 }
 
-fn prompt_width(kind: cl::Kind) -> u16 {
-    match kind {
+fn prompt_width(pd: &cl::ParamDef) -> u16 {
+    match pd.kind {
         cl::Kind::Name | cl::Kind::Qualified => 10,
         cl::Kind::Password => users::MAX_PASSWORD as u16,
-        // To the end of the row (IBM i's are 32 for a data area value).
+        // TEXT is 50 characters (it goes on to the next row, as on IBM i);
+        // other text values to the end of the row.
+        cl::Kind::Text if pd.keyword == "TEXT" => 50,
         cl::Kind::Text | cl::Kind::List => 30,
         cl::Kind::Command => 190,
     }
+}
+
+/// Parameters IBM i's prompt shows only after F10 (Additional
+/// parameters): AUT on the create commands (CRTDTAARA on PUB400).
+fn additional_parameter(pd: &cl::ParamDef) -> bool {
+    pd.keyword == "AUT"
+}
+
+/// Prompt control: a parameter shown only once another one has a value
+/// (IBM i 7.5, PUB400: CRTDTAARA shows LEN, VALUE and TEXT after TYPE).
+fn prompted_after(command: &str, keyword: &str) -> Option<&'static str> {
+    match (command, keyword) {
+        ("CRTDTAARA", "LEN" | "VALUE" | "TEXT") => Some("TYPE"),
+        _ => None,
+    }
+}
+
+/// The library a qualified name's prompt starts with: the create commands
+/// put new objects in the current library (CRTDTAARA's prompt on PUB400
+/// shows *CURLIB), the others look in the library list.
+fn default_library(def: &cl::CommandDef) -> &'static str {
+    if def.name.starts_with("CRT") {
+        "*CURLIB"
+    } else {
+        "*LIBL"
+    }
+}
+
+/// What one prompt page shows.
+#[derive(Clone, Copy)]
+enum PromptItem {
+    Param(&'static cl::ParamDef),
+    /// "Additional Parameters", after F10.
+    Additional,
 }
 
 /// F4: a screen with one input field per parameter, filled with what was
@@ -1157,6 +1227,7 @@ async fn prompt(
     first_message: &str,
 ) -> Result<PromptResult> {
     use std::collections::BTreeMap;
+    let lib_default = default_library(def);
     let initial = || -> BTreeMap<String, String> {
         let mut v = BTreeMap::new();
         for pd in def.params {
@@ -1165,7 +1236,7 @@ async fn prompt(
                 None => pd.default.unwrap_or("").to_string(),
             };
             if pd.kind == cl::Kind::Qualified {
-                let (lib, obj) = text.split_once('/').unwrap_or(("*LIBL", &text));
+                let (lib, obj) = text.split_once('/').unwrap_or((lib_default, &text));
                 v.insert(format!("{}.LIB", pd.keyword), lib.to_string());
                 v.insert(pd.keyword.to_string(), obj.to_string());
             } else {
@@ -1175,44 +1246,96 @@ async fn prompt(
         v
     };
     let mut values = initial();
+    let start_values = initial();
     let mut message = first_message.to_string();
-    // Pages of parameters: lines 5-20, a qualified name takes two; the
-    // Page Down and Page Up keys (Roll Up, Roll Down) move between them.
-    let mut pages: Vec<Vec<&cl::ParamDef>> = vec![vec![]];
-    let mut used = 0;
-    for pd in def.params {
-        let n = prompt_rows(pd);
-        if used + n > PROMPT_LINES {
-            pages.push(vec![]);
-            used = 0;
+    let mut show_additional = false;
+    // The parameters shown: those prompt control does not hold back, the
+    // additional ones after F10 under their heading.
+    let visible = |values: &BTreeMap<String, String>, additional: bool| -> Vec<PromptItem> {
+        let shown = |pd: &cl::ParamDef| {
+            prompted_after(def.name, pd.keyword)
+                .is_none_or(|k| values.get(k).is_some_and(|v| !v.trim().is_empty()))
+        };
+        let mut items: Vec<PromptItem> = def
+            .params
+            .iter()
+            .filter(|pd| !additional_parameter(pd) && shown(pd))
+            .map(PromptItem::Param)
+            .collect();
+        if additional {
+            let more: Vec<PromptItem> = def
+                .params
+                .iter()
+                .filter(|pd| additional_parameter(pd) && shown(pd))
+                .map(PromptItem::Param)
+                .collect();
+            if !more.is_empty() {
+                items.push(PromptItem::Additional);
+                items.extend(more);
+            }
         }
-        pages.last_mut().unwrap().push(pd);
-        used += n;
-    }
+        items
+    };
+    let has_additional = def.params.iter().any(additional_parameter);
+    let item_rows = |it: &PromptItem| match it {
+        PromptItem::Param(pd) => prompt_rows(pd),
+        PromptItem::Additional => 3,
+    };
+    // Pages of parameters: lines 5-20; the Page Down and Page Up keys
+    // (Roll Up, Roll Down) move between them.
+    let paginate = |items: &[PromptItem]| -> Vec<Vec<PromptItem>> {
+        let mut pages: Vec<Vec<PromptItem>> = vec![vec![]];
+        let mut used = 0;
+        for it in items {
+            let n = item_rows(it);
+            if used + n > PROMPT_LINES {
+                pages.push(vec![]);
+                used = 0;
+            }
+            pages.last_mut().unwrap().push(*it);
+            used += n;
+        }
+        pages
+    };
+    let mut items = visible(&values, show_additional);
+    let mut pages = paginate(&items);
     // The page and field the message is about: a parameter's keyword in
     // the message puts the cursor on that parameter, as IBM i does.
     let mut page = 0usize;
     let mut focus: Option<&'static str> = None;
+    let mut focus_next: Option<&'static str> = None;
     loop {
+        if let Some(k) = focus_next.take() {
+            focus = Some(k);
+        }
         if let Some(pd) = def.params.iter().find(|pd| {
             message
                 .split(|c: char| !c.is_ascii_alphanumeric())
                 .any(|w| w == pd.keyword)
         }) {
-            focus = Some(pd.keyword);
-            if let Some(p) = pages
-                .iter()
-                .position(|pg| pg.iter().any(|x| x.keyword == pd.keyword))
-            {
+            if let Some(p) = pages.iter().position(|pg| {
+                pg.iter()
+                    .any(|x| matches!(x, PromptItem::Param(p) if p.keyword == pd.keyword))
+            }) {
+                focus = Some(pd.keyword);
                 page = p;
             }
         }
+        page = page.min(pages.len() - 1);
         let mut s = Screen::new();
         centered(&mut s, 1, &format!("{} ({})", def.description, def.name));
         s.put(3, 2, "Type choices, press Enter.");
         let mut row = PROMPT_FIRST_ROW;
         let mut cursor = None;
-        for pd in pages[page].iter().copied() {
+        for it in pages[page].iter().copied() {
+            let pd = match it {
+                PromptItem::Param(pd) => pd,
+                PromptItem::Additional => {
+                    centered(&mut s, row + 1, "Additional Parameters");
+                    row += 3;
+                    continue;
+                }
+            };
             let a = if pd.required {
                 attr::HIGH
             } else {
@@ -1222,11 +1345,14 @@ async fn prompt(
             // field: IBM i 7.5's prompt with keywords shown (PUB400).
             s.text(row, PROMPT_LABEL_COL, a, &prompt_label(pd.prompt, 0));
             s.put(row, PROMPT_KEYWORD_COL, pd.keyword);
-            let given = typed.contains_key(pd.keyword);
+            // '>': a value given on the command line or changed on the
+            // prompt (IBM i 7.5, PUB400).
+            let given = typed.contains_key(pd.keyword)
+                || values.get(pd.keyword) != start_values.get(pd.keyword);
             if given {
                 s.put(row, PROMPT_FIELD_COL - 2, ">");
             }
-            let w = prompt_width(pd.kind);
+            let w = prompt_width(pd);
             let kind = match pd.kind {
                 cl::Kind::Password => FieldKind::Hidden,
                 cl::Kind::Text | cl::Kind::List | cl::Kind::Command => FieldKind::Text,
@@ -1241,10 +1367,14 @@ async fn prompt(
             if pd.kind == cl::Kind::Qualified {
                 row -= 1;
                 s.put(row, PROMPT_LABEL_COL, &prompt_label("Library", 2));
-                if given {
+                let key = format!("{}.LIB", pd.keyword);
+                let lib_given = typed
+                    .get(pd.keyword)
+                    .is_some_and(|v| cl::prompt_text(pd.kind, v).contains('/'))
+                    || values.get(&key) != start_values.get(&key);
+                if lib_given {
                     s.put(row, PROMPT_FIELD_COL - 2, ">");
                 }
-                let key = format!("{}.LIB", pd.keyword);
                 let v = values.get(&key).cloned().unwrap_or_default();
                 s.field(&key, row, PROMPT_FIELD_COL + 2, 10, FieldKind::Upper, &v);
                 row += 1;
@@ -1258,7 +1388,15 @@ async fn prompt(
         } else {
             s.put(PROMPT_LAST_ROW + 1, 74, "Bottom");
         }
-        keys(&mut s, 22, "F3=Exit   F5=Refresh   F12=Cancel");
+        keys(
+            &mut s,
+            22,
+            if has_additional && !show_additional {
+                "F3=Exit   F5=Refresh   F10=Additional parameters   F12=Cancel"
+            } else {
+                "F3=Exit   F5=Refresh   F12=Cancel"
+            },
+        );
         s.message(&message);
         message.clear();
         focus = None;
@@ -1271,6 +1409,14 @@ async fn prompt(
             Aid::F(12) => return Ok(PromptResult::Cancel),
             Aid::F(5) => {
                 values = initial();
+                items = visible(&values, show_additional);
+                pages = paginate(&items);
+                continue;
+            }
+            Aid::F(10) if has_additional && !show_additional => {
+                show_additional = true;
+                items = visible(&values, show_additional);
+                pages = paginate(&items);
                 continue;
             }
             Aid::RollUp => {
@@ -1295,6 +1441,23 @@ async fn prompt(
                 continue;
             }
         }
+        // Values that bring more parameters in (prompt control): show them
+        // before running, as IBM i does.
+        let now = visible(&values, show_additional);
+        if now.len() != items.len() {
+            // The cursor goes to the first parameter that came in.
+            let key = |it: &PromptItem| match it {
+                PromptItem::Param(pd) => pd.keyword,
+                PromptItem::Additional => "",
+            };
+            let before: Vec<&str> = items.iter().map(key).collect();
+            if let Some(PromptItem::Param(pd)) = now.iter().find(|it| !before.contains(&key(it))) {
+                focus_next = Some(pd.keyword);
+            }
+            items = now;
+            pages = paginate(&items);
+            continue;
+        }
         // Put qualified names back together, then build the command.
         let mut flat = BTreeMap::new();
         for pd in def.params {
@@ -1305,7 +1468,7 @@ async fn prompt(
                     .map(|l| l.trim().to_string())
                     .unwrap_or_default();
                 let v = v.trim();
-                let q = if v.is_empty() || lib.is_empty() || lib == "*LIBL" {
+                let q = if v.is_empty() || lib.is_empty() || lib == lib_default {
                     v.to_string()
                 } else {
                     format!("{lib}/{v}")
@@ -1440,6 +1603,7 @@ async fn sql_session(term: &mut Term, job: &mut Job<'_>) -> Result<()> {
                         ..Default::default()
                     },
                     "",
+                    "",
                 )
                 .await?;
                 message = if n >= crate::sql::MAX_ROWS {
@@ -1479,11 +1643,11 @@ enum ListResult {
 /// Show a list, then run the commands of the options typed on it and come
 /// back to it, as IBM i list screens do. F12 goes back one screen, F3
 /// returns to the command line.
-async fn show_list(term: &mut Term, job: &mut Job<'_>, d: ListDisplay) -> Result<()> {
+async fn show_list(term: &mut Term, job: &mut Job<'_>, system: &str, d: ListDisplay) -> Result<()> {
     let mut stack = vec![d];
     let mut message = String::new();
     while let Some(top) = stack.last() {
-        let result = list_display(term, top, &message).await?;
+        let result = list_display(term, top, system, &message).await?;
         message.clear();
         match result {
             ListResult::Exit => return Ok(()),
@@ -1531,7 +1695,15 @@ async fn refresh_top(job: &mut Job<'_>, stack: &mut [ListDisplay], message: &mut
     }
 }
 
-async fn list_display(term: &mut Term, d: &ListDisplay, first_message: &str) -> Result<ListResult> {
+async fn list_display(
+    term: &mut Term,
+    d: &ListDisplay,
+    system: &str,
+    first_message: &str,
+) -> Result<ListResult> {
+    if let Some(l) = &d.ibm {
+        return ibm_list_display(term, d, l, system, first_message).await;
+    }
     let mut top = 0usize;
     let mut left = 0usize;
     let has_options = !d.options.is_empty();
@@ -1654,6 +1826,281 @@ async fn list_display(term: &mut Term, d: &ListDisplay, first_message: &str) -> 
                     Some((idx, v)) => {
                         message = format!("Option {v} is not valid.");
                         // Show the page with the wrong option.
+                        top = idx / page_rows * page_rows;
+                    }
+                }
+            }
+            Aid::F(19) if wide => left = left.saturating_sub(SHIFT),
+            Aid::F(20) if wide => {
+                if left + text_width < width {
+                    left += SHIFT;
+                } else {
+                    message = "Already at the right edge.".into();
+                }
+            }
+            Aid::RollUp => {
+                if top + page_rows < d.rows.len() {
+                    top += page_rows;
+                } else {
+                    message = "Already at the bottom of the list.".into();
+                }
+            }
+            Aid::RollDown => {
+                if top == 0 {
+                    message = "Already at the top of the list.".into();
+                } else {
+                    top = top.saturating_sub(page_rows);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Function key texts on as many lines as they need (at most 78
+/// characters each), as IBM i's displays show them.
+fn key_lines(keys: &[&str]) -> Vec<String> {
+    let mut lines: Vec<String> = vec![String::new()];
+    for k in keys {
+        let last = lines.last_mut().unwrap();
+        if !last.is_empty() && last.len() + 3 + k.len() > 78 {
+            lines.push(k.to_string());
+        } else {
+            if !last.is_empty() {
+                last.push_str("   ");
+            }
+            last.push_str(k);
+        }
+    }
+    lines
+}
+
+/// A list display in IBM i's layout (`commands::IbmLayout`).
+async fn ibm_list_display(
+    term: &mut Term,
+    d: &ListDisplay,
+    l: &crate::commands::IbmLayout,
+    system: &str,
+    first_message: &str,
+) -> Result<ListResult> {
+    let has_options = !d.options.is_empty();
+    let opt_width = d
+        .options
+        .iter()
+        .map(|(n, _, _)| n.to_string().len())
+        .max()
+        .unwrap_or(1) as u16;
+    // The option field ends in column 3 (column 2 for two digits).
+    let opt_col = (4 - opt_width.min(2)) as u8;
+    let text_col: u8 = if has_options { 7 } else { 2 };
+    // Up to column 79 (IBM i leaves column 80 blank).
+    let text_width = 80 - text_col as usize;
+    let width = d
+        .rows
+        .iter()
+        .chain(std::iter::once(&d.heading))
+        .map(|r| r.chars().count())
+        .max()
+        .unwrap_or(0);
+    let wide = width > text_width;
+    let mut fkeys: Vec<&str> = vec!["F3=Exit"];
+    if d.refresh.is_some() {
+        fkeys.push("F5=Refresh");
+    }
+    fkeys.push("F12=Cancel");
+    if l.view2.is_some() {
+        fkeys.push("F11=Next view");
+    }
+    if l.top_bottom_keys {
+        fkeys.push("F17=Top");
+        fkeys.push("F18=Bottom");
+    }
+    if wide {
+        fkeys.push("F19=Left");
+        fkeys.push("F20=Right");
+    }
+    let key_text = key_lines(&fkeys);
+    let key_top = 24 - key_text.len() as u8;
+    let bottom_row = if l.command_line.is_some() || l.enter_line {
+        key_top - 3
+    } else {
+        key_top - 1
+    };
+    // Where the list starts: the header lines, a blank line, the options
+    // (or an instruction) and a blank line, the headings.
+    let mut first = 3u8;
+    if !l.lines.is_empty() {
+        first += l.lines.len() as u8 + 1;
+    }
+    let option_lines: Vec<String> = {
+        let mut out = vec![String::new()];
+        for (n, t, _) in &d.options {
+            let o = format!("{n}={t}");
+            let last = out.last_mut().unwrap();
+            if !last.is_empty() && 3 + last.len() + 3 + o.len() > 78 {
+                out.push(o);
+            } else {
+                if !last.is_empty() {
+                    last.push_str("   ");
+                }
+                last.push_str(&o);
+            }
+        }
+        out
+    };
+    let options_row = first;
+    if has_options {
+        first += 1 + option_lines.len() as u8 + 1;
+    } else if !l.instruction.is_empty() {
+        first += 1;
+    }
+    if !l.heading2.is_empty() {
+        first += 1;
+    }
+    if !d.heading.is_empty() {
+        first += 1;
+    }
+    let page_rows = (bottom_row.saturating_sub(first)).max(1) as usize;
+    let mut top = 0usize;
+    let mut left = 0usize;
+    let cut =
+        |line: &str, left: usize| -> String { line.chars().skip(left).take(text_width).collect() };
+    let mut message = first_message.to_string();
+    let mut typed: std::collections::BTreeMap<usize, String> = Default::default();
+    let mut command = String::new();
+    let mut second = false;
+    loop {
+        let (heading2, heading, rows) = match (&l.view2, second) {
+            (Some((h2, h, r)), true) => (h2, h, r),
+            _ => (&l.heading2, &d.heading, &d.rows),
+        };
+        let mut s = Screen::new();
+        centered(&mut s, 1, &d.title);
+        if let Some(col) = l.system_col {
+            s.put(2, col, &format!("System:   {system}"));
+        }
+        if !l.right2.is_empty() {
+            s.put(2, 80 - l.right2.chars().count() as u8, &l.right2);
+        }
+        for (i, line) in l.lines.iter().enumerate() {
+            if !line.trim().is_empty() {
+                s.put(3 + i as u8, 2, line);
+            }
+        }
+        let mut row = options_row;
+        if has_options {
+            s.put(row, 2, "Type options, press Enter.");
+            for (i, o) in option_lines.iter().enumerate() {
+                s.text(row + 1 + i as u8, 4, attr::BLUE, o);
+            }
+            row += 1 + option_lines.len() as u8 + 1;
+        } else if !l.instruction.is_empty() {
+            s.put(row, 2, &l.instruction);
+            row += 1;
+        }
+        if !l.heading2.is_empty() {
+            s.text(row, text_col, attr::HIGH, &cut(heading2, left));
+            row += 1;
+        }
+        if !d.heading.is_empty() {
+            if has_options {
+                s.text(row, 2, attr::HIGH, "Opt");
+            }
+            s.text(row, text_col, attr::HIGH, &cut(heading, left));
+        }
+        let end = (top + page_rows).min(d.rows.len());
+        if d.rows.is_empty() {
+            s.put(first, 4, "(No entries)");
+        }
+        for (i, idx) in (top.min(d.rows.len())..end).enumerate() {
+            let r = first + i as u8;
+            if has_options && d.keys.get(idx).is_some_and(|k| !k.is_empty()) {
+                let v = typed.get(&idx).cloned().unwrap_or_default();
+                s.field(
+                    &format!("OPT{idx}"),
+                    r,
+                    opt_col,
+                    opt_width,
+                    FieldKind::Text,
+                    &v,
+                );
+            }
+            s.put(
+                r,
+                text_col,
+                &cut(rows.get(idx).map(String::as_str).unwrap_or(""), left),
+            );
+        }
+        if end < d.rows.len() {
+            s.put(bottom_row, 73, "More...");
+        } else {
+            s.put(bottom_row, 74, "Bottom");
+        }
+        if let Some(text) = &l.command_line {
+            s.put(key_top - 2, 2, text);
+            s.text(key_top - 1, 2, attr::HIGH, "===>");
+            s.field("CMD", key_top - 1, 7, 73, FieldKind::Text, &command);
+        } else if l.enter_line {
+            s.put(key_top - 2, 2, "Press Enter to continue.");
+        }
+        for (i, k) in key_text.iter().enumerate() {
+            keys(&mut s, key_top + i as u8, k);
+        }
+        if !has_options && l.command_line.is_none() {
+            s.cursor_at(1, 2);
+        }
+        s.message(&message);
+        message.clear();
+        let inp = term.show(&s).await?;
+        for (name, v) in &inp.values {
+            if name == "CMD" {
+                command = v.trim().to_string();
+            } else if let Some(idx) = name
+                .strip_prefix("OPT")
+                .and_then(|n| n.parse::<usize>().ok())
+            {
+                let v = v.trim();
+                if v.is_empty() {
+                    typed.remove(&idx);
+                } else {
+                    typed.insert(idx, v.to_string());
+                }
+            }
+        }
+        let last_page = d.rows.len().saturating_sub(1) / page_rows * page_rows;
+        match inp.aid {
+            Aid::F(3) => return Ok(ListResult::Exit),
+            Aid::F(12) => return Ok(ListResult::Back),
+            Aid::F(5) if d.refresh.is_some() => return Ok(ListResult::Refresh),
+            Aid::F(11) if l.view2.is_some() => second = !second,
+            Aid::F(17) if l.top_bottom_keys => top = 0,
+            Aid::F(18) if l.top_bottom_keys => top = last_page,
+            Aid::Enter => {
+                if typed.is_empty() && command.is_empty() {
+                    return Ok(ListResult::Back);
+                }
+                let mut cmds = Vec::new();
+                let mut bad = None;
+                for (idx, v) in &typed {
+                    match d.options.iter().find(|(n, _, _)| n.to_string() == *v) {
+                        Some((_, _, cmd)) => cmds.push(
+                            cmd.replace("{}", d.keys.get(*idx).map(String::as_str).unwrap_or("")),
+                        ),
+                        None => {
+                            bad = Some((*idx, v.clone()));
+                            break;
+                        }
+                    }
+                }
+                match bad {
+                    None => {
+                        if !command.is_empty() {
+                            cmds.push(std::mem::take(&mut command));
+                        }
+                        return Ok(ListResult::Run(cmds));
+                    }
+                    Some((idx, v)) => {
+                        message = format!("Option {v} is not valid.");
                         top = idx / page_rows * page_rows;
                     }
                 }

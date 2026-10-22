@@ -3215,16 +3215,25 @@ async fn data_areas_commands_and_rtvdtaara() {
     let Outcome::Display(d) = run("DSPDTAARA CO".into()).await.unwrap() else {
         panic!()
     };
-    assert_eq!(d.rows, ["     0   'Acme Ltd  '"]);
-    assert!(d.info.contains(&("Type".into(), "*CHAR".into())));
+    // The value line of IBM i 7.5's DSPDTAARA display (PUB400 capture):
+    // the offset ending in column 6, the quoted value from column 13.
+    assert_eq!(d.rows, ["    0      'Acme Ltd  '"]);
+    let lines = &d.ibm.as_ref().unwrap().lines;
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("Type  . . . . . . . . . :   *CHAR")),
+        "{lines:?}"
+    );
     run(format!("CRTDTAARA {lib}/DFT TYPE(*DEC)"))
         .await
         .unwrap();
     let Outcome::Display(d) = run("DSPDTAARA DFT".into()).await.unwrap() else {
         panic!()
     };
-    assert!(d.info.contains(&("Length".into(), "15 5".into())));
-    assert_eq!(d.rows, ["     0   0.00000"]);
+    let lines = &d.ibm.as_ref().unwrap().lines;
+    assert!(lines.iter().any(|l| l.ends_with(":   15 5")), "{lines:?}");
+    assert_eq!(d.rows, ["    0      0.00000"]);
     run("CRTDTAARA FLAG *LGL".into()).await.unwrap();
     // Values that do not fit, and substrings of a *DEC data area.
     assert!(run("CHGDTAARA NEXTNO VALUE(12345678)".into())

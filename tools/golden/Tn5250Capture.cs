@@ -1,6 +1,8 @@
 // A small TN5250 display station for capturing screens from a real IBM i
 // (tools/golden/screens.ps1). Written from RFC 1205 (5250 Telnet), RFC 2877
-// and the public 5250 data stream descriptions, like as4tainr's own
+// (5250 Telnet enhancements: the NEW-ENVIRON variables KBDTYPE, CODEPAGE
+// and CHARSET that pick the device's code page) and the public 5250 data
+// stream descriptions, like as4tainr's own
 // station (core/src/web/display.rs). C# 5, so Windows PowerShell's
 // Add-Type compiles it without anything to install.
 //
@@ -33,7 +35,7 @@ public class Tn5250Capture
 {
     public const int Rows = 24, Cols = 80, Size = Rows * Cols;
     const byte IAC = 255, DONT = 254, DO = 253, WONT = 252, WILL = 251, SB = 250, SE = 240, EOR = 239;
-    const byte OPT_BINARY = 0, OPT_TTYPE = 24, OPT_EOR = 25;
+    const byte OPT_BINARY = 0, OPT_TTYPE = 24, OPT_EOR = 25, OPT_NEW_ENVIRON = 39;
 
     TcpClient client;
     NetworkStream stream;
@@ -176,7 +178,7 @@ public class Tn5250Capture
 
     void OnOption(byte cmd, byte opt)
     {
-        bool known = opt == OPT_BINARY || opt == OPT_TTYPE || opt == OPT_EOR;
+        bool known = opt == OPT_BINARY || opt == OPT_TTYPE || opt == OPT_EOR || opt == OPT_NEW_ENVIRON;
         if (cmd == DO) Send(new byte[] { IAC, known ? WILL : WONT, opt });
         else if (cmd == WILL) Send(new byte[] { IAC, (opt == OPT_BINARY || opt == OPT_EOR) ? DO : DONT, opt });
         Log.AppendLine("telnet " + cmd + " " + opt);
@@ -191,6 +193,24 @@ public class Tn5250Capture
             r.AddRange(Encoding.ASCII.GetBytes(TerminalType));
             r.Add(IAC); r.Add(SE);
             Send(r.ToArray());
+        }
+        // NEW-ENVIRON SEND (RFC 4777): the device is a US keyboard with code
+        // page 37 (character set 697), the table this client types and reads
+        // with. Without it the server takes the system's keyboard type, and a
+        // password with characters that differ between code pages (PUB400 is
+        // CCSID 273) is not the password typed. No sign-on values are sent.
+        else if (s.Length >= 2 && s[0] == OPT_NEW_ENVIRON && s[1] == 1)
+        {
+            List<byte> r = new List<byte> { IAC, SB, OPT_NEW_ENVIRON, 0 };
+            string[,] vars = { { "KBDTYPE", "USB" }, { "CODEPAGE", "37" }, { "CHARSET", "697" } };
+            for (int k = 0; k < vars.GetLength(0); k++)
+            {
+                r.Add(3); r.AddRange(Encoding.ASCII.GetBytes(vars[k, 0])); // USERVAR
+                r.Add(1); r.AddRange(Encoding.ASCII.GetBytes(vars[k, 1])); // VALUE
+            }
+            r.Add(IAC); r.Add(SE);
+            Send(r.ToArray());
+            Log.AppendLine("sent NEW-ENVIRON KBDTYPE USB, CODEPAGE 37, CHARSET 697");
         }
     }
 
@@ -493,7 +513,7 @@ public class Tn5250Capture
     // Run one step: text with {KEY} tokens ({TAB}, {FIELDEXIT}, {ERASEEOF}, {ENTER},
     // {F1}-{F24}, {PAGEUP}, {PAGEDOWN}, {WAIT n}); {USER} and {PASSWORD} type
     // the values given. After an AID key it waits for the host's answer.
-    public void Step(string actions, string user, string password, int quietMs)
+    public bool Step(string actions, string user, string password, int quietMs)
     {
         int i = 0;
         while (i < actions.Length)
@@ -510,7 +530,7 @@ public class Tn5250Capture
                 else if (up == "USER") Type(user);
                 else if (up == "PASSWORD") Type(password);
                 else if (up.StartsWith("WAIT")) Thread.Sleep(1000 * int.Parse(up.Substring(4).Trim()));
-                else if (AidByte(up) != 0) { if (Aid(up)) Pump(quietMs, 60000); }
+                else if (AidByte(up) != 0) { if (!Aid(up)) return false; Pump(quietMs, 60000); }
                 else throw new ArgumentException("unknown token {" + tok + "}");
             }
             else
@@ -521,6 +541,14 @@ public class Tn5250Capture
                 i = j;
             }
         }
+        return true;
+    }
+
+    // An input field whose text is not shown: a password is asked for.
+    public bool HasNonDisplayInput()
+    {
+        foreach (Tn5250Field f in fields) if (f.IsInput && f.NonDisplay) return true;
+        return false;
     }
 
     // Run a list of steps ("name|actions" lines, '#' comments) and write each
@@ -545,9 +573,22 @@ public class Tn5250Capture
                 string name = line.Substring(0, bar).Trim();
                 string actions = line.Substring(bar + 1);
                 Console.WriteLine(name + " ...");
-                t.Step(actions, user, password, quietMs);
+                bool signOn = actions.IndexOf("{PASSWORD}", StringComparison.OrdinalIgnoreCase) >= 0;
+                // Never type anything into a sign-on screen except in the
+                // sign-on step: a step typed into the user field is another
+                // sign-on attempt, and IBM i disables the device or the
+                // profile after QMAXSIGN attempts.
+                if (!signOn && t.HasNonDisplayInput())
+                    throw new InvalidOperationException("stopped before " + name + ": the screen asks for a password (not signed on)");
+                if (!t.Step(actions, user, password, quietMs))
+                {
+                    File.WriteAllText(Path.Combine(outDir, name + ".txt"), t.Screen());
+                    throw new InvalidOperationException("stopped at " + name + ": the keyboard was locked, a key was not sent");
+                }
                 File.WriteAllText(Path.Combine(outDir, name + ".txt"), t.Screen());
                 done++;
+                if (signOn && t.HasNonDisplayInput())
+                    throw new InvalidOperationException("stopped after " + name + ": the sign-on was not accepted (see " + name + ".txt); nothing else is typed, so no more sign-on attempts are made");
             }
         }
         finally

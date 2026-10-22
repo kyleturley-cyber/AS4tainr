@@ -10,6 +10,12 @@
 # screen as text to target\ibmi\screens\<name>.txt. Text in non-display
 # fields (the password) is never part of a screen written.
 #
+# The password is asked twice and must match: each wrong sign-on counts
+# toward the system's limit (QMAXSIGN), after which IBM i varies off the
+# device or disables the profile. The run stops at once when the sign-on
+# is not accepted, when a password is asked for again, or when the
+# keyboard stays locked, so it never makes a second sign-on attempt.
+#
 # A list has one "name|actions" per line: text to type and keys in braces:
 # {ENTER} {F1}-{F24} {PAGEUP} {PAGEDOWN} {TAB} {FIELDEXIT} {ERASEEOF}
 # {WAIT n} {USER} {PASSWORD}. After a key that goes to the host, the
@@ -25,7 +31,16 @@ param(
 $ErrorActionPreference = 'Stop'
 Add-Type -Path (Join-Path $PSScriptRoot 'Tn5250Capture.cs')
 $secure = Read-Host "Password for $User on $HostAlias" -AsSecureString
+$again = Read-Host "Same password again" -AsSecureString
 $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+$ptr2 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($again)
+$same = ([Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)) -ceq ([Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr2))
+[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr2)
+if (-not $same) {
+  [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
+  Write-Host 'The two passwords differ; nothing was sent.'
+  exit 1
+}
 $tunnel = $null
 try {
   $password = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
@@ -39,8 +54,15 @@ try {
   }
   if (-not $ok) { throw "the tunnel did not open (ssh exited: $($tunnel.HasExited)); try again" }
   $out = [IO.Path]::GetFullPath($Out)
-  $n = [Tn5250Capture]::RunList('127.0.0.1', $Port, (Resolve-Path $List).Path, $out, $User, $password, $QuietMs)
-  Write-Host "$n screens written to $out"
+  try {
+    $n = [Tn5250Capture]::RunList('127.0.0.1', $Port, (Resolve-Path $List).Path, $out, $User, $password, $QuietMs)
+    Write-Host "$n screens written to $out"
+  } catch {
+    $e = $_.Exception
+    while ($e.InnerException) { $e = $e.InnerException }
+    Write-Host $e.Message
+    Write-Host "The screens taken so far are in $out (session.log too)."
+  }
 } finally {
   [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
   $password = $null

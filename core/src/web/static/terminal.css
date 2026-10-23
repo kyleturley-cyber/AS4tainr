@@ -111,8 +111,10 @@ body {
   color: var(--key-text);
   background: linear-gradient(var(--key-top), var(--key-bottom));
   border: 1px solid var(--key-edge);
-  border-bottom-width: 3px;
   border-radius: 6px;
+  /* The key's depth is a shadow, not a border, so pressing it moves only
+     the key's picture and never the layout below the keyboard. */
+  box-shadow: 0 2px 0 var(--key-edge);
   min-height: 42px;
   min-width: 0;
   padding: 4px 6px;
@@ -123,11 +125,11 @@ body {
   cursor: pointer;
   text-align: left;
   user-select: none;
-  transition: transform .04s ease, border-bottom-width .04s ease, filter .1s;
+  transition: transform .04s ease, box-shadow .04s ease, filter .1s;
 }
 .key:hover { filter: brightness(1.12); }
 .key:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.key:active, .key.pressed { transform: translateY(2px); border-bottom-width: 1px; margin-bottom: 2px; }
+.key:active, .key.pressed { transform: translateY(2px); box-shadow: 0 0 0 var(--key-edge); }
 .key .cap { font-size: 12px; font-weight: 650; line-height: 1.1; }
 .key .lbl {
   font-size: 11px;

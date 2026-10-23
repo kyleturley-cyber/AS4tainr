@@ -12020,3 +12020,118 @@ enddo;
     assert!(r.error.is_none(), "{:?}", r.error);
     assert_eq!(r.messages, ["bound"]);
 }
+
+#[tokio::test]
+async fn qsh_commands_work_on_the_ifs() {
+    // Qshell's utilities work on the integrated file system (Qshell,
+    // "Qshell and the integrated file system"): a command reads the
+    // stream files there and what it writes, makes or removes is there
+    // after it ends; it starts in the user's home directory.
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    if !as4tainr_core::qshfs::available() {
+        eprintln!("skipped: no mount namespaces here");
+        return;
+    }
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    std::env::set_var("AS4TAINR_QSH", "1");
+    let dir = format!("/tmp/{lib}i");
+    as4tainr_core::ifs::mkdir_all(&client, &dir, "QSECOFR")
+        .await
+        .unwrap();
+    for (f, data) in [("in.txt", "one\ntwo\nthree\n"), ("old.txt", "x\n")] {
+        as4tainr_core::ifs::write_file(
+            &client,
+            &format!("{dir}/{f}"),
+            data.as_bytes(),
+            819,
+            0o644,
+            "QSECOFR",
+        )
+        .await
+        .unwrap();
+    }
+    cl_cmd(&mut job, "RMVENVVAR ENVVAR(QIBM_QSH_CMD_OUTPUT)".into())
+        .await
+        .ok();
+    let m = cl_cmd(
+        &mut job,
+        format!(
+            "QSH CMD('cd {dir} && wc -l < in.txt && sort in.txt > out.txt && mkdir sub && echo deep > sub/f.txt && rm old.txt && echo end >> in.txt')"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        m,
+        ["QSH0005: Command ended normally with exit status 0.", "3"]
+    );
+    let read = |p: String| {
+        let client = &client;
+        async move {
+            as4tainr_core::ifs::read_file(client, &p)
+                .await
+                .map(|(b, _)| String::from_utf8(b).unwrap())
+        }
+    };
+    assert_eq!(
+        read(format!("{dir}/out.txt")).await.unwrap(),
+        "one\nthree\ntwo\n"
+    );
+    assert_eq!(read(format!("{dir}/sub/f.txt")).await.unwrap(), "deep\n");
+    assert_eq!(
+        read(format!("{dir}/in.txt")).await.unwrap(),
+        "one\ntwo\nthree\nend\n"
+    );
+    assert!(read(format!("{dir}/old.txt")).await.is_err());
+    // A file that was there keeps its CCSID; a new one is tagged 1208.
+    let ccsid = |p: String| {
+        let client = &client;
+        async move {
+            as4tainr_core::ifs::stat(client, &p)
+                .await
+                .unwrap()
+                .unwrap()
+                .ccsid
+        }
+    };
+    assert_eq!(ccsid(format!("{dir}/in.txt")).await, 819);
+    assert_eq!(ccsid(format!("{dir}/out.txt")).await, 1208);
+    // A change made in the IFS after one command is what the next sees.
+    as4tainr_core::ifs::write_file(
+        &client,
+        &format!("{dir}/in.txt"),
+        b"changed\n",
+        819,
+        0o644,
+        "QSECOFR",
+    )
+    .await
+    .unwrap();
+    let m = cl_cmd(&mut job, format!("QSH CMD('cat {dir}/in.txt; ls {dir}')"))
+        .await
+        .unwrap();
+    assert_eq!(
+        m,
+        [
+            "QSH0005: Command ended normally with exit status 0.",
+            "changed",
+            "in.txt",
+            "out.txt",
+            "sub"
+        ]
+    );
+}

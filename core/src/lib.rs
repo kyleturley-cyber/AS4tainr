@@ -49,6 +49,7 @@ pub mod pftrg;
 pub mod pgmmsg;
 pub mod prtf;
 pub mod qsh;
+pub mod qshfs;
 pub mod qsysinc;
 pub mod report;
 pub mod rla;

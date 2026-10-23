@@ -15,8 +15,9 @@
 //! system user as4tainr runs as: it is not limited by as4tainr's object
 //! authorities, so QSH runs only when the system is set up for it
 //! (AS4TAINR_QSH=1). The command sees the job's environment variables
-//! (only those: not as4tainr's own), and the container's file system,
-//! not the IFS (docs/fidelity-gaps.md).
+//! (only those: not as4tainr's own), and the IFS at its paths in a mount
+//! namespace of its own (`qshfs.rs`), or the container's file system
+//! where mount namespaces are not allowed (docs/fidelity-gaps.md).
 
 use crate::cl::{Command, Value};
 use crate::commands::{Job, ListDisplay, Outcome};
@@ -207,22 +208,52 @@ impl Job<'_> {
         let setting = |n: &str| vars.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
         let out = output(setting("QIBM_QSH_CMD_OUTPUT").as_deref());
         let escape_msg = setting("QIBM_QSH_CMD_ESCAPE_MSG").is_some_and(|v| v == "Y");
-        let mut p = tokio::process::Command::new("/bin/sh");
-        p.arg("-c")
-            .arg(format!("exec 2>&1\n{line}"))
-            .env_clear()
+        // The IFS at its paths, when this system can (qshfs.rs); the
+        // command starts in the user's home directory if there is one.
+        let mirror = if crate::qshfs::available() {
+            Some(crate::qshfs::Mirror::open(self.client, &self.env.database_url).await?)
+        } else {
+            None
+        };
+        let home = format!("/home/{}", self.user);
+        let start = match &mirror {
+            Some(_) => match crate::ifs::stat(self.client, &home).await {
+                Ok(Some(e)) if e.dir => home.clone(),
+                _ => "/".to_string(),
+            },
+            None => std::env::temp_dir().to_string_lossy().to_string(),
+        };
+        let mut p = match mirror.as_ref().and_then(|m| m.command(&start, &line)) {
+            Some((prog, args)) => {
+                let mut c = tokio::process::Command::new(prog);
+                c.args(args);
+                c
+            }
+            None => {
+                let mut c = tokio::process::Command::new("/bin/sh");
+                c.arg("-c")
+                    .arg(format!("exec 2>&1\n{line}"))
+                    .current_dir(std::env::temp_dir());
+                c
+            }
+        };
+        p.env_clear()
             .envs(vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .current_dir(std::env::temp_dir());
+            .stdout(std::process::Stdio::piped());
         if setting("PATH").is_none() {
             p.env("PATH", "/usr/local/bin:/usr/bin:/bin");
         }
         if setting("HOME").is_none() {
-            p.env("HOME", std::env::temp_dir());
+            p.env("HOME", &start);
         }
         p.env("LOGNAME", &self.user);
-        let r = p.output().await?;
+        let r = p.output().await;
+        // What the command changed goes back to the IFS.
+        if let Some(m) = mirror {
+            m.close(self.client, &self.user).await?;
+        }
+        let r = r?;
         let text = String::from_utf8_lossy(&r.stdout).to_string();
         match &out {
             Output::Stdout => self

@@ -26,7 +26,7 @@ It runs IBM i business applications (RPG, CL, DDS files) on ordinary Linux and c
 
 - **`core/`**: the `as4tainr` binary: the object catalog, the DDS parser, record-level access over PostgreSQL, CL, jobs, the 5250 server and browser terminal, and the RPG engine.
 - **`samples/`**: DDS sources, CSV data, RPG programs and their expected (golden) output.
-- **`docs/`**: [5250 server](docs/5250-server.md), [browser terminal](docs/web-terminal.md), [display files](docs/display-files.md), [logical files](docs/logical-files.md), [SQL](docs/sql.md), [CL programs](docs/cl-programs.md), [data areas](docs/data-areas.md), [work management](docs/work-management.md), [record locks](docs/record-locks.md), [spooled files](docs/spooled-files.md), [object authority](docs/object-authority.md), [menus](docs/menus.md), [importing an application](docs/import.md), [the RPG engine](docs/rpg-engine.md), [order entry sample](docs/order-entry.md), [known fidelity gaps](docs/fidelity-gaps.md), [spike 01 report](docs/spike-01.md).
+- **`docs/`**: [5250 server](docs/5250-server.md), [browser terminal](docs/web-terminal.md), [display files](docs/display-files.md), [logical files](docs/logical-files.md), [SQL](docs/sql.md), [CL programs](docs/cl-programs.md), [data areas](docs/data-areas.md), [work management](docs/work-management.md), [record locks](docs/record-locks.md), [spooled files](docs/spooled-files.md), [object authority](docs/object-authority.md), [menus](docs/menus.md), [importing an application](docs/import.md), [the RPG engine](docs/rpg-engine.md), [order entry sample](docs/order-entry.md), [Qshell and environment variables](docs/qshell.md), [known fidelity gaps](docs/fidelity-gaps.md), [spike 01 report](docs/spike-01.md).
 
 ## Quick start (Docker)
 

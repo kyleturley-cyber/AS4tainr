@@ -27,17 +27,34 @@ impl Machine<'_> {
     }
 
     /// The printer of a file, opened (its spooled file) on first use.
-    fn ensure_printer(&mut self, file: &str) -> Result<()> {
+    pub(super) fn ensure_printer(&mut self, file: &str) -> Result<()> {
         if self.printers.contains_key(file) {
             return Ok(());
         }
+        // OVRPRTF SPLFNAME and USRDTA in effect name the spooled file and
+        // give its user data (else the file's name and the program's).
+        let mut ovr = self
+            .io
+            .cl
+            .as_ref()
+            .map(|c| c.overrides.clone())
+            .unwrap_or_default();
+        crate::ovr::merge_scoped(&self.io.job_key, &mut ovr);
+        // Overrides scoped to an activation group are used by that
+        // activation group's opens only.
+        let group = self.io.actgrp.clone();
+        ovr.retain(|o| o.actgrp.as_ref().is_none_or(|g| *g == group));
+        let o = crate::ovr::effective(&ovr, crate::ovr::Kind::Printer, file);
+        let name = o
+            .and_then(|o| o.splfname.clone())
+            .unwrap_or_else(|| file.to_string());
+        let usrdta = o
+            .and_then(|o| o.usrdta.clone())
+            .unwrap_or_else(|| self.prog.name.clone());
         let spl = match &self.io.job {
-            Some(job) => Some(self.block(crate::spool::open(
-                self.io.client,
-                job,
-                file,
-                &self.prog.name,
-            ))?),
+            Some(job) => {
+                Some(self.block(crate::spool::open(self.io.client, job, &name, &usrdta))?)
+            }
             None => None,
         };
         self.printers.insert(
@@ -59,9 +76,22 @@ impl Machine<'_> {
     pub(super) fn printer_op(&mut self, op: FileOp, i: usize, name: &str) -> Result<()> {
         match op {
             FileOp::Write => self.printer_write(i, name),
-            FileOp::Open | FileOp::Close | FileOp::Feod => {
+            FileOp::Open | FileOp::Feod => {
                 let file = self.prog.files[i].decl.name.clone();
                 self.flush_printer(&file)
+            }
+            // CLOSE: the spooled file is complete (RDY); an OPEN after it
+            // starts a new one.
+            FileOp::Close => {
+                let file = self.prog.files[i].decl.name.clone();
+                self.flush_printer(&file)?;
+                if let Some(p) = self.printers.remove(&file) {
+                    if let Some(id) = p.spl {
+                        let client = self.io.client;
+                        self.block(crate::spool::close(client, id))?;
+                    }
+                }
+                Ok(())
             }
             other => bail!(
                 "{other:?} {name}: a printer file can only be written (WRITE, EXCEPT, output specifications)"

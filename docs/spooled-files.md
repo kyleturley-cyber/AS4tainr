@@ -6,7 +6,7 @@ Printed output on IBM i does not go straight to a printer. It becomes a **spoole
 
 | Source | Spooled file | User data |
 | --- | --- | --- |
-| An RPG program printing through a program-described printer file (O specs, `EXCEPT`) | the printer file's name, e.g. `QSYSPRT` | the program name |
+| An RPG program printing through a program-described printer file (O specs, `EXCEPT`) | the printer file's name, e.g. `QSYSPRT`, or OVRPRTF `SPLFNAME` | the program name, or OVRPRTF `USRDTA` |
 | A display command (`DSPPFM`, `DSPLIB`, `WRKOBJ`, ...) run in a batch job | `QSYSPRT` | the command name |
 | `DSPJOBLOG OUTPUT(*PRINT)`, `SIGNOFF LOG(*LIST)` | `QPJOBLOG` | the job name |
 | A batch job that ends abnormally | `QPJOBLOG` | the job name |
@@ -92,12 +92,16 @@ An RPG program writes the record formats of an externally described printer file
 
 ## How it works
 
-The RPG engine (docs/rpg-engine.md) lays out each output record from the program's fields as the O specs say, and writes the lines to the job's spooled file, kept by page and line (`as4tainr.spooled_files`, `as4tainr.spool_lines`). The spooled file is opened by the first line printed and closed when the program ends. A call without a job (`as4tainr call`) prints to standard output instead.
+The RPG engine (docs/rpg-engine.md) lays out each output record from the program's fields as the O specs say, and writes the lines to the job's spooled file, kept by page and line (`as4tainr.spooled_files`, `as4tainr.spool_lines`). The spooled file is opened by the first line printed and closed by CLOSE or when the program ends; a module of a service program (or one bound into a program) keeps its printer file open between calls, until CLOSE or the end of its activation group. A call without a job prints to standard output instead: `as4tainr call` as on paper, `as4tainr system` as PASE `system` does on IBM i (its lines one after another without the blank lines spacing and skipping make, a line printed over another merged into it; observed on PUB400). `as4tainr batch "CMD"` runs a command in a batch job now, as SBMJOB and QBATCH would, so its spooled files stay.
+
+## Spooled file APIs
+
+QGYOLSPL (format OSPL0300, filter OSPF0100) lists spooled files and keeps the list open for QGYGTLE and QGYCLST; QSPOPNSP, QSPGETSP (format SPFR0300, into a user space) and QSPCLOSP read one (`core/src/spoolapi.rs`). The print data is SCS: a new line (x'15') for each line the printer moves down from line 1, a carriage return (x'0D') to print over a line, a form feed (x'0C') at each new page. RPGUnit's acceptance tests read its report this way and pass.
 
 ## Not yet
 
 - **Formats and editing:** data formats `P`/`B`/`L`/`R` in O specs, the overflow indicators `OA`-`OG`; in DDS, fonts, CPI/LPI, BOX, LINE and barcodes are accepted and not printed.
-- **Printer settings:** `PRTCTL`, `OVRPRTF`.
+- **Printer settings:** `PRTCTL`; of OVRPRTF only `SPLFNAME`, `USRDTA`, `PAGESIZE` and `OVRFLW` are used.
 - **Output queues and writers:** `CPYSPLF`, writers (`STRPRTWTR`; a held output queue holds nothing back here, as there are no writers), remote output queues, the data queue of an output queue, `WRKSPLF`'s options 1 (send), 2 (change), 7 (messages) and 9 (printing status), and printing to a real printer or to PDF.
 - **Unedited negative numbers** print with a trailing `-`. IBM i shows the sign in the last digit's zone.
 

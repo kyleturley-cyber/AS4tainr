@@ -26,15 +26,34 @@ impl DataSession {
     }
 }
 
+/// The tasks driving the database connections still open. A command
+/// line process waits for them before it exits ([`close_connections`]).
+static CONNECTIONS: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// A database session of its own (each program call, each job).
 pub async fn connect_db(url: &str) -> Result<Client> {
     let (client, conn) = tokio_postgres::connect(url, NoTls).await?;
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         if let Err(e) = conn.await {
             eprintln!("as4tainr: database connection error: {e}");
         }
     });
+    let mut tasks = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
+    tasks.retain(|t| !t.is_finished());
+    tasks.push(task);
     Ok(client)
+}
+
+/// Lets the connections whose clients are gone finish before the process
+/// exits: a transaction dropped on an error (CPF7302 from CRTPF, say) has
+/// queued its ROLLBACK, and ending the runtime first would cut the socket
+/// while PostgreSQL answers ("could not send data to client: Broken
+/// pipe" in the server log). Connections still in use (kept by a static
+/// cache) are left after `wait`.
+pub async fn close_connections(wait: std::time::Duration) {
+    let tasks: Vec<_> = std::mem::take(&mut *CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner()));
+    let _ = tokio::time::timeout(wait, futures_util::future::join_all(tasks)).await;
 }
 
 /// Set up a job's database session: other jobs see who holds a record

@@ -161,6 +161,19 @@ enum Cmd {
     },
     /// CALL: run a program (CL or RPG) as QSECOFR, outside any job.
     Call { program: String, args: Vec<String> },
+    /// Run a CL command in a batch job now, as SBMJOB and the QBATCH
+    /// subsystem would (without a server running): its printed output
+    /// stays as spooled files, its messages in its job log, which is
+    /// written to standard output. Exit status 255 when the job ends
+    /// abnormally.
+    Batch {
+        /// The command (joined with spaces).
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+        /// The user profile the job runs under.
+        #[arg(long, default_value = "QSECOFR")]
+        user: String,
+    },
 }
 
 fn split_lib_file(q: &str) -> Result<(String, String)> {
@@ -501,6 +514,39 @@ async fn run(cli: Cli) -> Result<u8> {
                 r = web => r?,
             }
         }
+        Cmd::Batch { command, user } => {
+            let client = runtime::connect_db(&cli.database_url).await?;
+            catalog::init(&client).await?;
+            let env = commands::Environment {
+                database_url: cli.database_url.clone(),
+            };
+            let command = command.join(" ");
+            let user = user.to_ascii_uppercase();
+            let id = as4tainr_core::jobs::submit(
+                &client,
+                &as4tainr_core::jobs::Submit {
+                    name: as4tainr_core::jobs::DEFAULT_BATCH_JOB_NAME.to_string(),
+                    user: user.clone(),
+                    command,
+                    jobq: as4tainr_core::jobs::BATCH_QUEUE.to_string(),
+                    curlib: None,
+                    libl: libl.clone(),
+                    submitted_by: String::new(),
+                    submitter: None,
+                },
+            )
+            .await?;
+            let Some(info) = as4tainr_core::jobs::claim(&client, id.number).await? else {
+                bail!("job {id} was taken off the job queue by a running subsystem");
+            };
+            let normal = as4tainr_core::jobs::run_batch_job(&env, &info).await?;
+            for e in as4tainr_core::jobs::job_log(&client, id.number).await? {
+                println!("{}", e.text);
+            }
+            if !normal {
+                return Ok(255);
+            }
+        }
         Cmd::Call { program, args } => {
             // A CL program runs here as a job would run it; an RPG program
             // on the RPG engine. Printed output goes to standard output.
@@ -536,10 +582,17 @@ async fn run(cli: Cli) -> Result<u8> {
                 id: None,
                 calls: Default::default(),
             };
-            match job.call_program(&program, args).await {
+            let result = job.call_program(&program, args).await;
+            // Printed output, as it would be on paper (no job: no
+            // spooled file).
+            let printed = std::mem::take(&mut job.calls.printed);
+            match result {
                 Ok(commands::Outcome::Messages(m)) => {
                     for l in m {
                         println!("{}", show(&l));
+                    }
+                    for l in &printed {
+                        println!("{l}");
                     }
                 }
                 Ok(_) => {}
@@ -549,6 +602,9 @@ async fn run(cli: Cli) -> Result<u8> {
                     // DSPLY lines before the error are output too.
                     while lines.first().is_some_and(|l| l.starts_with("DSPLY  ")) {
                         println!("{}", show(lines.remove(0)));
+                    }
+                    for l in &printed {
+                        println!("{l}");
                     }
                     for l in lines {
                         eprintln!("as4tainr: {l}");

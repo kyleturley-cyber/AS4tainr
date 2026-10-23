@@ -106,6 +106,28 @@ type ActivePrograms = HashMap<(String, String, String), Active>;
 
 static PROGRAMS: std::sync::Mutex<Option<ActivePrograms>> = std::sync::Mutex::new(None);
 
+/// The open files and printers of service program modules in each job's
+/// activation groups: (job, group, unit) → files (by index), printers.
+type ModuleFiles =
+    HashMap<(String, String, String), (Vec<Option<OpenFile>>, HashMap<String, Printer>)>;
+
+static MODULE_FILES: std::sync::Mutex<Option<ModuleFiles>> = std::sync::Mutex::new(None);
+
+/// Spooled files of ended activation groups' printers, to be closed
+/// (status RDY) by whoever has the database at hand ([`close_ended_spools`]).
+static ENDED_SPOOLS: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+
+/// Close the spooled files of printers whose activation group ended.
+pub async fn close_ended_spools(client: &Client) {
+    let ids = ENDED_SPOOLS
+        .lock()
+        .map(|mut e| std::mem::take(&mut *e))
+        .unwrap_or_default();
+    for id in ids {
+        let _ = crate::spool::close(client, id).await;
+    }
+}
+
 /// A module that bound calls run: its unit (LIB/SRVPGM/MODULE), how its
 /// service program is bound, the module compiled.
 type BoundModule = (
@@ -129,6 +151,22 @@ pub fn end_programs(job: &str, groups: &crate::ile::Groups) -> usize {
     if let Ok(mut g) = BOUND.lock() {
         if let Some(m) = g.as_mut() {
             m.retain(|(j, grp, _), _| !(j == job && groups.covers(grp)));
+        }
+    }
+    if let Ok(mut g) = MODULE_FILES.lock() {
+        if let Some(m) = g.as_mut() {
+            // Their printer files' spooled files are complete.
+            let mut ended = Vec::new();
+            m.retain(|(j, grp, _), (_, printers)| {
+                let end = j == job && groups.covers(grp);
+                if end {
+                    ended.extend(printers.values().filter_map(|p| p.spl));
+                }
+                !end
+            });
+            if let Ok(mut e) = ENDED_SPOOLS.lock() {
+                e.extend(ended);
+            }
         }
     }
     let mut n = 0;
@@ -4025,6 +4063,8 @@ impl<'a> Machine<'a> {
                 &self.io.job_key,
                 &crate::ile::Groups::Named(&self.io.actgrp),
             );
+            let client = self.io.client;
+            self.block(close_ended_spools(client));
         }
         if keep {
             let globals = self.prog.globals.len();
@@ -4388,7 +4428,7 @@ impl Machine<'_> {
                 let mut li = [0u8; 80];
                 li[0..4].copy_from_slice(&(msgs.len() as i32).to_be_bytes());
                 li[4..8].copy_from_slice(&returned.to_be_bytes());
-                li[8..12].copy_from_slice(&next_list_handle().to_be_bytes());
+                li[8..12].copy_from_slice(&crate::spoolapi::list_open(Vec::new()).to_be_bytes());
                 li[16] = data::e("C")[0];
                 let ((y, mo, d), (h, mi, sec), _) = crate::rpg::dates::now();
                 let created = format!(
@@ -4398,10 +4438,10 @@ impl Machine<'_> {
                 );
                 li[17..30].copy_from_slice(&data::e(&created));
                 li[30] = data::e("2")[0];
-                li[32..36].copy_from_slice(&80i32.to_be_bytes());
-                li[36..40].copy_from_slice(&1i32.to_be_bytes());
-                for (i, b) in data::e(&" ".repeat(40)).iter().enumerate() {
-                    li[40 + i] = *b;
+                li[32..36].copy_from_slice(&(out.len() as i32).to_be_bytes());
+                li[36..40].copy_from_slice(&i32::from(returned > 0).to_be_bytes());
+                for b in &mut li[40..80] {
+                    *b = 0;
                 }
                 let k = info.size.min(80);
                 self.bufs[info.buf][info.off..info.off + k].copy_from_slice(&li[..k]);
@@ -4497,9 +4537,198 @@ impl Machine<'_> {
             // QGYCLST (request handle, error code) (Close List API): the
             // list's resources go (a list here keeps none).
             "QGYCLST" => {
-                let [_handle, rest @ ..] = locs else {
+                let [handle, rest @ ..] = locs else {
                     bail!("QGYCLST needs a request handle and an error code");
                 };
+                let h = self.bufs[handle.buf][handle.off..handle.off + 4].to_vec();
+                crate::spoolapi::list_close(u32::from_be_bytes(h.try_into().unwrap()));
+                self.api_ok(rest.first());
+            }
+            // QGYOLSPL (receiver, its length, list information, number of
+            // records to return, sort information, filter information,
+            // qualified job name, format, error code) (Open List of
+            // Spooled Files API): format OSPL0100 or OSPL0300, filter
+            // OSPF0100; the list stays open for QGYGTLE.
+            "QGYOLSPL" => {
+                let [rcv, len, info, count, _sort, filter, qjob, fmt, rest @ ..] = locs else {
+                    bail!("QGYOLSPL needs 8 parameters and an error code");
+                };
+                let format = text(self, fmt).trim().to_ascii_uppercase();
+                if format != "OSPL0300" {
+                    return self
+                        .api_error(
+                            rest.first(),
+                            anyhow!("CPF3C21: Format name {format} is not valid."),
+                        )
+                        .map(|_| true);
+                }
+                let fb = self.bufs[filter.buf][filter.off..filter.off + filter.size].to_vec();
+                let f = crate::spoolapi::parse_filter(&fb);
+                let jt = text(self, qjob);
+                let job = if jt.trim().is_empty() {
+                    None
+                } else if jt.trim() == "*" {
+                    Some(self.io.job.as_ref().map(|j| j.number).unwrap_or(-1))
+                } else {
+                    Some(
+                        jt.get(20..26)
+                            .and_then(|n| n.trim().parse().ok())
+                            .unwrap_or(-1),
+                    )
+                };
+                let user = self.io.user.clone();
+                let client = self.io.client;
+                let files = self.block(crate::spoolapi::select(client, &f, &user, job))?;
+                let records: Vec<Vec<u8>> = files.iter().map(crate::spoolapi::ospl0300).collect();
+                let total = records.len();
+                let room = (num(self, len)?.to_i128()?.max(0) as usize).min(rcv.size);
+                let want = num(self, count)?.to_i128()?;
+                let mut out = Vec::new();
+                let mut returned = 0usize;
+                for r in &records {
+                    if (want >= 0 && returned as i128 >= want) || out.len() + r.len() > room {
+                        break;
+                    }
+                    out.extend(r);
+                    returned += 1;
+                }
+                self.bufs[rcv.buf][rcv.off..rcv.off + out.len()].copy_from_slice(&out);
+                let h = crate::spoolapi::list_open(records);
+                let li = crate::spoolapi::list_info(
+                    total,
+                    returned,
+                    h,
+                    136,
+                    usize::from(returned > 0),
+                    out.len(),
+                );
+                let k = info.size.min(80);
+                self.bufs[info.buf][info.off..info.off + k].copy_from_slice(&li[..k]);
+                self.api_ok(rest.first());
+            }
+            // QGYGTLE (receiver, its length, request handle, list
+            // information, number of records, starting record, error
+            // code) (Get List Entries API).
+            "QGYGTLE" => {
+                let [rcv, len, handle, info, count, start, rest @ ..] = locs else {
+                    bail!("QGYGTLE needs 6 parameters and an error code");
+                };
+                let hb = self.bufs[handle.buf][handle.off..handle.off + 4].to_vec();
+                let h = u32::from_be_bytes(hb.try_into().unwrap());
+                let n = num(self, count)?.to_i128()? as i32;
+                let s = num(self, start)?.to_i128()? as i32;
+                let Some((total, recs)) = crate::spoolapi::list_get(h, s, n) else {
+                    return self
+                        .api_error(rest.first(), anyhow!("The request handle is not valid."))
+                        .map(|_| true);
+                };
+                let room = (num(self, len)?.to_i128()?.max(0) as usize).min(rcv.size);
+                let mut out = Vec::new();
+                let mut returned = 0;
+                for r in &recs {
+                    if out.len() + r.len() > room {
+                        break;
+                    }
+                    out.extend(r);
+                    returned += 1;
+                }
+                self.bufs[rcv.buf][rcv.off..rcv.off + out.len()].copy_from_slice(&out);
+                let rl = recs.first().map_or(0, |r| r.len());
+                let li = crate::spoolapi::list_info(
+                    total,
+                    returned,
+                    h,
+                    rl,
+                    if returned > 0 { s.max(1) as usize } else { 0 },
+                    out.len(),
+                );
+                let k = info.size.min(80);
+                self.bufs[info.buf][info.off..info.off + k].copy_from_slice(&li[..k]);
+                self.api_ok(rest.first());
+            }
+            // QSPOPNSP (handle, qualified job name, internal job and
+            // spooled file identifiers, spooled file name and number,
+            // number of buffers, error code) (Open Spooled File API).
+            "QSPOPNSP" => {
+                let [handle, qjob, _ijob, _isplf, name, number, _buffers, rest @ ..] = locs else {
+                    bail!("QSPOPNSP needs 7 parameters and an error code");
+                };
+                let jt = text(self, qjob);
+                let job = if jt.trim() == "*" || jt.trim().is_empty() {
+                    None
+                } else {
+                    jt.get(20..26).and_then(|n| n.trim().parse::<i64>().ok())
+                };
+                let this = self.io.job.as_ref().map(|j| j.number);
+                let file = text(self, name);
+                let nbr = num(self, number)?.to_i128()? as i32;
+                let client = self.io.client;
+                let r = self.block(crate::spoolapi::open(client, job, this, &file, nbr));
+                let h = match r {
+                    Ok(h) => h,
+                    Err(e) => return self.api_error(rest.first(), e).map(|_| true),
+                };
+                self.bufs[handle.buf][handle.off..handle.off + 4].copy_from_slice(&h.to_be_bytes());
+                self.api_ok(rest.first());
+            }
+            // QSPGETSP (handle, user space, format SPFR0300, ordinal
+            // number of the buffer (-1: all), end of file action, error
+            // code) (Get Spooled File Data API): into the user space.
+            "QSPGETSP" => {
+                let [handle, space, fmt, _ord, _end, rest @ ..] = locs else {
+                    bail!("QSPGETSP needs 5 parameters and an error code");
+                };
+                let format = text(self, fmt).trim().to_ascii_uppercase();
+                if format != "SPFR0300" {
+                    bail!("QSPGETSP format {format} is not supported");
+                }
+                let h = num(self, handle)?.to_i128()? as i32;
+                let Some(id) = crate::spoolapi::opened(h) else {
+                    return self
+                        .api_error(
+                            rest.first(),
+                            anyhow!("The spooled file handle is not valid."),
+                        )
+                        .map(|_| true);
+                };
+                let q = text(self, space);
+                let name = q.get(..10).unwrap_or("").trim().to_ascii_uppercase();
+                let lib = q.get(10..20).unwrap_or("").trim().to_ascii_uppercase();
+                let caller = crate::dtaq::Caller {
+                    user: self.io.user.clone(),
+                    job: self.io.job.clone(),
+                    libl: self.io.libl.clone(),
+                    curlib: self
+                        .io
+                        .cl
+                        .as_ref()
+                        .and_then(|c| c.curlib.clone())
+                        .unwrap_or_default(),
+                };
+                let client = self.io.client;
+                let r = self.block(async {
+                    let s = crate::usrspc::find(client, &name, &lib, &caller).await?;
+                    let (data, pages) = crate::spoolapi::scs(client, id).await?;
+                    let b = crate::spoolapi::spfr0300(&data, &pages);
+                    let mut cur = crate::usrspc::contents(client, &s).await?;
+                    if cur.len() < b.len() {
+                        cur.resize(b.len(), s.initval);
+                    }
+                    cur[..b.len()].copy_from_slice(&b);
+                    crate::usrspc::put_contents(client, &s.library, &s.name, &cur).await
+                });
+                if let Err(e) = r {
+                    return self.api_error(rest.first(), e).map(|_| true);
+                }
+                self.api_ok(rest.first());
+            }
+            // QSPCLOSP (handle, error code) (Close Spooled File API).
+            "QSPCLOSP" => {
+                let [handle, rest @ ..] = locs else {
+                    bail!("QSPCLOSP needs a handle and an error code");
+                };
+                let h = num(self, handle)?.to_i128()? as i32;
+                crate::spoolapi::close(h);
                 self.api_ok(rest.first());
             }
             // QWVRCSTK (receiver, its length, format CSTK0100, job
@@ -5410,6 +5639,25 @@ impl<'a> Machine<'a> {
         if let Some(u) = &act_unit {
             m.owner = crate::ile::activation_owner(&self.io.job_key, &group, u);
         }
+        // Its files stay open between calls: in the service program's
+        // activation, or the program's (a module bound into it).
+        let files_key = (
+            self.io.job_key.clone(),
+            group.clone(),
+            act_unit
+                .clone()
+                .unwrap_or_else(|| format!("{}/{unit}", self.stack_pgm())),
+        );
+        let kept = MODULE_FILES
+            .lock()
+            .ok()
+            .and_then(|mut g| g.as_mut().and_then(|x| x.remove(&files_key)));
+        if let Some((files, printers)) = kept {
+            for (f, o) in m.files.iter_mut().zip(files) {
+                f.open = o;
+            }
+            m.printers = printers;
+        }
         match storage {
             Some(s) => m.bufs.own = s,
             None => {
@@ -5493,6 +5741,19 @@ impl<'a> Machine<'a> {
         self.messages.append(&mut m.messages);
         self.printed.append(&mut m.printed);
         let kept: Vec<Vec<u8>> = m.bufs.own[..globals].to_vec();
+        // Printed lines go to the spooled file now; the file stays open.
+        let names: Vec<String> = m.printers.keys().cloned().collect();
+        for n in names {
+            m.flush_printer(&n)?;
+        }
+        let files: Vec<Option<OpenFile>> = m.files.iter_mut().map(|f| f.open.take()).collect();
+        let printers = std::mem::take(&mut m.printers);
+        if files.iter().any(|f| f.is_some()) || !printers.is_empty() {
+            if let Ok(mut g) = MODULE_FILES.lock() {
+                g.get_or_insert_with(HashMap::new)
+                    .insert(files_key, (files, printers));
+            }
+        }
         if let Some(u) = &act_unit {
             crate::ile::keep_activation(&self.io.job_key, &group, u, kept);
         } else if let Ok(mut g) = self.io.modules.lock() {
@@ -5565,7 +5826,11 @@ impl<'a> Machine<'a> {
         });
         let pgm = self.stack_pgm();
         let lib = self.stack_lib();
-        crate::pgmmsg::stack_line(&self.io.job_key, self.line);
+        // The caller's line (a call from this module; a bound call set it
+        // in the calling module already).
+        if self.line > 0 {
+            crate::pgmmsg::stack_line(&self.io.job_key, self.line);
+        }
         let ext = self.external_proc_name(&pi.name);
         let stack_id = crate::pgmmsg::stack_push(
             &self.io.job_key,
@@ -6332,28 +6597,7 @@ impl Machine<'_> {
         // object's (CRTPRTF PAGESIZE, OVRFLW); 66 and 60 without one.
         let (page_length, overflow_line) = self.form_of(i);
         let _ = (DEFAULT_LEN, DEFAULT_OFL);
-        if !self.printers.contains_key(&r.file) {
-            let spl = match &self.io.job {
-                Some(job) => Some(self.block(crate::spool::open(
-                    self.io.client,
-                    job,
-                    &r.file,
-                    &self.prog.name,
-                ))?),
-                None => None,
-            };
-            self.printers.insert(
-                r.file.clone(),
-                Printer {
-                    spl,
-                    page: 1,
-                    line: 1,
-                    printed_on_page: false,
-                    buffer: Vec::new(),
-                    out_pos: (1, 0),
-                },
-            );
-        }
+        self.ensure_printer(&r.file)?;
         let new_page = |p: &mut Printer| {
             p.page += 1;
             p.line = 1;
@@ -6457,6 +6701,15 @@ impl Machine<'_> {
                     if page > p.out_pos.0 {
                         self.printed.push("\x0c".to_string());
                         p.out_pos = (page, 0);
+                    }
+                    // A line printed again (no spacing between): the new
+                    // text over the old, the old showing through its
+                    // blanks (PUB400 2026-10-23).
+                    if line == p.out_pos.1 && line > 0 {
+                        if let Some(last) = self.printed.last_mut() {
+                            *last = overprint(last, &text);
+                            continue;
+                        }
                     }
                     while p.out_pos.1 + 1 < line {
                         self.printed.push(String::new());
@@ -6908,12 +7161,6 @@ fn space_pages(mut data: Vec<u8>, initval: u8) -> Vec<u8> {
     data
 }
 
-/// A request handle for an open list.
-fn next_list_handle() -> u32 {
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
 /// The job log messages QGYOLJBL lists, and the fields to return.
 /// Message selection information: list direction (*NEXT or *PRV),
 /// qualified job name ('*': this job), internal job identifier,
@@ -7038,6 +7285,20 @@ fn char_number(t: &str) -> Result<Dec> {
             t.trim()
         )
     })
+}
+
+/// Text printed over a line: its characters, except its blanks, over
+/// the line's.
+fn overprint(old: &str, new: &str) -> String {
+    let mut o: Vec<char> = old.chars().collect();
+    for (i, c) in new.chars().enumerate() {
+        if i >= o.len() {
+            o.push(c);
+        } else if c != ' ' {
+            o[i] = c;
+        }
+    }
+    o.into_iter().collect()
 }
 
 #[cfg(test)]

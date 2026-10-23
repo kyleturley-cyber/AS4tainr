@@ -387,6 +387,7 @@ impl Job<'_> {
                     g => crate::ile::Groups::Named(g),
                 };
                 let n = crate::ile::end_activations(&key, &groups);
+                crate::rpg::interp::close_ended_spools(self.client).await;
                 if cmd.def.name == "RCLACTGRP" && n == 0 && what != "*ELIGIBLE" {
                     bail!("CPF1653: Activation group {what} not found.");
                 }
@@ -1373,14 +1374,14 @@ impl Job<'_> {
         let mut c = runtime::connect_db(&self.env.database_url).await?;
         crate::ile::store(&mut c, &lib, &name, "*SRVPGM", "RPGLE", &text, &json, "").await?;
         authority::set_owner(self.client, &lib, &name, "*SRVPGM", &self.user).await?;
-        // The completion message's data: the service program and its
-        // library (RPGUnit's RUCRTTST reads them; the message ID is not
-        // known without a capture, docs/fidelity-gaps.md).
+        // The completion message CPC5D0B (PUB400 2026-10-23), its data
+        // the service program and its library (RPGUnit's RUCRTTST reads
+        // them).
         let mut data = crate::rpg::data::e(&format!("{name:<10}{lib:<10}"));
         data.truncate(20);
         self.calls.message_data = Some(data);
         Ok(Outcome::Messages(vec![format!(
-            "Service program {name} created in library {lib}."
+            "CPC5D0B: Service program {name} created in library {lib}."
         )]))
     }
 
@@ -3628,6 +3629,14 @@ impl Job<'_> {
                 pagesize,
                 ovrflw: num("OVRFLW")?,
                 no_lvlchk: cmd.get("LVLCHK") == "*NO",
+                splfname: match cmd.get("SPLFNAME") {
+                    "" | "*NONE" | "*FILE" => None,
+                    n => Some(n.to_ascii_uppercase()),
+                },
+                usrdta: match cmd.get("USRDTA") {
+                    "" | "*NONE" => None,
+                    d => Some(d.to_string()),
+                },
                 actgrp,
             },
         );
@@ -5802,8 +5811,9 @@ impl Job<'_> {
         self.calls.returned = Some(r.params.clone());
         let mut msgs: Vec<String> = r.messages.iter().map(|m| format!("DSPLY  {m}")).collect();
         // Without a job there are no spooled files: printed lines come back
-        // as they would be on paper.
-        msgs.extend(r.printed.iter().cloned());
+        // as the command's printed output (PASE `system` writes a
+        // program's spooled output to standard output).
+        self.calls.printed.extend(r.printed.iter().cloned());
         if let Some(e) = r.error {
             msgs.push(format!("{e:#}"));
             msgs.push(format!("Program {pgm} ended abnormally."));

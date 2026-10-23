@@ -5311,8 +5311,16 @@ async fn cl_cmd(
     c: String,
 ) -> Result<Vec<String>, String> {
     use as4tainr_core::commands::Outcome;
-    match job.run(&c).await {
-        Ok(Outcome::Messages(m)) => Ok(m),
+    // The command's messages, then what it printed (without a job, a
+    // program's printed lines are the command's printed output).
+    job.calls.printed.clear();
+    let r = job.run(&c).await;
+    let printed = std::mem::take(&mut job.calls.printed);
+    match r {
+        Ok(Outcome::Messages(mut m)) => {
+            m.extend(printed);
+            Ok(m)
+        }
         Ok(other) => Ok(vec![format!("{other:?}")]),
         Err(e) => Err(format!("{c}: {e:#}")),
     }
@@ -11453,4 +11461,175 @@ end-proc;
         "1".into(),
     ];
     assert_eq!(got, want);
+}
+
+#[tokio::test]
+async fn spooled_file_apis_and_printed_output_of_system() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::{jobs, pase_system};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    // The golden programs of tools/golden/spool.txt: GLDSPL prints with
+    // space before 1 and 2, skip before 10, space after 3 (printed over
+    // the line before) and skip before 1 (a new page), under OVRPRTF
+    // SPLFNAME(GLDSPL) USRDTA(GLDSPL); GLDSPD makes the spooled file and
+    // reads it back with QGYOLSPL, QGYGTLE, QSPOPNSP and QSPGETSP.
+    job.run(&format!(
+        "RUNSQL SQL('CREATE TABLE {lib}/GLDSPO (ID CHAR(10) NOT NULL, VAL CHAR(100) NOT NULL)') COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
+    let dir = format!("/tmp/{lib}");
+    let _ = as4tainr_core::ifs::mkdir_all(&client, &dir, "QSECOFR").await;
+    for (f, src) in [
+        (
+            "gldspl",
+            include_str!("../../tools/golden/spool/gldspl.rpgle"),
+        ),
+        (
+            "gldspd",
+            include_str!("../../tools/golden/spool/gldspd.rpgle"),
+        ),
+    ] {
+        let src = src.replace("AS4TRAINR1", &lib);
+        as4tainr_core::ifs::write_file(
+            &client,
+            &format!("{dir}/{f}.rpgle"),
+            src.as_bytes(),
+            819,
+            0o644,
+            "QSECOFR",
+        )
+        .await
+        .unwrap();
+        let o = pase_system::run(
+            &mut job,
+            &[format!(
+                "CRTBNDRPG PGM({lib}/{}) SRCSTMF('{dir}/{f}.rpgle')",
+                f.to_uppercase()
+            )],
+        )
+        .await;
+        assert_eq!(o.status, 0, "{o:?}");
+    }
+
+    // PASE `system` writes a program's spooled output to standard output:
+    // its lines without the blank lines spacing and skipping make, a line
+    // printed over another merged into it (PUB400 2026-10-23, s_print;
+    // PUB400's own QPRTTXT page footer left out).
+    let o = pase_system::run(&mut job, &[format!("CALL PGM({lib}/GLDSPL)")]).await;
+    assert_eq!(
+        o.stdout,
+        [
+            "LINE ONE",
+            "  INDENTED",
+            "A    B    C",
+            "AFTER A BLANK LINE",
+            "SPACEEAFTERL3NE 10",
+            "PAGE TWO",
+            "LAST"
+        ]
+    );
+
+    // In a batch job the spooled file stays, named and with user data as
+    // OVRPRTF says; the APIs read it. The print data is SCS: a new line
+    // (x'15') for each line moved down from line 1, a carriage return
+    // (x'0D') to print over a line, a form feed (x'0C') at a new page (SCS
+    // control codes); RPGUnit's acceptance tests find each line of its
+    // report right after a new line.
+    let b = jobs::submit(
+        &client,
+        &jobs::Submit {
+            name: "SPLAPI".into(),
+            user: "QSECOFR".into(),
+            command: format!("CALL PGM({lib}/GLDSPD)"),
+            jobq: "SPLAPIQ".into(),
+            curlib: Some(lib.clone()),
+            libl: vec![lib.clone()],
+            submitted_by: "QSECOFR".into(),
+            submitter: None,
+        },
+    )
+    .await
+    .unwrap();
+    let info = jobs::claim(&client, b.number).await.unwrap().unwrap();
+    assert!(jobs::run_batch_job(&env, &info).await.unwrap());
+    let rows = client
+        .query(
+            &format!("SELECT TRIM(ID), TRIM(VAL) FROM {lib}.GLDSPO"),
+            &[],
+        )
+        .await
+        .unwrap();
+    let mut errs: Vec<(String, String)> = rows
+        .iter()
+        .filter(|r| r.get::<_, String>(0).starts_with('E'))
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    errs.sort();
+    assert!(errs.iter().all(|e| e.1 == "OK"), "{errs:?}");
+    assert_eq!(errs.len(), 8);
+    let hex = |p: char| -> Vec<u8> {
+        let mut parts: Vec<(i64, String)> = rows
+            .iter()
+            .filter(|r| r.get::<_, String>(0).starts_with(p))
+            .map(|r| {
+                let id: String = r.get(0);
+                (id[1..].parse().unwrap(), r.get(1))
+            })
+            .collect();
+        parts.sort();
+        let h: String = parts.into_iter().map(|p| p.1).collect();
+        (0..h.len() / 2)
+            .map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap())
+            .collect()
+    };
+    let e = |s: &str| as4tainr_core::rpg::data::e(s);
+    // OSPL0300: job name, user, number, then the spooled file's name.
+    let rec = hex('R');
+    assert_eq!(&rec[0..10], &e("SPLAPI    ")[..]);
+    assert_eq!(&rec[26..36], &e("GLDSPL    ")[..]);
+    assert_eq!(&rec[68..78], &e("GLDSPL    ")[..]);
+    // SPFR0300: completion indicator 'C', the size used, the first
+    // buffer; the print data ends the space.
+    let sp = hex('S');
+    assert_eq!(sp[86], e("C")[0]);
+    let used = i32::from_be_bytes(sp[88..92].try_into().unwrap()) as usize;
+    assert_eq!(used, sp.len());
+    let mut want = Vec::new();
+    for (moves, text) in [
+        (1, "LINE ONE"),
+        (1, "  INDENTED"),
+        (1, "A    B    C"),
+        (2, "AFTER A BLANK LINE"),
+        (4, "SKIPPED TO LINE 10"),
+    ] {
+        want.extend(std::iter::repeat_n(0x15u8, moves));
+        want.extend(e(text));
+    }
+    want.push(0x0D);
+    want.extend(e("SPACE AFTER 3"));
+    want.push(0x0C);
+    want.extend(e("PAGE TWO"));
+    want.push(0x15);
+    want.extend(e("LAST"));
+    want.push(0x0C);
+    assert!(
+        sp.ends_with(&want),
+        "{:02X?}",
+        &sp[sp.len().saturating_sub(want.len() + 8)..]
+    );
 }

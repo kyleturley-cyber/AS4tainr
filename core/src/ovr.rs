@@ -34,6 +34,10 @@ pub struct Override {
     pub ovrflw: Option<i32>,
     /// OVRDBF LVLCHK(*NO): no record format level check.
     pub no_lvlchk: bool,
+    /// OVRPRTF SPLFNAME and USRDTA: the spooled file's name and user
+    /// data.
+    pub splfname: Option<String>,
+    pub usrdta: Option<String>,
     /// OVRSCOPE(*ACTGRPDFN) from a program of a non-default activation
     /// group: the override is scoped to that activation group, so it
     /// stays when the program that made it returns.
@@ -128,6 +132,8 @@ mod tests {
             pagesize: None,
             ovrflw: None,
             no_lvlchk: false,
+            splfname: None,
+            usrdta: None,
             actgrp: None,
         }
     }

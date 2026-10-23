@@ -13,8 +13,9 @@
 #   Start it with CALL COM022LIB/COMSTART.
 # - RPGUnit (CPL-1.0): its members copied into the source files of
 #   library RPGUNIT (CPYFRMSTMF), built by its own MKMETADATA and
-#   MKRPGUNIT, then its self-test MKRPGUNITT: the sanity check (TESTPGM03
-#   must fail), the unit test suites (MKUT), the acceptance tests.
+#   MKRPGUNIT, then its self-test MKRPGUNITT in a batch job: the sanity
+#   check (TESTPGM03 must fail), the unit test suites (MKUT), the
+#   acceptance tests.
 #
 #   tools/legacy.sh
 #
@@ -103,8 +104,9 @@ for n in SRVPGM1 SRVPGM2; do
   "$bin" --libl RPGUNIT system "CRTSRVPGM SRVPGM(RPGUNIT/$n) EXPORT(*ALL)" | tail -1
 done
 run "CRTBNDCL PGM(RPGUNIT/MKRPGUNITT) SRCFILE(RPGUNIT/RPGUNITT1)" | tail -1
-# Each suite's result line (Success. / FAILURE. / ERROR.), and how the
-# self-test ended. The acceptance tests read the report's spooled file
-# (docs/fidelity-gaps.md: spooled file APIs).
-"$bin" --libl RPGUNIT system "CALL RPGUNIT/MKRPGUNITT PARM(RPGUNIT)" 2>&1 |
-  grep -E "^DSPLY  (Success|FAILURE|ERROR)|CPF9897|^Error in"
+# The self-test in a batch job (`as4tainr batch`, as SBMJOB and QBATCH
+# would run it): its acceptance tests read RPGUnit's report from the
+# spooled file, and PASE `system` keeps no spooled files. Each suite's
+# result line (Success. / FAILURE. / ERROR.), and how the job ended.
+"$bin" --libl RPGUNIT batch "CALL RPGUNIT/MKRPGUNITT PARM(RPGUNIT)" 2>&1 |
+  grep -E "^(Success|FAILURE|ERROR)\.|CPF124[01]"

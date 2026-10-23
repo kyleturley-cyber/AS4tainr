@@ -91,7 +91,18 @@ pub async fn run(job: &mut Job<'_>, args: &[String]) -> Output {
     // A compiler listing: after the completion message, or before the
     // failure's messages (observed on IBM i 7.5).
     let printed = std::mem::take(&mut job.calls.printed);
-    let printed = if opts.no_spool { vec![] } else { printed };
+    // The spooled output as `system` writes it: its lines one after
+    // another, without the blank lines and page breaks spacing and
+    // skipping made (PUB400 2026-10-23: an RPG program printing with
+    // space before 2 and skip before 10).
+    let printed: Vec<String> = if opts.no_spool {
+        vec![]
+    } else {
+        printed
+            .into_iter()
+            .filter(|l| !l.trim().is_empty() && l != "\x0c")
+            .collect()
+    };
     if result.is_err() {
         out.stdout.extend(printed.iter().cloned());
     }

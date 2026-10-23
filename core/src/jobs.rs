@@ -209,6 +209,7 @@ pub async fn end(client: &Client, id: &JobId, normal: bool) -> Result<()> {
     crate::cmtctl::end_job(&id.to_string()).await;
     // Its activation groups and program message queues end.
     crate::ile::end_activations(&id.to_string(), &crate::ile::Groups::All);
+    crate::rpg::interp::close_ended_spools(client).await;
     crate::pgmmsg::named_end_job(&id.to_string());
     // Its open stream files are closed.
     for (path, data) in crate::rpg::interp::crt::end_job(&id.to_string()) {

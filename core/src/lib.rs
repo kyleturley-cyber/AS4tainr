@@ -56,6 +56,7 @@ pub mod save;
 pub mod services;
 pub mod source;
 pub mod spool;
+pub mod spoolapi;
 pub mod sql;
 pub mod sqlcat;
 pub mod sqlfn;

@@ -1,0 +1,5 @@
+# What happened to a job submitted by tools/golden/spool.txt: its status,
+# and its job log if it kept one. Set the job number below first.
+j_sbmjob|!system "WRKSBMJOB" | grep -i -E "GLDSPD|Job  " 
+j_joblog|!system -q "DLTF FILE(QTEMP/GLDJL)"; system "CRTPF FILE(QTEMP/GLDJL) RCDLEN(132)" >/dev/null; system "CPYSPLF FILE(QPJOBLOG) TOFILE(QTEMP/GLDJL) JOB(271948/AS4TRAINR/GLDSPD) SPLNBR(*LAST)" && system "CPYF FROMFILE(QTEMP/GLDJL) TOFILE(*PRINT)"
+j_splf|WRKSPLF SELECT(*CURRENT)

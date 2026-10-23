@@ -1,0 +1,29 @@
+# Golden spooled file: what an RPG program prints (space before, space
+# after, skip before) as the spooled file APIs return it (QGYOLSPL
+# OSPL0300, QGYGTLE, QSPOPNSP, QSPGETSP SPFR0300), for as4tainr's spooled
+# file APIs and RPGUnit's acceptance tests. Also CRTSRVPGM's completion
+# message.
+# Capture with: golden.ps1 -List tools\golden\spool.txt -Files tools\golden\spool
+# (the source files go to /home/AS4TRAINR/gld first).
+s_cleanup|!for o in GLDSPL GLDSPD; do system -q "DLTPGM PGM(AS4TRAINR1/$o)"; done; system -q "DLTSRVPGM SRVPGM(AS4TRAINR1/GLDSRV)"; system -q "DLTMOD MODULE(AS4TRAINR1/GLDSRV)"; system -q "DLTF FILE(AS4TRAINR1/GLDSPO)"; system -q "DLTSPLF FILE(GLDSPL) SPLNBR(*LAST)"; echo cleaned
+s_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLDSPO (ID CHAR(10) NOT NULL, VAL CHAR(100) NOT NULL)') COMMIT(*NONE)
+s_tag|!for f in gldspl gldspd gldsrv; do setccsid 819 /home/AS4TRAINR/gld/$f.rpgle; done; ls -l /home/AS4TRAINR/gld
+s_crtspl|!system -s "CRTBNDRPG PGM(AS4TRAINR1/GLDSPL) SRCSTMF('/home/AS4TRAINR/gld/gldspl.rpgle')"
+s_crtspd|!system -s "CRTBNDRPG PGM(AS4TRAINR1/GLDSPD) SRCSTMF('/home/AS4TRAINR/gld/gldspd.rpgle')"
+# The listings, if a program was not created (the compiler's messages).
+s_lstspl|!system -q "CHKOBJ OBJ(AS4TRAINR1/GLDSPL) OBJTYPE(*PGM)" || system "CRTBNDRPG PGM(AS4TRAINR1/GLDSPL) SRCSTMF('/home/AS4TRAINR/gld/gldspl.rpgle')"
+s_lstspd|!system -q "CHKOBJ OBJ(AS4TRAINR1/GLDSPD) OBJTYPE(*PGM)" || system "CRTBNDRPG PGM(AS4TRAINR1/GLDSPD) SRCSTMF('/home/AS4TRAINR/gld/gldspd.rpgle')"
+s_print|CALL PGM(AS4TRAINR1/GLDSPL)
+# The spooled file as WRKSPLF and DSPSPLF see it, then as the APIs do.
+s_wrksplf|WRKSPLF SELECT(*CURRENT *ALL *ALL GLDSPL)
+s_dspsplf|DSPSPLF FILE(GLDSPL) SPLNBR(*LAST)
+s_dumpclr|RUNSQL SQL('DELETE FROM AS4TRAINR1/GLDSPO') COMMIT(*NONE)
+# In a batch job: its spooled files stay while it runs.
+s_dump|SBMJOB CMD(CALL PGM(AS4TRAINR1/GLDSPD)) JOB(GLDSPD)
+s_wait|!sleep 90; echo waited
+s_out|CPYF FROMFILE(AS4TRAINR1/GLDSPO) TOFILE(*PRINT)
+# CRTSRVPGM: its completion message (ID and text), as `system` shows it.
+s_crtmod|!system "CRTRPGMOD MODULE(AS4TRAINR1/GLDSRV) SRCSTMF('/home/AS4TRAINR/gld/gldsrv.rpgle')" | tail -3
+s_crtsrvpgm|CRTSRVPGM SRVPGM(AS4TRAINR1/GLDSRV) EXPORT(*ALL)
+s_crtsrvpgm_again|CRTSRVPGM SRVPGM(AS4TRAINR1/GLDSRV) EXPORT(*ALL) OPTION(*DUPPROC)
+s_end|!for o in GLDSPL GLDSPD; do system -q "DLTPGM PGM(AS4TRAINR1/$o)"; done; system -q "DLTSRVPGM SRVPGM(AS4TRAINR1/GLDSRV)"; system -q "DLTMOD MODULE(AS4TRAINR1/GLDSRV)"; system -q "DLTF FILE(AS4TRAINR1/GLDSPO)"; echo cleaned

@@ -248,7 +248,8 @@ async fn bind_source(
     let mut externals = HashMap::new();
     for f in program::external_files(&src) {
         let r =
-            crate::catalog::resolve_file(client, libl, &ovr::file_name(ovr, Kind::Db, &f)).await;
+            crate::catalog::resolve_record_file(client, libl, &ovr::file_name(ovr, Kind::Db, &f))
+                .await;
         // A program-described file need not exist when the program is
         // compiled (it is opened later, by EXTFILE perhaps): the compiler
         // knows its record length only.

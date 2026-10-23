@@ -635,6 +635,32 @@ fn const_value(e: &Expr, syms: &HashMap<String, Sym>) -> Result<Value> {
             let n = if f == "SIZE" { size as i64 } else { dim as i64 };
             Value::Num(Dec::from_i64(n))
         }
+        // %LEN of a defined item of fixed length: its length in
+        // characters, or its digits (ILE RPG Reference, %LEN: allowed in
+        // definitions for such items).
+        Expr::Bif(f, a) if f == "LEN" && a.len() == 1 => {
+            let n = match &a[0] {
+                Expr::Name { parts, args: None } => match syms.get(&parts.join(".")) {
+                    Some(Sym::Var(v)) => match v.dtype {
+                        DType::Char(n) | DType::Ucs2(n) => n as i64,
+                        DType::Varchar(_) | DType::VarUcs2(_) => {
+                            bail!("%LEN of a varying-length item is not a constant")
+                        }
+                        t if t.is_numeric() => t.precision().0 as i64,
+                        t => t.size() as i64,
+                    },
+                    Some(Sym::Ds(d)) => d.size as i64,
+                    Some(Sym::Const(Value::Char(c))) => c.len() as i64,
+                    _ => bail!(
+                        "%LEN({}): it is not defined before it is used",
+                        parts.join(".")
+                    ),
+                },
+                Expr::Str(c) => c.len() as i64,
+                other => bail!("a constant value is needed, found {other:?}"),
+            };
+            Value::Num(Dec::from_i64(n))
+        }
         Expr::Bin(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), l, r) => {
             let (l, r) = (const_value(l, syms)?.num()?, const_value(r, syms)?.num()?);
             Value::Num(match op {
@@ -2187,22 +2213,26 @@ pub fn bind(
             // stored form (zoned, packed, binary, characters).
             // Not found when compiled: the file opened (EXTFILE) gives the
             // layout then; the record length is the declared one.
-            let Some(fr) = externals.get(&f.name).cloned() else {
-                info.record_len = f.record_len.unwrap_or(0) as usize;
-                info.program_described = true;
-                info.format = f.name.clone();
-                files.push(info);
-                continue;
-            };
-            let mut at = 0usize;
-            for fd in &fr.file.fields {
-                let t = program_type(fd, true, false).unwrap_or(DType::Char(0));
-                info.layout.push((t, at));
-                at += t.size();
-            }
-            info.record_len = at;
+            let found = externals.get(&f.name).cloned();
             info.program_described = true;
-            info.format = fr.file.format.clone();
+            match &found {
+                None => {
+                    info.record_len = f.record_len.unwrap_or(0) as usize;
+                    info.format = f.name.clone();
+                }
+                Some(fr) => {
+                    let mut at = 0usize;
+                    for fd in &fr.file.fields {
+                        let t = program_type(fd, true, false).unwrap_or(DType::Char(0));
+                        info.layout.push((t, at));
+                        at += t.size();
+                    }
+                    info.record_len = at;
+                    info.format = fr.file.format.clone();
+                }
+            }
+            // Its input specifications: the record's fields by position
+            // (also when the file is not there at compile time).
             for r in src.inputs.iter().filter(|r| r.file == f.name) {
                 let mut fields = Vec::new();
                 for x in &r.fields {
@@ -2235,7 +2265,7 @@ pub fn bind(
                     fields,
                 });
             }
-            info.fref = Some(fr);
+            info.fref = found;
         }
         files.push(info);
     }

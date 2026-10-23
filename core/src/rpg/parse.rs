@@ -2520,6 +2520,15 @@ fn free_calc(text: &str) -> Result<Line> {
         }
         return Ok(Line::Stmt(Stmt::CallP(expr::parse(text)?)));
     };
+    // An operation code followed at once by a parenthesis takes it as its
+    // extender: `dump('x')` is DUMP with an extender that is not valid,
+    // even when a procedure DUMP exists (CALLP calls it; PUB400
+    // 2026-10-23: RNF5374, RNF5507).
+    if x.is_empty() && rest.starts_with('(') {
+        bail!(
+            "{op}: the operation extender in parentheses is not valid (a procedure named like an operation code is called with CALLP)"
+        );
+    }
     let ext = Ext::parse(&x);
     let rest_t = rest.trim();
     let e_opt = || opt_expr(rest_t);
@@ -2886,6 +2895,18 @@ mod tests {
             matches!(&s.calcs[1].what, Line::Stmt(Stmt::File { op: FileOp::Chain, key: Some(k), .. }) if k.len() == 2)
         );
         assert!(matches!(s.calcs[2].what, Line::If(_)));
+    }
+
+    #[test]
+    fn operation_codes_take_a_parenthesis_as_their_extender() {
+        // A procedure named like an operation code is not called by its
+        // name in free form: DUMP('L' : ...) is DUMP with an extender
+        // (PUB400 2026-10-23: RNF5374, RNF5507); CALLP calls it, and an
+        // extender or a blank before the parenthesis is fine.
+        let none = |_: &str| None;
+        assert!(parse("**FREE\ndump('L' : 1);\n", &none).is_err());
+        assert!(parse("**FREE\ncallp dump('L' : 1);\n", &none).is_ok());
+        assert!(parse("**FREE\ndump(a);\nif (x = 1);\nendif;\n", &none).is_ok());
     }
 
     #[test]

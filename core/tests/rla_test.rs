@@ -11633,3 +11633,390 @@ async fn spooled_file_apis_and_printed_output_of_system() {
         &sp[sp.len().saturating_sub(want.len() + 8)..]
     );
 }
+
+#[tokio::test]
+async fn environment_variables_and_qshell_from_cl() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    // QSH runs commands only on a system set up for it.
+    std::env::set_var("AS4TAINR_QSH", "1");
+    let dir = format!("/tmp/{lib}q");
+    let _ = as4tainr_core::ifs::mkdir_all(&client, &dir, "QSECOFR").await;
+    job.run(&format!(
+        "RUNSQL SQL('CREATE TABLE {lib}/GLDQSO (ID CHAR(10) NOT NULL, VAL CHAR(150) NOT NULL)') COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
+    // tools/golden/qsh.txt's program.
+    for (f, src) in [
+        (
+            "gldqsh.clle",
+            include_str!("../../tools/golden/qsh/gldqsh.clle"),
+        ),
+        (
+            "gldcas.cmd",
+            include_str!("../../tools/golden/qsh/gldcas.cmd"),
+        ),
+        (
+            "gldcasc.clle",
+            include_str!("../../tools/golden/qsh/gldcasc.clle"),
+        ),
+    ] {
+        let src = src
+            .replace("/home/AS4TRAINR/gld", &dir)
+            .replace("AS4TRAINR1", &lib);
+        as4tainr_core::ifs::write_file(
+            &client,
+            &format!("{dir}/{f}"),
+            src.as_bytes(),
+            819,
+            0o644,
+            "QSECOFR",
+        )
+        .await
+        .unwrap();
+    }
+    // `OBJ(LIB/*ALL)`: the slash qualifies, it does not start a comment.
+    cl_cmd(
+        &mut job,
+        format!("CRTBNDCL PGM({lib}/GLDQSH) SRCSTMF('{dir}/gldqsh.clle')"),
+    )
+    .await
+    .unwrap();
+    cl_cmd(&mut job, format!("CALL PGM({lib}/GLDQSH)"))
+        .await
+        .unwrap();
+    let rows = client
+        .query(
+            &format!("SELECT rtrim(id), rtrim(val) FROM {lib}.gldqso ORDER BY rrn"),
+            &[],
+        )
+        .await
+        .unwrap();
+    let got: Vec<(String, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    let want: Vec<(String, String)> = [
+        // CL reference: ADDENVVAR with REPLACE(*NO) on an existing
+        // variable CPFA980; CHGENVVAR and RMVENVVAR of one that is not
+        // there CPFA981; a name with '=' CPFA982.
+        ("dupadd", "CPFA980"),
+        ("rmvmissing", "CPFA981"),
+        ("chgmissing", "CPFA981"),
+        ("badname", "CPFA982"),
+        // Qshell, "Running Qshell commands from CL": QSH0005 with the
+        // exit status, QSH0006 with the signal number, completion
+        // messages, escape messages with QIBM_QSH_CMD_ESCAPE_MSG=Y for
+        // an exit status above 0; the status in 4 binary bytes (QshOni
+        // reads it with %BIN(&MSGDTA 1 4)).
+        ("exit3", "QSH0005 4 3"),
+        ("exit0", "QSH0005 4 0"),
+        ("signal9", "QSH0006 4 9"),
+        ("esc4", "QSH0005 4 4"),
+        ("esc0", "QSH0005 4 0"),
+        // ADDMSGD FMT: data shorter than the field's length makes the
+        // substitution value a null field.
+        ("shortdata", "<>"),
+        // CL expressions in a parameter: |> joins with one blank, |<
+        // drops the trailing blanks of the first operand.
+        ("exprtext", "Gold textx"),
+    ]
+    .iter()
+    .map(|(a, b)| (a.to_string(), b.to_string()))
+    .collect();
+    assert_eq!(got, want);
+    // QIBM_QSH_CMD_OUTPUT=FILE=: the output in the stream file, which
+    // CPYFRMSTMF (with STMFCODPAG, the old name of STMFCCSID) copies
+    // into a program-described file, a record per line.
+    cl_cmd(&mut job, format!("CRTPF FILE({lib}/QSHOUT) RCDLEN(20) OPTION(*NOLIST *NOSRC) MAXMBRS(*NOMAX) SIZE(*NOMAX)"))
+        .await
+        .unwrap();
+    cl_cmd(
+        &mut job,
+        format!(
+            "CPYFRMSTMF FROMSTMF('{dir}/qshout.txt') TOMBR('/QSYS.LIB/{lib}.LIB/QSHOUT.FILE/QSHOUT.MBR') MBROPT(*REPLACE) STMFCODPAG(*STMF)"
+        ),
+    )
+    .await
+    .unwrap();
+    let rows = client
+        .query(
+            &format!("SELECT qshout FROM {lib}.qshout ORDER BY rrn"),
+            &[],
+        )
+        .await
+        .unwrap();
+    let lines: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(
+        lines,
+        [format!("{:<20}", "hello"), format!("{:<20}", "there")]
+    );
+    // QSH's output by default: standard output (what `system` prints).
+    // The job's variables stay after the program ends.
+    cl_cmd(&mut job, "RMVENVVAR ENVVAR(QIBM_QSH_CMD_OUTPUT)".into())
+        .await
+        .unwrap();
+    let m = cl_cmd(&mut job, "QSH CMD('echo plain; exit 2')".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        m,
+        [
+            "QSH0005: Command ended normally with exit status 2.",
+            "plain"
+        ]
+    );
+    // A command processing program's completion message to its caller
+    // is on the caller's queue once: a CL caller receives it, then the
+    // next one (QshOni's QSHEXECC loops RCVMSG *COMP for QSH0005).
+    cl_cmd(
+        &mut job,
+        format!("CRTBNDCL PGM({lib}/GLDCASC) SRCSTMF('{dir}/gldcasc.clle')"),
+    )
+    .await
+    .unwrap();
+    for c in [
+        format!("CRTSRCPF FILE({lib}/GLDQCMD) RCDLEN(92)"),
+        format!("CPYFRMSTMF FROMSTMF('{dir}/gldcas.cmd') TOMBR('/QSYS.LIB/{lib}.LIB/GLDQCMD.FILE/GLDCAS.MBR') MBROPT(*REPLACE)"),
+        format!("CRTCMD CMD({lib}/GLDCAS) PGM({lib}/GLDCASC) SRCFILE({lib}/GLDQCMD)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    let caller = format!(
+        "PGM
+  DCL &ID *CHAR 7
+  DCL &M *CHAR 80
+  {lib}/GLDCAS VAL('MiXed') WORD(lower)
+  QSH CMD('exit 0')
+  RCVMSG MSGTYPE(*COMP) MSG(&M) MSGID(&ID)
+  SNDPGMMSG MSG('first' *BCAT &ID *BCAT &M) MSGTYPE(*COMP)
+  RCVMSG MSGTYPE(*COMP) MSGID(&ID)
+  SNDPGMMSG MSG('second' *BCAT &ID) MSGTYPE(*COMP)
+ENDPGM
+"
+    );
+    as4tainr_core::ifs::write_file(
+        &client,
+        &format!("{dir}/gldcall.clle"),
+        caller.as_bytes(),
+        819,
+        0o644,
+        "QSECOFR",
+    )
+    .await
+    .unwrap();
+    cl_cmd(
+        &mut job,
+        format!("CRTBNDCL PGM({lib}/GLDCALL) SRCSTMF('{dir}/gldcall.clle')"),
+    )
+    .await
+    .unwrap();
+    let m = cl_cmd(&mut job, format!("CALL PGM({lib}/GLDCALL)"))
+        .await
+        .unwrap();
+    // PARM CASE(*MONO): a value in apostrophes keeps its case, a word
+    // is in upper case (CL reference, PARM CASE).
+    assert!(
+        m.iter()
+            .any(|l| l == "first CPF9898 VAL=<MiXed     > WORD=<LOWER     >."
+                || l == "first VAL=<MiXed     > WORD=<LOWER     >"),
+        "{m:?}"
+    );
+    assert!(m.iter().any(|l| l == "second QSH0005"), "{m:?}");
+    // CHGLIB: the library's text.
+    cl_cmd(&mut job, format!("CHGLIB LIB({lib}) TEXT('Changed text')"))
+        .await
+        .unwrap();
+    let t: String = client
+        .query_one(
+            "SELECT text FROM as4tainr.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
+            &[&lib],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(t, "Changed text");
+    let e = cl_cmd(&mut job, "CHGLIB LIB(NOSUCHLIB9) TEXT(*SAME)".into())
+        .await
+        .unwrap_err();
+    assert!(e.contains("CPF2110"), "{e}");
+}
+
+#[tokio::test]
+async fn cl_and_rpg_forms_from_qshoni() {
+    // Forms QshOni's sources use (built by its own build.sh, docs/import.md).
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let dir = format!("/tmp/{lib}f");
+    let _ = as4tainr_core::ifs::mkdir_all(&client, &dir, "QSECOFR").await;
+    cl_cmd(
+        &mut job,
+        format!("RUNSQL SQL('CREATE TABLE {lib}/QFO (N INTEGER)') COMMIT(*NONE)"),
+    )
+    .await
+    .unwrap();
+    let src = format!(
+        "PGM
+  DCL &T *CHAR 10 VALUE('*COMP')
+  DCL &C *CHAR 60 VALUE('CRTDTAARA DTAARA({lib}/QFOCMD) TYPE(*CHAR) LEN(5)')
+  DCL &L *DEC (15 5) VALUE(60)
+  DCL &X *CHAR 10
+  DCL &X *CHAR 10
+  /* CL programming, selective prompting: ?? and ?* mark parameters  */
+  /* the prompt would show; the values given are the command's.      */
+  ?CRTDTAARA ??DTAARA({lib}/QFOSEL) ?*TYPE(*CHAR) LEN(3)
+  /* QCMDEXC (CL reference, APIs): the command in its first          */
+  /* parameter, its length in the second.                            */
+  CALL QCMDEXC PARM(&C &L)
+  CHKOBJ {lib}/QFOCMD *DTAARA
+  CHKOBJ {lib}/QFOSEL *DTAARA
+  /* An escape no MONMSG names is a function check, CPF9999, which   */
+  /* MONMSG CPF0000 handles (CL programming, unmonitored messages).  */
+  RUNSQL SQL('SELEKT 1') COMMIT(*NONE)
+  MONMSG CPF0000 EXEC(SNDPGMMSG MSG('function check') MSGTYPE(&T))
+  /* QSYS2.NETSTAT_JOB_INFO and its columns.                         */
+  RUNSQL SQL('INSERT INTO {lib}/QFO SELECT COUNT(*) FROM +
+    QSYS2.NETSTAT_JOB_INFO WHERE LOCAL_PORT > 0 AND +
+    JOB_NAME IS NOT NULL OR REMOTE_PORT IS NOT NULL') COMMIT(*NONE)
+  SNDPGMMSG MSG('done') MSGTYPE(&T)
+ENDPGM
+"
+    );
+    as4tainr_core::ifs::write_file(
+        &client,
+        &format!("{dir}/qfo.clle"),
+        src.as_bytes(),
+        819,
+        0o644,
+        "QSECOFR",
+    )
+    .await
+    .unwrap();
+    // The same declaration twice is taken (QshOni's QSHCPYSRCC); a
+    // different one is still an error.
+    cl_cmd(
+        &mut job,
+        format!("CRTBNDCL PGM({lib}/QFO) SRCSTMF('{dir}/qfo.clle')"),
+    )
+    .await
+    .unwrap();
+    let m = cl_cmd(&mut job, format!("CALL PGM({lib}/QFO)"))
+        .await
+        .unwrap();
+    assert!(m.iter().any(|l| l == "function check"), "{m:?}");
+    assert!(m.iter().any(|l| l == "done"), "{m:?}");
+    let n: i64 = client
+        .query_one(&format!("SELECT count(*) FROM {lib}.qfo"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 1);
+    as4tainr_core::ifs::write_file(
+        &client,
+        &format!("{dir}/qfo2.clle"),
+        b"PGM\n DCL &X *CHAR 10\n DCL &X *CHAR 11\nENDPGM\n",
+        819,
+        0o644,
+        "QSECOFR",
+    )
+    .await
+    .unwrap();
+    cl_cmd(
+        &mut job,
+        format!("CRTBNDCL PGM({lib}/QFO2) SRCSTMF('{dir}/qfo2.clle')"),
+    )
+    .await
+    .unwrap_err();
+
+    // A source physical file read and updated by record (CL reference,
+    // CRTSRCPF: the fields SRCSEQ, zoned 6,2, SRCDAT, zoned 6,0, and
+    // SRCDTA; the record format is named like the file, so RPG renames
+    // it).
+    for c in [
+        format!("CRTSRCPF FILE({lib}/QFOSRC) RCDLEN(92)"),
+        format!(
+            "CPYFRMSTMF FROMSTMF('{dir}/qfo2.clle') TOMBR('/QSYS.LIB/{lib}.LIB/QFOSRC.FILE/M1.MBR') MBROPT(*REPLACE)"
+        ),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    let rpg = "**free
+dcl-f QFOSRC disk(*ext) usage(*update) rename(QFOSRC:SRCR);
+// ILE RPG reference, %LEN: a constant's length at compile time.
+dcl-c LEN6 %len('abcdef');
+dcl-s n int(10);
+dsply %char(LEN6);
+read QFOSRC;
+dow not %eof(QFOSRC);
+  n += 1;
+  dsply (%char(SRCSEQ) + ' ' + %char(SRCDAT) + ' ' + %trimr(SRCDTA));
+  if n = 2;
+    SRCDTA = ' DCL &Y *CHAR 1';
+    update SRCR;
+  endif;
+  read QFOSRC;
+enddo;
+*inlr = *on;
+";
+    let r = run_rpg(&url, &lib, "QSECOFR", "QFORLA", rpg, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "6",
+            "1.00 0 PGM",
+            "2.00 0  DCL &X *CHAR 10",
+            "3.00 0  DCL &X *CHAR 11",
+            "4.00 0 ENDPGM"
+        ]
+    );
+    let src: String = client
+        .query_one(
+            "SELECT source FROM as4tainr.source_members WHERE library=$1 AND file='QFOSRC' AND member='M1'",
+            &[&lib],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(src, "PGM\n DCL &Y *CHAR 1\n DCL &X *CHAR 11\nENDPGM\n");
+
+    // ILE RPG reference, program-described files: the input
+    // specifications define the fields whether or not the file exists
+    // when the program is compiled.
+    let rpg = "     FNOFILE    IF   F  100        DISK    USROPN
+     INOFILE    AA  01
+     I                                  1   10  FLD1
+     C                   EVAL      FLD1 = 'bound'
+     C     FLD1          DSPLY
+     C                   EVAL      *INLR = *ON
+";
+    let r = run_rpg(&url, &lib, "QSECOFR", "QFOISP", rpg, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["bound"]);
+}

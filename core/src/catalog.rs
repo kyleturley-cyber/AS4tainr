@@ -351,6 +351,7 @@ pub async fn init(client: &Client) -> Result<()> {
             .await?;
         crate::users::init(client).await?;
         crate::outq::init(client).await?;
+        crate::envvar::init(client).await?;
         crate::qsysinc::init(client).await?;
         // SQL runs as a restricted role. A database user who may not
         // create roles still gets a working system, without SQL.
@@ -1088,6 +1089,7 @@ pub async fn create_logical_file(
         keys: lf.keys.clone(),
         descending: lf.descending.clone(),
         view: None,
+        source: None,
     };
 
     let tx = client.transaction().await?;
@@ -1196,6 +1198,29 @@ pub async fn physical_file_of(
 }
 
 /// Resolve a file name through the library list (first match wins).
+/// [`resolve_file`], and source files too, as the record-level access of
+/// a program sees them: the first library with a database or source file
+/// of the name (source.rs: SRCSEQ, SRCDAT, SRCDTA).
+pub async fn resolve_record_file(client: &Client, libl: &[String], name: &str) -> Result<FileRef> {
+    let (libs, n) = match name.split_once('/') {
+        Some((l, n)) => (vec![l.to_ascii_uppercase()], n.to_ascii_uppercase()),
+        None => (libl.to_vec(), name.to_ascii_uppercase()),
+    };
+    for lib in &libs {
+        if let Ok(f) = resolve_file(client, std::slice::from_ref(lib), &n).await {
+            return Ok(f);
+        }
+        if crate::source::is_source_file(client, lib, &n).await? {
+            let rcdlen = crate::source::record_length(client, lib, &n).await?;
+            return Ok(FileRef {
+                library: lib.clone(),
+                file: crate::source::record_file(&n, rcdlen),
+            });
+        }
+    }
+    resolve_file(client, libl, name).await
+}
+
 pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Result<FileRef> {
     let (lib_q, name) = match name.split_once('/') {
         Some((l, n)) => (
@@ -1269,6 +1294,7 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
                 keys,
                 descending,
                 view: row.get::<_, Option<String>>(3).map(|v| v == "RRN"),
+                source: None,
             },
         });
     }

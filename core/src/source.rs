@@ -7,8 +7,13 @@
 //! change an object until it is created again.
 //!
 //! as4tainr keeps a source file as a *FILE object (attribute PF-SRC) and its
-//! members as text in `as4tainr.source_members`. Source files cannot be read
-//! with record-level access yet (no SRCSEQ/SRCDAT/SRCDTA records).
+//! members as text in `as4tainr.source_members`. A program reads and
+//! changes a member with record-level access as IBM i's records: SRCSEQ
+//! (sequence number, ZONED(6,2)), SRCDAT (date changed, ZONED(6,0)) and
+//! SRCDTA (the line, the record length less 12), record format named as
+//! the file. When it is opened the member's lines become the records of
+//! a table named as the file; when it is closed they are the member's
+//! lines again ([`open_member`], [`close_member`]).
 
 use anyhow::{bail, Result};
 use tokio_postgres::Client;
@@ -33,6 +38,8 @@ CREATE TABLE IF NOT EXISTS as4tainr.source_members (
     changed  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (library, file, member)
 );
+-- When a member was added: *FIRST is the member added first.
+ALTER TABLE as4tainr.source_members ADD COLUMN IF NOT EXISTS added timestamptz NOT NULL DEFAULT now();
 -- Stream files (a small IFS): include files that source refers to by
 -- path, such as RPG `/INCLUDE 'header.rpgleinc'`.
 CREATE TABLE IF NOT EXISTS as4tainr.stream_files (
@@ -348,6 +355,175 @@ pub async fn expand_cl_includes(client: &Client, libs: &[String], source: &str) 
         }
     }
     bail!("INCLUDE: includes nested more than 10 deep.");
+}
+
+/// A source file as a database file: its record format (named as the
+/// file) SRCSEQ, SRCDAT, SRCDTA.
+pub fn record_file(name: &str, rcdlen: u32) -> crate::dds::PhysicalFile {
+    use crate::dds::{DataType, FieldDef};
+    let field = |n: &str, t: DataType, len: u32, dec: u32, text: &str| FieldDef {
+        name: n.to_string(),
+        data_type: t,
+        length: len,
+        decimals: dec,
+        text: text.to_string(),
+        varlen: false,
+        null_capable: false,
+        default: None,
+        alias: None,
+        identity: None,
+        double: false,
+    };
+    crate::dds::PhysicalFile {
+        name: name.to_string(),
+        format: name.to_string(),
+        text: String::new(),
+        unique: false,
+        fields: vec![
+            field("SRCSEQ", DataType::Zoned, 6, 2, "Sequence number"),
+            field("SRCDAT", DataType::Zoned, 6, 0, "Date changed"),
+            field(
+                "SRCDTA",
+                DataType::Char,
+                rcdlen.saturating_sub(12).max(1),
+                0,
+                "Source data",
+            ),
+        ],
+        keys: vec![],
+        descending: vec![],
+        view: None,
+        source: Some(String::new()),
+    }
+}
+
+/// Open a member of a source file for record-level access: `member`, or
+/// the first one added (*FIRST). Its lines become the records of the
+/// table LIB.FILE (sequence numbers 1.00, 2.00...; date 0). The member's
+/// name.
+pub async fn open_member(
+    client: &Client,
+    library: &str,
+    file: &str,
+    member: Option<&str>,
+) -> Result<String> {
+    let member = match member.map(|m| m.trim().to_ascii_uppercase()) {
+        Some(m) if !m.is_empty() && m != "*FIRST" => m,
+        _ => client
+            .query_opt(
+                "SELECT member FROM as4tainr.source_members WHERE library=$1 AND file=$2
+                 ORDER BY added, member LIMIT 1",
+                &[&library, &file],
+            )
+            .await?
+            .map(|r| r.get(0))
+            .ok_or_else(|| {
+                anyhow::anyhow!("CPF4102: File {file} in library {library} has no members.")
+            })?,
+    };
+    let text: String = client
+        .query_opt(
+            "SELECT source FROM as4tainr.source_members WHERE library=$1 AND file=$2 AND member=$3",
+            &[&library, &file, &member],
+        )
+        .await?
+        .map(|r| r.get(0))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "CPF9815: Member {member} of file {file} in library {library} does not exist."
+            )
+        })?;
+    let rcdlen = record_length(client, library, file).await?;
+    let pf = record_file(file, rcdlen);
+    let table = format!(
+        "{}.{}",
+        crate::catalog::ident(library),
+        crate::catalog::ident(file)
+    );
+    let mut cols = vec!["rrn bigserial PRIMARY KEY".to_string()];
+    for f in &pf.fields {
+        let coll = if f.data_type == crate::dds::DataType::Char {
+            " COLLATE \"C\""
+        } else {
+            ""
+        };
+        cols.push(format!(
+            "{} {}{} NOT NULL{}",
+            f.column(),
+            f.sql_type(),
+            coll,
+            f.default_clause()
+        ));
+    }
+    client
+        .batch_execute(&format!(
+            "DROP TABLE IF EXISTS {table}; CREATE TABLE {table} ({})",
+            cols.join(", ")
+        ))
+        .await?;
+    let width = pf.fields[2].length as usize;
+    let lines: Vec<String> = if text.is_empty() {
+        vec![]
+    } else {
+        text.lines()
+            .map(|l| l.chars().take(width).collect::<String>())
+            .collect()
+    };
+    let seqs: Vec<String> = (1..=lines.len())
+        .map(|n| format!("{}.00", n % 10000))
+        .collect();
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {table} ({}, {}, {}) SELECT s::numeric, 0, rpad(d, {width})
+                   FROM unnest($1::text[], $2::text[]) AS t(s, d)",
+                pf.fields[0].column(),
+                pf.fields[1].column(),
+                pf.fields[2].column()
+            ),
+            &[&seqs, &lines],
+        )
+        .await?;
+    Ok(member)
+}
+
+/// Close a source member opened by [`open_member`]: the records, in
+/// arrival order, are its lines again (trailing blanks dropped).
+pub async fn close_member(client: &Client, library: &str, file: &str, member: &str) -> Result<()> {
+    let pf = record_file(file, 92);
+    let table = format!(
+        "{}.{}",
+        crate::catalog::ident(library),
+        crate::catalog::ident(file)
+    );
+    let rows = client
+        .query(
+            &format!(
+                "SELECT rtrim({}) FROM {table} ORDER BY rrn",
+                pf.fields[2].column()
+            ),
+            &[],
+        )
+        .await?;
+    let mut text: String = rows
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    client
+        .execute(
+            "UPDATE as4tainr.source_members SET source=$4, changed=now()
+             WHERE library=$1 AND file=$2 AND member=$3",
+            &[&library, &file, &member, &text],
+        )
+        .await?;
+    client
+        .batch_execute(&format!("DROP TABLE IF EXISTS {table}"))
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]

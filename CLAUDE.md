@@ -48,6 +48,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/dtaara.rs` | Data areas: CRTDTAARA/CHGDTAARA/RTVDTAARA values, RPG `IN *LOCK`/`OUT` (PostgreSQL advisory locks), the local data area `*LDA` (`as4tainr.local_data_areas`) |
 | `core/src/dtaq.rs` | Data queues (`as4tainr.data_queues`, `data_queue_entries`): CRTDTAQ, DLTDTAQ, QSNDDTAQ, QRCVDTAQ, QCLRDTAQ, QMHQRDQD; `ApiArgs` (an API's parameters from CL as text or from RPG as typed bytes) and ERRC0100 error codes for the APIs done in Rust (docs/data-queues.md) |
 | `core/src/usrspc.rs` | User spaces (`as4tainr.user_spaces`): QUSCRTUS, QUSDLTUS, QUSRTVUS, QUSCHGUS, QUSRUSAT, QUSCUSAT, and the list APIs QUSLMBR, QUSLOBJ, QUSLFLD and QUSLSPL with the generic header; QUSPTRUS is in `rpg/interp.rs` (a heap block written back at calls) |
+| `core/src/envvar.rs` | Environment variables: job-level (in the process, by job key) and system-level (`as4tainr.environment_variables`); `qsh.rs`: ADDENVVAR/CHGENVVAR/RMVENVVAR/WRKENVVAR and QSH/STRQSH (runs /bin/sh in the container only with AS4TAINR_QSH=1; QIBM_QSH_CMD_OUTPUT, QSH0005/QSH0006) |
 | `core/src/outq.rs` | Output queues (`as4tainr.output_queues`; QGPL/QPRINT made at init): CRTOUTQ, DLTOUTQ, CLROUTQ, HLDOUTQ, RLSOUTQ, WRKOUTQ, HLDSPLF, RLSSPLF, CHGSPLFA, WRKSPLFA, a profile's OUTQ (where `spool::open` puts a job's spooled files) |
 | `core/src/qsysinc.rs` | The system include library QSYSINC (QRPGLESRC QUSEC, QWCRNETA): as4tainr's own members from the API documentation, made at catalog initialization |
 | `core/src/sysapi.rs` | Which system API a CALL goes to (data queues, user spaces, list and retrieve APIs), and the retrieve APIs QUSROBJD, QUSRMBRD, QUSRSPLA, QWCRNETA |
@@ -55,7 +56,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `core/src/report.rs` | Printed reports in IBM's layouts (page headers A and B, columns, end-of-listing lines) for display commands with OUTPUT(*PRINT), batch and `system` |
 | `core/src/pase_system.rs` | The PASE `system` utility (`as4tainr system`): options -h -n -q -s -v, messages to standard output or error, exit status 0/255/2 |
 | `core/src/spool.rs` | Spooled files (`as4tainr.spooled_files`, `as4tainr.spool_lines`): printer output, QSYSPRT listings of batch display commands, QPJOBLOG |
-| `core/src/source.rs` | Source physical files (`PF-SRC` objects) and members (`as4tainr.source_members`), include files found in the IFS, CL `INCLUDE` expansion |
+| `core/src/source.rs` | Source physical files (`PF-SRC` objects) and members (`as4tainr.source_members`), a member opened by record (a temporary table of SRCSEQ/SRCDAT/SRCDTA, written back at close), include files found in the IFS, CL `INCLUDE` expansion |
 | `core/src/ifs.rs` | The integrated file system: directories and stream files (`as4tainr.ifs`), errno values, CCSID conversion (docs/ifs.md) |
 | `core/src/journal.rs` | Journals: CRTJRNRCV, CRTJRN, CHGJRN, DLTJRN, DLTJRNRCV, STRJRNPF, ENDJRNPF, DSPJRN, APYJRNCHG, RMVJRNCHG (`as4tainr.journals`, `journal_receivers`, `journaled_files`, `journal_entries`), the PostgreSQL trigger that journals record changes, record images (and back to column values, `image_json`), commit cycles, rollbacks journaled (`hold`/`restore`, `rollback_to`), QSYS2.DISPLAY_JOURNAL, INTERPRET (docs/journals.md) |
 | `core/src/pftrg.rs` | Trigger programs: ADDPFTRG, RMVPFTRG (`as4tainr.file_triggers`), the PostgreSQL triggers that note changes, the trigger buffer, `Change` (a change with its programs in the caller's session: *BEFORE programs on a trial run, ALWREPCHG, commitment control rules) and `run` for SQL; the RPG engine drives `Change` itself (`interp.rs` `triggered_change`, `call_trigger`) |
@@ -79,7 +80,7 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 | `tools/golden/`, `tools/golden_compare.py`, `tools/golden.py` | Capture output on a real IBM i (PUB400 over SSH, outputs kept in target/ibmi/golden, never committed) and compare it with `as4tainr system`; `screens.ps1` with `Tn5250Capture.cs` captures 5250 screens (docs/golden-outputs.md) |
 | `tools/golden.py` | Compares as4tainr with captures from a real IBM i (exit status, message IDs, printed output) and looks for IBM's message texts in the source (`--audit`); the captures stay in `target/ibmi/golden` (docs/golden-outputs.md) |
 | `tools/corpus.sh` | Clone a public repository of IBM i source and import it (real-world test; never vendored) |
-| `tools/legacy.sh` | Install real applications (Northwind for IBM i, COM order management, RPGUnit with its self-test) the way their READMEs say, on an empty database (cloned at test time; never vendored). docs/import.md |
+| `tools/legacy.sh` | Install real applications (Northwind for IBM i, COM order management, RPGUnit with its self-test, QshOni built by its build.sh) the way their READMEs say, on an empty database (cloned at test time; never vendored). docs/import.md |
 
 ## Commands
 
@@ -98,4 +99,5 @@ TN5250=/path/to/tn5250 AS4TAINR_BIN=target/debug/as4tainr python3 tools/gate3_52
 - SQL is built dynamically only with `catalog::ident()` for identifiers. Values are always bound parameters (as text, then `CAST`), except in data definition, which takes no parameters: DEFAULT and CHECK constants are written with `dds::quote()` after `ddl.rs` has parsed them. The exception is user SQL (`sql.rs`), which only ever runs as the `as4tainr_sql` login: never run user-supplied SQL on the main connection.
 - `as4tainr batch "CMD"` runs a command in a batch job right away (SBMJOB plus QBATCH without a server): spooled files stay, the job log goes to standard output. `as4tainr system` keeps no spooled files, as PASE `system`.
 - `AS4TAINR_TRACE_ERRORS=1` prints every error an RPG program handles (MONITOR, error indicators, *PSSR) to standard error: the quickest way to see why a real application takes an error path.
+- `AS4TAINR_QSH=1` lets QSH/STRQSH run commands with /bin/sh in the container (off by default: the shell is outside as4tainr's authorities).
 - Commits are signed off (`git commit -s`). Commit messages describe the IBM i behavior implemented.

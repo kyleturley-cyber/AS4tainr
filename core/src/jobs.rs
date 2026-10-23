@@ -211,6 +211,7 @@ pub async fn end(client: &Client, id: &JobId, normal: bool) -> Result<()> {
     crate::ile::end_activations(&id.to_string(), &crate::ile::Groups::All);
     crate::rpg::interp::close_ended_spools(client).await;
     crate::pgmmsg::named_end_job(&id.to_string());
+    crate::envvar::end_job(&id.to_string());
     // Its open stream files are closed.
     for (path, data) in crate::rpg::interp::crt::end_job(&id.to_string()) {
         let _ = crate::ifs::write_file(client, &path, &data, 37, 0o644, "QSECOFR").await;

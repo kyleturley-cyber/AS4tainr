@@ -1,0 +1,26 @@
+# Golden: environment variables (ADDENVVAR, CHGENVVAR, RMVENVVAR), QSH
+# from CL (QSH0005/QSH0006 and their data, QIBM_QSH_CMD_ESCAPE_MSG,
+# QIBM_QSH_CMD_OUTPUT=FILE and the file's CCSID), message data shorter
+# than its FMT, an expression as a parameter value, CHGLIB's and
+# CRTCMD's completion messages, CASE(*MONO) with a quoted value.
+# Capture with: golden.ps1 -List tools\golden\qsh.txt -Files tools\golden\qsh
+# (the source files go to /home/AS4TRAINR/gld first).
+q_cleanup|!system -q "DLTPGM PGM(AS4TRAINR1/GLDQSH)"; system -q "DLTF FILE(AS4TRAINR1/GLDQSO)"; system -q "DLTCMD CMD(AS4TRAINR1/GLDCAS)"; system -q "DLTPGM PGM(AS4TRAINR1/GLDCASC)"; system -q "DLTF FILE(AS4TRAINR1/GLDQCMD)"; rm -f /home/AS4TRAINR/gld/qshout.txt; echo cleaned
+q_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLDQSO (ID CHAR(10) NOT NULL, VAL CHAR(150) NOT NULL)') COMMIT(*NONE)
+q_tag|!for f in gldqsh.clle gldcas.cmd gldcasc.clle; do setccsid 819 /home/AS4TRAINR/gld/$f; done; ls -l /home/AS4TRAINR/gld
+q_crt|!system "CRTBNDCL PGM(AS4TRAINR1/GLDQSH) SRCSTMF('/home/AS4TRAINR/gld/gldqsh.clle')" | tail -4
+q_call|CALL PGM(AS4TRAINR1/GLDQSH)
+q_out|CPYF FROMFILE(AS4TRAINR1/GLDQSO) TOFILE(*PRINT)
+# The output file QSH wrote: its CCSID and contents.
+q_file|!attr /home/AS4TRAINR/gld/qshout.txt CCSID; od -c /home/AS4TRAINR/gld/qshout.txt | head -3
+# QSH without QIBM_QSH_CMD_OUTPUT from `system`: where its output goes.
+q_stdout|QSH CMD('echo plain; exit 2')
+# CHGLIB's completion message.
+q_chglib|CHGLIB LIB(AS4TRAINR1) TEXT(*SAME)
+# CRTCMD's completion message; a CASE(*MONO) parameter given a quoted
+# lower case value (the CPP sends it back as a message).
+q_crtcpp|!system "CRTBNDCL PGM(AS4TRAINR1/GLDCASC) SRCSTMF('/home/AS4TRAINR/gld/gldcasc.clle')" | tail -2
+q_cmdsrc|!system -q "CRTSRCPF FILE(AS4TRAINR1/GLDQCMD) RCDLEN(92)"; system "CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gldcas.cmd') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLDQCMD.FILE/GLDCAS.MBR') MBROPT(*REPLACE)"
+q_crtcmd|CRTCMD CMD(AS4TRAINR1/GLDCAS) PGM(AS4TRAINR1/GLDCASC) SRCFILE(AS4TRAINR1/GLDQCMD)
+q_case|AS4TRAINR1/GLDCAS VAL('MiXed') WORD(lower)
+q_end|!system -q "DLTPGM PGM(AS4TRAINR1/GLDQSH)"; system -q "DLTF FILE(AS4TRAINR1/GLDQSO)"; system -q "DLTCMD CMD(AS4TRAINR1/GLDCAS)"; system -q "DLTPGM PGM(AS4TRAINR1/GLDCASC)"; system -q "DLTMSGF MSGF(AS4TRAINR1/GLDMSGF)"; system -q "DLTF FILE(AS4TRAINR1/GLDQCMD)"; system -q "DLTDTAARA DTAARA(AS4TRAINR1/GLDEXP)"; echo cleaned

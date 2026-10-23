@@ -120,6 +120,12 @@ impl CallStack {
         k
     }
 
+    /// The messages on the running program's queue (to tell those a
+    /// command put there from those it only returned).
+    pub fn current_queue(&self) -> &[QMsg] {
+        self.stack.last().map(|q| q.as_slice()).unwrap_or(&[])
+    }
+
     /// The text a system message had in this job.
     pub fn known_text(&self, msgid: &str) -> Option<&String> {
         self.texts.get(msgid)
@@ -248,7 +254,7 @@ pub fn from_error(e: &anyhow::Error, id: &str) -> QMsg {
 fn is_system_msgf(name: &str) -> bool {
     matches!(
         name,
-        "QCPFMSG" | "QRNXMSG" | "QSQLMSG" | "QCPFMSGL" | "QCPFMSGU"
+        "QCPFMSG" | "QRNXMSG" | "QSQLMSG" | "QCPFMSGL" | "QCPFMSGU" | "QZSHMSGF"
     )
 }
 

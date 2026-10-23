@@ -336,9 +336,33 @@ SELECT CAST(lpad(j.number::text, 6, '0') || '/' || j.user_name || '/' || j.name 
  ORDER BY j.number
 $as4tainr$;
 
+-- NETSTAT_JOB_INFO (IBM i Services): the TCP/IP connections and the jobs
+-- that use them, its columns as IBM's. The connections as4tainr knows
+-- are its jobs' connections to the database server (pg_stat_activity;
+-- a job's session is named after the job): the 5250 sessions' own
+-- connections are not kept (fidelity-gaps).
+CREATE OR REPLACE VIEW qsys2.netstat_job_info AS
+SELECT CAST(CASE WHEN family(a.client_addr) = 6 THEN 'IPV6' ELSE 'IPV4' END AS char(4)) AS connection_type,
+       CAST(coalesce(host(inet_server_addr()), '127.0.0.1') AS varchar(45)) AS remote_address,
+       CAST(coalesce(inet_server_port(), 5432) AS integer) AS remote_port,
+       CAST(NULL AS varchar(14)) AS remote_port_name,
+       CAST(host(a.client_addr) AS varchar(45)) AS local_address,
+       CAST(a.client_port AS integer) AS local_port,
+       CAST(NULL AS varchar(14)) AS local_port_name,
+       CAST(split_part(a.application_name, '/', 2) AS varchar(10)) AS authorization_name,
+       CAST(nullif(a.application_name, '') AS varchar(28)) AS job_name,
+       CAST(nullif(split_part(a.application_name, '/', 3), '') AS varchar(10)) AS job_name_short,
+       CAST(nullif(split_part(a.application_name, '/', 2), '') AS varchar(10)) AS job_user,
+       CAST(nullif(split_part(a.application_name, '/', 1), '') AS varchar(6)) AS job_number,
+       CAST(NULL AS varchar(16)) AS slic_task_name,
+       CAST(NULL AS bytea) AS internal_job_id,
+       CAST(NULL AS varchar(11)) AS job_type
+  FROM pg_stat_activity a
+ WHERE a.client_port IS NOT NULL AND a.client_port > 0;
+
 GRANT SELECT ON qsys2.syscst, qsys2.syskeycst, qsys2.syschkcst, qsys2.sysrefcst, qsys2.systriggers,
     qsys2.syssequences, qsys2.output_queue_entries_basic, qsys2.output_queue_entries,
-    qsys2.object_privileges TO {role};
+    qsys2.object_privileges, qsys2.netstat_job_info TO {role};
 GRANT EXECUTE ON FUNCTION qsys2.job_info(varchar, varchar, varchar, varchar, varchar) TO {role};
 "#,
             role = crate::sql::SQL_ROLE

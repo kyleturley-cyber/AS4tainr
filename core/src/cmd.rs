@@ -1090,7 +1090,9 @@ fn encode_scalar(p: &Parm, text: &str, quoted: bool, special: bool) -> Result<Ve
     let kwd = if p.kwd.is_empty() { "element" } else { &p.kwd };
     let len = p.len as usize;
     let chars = |t: &str| -> Result<Vec<u8>> {
-        let t = if p.mixed && quoted {
+        // PARM CASE: *MONO folds a value to upper case, but a value in
+        // apostrophes keeps its case either way (CL reference, PARM).
+        let t = if p.mixed || quoted {
             t.to_string()
         } else {
             t.to_ascii_uppercase()
@@ -1432,7 +1434,8 @@ mod tests {
     // a qualified name is its parts, object first; a simple list is a
     // 2-byte count and the values; a mixed list is the count of elements
     // and the elements; *DEC is passed as a number; SPCVAL replaces a
-    // special value; CASE(*MONO) folds quoted text to upper case.
+    // special value; CASE(*MONO) folds unquoted text to upper case, quoted
+    // text keeps its case (CL reference, PARM: CASE).
     const SRC: &str = "
              CMD        PROMPT('Test command')
              PARM       KWD(OUTQ) TYPE(Q1) MIN(1) PROMPT('Output queue')
@@ -1470,6 +1473,12 @@ E1:          ELEM       TYPE(*CHAR) LEN(2) DFT(AA)
         assert_eq!(crate::rpg::data::a(&names[2..]), "AB  CD  ");
         assert_eq!(bytes(&args[3]), "*NO ");
         assert_eq!(bytes(&args[4]), "Hi    ");
+        // CASE(*MONO): a quoted value keeps its case.
+        let q = encode(&d, "TST MYQ NAMES('ab')").unwrap();
+        match &q[2] {
+            Arg::Bytes(b) => assert_eq!(crate::rpg::data::a(&b[2..]), "ab  "),
+            _ => panic!(),
+        }
         let pair = match &args[5] {
             Arg::Bytes(b) => b.clone(),
             _ => panic!(),

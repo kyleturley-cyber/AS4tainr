@@ -1726,7 +1726,7 @@ impl<'a> Machine<'a> {
                     .and_then(|k| k.args.first())
                     .is_some_and(|a| !a.trim().eq_ignore_ascii_case("*EXTDESC"));
                 let n = fi.decl.name.clone();
-                match self.block(crate::catalog::resolve_file(
+                match self.block(crate::catalog::resolve_record_file(
                     self.io.client,
                     &self.io.libl,
                     &n,
@@ -1743,6 +1743,7 @@ impl<'a> Machine<'a> {
                             keys: vec![],
                             descending: vec![],
                             view: None,
+                            source: None,
                         },
                     },
                     Err(_) => bail!("CPF4101: File {n} not found."),
@@ -1772,7 +1773,7 @@ impl<'a> Machine<'a> {
                 let n = n.trim().to_ascii_uppercase();
                 let n = n.strip_prefix("*LIBL/").unwrap_or(&n).to_string();
                 fref = self
-                    .block(crate::catalog::resolve_file(
+                    .block(crate::catalog::resolve_record_file(
                         self.io.client,
                         &self.io.libl,
                         &n,
@@ -1822,6 +1823,39 @@ impl<'a> Machine<'a> {
                 ),
             }
         }
+        // A source file: the member (EXTMBR, else *FIRST) is opened as
+        // records (source.rs).
+        if fref.file.source.is_some() {
+            let member = match crate::rpg::ast::keyword(&fi.decl.keywords, "EXTMBR")
+                .and_then(|k| k.args.first().cloned())
+            {
+                Some(arg) => {
+                    let arg = arg.trim().to_string();
+                    if let Some(lit) = arg.strip_prefix('\'') {
+                        Some(lit.trim_end_matches('\'').to_string())
+                    } else if arg.starts_with('*') {
+                        Some(arg)
+                    } else {
+                        let v = self.eval(&Expr::name(&arg.to_ascii_uppercase()))?;
+                        Some(a(&v.chars()?).trim().to_string())
+                    }
+                }
+                None => None,
+            };
+            let m = self.block(crate::source::open_member(
+                self.io.client,
+                &fref.library,
+                &fref.file.name,
+                member.as_deref(),
+            ))?;
+            fref.file.source = Some(m);
+            let mut open = OpenFile::new(fref.clone());
+            if update {
+                open = open.for_update(format!("{}/{}", fref.library, fref.file.name));
+            }
+            self.files[i].open = Some(open);
+            return Ok(());
+        }
         let mut open = OpenFile::new(fref.clone());
         if update {
             let (lib, pf) = self.block(crate::catalog::physical_file_of(
@@ -1832,6 +1866,22 @@ impl<'a> Machine<'a> {
             open = open.for_update(format!("{lib}/{pf}"));
         }
         self.files[i].open = Some(open);
+        Ok(())
+    }
+
+    /// A file is closed: its record lock goes; a source member's records
+    /// are its lines again.
+    pub(super) fn close_open_file(&mut self, mut f: OpenFile) -> Result<()> {
+        let client = self.io.client;
+        let _ = self.io.rt.block_on(f.release(client));
+        if let Some(m) = f.file.file.source.clone().filter(|m| !m.is_empty()) {
+            self.block(crate::source::close_member(
+                client,
+                &f.file.library,
+                &f.file.file.name,
+                &m,
+            ))?;
+        }
         Ok(())
     }
 
@@ -2209,8 +2259,8 @@ impl<'a> Machine<'a> {
                 self.open_file(i)?;
             }
             FileOp::Close => {
-                if let Some(mut f) = self.files[i].open.take() {
-                    let _ = rt.block_on(f.release(client));
+                if let Some(f) = self.files[i].open.take() {
+                    self.close_open_file(f)?;
                 }
             }
             FileOp::Unlock | FileOp::Feod => {}
@@ -4091,8 +4141,13 @@ impl<'a> Machine<'a> {
                 g.get_or_insert_with(HashMap::new).insert(key, a);
             }
         } else {
-            for f in self.files.iter_mut() {
-                f.open = None;
+            let opened: Vec<OpenFile> = self
+                .files
+                .iter_mut()
+                .filter_map(|f| f.open.take())
+                .collect();
+            for f in opened {
+                self.close_open_file(f)?;
             }
         }
         r?;

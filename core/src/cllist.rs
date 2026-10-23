@@ -578,7 +578,11 @@ fn code_lines(source: &str) -> Vec<usize> {
                     k += 2;
                     continue;
                 }
-            } else if !in_q && cs[k] == '/' && cs.get(k + 1) == Some(&'*') {
+            } else if !in_q
+                && cs[k] == '/'
+                && cs.get(k + 1) == Some(&'*')
+                && !crate::clpgm::qualifier_slash(&cs, k)
+            {
                 in_comment = true;
                 k += 2;
                 continue;

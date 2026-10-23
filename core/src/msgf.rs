@@ -129,6 +129,7 @@ pub fn system_msgf(id: &str) -> &'static str {
     match id.get(..3) {
         Some("RNQ") | Some("RNX") => "QRNXMSG",
         Some("SQL") => "QSQLMSG",
+        Some("QSH") => "QZSHMSGF",
         _ => "QCPFMSG",
     }
 }

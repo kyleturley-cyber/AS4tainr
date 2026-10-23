@@ -772,6 +772,7 @@ pub static NAMES: &[&str] = &[
     "DSPACTSCD",
     "DSPAPPNINF",
     "DSPASPSTS",
+    "DSPATR",
     "DSPAUDJRNE",
     "DSPAUT",
     "DSPAUTHLR",

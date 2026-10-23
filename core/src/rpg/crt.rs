@@ -53,6 +53,10 @@ pub const C_FUNCTIONS: &[&str] = &[
     "__ERRNO",
     "STRERROR",
     "PERROR",
+    "GETENV",
+    "PUTENV",
+    "QP0ZGETENV",
+    "QP0ZPUTENV",
     "STRLEN",
     "STRCPY",
     "STRNCPY",
@@ -207,6 +211,40 @@ impl<'a> Machine<'a> {
                 self.c_result(r.map(|_| 0))
             }
             "__ERRNO" => Ok(self.errno_ptr()),
+            // getenv(), putenv(), Qp0zGetEnv(), Qp0zPutEnv() (IBM i
+            // Environment variable APIs): the job's variables; getenv
+            // returns NULL for one that is not set; putenv takes
+            // "name=value" and returns 0, or -1 with EINVAL.
+            "GETENV" | "QP0ZGETENV" => {
+                let name = a(&self.str_at(&val(0), None)?.chars()?);
+                let job = self.job();
+                match self.block(crate::envvar::get(self.io.client, &job, &name))? {
+                    Some(crate::envvar::Var { value: Some(v), .. }) => Ok(self.c_static_string(&v)),
+                    Some(_) => Ok(self.c_static_string("")),
+                    None => Ok(Value::Fig(Fig::Null)),
+                }
+            }
+            "PUTENV" | "QP0ZPUTENV" => {
+                let s = a(&self.str_at(&val(0), None)?.chars()?);
+                let job = self.job();
+                let r = match s.split_once('=') {
+                    Some((n, v)) if crate::envvar::check_name(n).is_ok() => {
+                        self.block(crate::envvar::add(
+                            self.io.client,
+                            &job,
+                            crate::envvar::Level::Job,
+                            n,
+                            crate::envvar::Var {
+                                value: Some(v.to_string()),
+                                ccsid: 0,
+                            },
+                            true,
+                        ))
+                    }
+                    _ => Err(ifs::Errno(errno::EINVAL).into()),
+                };
+                self.c_result(r.map(|_| 0))
+            }
             "STRERROR" => {
                 let text = ifs::errno_text(int(0) as i32);
                 Ok(self.c_static_string(&text))

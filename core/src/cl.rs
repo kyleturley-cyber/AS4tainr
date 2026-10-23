@@ -91,6 +91,59 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "ADDENVVAR",
+        description: "Add Environment Variable",
+        params: &[
+            p("ENVVAR", Kind::Text, true, None, "Environment variable"),
+            p("VALUE", Kind::Text, false, Some("*NULL"), "Initial value"),
+            p("CCSID", Kind::Text, false, Some("*JOB"), "Coded character set ID").ch("1-65535, *JOB, *HEX"),
+            p("LEVEL", Kind::Name, false, Some("*JOB"), "Level").ch("*JOB, *SYS").keyword_only(),
+            p("REPLACE", Kind::Name, false, Some("*NO"), "Replace existing entry").ch("*NO, *YES").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CHGENVVAR",
+        description: "Change Environment Variable",
+        params: &[
+            p("ENVVAR", Kind::Text, true, None, "Environment variable"),
+            p("VALUE", Kind::Text, false, Some("*SAME"), "New value"),
+            p("CCSID", Kind::Text, false, Some("*SAME"), "Coded character set ID").ch("1-65535, *SAME, *JOB, *HEX"),
+            p("LEVEL", Kind::Name, false, Some("*JOB"), "Level").ch("*JOB, *SYS").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "RMVENVVAR",
+        description: "Remove Environment Variable",
+        params: &[
+            p("ENVVAR", Kind::Text, true, None, "Environment variable"),
+            p("LEVEL", Kind::Name, false, Some("*JOB"), "Level").ch("*JOB, *SYS").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "WRKENVVAR",
+        description: "Work with Environment Vars",
+        params: &[p("LEVEL", Kind::Name, false, Some("*JOB"), "Level").ch("*JOB, *SYS")],
+    },
+    CommandDef {
+        name: "QSH",
+        description: "Start QSH",
+        params: &[p("CMD", Kind::Text, false, Some("*NONE"), "Command").ch("*NONE")],
+    },
+    CommandDef {
+        name: "STRQSH",
+        description: "Start QSH",
+        params: &[p("CMD", Kind::Text, false, Some("*NONE"), "Command").ch("*NONE")],
+    },
+    CommandDef {
+        name: "CHGLIB",
+        description: "Change Library",
+        params: &[
+            p("LIB", Kind::Name, true, None, "Library").ch("Name"),
+            p("TYPE", Kind::Name, false, Some("*SAME"), "Library type").ch("*SAME, *PROD, *TEST"),
+            p("TEXT", Kind::Text, false, Some("*SAME"), "Text 'description'"),
+        ],
+    },
+    CommandDef {
         name: "DSPLIB",
         description: "Display Library",
         params: &[p("LIB", Kind::Name, false, Some("*LIBL"), "Library").ch("Name, *LIBL, *CURLIB")],
@@ -366,6 +419,9 @@ pub static COMMANDS: &[CommandDef] = &[
             p("OPTION", Kind::List, false, Some("*SRC"), "Source listing options").keyword_only(),
             p("REPLACE", Kind::Name, false, Some("*YES"), "Replace panel group")
                 .ch("*YES, *NO")
+                .keyword_only(),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
+                .ch("Name, *LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE")
                 .keyword_only(),
         ],
     },
@@ -1450,6 +1506,9 @@ pub static COMMANDS: &[CommandDef] = &[
             p("VALUE", Kind::Text, false, Some("*DFT"), "Initial value"),
             // *BLANK, as IBM i's CRTDTAARA prompt shows it (PUB400).
             p("TEXT", Kind::Text, false, Some("*BLANK"), "Text 'description'"),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
+                .ch("Name, *LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE")
+                .keyword_only(),
         ],
     },
     CommandDef {
@@ -1519,6 +1578,9 @@ pub static COMMANDS: &[CommandDef] = &[
             p("FILE", Kind::Qualified, true, None, "File").ch("Name"),
             p("RCDLEN", Kind::Text, false, Some("92"), "Record length").ch("Number"),
             p("TEXT", Kind::Text, false, Some(""), "Text 'description'").keyword_only(),
+            p("CCSID", Kind::Text, false, Some("*JOB"), "Coded character set ID")
+                .ch("1-65535, *JOB, *HEX")
+                .keyword_only(),
         ],
     },
     CommandDef {
@@ -1599,6 +1661,16 @@ pub static COMMANDS: &[CommandDef] = &[
                 "Text 'description'",
             )
             .keyword_only(),
+            p("CCSID", Kind::Text, false, Some("*JOB"), "Coded character set ID")
+                .ch("1-65535, *JOB, *HEX")
+                .keyword_only(),
+            // Accepted; the compiler listing options, the member limit and
+            // the size are not honored (docs/fidelity-gaps.md).
+            p("OPTION", Kind::List, false, Some("*SRC *LIST"), "Source listing options")
+                .keyword_only(),
+            p("MAXMBRS", Kind::Text, false, Some("1"), "Maximum members").ch("Number, *NOMAX")
+                .keyword_only(),
+            p("SIZE", Kind::List, false, Some("10000 1000 3"), "Member size").keyword_only(),
         ],
     },
     CommandDef {
@@ -1648,6 +1720,9 @@ pub static COMMANDS: &[CommandDef] = &[
                 .keyword_only(),
             p("REPLACE", Kind::Name, false, Some("*YES"), "Replace file")
                 .ch("*YES, *NO")
+                .keyword_only(),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
+                .ch("Name, *LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE")
                 .keyword_only(),
         ],
     },
@@ -1796,6 +1871,27 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*CURRENT, *PRV, VxRxMx")
             .keyword_only(),
+            p("DFTACTGRP", Kind::Name, false, Some("*YES"), "Default activation group")
+                .ch("*YES, *NO")
+                .keyword_only(),
+            p("ACTGRP", Kind::Name, false, Some("*STGMDL"), "Activation group")
+                .ch("Name, *STGMDL, *NEW, *CALLER")
+                .keyword_only(),
+            p("BNDDIR", Kind::List, false, Some("*NONE"), "Binding directory")
+                .ch("Name, *NONE")
+                .keyword_only(),
+            p("ALWRTVSRC", Kind::Name, false, Some("*YES"), "Allow RTVCLSRC")
+                .ch("*YES, *NO")
+                .keyword_only(),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
+                .ch("Name, *LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE")
+                .keyword_only(),
+            p("USRPRF", Kind::Name, false, Some("*USER"), "User profile")
+                .ch("*USER, *OWNER")
+                .keyword_only(),
+            p("LOG", Kind::Name, false, Some("*JOB"), "Log commands")
+                .ch("*JOB, *YES, *NO")
+                .keyword_only(),
         ],
     },
     CommandDef {
@@ -1829,6 +1925,21 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*YES, *NO")
             .keyword_only(),
+            p("TGTRLS", Kind::Name, false, Some("*CURRENT"), "Target release")
+                .ch("*CURRENT, *PRV, VxRxMx")
+                .keyword_only(),
+            p("ALWRTVSRC", Kind::Name, false, Some("*YES"), "Allow RTVCLSRC")
+                .ch("*YES, *NO")
+                .keyword_only(),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
+                .ch("Name, *LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE")
+                .keyword_only(),
+            p("USRPRF", Kind::Name, false, Some("*USER"), "User profile")
+                .ch("*USER, *OWNER")
+                .keyword_only(),
+            p("LOG", Kind::Name, false, Some("*JOB"), "Log commands")
+                .ch("*JOB, *YES, *NO")
+                .keyword_only(),
         ],
     },
     CommandDef {
@@ -1931,6 +2042,12 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*CURRENT, *PRV, VxRxMx")
             .keyword_only(),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
+                .ch("Name, *LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE")
+                .keyword_only(),
+            p("USRPRF", Kind::Name, false, Some("*USER"), "User profile")
+                .ch("*USER, *OWNER")
+                .keyword_only(),
         ],
     },
     CommandDef {
@@ -2074,6 +2191,9 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*CURRENT, *PRV, VxRxMx")
             .keyword_only(),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
+                .ch("Name, *LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE")
+                .keyword_only(),
         ],
     },
     CommandDef {
@@ -2150,6 +2270,15 @@ pub static COMMANDS: &[CommandDef] = &[
             p("OPTION", Kind::List, false, Some("*GEN"), "Creation options")
                 .ch("*GEN, *NOGEN, *NODUPPROC, *DUPPROC, *NODUPVAR, *DUPVAR, *WARN, *NOWARN, *RSLVREF, *UNRSLVREF")
                 .keyword_only(),
+            p("TGTRLS", Kind::Name, false, Some("*CURRENT"), "Target release")
+                .ch("*CURRENT, *PRV, VxRxMx")
+                .keyword_only(),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
+                .ch("Name, *LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE")
+                .keyword_only(),
+            p("USRPRF", Kind::Name, false, Some("*USER"), "User profile")
+                .ch("*USER, *OWNER")
+                .keyword_only(),
         ],
     },
     CommandDef {
@@ -2214,6 +2343,9 @@ pub static COMMANDS: &[CommandDef] = &[
             p("OPTION", Kind::List, false, Some("*GEN"), "Creation options")
                 .ch("*GEN, *NOGEN, *NODUPPROC, *DUPPROC, *NODUPVAR, *DUPVAR, *WARN, *NOWARN, *RSLVREF, *UNRSLVREF")
                 .keyword_only(),
+            p("TGTRLS", Kind::Name, false, Some("*CURRENT"), "Target release")
+                .ch("*CURRENT, *PRV, VxRxMx")
+                .keyword_only(),
         ],
     },
     CommandDef {
@@ -2222,6 +2354,9 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[
             p("BNDDIR", Kind::Qualified, true, None, "Binding directory").ch("Name"),
             p("TEXT", Kind::Text, false, Some(""), "Text 'description'").keyword_only(),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
+                .ch("Name, *LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE")
+                .keyword_only(),
         ],
     },
     CommandDef {
@@ -2231,6 +2366,9 @@ pub static COMMANDS: &[CommandDef] = &[
             p("BNDDIR", Kind::Qualified, true, None, "Binding directory").ch("Name"),
             p("OBJ", Kind::Command, true, None, "Object specifications")
                 .ch("(Name *SRVPGM|*MODULE)..."),
+            p("POSITION", Kind::List, false, Some("*LAST"), "Position")
+                .ch("*LAST, *FIRST, *REPLACE, *BEFORE, *AFTER")
+                .keyword_only(),
         ],
     },
     CommandDef {
@@ -2387,6 +2525,9 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*YES, *NO")
             .keyword_only(),
+            p("TGTRLS", Kind::Name, false, Some("*CURRENT"), "Target release")
+                .ch("*CURRENT, *PRV, VxRxMx")
+                .keyword_only(),
         ],
     },
     CommandDef {
@@ -2552,6 +2693,12 @@ pub static COMMANDS: &[CommandDef] = &[
                 "Compiler options",
             )
             .keyword_only(),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
+                .ch("Name, *LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE")
+                .keyword_only(),
+            p("USRPRF", Kind::Name, false, Some("*USER"), "User profile")
+                .ch("*USER, *OWNER")
+                .keyword_only(),
         ],
     },
     CommandDef {
@@ -2721,6 +2868,10 @@ pub static COMMANDS: &[CommandDef] = &[
                 "Stream file CCSID",
             )
             .ch("1-65533, *STMF, *PCASCII, *STDASCII"),
+            // The old name of STMFCCSID, still accepted (QshOni's
+            // QSHEXECC, built for V7R3): a code page.
+            p("STMFCODPAG", Kind::Text, false, Some("*STMF"), "Stream file code page")
+                .keyword_only(),
             p(
                 "ENDLINFMT",
                 Kind::Name,
@@ -2763,6 +2914,10 @@ pub static COMMANDS: &[CommandDef] = &[
                 "Stream file CCSID",
             )
             .ch("1-65533, *STMF, *PCASCII"),
+            // The old name of STMFCCSID, still accepted (QshOni's
+            // QSHEXECC, built for V7R3): a code page.
+            p("STMFCODPAG", Kind::Text, false, Some("*STMF"), "Stream file code page")
+                .keyword_only(),
             p(
                 "DBFCCSID",
                 Kind::Text,
@@ -3379,6 +3534,7 @@ pub static GROUPS: &[Group] = &[
         title: "Library Commands",
         commands: &[
             "CRTLIB",
+            "CHGLIB",
             "DLTLIB",
             "CLRLIB",
             "DSPLIB",
@@ -3450,6 +3606,10 @@ pub static GROUPS: &[Group] = &[
             "DSPMSG",
             "DLYJOB",
             "DSPSYSVAL",
+            "ADDENVVAR",
+            "CHGENVVAR",
+            "RMVENVVAR",
+            "WRKENVVAR",
         ],
     },
     Group {
@@ -3543,6 +3703,8 @@ pub static GROUPS: &[Group] = &[
         item: "Integrated file system commands",
         title: "Integrated File System Commands",
         commands: &[
+            "QSH",
+            "STRQSH",
             "WRKLNK",
             "DSPLNK",
             "MKDIR",

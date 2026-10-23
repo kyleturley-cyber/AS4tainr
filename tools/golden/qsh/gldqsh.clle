@@ -1,0 +1,121 @@
+/* Golden: environment variables, QSH from CL, short message data,    */
+/* an expression as a parameter value, a qualified *ALL/*ALL. Each    */
+/* result goes into AS4TRAINR1/GLDQSO (ID, VAL), printed by the list. */
+PGM
+  DCL &ID   *CHAR 7
+  DCL &D    *CHAR 100
+  DCL &DL   *DEC (5 0)
+  DCL &N    *DEC (10 0)
+  DCL &M    *CHAR 100
+  DCL &T    *CHAR 50
+  DCL &K    *CHAR 10
+  DCL &V    *CHAR 150
+
+  /* A qualified name whose object part is a special value: not a    */
+  /* comment.                                                         */
+  DSPOBJD OBJ(AS4TRAINR1/*ALL) OBJTYPE(*DTAARA) OUTPUT(*PRINT)
+  MONMSG CPF0000
+
+  /* ADDENVVAR twice, REPLACE(*NO): the second one's message.         */
+  ADDENVVAR ENVVAR(GLDVAR) VALUE('one') REPLACE(*YES)
+  ADDENVVAR ENVVAR(GLDVAR) VALUE('two')
+  MONMSG CPF0000 EXEC(DO)
+    RCVMSG MSGTYPE(*EXCP) MSGID(&ID)
+    CHGVAR &K 'dupadd'
+    CHGVAR &V &ID
+    CALLSUBR PUT
+  ENDDO
+  RMVENVVAR ENVVAR(GLDNOPE)
+  MONMSG CPF0000 EXEC(DO)
+    RCVMSG MSGTYPE(*EXCP) MSGID(&ID)
+    CHGVAR &K 'rmvmissing'
+    CHGVAR &V &ID
+    CALLSUBR PUT
+  ENDDO
+  CHGENVVAR ENVVAR(GLDNOPE) VALUE('x')
+  MONMSG CPF0000 EXEC(DO)
+    RCVMSG MSGTYPE(*EXCP) MSGID(&ID)
+    CHGVAR &K 'chgmissing'
+    CHGVAR &V &ID
+    CALLSUBR PUT
+  ENDDO
+  ADDENVVAR ENVVAR('A=B') VALUE('x')
+  MONMSG CPF0000 EXEC(DO)
+    RCVMSG MSGTYPE(*EXCP) MSGID(&ID)
+    CHGVAR &K 'badname'
+    CHGVAR &V &ID
+    CALLSUBR PUT
+  ENDDO
+
+  /* QSH: the completion message and its data (exit status 3).       */
+  ADDENVVAR ENVVAR(QIBM_QSH_CMD_OUTPUT) VALUE(NONE) REPLACE(*YES)
+  QSH CMD('exit 3')
+  CHGVAR &K 'exit3'
+  CALLSUBR COMP
+  QSH CMD('exit 0')
+  CHGVAR &K 'exit0'
+  CALLSUBR COMP
+  QSH CMD('kill -9 $$')
+  MONMSG CPF0000
+  CHGVAR &K 'signal9'
+  CALLSUBR COMP
+
+  /* QIBM_QSH_CMD_ESCAPE_MSG=Y: an exit status above 0 is an escape. */
+  ADDENVVAR ENVVAR(QIBM_QSH_CMD_ESCAPE_MSG) VALUE(Y) REPLACE(*YES)
+  QSH CMD('exit 4')
+  MONMSG CPF0000 EXEC(DO)
+    RCVMSG MSGTYPE(*EXCP) MSGDTA(&D) MSGDTALEN(&DL) MSGID(&ID)
+    CHGVAR &N %BIN(&D 1 4)
+    CHGVAR &K 'esc4'
+    CHGVAR &V (&ID *BCAT %CHAR(&DL) *BCAT %CHAR(&N))
+    CALLSUBR PUT
+  ENDDO
+  QSH CMD('exit 0')
+  CHGVAR &K 'esc0'
+  CALLSUBR COMP
+  RMVENVVAR ENVVAR(QIBM_QSH_CMD_ESCAPE_MSG)
+
+  /* Output to a file (its CCSID: the list's next step).              */
+  ADDENVVAR ENVVAR(QIBM_QSH_CMD_OUTPUT) +
+    VALUE('FILE=/home/AS4TRAINR/gld/qshout.txt') REPLACE(*YES)
+  QSH CMD('echo hello; echo there')
+
+  /* Message data shorter than the FMT length.                        */
+  DLTMSGF MSGF(AS4TRAINR1/GLDMSGF)
+  MONMSG CPF0000
+  CRTMSGF MSGF(AS4TRAINR1/GLDMSGF)
+  ADDMSGD MSGID(GLD0001) MSGF(AS4TRAINR1/GLDMSGF) MSG('<&1>') +
+    FMT((*CHAR 20))
+  SNDPGMMSG MSGID(GLD0001) MSGF(AS4TRAINR1/GLDMSGF) MSGDTA('AB') +
+    TOPGMQ(*SAME) MSGTYPE(*INFO)
+  RCVMSG MSGTYPE(*INFO) MSG(&M)
+  CHGVAR &K 'shortdata'
+  CHGVAR &V &M
+  CALLSUBR PUT
+
+  /* An expression as a parameter's value.                            */
+  DLTDTAARA DTAARA(AS4TRAINR1/GLDEXP)
+  MONMSG CPF0000
+  CHGVAR &T 'Gold'
+  CRTDTAARA DTAARA(AS4TRAINR1/GLDEXP) TYPE(*CHAR) LEN(10) +
+    TEXT(&T |> 'text' |< 'x')
+  RTVOBJD OBJ(AS4TRAINR1/GLDEXP) OBJTYPE(*DTAARA) TEXT(&T)
+  CHGVAR &K 'exprtext'
+  CHGVAR &V &T
+  CALLSUBR PUT
+  RETURN
+
+  /* The next *COMP message: its ID, data length and first 4 bytes.  */
+  SUBR COMP
+    CHGVAR &ID ' '
+    RCVMSG MSGTYPE(*COMP) MSGDTA(&D) MSGDTALEN(&DL) MSGID(&ID)
+    CHGVAR &N %BIN(&D 1 4)
+    CHGVAR &V (&ID *BCAT %CHAR(&DL) *BCAT %CHAR(&N))
+    CALLSUBR PUT
+  ENDSUBR
+
+  SUBR PUT
+    RUNSQL SQL('INSERT INTO AS4TRAINR1/GLDQSO VALUES(''' *CAT &K *TCAT +
+      ''', ''' *CAT &V *TCAT ''')') COMMIT(*NONE)
+  ENDSUBR
+ENDPGM

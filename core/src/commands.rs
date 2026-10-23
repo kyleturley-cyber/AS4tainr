@@ -298,6 +298,9 @@ impl Job<'_> {
         if let Some(o) = self.outq_command(&cmd).await? {
             return Ok(o);
         }
+        if let Some(o) = self.qsh_command(&cmd).await? {
+            return Ok(o);
+        }
         if let Some(o) = self.pdm_command(&cmd).await? {
             return Ok(o);
         }
@@ -306,6 +309,7 @@ impl Job<'_> {
         }
         match cmd.def.name {
             "CRTLIB" => self.crtlib(&cmd).await,
+            "CHGLIB" => self.chglib(&cmd).await,
             "DSPLIB" => self.dsplib(&cmd).await,
             "DSPLIBL" => self.dsplibl().await,
             "ADDLIBLE" => self.addlible(&cmd).await,
@@ -452,6 +456,32 @@ impl Job<'_> {
         Ok(Outcome::Messages(vec![format!(
             "CPC2102: Library {lib} was created."
         )]))
+    }
+
+    /// CHGLIB: the library's text and type (*SAME keeps them). The
+    /// completion message has no ID here (not captured).
+    async fn chglib(&mut self, cmd: &Command) -> Result<Outcome> {
+        let lib = cmd.get("LIB").to_ascii_uppercase();
+        if !catalog::library_exists(self.client, &lib).await? {
+            bail!("CPF2110: Library {lib} does not exist.");
+        }
+        authority::check(self.client, &self.user, "QSYS", &lib, "*LIB", Aut::Change).await?;
+        let text = cmd.get("TEXT");
+        let ty = cmd.get("TYPE");
+        let n = self
+            .client
+            .execute(
+                "UPDATE as4tainr.objects SET
+                   text = CASE WHEN $2 = '*SAME' THEN text WHEN $2 = '*BLANK' THEN '' ELSE $2 END,
+                   attribute = CASE WHEN $3 = '*SAME' THEN attribute ELSE substr($3, 2) END
+                 WHERE library = 'QSYS' AND name = $1 AND objtype = '*LIB'",
+                &[&lib, &text, &ty],
+            )
+            .await?;
+        if n == 0 {
+            bail!("CPF2110: Library {lib} does not exist.");
+        }
+        Ok(Outcome::Messages(vec![format!("Library {lib} changed.")]))
     }
 
     async fn dsplib(&mut self, cmd: &Command) -> Result<Outcome> {
@@ -5677,6 +5707,22 @@ impl Job<'_> {
             crate::sysapi::call_api(self.client, &caller, &name, &mut a).await?;
             self.calls.returned = Some(a.0);
             return Ok(Outcome::Messages(vec![]));
+        }
+        // QCMDEXC (command, its length): the command runs here, its
+        // messages to the caller (Execute Command API).
+        if name == "QCMDEXC" && matches!(pgm.split_once('/'), None | Some(("*LIBL" | "QSYS", _))) {
+            let cmd = args.first().cloned().unwrap_or_default();
+            let len = args
+                .get(1)
+                .and_then(|l| l.trim().parse::<f64>().ok())
+                .map(|l| l.max(0.0) as usize);
+            let cmd: String = match len {
+                Some(n) => cmd.chars().take(n).collect(),
+                None => cmd,
+            };
+            let r = self.run_boxed(cmd.trim()).await;
+            self.calls.returned = Some(args.clone());
+            return r;
         }
         // QCMD, the command processor: interactively, the Command Entry
         // display.

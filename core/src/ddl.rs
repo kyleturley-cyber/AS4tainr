@@ -1406,6 +1406,7 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
             keys: Vec::new(),
             descending: Vec::new(),
             view: None,
+            source: None,
         },
         name,
         replace,
@@ -3456,6 +3457,7 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
                 keys: Vec::new(),
                 descending: Vec::new(),
                 view: None,
+                source: None,
             };
             let create = Ddl::CreateTable {
                 name: name.clone(),

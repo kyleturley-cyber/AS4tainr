@@ -51,6 +51,12 @@ pub struct Param {
     pub value: String,
 }
 
+/// `/` at `i` qualifies a name (`LIB/*ALL`, `*ALL/*ALL`) rather than
+/// starting a comment when a name character comes right before it.
+pub(crate) fn qualifier_slash(cs: &[char], i: usize) -> bool {
+    i > 0 && (cs[i - 1].is_ascii_alphanumeric() || matches!(cs[i - 1], '@' | '#' | '$' | '_'))
+}
+
 /// Remove comments and join continuation lines. A line ending in `+`
 /// continues with the next line's first non-blank; `-` keeps the next
 /// line's leading blanks. Returns (line number, text) per statement.
@@ -61,7 +67,7 @@ pub(crate) fn logical_lines(source: &str) -> Result<Vec<(usize, String)>> {
     let mut i = 0;
     let mut in_q = false;
     while i < cs.len() {
-        if !in_q && cs[i] == '/' && cs.get(i + 1) == Some(&'*') {
+        if !in_q && cs[i] == '/' && cs.get(i + 1) == Some(&'*') && !qualifier_slash(&cs, i) {
             let mut j = i + 2;
             while j + 1 < cs.len() && !(cs[j] == '*' && cs[j + 1] == '/') {
                 if cs[j] == '\n' {
@@ -209,6 +215,35 @@ fn split_params(text: &str) -> Result<Vec<Param>> {
     Ok(out)
 }
 
+/// A command without its selective prompt characters: `??`, `?*`, `?<`,
+/// `?/`, `?-` or `?&` at the start of a keyword (outside quoted strings).
+pub fn strip_selective_prompts(text: &str) -> String {
+    let cs: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut in_q = false;
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if c == '\'' {
+            in_q = !in_q;
+        }
+        let at_word = i == 0 || cs[i - 1].is_whitespace();
+        if !in_q
+            && at_word
+            && c == '?'
+            && i + 2 < cs.len()
+            && "?*<>/-&".contains(cs[i + 1])
+            && cs[i + 2].is_ascii_alphabetic()
+        {
+            i += 2;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 /// Parse one statement's text ("LABEL: CMD params").
 pub(crate) fn parse_statement(line: usize, text: &str) -> Result<Statement> {
     let mut rest = text.trim();
@@ -225,6 +260,16 @@ pub(crate) fn parse_statement(line: usize, text: &str) -> Result<Statement> {
             rest = rest[colon + 1..].trim();
         }
     }
+    // Prompting: `?` before the command, and the selective prompt
+    // characters before keywords (`??KW(`, `?*KW(`, `?<KW(`, `?/KW(`,
+    // `?-KW(`, `?&KW(`): taken out; the command runs as it stands (CL
+    // programming, "Selective prompting for CL commands"; no prompt is
+    // shown here: fidelity-gaps).
+    if let Some(r) = rest.strip_prefix('?') {
+        rest = r.trim_start();
+    }
+    let unprompted = strip_selective_prompts(rest);
+    let rest = unprompted.as_str();
     if rest.is_empty() {
         return Ok(Statement {
             line,
@@ -2235,7 +2280,14 @@ pub fn compile_with(
             continue;
         }
         let (n, v) = parse_dcl(&sts[i])?;
-        if decls.iter().any(|(d, _): &(String, Var)| *d == n) {
+        if let Some((_, old)) = decls.iter().find(|(d, _): &&(String, Var)| *d == n) {
+            // The same declaration again is taken (QshOni's QSHCPYSRCC
+            // declares &IFSOPT twice and builds on IBM i); a different
+            // one is an error.
+            if format!("{old:?}") == format!("{v:?}") {
+                i += 1;
+                continue;
+            }
             bail!("line {}: {n} is declared twice", sts[i].line);
         }
         decls.push((n, v));
@@ -2391,13 +2443,47 @@ pub const MAX_STEPS: u64 = 10_000_000;
 fn substitute(st: &Statement, vars: &HashMap<String, Var>) -> Result<String> {
     let mut out = st.name.clone();
     for p in &st.params {
-        let v = substitute_text(&p.value, vars)?;
+        // A character expression as a parameter's value (CL programming:
+        // "expressions in CL commands"): evaluated, its value quoted.
+        let v = if has_concatenation(&p.value) {
+            let s = eval(&parse_expr(&p.value)?, vars)?.as_char()?;
+            format!("'{}'", s.replace('\'', "''"))
+        } else {
+            substitute_text(&p.value, vars)?
+        };
         match &p.keyword {
             Some(k) => out.push_str(&format!(" {k}({v})")),
             None => out.push_str(&format!(" {v}")),
         }
     }
     Ok(out)
+}
+
+/// Whether a parameter's value concatenates (`*CAT`, `*BCAT`, `*TCAT`,
+/// `||`, `|>`, `|<`) outside quotes and parentheses.
+fn has_concatenation(text: &str) -> bool {
+    let cs: Vec<char> = text.chars().collect();
+    let (mut in_q, mut depth) = (false, 0);
+    for (i, &c) in cs.iter().enumerate() {
+        match c {
+            '\'' => in_q = !in_q,
+            '(' if !in_q => depth += 1,
+            ')' if !in_q => depth -= 1,
+            '|' if !in_q && depth == 0 => {
+                if matches!(cs.get(i + 1), Some('|' | '>' | '<')) {
+                    return true;
+                }
+            }
+            '*' if !in_q && depth == 0 && (i == 0 || cs[i - 1].is_whitespace()) => {
+                let w: String = cs[i..].iter().take_while(|c| !c.is_whitespace()).collect();
+                if matches!(w.to_ascii_uppercase().as_str(), "*CAT" | "*BCAT" | "*TCAT") && i > 0 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn substitute_text(text: &str, vars: &HashMap<String, Var>) -> Result<String> {
@@ -2651,10 +2737,32 @@ async fn run_program(
                             .map(|m| m.msgid.clone())
                             .filter(|i| !i.is_empty())
                             .unwrap_or_else(|| error_id(&e));
-                        let monitored = monitors
-                            .iter()
-                            .chain(pgm.global.iter())
-                            .any(|(ids, _)| ids.iter().any(|m| msgid_matches(m, &id)));
+                        let watched = |id: &str| {
+                            monitors
+                                .iter()
+                                .chain(pgm.global.iter())
+                                .any(|(ids, _)| ids.iter().any(|m| msgid_matches(m, id)))
+                        };
+                        // An escape message no MONMSG names becomes a
+                        // function check, CPF9999, which a MONMSG for it
+                        // (or CPF0000) handles (CL programming, "Handling
+                        // unmonitored messages"): RUNSQL's SQL9010 under
+                        // MONMSG CPF0000.
+                        let original = id.clone();
+                        let id = if !watched(&id) && watched("CPF9999") {
+                            "CPF9999".to_string()
+                        } else {
+                            id
+                        };
+                        let monitored = watched(&id);
+                        if std::env::var("AS4TAINR_TRACE_ERRORS").is_ok() {
+                            eprintln!(
+                                "[CL {} line {}{}] {e:#}",
+                                pgm.name,
+                                st.line,
+                                if monitored { ", monitored" } else { "" }
+                            );
+                        }
                         if monitored {
                             // The handled exception goes on the program's
                             // queue, for RCVMSG MSGTYPE(*EXCP).
@@ -2662,7 +2770,7 @@ async fn run_program(
                                 .calls
                                 .escape
                                 .take()
-                                .unwrap_or_else(|| crate::pgmmsg::from_error(&e, &id));
+                                .unwrap_or_else(|| crate::pgmmsg::from_error(&e, &original));
                             job.calls.put(m, false);
                         }
                         if let Some((_, start)) = monitors
@@ -3220,10 +3328,15 @@ async fn command(
                     .trim_end()
                     .to_string())
             };
-            let kind = p
-                .get("MSGTYPE")
-                .map(|t| t.trim().to_ascii_uppercase())
-                .unwrap_or_else(|| "*INFO".into());
+            // The message type, also from a variable (MSGTYPE(&TYPE)).
+            let kind = match p.get("MSGTYPE") {
+                Some(t) => substitute_text(t, vars)?
+                    .trim()
+                    .trim_matches('\'')
+                    .trim()
+                    .to_ascii_uppercase(),
+                None => "*INFO".into(),
+            };
             let mut m = match (p.get("MSG"), p.get("MSGID")) {
                 (Some(t), _) => crate::pgmmsg::QMsg {
                     text: text(t)?,
@@ -4126,6 +4239,8 @@ async fn command(
         }
         _ => {
             let line = substitute(st, vars)?;
+            job.calls.message_data = None;
+            let queued_before: Vec<u32> = job.calls.current_queue().iter().map(|m| m.key).collect();
             match job
                 .run_boxed(&line)
                 .await
@@ -4133,8 +4248,28 @@ async fn command(
             {
                 Outcome::Messages(m) => {
                     // The command's messages go on the program's queue
-                    // (completion messages, for RCVMSG).
-                    for t in &m {
+                    // (completion messages, for RCVMSG); the last one
+                    // has the message data the command left (QSH0005's
+                    // exit status, CRTSRVPGM's CPC5D0B).
+                    let mut data = job.calls.message_data.take();
+                    // Messages the command (a command processing program
+                    // sending to *PRV) already put on this queue.
+                    let sent: Vec<String> = job
+                        .calls
+                        .current_queue()
+                        .iter()
+                        .filter(|q| !queued_before.contains(&q.key))
+                        .map(|q| q.text.clone())
+                        .collect();
+                    let n = m.len();
+                    for (i, t) in m.iter().enumerate() {
+                        let bare = t
+                            .split_once(": ")
+                            .filter(|(i, _)| is_msgid(i))
+                            .map_or(t.as_str(), |x| x.1);
+                        if sent.iter().any(|s| s == bare || s == t) {
+                            continue;
+                        }
                         let (id, text) = match t.split_once(": ") {
                             Some((i, x)) if is_msgid(i) => (i.to_string(), x.to_string()),
                             _ => (String::new(), t.clone()),
@@ -4154,6 +4289,11 @@ async fn command(
                                 msgid: id,
                                 text,
                                 ty: "*COMP".into(),
+                                data: if i + 1 == n {
+                                    data.take().unwrap_or_default()
+                                } else {
+                                    Vec::new()
+                                },
                                 ..Default::default()
                             },
                             false,
@@ -4180,6 +4320,28 @@ async fn command(
 
 #[cfg(test)]
 mod tests {
+    // CL reference: a qualified name's object part can be a special
+    // value (`OBJ(LIB/*ALL)`, RSTOBJ SELECT `*ALL/*ALL`); `/*` after a
+    // blank starts a comment.
+    #[test]
+    fn slash_star_after_a_name_qualifies() {
+        let l = super::logical_lines("DSPOBJD OBJ(MYLIB/*ALL) OBJTYPE(*PGM) /* note */\n").unwrap();
+        assert_eq!(l[0].1.trim(), "DSPOBJD OBJ(MYLIB/*ALL) OBJTYPE(*PGM)");
+        let l = super::logical_lines("RSTOBJ SELECT((*INCLUDE *ALL/*ALL *ALL))\n").unwrap();
+        assert!(l[0].1.contains("*ALL/*ALL"));
+    }
+
+    // CL programming, expressions in parameters: *CAT, *BCAT, *TCAT and
+    // their symbols outside quotes.
+    #[test]
+    fn concatenation_in_a_parameter() {
+        assert!(super::has_concatenation("&LIB |> 'version'"));
+        assert!(super::has_concatenation("'a' *BCAT &B"));
+        assert!(!super::has_concatenation("'a |> b'"));
+        assert!(!super::has_concatenation("*CAT"));
+        assert!(!super::has_concatenation("(&A *CAT &B)"));
+    }
+
     #[test]
     fn decimal_to_character_is_right_aligned_with_zeros() {
         // CL programming, "Changing the value of a variable": a decimal

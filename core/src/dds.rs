@@ -521,6 +521,11 @@ pub struct PhysicalFile {
     /// its rows have the record number of a single underlying table.
     #[serde(default)]
     pub view: Option<bool>,
+    /// A source physical file read with record-level access: Some(member
+    /// opened) (empty until it is opened). Its records SRCSEQ, SRCDAT,
+    /// SRCDTA are the member's lines (source.rs).
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 impl PhysicalFile {
@@ -849,6 +854,7 @@ pub fn parse_pf(file_name: &str, source: &str) -> Result<PhysicalFile> {
         keys: Vec::new(),
         descending: Vec::new(),
         view: None,
+        source: None,
     };
 
     for (idx, raw) in source.lines().enumerate() {

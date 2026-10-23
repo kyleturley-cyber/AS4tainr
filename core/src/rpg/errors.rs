@@ -700,8 +700,8 @@ impl<'a> Machine<'a> {
             {
                 continue;
             }
-            if let Some(mut f) = self.files[i].open.take() {
-                let _ = self.io.rt.block_on(f.release(self.io.client));
+            if let Some(f) = self.files[i].open.take() {
+                let _ = self.close_open_file(f);
             }
             self.files[i].ws_open = false;
         }

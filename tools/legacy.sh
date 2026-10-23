@@ -16,6 +16,10 @@
 #   MKRPGUNIT, then its self-test MKRPGUNITT in a batch job: the sanity
 #   check (TESTPGM03 must fail), the unit test suites (MKUT), the
 #   acceptance tests.
+# - QshOni (MIT): built by its own build.sh (bash, its `system` calls run
+#   by as4tainr's `system`) from a clone put in the IFS at the same path,
+#   then QSHEXEC runs a shell command (Qshell needs AS4TAINR_QSH=1) and
+#   its output is in the outfile.
 #
 #   tools/legacy.sh
 #
@@ -33,6 +37,7 @@ clone https://github.com/ZodandSons/northwind-db2-sql-database.git nwdb
 clone https://github.com/ZodandSons/northwind-ibmi-rpgle-application.git nwapp
 clone https://github.com/ARNAV2684/as400-order-management-modernization.git com
 clone https://github.com/RPGUnit/RPGUnit.git rpgunit
+clone https://github.com/richardschoen/QshOni.git qshoni
 
 step() {
   echo "== $*"
@@ -110,3 +115,13 @@ run "CRTBNDCL PGM(RPGUNIT/MKRPGUNITT) SRCFILE(RPGUNIT/RPGUNITT1)" | tail -1
 # result line (Success. / FAILURE. / ERROR.), and how the job ended.
 "$bin" --libl RPGUNIT batch "CALL RPGUNIT/MKRPGUNITT PARM(RPGUNIT)" 2>&1 |
   grep -E "^(Success|FAILURE|ERROR)\.|CPF124[01]"
+
+step "QshOni (build.sh, then QSHEXEC)"
+shim="$work/shim"
+mkdir -p "$shim"
+printf '#!/bin/sh\nexec "%s" system "$@"\n' "$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")" > "$shim/system"
+chmod +x "$shim/system"
+"$bin" put "$work/qshoni" "$work/qshoni" >/dev/null
+(cd "$work/qshoni" && PATH="$shim:$PATH" bash build.sh 2>&1) |
+  grep -E "^(CPF|Error in)|was created and programs compiled" | grep -v CPF0006
+AS4TAINR_QSH=1 "$bin" --libl QSHONI system "QSHEXEC CMDLINE('echo QshOni works') PRTOUTQ(*SAME) OUTFILE(QTEMP/STDOUTQSH) LOGSTDOUT(*NO)" | grep -E "QSH0005|CPF"

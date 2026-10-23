@@ -174,8 +174,8 @@ impl Job<'_> {
                 // STMFCCSID(*STMF): an existing file's CCSID, else the
                 // database file's (37).
                 let file_ccsid = match &existing {
-                    Some(e) => ccsid_param(cmd.get("STMFCCSID"), e.ccsid)?,
-                    None => ccsid_param(cmd.get("STMFCCSID"), 37)?,
+                    Some(e) => ccsid_param(stmf_ccsid(cmd), e.ccsid)?,
+                    None => ccsid_param(stmf_ccsid(cmd), 37)?,
                 };
                 let fixed = cmd.get("ENDLINFMT").eq_ignore_ascii_case("*FIXED");
                 // Trailing blanks go, except with *FIXED (no line ends).
@@ -213,7 +213,7 @@ impl Job<'_> {
                         ifs::errno_text(errno_of(&e))
                     )
                 })?;
-                let ccsid = ccsid_param(cmd.get("STMFCCSID"), ccsid)?;
+                let ccsid = ccsid_param(stmf_ccsid(cmd), ccsid)?;
                 let text = codec::text(ccsid, &bytes);
                 // ENDLINFMT(*ALL): CR, LF, CRLF or LFCR ends a line;
                 // TABEXPN(*YES): tabs become blanks to the next stop (every
@@ -246,6 +246,16 @@ impl Job<'_> {
                 }
                 let opt = cmd.get("MBROPT").to_ascii_uppercase();
                 let libs = [lib.clone()];
+                // A database file (not a source file): one record per
+                // line, in its one character field (CRTPF RCDLEN).
+                if let Ok(f) = crate::catalog::resolve_file(self.client, &libs, &file).await {
+                    if f.file.source.is_none() {
+                        return self
+                            .stmf_to_data(&f, &lines, &opt, from, &mbr)
+                            .await
+                            .map(Some);
+                    }
+                }
                 let old = crate::source::find_member(self.client, &libs, &file, &mbr)
                     .await
                     .ok();
@@ -273,6 +283,62 @@ impl Job<'_> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// CPYFRMSTMF into a database file's member: a record per line, the
+    /// line padded or cut to the record (a file with one character
+    /// field, as CRTPF RCDLEN makes).
+    async fn stmf_to_data(
+        &mut self,
+        f: &crate::catalog::FileRef,
+        lines: &[String],
+        opt: &str,
+        from: &str,
+        mbr: &str,
+    ) -> Result<Outcome> {
+        let [field] = f.file.fields.as_slice() else {
+            bail!(
+                "CPFA095: Stream file {from} was not copied: file {}/{} has more than one field.",
+                f.library,
+                f.file.name
+            );
+        };
+        let table = format!(
+            "{}.{}",
+            crate::catalog::ident(&f.library),
+            crate::catalog::ident(&f.file.name)
+        );
+        let count: i64 = self
+            .client
+            .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+            .await?
+            .get(0);
+        match opt {
+            "*REPLACE" => {
+                self.client.execute(&format!("DELETE FROM {table}"), &[]).await?;
+            }
+            "*ADD" => {}
+            _ if count > 0 => bail!(
+                "CPDA089: Member {mbr} is already in file {}/{}; MBROPT(*NONE) does not replace it.\nCPFA095: Stream file {from} was not copied.",
+                f.library,
+                f.file.name
+            ),
+            _ => {}
+        }
+        let len = field.length as usize;
+        let mut lines = lines.to_vec();
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        let sql = format!("INSERT INTO {table} ({}) VALUES ($1)", field.column());
+        for l in &lines {
+            let t: String = l.chars().take(len).collect();
+            let t = format!("{t:<len$}");
+            self.client.execute(&sql, &[&t]).await?;
+        }
+        Ok(Outcome::Messages(vec![format!(
+            "CPCA081: Stream file {from} was copied to member {mbr}."
+        )]))
     }
 
     /// RMVDIR SUBTREE(*ALL): the directory and everything in it.
@@ -366,5 +432,17 @@ impl Job<'_> {
             print_msg: None,
             spool: None,
         }))
+    }
+}
+
+/// STMFCCSID, or the code page of the old keyword STMFCODPAG when only
+/// that one is given.
+fn stmf_ccsid(cmd: &crate::cl::Command) -> &str {
+    let c = cmd.get("STMFCCSID");
+    let old = cmd.get("STMFCODPAG");
+    if c.eq_ignore_ascii_case("*STMF") && !old.eq_ignore_ascii_case("*STMF") && !old.is_empty() {
+        old
+    } else {
+        c
     }
 }

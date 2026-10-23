@@ -894,11 +894,22 @@ fn fixed_f(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
     Ok(())
 }
 
+/// A line that only continues a long name: the name's part with an
+/// ellipsis anywhere in positions 7-80 (ILE RPG Reference, definition and
+/// procedure specifications: "a name can be continued... positions 7-80").
+fn name_continuation(cs: &[char]) -> Option<String> {
+    let t = colt(cs, 7, 80);
+    let t = t.trim();
+    t.strip_suffix("...")
+        .filter(|p| !p.is_empty() && !p.contains(' '))
+        .map(String::from)
+}
+
 fn fixed_d(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
     let raw_name = colt(cs, 7, 21);
     // A long name: NAME... on this line, the definition on the next.
-    if let Some(prefix) = raw_name.strip_suffix("...") {
-        ctx.long_name.push_str(prefix);
+    if let Some(prefix) = name_continuation(cs) {
+        ctx.long_name.push_str(&prefix);
         return Ok(());
     }
     let name = format!("{}{}", ctx.long_name, raw_name).to_ascii_uppercase();
@@ -1029,7 +1040,12 @@ fn fixed_d(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
 }
 
 fn fixed_p(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
-    let name = colt(cs, 7, 21).to_ascii_uppercase();
+    if let Some(prefix) = name_continuation(cs) {
+        ctx.long_name.push_str(&prefix);
+        return Ok(());
+    }
+    let name = format!("{}{}", ctx.long_name, colt(cs, 7, 21)).to_ascii_uppercase();
+    ctx.long_name.clear();
     let be = cs.get(23).copied().unwrap_or(' ').to_ascii_uppercase();
     let kws = keywords(&col(cs, 44, 80))?;
     match be {
@@ -2108,7 +2124,9 @@ fn free_op(text: &str) -> Option<(String, String, String)> {
     let t = text.trim_start();
     let word: String = t
         .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        // A name goes on through _ # @ $ (return_value is a name, not
+        // RETURN).
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '#' | '@' | '$'))
         .collect();
     let up = word.to_ascii_uppercase();
     if !FREE_OPS.contains(&up.as_str()) {

@@ -91,6 +91,13 @@ const CATALOG: &[CatTable] = &[
         libs: &[],
     },
     CatTable {
+        table: "source_files",
+        lib: "library",
+        name: "name",
+        types: &["*FILE"],
+        libs: &[],
+    },
+    CatTable {
         table: "source_members",
         lib: "library",
         name: "file",
@@ -151,6 +158,30 @@ const CATALOG: &[CatTable] = &[
         lib: "library",
         name: "name",
         types: &["*CMD"],
+        libs: &[],
+    },
+    // A data queue's description; its entries are not saved (SAVOBJ's
+    // QDTA(*NONE), the default).
+    CatTable {
+        table: "data_queues",
+        lib: "library",
+        name: "name",
+        types: &["*DTAQ"],
+        libs: &[],
+    },
+    // A user space's description and bytes.
+    CatTable {
+        table: "user_spaces",
+        lib: "library",
+        name: "name",
+        types: &["*USRSPC"],
+        libs: &[],
+    },
+    CatTable {
+        table: "output_queues",
+        lib: "library",
+        name: "name",
+        types: &["*OUTQ"],
         libs: &[],
     },
     CatTable {

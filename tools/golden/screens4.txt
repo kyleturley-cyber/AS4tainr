@@ -1,0 +1,41 @@
+# 5250 screens of PUB400 (IBM i 7.5), round 4: a compiler listing as a
+# spooled file (WRKSPLF, DSPSPLF), PDM (WRKMBRPDM, WRKOBJPDM), DSPFD and
+# DSPFFD displays, DSPMSGD and WRKMSGD displays.
+# Objects: source file SCR4SRC and program SCR4CL in AS4TRAINR1 (created
+# and deleted here); the source comes from /home/AS4TRAINR/gld/gldclm.clle
+# (copied there by tools/golden/listings2.txt).
+# Run: screens.ps1 -List tools\golden\screens4.txt -Out target\ibmi\screens4
+01_signon|{USER}{TAB}{PASSWORD}{ENTER}
+02_after_signon|{ENTER}
+03_cmd_entry|call qcmd{ERASEEOF}{ENTER}
+04_crtsrcpf|crtsrcpf as4trainr1/scr4src rcdlen(112){ERASEEOF}{ENTER}
+05_cpyfrmstmf|cpyfrmstmf fromstmf('/home/AS4TRAINR/gld/gldclm.clle') tombr('/QSYS.LIB/AS4TRAINR1.LIB/SCR4SRC.FILE/SCR4CL.MBR') mbropt(*replace) stmfccsid(819){ERASEEOF}{ENTER}
+06_chgpfm|chgpfm file(as4trainr1/scr4src) mbr(scr4cl) srctype(clle) text('Screens round 4'){ERASEEOF}{ENTER}
+07_crtbndcl|crtbndcl pgm(as4trainr1/scr4cl) srcfile(as4trainr1/scr4src){ERASEEOF}{ENTER}
+08_wrksplf|wrksplf{ERASEEOF}{ENTER}
+09_wrksplf_bottom|{F18}
+10_wrksplf_exit|{F3}
+11_dspsplf|dspsplf file(scr4cl) splnbr(*last){ERASEEOF}{ENTER}
+12_dspsplf_down|{PAGEDOWN}
+13_dspsplf_right|{F20}
+14_dspsplf_exit|{F3}
+15_wrkmbrpdm|wrkmbrpdm as4trainr1/scr4src{ERASEEOF}{ENTER}
+16_wrkmbrpdm_f23|{F23}
+17_wrkmbrpdm_exit|{F3}
+18_wrkobjpdm|wrkobjpdm as4trainr1{ERASEEOF}{ENTER}
+19_wrkobjpdm_exit|{F3}
+20_dspfd|dspfd as4trainr1/scr4src{ERASEEOF}{ENTER}
+21_dspfd_down|{PAGEDOWN}
+22_dspfd_exit|{F3}
+23_dspffd|dspffd as4trainr1/scr4src{ERASEEOF}{ENTER}
+24_dspffd_down|{PAGEDOWN}
+25_dspffd_exit|{F3}
+26_dspmsgd|dspmsgd cpf9801{ERASEEOF}{ENTER}
+27_dspmsgd_exit|{F3}
+28_wrkmsgd|wrkmsgd msgf(qcpfmsg) msgid(cpf9801){ERASEEOF}{ENTER}
+29_wrkmsgd_exit|{F3}
+30_dltpgm|dltpgm as4trainr1/scr4cl{ERASEEOF}{ENTER}
+31_dltf|dltf as4trainr1/scr4src{ERASEEOF}{ENTER}
+32_dltsplf|dltsplf file(scr4cl) splnbr(*last){ERASEEOF}{ENTER}
+33_exit_cmd_entry|{F3}
+34_signoff|signoff{ERASEEOF}{ENTER}

@@ -320,10 +320,12 @@ with Tn5250(HOST) as t:
     screen = t.text()
     check("Customer Balance Report" in screen and "Midwest Fasteners" in screen and "Customers:     5" in screen,
           "DSPSPLF shows the report as printed: heading, detail lines, totals", t)
+    # F20 moves 78 columns, as IBM i's viewer does (tools/golden/screens4.txt):
+    # columns 79-132 show the page number and the end of the amounts.
     t.fkey(20)
     t.pump(1)
-    t.wait_for("75.25-*")
-    check("Page    1" in t.text(),
+    t.wait_for("Columns     79 - 132")
+    check("5.25-*" in t.text() and t.line(6).strip() == "1",
           "F20 shows the rest of the 132-column lines: page number, edit code J and the conditioned '*'", t)
     t.fkey(12); t.wait_for("Work with All Spooled Files")
     t.tab(); t.type("4"); t.enter()
@@ -654,6 +656,58 @@ with Tn5250(HOST) as t:
     command(t, "call contacts/contcnt", "DSPLY  Barbara Liskov", timeout=90)
     check("DSPLY  5" in t.text() and "DSPLY  Grace Hopper" in t.text(),
           "the RPG program object runs: READ to end of file, CHAIN found and not found", t)
+    # Screens round 4 (IBM i 7.5 on PUB400, tools/golden/screens4.txt).
+    # The compile's listing in the Display Spooled File viewer: "Page/Line"
+    # and "Columns" in column 55, Control and Find fields, 78 columns a view.
+    command(t, "dspsplf file(contcnt) splnbr(*last)", "Display Spooled File")
+    base = t.line(2).find("File")
+    check(t.line(2).find("Page/Line") - base == 53 and t.line(3).find("Columns     1 - 78") - base == 53
+          and "Find  . . . . . ." in t.line(4) and "*...+....1" in t.line(5),
+          "DSPSPLF shows a listing in IBM i's viewer layout", t)
+    t.fkey(20); t.wait_for("Columns     79 - 132")
+    check(".8....+....9" in t.line(5), "F20 shows columns 79-132 with their ruler", t)
+    t.type("b"); t.enter(); t.wait_for("Bottom")
+    check("Bottom" in t.line(22), "control value B goes to the end of the spooled file", t)
+    t.fkey(3); t.wait_for("Command Entry")
+    # Command Entry continues a long request in column 7 of the next line.
+    long_cmd = "chgpfm file(contacts/qrpglesrc) mbr(contcnt) text('Counts contacts and looks two of them up')"
+    command(t, long_cmd, "changed")
+    rest = long_cmd[73:]
+    check(any(t.line(i).strip() == rest and t.line(i).find(rest) == t.line(i - 1).find("chgpfm")
+              and t.line(i - 1).rstrip().endswith(long_cmd[60:73]) for i in range(4, 17)),
+          "a long request is cut at column 79 and continued in column 7", t)
+    # PDM: WRKMBRPDM and WRKOBJPDM at IBM's columns.
+    command(t, "wrkmbrpdm contacts/qrpglesrc", "Work with Members Using PDM")
+    base = t.line(3).find("File")
+    check(t.line(1).find("Work with Members") - base == 26 and "CONTLST" in t.text()
+          and "14=Compile" in t.text() and "Position to" in t.line(4),
+          "WRKMBRPDM lists the members with PDM's layout", t)
+    t.type("5"); t.enter(); t.wait_for("Display Physical File Member")
+    check("CONT" in t.text(), "PDM option 5 displays a member", t)
+    t.fkey(12); t.wait_for("Work with Members Using PDM")
+    t.type("4"); t.enter(); t.wait_for("Confirm Delete")
+    check("CONTCNT" in t.text() or "CONTLST" in t.text(),
+          "PDM option 4 asks for a confirmation first", t)
+    t.fkey(12); t.wait_for("Work with Members Using PDM")
+    t.fkey(3); t.wait_for("Command Entry")
+    command(t, "wrkobjpdm contacts", "Work with Objects Using PDM")
+    rows = t.text().split("\n")
+    pgm = next(i for i, r in enumerate(rows) if "*PGM" in r)
+    fil = next(i for i, r in enumerate(rows) if "*FILE" in r)
+    check(pgm < fil and "PF-SRC" in t.text(), "WRKOBJPDM lists programs before files; source files are PF-SRC", t)
+    t.fkey(3); t.wait_for("Command Entry")
+    # WRKMSGD: a message file's descriptions; option 4 confirms, then
+    # removes the description.
+    command(t, "crtmsgf contacts/e2emsgf", "created")
+    command(t, "addmsgd usr0001 contacts/e2emsgf msg('Hello from e2e') sev(20)", "> addmsgd usr0001")
+    command(t, "wrkmsgd msgf(contacts/e2emsgf)", "Work with Message Descriptions")
+    check("USR0001       20     Hello from e2e" in t.text() and "E2EMSGF" in t.line(3),
+          "WRKMSGD lists the descriptions: ID, severity, text", t)
+    t.type("4"); t.enter(); t.wait_for("Confirm Delete")
+    t.enter(); t.wait_for("(No entries)")
+    check("USR0001" not in t.text(), "WRKMSGD option 4 removes the description after the confirmation", t)
+    t.fkey(3); t.wait_for("Command Entry")
+    command(t, "dltmsgf contacts/e2emsgf", "deleted")
     command(t, "rmvlible contacts", "removed from library list")
     command(t, "signoff", "Sign On")
 

@@ -138,7 +138,7 @@ DSPLIB, laid out as IBM i 7.5 draws it (the library's attributes in two columns,
  F3=Exit   F12=Cancel   F17=Top   F18=Bottom
 ```
 
-DSPLIBL, DSPDTAARA, DSPOBJD, WRKOBJ, WRKSPLF (F11 shows each file's job), DSPJOBLOG and DSPMSG follow IBM i's layouts the same way (`commands::IbmLayout`); the other list displays keep a plainer layout. On Command Entry, F10 shows every request level's commands and messages, each command with its level.
+DSPLIBL, DSPDTAARA, DSPOBJD, WRKOBJ, WRKSPLF (F11 shows each file's job), DSPJOBLOG and DSPMSG follow IBM i's layouts the same way (`commands::IbmLayout`); the other list displays keep a plainer layout. WRKMSGD, WRKMBRPDM and WRKOBJPDM (PDM: header fields with "Position to", option and key lines at IBM's columns, a confirmation before option 4 deletes; `core/src/pdm.rs`) use the same layout, and DSPSPLF, DSPFD and DSPFFD show their lines in IBM's Display Spooled File viewer (Page/Line, Control and Find fields, 78 columns a view). On Command Entry, F10 shows every request level's commands and messages, each command with its level. A request or message longer than a line goes on in column 7 of the next.
 
 ## Commands
 

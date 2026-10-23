@@ -273,6 +273,14 @@ pub async fn init(client: &Client) -> Result<()> {
             .await
             .context("creating catalog")?;
         client
+            .batch_execute(crate::dtaq::DDL)
+            .await
+            .context("creating catalog")?;
+        client
+            .batch_execute(crate::usrspc::DDL)
+            .await
+            .context("creating catalog")?;
+        client
             .batch_execute(crate::cmd::DDL)
             .await
             .context("creating catalog")?;
@@ -342,6 +350,8 @@ pub async fn init(client: &Client) -> Result<()> {
             )
             .await?;
         crate::users::init(client).await?;
+        crate::outq::init(client).await?;
+        crate::qsysinc::init(client).await?;
         // SQL runs as a restricted role. A database user who may not
         // create roles still gets a working system, without SQL.
         if let Err(e) = crate::sql::init(client).await {

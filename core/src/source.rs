@@ -16,6 +16,13 @@ use tokio_postgres::Client;
 use crate::catalog::validate_name;
 
 pub const DDL: &str = r#"
+-- A source file's record length (CRTSRCPF RCDLEN; 92 when not kept).
+CREATE TABLE IF NOT EXISTS as4tainr.source_files (
+    library  text NOT NULL,
+    name     text NOT NULL,
+    rcdlen   int NOT NULL,
+    PRIMARY KEY (library, name)
+);
 CREATE TABLE IF NOT EXISTS as4tainr.source_members (
     library  text NOT NULL,
     file     text NOT NULL,
@@ -50,7 +57,11 @@ pub fn type_for_extension(ext: &str) -> Option<&'static str> {
         "clp" => "CLP",
         "cmd" => "CMD",
         "cbl" | "cblle" => "CBLLE",
-        "sql" | "table" | "view" | "index" => "SQL",
+        // SQL scripts, and the object-type extensions of IBM's build
+        // tools (Bob: .table, .view, .index, .sqlprc, .sqludf, .sqltrg,
+        // .sqlseq...).
+        "sql" | "table" | "view" | "index" | "sqlprc" | "sqludf" | "sqludt" | "sqltrg"
+        | "sqlseq" | "sqlalias" | "sqlvar" | "sqlmask" | "sqlperm" => "SQL",
         "bnd" => "BND",
         "bnddir" => "BNDDIR",
         "txt" => "TXT",
@@ -93,6 +104,40 @@ pub async fn create_file(client: &Client, library: &str, name: &str, text: &str)
         return Err(crate::catalog::file_exists_error(&name, &lib));
     }
     Ok(())
+}
+
+/// Keep a source file's record length (CRTSRCPF RCDLEN).
+pub async fn set_record_length(
+    client: &Client,
+    library: &str,
+    name: &str,
+    rcdlen: i32,
+) -> Result<()> {
+    client
+        .execute(
+            "INSERT INTO as4tainr.source_files (library, name, rcdlen) VALUES ($1, $2, $3)
+             ON CONFLICT (library, name) DO UPDATE SET rcdlen = EXCLUDED.rcdlen",
+            &[
+                &library.to_ascii_uppercase(),
+                &name.to_ascii_uppercase(),
+                &rcdlen,
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
+/// A source file's record length: CRTSRCPF's RCDLEN, 92 (its default)
+/// for files created before it was kept.
+pub async fn record_length(client: &Client, library: &str, name: &str) -> Result<u32> {
+    Ok(client
+        .query_opt(
+            "SELECT rcdlen FROM as4tainr.source_files WHERE library=$1 AND name=$2",
+            &[&library, &name],
+        )
+        .await?
+        .map(|r| r.get::<_, i32>(0) as u32)
+        .unwrap_or(92))
 }
 
 /// Is LIB/NAME a source file?
@@ -197,6 +242,29 @@ pub async fn members(
         .iter()
         .map(|r| (r.get(0), r.get(1), r.get(2)))
         .collect())
+}
+
+/// DLTF of a source file: the file, its members and its record length.
+pub async fn delete_file(client: &Client, library: &str, name: &str) -> Result<()> {
+    for sql in [
+        "DELETE FROM as4tainr.source_members WHERE library=$1 AND file=$2",
+        "DELETE FROM as4tainr.source_files WHERE library=$1 AND name=$2",
+        "DELETE FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+    ] {
+        client.execute(sql, &[&library, &name]).await?;
+    }
+    Ok(())
+}
+
+/// RMVM: remove a member of a source file.
+pub async fn remove_member(client: &Client, library: &str, file: &str, member: &str) -> Result<()> {
+    client
+        .execute(
+            "DELETE FROM as4tainr.source_members WHERE library=$1 AND file=$2 AND member=$3",
+            &[&library, &file, &member],
+        )
+        .await?;
+    Ok(())
 }
 
 /// Store a stream file (replacing it) in the IFS, as UTF-8 text.

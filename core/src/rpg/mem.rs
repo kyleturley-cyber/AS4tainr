@@ -40,6 +40,62 @@ pub struct Ptr {
 
 pub const KIND_STORAGE: u8 = 1;
 pub const KIND_HEAP: u8 = 2;
+/// A procedure pointer (%PADDR, QleGetExp): `buf` is the procedure's
+/// number in `proc_id`'s table.
+pub const KIND_PROC: u8 = 3;
+/// A system pointer (rslvsp): `buf` is the object's number in `sys_id`'s
+/// table.
+pub const KIND_SYS: u8 = 4;
+
+/// A procedure a procedure pointer addresses: its name (upper case) and
+/// the service program (library, name) it is in, when it is in one.
+pub type ProcRef = (String, Option<(String, String)>);
+
+static PROCS: std::sync::Mutex<Vec<ProcRef>> = std::sync::Mutex::new(Vec::new());
+
+/// An object a system pointer addresses: (type, library, name).
+pub type SysRef = (String, String, String);
+
+static SYSOBJS: std::sync::Mutex<Vec<SysRef>> = std::sync::Mutex::new(Vec::new());
+
+fn number<T: PartialEq + Clone>(table: &std::sync::Mutex<Vec<T>>, v: &T) -> u32 {
+    let mut g = table.lock().unwrap_or_else(|e| e.into_inner());
+    match g.iter().position(|n| n == v) {
+        Some(i) => i as u32,
+        None => {
+            g.push(v.clone());
+            (g.len() - 1) as u32
+        }
+    }
+}
+
+/// The number of a procedure, for procedure pointers.
+pub fn proc_id(name: &str, home: Option<(String, String)>) -> u32 {
+    number(&PROCS, &(name.to_string(), home))
+}
+
+/// The procedure a procedure pointer addresses.
+pub fn proc_ref(id: u32) -> Option<ProcRef> {
+    PROCS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id as usize)
+        .cloned()
+}
+
+/// The number of an object, for system pointers.
+pub fn sys_id(obj: &SysRef) -> u32 {
+    number(&SYSOBJS, obj)
+}
+
+/// The object a system pointer addresses.
+pub fn sys_ref(id: u32) -> Option<SysRef> {
+    SYSOBJS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id as usize)
+        .cloned()
+}
 
 impl Ptr {
     pub fn encode(&self) -> [u8; 16] {
@@ -53,7 +109,7 @@ impl Ptr {
 
     /// None for *NULL (or bytes that are not an address).
     pub fn decode(b: &[u8]) -> Option<Ptr> {
-        if b.len() < 16 || !matches!(b[0], KIND_STORAGE | KIND_HEAP) {
+        if b.len() < 16 || !matches!(b[0], KIND_STORAGE | KIND_HEAP | KIND_PROC | KIND_SYS) {
             return None;
         }
         let u = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
@@ -80,6 +136,10 @@ impl Ptr {
 pub struct Heap {
     pub blocks: Vec<Vec<u8>>,
     pub freed: Vec<bool>,
+    /// User spaces addressed through pointers (QUSPTRUS): heap buffer,
+    /// library, name, size (the buffer is whole pages). They go with the heap, so every module of the
+    /// call sees them.
+    pub spaces: Vec<(usize, String, String, usize)>,
 }
 
 impl Heap {

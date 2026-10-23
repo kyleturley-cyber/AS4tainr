@@ -9,7 +9,9 @@
 //! DLTOVR. When several call levels override the same file, the override
 //! made at the higher call level (nearer the start of the job) is the one
 //! that counts; a second override of a file at the same level replaces the
-//! first.
+//! first. From a program of a non-default activation group,
+//! OVRSCOPE(*ACTGRPDFN) scopes the override to the activation group
+//! instead, and DLTOVR LVL(*) deletes that activation group's overrides.
 
 /// What kind of file an override is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +34,10 @@ pub struct Override {
     pub ovrflw: Option<i32>,
     /// OVRDBF LVLCHK(*NO): no record format level check.
     pub no_lvlchk: bool,
+    /// OVRSCOPE(*ACTGRPDFN) from a program of a non-default activation
+    /// group: the override is scoped to that activation group, so it
+    /// stays when the program that made it returns.
+    pub actgrp: Option<String>,
 }
 
 /// The override in effect for a file: the one of the highest call level.
@@ -51,10 +57,61 @@ pub fn file_name(ovr: &[Override], kind: Kind, file: &str) -> String {
     }
 }
 
+/// Overrides scoped to activation groups, by job: they outlive the
+/// program that made them, so they are kept for the job rather than with
+/// a program's call level.
+static SCOPED: std::sync::Mutex<Option<std::collections::HashMap<String, Vec<Override>>>> =
+    std::sync::Mutex::new(None);
+
+fn with_scoped<R>(f: impl FnOnce(&mut std::collections::HashMap<String, Vec<Override>>) -> R) -> R {
+    let mut g = SCOPED.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(Default::default))
+}
+
+/// The job's activation-group overrides, added to `ovr` where missing.
+pub fn merge_scoped(job: &str, ovr: &mut Vec<Override>) {
+    with_scoped(|m| {
+        for o in m.get(job).into_iter().flatten() {
+            if !ovr
+                .iter()
+                .any(|x| x.actgrp == o.actgrp && x.kind == o.kind && x.file == o.file)
+            {
+                ovr.push(o.clone());
+            }
+        }
+    })
+}
+
+/// Keep the activation-group overrides of `ovr` as the job's.
+pub fn save_scoped(job: &str, ovr: &[Override]) {
+    let scoped: Vec<Override> = ovr.iter().filter(|o| o.actgrp.is_some()).cloned().collect();
+    with_scoped(|m| {
+        m.insert(job.to_string(), scoped);
+    })
+}
+
+/// Activation groups end: their overrides go.
+pub fn end_groups(job: &str, ends: impl Fn(&str) -> bool) {
+    with_scoped(|m| {
+        if let Some(v) = m.get_mut(job) {
+            v.retain(|o| !o.actgrp.as_deref().is_some_and(&ends));
+        }
+    })
+}
+
+/// The job ends.
+pub fn end_job(job: &str) {
+    with_scoped(|m| {
+        m.remove(job);
+    })
+}
+
 /// Add an override at a call level (replacing one of the same file made
 /// at that level).
 pub fn add(ovr: &mut Vec<Override>, o: Override) {
-    ovr.retain(|x| !(x.level == o.level && x.kind == o.kind && x.file == o.file));
+    ovr.retain(|x| {
+        !(x.level == o.level && x.actgrp == o.actgrp && x.kind == o.kind && x.file == o.file)
+    });
     ovr.push(o);
 }
 
@@ -71,6 +128,7 @@ mod tests {
             pagesize: None,
             ovrflw: None,
             no_lvlchk: false,
+            actgrp: None,
         }
     }
 

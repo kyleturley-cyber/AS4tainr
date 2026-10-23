@@ -3727,16 +3727,12 @@ async fn spooled_files() {
     else {
         panic!()
     };
-    assert_eq!(
-        d.rows,
-        [
-            "Title",
-            "",
-            "Body",
-            "---------------- Page 2 ----------------",
-            "Page two"
-        ]
-    );
+    // The viewer shows the lines one after another, as IBM i's does; its
+    // Page/Line tells the page (tools/golden/screens4.txt).
+    assert_eq!(d.rows, ["Title", "", "Body", "Page two"]);
+    let v = d.spool.expect("spooled file viewer");
+    assert_eq!(v.lines[2], (1, 3, "Body".to_string()));
+    assert_eq!(v.lines[3], (2, 1, "Page two".to_string()));
     job.run("DLTSPLF QSYSPRT SPLNBR(1)").await.unwrap();
     assert!(spool::find(&client, "QSYSPRT", id.number, Some(1))
         .await
@@ -4397,6 +4393,12 @@ async fn native_rpg_engine_runs_a_program() {
         // ON-EXIT runs when the procedure returns; its indicator is off
         // for a normal end.
         ("ONEXIT", "**FREE\ndsply %char(t());\n*inlr = *on;\ndcl-proc t;\n  dcl-pi *n int(10) end-pi;\n  dcl-s bad ind inz(*on);\n  return 1;\n  on-exit bad;\n    if not bad;\n      dsply 'clean';\n    endif;\nend-proc;\n", vec!["clean", "1"]),
+        // LIKE of a data structure (ILE RPG Reference, LIKE: a data
+        // structure name gives a character item of the structure's
+        // length) as a procedure's return value, the company_system
+        // corpus's getDeptDetail: ind 1 + varchar(20) 22 = 23 bytes,
+        // assigned to a LIKEDS structure.
+        ("LIKEDSRET", "**FREE\ndcl-ds dept_t qualified template;\n  found ind;\n  name varchar(20);\nend-ds;\ndcl-pr getDept like(dept_t);\n  no char(3) const;\nend-pr;\ndcl-ds info likeds(dept_t);\ninfo = getDept('A00');\nif info.found;\n  dsply info.name;\nendif;\ndsply %char(%size(info));\n*inlr = *on;\ndcl-proc getDept;\n  dcl-pi *n like(dept_t);\n    no char(3) const;\n  end-pi;\n  dcl-ds d likeds(dept_t);\n  d.found = *on;\n  d.name = 'Dept ' + no;\n  return d;\nend-proc;\n", vec!["Dept A00", "23"]),
         ("CALLER2", "**FREE\ndcl-pr callee extpgm('CALLEE');\n  name char(10);\n  count packed(5:0);\nend-pr;\ndcl-pr mainpgm extpgm('MAINPGM');\n  who char(10);\nend-pr;\ndcl-s n char(10) inz('Orig');\ndcl-s c packed(5:0) inz(41);\ndcl-s w char(10) inz('Ada');\ncallee(n: c);\ndsply n;\ndsply %char(c);\nmainpgm(w);\ndsply w;\n*inlr = *on;\n", vec!["Changed", "42", "Hi Ada", "Back"]),
     ] {
         let r = rpg::call(
@@ -9552,4 +9554,1903 @@ async fn more_compiler_listings() {
     ] {
         has(&m, l);
     }
+}
+
+/// Screens round 4 (IBM i 7.5 on PUB400, tools/golden/screens4.txt and
+/// tools/golden/files-and-programs.txt, captures in target/ibmi not kept):
+/// DSPFFD's report, printed and in the spooled file viewer; PDM's lists
+/// (WRKMBRPDM, WRKOBJPDM) and WRKMSGD laid out at IBM's columns; RMVM;
+/// DLTF of a source file.
+#[tokio::test]
+async fn screens_round4_reports_and_pdm() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::pase_system;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let dir = format!("/tmp/{lib}r4");
+    let _ = as4tainr_core::ifs::mkdir_all(&client, &dir, "QSECOFR").await;
+    as4tainr_core::ifs::write_file(
+        &client,
+        &format!("{dir}/gldclm.clle"),
+        include_str!("../../tools/golden/lst2/gldclm.clle").as_bytes(),
+        819,
+        0o644,
+        "QSECOFR",
+    )
+    .await
+    .unwrap();
+    macro_rules! sys {
+        ($c:expr) => {
+            pase_system::run(&mut job, &[$c.to_string()]).await
+        };
+    }
+    for c in [
+        format!("CRTSRCPF FILE({lib}/SCR4SRC) RCDLEN(112)"),
+        format!("CPYFRMSTMF FROMSTMF('{dir}/gldclm.clle') TOMBR('/QSYS.LIB/{lib}.LIB/SCR4SRC.FILE/SCR4CL.MBR') MBROPT(*REPLACE) STMFCCSID(819)"),
+        format!("CHGPFM FILE({lib}/SCR4SRC) MBR(SCR4CL) SRCTYPE(CLLE) TEXT('Screens round 4')"),
+        format!("RUNSQL SQL('CREATE TABLE {lib}/GLDPF (CODE DECIMAL(5, 0) NOT NULL, NAME CHAR(20) NOT NULL) RCDFMT GLDR') COMMIT(*NONE)"),
+    ] {
+        let o = pase_system::run(&mut job, std::slice::from_ref(&c)).await;
+        assert_eq!(o.status, 0, "{c}: {o:?}");
+    }
+    let has = |m: &[String], l: &str| {
+        assert!(m.iter().any(|x| x == l), "missing: {l:?}\n{}", m.join("\n"));
+    };
+
+    // DSPFFD of a source file (screens4 24_dspffd_down): SRCSEQ, SRCDAT,
+    // SRCDTA in IBM's columns, the record length from CRTSRCPF RCDLEN.
+    let o = sys!(format!("DSPFFD FILE({lib}/SCR4SRC)"));
+    assert_eq!(o.status, 0, "{o:?}");
+    let first = &o.stdout[0];
+    assert_eq!(
+        first.find("Display File Field Description"),
+        Some(29),
+        "{first}"
+    );
+    assert!(first.ends_with("Page    1"), "{first}");
+    for l in [
+        " Input parameters",
+        " Field Level Information",
+        "              Data        Field  Buffer    Buffer        Field    Column",
+        "   Field      Type       Length  Length  Position        Usage    Heading",
+        "   SRCSEQ     ZONED        6  2       6         1        Both",
+        "   SRCDAT     ZONED        6  0       6         7        Both",
+        "   SRCDTA     CHAR          100     100        13        Both",
+        "   Record length . . . . . . . . . . . . . . . :    112",
+        "   Number of fields  . . . . . . . . . . . . . :      3",
+        "   Externally described  . . . . . . . . . . . :  Yes",
+        "   Type of file  . . . . . . . . . . . . . . . :  Physical",
+        &format!("     Library . . . . . . . . . . . . . . . . . :  {lib}"),
+    ] {
+        has(&o.stdout, l);
+    }
+    // A database file (files-and-programs f_dspffd): the column heading is
+    // the field name; a CCSID line follows each character field.
+    let o = sys!(format!("DSPFFD FILE({lib}/GLDPF)"));
+    assert_eq!(o.status, 0, "{o:?}");
+    for l in [
+        "   Record format . . . . . . . . . . . . . . . :  GLDR",
+        "   Record length . . . . . . . . . . . . . . . :     23",
+        "   CODE       PACKED       5  0       3         1        Both     CODE",
+        "   NAME       CHAR           20      20         4        Both     NAME",
+    ] {
+        has(&o.stdout, l);
+    }
+    let ccsid = o
+        .stdout
+        .iter()
+        .find(|l| l.contains("Coded Character Set Identifier"))
+        .unwrap();
+    assert_eq!(ccsid.find(':'), Some(47), "{ccsid}");
+    assert_eq!(ccsid.len(), 55, "{ccsid}");
+    // On a display: the Display Spooled File viewer, file QPDSPFFD, the
+    // title in column 30 instead of the page header.
+    match job.run(&format!("DSPFFD FILE({lib}/GLDPF)")).await.unwrap() {
+        Outcome::Display(d) => {
+            let v = d.spool.expect("spooled file viewer");
+            assert_eq!(v.file, "QPDSPFFD");
+            assert_eq!(
+                v.lines[0].2.find("Display File Field Description"),
+                Some(29)
+            );
+            assert_eq!(v.lines[1].2, " Input parameters");
+        }
+        o => panic!("{o:?}"),
+    }
+
+    // WRKMBRPDM (screens4 15_wrkmbrpdm): title in column 28, the system
+    // name in 72, header fields at 3,22 4,24 4,70; options at IBM's
+    // columns; members in 7, types in 19, texts in 31.
+    match job.run(&format!("WRKMBRPDM {lib}/SCR4SRC")).await.unwrap() {
+        Outcome::Display(d) => {
+            let l = d.ibm.expect("IBM layout");
+            assert_eq!(d.title, "Work with Members Using PDM");
+            assert_eq!(l.title_col, Some(28));
+            assert_eq!(l.system_col1, Some(72));
+            let at: Vec<(u8, u8, u16)> = l
+                .header_fields
+                .iter()
+                .map(|f| (f.row, f.col, f.len))
+                .collect();
+            assert_eq!(at, vec![(3, 22, 10), (4, 24, 10), (4, 70, 10)]);
+            // Shown from column 2: "4=Delete" in column 26, "14=Compile" in 50.
+            assert_eq!(l.option_text[0][0].find("4=Delete"), Some(24));
+            assert_eq!(l.option_text[0][0].find("5=Display"), Some(33));
+            assert_eq!(l.option_text[0][1].find("14=Compile"), Some(48));
+            assert_eq!(l.option_text[0][1].find("15=Create module"), Some(60));
+            assert_eq!(l.key_text[0].find("F5=Refresh"), Some(39));
+            assert_eq!(
+                d.rows,
+                vec!["SCR4CL      CLLE        Screens round 4".to_string()]
+            );
+            let opts = &l.row_options[0];
+            assert!(opts.contains(&(
+                14,
+                format!("SBMJOB CMD(CRTBNDCL PGM({lib}/SCR4CL) SRCFILE({lib}/SCR4SRC) SRCMBR(SCR4CL)) JOB(SCR4CL)")
+            )));
+            assert!(opts.contains(&(4, format!("RMVM FILE({lib}/SCR4SRC) MBR(SCR4CL)"))));
+        }
+        o => panic!("{o:?}"),
+    }
+    // WRKOBJPDM (screens4 18_wrkobjpdm): programs before files, a source
+    // file's attribute PF-SRC, a data file's PF-DTA.
+    assert_eq!(
+        sys!(format!("CRTBNDCL PGM({lib}/SCR4CL) SRCFILE({lib}/SCR4SRC)")).status,
+        0
+    );
+    match job.run(&format!("WRKOBJPDM {lib}")).await.unwrap() {
+        Outcome::Display(d) => {
+            let rows: Vec<String> = d
+                .rows
+                .iter()
+                .filter(|r| r.starts_with("SCR4") || r.starts_with("GLDPF"))
+                .cloned()
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    "SCR4CL      *PGM        CLLE        Screens round 4".to_string(),
+                    "GLDPF       *FILE       PF-DTA".to_string(),
+                    "SCR4SRC     *FILE       PF-SRC".to_string(),
+                ]
+            );
+            let l = d.ibm.unwrap();
+            assert_eq!(l.title_col, Some(27));
+            assert_eq!(l.option_text[0][0].find("4=Delete"), Some(31));
+            assert_eq!(l.option_text[0][0].find("5=Display"), Some(45));
+            assert_eq!(l.option_text[0][1].find("8=Display description"), Some(2));
+        }
+        o => panic!("{o:?}"),
+    }
+
+    // WRKMSGD (screens4 28_wrkmsgd): ID in column 8, severity ending in
+    // 23, text from 29; the list starts at MSGID.
+    for c in [
+        format!("CRTMSGF MSGF({lib}/SCR4MSGF)"),
+        format!("ADDMSGD MSGID(USR0001) MSGF({lib}/SCR4MSGF) MSG('First') SEV(20)"),
+        format!("ADDMSGD MSGID(USR0002) MSGF({lib}/SCR4MSGF) MSG('Second') SEV(40)"),
+    ] {
+        assert_eq!(
+            pase_system::run(&mut job, std::slice::from_ref(&c))
+                .await
+                .status,
+            0,
+            "{c}"
+        );
+    }
+    match job
+        .run(&format!("WRKMSGD MSGF({lib}/SCR4MSGF) MSGID(USR0002)"))
+        .await
+        .unwrap()
+    {
+        Outcome::Display(d) => {
+            // Rows are shown from column 7.
+            assert_eq!(d.rows[1], " USR0002       40     Second");
+            assert_eq!(d.rows[1].find("USR0002").map(|i| i + 7), Some(8));
+            assert_eq!(d.rows[1].find("40").map(|i| i + 7), Some(22));
+            assert_eq!(d.rows[1].find("Second").map(|i| i + 7), Some(29));
+            let l = d.ibm.unwrap();
+            assert_eq!(l.start_at, 1);
+            assert_eq!(l.system_col, Some(62));
+            assert_eq!(l.option_text[0][0].find("4=Delete"), Some(13));
+            assert_eq!(l.key_text[0].find("F12=Cancel"), Some(32));
+        }
+        o => panic!("{o:?}"),
+    }
+
+    // RMVM removes a member; DLTF deletes a source file (screens4
+    // 31_dltf: "Object SCR4SRC in AS4TRAINR1 type *FILE deleted.").
+    let o = sys!(format!("RMVM FILE({lib}/SCR4SRC) MBR(SCR4CL)"));
+    assert_eq!(o.status, 0, "{o:?}");
+    let o = sys!(format!("DSPPFM FILE({lib}/SCR4SRC) MBR(SCR4CL)"));
+    assert_ne!(o.status, 0, "{o:?}");
+    let o = sys!(format!("DLTF FILE({lib}/SCR4SRC)"));
+    assert_eq!(o.status, 0, "{o:?}");
+    let o = sys!(format!("DSPFFD FILE({lib}/SCR4SRC)"));
+    assert!(
+        o.stderr.join("\n").contains("CPF9812") || o.stdout.join("\n").contains("CPF9812"),
+        "{o:?}"
+    );
+}
+
+/// Data queues (IBM documentation: CRTDTAQ; Object APIs, "Send Data
+/// Queue (QSNDDTAQ)", "Receive Data Queue (QRCVDTAQ)", "Clear Data Queue
+/// (QCLRDTAQ)", "Retrieve Data Queue Description (QMHQRDQD)"). Expected
+/// values from those pages: *FIFO and *LIFO order; a keyed receive with
+/// LE of entries GGG, XXX, AAA, GGG and key XXX returns AAA, GGG (the
+/// first), GGG (the fourth), XXX (QRCVDTAQ's example); a wait of 0 on an
+/// empty queue returns length 0; Length of data is the entry's length
+/// even when the size of data receiver cuts it; remove *NO leaves the
+/// entry; sender information: two PACKED(7,0) byte counts then job name,
+/// user, job number, current user (44 bytes); CPF2498 for data longer
+/// than MAXLEN, CPF9502 for a key on a queue without keys, CPF9501 for
+/// no key on a keyed one (returned in the error code: bytes available
+/// 15, then the ID at offset 8); RDQD0100: message length at 8, key
+/// length at 12, sequence at 16, sender ID at 17, number of messages at
+/// 72.
+#[tokio::test]
+async fn data_queues_and_their_apis() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let pgm = format!(
+        "PGM
+  DCL &LEN *DEC (5 0)
+  DCL &DATA *CHAR 20
+  DCL &KEY *CHAR 3
+  DCL &SND *CHAR 44
+  DCL &ERR *CHAR 16 VALUE(X'00000010')
+  DCL &RCV *CHAR 120
+  DCL &RL *CHAR 4
+  DCL &N *DEC (5 0)
+  DCL &T *CHAR 5
+  CRTDTAQ DTAQ({lib}/FIFOQ) MAXLEN(20) TEXT('First in')
+  CRTDTAQ DTAQ({lib}/LIFOQ) MAXLEN(20) SEQ(*LIFO)
+  CRTDTAQ DTAQ({lib}/KEYQ) MAXLEN(20) SEQ(*KEYED) KEYLEN(3) SENDERID(*YES)
+  CALL QSNDDTAQ PARM('FIFOQ' '{lib}' 5 'FIRST')
+  CALL QSNDDTAQ PARM('FIFOQ' '*LIBL' 6 'SECOND')
+  CALL QRCVDTAQ PARM('FIFOQ' '{lib}' &LEN &DATA 0)
+  CHGVAR &T &LEN
+  SNDPGMMSG MSG('Q: FIFO ' *CAT &DATA *TCAT ' ' *CAT &T)
+  CHGVAR &DATA ' '
+  CALL QRCVDTAQ PARM('FIFOQ' '{lib}' &LEN &DATA 0 '  ' 0 ' ' 0 ' ' '*YES' 3 &ERR)
+  CHGVAR &T &LEN
+  SNDPGMMSG MSG('Q: CUT ' *CAT &DATA *TCAT ' ' *CAT &T)
+  CHGVAR &DATA 'UNCHANGED'
+  CALL QRCVDTAQ PARM('FIFOQ' '{lib}' &LEN &DATA 0)
+  CHGVAR &T &LEN
+  SNDPGMMSG MSG('Q: EMPTY ' *CAT &DATA *TCAT ' ' *CAT &T)
+  CHGVAR &DATA ' '
+  CALL QSNDDTAQ PARM('LIFOQ' '{lib}' 1 'A')
+  CALL QSNDDTAQ PARM('LIFOQ' '{lib}' 1 'B')
+  CALL QRCVDTAQ PARM('LIFOQ' '{lib}' &LEN &DATA 0 '  ' 0 ' ' 0 ' ' '*NO' 20 &ERR)
+  SNDPGMMSG MSG('Q: PEEK ' *CAT &DATA)
+  CALL QRCVDTAQ PARM('LIFOQ' '{lib}' &LEN &DATA 0)
+  SNDPGMMSG MSG('Q: LIFO ' *CAT &DATA)
+  CALL QRCVDTAQ PARM('LIFOQ' '{lib}' &LEN &DATA 0)
+  SNDPGMMSG MSG('Q: LIFO ' *CAT &DATA)
+  CALL QSNDDTAQ PARM('FIFOQ' '{lib}' 21 'TOO LONG')
+  MONMSG CPF2498 EXEC(SNDPGMMSG MSG('Q: CPF2498'))
+  CALL QSNDDTAQ PARM('FIFOQ' '{lib}' 1 'X' 3 'AAA')
+  MONMSG CPF9502 EXEC(SNDPGMMSG MSG('Q: CPF9502'))
+  CALL QSNDDTAQ PARM('KEYQ' '{lib}' 2 'E1' 3 'GGG')
+  CALL QSNDDTAQ PARM('KEYQ' '{lib}' 2 'E2' 3 'XXX')
+  CALL QSNDDTAQ PARM('KEYQ' '{lib}' 2 'E3' 3 'AAA')
+  CALL QSNDDTAQ PARM('KEYQ' '{lib}' 2 'E4' 3 'GGG')
+  CALL QRCVDTAQ PARM('KEYQ' '{lib}' &LEN &DATA 0 '  ' 0 ' ' 0 ' ' '*YES' 20 &ERR)
+  SNDPGMMSG MSG('Q: ERR ' *CAT %SST(&ERR 9 7))
+  CHGVAR &N %BIN(&ERR 5 4)
+  CHGVAR &T &N
+  SNDPGMMSG MSG('Q: AVAIL ' *CAT &T)
+  CALL QMHQRDQD PARM(&RCV X'00000078' 'RDQD0100' 'KEYQ      *LIBL     ')
+  CHGVAR &N %BIN(&RCV 73 4)
+  CHGVAR &T &N
+  SNDPGMMSG MSG('Q: DESC ' *CAT %SST(&RCV 17 2) *CAT ' ' *CAT &T)
+  CHGVAR &N %BIN(&RCV 9 4)
+  CHGVAR &T &N
+  SNDPGMMSG MSG('Q: MAXLEN ' *CAT &T)
+  CHGVAR &N %BIN(&RCV 13 4)
+  CHGVAR &T &N
+  SNDPGMMSG MSG('Q: KEYLEN ' *CAT &T)
+  CHGVAR &KEY 'XXX'
+  CALL QRCVDTAQ PARM('KEYQ' '{lib}' &LEN &DATA 0 'LE' 3 &KEY 44 &SND)
+  SNDPGMMSG MSG('Q: KEY ' *CAT &KEY *CAT ' ' *CAT %SST(&DATA 1 2) *CAT ' ' *CAT %SST(&SND 19 10))
+  CHGVAR &KEY 'XXX'
+  CALL QRCVDTAQ PARM('KEYQ' '{lib}' &LEN &DATA 0 'LE' 3 &KEY 0 &SND)
+  SNDPGMMSG MSG('Q: KEY ' *CAT &KEY *CAT ' ' *CAT %SST(&DATA 1 2))
+  CALL QCLRDTAQ PARM('KEYQ' '{lib}' 'EQ' 3 'GGG' &ERR)
+  CHGVAR &KEY 'XXX'
+  CALL QRCVDTAQ PARM('KEYQ' '{lib}' &LEN &DATA 0 'LE' 3 &KEY 0 &SND)
+  SNDPGMMSG MSG('Q: KEY ' *CAT &KEY *CAT ' ' *CAT %SST(&DATA 1 2))
+  CALL QRCVDTAQ PARM('KEYQ' '{lib}' &LEN &DATA 0 'XX' 3 &KEY 0 &SND)
+  MONMSG CPF9504 EXEC(SNDPGMMSG MSG('Q: CPF9504'))
+  CALL QRCVDTAQ PARM('NOQ' '{lib}' &LEN &DATA 0)
+  MONMSG CPF9801 EXEC(SNDPGMMSG MSG('Q: CPF9801'))
+  DLTDTAQ DTAQ({lib}/LIFOQ)
+ENDPGM"
+    );
+    let m = cl_job_run(&client, &url, &lib, &[("DQTEST", &pgm)], "CALL DQTEST")
+        .await
+        .unwrap();
+    // (CHGVAR of a *DEC (5 0) into a *CHAR 5 gives the digits with
+    // leading zeros, CL reference CHGVAR.)
+    let q: Vec<&str> = m.iter().filter_map(|x| x.strip_prefix("Q: ")).collect();
+    assert_eq!(
+        q,
+        [
+            "FIFO FIRST 00005",
+            "CUT SEC 00006",
+            "EMPTY UNCHANGED 00000",
+            "PEEK B",
+            "LIFO B",
+            "LIFO A",
+            "CPF2498",
+            "CPF9502",
+            "ERR CPF9501",
+            "AVAIL 00015",
+            "DESC KY 00004",
+            "MAXLEN 00020",
+            "KEYLEN 00003",
+            "KEY AAA E3 QSECOFR",
+            "KEY GGG E1",
+            "KEY XXX E2",
+            "CPF9504",
+            "CPF9801",
+        ]
+    );
+    assert!(m
+        .iter()
+        .any(|x| x == &format!("Data queue KEYQ was created in library {lib}.")));
+    assert!(m.iter().any(
+        |x| x == &format!("CPC2191: Object LIFOQ of type *DTAQ in library {lib} was deleted.")
+    ));
+}
+
+/// An RPG program waits on a data queue (QRCVDTAQ wait time 10: up to
+/// ten seconds) for an entry another job sends a second later, and
+/// answers on a second queue; QRCVDTAQ with an error code structure
+/// gets the exception ID in it (ERRC0100) instead of an escape message.
+/// IBM documentation: Object APIs, Receive Data Queue and Send Data
+/// Queue; "Error code parameter".
+#[tokio::test]
+async fn rpg_waits_on_a_data_queue() {
+    use as4tainr_core::dtaq::{call_api, Caller, ClArgs};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    for q in ["WAITQ", "REPLYQ"] {
+        as4tainr_core::dtaq::create(
+            &client,
+            &as4tainr_core::dtaq::Create {
+                library: &lib,
+                name: q,
+                maxlen: 20,
+                seq: 'F',
+                keylen: 0,
+                senderid: false,
+                force: false,
+                autorcl: false,
+                size_max: -1,
+                size_init: 16,
+                text: "",
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let src = format!(
+        "**FREE
+dcl-pr QSNDDTAQ extpgm('QSNDDTAQ');
+  name char(10) const;
+  lib char(10) const;
+  len packed(5:0) const;
+  data char(32767) const options(*varsize);
+end-pr;
+dcl-pr QRCVDTAQ extpgm('QRCVDTAQ');
+  name char(10) const;
+  lib char(10) const;
+  len packed(5:0);
+  data char(32767) options(*varsize);
+  wait packed(5:0) const;
+  keyord char(2) const options(*nopass);
+  keylen packed(3:0) const options(*nopass);
+  key char(256) options(*varsize:*nopass);
+  sndlen packed(3:0) const options(*nopass);
+  sndinf char(44) options(*varsize:*nopass);
+  remove char(10) const options(*nopass);
+  size packed(5:0) const options(*nopass);
+  error likeds(errc) options(*nopass);
+end-pr;
+dcl-ds errc qualified;
+  provided int(10) inz(%size(errc));
+  available int(10);
+  id char(7);
+  *n char(1);
+end-ds;
+dcl-s len packed(5:0);
+dcl-s data char(20);
+dcl-s key char(1);
+dcl-s snd char(1);
+QRCVDTAQ('WAITQ' : '{lib}' : len : data : 10);
+dsply ('got ' + %trim(data) + ' ' + %char(len));
+QSNDDTAQ('REPLYQ' : '{lib}' : 4 : 'PONG');
+QRCVDTAQ('NOSUCHQ' : '{lib}' : len : data : 0 : ' ' : 0 : key : 0 : snd
+         : '*YES' : 20 : errc);
+dsply ('error ' + errc.id + ' ' + %char(errc.available));
+*inlr = *on;
+"
+    );
+    let sender = {
+        let url = url.clone();
+        let lib = lib.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            let c = runtime::connect_db(&url).await.unwrap();
+            let caller = Caller {
+                user: "QSECOFR".into(),
+                libl: vec![lib.clone()],
+                ..Default::default()
+            };
+            let mut a = ClArgs(vec!["WAITQ".into(), lib.clone(), "4".into(), "PING".into()]);
+            call_api(&c, &caller, "QSNDDTAQ", &mut a).await.unwrap();
+        })
+    };
+    let start = std::time::Instant::now();
+    let r = run_rpg(&url, &lib, "QSECOFR", "DQWAIT", &src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    sender.await.unwrap();
+    assert!(start.elapsed() >= std::time::Duration::from_millis(1400));
+    assert_eq!(r.messages, ["got PING 4", "error CPF9801 15"]);
+    // The answer is on REPLYQ.
+    let caller = Caller {
+        user: "QSECOFR".into(),
+        libl: vec![lib.clone()],
+        ..Default::default()
+    };
+    let mut a = ClArgs(vec![
+        "REPLYQ".into(),
+        lib.clone(),
+        "0".into(),
+        " ".repeat(20),
+        "0".into(),
+    ]);
+    call_api(&client, &caller, "QRCVDTAQ", &mut a)
+        .await
+        .unwrap();
+    assert_eq!((a.0[2].as_str(), a.0[3].trim()), ("4", "PONG"));
+}
+
+/// User spaces (IBM documentation, Object APIs, "User Space APIs":
+/// QUSCRTUS, QUSCHGUS, QUSRTVUS, QUSRUSAT, QUSCUSAT, QUSPTRUS,
+/// QUSDLTUS). Expected values from those pages: every byte starts as the
+/// initial value; starting positions are 1-based; SPCA0100 has the space
+/// size at offset 8, automatic extendibility ('0' or '1') at 12, the
+/// initial value at 13 and the library at 14; a second QUSCRTUS with
+/// replace *NO fails with CPF9870 (in the error code here); a deleted
+/// space is not found (CPF9801). A program changes the space in place
+/// through QUSPTRUS's pointer, and QUSRTVUS then sees the change.
+#[tokio::test]
+async fn user_spaces_and_their_apis() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let pgm = format!(
+        "PGM
+  DCL &ERR *CHAR 16 VALUE(X'00000010')
+  DCL &RCV *CHAR 24
+  DCL &D *CHAR 10
+  DCL &N *DEC (9 0)
+  DCL &T *CHAR 9
+  DCL &RL *CHAR 10
+  CALL QUSCRTUS PARM('SPACE1    {lib:<10}' 'TEST' X'00000064' '*' '*USE' 'A test space')
+  CALL QUSCHGUS PARM('SPACE1    *LIBL     ' X'00000005' X'00000003' 'ABC' '0')
+  CALL QUSRTVUS PARM('SPACE1    {lib:<10}' X'00000001' X'0000000A' &D)
+  SNDPGMMSG MSG('S: RTV ' *CAT &D)
+  CALL QUSRUSAT PARM(&RCV X'00000018' 'SPCA0100' 'SPACE1    *LIBL     ' &ERR)
+  CHGVAR &N %BIN(&RCV 9 4)
+  CHGVAR &T &N
+  SNDPGMMSG MSG('S: SIZE ' *CAT &T *CAT ' ' *CAT %SST(&RCV 13 2) *CAT ' ' *CAT %SST(&RCV 15 10))
+  CALL QUSCHGUS PARM('SPACE1    *LIBL     ' X'00000063' X'00000004' 'WXYZ' '0' &ERR)
+  SNDPGMMSG MSG('S: PAST END ' *CAT %SST(&ERR 9 7))
+  CALL QUSCUSAT PARM(&RL 'SPACE1    *LIBL     ' X'000000010000000300000001F1' &ERR)
+  CALL QUSCHGUS PARM('SPACE1    *LIBL     ' X'00000063' X'00000004' 'WXYZ' '0')
+  CALL QUSRUSAT PARM(&RCV X'00000018' 'SPCA0100' 'SPACE1    *LIBL     ' &ERR)
+  CHGVAR &N %BIN(&RCV 9 4)
+  CHGVAR &T &N
+  SNDPGMMSG MSG('S: GREW ' *CAT &T *CAT ' ' *CAT %SST(&RCV 13 1) *CAT ' ' *CAT &RL)
+  CALL QUSCRTUS PARM('SPACE1    {lib:<10}' 'TEST' X'00000064' ' ' '*USE' 'Again' '*NO' &ERR)
+  SNDPGMMSG MSG('S: DUP ' *CAT %SST(&ERR 9 7))
+  CALL QUSDLTUS PARM('SPACE1    {lib:<10}' &ERR)
+  CALL QUSRTVUS PARM('SPACE1    {lib:<10}' X'00000001' X'0000000A' &D)
+  MONMSG CPF9801 EXEC(SNDPGMMSG MSG('S: CPF9801'))
+ENDPGM"
+    );
+    let m = cl_job_run(&client, &url, &lib, &[("USTEST", &pgm)], "CALL USTEST")
+        .await
+        .unwrap();
+    let s: Vec<&str> = m.iter().filter_map(|x| x.strip_prefix("S: ")).collect();
+    assert_eq!(
+        s,
+        [
+            "RTV ****ABC***",
+            &format!("SIZE 000000100 0* {lib}"),
+            "PAST END CPF3CF2",
+            &format!("GREW 000000102 1 {lib}"),
+            "DUP CPF9870",
+            "CPF9801",
+        ]
+    );
+
+    // QUSPTRUS: an RPG program changes the space through the pointer.
+    let src = format!(
+        "**FREE
+dcl-pr QUSCRTUS extpgm('QUSCRTUS');
+  name char(20) const;
+  attr char(10) const;
+  size int(10) const;
+  init char(1) const;
+  aut char(10) const;
+  text char(50) const;
+end-pr;
+dcl-pr QUSPTRUS extpgm('QUSPTRUS');
+  name char(20) const;
+  ptr pointer;
+end-pr;
+dcl-pr QUSRTVUS extpgm('QUSRTVUS');
+  name char(20) const;
+  start int(10) const;
+  len int(10) const;
+  data char(32767) options(*varsize);
+end-pr;
+dcl-s p pointer;
+dcl-ds space based(p);
+  head char(4);
+  count int(10);
+end-ds;
+dcl-s back char(8);
+QUSCRTUS('SPACE2    {lib}' : 'LIST' : 64 : x'00' : '*ALL' : 'Pointer test');
+QUSPTRUS('SPACE2    {lib}' : p);
+head = 'LIST';
+count = 7;
+QUSRTVUS('SPACE2    {lib}' : 1 : 8 : back);
+if %subst(back : 5 : 4) = x'00000007';
+  dsply (%subst(back : 1 : 4) + ' 7');
+endif;
+*inlr = *on;
+"
+    );
+    let r = run_rpg(&url, &lib, "QSECOFR", "USPTR", &src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["LIST 7"]);
+}
+
+/// The list APIs into a user space (IBM documentation: "List Database
+/// File Members (QUSLMBR)", "List Objects (QUSLOBJ)" and the generic
+/// header of list APIs): an RPG program lists a source file's members
+/// (MBRL0200: name, source type, dates, text) and a library's data
+/// queues (OBJL0100: name, library, type), then walks the list through
+/// QUSPTRUS's pointer: the list data's offset at 124, the number of
+/// entries at 132 and the size of each at 136; information status 'C'
+/// (complete) at 103; the user area (0-63) is left as it was; the space
+/// (100 bytes) grows to hold the list.
+#[tokio::test]
+async fn list_apis_into_user_spaces() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    as4tainr_core::source::create_file(&client, &lib, "QLSTSRC", "")
+        .await
+        .unwrap();
+    for (m, t, x) in [("BETA", "CLLE", "Second"), ("ALPHA", "RPGLE", "First")] {
+        as4tainr_core::source::put_member(
+            &client,
+            &as4tainr_core::source::Member {
+                library: lib.clone(),
+                file: "QLSTSRC".into(),
+                name: m.into(),
+                srctype: t.into(),
+                text: x.into(),
+                source: "x".into(),
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    for q in ["DQ1", "DQ2"] {
+        as4tainr_core::dtaq::create(
+            &client,
+            &as4tainr_core::dtaq::Create {
+                library: &lib,
+                name: q,
+                maxlen: 10,
+                seq: 'F',
+                keylen: 0,
+                senderid: false,
+                force: false,
+                autorcl: false,
+                size_max: -1,
+                size_init: 16,
+                text: "",
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let src = format!(
+        "**FREE
+dcl-pr QUSCRTUS extpgm('QUSCRTUS');
+  name char(20) const;
+  attr char(10) const;
+  size int(10) const;
+  init char(1) const;
+  aut char(10) const;
+  text char(50) const;
+end-pr;
+dcl-pr QUSCHGUS extpgm('QUSCHGUS');
+  name char(20) const;
+  start int(10) const;
+  len int(10) const;
+  data char(64) const;
+  frc char(1) const;
+end-pr;
+dcl-pr QUSPTRUS extpgm('QUSPTRUS');
+  name char(20) const;
+  ptr pointer;
+end-pr;
+dcl-pr QUSLMBR extpgm('QUSLMBR');
+  space char(20) const;
+  format char(8) const;
+  file char(20) const;
+  mbr char(10) const;
+  ovr char(1) const;
+end-pr;
+dcl-pr QUSLOBJ extpgm('QUSLOBJ');
+  space char(20) const;
+  format char(8) const;
+  obj char(20) const;
+  type char(10) const;
+end-pr;
+dcl-s p pointer;
+dcl-s e pointer;
+dcl-ds hdr based(p);
+  user char(64);
+  *n char(39);
+  status char(1);
+  *n char(20);
+  listoff int(10) pos(125);
+  listsize int(10);
+  count int(10);
+  entsize int(10);
+end-ds;
+dcl-ds mbr based(e);
+  name char(10);
+  type char(10);
+  created char(13);
+  changed char(13);
+  text char(50);
+end-ds;
+dcl-ds obj based(e);
+  oname char(10);
+  olib char(10);
+  otype char(10);
+end-ds;
+dcl-s i int(10);
+QUSCRTUS('LIST      {lib}' : 'LIST' : 100 : x'00' : '*ALL' : 'Lists');
+QUSCHGUS('LIST      {lib}' : 1 : 64 : 'MY USER AREA' : '0');
+QUSLMBR('LIST      {lib}' : 'MBRL0200' : 'QLSTSRC   {lib}' : '*ALL' : '0');
+QUSPTRUS('LIST      {lib}' : p);
+dsply (status + ' ' + %char(count) + ' ' + %char(entsize) + ' ' + %subst(user : 1 : 12));
+for i = 0 to count - 1;
+  e = p + listoff + i * entsize;
+  dsply (%trim(name) + ' ' + %trim(type) + ' ' + %trim(text) + ' ' + %subst(created : 1 : 1));
+endfor;
+QUSLOBJ('LIST      {lib}' : 'OBJL0100' : '*ALL      {lib}' : '*DTAQ');
+dsply (%char(count) + ' ' + %char(entsize));
+for i = 0 to count - 1;
+  e = p + listoff + i * entsize;
+  dsply (%trim(oname) + ' ' + %trim(otype));
+endfor;
+*inlr = *on;
+"
+    );
+    let r = run_rpg(&url, &lib, "QSECOFR", "LISTS", &src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "C 2 96 MY USER AREA",
+            "ALPHA RPGLE First 1",
+            "BETA CLLE Second 1",
+            "2 30",
+            "DQ1 *DTAQ",
+            "DQ2 *DTAQ",
+        ]
+    );
+}
+
+/// The retrieve and list APIs (IBM documentation: "Retrieve Object
+/// Description (QUSROBJD)" OBJD0200, "Retrieve Member Description
+/// (QUSRMBRD)" MBRD0200, "List Fields (QUSLFLD)" FLDL0100, "List Spooled
+/// Files (QUSLSPL)" SPLF0100 and "Retrieve Spooled File Attributes
+/// (QUSRSPLA)" SPLA0100). Expected values from those pages' formats: the
+/// return library only for *LIBL, domain *S, the owner; the file
+/// attribute PF, source file '1', the member's text and records; each
+/// field's data type, use B, buffer positions, length, digits and
+/// decimals; a spooled file found by its internal identifiers from
+/// QUSLSPL, with its name, number, user data, status *READY and pages.
+#[tokio::test]
+async fn retrieve_and_list_apis() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    as4tainr_core::source::create_file(&client, &lib, "QAPISRC", "API source")
+        .await
+        .unwrap();
+    as4tainr_core::source::put_member(
+        &client,
+        &as4tainr_core::source::Member {
+            library: lib.clone(),
+            file: "QAPISRC".into(),
+            name: "MEMBER1".into(),
+            srctype: "RPGLE".into(),
+            text: "Three lines".into(),
+            source: "a\nb\nc\n".into(),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    let job = as4tainr_core::jobs::JobId {
+        number: 900000 + (std::process::id() as i64 % 99999),
+        user: "QSECOFR".into(),
+        name: "APITEST".into(),
+    };
+    as4tainr_core::spool::print_lines(
+        &client,
+        &job,
+        "QSYSPRT",
+        "MYDATA",
+        &["one".into(), "two".into()],
+    )
+    .await
+    .unwrap();
+    let src = format!(
+        "**FREE
+dcl-pr QUSROBJD extpgm('QUSROBJD');
+  rcv char(200) options(*varsize);
+  len int(10) const;
+  fmt char(8) const;
+  obj char(20) const;
+  type char(10) const;
+end-pr;
+dcl-pr QUSRMBRD extpgm('QUSRMBRD');
+  rcv char(300) options(*varsize);
+  len int(10) const;
+  fmt char(8) const;
+  file char(20) const;
+  mbr char(10) const;
+  ovr char(1) const;
+end-pr;
+dcl-pr QUSCRTUS extpgm('QUSCRTUS');
+  name char(20) const;
+  attr char(10) const;
+  size int(10) const;
+  init char(1) const;
+  aut char(10) const;
+  text char(50) const;
+end-pr;
+dcl-pr QUSPTRUS extpgm('QUSPTRUS');
+  name char(20) const;
+  ptr pointer;
+end-pr;
+dcl-pr QUSLFLD extpgm('QUSLFLD');
+  space char(20) const;
+  fmt char(8) const;
+  file char(20) const;
+  rcdfmt char(10) const;
+  ovr char(1) const;
+end-pr;
+dcl-pr QUSLSPL extpgm('QUSLSPL');
+  space char(20) const;
+  fmt char(8) const;
+  user char(10) const;
+  outq char(20) const;
+  form char(10) const;
+  udata char(10) const;
+  err char(16);
+  job char(26) const;
+end-pr;
+dcl-pr QUSRSPLA extpgm('QUSRSPLA');
+  rcv char(500) options(*varsize);
+  len int(10) const;
+  fmt char(8) const;
+  job char(26) const;
+  ijob char(16) const;
+  ispl char(16) const;
+  splf char(10) const;
+  nbr int(10) const;
+end-pr;
+dcl-ds objd len(200) qualified;
+  name char(10) pos(9);
+  lib char(10) pos(19);
+  type char(10) pos(29);
+  rtnlib char(10) pos(39);
+  owner char(10) pos(53);
+  domain char(2) pos(63);
+  attr char(10) pos(91);
+  text char(50) pos(101);
+end-ds;
+dcl-ds mbrd len(300) qualified;
+  file char(10) pos(9);
+  mbr char(10) pos(29);
+  attr char(10) pos(39);
+  type char(10) pos(49);
+  text char(50) pos(85);
+  src char(1) pos(135);
+  records int(10) pos(141);
+end-ds;
+dcl-ds spla len(500) qualified;
+  file char(10) pos(67);
+  nbr int(10) pos(77);
+  udata char(10) pos(91);
+  status char(10) pos(101);
+  pages int(10) pos(141);
+end-ds;
+dcl-s p pointer;
+dcl-s e pointer;
+dcl-ds hdr based(p) qualified;
+  listoff int(10) pos(125);
+  count int(10) pos(133);
+  entsize int(10) pos(137);
+end-ds;
+dcl-ds fld based(e) qualified;
+  name char(10);
+  type char(1);
+  use char(1);
+  outpos int(10);
+  inpos int(10);
+  len int(10);
+  digits int(10);
+  dec int(10);
+end-ds;
+dcl-ds splf based(e) qualified;
+  user char(10);
+  udata char(10) pos(41);
+  ijob char(16) pos(51);
+  ispl char(16) pos(67);
+end-ds;
+dcl-s err char(16) inz(x'00000010');
+dcl-s i int(10);
+QUSROBJD(objd : %size(objd) : 'OBJD0200' : 'QAPISRC   *LIBL' : '*FILE');
+dsply (%trim(objd.name) + ' ' + %trim(objd.type) + ' ' + %trim(objd.rtnlib) + ' '
+       + %trim(objd.owner) + ' ' + objd.domain + ' ' + %trim(objd.attr) + ' ' + %trim(objd.text));
+QUSRMBRD(mbrd : %size(mbrd) : 'MBRD0200' : 'QAPISRC   {lib}' : '*FIRST' : '0');
+dsply (%trim(mbrd.mbr) + ' ' + %trim(mbrd.attr) + ' ' + %trim(mbrd.type) + ' '
+       + %trim(mbrd.text) + ' ' + mbrd.src + ' ' + %char(mbrd.records));
+QUSCRTUS('APISPC    {lib}' : 'LIST' : 1000 : x'00' : '*ALL' : '');
+QUSLFLD('APISPC    {lib}' : 'FLDL0100' : 'QAPISRC   {lib}' : '*FIRST' : '0');
+QUSPTRUS('APISPC    {lib}' : p);
+for i = 0 to hdr.count - 1;
+  e = p + hdr.listoff + i * hdr.entsize;
+  dsply (%trim(fld.name) + ' ' + fld.type + fld.use + ' ' + %char(fld.inpos) + ' '
+         + %char(fld.len) + ' ' + %char(fld.digits) + ' ' + %char(fld.dec));
+endfor;
+QUSLSPL('APISPC    {lib}' : 'SPLF0100' : '*CURRENT' : '*ALL' : '*ALL' : '*ALL' : err
+        : 'APITEST   QSECOFR   {nbr:06}');
+dsply ('spooled ' + %char(hdr.count) + ' ' + %char(hdr.entsize));
+e = p + hdr.listoff;
+QUSRSPLA(spla : %size(spla) : 'SPLA0100' : '*INT' : splf.ijob : splf.ispl : '*INT' : -1);
+dsply (%trim(spla.file) + ' ' + %char(spla.nbr) + ' ' + %trim(spla.udata) + ' '
+       + %trim(spla.status) + ' ' + %char(spla.pages));
+*inlr = *on;
+",
+        nbr = job.number
+    );
+    let r = run_rpg(&url, &lib, "QSECOFR", "APIS", &src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            &format!("QAPISRC *FILE {lib} QSECOFR *S PF-SRC API source"),
+            "MEMBER1 PF RPGLE Three lines 1 3",
+            "SRCSEQ SB 1 6 6 2",
+            "SRCDAT SB 7 6 6 0",
+            "SRCDTA AB 13 80 0 0",
+            "spooled 1 88",
+            "QSYSPRT 1 MYDATA *READY 1",
+        ]
+    );
+}
+
+/// Output queues and spooled file commands (IBM CL reference: CRTOUTQ
+/// and CHGOUTQ's parameters, HLDOUTQ (CPF3426 when the queue is already
+/// held; CPF3357 when not found), HLDSPLF, RLSSPLF, CHGSPLFA, CLROUTQ,
+/// DLTOUTQ, CRTUSRPRF and CHGUSRPRF OUTQ). A user's spooled files go to
+/// the profile's output queue; WRKSPLF shows a held file's status as HLD
+/// and a ready one as RDY (the Sts column of IBM i 7.5's WRKSPLF, PUB400
+/// tools/golden/screens4.txt), with options 3=Hold in column 24,
+/// 4=Delete in 33, 5=Display in 44, 6=Release in 56 and 8=Attributes in
+/// column 4 of the next line (the same capture).
+#[tokio::test]
+async fn output_queues_and_spooled_file_commands() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::{jobs, spool};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let user = format!("Q{}", &lib[1..]);
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut admin = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    for c in [
+        format!("CRTOUTQ OUTQ({lib}/MYQ) TEXT('My queue')"),
+        format!("CRTUSRPRF USRPRF({user}) PASSWORD(*NONE) OUTQ({lib}/MYQ)"),
+    ] {
+        admin.run(&c).await.unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    let e = admin
+        .run(&format!("CRTOUTQ OUTQ({lib}/MYQ)"))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().starts_with("CPF9870"), "{e}");
+    let e = admin.run(&format!("HLDOUTQ {lib}/NOQ")).await.unwrap_err();
+    assert!(e.to_string().starts_with("CPF3357"), "{e}");
+    admin.run(&format!("HLDOUTQ {lib}/MYQ")).await.unwrap();
+    let e = admin.run(&format!("HLDOUTQ {lib}/MYQ")).await.unwrap_err();
+    assert!(e.to_string().starts_with("CPF3426"), "{e}");
+    admin.run(&format!("RLSOUTQ {lib}/MYQ")).await.unwrap();
+
+    let id = jobs::start_interactive(
+        &client,
+        "OUTQDEV",
+        &user,
+        Some(&lib),
+        std::slice::from_ref(&lib),
+    )
+    .await
+    .unwrap();
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: user.clone(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: Some(id.clone()),
+        calls: Default::default(),
+    };
+    spool::print_lines(&client, &id, "REPORT", "A", &["one".into()])
+        .await
+        .unwrap();
+    spool::print_lines(&client, &id, "REPORT", "B", &["two".into()])
+        .await
+        .unwrap();
+    let files = spool::for_user(&client, &user).await.unwrap();
+    assert!(files.iter().all(|f| f.outq == "MYQ"), "{files:?}");
+
+    job.run("HLDSPLF FILE(REPORT) SPLNBR(1)").await.unwrap();
+    let Outcome::Display(d) = job.run("WRKSPLF").await.unwrap() else {
+        panic!()
+    };
+    let sts: Vec<&str> = d.rows.iter().map(|r| &r[48..51]).collect();
+    assert_eq!(sts, ["HLD", "RDY"], "{:?}", d.rows);
+    let l = d.ibm.unwrap();
+    assert_eq!(l.option_text[0][0].find("3=Hold"), Some(22));
+    assert_eq!(l.option_text[0][0].find("4=Delete"), Some(31));
+    assert_eq!(l.option_text[0][0].find("5=Display"), Some(42));
+    assert_eq!(l.option_text[0][0].find("6=Release"), Some(54));
+    assert_eq!(l.option_text[0][1].find("8=Attributes"), Some(2));
+    job.run("RLSSPLF FILE(REPORT) SPLNBR(1)").await.unwrap();
+    assert!(spool::for_user(&client, &user)
+        .await
+        .unwrap()
+        .iter()
+        .all(|f| f.status == "RDY"));
+
+    // CHGSPLFA moves a file to QGPL/QPRINT and changes its user data.
+    job.run("CHGSPLFA FILE(REPORT) SPLNBR(2) OUTQ(QGPL/QPRINT) USRDTA(MOVED)")
+        .await
+        .unwrap();
+    let f = spool::find(&client, "REPORT", id.number, Some(2))
+        .await
+        .unwrap();
+    assert_eq!((f.outq.as_str(), f.user_data.as_str()), ("QPRINT", "MOVED"));
+
+    // A queue with files is not deleted; CLROUTQ empties it.
+    assert!(admin.run(&format!("DLTOUTQ {lib}/MYQ")).await.is_err());
+    admin.run(&format!("CLROUTQ {lib}/MYQ")).await.unwrap();
+    let left = spool::for_user(&client, &user).await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].outq, "QPRINT");
+    admin
+        .run(&format!("CHGUSRPRF USRPRF({user}) OUTQ(*WRKSTN)"))
+        .await
+        .unwrap();
+    let m = admin.run(&format!("DLTOUTQ {lib}/MYQ")).await.unwrap();
+    assert!(
+        matches!(m, Outcome::Messages(ref v) if v[0].starts_with("CPC2191")),
+        "{m:?}"
+    );
+    // OUTQ(*WRKSTN): QGPL/QPRINT.
+    spool::print_lines(&client, &id, "REPORT", "C", &["three".into()])
+        .await
+        .unwrap();
+    let f = spool::find(&client, "REPORT", id.number, None)
+        .await
+        .unwrap();
+    assert_eq!(f.outq, "QPRINT");
+    spool::delete(&client, f.id).await.unwrap();
+    spool::delete(&client, left[0].id).await.unwrap();
+    admin.run(&format!("DLTUSRPRF {user}")).await.unwrap();
+}
+
+/// Referential constraints written the ways IBM i's SQL programming guide
+/// writes them: "Department table (DEPARTMENT)" adds them with the
+/// constraint's name after FOREIGN KEY (ADD FOREIGN KEY ROD (ADMRDEPT)
+/// REFERENCES DEPARTMENT ON DELETE CASCADE: the parent's primary key);
+/// "Adding referential constraints" puts one on a column (CONSTRAINT
+/// WORKDEPT_EXISTS REFERENCES ... (DEPTNO)). An INSERT whose foreign key
+/// has no parent fails with SQL0530 (SQLSTATE 23503).
+#[tokio::test]
+async fn referential_constraints_as_in_the_sample_tables() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let script = format!(
+        "CREATE TABLE {lib}.DEPARTMENT
+      (DEPTNO    CHAR(3)           NOT NULL,
+       DEPTNAME  VARCHAR(36)       NOT NULL,
+       MGRNO     CHAR(6)                   ,
+       ADMRDEPT  CHAR(3)           NOT NULL,
+       LOCATION  CHAR(16),
+       PRIMARY KEY (DEPTNO));
+ALTER TABLE {lib}.DEPARTMENT
+      ADD FOREIGN KEY ROD (ADMRDEPT)
+          REFERENCES {lib}.DEPARTMENT
+          ON DELETE CASCADE;
+CREATE TABLE {lib}.EMP (EMPNO CHAR(6) NOT NULL PRIMARY KEY,
+       WORKDEPT CHAR(3) CONSTRAINT WORKDEPT_EXISTS REFERENCES {lib}.DEPARTMENT (DEPTNO));
+INSERT INTO {lib}.DEPARTMENT VALUES ('A00', 'SPIFFY', NULL, 'A00', NULL);
+INSERT INTO {lib}.DEPARTMENT VALUES ('B01', 'PLANNING', NULL, 'A00', NULL);
+INSERT INTO {lib}.EMP VALUES ('000010', 'B01');"
+    );
+    let lines = job
+        .run_sql_script(&script, "sample tables", 0, None, true)
+        .await
+        .unwrap();
+    assert!(lines.last().unwrap().contains("0 with errors"), "{lines:?}");
+    let e = as4tainr_core::sql::run_as(
+        &client,
+        &url,
+        std::slice::from_ref(&lib),
+        "QSECOFR",
+        None,
+        None,
+        &format!("INSERT INTO {lib}.EMP VALUES ('000020', 'Z99')"),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.to_string().starts_with("SQL0530"), "{e}");
+    let e = as4tainr_core::sql::run_as(
+        &client,
+        &url,
+        std::slice::from_ref(&lib),
+        "QSECOFR",
+        None,
+        None,
+        &format!("INSERT INTO {lib}.DEPARTMENT VALUES ('C01', 'X', NULL, 'Q99', NULL)"),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.to_string().starts_with("SQL0530"), "{e}");
+}
+
+/// One value of `VALUES expr` through the SQL interface.
+async fn sql_value(client: &tokio_postgres::Client, url: &str, lib: &str, expr: &str) -> String {
+    match as4tainr_core::sql::run_as(
+        client,
+        url,
+        &[lib.to_string()],
+        "QSECOFR",
+        None,
+        None,
+        &if expr.starts_with("SELECT") {
+            expr.to_string()
+        } else {
+            format!("VALUES {expr}")
+        },
+    )
+    .await
+    {
+        Ok(as4tainr_core::sql::Outcome::Rows { rows, .. }) => rows[0][0].trim().to_string(),
+        Ok(_) => panic!("{expr}: no rows"),
+        Err(e) => format!("ERR {e}"),
+    }
+}
+
+#[tokio::test]
+async fn db2_scalar_functions_found_by_the_corpus() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    // Expected values: the examples of the Db2 for i SQL Reference (IBM i
+    // 7.5), scalar functions, where it gives one ("ex"); otherwise worked
+    // out by hand from the rules it states.
+    let cases: &[(&str, &str)] = &[
+        ("LOCATE('N', 'DINING')", "3"),                     // ex
+        ("LOCATE('N', 'DINING', 4)", "5"),                  // start at 4: D I N I N G
+        ("POSSTR('Hello', 'l')", "3"),
+        ("LOCATE_IN_STRING('WINNING', 'IN', 1, 2)", "5"),   // second occurrence
+        ("LOCATE_IN_STRING('WINNING', 'IN', -1)", "5"),     // backward from the end
+        ("INSERT('INSERTING', 4, 2, 'IS')", "INSISTING"),   // ex
+        ("INSERT('INSERTING', 4, 0, 'IS')", "INSISERTING"), // ex
+        ("INSERT('INSERTING', 4, 2, '')", "INSTING"),       // ex
+        ("'[' || SPACE(3) || ']'", "[   ]"),
+        ("TRANSLATE('abcdef')", "ABCDEF"),
+        // to padded with the pad character to the length of from.
+        ("TRANSLATE('abcd', 'A', 'ab', '%')", "A%cd"),
+        ("TRANSLATE('abcdef', 'xy', 'bc')", "axydef"),
+        ("STRIP('  a  ')", "a"),
+        ("STRIP('00100', L, '0')", "100"),
+        ("STRIP('00100', TRAILING, '0')", "001"),
+        ("IFNULL(NULL, 2)", "2"),
+        ("VALUE(NULL, NULL, 3)", "3"),
+        ("MIDNIGHT_SECONDS('12:00:00')", "43200"),
+        ("MIDNIGHT_SECONDS('24.00.00')", "86400"), // the range ends at 86400
+        // Weeks start on Sunday, January 1 is in week 1: 2007-01-01 was a
+        // Monday, so Saturday the 6th is in week 1, Sunday the 7th in week 2.
+        ("WEEK('2007-01-06')", "1"),
+        ("WEEK('2007-01-07')", "2"),
+        ("WEEK_ISO('2024-01-01')", "1"),
+        ("DAYOFWEEK_ISO('2024-01-07')", "7"), // a Sunday
+        ("MONTHNAME('2024-02-01')", "February"),
+        ("DAYNAME('2024-01-01')", "Monday"),
+        ("JULIAN_DAY('1998-01-01')", "2450815"), // ex
+        ("ADD_MONTHS('2024-01-31', 1)", "2024-02-29"), // no 31st: last day
+        ("ADD_MONTHS('2024-02-29', 1)", "2024-03-31"), // last day stays last
+        ("LAST_DAY('2024-02-10')", "2024-02-29"),
+        ("NEXT_DAY('2024-01-01', 'MONDAY')", "2024-01-08-00.00.00.000000"),
+        ("NEXT_DAY('2024-01-01', 'FRI')", "2024-01-05-00.00.00.000000"),
+        ("MONTHS_BETWEEN('2005-02-02', '2005-01-01')", "1.032258064516129"), // ex
+        ("MONTHS_BETWEEN('2005-03-31', '2005-02-28')", "1.000000000000000"), // both last days
+        ("JULIAN_DAY(TIMESTAMP_FORMAT('1998-01-01 10:00:00', 'YYYY-MM-DD HH24:MI:SS'))", "2450815"),
+        ("TO_DATE('20240105', 'YYYYMMDD')", "2024-01-05-00.00.00.000000"),
+        ("LENGTH(GENERATE_UNIQUE())", "13"), // 13 bytes of bit data
+        // HEX: the internal form, big-endian binary, IEEE floating point,
+        // packed decimal (1.5 is DECIMAL(2,1), X'015D' when negative).
+        ("HEX(1)", "00000001"),
+        ("HEX(SMALLINT(1))", "0001"),
+        ("HEX(DOUBLE(1.5))", "3FF8000000000000"),
+        ("HEX(-1.5)", "015D"),
+        // INTEGER and the other cast functions cut off the fraction.
+        ("INT(1.9)", "1"),
+        ("INTEGER('  12 ')", "12"),
+        ("SMALLINT(-3.7)", "-3"),
+        ("DOUBLE('1.5')", "1.5"),
+        ("VARCHAR('abc', 2)", "ab"),
+        ("VARCHAR(1.50)", "1.50"),
+        ("ZONED(12.345, 5, 2)", "12.34"),
+        // DATE of n: n - 1 days after 0001-01-01; yyyynnn; USA and EUR.
+        ("DATE(1)", "0001-01-01"),
+        ("DATE(DAYS('2021-07-29'))", "2021-07-29"),
+        ("DATE('2024032')", "2024-02-01"),
+        ("DATE('12/25/2024')", "2024-12-25"),
+        ("DATE('25.12.2024')", "2024-12-25"),
+        // TIMESTAMPDIFF of CHAR(ts - ts): 10 seconds.
+        (
+            "TIMESTAMPDIFF(2, CHAR(TIMESTAMP('2024-01-01-00.00.10') - TIMESTAMP('2024-01-01-00.00.00')))",
+            "10",
+        ),
+        ("TIMESTAMPDIFF(16, '00000203000000.000000')", "63"), // 2 months of 30 days + 3
+        ("MAX(1, 2)", "2"),
+        ("MIN(1, NULL)", "-"), // null when an argument is null
+        ("CURDATE() = CURRENT DATE", "TRUE"),
+        ("CURRENT USER", "QSECOFR"),
+        ("SESSION_USER", "QSECOFR"),
+    ];
+    for (expr, want) in cases {
+        let got = sql_value(&client, &url, &lib, expr).await;
+        let got = if got == "1" && *want == "TRUE" {
+            "TRUE".to_string()
+        } else {
+            got
+        };
+        assert_eq!(got, *want, "{expr}");
+    }
+    // An invalid date: SQL0181 (Db2 for i SQL messages and codes).
+    for bad in ["DATE('2024-02-30')", "DATE(0)"] {
+        let got = sql_value(&client, &url, &lib, bad).await;
+        assert!(got.starts_with("ERR SQL0181"), "{bad}: {got}");
+    }
+    // LISTAGG: the values joined in the WITHIN GROUP order; no separator
+    // is an empty string.
+    let got = sql_value(
+        &client,
+        &url,
+        &lib,
+        "SELECT LISTAGG(X, ', ') WITHIN GROUP (ORDER BY X DESC) FROM (VALUES ('a'), ('b'), ('c')) T(X)",
+    )
+    .await;
+    assert_eq!(got, "c, b, a");
+    let got = sql_value(
+        &client,
+        &url,
+        &lib,
+        "SELECT LISTAGG(X) WITHIN GROUP (ORDER BY X) FROM (VALUES ('b'), ('a')) T(X)",
+    )
+    .await;
+    assert_eq!(got, "ab");
+}
+
+#[tokio::test]
+async fn procedure_variables_named_like_columns() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    // The company_system corpus's POPDEPT: variables named like the
+    // columns. The column list of INSERT and the targets of UPDATE ... SET
+    // name columns, not variables (Db2 for i SQL Reference, INSERT, UPDATE).
+    let script = format!(
+        "CREATE TABLE {lib}.DEPT (DEPTNO CHAR(3) NOT NULL, DEPTNAME VARCHAR(36));
+CREATE OR REPLACE PROCEDURE {lib}.POPD()
+LANGUAGE SQL
+BEGIN
+  DECLARE DEPTNO CHAR(3);
+  DECLARE DEPTNAME VARCHAR(36);
+  SET DEPTNO = RIGHT('000' || CAST(RAND() * 1000 AS INT), 3);
+  SET DEPTNAME = 'Admin';
+  INSERT INTO {lib}.DEPT (DEPTNO, DEPTNAME) VALUES (DEPTNO, DEPTNAME) WITH NC;
+  UPDATE {lib}.DEPT SET DEPTNAME = 'IT' WITH NC;
+END;
+CALL {lib}.POPD();"
+    );
+    let lines = job
+        .run_sql_script(&script, "popd", 0, None, true)
+        .await
+        .unwrap();
+    assert!(lines.last().unwrap().contains("0 with errors"), "{lines:?}");
+    let got = sql_value(
+        &client,
+        &url,
+        &lib,
+        &format!("SELECT LENGTH(DEPTNO) || DEPTNAME FROM {lib}.DEPT"),
+    )
+    .await;
+    assert_eq!(got, "3IT");
+}
+
+#[tokio::test]
+async fn rpg_features_found_by_the_ossile_corpus() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    // A program-described file the program names does not exist; EXTFILE
+    // names the one it opens (ILE RPG Reference, EXTFILE: the file is
+    // found when it is opened).
+    job.run(&format!("CRTPF FILE({lib}/DATA10) RCDLEN(10)"))
+        .await
+        .unwrap();
+    as4tainr_core::sql::run_as(
+        &client,
+        &url,
+        std::slice::from_ref(&lib),
+        "QSECOFR",
+        None,
+        None,
+        &format!("INSERT INTO {lib}.DATA10 VALUES ('HELLO')"),
+    )
+    .await
+    .unwrap();
+    let programs: Vec<(&str, String, Vec<&str>)> = vec![
+        // A name continued with an ellipsis past position 21, on D and P
+        // specifications (ILE RPG Reference: a name may use positions
+        // 7-80 when it ends in "..."), as OSSILE's llist_h.rpgle writes
+        // list_removeFirst...
+        (
+            "LONGNAME",
+            "     Dr                S             10I 0\n     Dlist_removeFirst...\n     D                 PR            10I 0\n     Dn                              10I 0 value\n     C                   eval      r = list_removeFirst(21)\n     C     r             dsply\n     C                   seton                                        LR\n     Plist_removeFirst...\n     P                 B\n     D                 PI            10I 0\n     Dn                              10I 0 value\n     C                   return    n * 2\n     P                 E\n".to_string(),
+            vec!["42"],
+        ),
+        // ILE RPG Reference: a subfield named like an opcode's prefix
+        // (return_value); a subfield LIKEDS a data structure defined
+        // later (10 bytes);
+        // INZ(*LIKEDS) (the template's INZ values); a local field LIKE a
+        // parameter; procedure pointers (%PADDR, EXTPROC(pointer),
+        // POINTER(*PROC)); an array overlaying a data structure array,
+        // sorted by SORTA (whole elements move); %SIZE of based storage
+        // without an address. QlgConvertCase (Convert Case API: request
+        // type 1, case 0 to upper case) with the QSYSINC error code
+        // structure QUSEC (bytes available 0: no error).
+        (
+            "OSSFREE",
+            "**FREE
+ctl-opt dftactgrp(*no);
+/copy QSYSINC/QRPGLESRC,QUSEC
+dcl-ds msg_t qualified template;
+  id char(7);
+  sender likeds(sender_t);
+end-ds;
+dcl-ds sender_t qualified template;
+  pgm char(10) inz('CALLER');
+end-ds;
+dcl-ds iconv_t qualified template;
+  return_value int(10) inz(7);
+end-ds;
+dcl-ds rcb_t qualified template;
+  type int(10) inz(1);
+  ccsid int(10) inz(0);
+  case int(10) inz(0);
+  res char(10) inz(*allx'00');
+end-ds;
+dcl-pr convertCase extproc('QlgConvertCase');
+  rcb likeds(rcb_t) const;
+  input char(64) const options(*varsize);
+  output char(64) options(*varsize);
+  length int(10) const;
+  err likeds(QUSEC) options(*varsize);
+end-pr;
+dcl-pr apply int(10) extproc(fn);
+  x int(10) value;
+end-pr;
+dcl-s fn pointer(*proc);
+dcl-ds m likeds(msg_t) inz(*likeds);
+dcl-ds ic likeds(iconv_t) inz(*likeds);
+dcl-ds rcb likeds(rcb_t) inz(*likeds);
+dcl-ds err likeds(QUSEC);
+dcl-s s char(20) inz('Gipfel strasse 1a');
+dcl-ds *n;
+  loc char(8) dim(3);
+  zip char(3) overlay(loc);
+end-ds;
+dcl-ds based_t qualified based(p);
+  a char(30);
+end-ds;
+dcl-s p pointer;
+dsply %char(%size(m.sender));
+dsply %char(ic.return_value);
+clear err;
+err.QUSBPRV = %size(err);
+convertCase(rcb : s : s : %len(s) : err);
+dsply s;
+dsply %char(err.QUSBAVL);
+fn = %paddr(twice);
+dsply %char(apply(5));
+fn = %paddr('THRICE');
+dsply %char(apply(5));
+loc(1) = '300Bonn';
+loc(2) = '100Linz';
+loc(3) = '200Graz';
+sorta zip;
+dsply (loc(1) + loc(2) + loc(3));
+dsply %char(%size(based_t));
+*inlr = *on;
+dcl-proc twice;
+  dcl-pi *n int(10);
+    x int(10) value;
+  end-pi;
+  return x * 2;
+end-proc;
+dcl-proc thrice;
+  dcl-pi *n int(10);
+    x int(10) value;
+  end-pi;
+  dcl-s keep like(x);
+  keep = x * 3;
+  return keep;
+end-proc;
+"
+            .to_string(),
+            vec![
+                "10",
+                "7",
+                "GIPFEL STRASSE 1A",
+                "0",
+                "10",
+                "15",
+                "100Linz 200Graz 300Bonn",
+                "30",
+            ],
+        ),
+        // ILE CEE APIs (the CEEDAYS and CEEDATE pages): 16 May 1988 is
+        // Lilian day 148138; 148143 written as "Wwwwwwwwwz, Mmmmmmmmmz
+        // DD, YYYY" is "Saturday, May 21, 1988"; CEEDYWK gives 7 for a
+        // Saturday (1 is Sunday); an invalid date gives Lilian date 0 and
+        // a feedback code that is not all zeros (CEE0000 is). CEEDOD gives
+        // the length of the argument passed (its operational descriptor).
+        // strtok (ILE C runtime) skips empty tokens; EXTPROC(*DCLCASE).
+        // The program-described file opened by EXTFILE.
+        (
+            "CEEPGM",
+            format!(
+                "**FREE
+ctl-opt dftactgrp(*no) main(main);
+dcl-pr CEEDAYS opdesc;
+  d char(20) const options(*varsize);
+  pic char(20) const options(*varsize);
+  lil int(10);
+  fc char(12) options(*omit);
+end-pr;
+dcl-pr CEEDATE opdesc;
+  lil int(10) const;
+  pic char(40) const options(*varsize);
+  result char(40) options(*varsize);
+  fc char(12) options(*omit);
+end-pr;
+dcl-pr CEEDYWK;
+  lil int(10) const;
+  wday int(10);
+  fc char(12) options(*omit);
+end-pr;
+dcl-pr CEEDOD;
+  pos int(10) const;
+  a int(10);
+  b int(10);
+  c int(10);
+  d int(10);
+  len int(10);
+  fc char(12) options(*omit);
+end-pr;
+dcl-pr strtok pointer extproc('strtok');
+  s pointer value options(*string);
+  d pointer value options(*string);
+end-pr;
+dcl-pr lenOf int(10) opdesc extproc(*dclcase);
+  v char(100) const options(*varsize);
+end-pr;
+dcl-pr main extpgm('CEEPGM') end-pr;
+dcl-proc main;
+  dcl-s lil int(10);
+  dcl-s fc char(12);
+  dcl-s out char(40);
+  dcl-s wday int(10);
+  dcl-s t pointer;
+  dcl-s fname char(21) inz('{lib}/DATA10');
+  dcl-f nosuch disk(10) extfile(fname) usropn;
+  dcl-ds rec len(10) end-ds;
+  CEEDAYS('19880516' : 'YYYYMMDD' : lil : fc);
+  dsply %char(lil);
+  dsply %char(%check(x'00' : fc));
+  CEEDATE(148143 : 'Wwwwwwwwwz, Mmmmmmmmmz DD, YYYY' : out : *omit);
+  dsply out;
+  CEEDYWK(148143 : wday : *omit);
+  dsply %char(wday);
+  CEEDAYS('19880230' : 'YYYYMMDD' : lil : fc);
+  dsply %char(lil);
+  dsply %char(%check(x'00' : fc) > 0);
+  dsply %char(lenOf('abc'));
+  t = strtok('a,b,,c' : ',');
+  dow t <> *null;
+    dsply %str(t);
+    t = strtok(*null : ',');
+  enddo;
+  open nosuch;
+  read nosuch rec;
+  dsply rec;
+  close nosuch;
+end-proc;
+dcl-proc lenOf;
+  dcl-pi *n int(10) opdesc;
+    v char(100) const options(*varsize);
+  end-pi;
+  dcl-s a int(10);
+  dcl-s len int(10);
+  CEEDOD(1 : a : a : a : a : len : *omit);
+  return len;
+end-proc;
+"
+            ),
+            vec![
+                "148138",
+                "0",
+                "Saturday, May 21, 1988",
+                "7",
+                "0",
+                "1",
+                "3",
+                "a",
+                "b",
+                "c",
+                "HELLO",
+            ],
+        ),
+        // QWCRNETA (Retrieve Network Attributes API): the number of
+        // attributes, their offsets, then each one's entry (the QSYSINC
+        // names QWCRAT, QWCNA, QWCLD); SYSNAME is CHAR(8).
+        (
+            "NETA",
+            "**FREE
+/copy QSYSINC/QRPGLESRC,QWCRNETA
+dcl-pr qwcrneta extpgm('QWCRNETA');
+  rcv char(256) options(*varsize);
+  len int(10) const;
+  n int(10) const;
+  names char(10) const;
+  err char(8);
+end-pr;
+dcl-ds rcv len(256);
+  count int(10) pos(1);
+  off1 int(10) pos(5);
+end-ds;
+dcl-s err char(8) inz(*allx'00');
+qwcrneta(rcv : 256 : 1 : 'SYSNAME' : err);
+dsply %char(count);
+qwcrat = %subst(rcv : off1 + 1 : 16);
+dsply qwcna;
+dsply %char(qwcld);
+*inlr = *on;
+"
+            .to_string(),
+            vec!["1", "SYSNAME", "8"],
+        ),
+    ];
+    for (name, source, want) in programs {
+        let r = rpg::call(
+            &url,
+            vec![lib.clone()],
+            "QSECOFR".into(),
+            None,
+            None,
+            None,
+            name.into(),
+            source,
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(r.error.is_none(), "{name}: {:?}", r.error);
+        let got: Vec<String> = r
+            .messages
+            .iter()
+            .map(|m| m.trim_end().to_string())
+            .collect();
+        assert_eq!(got, want, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn rpg_features_found_by_rpgunit() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    // OVRPRTF's parameters left out are not overridden (CL reference,
+    // OVRPRTF): RPGUnit's OVRPRTF names no OUTQ; and CRTSRVPGM takes
+    // OPTION(*DUPPROC).
+    job.run("OVRPRTF FILE(QSYSPRT) USRDTA(X) SPLFNAME(RPGUNIT)")
+        .await
+        .unwrap();
+    job.run("DLTOVR FILE(QSYSPRT)").await.unwrap();
+    as4tainr_core::cl::parse(&format!(
+        "CRTSRVPGM SRVPGM({lib}/X) EXPORT(*ALL) OPTION(*DUPPROC)"
+    ))
+    .unwrap();
+    // RPGUnit's own tests (RPGUnit/RPGUnit on GitHub) expect these on IBM
+    // i, and they pass there:
+    // - QWVRCSTK (Retrieve Call Stack, format CSTK0100): the most recent
+    //   entry first; a procedure's name as exported (EXTPROC('inner')
+    //   keeps its case); its statement ID the source sequence number with
+    //   two decimals, zero-padded to 10 (ASSERTT: '0000008500' for line
+    //   85).
+    // - QMHSNDPM *ESCAPE to the caller of the caller (counter 2): the
+    //   entries between end, their MONITOR groups do not take it
+    //   (ASSERTT testFailShouldRiseAboveAnEnclosingMonitorBlock).
+    // - An exception message's sender is the procedure where it happened
+    //   and its statement '16500' for line 165 (PGMMSGT
+    //   test_rcvExcpMsgInfo, RCVM0300 sender information).
+    // - QMHRSNEM with a blank key resends the last new escape message to
+    //   the caller (PGMMSGT test_resendEscapeMsg).
+    // - A procedure returning LIKEDS(ds) DIM(n) returns every element
+    //   (ASSERT getCallStk); a whole array is passed to a CONST DIM
+    //   parameter (SPLF rtvJobUsrNm).
+    // - %INT of blanks is an error (CMDRUNLOG shows '*N' then).
+    // - QGYOLJBL lists the job log newest first (*PRV): a handled MCH1211
+    //   is there (JOBLOGT).
+    // - QWCRTVCA key 305: the current user, CHAR(10) (SPLF).
+    // - QLICVTTP *SYMTOHEX of *SRVPGM is x'0203' (MI object types).
+    let source = "**FREE
+ctl-opt dftactgrp(*no) main(main);
+dcl-ds ent_t qualified template;
+  pgm char(10);
+  proc char(30);
+  stmt char(10);
+end-ds;
+dcl-pr inner likeds(ent_t) dim(2) extproc('inner');
+end-pr;
+dcl-pr qwvrcstk extpgm('QWVRCSTK');
+  rcv char(2000) options(*varsize);
+  len int(10) const;
+  fmt char(8) const;
+  jid char(56) const;
+  jfmt char(8) const;
+  err char(8);
+end-pr;
+dcl-pr qmhsndpm extpgm('QMHSNDPM');
+  id char(7) const;
+  msgf char(20) const;
+  data char(80) const;
+  dlen int(10) const;
+  type char(10) const;
+  entry char(10) const;
+  counter int(10) const;
+  key char(4);
+  err char(8);
+end-pr;
+dcl-pr qmhrcvpm extpgm('QMHRCVPM');
+  rcv char(2000) options(*varsize);
+  len int(10) const;
+  fmt char(8) const;
+  entry char(10) const;
+  counter int(10) const;
+  type char(10) const;
+  key char(4) const;
+  wait int(10) const;
+  action char(10) const;
+  err char(8);
+end-pr;
+dcl-pr qmhrsnem extpgm('QMHRSNEM');
+  key char(4) const;
+  err char(8);
+end-pr;
+dcl-pr qgyoljbl extpgm('QGYOLJBL');
+  rcv char(4000) options(*varsize);
+  len int(10) const;
+  info char(80);
+  count int(10) const;
+  sel char(80) const;
+  sellen int(10) const;
+  err char(8);
+end-pr;
+dcl-pr qwcrtvca extpgm('QWCRTVCA');
+  rcv char(100) options(*varsize);
+  len int(10) const;
+  fmt char(8) const;
+  n int(10) const;
+  keys int(10) const dim(5) options(*varsize);
+  err char(8);
+end-pr;
+dcl-pr qlicvttp extpgm('QLICVTTP');
+  op char(10) const;
+  sym char(10) const;
+  hex char(2);
+  err char(8);
+end-pr;
+dcl-pr main extpgm('RUNITF') end-pr;
+dcl-s err char(8) inz(*allx'00');
+dcl-proc main;
+  dcl-ds e likeds(ent_t) dim(2);
+  dcl-s caught ind;
+  dcl-s rcv char(2000);
+  dcl-s key char(4);
+  dcl-s n int(10);
+  dcl-s keys int(10) dim(1);
+  dcl-s hex char(2);
+  dcl-ds sel len(80) qualified;
+    dir char(10) pos(1) inz('*PRV');
+    job char(26) pos(11) inz('*');
+    start char(4) pos(53) inz(x'FFFFFFFF');
+    fldoff int(10) pos(65) inz(0);
+    fldcnt int(10) pos(69) inz(0);
+  end-ds;
+  dcl-ds info len(80) qualified;
+    ret int(10) pos(5);
+  end-ds;
+  e = inner();
+  dsply (%trim(e(1).proc) + ' ' + e(1).stmt);
+  dsply %trim(e(2).proc);
+  monitor;
+    caught = passOver();
+  on-error;
+    dsply 'escape reached main';
+  endmon;
+  dsply %char(caught);
+  monitor;
+    n = divide(0);
+  on-error;
+  endmon;
+  qmhrcvpm(rcv : %size(rcv) : 'RCVM0300' : '*' : 0 : '*EXCP' : ' ' : 0 : '*SAME' : err);
+  dsply %subst(rcv : 13 : 7);
+  dsply %trim(sender(rcv));
+  qgyoljbl(rcv : %size(rcv) : info : -1 : sel : %size(sel) : err);
+  dsply %subst(rcv : 17 : 7);
+  monitor;
+    resend();
+  on-error;
+    dsply 'resent';
+  endmon;
+  monitor;
+    n = %int('   ');
+    dsply 'no error';
+  on-error 105;
+    dsply '*N';
+  endmon;
+  keys(1) = 305;
+  qwcrtvca(rcv : 100 : 'RTVC0100' : 1 : keys : err);
+  dsply %subst(rcv : 21 : 10);
+  qlicvttp('*SYMTOHEX' : '*SRVPGM' : hex : err);
+  dsply %char(hex = x'0203');
+end-proc;
+dcl-proc inner;
+  dcl-pi *n likeds(ent_t) dim(2);
+  end-pi;
+  dcl-ds res likeds(ent_t) dim(2);
+  dcl-s rcv char(2000);
+  dcl-s off int(10);
+  dcl-s i int(10);
+  dcl-s nl int(10);
+  qwvrcstk(rcv : %size(rcv) : 'CSTK0100' : '*' : 'JIDF0100' : err); // @STK
+  off = bin(%subst(rcv : 13 : 4)) + 1;
+  for i = 1 to 2;
+    res(i).pgm = %subst(rcv : off + 24 : 10);
+    nl = bin(%subst(rcv : off + 16 : 4));
+    res(i).proc = %subst(rcv : off + bin(%subst(rcv : off + 12 : 4)) : nl);
+    if bin(%subst(rcv : off + 8 : 4)) > 0;
+      res(i).stmt = %subst(rcv : off + bin(%subst(rcv : off + 4 : 4)) : 10);
+    endif;
+    off += bin(%subst(rcv : off : 4));
+  endfor;
+  return res;
+end-proc;
+dcl-proc passOver;
+  dcl-pi *n ind end-pi;
+  monitor;
+    sendUp();
+  on-error;
+    return *on;
+  endmon;
+  return *off;
+end-proc;
+dcl-proc sendUp;
+  dcl-s key char(4);
+  qmhsndpm('CPF9898' : 'QCPFMSG   *LIBL' : 'up' : 2 : '*ESCAPE' : '*' : 2 : key : err);
+end-proc;
+dcl-proc divide;
+  dcl-pi *n int(10);
+    d int(10) value;
+  end-pi;
+  return 1 / d; // @DIV
+end-proc;
+dcl-proc resend;
+  monitor;
+    divide(0);
+  on-error;
+    qmhrsnem(' ' : err);
+  endmon;
+end-proc;
+dcl-proc bin;
+  dcl-pi *n int(10);
+    b char(4) const;
+  end-pi;
+  dcl-ds d;
+    c char(4);
+    i int(10) overlay(c);
+  end-ds;
+  c = b;
+  return i;
+end-proc;
+dcl-proc sender;
+  dcl-pi *n varchar(300);
+    rcv char(2000) const;
+  end-pi;
+  dcl-s at int(10);
+  // RCVM0300: lengths of data, text, help and sender information.
+  at = 113 + bin(%subst(rcv : 81 : 4)) + bin(%subst(rcv : 89 : 4))
+       + bin(%subst(rcv : 97 : 4));
+  return %trim(%subst(rcv : at + 63 : 256)) + ' '
+       + %trim(%subst(rcv : at + 324 : 10));
+end-proc;
+";
+    let line_of = |marker: &str| {
+        source
+            .lines()
+            .position(|l| l.contains(marker))
+            .map(|i| i + 1)
+            .unwrap()
+    };
+    let stk = format!("inner {:010}", line_of("// @STK") * 100);
+    let div = format!("DIVIDE {}", line_of("// @DIV") * 100);
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        None,
+        "RUNITF".into(),
+        source.to_string(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let got: Vec<String> = r
+        .messages
+        .iter()
+        .map(|m| m.trim_end().to_string())
+        .collect();
+    let want: Vec<String> = vec![
+        stk,
+        "MAIN".into(),
+        "escape reached main".into(),
+        "0".into(),
+        "MCH1211".into(),
+        div,
+        "MCH1211".into(),
+        "resent".into(),
+        "*N".into(),
+        "QSECOFR".into(),
+        "1".into(),
+    ];
+    assert_eq!(got, want);
 }

@@ -315,6 +315,104 @@ fn paren_span(toks: &[Tok], open: usize) -> Option<(usize, Vec<usize>)> {
     None
 }
 
+/// Whether a type name followed by `(` is a function (`INTEGER(x)`) and not
+/// a data type (`AS VARCHAR(10)`, `RETURNS DECIMAL(5, 2)`, a column or
+/// variable's type after its name): what comes before it starts an
+/// expression.
+fn function_position(out: &[Tok]) -> bool {
+    match out.iter().rev().find(|t| !matches!(t, Tok::Space(_))) {
+        None => true,
+        Some(Tok::Punct(p)) => p != ")" && p != "." && !p.ends_with(" AS"),
+        Some(t) => word(t).is_some_and(|w| {
+            matches!(
+                w.as_str(),
+                "SELECT"
+                    | "WHERE"
+                    | "AND"
+                    | "OR"
+                    | "NOT"
+                    | "THEN"
+                    | "ELSE"
+                    | "WHEN"
+                    | "RETURN"
+                    | "VALUES"
+                    | "ON"
+                    | "HAVING"
+                    | "BY"
+                    | "DISTINCT"
+                    | "ALL"
+                    | "IN"
+                    | "LIKE"
+                    | "BETWEEN"
+                    | "IS"
+                    | "CASE"
+                    | "EXISTS"
+                    | "ANY"
+                    | "SOME"
+            )
+        }),
+    }
+}
+
+/// The USER special register (and SESSION_USER, SYSTEM_USER, CURRENT
+/// USER): the job's user profile; record-level access and triggers know
+/// the job by its name (number/user/name).
+const USER_SQL: &str = "CAST(COALESCE(NULLIF(current_setting('as4tainr.user', true), ''), \
+     NULLIF(split_part(current_setting('application_name'), '/', 2), ''), \
+     upper(session_user)) AS varchar(18))";
+
+/// LISTAGG(x [, separator]) WITHIN GROUP (ORDER BY ...) (Db2 for i SQL
+/// Reference, LISTAGG) as PostgreSQL's string_agg(x, separator ORDER BY
+/// ...); the separator is an empty string when there is none.
+fn listagg(mut toks: Vec<Tok>) -> Vec<Tok> {
+    let mut i = 0;
+    while i < toks.len() {
+        if word(&toks[i]).as_deref() != Some("LISTAGG") {
+            i += 1;
+            continue;
+        }
+        let next = |toks: &[Tok], from: usize| {
+            (from..toks.len()).find(|&j| !matches!(toks[j], Tok::Space(_)))
+        };
+        let Some(o) = next(&toks, i + 1).filter(|&o| toks[o] == Tok::Punct("(".into())) else {
+            i += 1;
+            continue;
+        };
+        let Some((c, commas)) = paren_span(&toks, o) else {
+            break;
+        };
+        toks[i] = Tok::Word("string_agg".into());
+        let mut order: Vec<Tok> = Vec::new();
+        let within = next(&toks, c + 1).filter(|&j| word(&toks[j]).as_deref() == Some("WITHIN"));
+        let group = within
+            .and_then(|w| next(&toks, w + 1))
+            .filter(|&j| word(&toks[j]).as_deref() == Some("GROUP"));
+        let gopen = group
+            .and_then(|g| next(&toks, g + 1))
+            .filter(|&j| toks[j] == Tok::Punct("(".into()));
+        let mut end = c;
+        if let Some(go) = gopen {
+            if let Some((gc, _)) = paren_span(&toks, go) {
+                order = toks[go + 1..gc].to_vec();
+                end = gc;
+            }
+        }
+        let mut tail: Vec<Tok> = Vec::new();
+        if commas.is_empty() {
+            tail.push(Tok::Punct(",".into()));
+            tail.push(Tok::Str(String::new()));
+        }
+        if !order.is_empty() {
+            tail.push(Tok::Space(" ".into()));
+            tail.extend(order);
+        }
+        tail.push(Tok::Punct(")".into()));
+        toks.splice(c..=end, tail);
+        i += 1;
+    }
+    toks
+}
+
 fn word(t: &Tok) -> Option<String> {
     match t {
         Tok::Word(w) => Some(w.to_ascii_uppercase()),
@@ -548,10 +646,10 @@ fn decimal_division(toks: Vec<Tok>) -> Vec<Tok> {
 }
 
 pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Translated> {
-    let mut toks = decimal_division(sequence_values(
+    let mut toks = listagg(decimal_division(sequence_values(
         crate::sqljsonfn::rewrite(crate::sqljson::rewrite(tokenize(sql.trim())?)?)?,
         is_library,
-    ));
+    )));
     // One statement: a trailing ';' is allowed, no other.
     while matches!(toks.last(), Some(Tok::Space(_))) {
         toks.pop();
@@ -860,8 +958,36 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
             Some("CURRENT") => {
                 if let Some(j) = next_non_space(&toks, i + 1) {
                     if let Some(n) = word(&toks[j]) {
+                        // CURRENT TIME and CURRENT TIMESTAMP are local
+                        // values without a time zone, TIME without
+                        // fractions (Db2 for i SQL Reference, special
+                        // registers).
                         if ["DATE", "TIME", "TIMESTAMP"].contains(&n.as_str()) {
-                            out.push(Tok::Word(format!("CURRENT_{n}")));
+                            out.push(Tok::Word(
+                                match n.as_str() {
+                                    "TIME" => "LOCALTIME(0)",
+                                    "TIMESTAMP" => "LOCALTIMESTAMP",
+                                    _ => "CURRENT_DATE",
+                                }
+                                .into(),
+                            ));
+                            i = j + 1;
+                            continue;
+                        }
+                        // CURRENT USER (Db2 for i SQL Reference, special
+                        // registers): the user profile, as USER here (no
+                        // adopted authority). CURRENT SERVER: the
+                        // relational database, the system's name.
+                        if n == "USER" {
+                            out.push(Tok::Punct(USER_SQL.into()));
+                            i = j + 1;
+                            continue;
+                        }
+                        if n == "SERVER" {
+                            out.push(Tok::Punct(format!(
+                                "CAST('{}' AS varchar(18))",
+                                crate::report::system_name().replace('\'', "''")
+                            )));
                             i = j + 1;
                             continue;
                         }
@@ -927,33 +1053,10 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
             // decimal number, extra fraction digits cut off (not
             // rounded), precision 15 and scale 0 by default.
             // (DECIMAL(5, 2) after a name, AS or RETURNS is the data type.)
-            Some("DEC" | "DECIMAL")
+            Some("DEC" | "DECIMAL" | "ZONED")
                 if next_non_space(&toks, i + 1)
                     .is_some_and(|o| toks[o] == Tok::Punct("(".into()))
-                    && match out.iter().rev().find(|t| !matches!(t, Tok::Space(_))) {
-                        None => true,
-                        Some(Tok::Punct(p)) => p != ")" && !p.ends_with(" AS"),
-                        Some(t) => word(t).is_some_and(|w| {
-                            matches!(
-                                w.as_str(),
-                                "SELECT"
-                                    | "WHERE"
-                                    | "AND"
-                                    | "OR"
-                                    | "NOT"
-                                    | "THEN"
-                                    | "ELSE"
-                                    | "WHEN"
-                                    | "RETURN"
-                                    | "VALUES"
-                                    | "ON"
-                                    | "HAVING"
-                                    | "BY"
-                                    | "DISTINCT"
-                                    | "ALL"
-                            )
-                        }),
-                    } =>
+                    && function_position(&out) =>
             {
                 let o = next_non_space(&toks, i + 1).unwrap();
                 let mut depth = 0i32;
@@ -1041,7 +1144,7 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
             // USER (Db2 for i SQL Reference, special registers): the
             // job's user profile; record-level access and triggers know
             // the job by its name (number/user/name).
-            Some("USER")
+            Some("USER" | "SESSION_USER" | "SYSTEM_USER" | "CURRENT_USER")
                 if !out
                     .iter()
                     .rev()
@@ -1051,12 +1154,7 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
                         |j| matches!(&toks[j], Tok::Punct(p) if p == "." || p == "("),
                     ) =>
             {
-                out.push(Tok::Punct(
-                    "CAST(COALESCE(NULLIF(current_setting('as4tainr.user', true), ''), \
-                     NULLIF(split_part(current_setting('application_name'), '/', 2), ''), \
-                     upper(session_user)) AS varchar(18))"
-                        .into(),
-                ));
+                out.push(Tok::Punct(USER_SQL.into()));
                 i += 1;
                 continue;
             }
@@ -1177,6 +1275,116 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
                 skip_close.extend(a + 1..=c);
                 i = o + 1;
                 continue;
+            }
+            // Scalar functions PostgreSQL lacks or has under other rules
+            // (sqlfn.rs).
+            Some(
+                f @ ("LOCATE" | "LOCATE_IN_STRING" | "SPACE" | "TRANSLATE" | "INSERT"
+                | "MIDNIGHT_SECONDS" | "WEEK" | "WEEK_ISO" | "DAYOFWEEK_ISO" | "MONTHNAME"
+                | "DAYNAME" | "JULIAN_DAY" | "RAND" | "ADD_MONTHS" | "LAST_DAY" | "NEXT_DAY"
+                | "MONTHS_BETWEEN" | "TIMESTAMP_FORMAT" | "TO_DATE" | "GENERATE_UNIQUE"
+                | "TIMESTAMPDIFF" | "VARCHAR" | "DATE"),
+            ) if call_open.is_some()
+                && (!matches!(f, "VARCHAR" | "DATE") || function_position(&out))
+                && !matches!(out.iter().rev().find(|t| !matches!(t, Tok::Space(_))), Some(Tok::Punct(p)) if p == ".") =>
+            {
+                out.push(Tok::Word(format!(
+                    "as4tainr_svc.{}",
+                    f.to_ascii_lowercase()
+                )));
+                i += 1;
+                continue;
+            }
+            // IFNULL and VALUE are COALESCE; POSSTR(source, search) is
+            // strpos; CURDATE() and CURTIME() are CURRENT DATE and
+            // CURRENT TIME.
+            Some(f @ ("IFNULL" | "VALUE" | "POSSTR"))
+                if call_open.is_some()
+                    && !matches!(out.iter().rev().find(|t| !matches!(t, Tok::Space(_))), Some(Tok::Punct(p)) if p == ".") =>
+            {
+                out.push(Tok::Word(
+                    if f == "POSSTR" { "strpos" } else { "COALESCE" }.into(),
+                ));
+                i += 1;
+                continue;
+            }
+            Some(f @ ("CURDATE" | "CURTIME")) if call_open.is_some() => {
+                if let Some((c, commas)) = paren_span(&toks, call_open.unwrap()) {
+                    if commas.is_empty()
+                        && c == next_non_space(&toks, call_open.unwrap() + 1).unwrap_or(0)
+                    {
+                        out.push(Tok::Word(
+                            if f == "CURDATE" {
+                                "CURRENT_DATE"
+                            } else {
+                                "LOCALTIME(0)"
+                            }
+                            .into(),
+                        ));
+                        i = c + 1;
+                        continue;
+                    }
+                }
+            }
+            // STRIP(x [, BOTH | B | LEADING | L | TRAILING | T [, c]]): the
+            // keyword passed as a string.
+            Some("STRIP") if call_open.is_some() => {
+                if let Some((_, commas)) = paren_span(&toks, call_open.unwrap()) {
+                    if let Some(&k) = commas.first() {
+                        if let Some(f) = next_non_space(&toks, k + 1) {
+                            let m = match word(&toks[f]).as_deref() {
+                                Some("B" | "BOTH") => Some('B'),
+                                Some("L" | "LEADING") => Some('L'),
+                                Some("T" | "TRAILING") => Some('T'),
+                                _ => None,
+                            };
+                            if let Some(m) = m {
+                                close_with.push((f, format!("'{m}'")));
+                            }
+                        }
+                    }
+                }
+                out.push(Tok::Word("as4tainr_svc.strip".into()));
+                i += 1;
+                continue;
+            }
+            // INTEGER(x), INT, SMALLINT, BIGINT: the fraction cut off, as
+            // CAST (a string is read as a number first); DOUBLE(x), FLOAT,
+            // DOUBLE_PRECISION, REAL: floating point (Db2 for i SQL
+            // Reference, scalar functions).
+            Some(
+                f @ ("INTEGER" | "INT" | "SMALLINT" | "BIGINT" | "DOUBLE" | "DOUBLE_PRECISION"
+                | "FLOAT" | "REAL"),
+            ) if call_open.is_some() && function_position(&out) => {
+                let o = call_open.unwrap();
+                if let Some((c, commas)) = paren_span(&toks, o) {
+                    if commas.is_empty() {
+                        let (open, ty) = match f {
+                            "INTEGER" | "INT" => {
+                                ("CAST(trunc(CAST((", ") AS numeric)) AS integer)")
+                            }
+                            "SMALLINT" => ("CAST(trunc(CAST((", ") AS numeric)) AS smallint)"),
+                            "BIGINT" => ("CAST(trunc(CAST((", ") AS numeric)) AS bigint)"),
+                            "REAL" => ("CAST((", ") AS real)"),
+                            _ => ("CAST((", ") AS double precision)"),
+                        };
+                        out.push(Tok::Punct(open.into()));
+                        close_with.push((c, ty.into()));
+                        i = o + 1;
+                        continue;
+                    }
+                }
+            }
+            // MAX and MIN with two or more arguments are scalar functions.
+            Some(f @ ("MAX" | "MIN")) if call_open.is_some() => {
+                if paren_span(&toks, call_open.unwrap()).is_some_and(|(_, c)| !c.is_empty()) {
+                    out.push(Tok::Word(format!(
+                        "as4tainr_svc.{}",
+                        f.to_ascii_lowercase()
+                    )));
+                    i += 1;
+                    continue;
+                }
             }
             Some(f @ ("HEX" | "SUBSTR"))
                 if next_non_space(&toks, i + 1)
@@ -1441,6 +1649,11 @@ pub(crate) fn map_error(e: &tokio_postgres::Error, sql: &str) -> anyhow::Error {
         "23502" => anyhow!("SQL0407: Null value not allowed in a NOT NULL column: {msg}."),
         "42501" => anyhow!("SQL0551: Not authorized to an object in the statement."),
         "22P02" | "22003" => anyhow!("SQL0302: A value does not fit its column: {msg}."),
+        // A date, time or timestamp string that is not a valid value (Db2
+        // for i SQL messages and codes: SQL0181, SQLSTATE 22007).
+        "22007" | "22008" => {
+            anyhow!("SQL0181: The date, time or timestamp value is not valid: {msg}.")
+        }
         "22012" => anyhow!("SQL0802: Division by zero: {msg}."),
         // Sequences: no more values (NO CYCLE); PREVIOUS VALUE before a
         // NEXT VALUE in the session.
@@ -1908,9 +2121,11 @@ mod tests {
         assert_eq!(t.sql, "select c.rrn, cusnam from custmast c");
         assert!(t.wants_rrn);
         assert!(!tr("select * from custmast").wants_rrn);
+        // CURRENT TIMESTAMP is a TIMESTAMP without a time zone (Db2 for i
+        // SQL Reference, special registers): PostgreSQL's LOCALTIMESTAMP.
         assert_eq!(
             tr("select current timestamp from sysibm.sysdummy1").sql,
-            "select CURRENT_TIMESTAMP from (VALUES ('Y')) AS sysdummy1(ibmreqd)"
+            "select LOCALTIMESTAMP from (VALUES ('Y')) AS sysdummy1(ibmreqd)"
         );
         assert_eq!(tr("select * from t with nc").sql, "select * from t");
         assert_eq!(

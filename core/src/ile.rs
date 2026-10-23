@@ -356,7 +356,10 @@ pub async fn bind(
             }
             // System procedures as4tainr provides itself (the C runtime's
             // Qp0zLprintf): resolved without a binding.
-            if !found && SYSTEM_PROCEDURES.contains(&sym.as_str()) {
+            if !found
+                && (SYSTEM_PROCEDURES.contains(&sym.as_str())
+                    || crate::rpg::interp::cee::CEE_APIS.contains(&sym.as_str()))
+            {
                 found = true;
             }
             if !found {
@@ -412,9 +415,39 @@ pub fn binder_language(source: &str) -> Result<BinderSource> {
     // The block being read: *CURRENT or not, its SIGNATURE, its exports.
     let mut block: Option<(bool, Option<String>, Vec<String>)> = None;
     let mut seen_current = false;
-    for raw in source.lines() {
+    // Comments (/* ... */) may span lines, as in CL.
+    let mut text = String::with_capacity(source.len());
+    let (mut in_comment, mut in_quote) = (false, false);
+    let cs: Vec<char> = source.chars().collect();
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if in_comment {
+            if c == '*' && cs.get(i + 1) == Some(&'/') {
+                in_comment = false;
+                i += 2;
+                continue;
+            }
+            if c == '\n' {
+                text.push('\n');
+            }
+        } else if !in_quote && c == '/' && cs.get(i + 1) == Some(&'*') {
+            in_comment = true;
+            i += 2;
+            continue;
+        } else {
+            if c == '\'' {
+                in_quote = !in_quote;
+            } else if c == '\n' {
+                in_quote = false;
+            }
+            text.push(c);
+        }
+        i += 1;
+    }
+    for raw in text.lines() {
         let line = raw.trim();
-        if line.is_empty() || line.starts_with("/*") {
+        if line.is_empty() {
             continue;
         }
         let cmd = crate::cl::parse(line).map_err(|e| anyhow!("binder language: {e}"))?;
@@ -432,7 +465,14 @@ pub fn binder_language(source: &str) -> Result<BinderSource> {
             }
             "EXPORT" => {
                 if let Some((_, _, ex)) = block.as_mut() {
-                    ex.push(cmd.get("SYMBOL").to_ascii_uppercase());
+                    // SYMBOL(name), SYMBOL('name') or SYMBOL("name") (a
+                    // quoted name: the symbol as written).
+                    ex.push(
+                        cmd.get("SYMBOL")
+                            .trim()
+                            .trim_matches('"')
+                            .to_ascii_uppercase(),
+                    );
                 }
             }
             "ENDPGMEXP" => {
@@ -486,6 +526,18 @@ pub fn activation(job: &str, group: &str, unit: &str) -> Option<Vec<Vec<u8>>> {
         .cloned()
 }
 
+/// The owner number of a module's storage in its activation: the same
+/// for every call, so a pointer to the module's static storage stays
+/// good while the activation lasts.
+pub fn activation_owner(job: &str, group: &str, unit: &str) -> u32 {
+    type Owners = HashMap<(String, String, String), u32>;
+    static OWNERS: std::sync::Mutex<Option<Owners>> = std::sync::Mutex::new(None);
+    let mut g = OWNERS.lock().unwrap_or_else(|e| e.into_inner());
+    *g.get_or_insert_with(HashMap::new)
+        .entry((job.to_string(), group.to_string(), unit.to_string()))
+        .or_insert_with(crate::rpg::mem::new_owner)
+}
+
 /// Keep a module's storage in its activation group.
 pub fn keep_activation(job: &str, group: &str, unit: &str, storage: Vec<Vec<u8>>) {
     if let Ok(mut g) = ACTIVATIONS.lock() {
@@ -529,6 +581,7 @@ pub fn end_activations(job: &str, groups: &Groups) -> usize {
             n = before - m.len();
         }
     }
+    crate::ovr::end_groups(job, |g| groups.covers(g));
     n + crate::rpg::interp::end_programs(job, groups)
 }
 
@@ -736,4 +789,21 @@ pub async fn set_program_binding(
         .await?;
     binding_changed();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binder_language_comments_span_lines() {
+        // Binder language follows CL's rules for comments: /* ... */ may
+        // span lines (OSSILE's llist.bnd starts with a license block of
+        // that form); a quoted /* is not a comment.
+        let src = "     /*\n      * license text\n      */\nSTRPGMEXP PGMLVL(*CURRENT) SIGNATURE('A /* B')\n  EXPORT SYMBOL('list_create') /* first */\n  EXPORT SYMBOL(\"aEqual\")\nENDPGMEXP\n";
+        let b = binder_language(src).unwrap();
+        // RPGUnit's TESTCASEBN names symbols in double quotes.
+        assert_eq!(b.exports, ["LIST_CREATE", "AEQUAL"]);
+        assert_eq!(b.signature.as_deref(), Some("A /* B"));
+    }
 }

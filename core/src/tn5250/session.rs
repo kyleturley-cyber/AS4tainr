@@ -546,10 +546,13 @@ async fn command_entry(
             .log
             .iter()
             .filter(|(l, _)| all || *l == level)
-            .map(|(l, line)| match line.strip_prefix("> ") {
-                Some(cmd) if all => format!("{l:>2} > {cmd}"),
-                Some(cmd) => format!("   > {cmd}"),
-                None => format!("   {line}"),
+            .flat_map(|(l, line)| {
+                let (first, text) = match line.strip_prefix("> ") {
+                    Some(cmd) if all => (format!("{l:>2} > "), cmd.to_string()),
+                    Some(cmd) => ("   > ".to_string(), cmd.to_string()),
+                    None => ("     ".to_string(), line.trim_start().to_string()),
+                };
+                wrap_log_line(&first, &text)
             })
             .collect();
         if shown.is_empty() {
@@ -619,6 +622,26 @@ async fn command_entry(
             _ => continue,
         }
     }
+}
+
+/// A request or message of the Command Entry log on as many lines as it
+/// needs: up to column 79, continued in column 7 (IBM i 7.5, PUB400
+/// tools/golden/screens4.txt: a long CPYFRMSTMF request goes on in column
+/// 7 of the next line, cut wherever column 79 falls).
+fn wrap_log_line(first: &str, text: &str) -> Vec<String> {
+    const WIDTH: usize = 73;
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return vec![first.trim_end().to_string()];
+    }
+    chars
+        .chunks(WIDTH)
+        .enumerate()
+        .map(|(i, c)| {
+            let lead = if i == 0 { first } else { "     " };
+            format!("{lead}{}", c.iter().collect::<String>())
+        })
+        .collect()
 }
 
 /// A system menu: its options, and a "Selection or command" line that
@@ -1775,6 +1798,8 @@ enum ListResult {
     Run(Vec<String>),
     /// F5: show the list again with fresh data.
     Refresh,
+    /// Show the list this command shows instead (PDM's header fields).
+    Replace(String),
 }
 
 /// Show a list, then run the commands of the options typed on it and come
@@ -1792,6 +1817,16 @@ async fn show_list(term: &mut Term, job: &mut Job<'_>, system: &str, d: ListDisp
                 stack.pop();
             }
             ListResult::Refresh => refresh_top(job, &mut stack, &mut message).await,
+            ListResult::Replace(cmd) => match job.run(&cmd).await {
+                Ok(Outcome::Display(d)) => {
+                    if let Some(top) = stack.last_mut() {
+                        *top = d;
+                    }
+                }
+                Ok(Outcome::Messages(m)) => message = m.last().cloned().unwrap_or_default(),
+                Ok(_) => {}
+                Err(e) => message = crate::jobs::display_text(&e.to_string()),
+            },
             ListResult::Run(cmds) => {
                 let mut shown = Vec::new();
                 for c in cmds {
@@ -1838,6 +1873,9 @@ async fn list_display(
     system: &str,
     first_message: &str,
 ) -> Result<ListResult> {
+    if let Some(v) = &d.spool {
+        return spool_display(term, v, first_message).await;
+    }
     if let Some(l) = &d.ibm {
         return ibm_list_display(term, d, l, system, first_message).await;
     }
@@ -1994,6 +2032,227 @@ async fn list_display(
     }
 }
 
+/// The column ruler of IBM i's displays of records: "*" in column 1,
+/// "+" every fifth column, the tens digit every tenth, "." elsewhere.
+pub(crate) fn ruler(from: usize, to: usize) -> String {
+    (from..=to)
+        .map(|p| match p {
+            1 => '*',
+            p if p % 10 == 0 => char::from(b'0' + (p / 10 % 10) as u8),
+            p if p % 5 == 0 => '+',
+            _ => '.',
+        })
+        .collect()
+}
+
+/// A control value of the Display Spooled File display: T (top), B
+/// (bottom), +n and -n (lines), Pn (page n), W+n, W-n, Wn (columns).
+enum SpoolControl {
+    Top,
+    Bottom,
+    Lines(i64),
+    Page(usize),
+    ColumnBy(i64),
+    Column(usize),
+}
+
+fn spool_control(v: &str) -> Option<SpoolControl> {
+    let v = v.trim().to_ascii_uppercase();
+    let signed = |t: &str| -> Option<i64> {
+        if let Some(n) = t.strip_prefix('+') {
+            n.parse().ok()
+        } else if let Some(n) = t.strip_prefix('-') {
+            n.parse::<i64>().ok().map(|n| -n)
+        } else {
+            None
+        }
+    };
+    match v.as_str() {
+        "T" => Some(SpoolControl::Top),
+        "B" => Some(SpoolControl::Bottom),
+        _ => {
+            if let Some(n) = v.strip_prefix('P') {
+                n.parse().ok().map(SpoolControl::Page)
+            } else if let Some(n) = v.strip_prefix('W') {
+                signed(n)
+                    .map(SpoolControl::ColumnBy)
+                    .or_else(|| n.parse().ok().map(SpoolControl::Column))
+            } else {
+                signed(&v).map(SpoolControl::Lines)
+            }
+        }
+    }
+}
+
+/// The Display Spooled File display as IBM i 7.5 draws it (PUB400,
+/// tools/golden/screens4.txt): the file and "Page/Line" on line 2, the
+/// Control and Find fields, a ruler, 16 lines of 78 columns from column
+/// 2; F19 and F20 move by 78 columns.
+async fn spool_display(
+    term: &mut Term,
+    v: &crate::commands::SpoolView,
+    first_message: &str,
+) -> Result<ListResult> {
+    const ROWS: usize = 16;
+    const COLS: usize = 78;
+    let n = v.lines.len();
+    let last_top = n.saturating_sub(ROWS);
+    let mut top = 0usize;
+    let mut left = 0usize;
+    let mut message = first_message.to_string();
+    let mut find = String::new();
+    loop {
+        let mut s = Screen::new();
+        centered(&mut s, 1, "Display Spooled File");
+        s.put(2, 2, "File  . . . . . :");
+        s.put(2, 22, &v.file);
+        let (page, line) = v.lines.get(top).map(|x| (x.0, x.1)).unwrap_or((1, 1));
+        s.put(2, 55, "Page/Line");
+        s.put(2, 67, &format!("{page}/{line}"));
+        s.put(3, 2, "Control . . . . .");
+        s.field("CTL", 3, 22, 8, FieldKind::Upper, "");
+        s.put(3, 55, "Columns");
+        let right = (left + COLS).min(v.width);
+        s.put(3, 67, &format!("{} - {}", left + 1, right));
+        s.put(4, 2, "Find  . . . . . .");
+        s.field("FIND", 4, 22, 30, FieldKind::Text, &find);
+        s.put(5, 2, &ruler(left + 1, right));
+        for (i, (_, _, t)) in v.lines.iter().skip(top).take(ROWS).enumerate() {
+            let text: String = t.chars().skip(left).take(right - left).collect();
+            if !text.trim().is_empty() {
+                s.put(6 + i as u8, 2, &text);
+            }
+        }
+        if top + ROWS < n {
+            s.put(22, 73, "More...");
+        } else {
+            s.put(22, 74, "Bottom");
+        }
+        keys(&mut s, 23, "F3=Exit   F12=Cancel   F19=Left   F20=Right");
+        s.cursor_at(3, 22);
+        s.message(&message);
+        message.clear();
+        let inp = term.show(&s).await?;
+        let mut control = String::new();
+        for (name, val) in &inp.values {
+            match name.as_str() {
+                "CTL" => control = val.trim().to_string(),
+                "FIND" => find = val.trim_end().to_string(),
+                _ => {}
+            }
+        }
+        let search = |from: usize, find: &str| -> Option<usize> {
+            let want = find.trim().to_ascii_uppercase();
+            (from..n).find(|&i| v.lines[i].2.to_ascii_uppercase().contains(&want))
+        };
+        match inp.aid {
+            Aid::F(3) => return Ok(ListResult::Exit),
+            Aid::F(12) => return Ok(ListResult::Back),
+            Aid::F(16) if !find.trim().is_empty() => match search(top + 1, &find) {
+                Some(i) => top = i,
+                None => message = "String not found.".into(),
+            },
+            Aid::F(19) => {
+                if left == 0 {
+                    message = "Already at the left edge.".into();
+                } else {
+                    left = left.saturating_sub(COLS);
+                }
+            }
+            Aid::F(20) => {
+                if left + COLS < v.width {
+                    left += COLS;
+                } else {
+                    message = "Already at the right edge.".into();
+                }
+            }
+            Aid::RollUp => {
+                if top + ROWS < n {
+                    top += ROWS;
+                } else {
+                    message = "Already at the bottom of the file.".into();
+                }
+            }
+            Aid::RollDown => {
+                if top == 0 {
+                    message = "Already at the top of the file.".into();
+                } else {
+                    top = top.saturating_sub(ROWS);
+                }
+            }
+            Aid::Enter => {
+                if control.is_empty() && find.trim().is_empty() {
+                    return Ok(ListResult::Back);
+                }
+                if !control.is_empty() {
+                    match spool_control(&control) {
+                        Some(SpoolControl::Top) => top = 0,
+                        Some(SpoolControl::Bottom) => top = last_top,
+                        Some(SpoolControl::Lines(d)) => {
+                            top = (top as i64 + d).clamp(0, n.saturating_sub(1) as i64) as usize
+                        }
+                        Some(SpoolControl::Page(p)) => {
+                            match v.lines.iter().position(|x| x.0 == p) {
+                                Some(i) => top = i,
+                                None => message = format!("Page {p} is not in the file."),
+                            }
+                        }
+                        Some(SpoolControl::ColumnBy(d)) => {
+                            left = (left as i64 + d).clamp(0, v.width.saturating_sub(1) as i64)
+                                as usize
+                        }
+                        Some(SpoolControl::Column(c)) => {
+                            left = c.clamp(1, v.width.max(1)) - 1;
+                        }
+                        None => message = format!("Control value {control} not valid."),
+                    }
+                } else {
+                    match search(top + 1, &find) {
+                        Some(i) => top = i,
+                        None => message = "String not found.".into(),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Confirm option 4 (delete) of a list's rows: Enter goes on, F12 goes
+/// back to the list with the options kept (as PDM does; the wording is
+/// as4tainr's).
+async fn confirm_delete(term: &mut Term, d: &ListDisplay, rows: &[usize]) -> Result<bool> {
+    let mut s = Screen::new();
+    centered(&mut s, 1, "Confirm Delete");
+    s.put(3, 2, "Press Enter to delete the items below.");
+    s.put(
+        4,
+        2,
+        "Press F12=Cancel to go back to the list without deleting.",
+    );
+    s.text(6, 2, attr::HIGH, "Opt");
+    s.text(
+        6,
+        7,
+        attr::HIGH,
+        &d.heading.chars().take(73).collect::<String>(),
+    );
+    for (i, idx) in rows.iter().take(14).enumerate() {
+        s.put(7 + i as u8, 3, "4");
+        let r: String = d.rows[*idx].chars().take(73).collect();
+        s.put(7 + i as u8, 7, &r);
+    }
+    keys(&mut s, 23, "F12=Cancel");
+    loop {
+        let inp = term.show(&s).await?;
+        match inp.aid {
+            Aid::Enter => return Ok(true),
+            Aid::F(12) | Aid::F(3) => return Ok(false),
+            _ => {}
+        }
+    }
+}
+
 /// Function key texts on as many lines as they need (at most 78
 /// characters each), as IBM i's displays show them.
 fn key_lines(keys: &[&str]) -> Vec<String> {
@@ -2056,7 +2315,11 @@ async fn ibm_list_display(
         fkeys.push("F19=Left");
         fkeys.push("F20=Right");
     }
-    let key_text = key_lines(&fkeys);
+    let key_text = if l.key_text.is_empty() {
+        key_lines(&fkeys)
+    } else {
+        l.key_text.clone()
+    };
     let key_top = 24 - key_text.len() as u8;
     let bottom_row = if l.command_line.is_some() || l.enter_line {
         key_top - 3
@@ -2069,7 +2332,10 @@ async fn ibm_list_display(
     if !l.lines.is_empty() {
         first += l.lines.len() as u8 + 1;
     }
-    let option_lines: Vec<String> = {
+    let auto_options = l.option_text.is_empty();
+    let option_lines: Vec<String> = if !auto_options {
+        l.option_text[0].clone()
+    } else {
         let mut out = vec![String::new()];
         for (n, t, _) in &d.options {
             let o = format!("{n}={t}");
@@ -2098,7 +2364,7 @@ async fn ibm_list_display(
         first += 1;
     }
     let page_rows = (bottom_row.saturating_sub(first)).max(1) as usize;
-    let mut top = 0usize;
+    let mut top = l.start_at.min(d.rows.len().saturating_sub(1));
     let mut left = 0usize;
     let cut =
         |line: &str, left: usize| -> String { line.chars().skip(left).take(text_width).collect() };
@@ -2106,13 +2372,23 @@ async fn ibm_list_display(
     let mut typed: std::collections::BTreeMap<usize, String> = Default::default();
     let mut command = String::new();
     let mut second = false;
+    let mut option_set = 0usize;
+    let mut header: Vec<String> = l.header_fields.iter().map(|f| f.value.clone()).collect();
     loop {
         let (heading2, heading, rows) = match (&l.view2, second) {
             (Some((h2, h, r)), true) => (h2, h, r),
             _ => (&l.heading2, &d.heading, &d.rows),
         };
         let mut s = Screen::new();
-        centered(&mut s, 1, &d.title);
+        match l.title_col {
+            Some(c) => {
+                s.text(1, c, attr::HIGH, &d.title);
+            }
+            None => centered(&mut s, 1, &d.title),
+        }
+        if let Some(c) = l.system_col1 {
+            s.put(1, c, system);
+        }
         if let Some(col) = l.system_col {
             s.put(2, col, &format!("System:   {system}"));
         }
@@ -2127,11 +2403,30 @@ async fn ibm_list_display(
                 s.put(3 + i as u8, 2, line);
             }
         }
+        for (f, v) in l.header_fields.iter().zip(&header) {
+            s.field(
+                &format!("HDR{}", f.name),
+                f.row,
+                f.col,
+                f.len,
+                FieldKind::Text,
+                v,
+            );
+        }
         let mut row = options_row;
         if has_options {
             s.put(row, 2, "Type options, press Enter.");
-            for (i, o) in option_lines.iter().enumerate() {
-                s.text(row + 1 + i as u8, 4, attr::BLUE, o);
+            if auto_options {
+                for (i, o) in option_lines.iter().enumerate() {
+                    s.text(row + 1 + i as u8, 4, attr::BLUE, o);
+                }
+            } else {
+                let set = &l.option_text[option_set % l.option_text.len()];
+                for (i, o) in set.iter().enumerate() {
+                    if !o.trim().is_empty() {
+                        s.text(row + 1 + i as u8, 2, attr::BLUE, o);
+                    }
+                }
             }
             row += 1 + option_lines.len() as u8 + u8::from(!l.tight);
         } else if !l.instruction.is_empty() {
@@ -2161,7 +2456,7 @@ async fn ibm_list_display(
                     r,
                     opt_col,
                     opt_width,
-                    FieldKind::Text,
+                    FieldKind::Upper,
                     &v,
                 );
             }
@@ -2190,12 +2485,19 @@ async fn ibm_list_display(
         if !has_options && l.command_line.is_none() {
             s.cursor_at(1, 2);
         }
+        if l.cursor_on_list && has_options && top < d.rows.len() {
+            s.cursor_at(first, opt_col);
+        }
         s.message(&message);
         message.clear();
         let inp = term.show(&s).await?;
         for (name, v) in &inp.values {
             if name == "CMD" {
                 command = v.trim().to_string();
+            } else if let Some(h) = name.strip_prefix("HDR") {
+                if let Some(i) = l.header_fields.iter().position(|f| f.name == h) {
+                    header[i] = v.trim().to_ascii_uppercase();
+                }
             } else if let Some(idx) = name
                 .strip_prefix("OPT")
                 .and_then(|n| n.parse::<usize>().ok())
@@ -2214,19 +2516,70 @@ async fn ibm_list_display(
             Aid::F(12) => return Ok(ListResult::Back),
             Aid::F(5) if d.refresh.is_some() => return Ok(ListResult::Refresh),
             Aid::F(11) if l.view2.is_some() => second = !second,
+            Aid::F(23) if l.option_text.len() > 1 => option_set += 1,
             Aid::F(17) if l.top_bottom_keys => top = 0,
             Aid::F(18) if l.top_bottom_keys => top = last_page,
             Aid::Enter => {
+                // Header fields: another file or library shows another
+                // list; "Position to" moves this one.
+                let changed = l
+                    .header_fields
+                    .iter()
+                    .zip(&header)
+                    .any(|(f, v)| Some(&f.name) != l.position_field.as_ref() && *v != f.value);
+                if let (true, Some(reload)) = (changed, &l.reload) {
+                    let mut cmd = reload.clone();
+                    for (f, v) in l.header_fields.iter().zip(&header) {
+                        cmd = cmd.replace(&format!("{{{}}}", f.name), v);
+                    }
+                    return Ok(ListResult::Replace(cmd));
+                }
+                if let Some(pf) = &l.position_field {
+                    if let Some(i) = l.header_fields.iter().position(|f| &f.name == pf) {
+                        let want = std::mem::take(&mut header[i]);
+                        if !want.is_empty() {
+                            top = d
+                                .rows
+                                .iter()
+                                .position(|r| {
+                                    r.split_whitespace().next().unwrap_or("") >= want.as_str()
+                                })
+                                .unwrap_or(d.rows.len().saturating_sub(1));
+                            if typed.is_empty() && command.is_empty() {
+                                continue;
+                            }
+                        }
+                    }
+                }
                 if typed.is_empty() && command.is_empty() {
                     return Ok(ListResult::Back);
                 }
                 let mut cmds = Vec::new();
+                let mut deletes = Vec::new();
                 let mut bad = None;
                 for (idx, v) in &typed {
-                    match d.options.iter().find(|(n, _, _)| n.to_string() == *v) {
-                        Some((_, _, cmd)) => cmds.push(
-                            cmd.replace("{}", d.keys.get(*idx).map(String::as_str).unwrap_or("")),
+                    let per_row = l.row_options.get(*idx).filter(|o| !o.is_empty());
+                    let found = match per_row {
+                        Some(o) => o
+                            .iter()
+                            .find(|(n, _)| n.to_string() == *v)
+                            .map(|(_, c)| c.clone()),
+                        None => d.options.iter().find(|(n, _, _)| n.to_string() == *v).map(
+                            |(_, _, cmd)| {
+                                cmd.replace(
+                                    "{}",
+                                    d.keys.get(*idx).map(String::as_str).unwrap_or(""),
+                                )
+                            },
                         ),
+                    };
+                    match found {
+                        Some(c) => {
+                            if v == "4" && l.confirm_delete {
+                                deletes.push(*idx);
+                            }
+                            cmds.push(c)
+                        }
                         None => {
                             bad = Some((*idx, v.clone()));
                             break;
@@ -2235,6 +2588,9 @@ async fn ibm_list_display(
                 }
                 match bad {
                     None => {
+                        if !deletes.is_empty() && !confirm_delete(term, d, &deletes).await? {
+                            continue;
+                        }
                         if !command.is_empty() {
                             cmds.push(std::mem::take(&mut command));
                         }

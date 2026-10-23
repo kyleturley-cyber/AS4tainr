@@ -80,6 +80,30 @@ On Oct 21, 2026 the corpus builds 43 programs (50 objects with its 4 modules and
 
 What as4tainr still lacks for the rest: DATALINK, ROWID, arrays and generated expression columns (ALLTABLE). JSNIFSSQL1 builds now that the IFS APIs and JSON_TABLE are there (docs/ifs.md, docs/sql.md).
 
+### IBM's company_system sample
+
+`tools/corpus.sh` also takes IBM's own sample application (github.com/IBM/ibmi-company_system: no license file, so it is cloned at test time only). It is laid out for IBM's build tools: TOBi names, a Rules.mk per folder, `.sqlprc` and `.sqlrpgle` members, a binder source next to its module, iRPGUnit tests. On Oct 22, 2026 it builds everything but two objects: the DEPARTMENT and EMPLOYEE tables (with the referential constraints of IBM's sample database), the POPDEPT and POPEMP procedures, the three display files, the EMPDET module and service program, the APP binding directory, and the DEPTS, EMPLOYEES and NEWEMP programs. What it found and as4tainr now does:
+
+- a source of one name twice in a folder (empdet.sqlrpgle and empdet.bnd): the binder source goes to QSRVSRC, where CRTSRVPGM looks for it;
+- a Rules.mk target built from a source of another name (TEMPDET.MODULE from empdet.test.sqlrpgle): the member takes the object's name;
+- the `.sqlprc`, `.sqludf`, `.sqltrg` and other SQL source extensions; `RESULT SETS n` without DYNAMIC;
+- CRTSQLRPGI COMPILEOPT (`BNDDIR(...)`, `DFTACTGRP(...)`);
+- FOREIGN KEY with a constraint name after KEY, REFERENCES without columns (the parent's primary key), and column-level `CONSTRAINT x REFERENCES t (c)`;
+- RPG `LIKE` of a data structure (a character item of its length) as a prototype's return value;
+- many Db2 for i scalar functions and special registers (RAND, INT, VARCHAR, DATE of a number, HEX of a number, LOCATE, TRANSLATE in Db2's argument order, STRIP with its keyword, LISTAGG, CURRENT USER, CURRENT SERVER... docs/sql.md);
+- SQL variables named like columns: in an INSERT column list and the targets of UPDATE ... SET they are the columns.
+
+What fails would fail on IBM i too: TEMPDET needs iRPGUnit's `qinclude,TESTCASE`, and MYPGM calls printf without binding QC2LE. CALL POPDEPT stops with SQL0530: it makes up random ADMRDEPT values, which the table's own ROD constraint (ADMRDEPT references DEPTNO) rejects. POPEMP calls SYSTOOLS.HTTP_GET for randomuser.me.
+
+### OSSILE
+
+The third corpus is OSSILE (github.com/OSSILE/OSSILE, MIT): utilities in RPG, CL, C and SQL, each project built by its own Makefile or `setup` shell script. On Oct 23, 2026 the import creates 54 objects (programs, modules, service programs, commands, display files, SQL objects); 17 cannot be created, and those would not build on IBM i either, or need what as4tainr does not have:
+
+- would fail on IBM i too: CALCWEEK, INTTOHEX and INPUTTEST call procedures but are created with DFTACTGRP(*YES) (no bindable APIs or bound calls then); LLIST's binder source has two PGMLVL(*CURRENT) blocks, so LLIST and LUTIL (bound to it) fail; DLTLIBRCV has a blank line inside a continued CALL; SU declares its display file as `DCLF OSSILE/ FILE(SU_DSPF)`; CURPTFGRP runs SELECT in RUNSQLSTM; the examples ALISTEX01, LLISTEX1 and LUTILEX1 are meant to be bound by hand; ALIST01 and LLIST_UT_1 need iRPGUnit;
+- not in as4tainr: C (the INIH module and INTEROPR1's C half; OSSILE's other C projects are not built), the QtocLstNetCnn API (NSTATR).
+
+What it found and as4tainr now does: source in Windows-1252 (not UTF-8); service programs as Makefiles and setup scripts build them (`CRTSRVPGM ... MODULE(...) BNDSRVPGM(...)`); copy members named by `/COPY name.rpgle`, `/COPY MEMBER` or a quoted path are include files, not programs (also when the file name is too long for a member); binder language comments that span lines; the QSYSINC library (QUSEC, QWCRNETA); TCP/IP command names such as FTP for the CL compiler's check; and the RPG engine's procedure pointers, CEE APIs, C runtime functions and compiler fixes (docs/rpg-engine.md). CONVCASE, DYNMEMCEE, TMPNAM, SORTARRAY, DYNMEM, COMPTIMARR and the other examples run.
+
 See [fidelity-gaps.md](fidelity-gaps.md).
 
 ## Legacy applications, installed their own way
@@ -90,3 +114,7 @@ See [fidelity-gaps.md](fidelity-gaps.md).
 - **COM order management** (no license file: test use only; github.com/ARNAV2684). Imported into COM022LIB with `as4tainr import`, then the README's order: the NXTORDNO data area, CRTCOMMSG (its message file), LOADDATA, the COMBNDDIR binding directory, and the programs bound through it. `CALL COM022LIB/COMSTART` runs the green-screen application: menus, customer, item and order maintenance with message subfiles, and an SQL order inquiry. Its SQL trigger (ITMPRCH) logs price changes.
 
 Then SETUPJRN journals its files and ADDTRG attaches its ORDTRG trigger program: changing an order writes an ORDAUD row through the trigger program, and the ORDAUDJV view (over QSYS2.DISPLAY_JOURNAL) shows the same change from the journal (docs/journals.md). What still fails would fail on IBM i too: SELECT statements in RUNSQLSTM scripts (JRNQRY, PRACTICE1).
+
+- **RPGUnit** (CPL-1.0; github.com/RPGUnit/RPGUnit), the unit testing framework for ILE RPG, installed and tested the way its own scripts do: its members copied into the source files of library RPGUNIT, MKMETADATA (CHGPFM of every member), MKRPGUNIT (the RUTESTCASE and RURUNNER service programs, the RUCMDRUN and RUCRTTST programs, the RUCRTTST and RUCALLTST commands with their UIM help panel group), then its self-test MKRPGUNITT. On Oct 23, 2026 the sanity check passes (TESTPGM03 must fail and does), and every unit test suite MKUT runs passes: ASSERTT, CALLPROCT, EXTPRCT, EXTTSTT, JOBLOGT, PGMMSGT, RUNT, CMDRUNT, CMDRUNLOGT and RUCRTTSTT. Of the 22 acceptance tests 10 pass; the other 12 read the RPGUnit report from its spooled file, and the spooled file APIs are not there yet (docs/fidelity-gaps.md). The EXTPRCT fixtures SRVPGM1 and SRVPGM2 are not built by RPGUnit's scripts; tools/legacy.sh builds them first.
+
+  What it found and as4tainr now does: the call stack (QWVRCSTK, QCMDEXC as an entry of its own), program messages across procedures (QMHSNDPM *ESCAPE ends the entries up to its target, whose MONITOR takes it; QMHRCVPM RCVM0300 with the sender's statement; QMHRSNEM; an exception message's sender is the procedure where it happened), the job log list API (QGYOLJBL), QWCRTVCA, QLICVTTP, rslvsp, QleActBndPgm and QleGetExp, QBNLSPGM, CRTPNLGRP, OVRPRTF without OUTQ, overrides scoped to an activation group, procedure pointers to a service program's procedures (also those it does not export) and calls back into a running service program, procedures returning LIKEDS DIM, whole arrays passed to array parameters, group subfields, CONST parameters by reference, %INT of blanks failing, SQL timestamps into RPG timestamp host variables.

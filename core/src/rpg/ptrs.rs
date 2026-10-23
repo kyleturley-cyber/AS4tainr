@@ -3,7 +3,9 @@
 //! DEALLOC): addresses of variables and heap storage, based variables
 //! found through their pointers.
 
-use super::super::mem::{Ptr, BAD_BUF, HEAP_BASE, KIND_HEAP, KIND_STORAGE, LENT_BASE};
+use super::super::mem::{
+    Ptr, BAD_BUF, HEAP_BASE, KIND_HEAP, KIND_PROC, KIND_STORAGE, KIND_SYS, LENT_BASE,
+};
 use super::*;
 
 /// The longest string %STR reads without a maximum (ILE RPG Reference:
@@ -55,6 +57,9 @@ impl<'a> Machine<'a> {
             other => bail!("a pointer is expected, not {}", other.describe()),
         };
         let buf = match p.kind {
+            KIND_PROC | KIND_SYS => {
+                bail!("MCH3601: a procedure or system pointer does not address storage.")
+            }
             KIND_HEAP => {
                 let h = p.buf as usize;
                 if self.bufs.heap.freed.get(h).copied().unwrap_or(true) {

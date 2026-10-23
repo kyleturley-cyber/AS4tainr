@@ -89,11 +89,14 @@ fn row(r: &tokio_postgres::Row) -> SpooledFile {
 
 /// Start a spooled file for a job (status OPN until [`close`]).
 pub async fn open(client: &Client, job: &JobId, file: &str, user_data: &str) -> Result<i64> {
+    // The output queue of the job's user (outq.rs: QGPL/QPRINT for
+    // OUTQ(*WRKSTN)).
+    let (qlib, q) = crate::outq::for_user(client, &job.user).await?;
     let r = client
         .query_one(
-            "INSERT INTO as4tainr.spooled_files (job, job_name, user_name, file, number, user_data)
+            "INSERT INTO as4tainr.spooled_files (job, job_name, user_name, file, number, user_data, outq_lib, outq)
              VALUES ($1, $2, $3, $4,
-                     (SELECT coalesce(max(number), 0) + 1 FROM as4tainr.spooled_files WHERE job = $1), $5)
+                     (SELECT coalesce(max(number), 0) + 1 FROM as4tainr.spooled_files WHERE job = $1), $5, $6, $7)
              RETURNING id",
             &[
                 &job.number,
@@ -101,6 +104,8 @@ pub async fn open(client: &Client, job: &JobId, file: &str, user_data: &str) -> 
                 &job.user,
                 &file.to_ascii_uppercase(),
                 &user_data,
+                &qlib,
+                &q,
             ],
         )
         .await?;
@@ -159,6 +164,39 @@ pub async fn print_lines(
     write(client, id, &numbered).await?;
     close(client, id).await?;
     Ok(id)
+}
+
+/// Write a report whose pages start with a page header (a compiler
+/// listing: the product line), a new spooled file page at each header,
+/// as IBM i's listings print (a listing of three pages is a spooled file
+/// of three pages in WRKSPLF, PUB400 2026-10-22). Lines before the first
+/// header, if any, are on page 1.
+pub async fn print_report(
+    client: &Client,
+    job: &JobId,
+    file: &str,
+    user_data: &str,
+    lines: &[String],
+) -> Result<i64> {
+    let id = open(client, job, file, user_data).await?;
+    let mut numbered = Vec::new();
+    let (mut page, mut line) = (1i32, 0i32);
+    for t in lines {
+        if is_page_header(t) && line > 0 {
+            page += 1;
+            line = 0;
+        }
+        line += 1;
+        numbered.push((page, line, t.clone()));
+    }
+    write(client, id, &numbered).await?;
+    close(client, id).await?;
+    Ok(id)
+}
+
+/// A report's page header line: the product and release at the start.
+pub fn is_page_header(line: &str) -> bool {
+    line.trim_start().starts_with(crate::report::PRODUCT)
 }
 
 /// Spooled files of a user (WRKSPLF), oldest first.

@@ -21,6 +21,26 @@ use crate::rpg::program::FileInfo;
 /// called again each time; a program that loops there never ends).
 const MAX_HANDLER_DEPTH: u32 = 20;
 
+/// Where an error a procedure did not handle happened: the statement's
+/// line and the call stack entry (shown as "line N").
+#[derive(Debug, Clone)]
+pub struct At {
+    pub line: usize,
+    pub sender: crate::pgmmsg::Sender,
+}
+
+impl std::fmt::Display for At {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "line {}", self.line)
+    }
+}
+
+/// Where an error happened (each `At` added on the way out carries the
+/// first one's sender).
+pub(super) fn origin(err: &anyhow::Error) -> Option<At> {
+    err.downcast_ref::<At>().cloned()
+}
+
 /// The message identifier an error starts with (`CPF5026: ...`), if any.
 pub(super) fn message_id(err: &anyhow::Error) -> String {
     crate::jobs::escape_id(&err.root_cause().to_string()).to_string()
@@ -231,8 +251,12 @@ impl<'a> Machine<'a> {
             .unwrap_or_else(|| self.prog.name.clone());
         self.ds_text(&ds, 1, 10, &proc_name);
         self.ds_zoned(&ds, 37, 3, self.parms_passed as i64);
-        let (lib, pgm) = match self.io.program.split_once('/') {
-            Some((l, p)) if l != "*NONE" => (l.to_string(), p.to_string()),
+        // A module of a service program: the service program; one bound
+        // into a program: that program.
+        let (lib, pgm) = match (self.current_srvpgm(), self.io.program.split_once('/')) {
+            (Some(x), _) => x,
+            (None, Some(("*BOUND", _))) => (self.stack_lib(), self.stack_pgm()),
+            (None, Some((l, p))) if l != "*NONE" => (l.to_string(), p.to_string()),
             _ => (String::new(), self.prog.name.clone()),
         };
         self.ds_text(&ds, 81, 10, &lib);
@@ -635,7 +659,7 @@ impl<'a> Machine<'a> {
             self.set_ind(l, false);
         }
         match self.stmt(s) {
-            Err(err) if !is_signal(&err) => {
+            Err(err) if !is_signal(&err) && !self.passes_by(&err) => {
                 self.note_error(&err);
                 if let Some(l) = &lo {
                     self.set_ind(l, true);
@@ -720,9 +744,25 @@ impl<'a> Machine<'a> {
         }
     }
 
+    /// An escape message sent to a caller of this procedure: no handler
+    /// here takes it (QMHSNDPM *ESCAPE ends the entries above its
+    /// target).
+    pub(super) fn passes_by(&self, err: &anyhow::Error) -> bool {
+        err.downcast_ref::<crate::pgmmsg::Escape>()
+            .is_some_and(|e| {
+                e.passes(
+                    &self.io.job_key,
+                    crate::pgmmsg::stack_top_id(&self.io.job_key),
+                )
+            })
+    }
+
     /// Record an error as the program sees it: %STATUS, %ERROR stay as
     /// the operation left them; the PSDS shows the exception.
     pub(super) fn note_error(&mut self, err: &anyhow::Error) -> u32 {
+        if std::env::var("AS4TAINR_TRACE_ERRORS").is_ok() {
+            eprintln!("[handled in {}] {err:#}", self.prog.name);
+        }
         let code = status_code(err);
         if code < 1000 {
             self.last = Status {
@@ -735,6 +775,24 @@ impl<'a> Machine<'a> {
             self.last.error = true;
         }
         self.psds_error(code, err);
+        // The exception message goes to the call message queue of the
+        // procedure that handled it (QMHRCVPM *EXCP finds it there).
+        if let Some(id) = crate::pgmmsg::stack_target(&self.io.job_key, "*", 0) {
+            let m = match err.downcast_ref::<crate::pgmmsg::Escape>() {
+                Some(e) => e.0.clone(),
+                None => {
+                    let msgid = message_id(err);
+                    let mut m = crate::pgmmsg::from_error(err, &msgid);
+                    m.data = super::data::e(&m.text);
+                    // Sent by the procedure where it happened.
+                    m.sender = origin(err)
+                        .map(|a| a.sender)
+                        .unwrap_or_else(|| self.sender());
+                    m
+                }
+            };
+            crate::pgmmsg::stack_send(&self.io.job_key, id, m);
+        }
         code
     }
 
@@ -743,7 +801,7 @@ impl<'a> Machine<'a> {
     /// on (no subroutine, ENDSR without a return point, a return point
     /// for the cycle).
     pub(super) fn recover(&mut self, err: anyhow::Error) -> Result<Recovery> {
-        if is_signal(&err) {
+        if is_signal(&err) || self.passes_by(&err) {
             return Err(err);
         }
         let code = self.note_error(&err);

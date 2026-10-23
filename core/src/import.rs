@@ -101,6 +101,9 @@ struct Found {
     path: PathBuf,
     /// The object type part of a TOBi name (`pgm` in X.pgm.rpgle).
     objtype: Option<String>,
+    /// Brought into other sources by name (`/COPY llist_h.rpgle`): a copy
+    /// member, not compiled.
+    included: bool,
 }
 
 /// What the import did, line by line, and whether everything was built.
@@ -144,6 +147,95 @@ struct Scan {
     rules: BTreeMap<String, (String, Vec<String>)>,
 }
 
+/// Service programs a Makefile or a setup script builds with CRTSRVPGM
+/// (`system "CRTSRVPGM $(BIN_LIB)/LLIST MODULE($(BIN_LIB)/LLIST
+/// $(BIN_LIB)/LLIST_SORT) BNDSRVPGM(...) ..."`, as the OSSILE projects
+/// do): a rule LLIST.SRVPGM from those modules (and the service programs
+/// it binds, X.SRVPGM).
+fn makefile_rules(text: &str, out: &mut BTreeMap<String, (String, Vec<String>)>) {
+    let name_of = |q: &str| {
+        q.rsplit('/')
+            .next()
+            .unwrap_or(q)
+            .trim_matches(|c: char| c == '"' || c == '\'' || c == ')')
+            .to_ascii_uppercase()
+    };
+    for line in text.lines() {
+        let u = line.to_ascii_uppercase();
+        let Some(at) = u.find("CRTSRVPGM ") else {
+            continue;
+        };
+        let rest = &u[at + 10..];
+        let Some(target) = rest.split_whitespace().next() else {
+            continue;
+        };
+        let target = name_of(target.trim_start_matches("SRVPGM("));
+        if target.starts_with('$') {
+            continue;
+        }
+        let Some(m) = rest.find("MODULE(") else {
+            continue;
+        };
+        let mods = &rest[m + 7..];
+        let mut depth = 1;
+        let end = mods
+            .char_indices()
+            .find(|&(_, c)| {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            })
+            .map(|(j, _)| j)
+            .unwrap_or(mods.len());
+        let mut modules: Vec<String> = mods[..end]
+            .split_whitespace()
+            .map(|x| format!("{}.MODULE", name_of(x)))
+            .filter(|x| !x.starts_with('$') && !x.starts_with('*'))
+            .collect();
+        if let Some(b) = rest.find("BNDSRVPGM(") {
+            let list = &rest[b + 10..];
+            let end = list.find(')').unwrap_or(list.len());
+            modules.extend(
+                list[..end]
+                    .split_whitespace()
+                    .map(|x| format!("{}.SRVPGM", name_of(x)))
+                    .filter(|x| !x.starts_with('$') && !x.starts_with('*')),
+            );
+        }
+        if catalog::validate_name("service program", &target).is_ok() && !modules.is_empty() {
+            out.entry(target).or_insert(("SRVPGM".into(), modules));
+        }
+    }
+}
+
+/// A file's text: UTF-8, or else Windows-1252, the code page source
+/// downloaded from IBM i to a Windows PC is usually in (zlib's changelog in
+/// the OSSILE corpus is one).
+fn read_text(path: impl AsRef<Path>) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    Ok(match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => e.into_bytes().iter().map(|&b| cp1252(b)).collect(),
+    })
+}
+
+/// One byte of Windows-1252 as a character (0x80-0x9F are its own
+/// characters; the bytes it leaves undefined are kept as C1 controls).
+fn cp1252(b: u8) -> char {
+    const HIGH: [u16; 32] = [
+        0x20AC, 0x81, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160,
+        0x2039, 0x0152, 0x8D, 0x017D, 0x8F, 0x90, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013,
+        0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x9D, 0x017E, 0x0178,
+    ];
+    match b {
+        0x80..=0x9F => char::from_u32(HIGH[(b - 0x80) as usize] as u32).unwrap_or('?'),
+        _ => b as char,
+    }
+}
+
 /// TOBi build rules (`Rules.mk`): lines like `CONVSRV.SRVPGM: CONVSRV.bnd
 /// CONVSRV.MODULE`.
 fn read_rules(text: &str, out: &mut BTreeMap<String, (String, Vec<String>)>) {
@@ -176,6 +268,9 @@ fn read_rules(text: &str, out: &mut BTreeMap<String, (String, Vec<String>)>) {
 /// folders) are only for grouping.
 fn scan(dir: &Path) -> Result<Scan> {
     let mut out = Scan::default();
+    // Files whose names cannot be member names (ARRAYLIST_H is 11
+    // characters): still include files when a source names them.
+    let mut loose: Vec<PathBuf> = Vec::new();
     let mut stack: Vec<(PathBuf, Option<String>)> = vec![(dir.to_path_buf(), None)];
     while let Some((folder, file_of_folder)) = stack.pop() {
         let mut entries: Vec<PathBuf> = std::fs::read_dir(&folder)
@@ -201,8 +296,17 @@ fn scan(dir: &Path) -> Result<Scan> {
         for p in entries.iter().filter(|p| p.is_file()) {
             let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if fname.eq_ignore_ascii_case("Rules.mk") {
-                if let Ok(t) = std::fs::read_to_string(p) {
+                if let Ok(t) = read_text(p) {
                     read_rules(&t, &mut out.rules);
+                }
+                continue;
+            }
+            if fname.eq_ignore_ascii_case("Makefile")
+                || fname.eq_ignore_ascii_case("setup")
+                || fname.to_ascii_lowercase().ends_with(".sh")
+            {
+                if let Ok(t) = read_text(p) {
+                    makefile_rules(&t, &mut out.rules);
                 }
                 continue;
             }
@@ -236,12 +340,14 @@ fn scan(dir: &Path) -> Result<Scan> {
                             text: String::new(),
                             path: p.clone(),
                             objtype: None,
+                            included: true,
                         });
                     }
                 }
                 continue;
             }
             let Some((name, text, ext)) = member_of(fname) else {
+                loose.push(p.clone());
                 continue;
             };
             if ext == "csv" {
@@ -251,16 +357,32 @@ fn scan(dir: &Path) -> Result<Scan> {
             let Some(srctype) = source::type_for_extension(&ext) else {
                 continue;
             };
-            let file = file_of_folder
+            let mut file = file_of_folder
                 .clone()
                 .unwrap_or_else(|| default_source_file(srctype).to_string());
-            if let Some(first) = out
+            // Two sources of one name in a folder (EMPDET.bnd and
+            // EMPDET.sqlrpgle, as the build tools keep them): the one whose
+            // usual source file is another goes there (binder source to
+            // QSRVSRC), as on IBM i, where a source file holds one member
+            // of a name.
+            if let Some(i) = out
                 .members
                 .iter()
-                .find(|m| m.file == file && m.member == name)
+                .position(|m| m.file == file && m.member == name)
             {
-                out.duplicates.push((name, first.path.clone(), p.clone()));
-                continue;
+                let taken =
+                    |f: &str, ms: &[Found]| ms.iter().any(|m| m.file == f && m.member == name);
+                let mine = default_source_file(srctype);
+                let theirs = default_source_file(&out.members[i].srctype);
+                if mine != file && !taken(mine, &out.members) {
+                    file = mine.to_string();
+                } else if theirs != file && !taken(theirs, &out.members) {
+                    out.members[i].file = theirs.to_string();
+                } else {
+                    out.duplicates
+                        .push((name, out.members[i].path.clone(), p.clone()));
+                    continue;
+                }
             }
             let objtype = fname
                 .rsplit_once('.')
@@ -274,7 +396,102 @@ fn scan(dir: &Path) -> Result<Scan> {
                 text,
                 path: p.clone(),
                 objtype,
+                included: false,
             });
+        }
+    }
+    // A build rule that names a source of another name (TEMPDET.MODULE:
+    // empdet.test.sqlrpgle): the member takes the object's name.
+    let renames: Vec<(String, String)> = out
+        .rules
+        .iter()
+        .filter_map(|(target, (_, deps))| {
+            deps.first()
+                .map(|d| (target.clone(), d.to_ascii_lowercase()))
+        })
+        .collect();
+    for (target, dep) in renames {
+        let Some(i) = out.members.iter().position(|m| {
+            m.path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case(&dep))
+        }) else {
+            continue;
+        };
+        let file = out.members[i].file.clone();
+        if out.members[i].member != target
+            && catalog::validate_name("member", &target).is_ok()
+            && !out
+                .members
+                .iter()
+                .any(|m| m.file == file && m.member == target)
+        {
+            out.members[i].member = target;
+        }
+    }
+    // Sources other sources bring in by file name (`/COPY llist_h.rpgle`,
+    // `/INCLUDE 'iconv_h.rpgle'`): copy members, and stream files for the
+    // compiler to find by name.
+    let mut wanted = std::collections::BTreeSet::new();
+    let mut members_named = std::collections::BTreeSet::new();
+    for m in &out.members {
+        if !matches!(m.srctype.as_str(), "RPGLE" | "SQLRPGLE" | "RPGLEINC") {
+            continue;
+        }
+        let Ok(t) = read_text(&m.path) else { continue };
+        for id in crate::rpg::parse::includes(&t) {
+            let id = id.trim().trim_matches(|c| c == '\'' || c == '"');
+            let base = id.rsplit('/').next().unwrap_or(id).to_ascii_lowercase();
+            if base.contains('.') && !id.contains(',') {
+                wanted.insert(base);
+            } else {
+                // A member: MBR (in QRPGLESRC), FILE,MBR or LIB/FILE,MBR.
+                let up = id.to_ascii_uppercase();
+                let (file, member) = match up.split_once(',') {
+                    Some((f, m)) => (f.rsplit('/').next().unwrap_or(f).to_string(), m.to_string()),
+                    None => ("QRPGLESRC".to_string(), up.clone()),
+                };
+                members_named.insert((file, member));
+            }
+        }
+    }
+    for m in out.members.iter_mut() {
+        if members_named.contains(&(m.file.clone(), m.member.clone())) {
+            m.included = true;
+        }
+    }
+    for p in loose {
+        let fname = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if wanted.contains(&fname) {
+            let rel = p
+                .strip_prefix(dir)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.includes.push((rel, p.clone()));
+        }
+    }
+    for m in out.members.iter_mut() {
+        let fname = m
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if wanted.contains(&fname) && !out.includes.iter().any(|(_, q)| *q == m.path) {
+            m.included = true;
+            let rel = m
+                .path
+                .strip_prefix(dir)
+                .unwrap_or(&m.path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.includes.push((rel, m.path.clone()));
         }
     }
     Ok(out)
@@ -344,8 +561,7 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         }
     }
     for m in &members {
-        let text = std::fs::read_to_string(&m.path)
-            .with_context(|| format!("reading {}", m.path.display()))?;
+        let text = read_text(&m.path).with_context(|| format!("reading {}", m.path.display()))?;
         source::put_member(
             job.client,
             &source::Member {
@@ -370,8 +586,7 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
     // Include files go to the stream files, under /<library>/ (RPG
     // `/INCLUDE 'name.rpgleinc'` finds them by name).
     for (rel, path) in &includes {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let text = read_text(path).with_context(|| format!("reading {}", path.display()))?;
         source::put_stream_file(
             job.client,
             &format!("/{}/{rel}", lib.to_ascii_lowercase()),
@@ -414,7 +629,7 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         );
         if step(job, &mut report, &m.member, &cmd).await {
             if let Some(csv) = data.get(&m.member) {
-                let text = std::fs::read_to_string(csv)?;
+                let text = read_text(csv)?;
                 let f = catalog::resolve_file(job.client, std::slice::from_ref(&lib), &m.member)
                     .await?;
                 match load_csv(job.client, f, &text).await {
@@ -498,7 +713,7 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         else {
             continue;
         };
-        let text = std::fs::read_to_string(csv)?;
+        let text = read_text(csv)?;
         match load_csv(job.client, f, &text).await {
             Ok(n) => report.lines.push(format!("  {name}: {n} records loaded")),
             Err(e) => {
@@ -534,10 +749,10 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
     let mut is_module = std::collections::BTreeSet::new();
     for m in members
         .iter()
-        .filter(|m| matches!(m.srctype.as_str(), "RPGLE" | "SQLRPGLE"))
+        .filter(|m| matches!(m.srctype.as_str(), "RPGLE" | "SQLRPGLE") && !m.included)
     {
         let rule = rules.get(&m.member).map(|r| r.0.as_str());
-        let nomain = std::fs::read_to_string(&m.path)
+        let nomain = read_text(&m.path)
             .map(|t| {
                 let u = t.to_ascii_uppercase();
                 u.lines().any(|l| {
@@ -570,31 +785,43 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         step(job, &mut report, &m.member, &cmd).await;
     }
     for m in of_type("BND") {
-        let modules: Vec<String> = match rules.get(&m.member) {
-            Some((kind, deps)) if kind == "SRVPGM" => deps
-                .iter()
-                .filter_map(|d| {
-                    d.to_ascii_uppercase()
-                        .strip_suffix(".MODULE")
-                        .map(String::from)
-                })
-                .map(|d| format!("{lib}/{d}"))
-                .collect(),
-            _ => vec![format!("{lib}/{}", m.member)],
+        let deps_of = |suffix: &str| -> Vec<String> {
+            match rules.get(&m.member) {
+                Some((kind, deps)) if kind == "SRVPGM" => deps
+                    .iter()
+                    .filter_map(|d| {
+                        d.to_ascii_uppercase()
+                            .strip_suffix(suffix)
+                            .map(String::from)
+                    })
+                    .map(|d| format!("{lib}/{d}"))
+                    .collect(),
+                _ => vec![],
+            }
         };
+        let mut modules = deps_of(".MODULE");
+        if modules.is_empty() {
+            modules.push(format!("{lib}/{}", m.member));
+        }
+        let srvpgms = deps_of(".SRVPGM");
         let cmd = format!(
-            "CRTSRVPGM SRVPGM({lib}/{}) MODULE({}) SRCFILE({lib}/{}) SRCMBR({})",
+            "CRTSRVPGM SRVPGM({lib}/{}) MODULE({}) SRCFILE({lib}/{}) SRCMBR({}){}",
             m.member,
             modules.join(" "),
             m.file,
-            m.member
+            m.member,
+            if srvpgms.is_empty() {
+                String::new()
+            } else {
+                format!(" BNDSRVPGM({})", srvpgms.join(" "))
+            }
         );
         step(job, &mut report, &m.member, &cmd).await;
     }
     for m in of_type("BNDDIR") {
         // A TOBi binding directory script: CL commands with &O (the
         // library) and &N (the object); a line starting with ! may fail.
-        let text = std::fs::read_to_string(&m.path)?;
+        let text = read_text(&m.path)?;
         let mut ok = true;
         for line in text.lines() {
             let l = line.trim();
@@ -634,7 +861,7 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         ("RPG", "CRTRPGPGM"),
     ] {
         for m in of_type(t) {
-            if is_module.contains(&(m.file.clone(), m.member.clone())) {
+            if m.included || is_module.contains(&(m.file.clone(), m.member.clone())) {
                 continue;
             }
             let target = if command == "CRTSQLRPGI" {
@@ -700,6 +927,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn source_in_windows_1252() {
+        // Not UTF-8: read as Windows-1252 (0x93/0x94 are its curly double
+        // quotes, 0xE9 is e acute in it and in ISO 8859-1).
+        let p = std::env::temp_dir().join(format!("as4tainr-1252-{}", std::process::id()));
+        std::fs::write(&p, b"caf\xe9 \x93x\x94").unwrap();
+        let t = read_text(&p).unwrap();
+        std::fs::remove_file(&p).unwrap();
+        assert_eq!(t, "caf\u{e9} \u{201c}x\u{201d}");
+    }
+
+    #[test]
     fn csv_lines() {
         assert_eq!(
             parse_csv_line(r#"1,"Acme, Inc.","say ""hi""""#),
@@ -732,6 +970,105 @@ mod tests {
         assert_eq!(default_source_file("PF"), "QDDSSRC");
         assert_eq!(default_source_file("RPGLE"), "QRPGLESRC");
         assert_eq!(default_source_file("CLLE"), "QCLSRC");
+    }
+
+    #[test]
+    fn build_scripts_and_copy_members() {
+        // OSSILE's projects build with Makefiles and setup scripts that
+        // run `system "CRTSRVPGM ..."`: LUTIL from the modules LUTIL and
+        // PARMEVAL, bound to the service program LLIST. Sources other
+        // sources /COPY by file name or member name (llist_h.rpgle,
+        // LUTIL_H, arraylist_h.rpgle, whose name is too long for a
+        // member) are copy members, not programs.
+        let dir = std::env::temp_dir().join(format!("as4tainr-mk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("setup"),
+            "system -kpieb \"CRTSRVPGM $TARGET_LIB/LUTIL MODULE($TARGET_LIB/LUTIL $TARGET_LIB/PARMEVAL) BNDSRVPGM($TARGET_LIB/LLIST) EXPORT(*SRCFILE)\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Makefile"),
+            "\tsystem \"CRTSRVPGM $(BIN_LIB)/LLIST MODULE($(BIN_LIB)/LLIST $(BIN_LIB)/LLIST_SORT) $(LFLAGS)\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("llist.rpgle"),
+            "      /copy llist_h.rpgle\n      /copy LUTIL_H\n      /include 'arraylist_h.rpgle'\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("llist_h.rpgle"), "\n").unwrap();
+        std::fs::write(dir.join("lutil_h.rpgle"), "\n").unwrap();
+        std::fs::write(dir.join("arraylist_h.rpgle"), "\n").unwrap();
+        let s = scan(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            s.rules.get("LUTIL"),
+            Some(&(
+                "SRVPGM".to_string(),
+                vec![
+                    "LUTIL.MODULE".to_string(),
+                    "PARMEVAL.MODULE".to_string(),
+                    "LLIST.SRVPGM".to_string()
+                ]
+            ))
+        );
+        assert_eq!(
+            s.rules.get("LLIST").map(|r| r.1.clone()),
+            Some(vec![
+                "LLIST.MODULE".to_string(),
+                "LLIST_SORT.MODULE".to_string()
+            ])
+        );
+        let included: Vec<(&str, bool)> = s
+            .members
+            .iter()
+            .map(|m| (m.member.as_str(), m.included))
+            .collect();
+        assert!(included.contains(&("LLIST", false)), "{included:?}");
+        assert!(included.contains(&("LLIST_H", true)), "{included:?}");
+        assert!(included.contains(&("LUTIL_H", true)), "{included:?}");
+        let mut inc: Vec<String> = s.includes.iter().map(|x| x.0.clone()).collect();
+        inc.sort();
+        assert_eq!(inc, ["arraylist_h.rpgle", "llist_h.rpgle"]);
+    }
+
+    #[test]
+    fn sources_of_one_name_and_build_rule_names() {
+        // The company_system corpus (IBM/ibmi-company_system): qrpglesrc
+        // holds empdet.sqlrpgle and empdet.bnd. A source file holds one
+        // member of a name (IBM i), so the binder source goes to QSRVSRC,
+        // where CRTSRVPGM looks for it (SRCFILE default). Its Rules.mk
+        // builds TEMPDET.MODULE from empdet.test.sqlrpgle: the member
+        // takes the object's name, as the build tool's CRTSQLRPGI would.
+        let dir = std::env::temp_dir().join(format!("as4tainr-dup-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("qrpglesrc")).unwrap();
+        std::fs::create_dir_all(dir.join("qtestsrc")).unwrap();
+        std::fs::write(dir.join("qrpglesrc/empdet.sqlrpgle"), "**free\n").unwrap();
+        std::fs::write(dir.join("qrpglesrc/empdet.bnd"), "STRPGMEXP\nENDPGMEXP\n").unwrap();
+        std::fs::write(dir.join("qtestsrc/empdet.test.sqlrpgle"), "**free\n").unwrap();
+        std::fs::write(
+            dir.join("qtestsrc/Rules.mk"),
+            "TEMPDET.MODULE: empdet.test.sqlrpgle\n",
+        )
+        .unwrap();
+        let s = scan(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let mut m: Vec<(&str, &str, &str)> = s
+            .members
+            .iter()
+            .map(|m| (m.file.as_str(), m.member.as_str(), m.srctype.as_str()))
+            .collect();
+        m.sort();
+        assert_eq!(
+            m,
+            [
+                ("QRPGLESRC", "EMPDET", "SQLRPGLE"),
+                ("QSRVSRC", "EMPDET", "BND"),
+                ("QTESTSRC", "TEMPDET", "SQLRPGLE"),
+            ]
+        );
+        assert!(s.duplicates.is_empty());
     }
 
     #[test]

@@ -444,6 +444,37 @@ impl Machine<'_> {
         if self.prog.sequence.get(&arr.name) == Some(&'D') {
             vals.reverse();
         }
+        // An array overlaying an array of a data structure: the sort
+        // rearranges whole elements of the overlaid array, by this key
+        // (ILE RPG Reference, SORTA).
+        let v = arr.var.clone();
+        if v.stride != v.dtype.size() || v.lead > 0 {
+            let n = self.elems_in_use(&arr.name, &v) as usize;
+            let mut keyed: Vec<(Value, Vec<u8>)> = Vec::new();
+            for k in 0..n {
+                let key = self.load_var(&v, Some(k as i128 + 1))?;
+                let start = v.off + k * v.stride - v.lead;
+                keyed.push((key, self.bufs[v.buf][start..start + v.stride].to_vec()));
+            }
+            let mut err = None;
+            keyed.sort_by(|x, y| {
+                data::compare(&x.0, &y.0).unwrap_or_else(|e| {
+                    err = Some(e);
+                    Ordering::Equal
+                })
+            });
+            if let Some(e) = err {
+                return Err(e);
+            }
+            if self.prog.sequence.get(&arr.name) == Some(&'D') {
+                keyed.reverse();
+            }
+            for (k, (_, bytes)) in keyed.into_iter().enumerate() {
+                let start = v.off + k * v.stride - v.lead;
+                self.bufs[v.buf][start..start + v.stride].copy_from_slice(&bytes);
+            }
+            return Ok(());
+        }
         for (k, v) in vals.iter().enumerate() {
             self.store_var(
                 &arr.var,

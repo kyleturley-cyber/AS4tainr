@@ -21,6 +21,8 @@ use tokio_postgres::Client;
 
 #[path = "bifs.rs"]
 mod bifs;
+#[path = "cee.rs"]
+pub mod cee;
 #[path = "crt.rs"]
 pub mod crt;
 #[path = "cycle.rs"]
@@ -357,6 +359,9 @@ struct Frame<'a> {
     omitted: Vec<String>,
     /// File parameters (LIKEFILE): the caller's file.
     files: HashMap<String, usize>,
+    /// The length of each argument, as an operational descriptor gives
+    /// it (CEEDOD).
+    lengths: Vec<Option<usize>>,
 }
 
 /// Where an argument passed by reference lives.
@@ -529,6 +534,16 @@ impl<'a> Machine<'a> {
     /// A name as the running code sees it: the current procedure's
     /// locals first, then the program's globals. Local storage comes back
     /// with its absolute buffer.
+    /// A name's definition without its storage looked up: what %SIZE and
+    /// %ELEM need (based storage need not have an address then).
+    fn sym_static(&self, name: &str) -> Option<Sym> {
+        self.frames
+            .last()
+            .and_then(|f| f.proc.syms.get(name))
+            .or_else(|| self.prog.syms.get(name))
+            .cloned()
+    }
+
     fn sym(&self, name: &str) -> Option<Sym> {
         if let Some(f) = self.frames.last() {
             if let Some(s) = f.proc.syms.get(name) {
@@ -1148,7 +1163,7 @@ impl<'a> Machine<'a> {
                     .first()
                     .ok_or_else(|| anyhow!("%SIZE needs an argument"))?;
                 let n = match a0 {
-                    Expr::Name { parts, .. } => match self.sym(&parts.join(".")) {
+                    Expr::Name { parts, .. } => match self.sym_static(&parts.join(".")) {
                         Some(Sym::Var(v)) => {
                             v.dtype.size()
                                 * if args.len() > 1 {
@@ -1165,7 +1180,7 @@ impl<'a> Machine<'a> {
                 Value::Num(Dec::from_i64(n as i64))
             }
             "ELEM" => match args.first() {
-                Some(Expr::Name { parts, .. }) => match self.sym(&parts.join(".")) {
+                Some(Expr::Name { parts, .. }) => match self.sym_static(&parts.join(".")) {
                     Some(Sym::Var(v)) => Value::Num(Dec::from_i64(v.dim as i64)),
                     Some(Sym::Ds(d)) => Value::Num(Dec::from_i64(d.dim as i64)),
                     _ => bail!("%ELEM needs an array"),
@@ -1258,7 +1273,7 @@ impl<'a> Machine<'a> {
             "INT" | "INTH" => {
                 let v = arg(self, 0)?;
                 let d = match v {
-                    Value::Char(c) => Dec::parse(&a(&c))?,
+                    Value::Char(c) => char_number(&a(&c))?,
                     o => o.num()?,
                 };
                 Value::Num(d.rescale(0, b == "INTH")?)
@@ -1266,7 +1281,7 @@ impl<'a> Machine<'a> {
             "DEC" | "DECH" => {
                 let v = arg(self, 0)?;
                 let d = match v {
-                    Value::Char(c) => Dec::parse(&a(&c))?,
+                    Value::Char(c) => char_number(&a(&c))?,
                     o => o.num()?,
                 };
                 match (args.get(1), args.get(2)) {
@@ -1338,8 +1353,52 @@ impl<'a> Machine<'a> {
                 };
                 self.ptr_to(l.buf, l.off + skip)
             }
-            // Procedure pointers are not supported yet: *NULL.
-            "PADDR" => Value::Fig(Fig::Null),
+            // %PADDR(name | 'name'): a procedure pointer (ILE RPG
+            // Reference, %PADDR); a prototype's name means its EXTPROC.
+            "PADDR" => {
+                let n = match args.first() {
+                    Some(Expr::Str(b)) => a(b).trim().to_ascii_uppercase(),
+                    Some(Expr::Name { parts, args: None }) if parts.len() == 1 => {
+                        let n = parts[0].to_ascii_uppercase();
+                        match self.prog.protos.get(&n).and_then(|p| p.extproc.clone()) {
+                            Some(e) => e.to_ascii_uppercase(),
+                            None => match self.sym(&n) {
+                                Some(Sym::Const(v)) => a(&v.chars()?).trim().to_ascii_uppercase(),
+                                _ => n,
+                            },
+                        }
+                    }
+                    _ => bail!("%PADDR needs a procedure name"),
+                };
+                // Where the procedure is: this module (in a service
+                // program: that service program), or the service program
+                // the program is bound to for it.
+                // A procedure the module does not export: its module too
+                // ("SRVPGM/MODULE"), a pointer reaches it all the same.
+                let home = if let Some(pi) = self.prog.procs.get(&n) {
+                    let exported = pi.export;
+                    self.current_srvpgm().map(|(l, sp)| {
+                        if exported {
+                            (l, sp)
+                        } else {
+                            (l, format!("{sp}/{}", self.prog.name))
+                        }
+                    })
+                } else {
+                    match self.io.binding.as_ref().and_then(|b| b.imports.get(&n)) {
+                        Some(crate::ile::Target::SrvPgm { library, name }) => {
+                            Some((library.clone(), name.clone()))
+                        }
+                        _ => None,
+                    }
+                };
+                Value::Ptr(super::mem::Ptr {
+                    kind: super::mem::KIND_PROC,
+                    owner: 0,
+                    buf: super::mem::proc_id(&n, home),
+                    off: 0,
+                })
+            }
             "ALLOC" => {
                 let n = arg(self, 0)?;
                 self.alloc(&n)?
@@ -1371,6 +1430,14 @@ impl<'a> Machine<'a> {
     // ---- assignment -----------------------------------------------------
 
     fn assign(&mut self, target: &Expr, val: &Value, fit: Fit, right: bool) -> Result<()> {
+        // A data structure array given all its elements at once (the
+        // value of a procedure returning LIKEDS(ds) DIM(n)).
+        if let (Some(d), Value::Char(b)) = (self.whole_ds_array(target), val) {
+            if b.len() == d.size * d.dim as usize {
+                self.bufs[d.buf][d.off..d.off + b.len()].copy_from_slice(b);
+                return Ok(());
+            }
+        }
         match target {
             Expr::Ind(n) => {
                 let v = val.truth()?;
@@ -1560,6 +1627,30 @@ impl<'a> Machine<'a> {
 
     // ---- files ----------------------------------------------------------
 
+    /// The service program (library, name) whose module is running, if
+    /// one is.
+    pub(super) fn current_srvpgm(&self) -> Option<(String, String)> {
+        let u = self.io.unit.as_ref()?;
+        let mut it = u.split('/');
+        Some((it.next()?.to_string(), it.next()?.to_string()))
+    }
+
+    /// The file a program file is over: the one opened (EXTFILE may
+    /// name another), or the one it was compiled with.
+    fn fref_of(&self, i: usize) -> Result<crate::catalog::FileRef> {
+        self.files[i]
+            .open
+            .as_ref()
+            .map(|o| o.file.clone())
+            .or_else(|| self.prog.files[i].fref.clone())
+            .ok_or_else(|| {
+                anyhow!(
+                    "CPF4101: File {} is not open.",
+                    self.prog.files[i].decl.name
+                )
+            })
+    }
+
     fn open_file(&mut self, i: usize) -> Result<()> {
         self.open_file_inner(i)?;
         self.infds_open(i);
@@ -1587,12 +1678,44 @@ impl<'a> Machine<'a> {
                 fi.decl.name
             );
         }
-        let Some(mut fref) = fi.fref.clone() else {
-            return Ok(());
+        // A program-described file not found when the program was
+        // compiled: found now, by EXTFILE or by its name.
+        let unresolved = fi.fref.is_none() && fi.decl.device == "DISK";
+        let mut fref = match fi.fref.clone() {
+            Some(f) => f,
+            None if unresolved => {
+                let has_extfile = crate::rpg::ast::keyword(&fi.decl.keywords, "EXTFILE")
+                    .and_then(|k| k.args.first())
+                    .is_some_and(|a| !a.trim().eq_ignore_ascii_case("*EXTDESC"));
+                let n = fi.decl.name.clone();
+                match self.block(crate::catalog::resolve_file(
+                    self.io.client,
+                    &self.io.libl,
+                    &n,
+                )) {
+                    Ok(f) => f,
+                    Err(_) if has_extfile => crate::catalog::FileRef {
+                        library: String::new(),
+                        file: crate::dds::PhysicalFile {
+                            name: n,
+                            format: String::new(),
+                            text: String::new(),
+                            unique: false,
+                            fields: vec![],
+                            keys: vec![],
+                            descending: vec![],
+                            view: None,
+                        },
+                    },
+                    Err(_) => bail!("CPF4101: File {n} not found."),
+                }
+            }
+            None => return Ok(()),
         };
         // EXTFILE: the file opened is the one it names when the file is
         // opened (a literal, or a variable's value; *EXTDESC: the one
         // EXTDESC names) (ILE RPG Reference, EXTFILE).
+        let fi = &self.prog.files[i];
         if let Some(k) = crate::rpg::ast::keyword(&fi.decl.keywords, "EXTFILE") {
             let arg = k
                 .args
@@ -1990,7 +2113,7 @@ impl<'a> Machine<'a> {
                 }
             }
             FileOp::Write | FileOp::Update | FileOp::Delete => {
-                let fref = self.prog.files[i].fref.clone().unwrap();
+                let fref = self.fref_of(i)?;
                 self.block(crate::authority::check(
                     self.io.client,
                     &self.io.user,
@@ -3348,6 +3471,13 @@ impl<'a> Machine<'a> {
                     }
                     Ins::Return(v) => {
                         let val = match v {
+                            // A data structure array (a procedure returning
+                            // LIKEDS(ds) DIM(n)): all its elements.
+                            Some(x) if self.whole_ds_array(x).is_some() => {
+                                let d = self.whole_ds_array(x).unwrap();
+                                let n = d.size * d.dim as usize;
+                                Some(Value::Char(self.bufs[d.buf][d.off..d.off + n].to_vec()))
+                            }
                             Some(x) => Some(self.eval(x)?),
                             None => None,
                         };
@@ -3457,6 +3587,11 @@ impl<'a> Machine<'a> {
                     if err.downcast_ref::<ReturnPointSignal>().is_some() {
                         return Err(err);
                     }
+                    // An escape message sent to a caller passes this
+                    // procedure by.
+                    if self.passes_by(&err) {
+                        return Err(err);
+                    }
                     // An error inside a monitored body goes to the first
                     // ON-ERROR that lists its status (or *ALL / nothing).
                     let mut handled = None;
@@ -3484,7 +3619,17 @@ impl<'a> Machine<'a> {
                             pc = h;
                         }
                         None if i.line == 0 => return Err(err),
-                        None => return Err(err.context(format!("line {}", i.line))),
+                        // Where the error happened, for its exception
+                        // message's sender (shown as "line N").
+                        None => {
+                            let sender = errors::origin(&err)
+                                .map(|a| a.sender)
+                                .unwrap_or_else(|| self.sender());
+                            return Err(err.context(errors::At {
+                                line: i.line,
+                                sender,
+                            }));
+                        }
                     }
                 }
             }
@@ -3537,6 +3682,195 @@ impl<'a> Machine<'a> {
     /// another program): each is the bytes of the caller's variable, and
     /// gets the parameter's value back when the program ends.
     pub fn run_bytes(&mut self, parms: &mut [Vec<u8>]) -> Result<()> {
+        // The program's main procedure: a call stack entry (its call
+        // message queue), for the message APIs.
+        let pgm = self.stack_pgm();
+        let main = self.prog.main.clone().unwrap_or_else(|| pgm.clone());
+        let lib = self.stack_lib();
+        let id = crate::pgmmsg::stack_push(
+            &self.io.job_key,
+            (&lib, &pgm),
+            &self.prog.name,
+            &main,
+            &self.io.actgrp,
+        );
+        let r = self.run_bytes_inner(parms);
+        crate::pgmmsg::stack_pop(&self.io.job_key, id);
+        r
+    }
+
+    /// A data structure array named without an index.
+    fn whole_ds_array(&self, e: &Expr) -> Option<super::program::DsInfo> {
+        let Expr::Name { parts, args: None } = e else {
+            return None;
+        };
+        match self.sym(&parts.join(".")) {
+            Some(Sym::Ds(d)) if d.dim > 1 => Some(d),
+            _ => None,
+        }
+    }
+
+    /// The library of the program or service program the running code
+    /// is in.
+    pub(super) fn stack_lib(&self) -> String {
+        if let Some((lib, _)) = self.current_srvpgm() {
+            return lib;
+        }
+        match self.io.program.split_once('/') {
+            Some((l, _)) if !l.starts_with('*') => l.to_string(),
+            _ => crate::pgmmsg::stack(&self.io.job_key)
+                .last()
+                .map(|e| e.lib.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// A procedure's name as the module exports it: EXTPROC of its
+    /// prototype as written ('assert'), else the name in capitals.
+    fn external_proc_name(&self, name: &str) -> String {
+        self.prog
+            .protos
+            .get(&name.to_ascii_uppercase())
+            .and_then(|p| p.written.clone())
+            .filter(|e| e.eq_ignore_ascii_case(name))
+            .unwrap_or_else(|| name.to_ascii_uppercase())
+    }
+
+    /// The program object (or service program) the running code is in,
+    /// as the call stack names it.
+    pub(super) fn stack_pgm(&self) -> String {
+        if let Some((_, sp)) = self.current_srvpgm() {
+            return sp;
+        }
+        let p = self.io.program.rsplit('/').next().unwrap_or("").to_string();
+        if self.io.program.starts_with("*BOUND/") {
+            // A module bound into a program: that program's.
+            return crate::pgmmsg::stack_top_pgm(&self.io.job_key).unwrap_or(p);
+        }
+        p
+    }
+
+    /// A received message in format RCVM0100 or RCVM0300 (Receive
+    /// Program Message API): bytes returned and available, severity,
+    /// message ID, type, key, then (RCVM0100) the replacement data, or
+    /// (RCVM0300) the message file, the lengths of the replacement data,
+    /// text, help and sender information, and those.
+    fn rcvm_format(
+        &self,
+        format: &str,
+        m: &crate::pgmmsg::QMsg,
+        receiver: Option<&crate::pgmmsg::Entry>,
+    ) -> Vec<u8> {
+        let i4 = |n: usize| (n as i32).to_be_bytes();
+        let field = |s: &str, n: usize| {
+            let mut b = data::e(s);
+            b.resize(n, 0x40);
+            b
+        };
+        let mut b: Vec<u8> = Vec::new();
+        b.extend([0u8; 8]);
+        b.extend_from_slice(&m.sev.to_be_bytes());
+        b.extend(field(&m.msgid, 7));
+        b.extend(field(crate::pgmmsg::rtntype(&m.ty), 2));
+        b.extend(data::e(&crate::pgmmsg::key_text(m.key)));
+        let text = data::e(&m.text);
+        let help = data::e(&m.seclvl);
+        if format == "RCVM0100" {
+            b.extend(field("", 7));
+            b.extend_from_slice(&i4(0));
+            b.extend_from_slice(&i4(37));
+            b.extend_from_slice(&i4(m.data.len()));
+            b.extend_from_slice(&i4(m.data.len()));
+            b.extend_from_slice(&m.data);
+        } else {
+            b.extend(field(&m.msgf, 10));
+            b.extend(field(&m.msgflib, 10));
+            b.extend(field(&m.msgflib, 10));
+            b.extend(field("*NO", 9));
+            for v in [0, 0, 37, 37] {
+                b.extend_from_slice(&i4(v));
+            }
+            let (date, time) = &m.sent;
+            let job = self.io.job.clone().unwrap_or(crate::jobs::JobId {
+                number: 0,
+                user: self.io.user.clone(),
+                name: "QPADEV0001".into(),
+            });
+            let mut snd = Vec::new();
+            snd.extend(field(&job.name, 10));
+            snd.extend(field(&job.user, 10));
+            snd.extend(field(&format!("{:06}", job.number), 6));
+            snd.extend(field(date, 7));
+            snd.extend(field(time, 6));
+            snd.extend(field("1", 1));
+            snd.extend(field("1", 1));
+            snd.extend(field(&m.sender.pgm, 12));
+            snd.extend(field(&m.sender.module, 10));
+            snd.extend(field(&m.sender.proc, 256));
+            snd.extend(field("", 1));
+            // The statement: its source sequence number with two
+            // decimals, left-adjusted (RPGUnit's PGMMSGT expects '16500'
+            // for line 165).
+            if m.sender.line > 0 {
+                snd.extend_from_slice(&i4(1));
+                snd.extend(field(&format!("{:<10}", m.sender.line * 100), 30));
+            } else {
+                snd.extend_from_slice(&i4(0));
+                snd.extend(field("", 30));
+            }
+            let (rp, rm, rpr) = receiver
+                .map(|r| (r.pgm.clone(), r.module.clone(), r.proc.clone()))
+                .unwrap_or_default();
+            snd.extend(field(&rp, 10));
+            snd.extend(field(&rm, 10));
+            snd.extend(field(&rpr, 256));
+            snd.extend(field("", 10));
+            snd.extend_from_slice(&i4(0));
+            snd.extend(field("", 30));
+            snd.extend(field("", 2));
+            for v in [
+                m.data.len(),
+                m.data.len(),
+                text.len(),
+                text.len(),
+                help.len(),
+                help.len(),
+                snd.len(),
+                snd.len(),
+            ] {
+                b.extend_from_slice(&i4(v));
+            }
+            b.extend_from_slice(&m.data);
+            b.extend_from_slice(&text);
+            b.extend_from_slice(&help);
+            b.extend_from_slice(&snd);
+        }
+        let n = b.len();
+        b[0..4].copy_from_slice(&i4(n));
+        b[4..8].copy_from_slice(&i4(n));
+        b
+    }
+
+    /// The sender of a message this code sends: its call stack entry.
+    pub(super) fn sender(&self) -> crate::pgmmsg::Sender {
+        let s = crate::pgmmsg::stack(&self.io.job_key);
+        match s.last() {
+            Some(e) => crate::pgmmsg::Sender {
+                pgm: e.pgm.clone(),
+                module: e.module.clone(),
+                proc: e.proc.clone(),
+                line: self.line,
+            },
+            None => crate::pgmmsg::Sender {
+                pgm: self.stack_pgm(),
+                module: self.prog.name.clone(),
+                proc: self.prog.name.clone(),
+                line: self.line,
+            },
+        }
+    }
+
+    fn run_bytes_inner(&mut self, parms: &mut [Vec<u8>]) -> Result<()> {
         // Still active in its activation group (it ended without LR): its
         // storage, indicators and files as it left them.
         let key = (
@@ -3678,6 +4012,10 @@ impl<'a> Machine<'a> {
         // tests, is not a program object: nothing stays active.)
         // What the program wrote to stream files still open is stored.
         self.c_flush();
+        let r = match self.spaces_flush() {
+            Ok(()) => r,
+            Err(e) => r.and(Err(e)),
+        };
         let keep = r.is_ok()
             && (prog.main.is_some() || !self.ind("LR"))
             && !self.io.actgrp.starts_with("*NEW")
@@ -3739,6 +4077,101 @@ impl Machine<'_> {
                 let n = num(self, len)?.to_i128()?.max(0) as usize;
                 let c: String = text(self, cmd).chars().take(n).collect();
                 self.run_cl(c.trim())?;
+            }
+            // QUSPTRUS (qualified user space name, pointer [, error
+            // code]): a pointer to the space's bytes, which this program
+            // then changes in place (written back at calls and at its end).
+            "QUSPTRUS" => {
+                let [qual, ptr, rest @ ..] = locs else {
+                    bail!("QUSPTRUS needs a user space name and a pointer");
+                };
+                let q = self.bufs[qual.buf][qual.off..qual.off + qual.size.min(20)].to_vec();
+                let name = a(q.get(..10).unwrap_or(&q)).trim().to_ascii_uppercase();
+                let lib = a(q.get(10..20).unwrap_or(&[])).trim().to_ascii_uppercase();
+                let caller = crate::dtaq::Caller {
+                    user: self.io.user.clone(),
+                    job: self.io.job.clone(),
+                    libl: self.io.libl.clone(),
+                    curlib: self
+                        .io
+                        .cl
+                        .as_ref()
+                        .and_then(|c| c.curlib.clone())
+                        .unwrap_or_default(),
+                };
+                let client = self.io.client;
+                let found = self.block(async {
+                    let s = crate::usrspc::find(client, &name, &lib, &caller).await?;
+                    crate::authority::check(
+                        client,
+                        &caller.user,
+                        &s.library,
+                        &s.name,
+                        "*USRSPC",
+                        crate::authority::Aut::Change,
+                    )
+                    .await?;
+                    let data = crate::usrspc::contents(client, &s).await?;
+                    Ok::<_, anyhow::Error>((s, data))
+                });
+                let (s, data) = match found {
+                    Ok(x) => x,
+                    Err(e) => return self.api_error(rest.first(), e).map(|_| true),
+                };
+                let buf = match self
+                    .bufs
+                    .heap
+                    .spaces
+                    .iter()
+                    .find(|(_, l, n, _)| *l == s.library && *n == s.name)
+                {
+                    Some((b, _, _, _)) => *b,
+                    None => {
+                        let h = self.bufs.heap.alloc(0);
+                        let b = super::mem::HEAP_BASE + h;
+                        let len = data.len();
+                        self.bufs[b] = space_pages(data, s.initval);
+                        self.bufs
+                            .heap
+                            .spaces
+                            .push((b, s.library.clone(), s.name.clone(), len));
+                        b
+                    }
+                };
+                if let Value::Ptr(p) = self.ptr_to(buf, 0) {
+                    let n = ptr.size.min(16);
+                    self.bufs[ptr.buf][ptr.off..ptr.off + n].copy_from_slice(&p.encode()[..n]);
+                }
+                self.api_ok(rest.first());
+            }
+            // The data queue APIs (dtaq.rs): the parameters' storage is
+            // copied out, and back after the call (by reference).
+            n if crate::sysapi::is_api(n) => {
+                let mut args = crate::dtaq::RpgArgs(
+                    locs.iter()
+                        .map(|l| (self.bufs[l.buf][l.off..l.off + l.size].to_vec(), l.dtype))
+                        .collect(),
+                );
+                let caller = crate::dtaq::Caller {
+                    user: self.io.user.clone(),
+                    job: self.io.job.clone(),
+                    libl: self.io.libl.clone(),
+                    curlib: self
+                        .io
+                        .cl
+                        .as_ref()
+                        .and_then(|c| c.curlib.clone())
+                        .unwrap_or_default(),
+                };
+                self.block(crate::sysapi::call_api(
+                    self.io.client,
+                    &caller,
+                    n,
+                    &mut args,
+                ))?;
+                for (l, (b, _)) in locs.iter().zip(args.0) {
+                    self.bufs[l.buf][l.off..l.off + l.size].copy_from_slice(&b);
+                }
             }
             // QDCXLATE (length, data, table): translate bytes in place
             // between EBCDIC (CCSID 37) and ASCII (QTCPASC, QTCPEBC).
@@ -3807,16 +4240,59 @@ impl Machine<'_> {
                 };
                 let msg = crate::pgmmsg::QMsg {
                     ty: ty.clone(),
+                    data: if msgid.is_empty() {
+                        data::e(&msg.text)
+                    } else {
+                        bytes.clone()
+                    },
+                    sender: self.sender(),
                     ..msg
                 };
                 if ty == "*ESCAPE" {
-                    // An escape message ends the program it is sent to:
-                    // here, the call fails with it.
-                    bail!(
-                        "{}: {}",
-                        if msgid.is_empty() { "CPF9898" } else { &msgid },
-                        msg.text
-                    );
+                    // An escape message ends the call stack entries up to
+                    // the one it is sent to: here, the call fails with it,
+                    // and the procedure that handles it finds it on its
+                    // queue.
+                    let mut m = msg;
+                    if m.msgid.is_empty() {
+                        m.msgid = "CPF9898".into();
+                    }
+                    let entry_text = text(self, entry);
+                    let up = num(self, counter)?.to_i128()?.max(0) as usize;
+                    let target = crate::pgmmsg::stack_target(&self.io.job_key, &entry_text, up);
+                    return Err(anyhow::Error::new(crate::pgmmsg::Escape(m, target)));
+                }
+                // The call stack entry the message goes to (entry and
+                // counter), when it is an RPG procedure's.
+                let entry_text = text(self, entry);
+                let up = num(self, counter)?.to_i128()?.max(0) as usize;
+                let stacked = if entry_text.trim().eq_ignore_ascii_case("*EXT") {
+                    None
+                } else {
+                    crate::pgmmsg::stack_target(&self.io.job_key, &entry_text, up)
+                };
+                if let Some(id) = stacked {
+                    let key =
+                        crate::pgmmsg::stack_send(&self.io.job_key, id, msg.clone()).unwrap_or(0);
+                    // The program's queue by name too (message subfiles,
+                    // SFLPGMQ).
+                    if let Some(q) = queue.clone().filter(|q| q != "*EXT") {
+                        crate::pgmmsg::named_send(
+                            &self.io.job_key,
+                            &q,
+                            crate::pgmmsg::QMsg { key, ..msg },
+                        );
+                    }
+                    if let Some(k) = rest.first() {
+                        let kb: Vec<u8> = crate::pgmmsg::key_text(key)
+                            .bytes()
+                            .map(|c| crate::tn5250::ebcdic::FROM_UNICODE[c as usize])
+                            .collect();
+                        let n = k.size.min(4);
+                        self.bufs[k.buf][k.off..k.off + n].copy_from_slice(&kb[..n]);
+                    }
+                    self.api_ok(rest.get(1));
+                    return Ok(true);
                 }
                 // *EXT, or a caller above the RPG programs (a command
                 // line, a CL program): the message goes to the job log.
@@ -3836,6 +4312,241 @@ impl Machine<'_> {
                     self.bufs[k.buf][k.off..k.off + n].copy_from_slice(&kb[..n]);
                 }
                 self.api_ok(rest.get(1));
+            }
+            // QMHRCVPM (receiver, its length, format RCVM0100 or RCVM0300,
+            // call stack entry, counter, message type, message key, wait
+            // time, action, error code) (Receive Program Message API): a
+            // message from the call message queue of a call stack entry.
+            "QMHRCVPM" => {
+                let [rcv, len, fmt, entry, counter, ty, key, _wait, action, rest @ ..] = locs
+                else {
+                    bail!("QMHRCVPM needs 9 parameters and an error code");
+                };
+                let format = text(self, fmt).trim().to_ascii_uppercase();
+                if !matches!(format.as_str(), "RCVM0100" | "RCVM0300") {
+                    return self
+                        .api_error(
+                            rest.first(),
+                            anyhow!("CPF3C21: Format name {format} is not valid."),
+                        )
+                        .map(|_| true);
+                }
+                let up = num(self, counter)?.to_i128()?.max(0) as usize;
+                let target = crate::pgmmsg::stack_target(&self.io.job_key, &text(self, entry), up);
+                let msgtype = text(self, ty).trim().to_ascii_uppercase();
+                let msgtype = if msgtype.is_empty() {
+                    "*ANY".to_string()
+                } else {
+                    msgtype
+                };
+                let k = crate::pgmmsg::parse_key(&text(self, key));
+                let action = text(self, action).trim().to_ascii_uppercase();
+                let m = target.and_then(|id| {
+                    crate::pgmmsg::stack_receive(&self.io.job_key, id, &msgtype, k, &action)
+                });
+                let receiver_entry =
+                    target.and_then(|id| crate::pgmmsg::stack_entry(&self.io.job_key, id));
+                let bytes = match m {
+                    None => {
+                        let mut b = vec![0u8; 8];
+                        b[0..4].copy_from_slice(&8i32.to_be_bytes());
+                        b
+                    }
+                    Some(m) => self.rcvm_format(&format, &m, receiver_entry.as_ref()),
+                };
+                let n = (num(self, len)?.to_i128()?.max(0) as usize)
+                    .min(rcv.size)
+                    .min(bytes.len());
+                self.bufs[rcv.buf][rcv.off..rcv.off + n].copy_from_slice(&bytes[..n]);
+                self.api_ok(rest.first());
+            }
+            // QGYOLJBL (receiver, its length, list information, number of
+            // records to return, message selection information, its
+            // size, error code) (Open List of Job Log Messages API):
+            // this job's messages in format OLJL0100.
+            "QGYOLJBL" => {
+                let [rcv, len, info, count, sel, sel_len, rest @ ..] = locs else {
+                    bail!("QGYOLJBL needs 6 parameters and an error code");
+                };
+                let n = (num(self, sel_len)?.to_i128()?.max(0) as usize).min(sel.size);
+                let s = self.bufs[sel.buf][sel.off..sel.off + n].to_vec();
+                let (msgs, fields) = oljl_select(&self.io.job_key, &s)?;
+                let room = (num(self, len)?.to_i128()?.max(0) as usize).min(rcv.size);
+                let want = num(self, count)?.to_i128()?;
+                // Whole entries that fit (and no more than asked for).
+                let mut out: Vec<u8> = Vec::new();
+                let mut returned: i32 = 0;
+                for m in &msgs {
+                    let e = oljl0100(m, &fields, out.len());
+                    if out.len() + e.len() > room || (want >= 0 && returned as i128 >= want) {
+                        break;
+                    }
+                    out.extend(e);
+                    returned += 1;
+                }
+                self.bufs[rcv.buf][rcv.off..rcv.off + out.len()].copy_from_slice(&out);
+                let mut li = [0u8; 80];
+                li[0..4].copy_from_slice(&(msgs.len() as i32).to_be_bytes());
+                li[4..8].copy_from_slice(&returned.to_be_bytes());
+                li[8..12].copy_from_slice(&next_list_handle().to_be_bytes());
+                li[16] = data::e("C")[0];
+                let ((y, mo, d), (h, mi, sec), _) = crate::rpg::dates::now();
+                let created = format!(
+                    "{}{:02}{mo:02}{d:02}{h:02}{mi:02}{sec:02}",
+                    u8::from(y >= 2000),
+                    y % 100
+                );
+                li[17..30].copy_from_slice(&data::e(&created));
+                li[30] = data::e("2")[0];
+                li[32..36].copy_from_slice(&80i32.to_be_bytes());
+                li[36..40].copy_from_slice(&1i32.to_be_bytes());
+                for (i, b) in data::e(&" ".repeat(40)).iter().enumerate() {
+                    li[40 + i] = *b;
+                }
+                let k = info.size.min(80);
+                self.bufs[info.buf][info.off..info.off + k].copy_from_slice(&li[..k]);
+                self.api_ok(rest.first());
+            }
+            // QMHRSNEM (message key, error code [, to call stack entry,
+            // its length, its format]) (Resend Escape Message API): an
+            // escape message this entry received (blank key: the last
+            // new one) sent again as an escape message, to this entry's
+            // caller.
+            "QMHRSNEM" => {
+                let [key, rest @ ..] = locs else {
+                    bail!("QMHRSNEM needs a message key and an error code");
+                };
+                if rest.len() > 1 {
+                    bail!("QMHRSNEM with a to call stack entry is not supported");
+                }
+                let k = crate::pgmmsg::parse_key(&text(self, key));
+                let job = self.io.job_key.clone();
+                let here = crate::pgmmsg::stack_top_id(&job);
+                let m = crate::pgmmsg::stack(&job)
+                    .into_iter()
+                    .find(|e| Some(e.id) == here)
+                    .and_then(|e| {
+                        e.queue.into_iter().rev().find(|m| {
+                            m.ty == "*ESCAPE"
+                                && match k {
+                                    Some(k) => m.key == k,
+                                    None => !m.old,
+                                }
+                        })
+                    });
+                let Some(m) = m else {
+                    bail!("QMHRSNEM: no escape message to resend");
+                };
+                let target = crate::pgmmsg::stack_target(&job, "*", 1);
+                return Err(anyhow::Error::new(crate::pgmmsg::Escape(m, target)));
+            }
+            // QWCRTVCA (receiver, its length, format RTVC0100, number of
+            // attributes, their keys, error code) (Retrieve Current
+            // Attributes API): the number of attributes returned, then
+            // for each its entry length, key, type of data ('C'), 3
+            // reserved bytes, data length and data. Key 0305 is the
+            // current user profile name, CHAR(10) (RPGUnit's SPLF checks
+            // that length).
+            "QWCRTVCA" => {
+                let [rcv, len, fmt, count, keys, rest @ ..] = locs else {
+                    bail!("QWCRTVCA needs 5 parameters and an error code");
+                };
+                let format = text(self, fmt).trim().to_ascii_uppercase();
+                if format != "RTVC0100" {
+                    return self
+                        .api_error(
+                            rest.first(),
+                            anyhow!("CPF3C21: Format name {format} is not valid."),
+                        )
+                        .map(|_| true);
+                }
+                let n = num(self, count)?.to_i128()?.max(0) as usize;
+                let kb = self.bufs[keys.buf][keys.off..].to_vec();
+                let mut b = Vec::new();
+                b.extend((n as i32).to_be_bytes());
+                for k in 0..n {
+                    let key = kb
+                        .get(4 * k..4 * k + 4)
+                        .map(|x| i32::from_be_bytes(x.try_into().unwrap()))
+                        .unwrap_or(0);
+                    let value = match key {
+                        305 => {
+                            let mut v = data::e(&self.io.user);
+                            v.resize(10, 0x40);
+                            v
+                        }
+                        other => bail!("QWCRTVCA attribute key {other} is not supported"),
+                    };
+                    let total = (16 + value.len()).div_ceil(4) * 4;
+                    let mut e = Vec::with_capacity(total);
+                    e.extend((total as i32).to_be_bytes());
+                    e.extend(key.to_be_bytes());
+                    e.extend(data::e("C"));
+                    e.extend([0u8; 3]);
+                    e.extend((value.len() as i32).to_be_bytes());
+                    e.extend(value);
+                    e.resize(total, 0);
+                    b.extend(e);
+                }
+                let room = (num(self, len)?.to_i128()?.max(0) as usize)
+                    .min(rcv.size)
+                    .min(b.len());
+                self.bufs[rcv.buf][rcv.off..rcv.off + room].copy_from_slice(&b[..room]);
+                self.api_ok(rest.first());
+            }
+            // QGYCLST (request handle, error code) (Close List API): the
+            // list's resources go (a list here keeps none).
+            "QGYCLST" => {
+                let [_handle, rest @ ..] = locs else {
+                    bail!("QGYCLST needs a request handle and an error code");
+                };
+                self.api_ok(rest.first());
+            }
+            // QWVRCSTK (receiver, its length, format CSTK0100, job
+            // identification, format JIDF0100, error code) (Retrieve Call
+            // Stack API): the call stack of this job's thread.
+            "QWVRCSTK" => {
+                let [rcv, len, fmt, jid, jfmt, rest @ ..] = locs else {
+                    bail!("QWVRCSTK needs 5 parameters and an error code");
+                };
+                let format = text(self, fmt).trim().to_ascii_uppercase();
+                if format != "CSTK0100" {
+                    return self
+                        .api_error(
+                            rest.first(),
+                            anyhow!("CPF3C21: Format name {format} is not valid."),
+                        )
+                        .map(|_| true);
+                }
+                let jformat = text(self, jfmt).trim().to_ascii_uppercase();
+                if jformat != "JIDF0100" {
+                    return self
+                        .api_error(
+                            rest.first(),
+                            anyhow!("CPF3C21: Format name {jformat} is not valid."),
+                        )
+                        .map(|_| true);
+                }
+                let job = text(self, jid);
+                if !job.starts_with('*') {
+                    // Another job's call stack is not kept (fidelity-gaps).
+                    bail!("QWVRCSTK of a job other than '*' is not supported");
+                }
+                crate::pgmmsg::stack_line(&self.io.job_key, self.line);
+                let bytes = cstk0100(&crate::pgmmsg::stack(&self.io.job_key));
+                let n = (num(self, len)?.to_i128()?.max(0) as usize).min(rcv.size);
+                let mut out = bytes.clone();
+                // Bytes returned: what fits (whole entries only).
+                let (fit, count) = cstk_fit(&bytes, n);
+                out.truncate(fit);
+                out[0..4].copy_from_slice(&(fit as i32).to_be_bytes());
+                out[16..20].copy_from_slice(&(count as i32).to_be_bytes());
+                if fit < bytes.len() {
+                    out[28] = data::e("I")[0];
+                }
+                let n = n.min(out.len());
+                self.bufs[rcv.buf][rcv.off..rcv.off + n].copy_from_slice(&out[..n]);
+                self.api_ok(rest.first());
             }
             // QMHRMVPM (call stack entry, counter, message key, messages
             // to remove, error code): Remove Program Messages.
@@ -3934,15 +4645,70 @@ impl Machine<'_> {
         // Overrides in effect for this program, and those QCMDEXC makes
         // (OVRDBF), for the programs it calls next.
         job.calls.overrides = ctx.overrides.clone();
+        // QCMDEXC is a call stack entry of its own while the command runs
+        // (a program it calls counts its caller's entries past it).
+        crate::pgmmsg::stack_line(&self.io.job_key, self.line);
+        let qcmdexc = crate::pgmmsg::stack_push(
+            &self.io.job_key,
+            ("QSYS", "QCMDEXC"),
+            "",
+            "",
+            crate::ile::DEFAULT_GROUP,
+        );
         let out = self.io.rt.block_on(job.run(cmd));
+        crate::pgmmsg::stack_pop(&self.io.job_key, qcmdexc);
         if let Some(c) = self.io.cl.as_mut() {
             c.overrides = job.calls.overrides.clone();
         }
         let returned = job.calls.returned.take();
+        let data = job.calls.message_data.take();
         let out = out?;
         if let crate::commands::Outcome::Messages(msgs) = out {
-            for m in msgs {
-                self.job_log(&m);
+            // The command's messages go to the call message queue of the
+            // procedure that ran it (QCMDEXC's caller): the last one is its
+            // completion message, with the command's message data.
+            let target = crate::pgmmsg::stack_target(&self.io.job_key, "*", 0);
+            // What programs the command called showed (DSPLY) is not a
+            // message to this program.
+            let shown = |m: &String| m.starts_with("DSPLY ");
+            let n = msgs.iter().rposition(|m| !shown(m)).map_or(0, |p| p + 1);
+            for (k, m) in msgs.iter().enumerate() {
+                if let (Some(id), false) = (target, shown(m)) {
+                    let msgid = crate::jobs::escape_id(m).to_string();
+                    let text = if msgid.is_empty() {
+                        m.trim_end().to_string()
+                    } else {
+                        m[msgid.len()..].trim_start_matches(':').trim().to_string()
+                    };
+                    let last = k + 1 == n;
+                    let q = crate::pgmmsg::QMsg {
+                        msgf: if msgid.is_empty() {
+                            String::new()
+                        } else {
+                            "QCPFMSG".into()
+                        },
+                        msgflib: if msgid.is_empty() {
+                            String::new()
+                        } else {
+                            "QSYS".into()
+                        },
+                        msgid,
+                        text: text.clone(),
+                        data: if last {
+                            data.clone().unwrap_or_else(|| data::e(&text))
+                        } else {
+                            data::e(&text)
+                        },
+                        ty: if last { "*COMP" } else { "*INFO" }.into(),
+                        sender: crate::pgmmsg::Sender {
+                            pgm: "QCMD".into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    crate::pgmmsg::stack_send(&self.io.job_key, id, q);
+                }
+                self.job_log(m);
             }
         }
         Ok(returned)
@@ -4210,6 +4976,21 @@ impl<'a> Machine<'a> {
                     bail!("{what}: *OMIT is not allowed for parameter {}", p.name);
                 }
                 Arg::Omit
+            } else if p.konst
+                && !p.by_value
+                && self
+                    .array_ref(a)
+                    .is_some_and(|r| r.index.is_none() && r.var.dtype == p.dtype)
+            {
+                // A whole array for an array parameter (CONST DIM(n)): its
+                // elements, by reference.
+                Arg::Ref(self.loc_of(a)?)
+            } else if p.konst && !p.by_value && self.same_type_variable(a, &p.dtype) {
+                // CONST: a variable of the parameter's own type is passed
+                // by reference (ILE RPG Reference, CONST: a temporary is
+                // used only when the value is not of the right type), so
+                // the callee addresses the caller's storage.
+                Arg::Ref(self.loc_of(a)?)
             } else if p.by_value || p.konst {
                 let v = self.eval(a)?;
                 // OPTIONS(*STRING): a character value goes as a pointer to
@@ -4231,10 +5012,30 @@ impl<'a> Machine<'a> {
         Ok(out)
     }
 
+    /// Is the expression a variable (not an expression or a literal) of
+    /// exactly this type?
+    fn same_type_variable(&mut self, a: &Expr, t: &DType) -> bool {
+        if !matches!(
+            a,
+            Expr::Name { args: None, .. } | Expr::Path { args: None, .. }
+        ) {
+            return false;
+        }
+        if matches!(a, Expr::Name { parts, .. } if parts.len() == 1 && parts[0].starts_with('*')) {
+            return false;
+        }
+        match self.loc_of(a) {
+            Ok(l) => l.dtype == *t,
+            Err(_) => false,
+        }
+    }
+
     /// CALLP, or a call in an expression: a procedure of this program, or
     /// a prototype for one or for a program (EXTPGM). Returns the
     /// procedure's return value.
     fn call_named(&mut self, name: &str, args: &[Expr]) -> Result<Option<Value>> {
+        // Where this entry is, for the call stack (QWVRCSTK).
+        crate::pgmmsg::stack_line(&self.io.job_key, self.line);
         let mark = self.temp_strings.len();
         let r = self.call_named_inner(name, args);
         // The OPTIONS(*STRING) copies last as long as the call.
@@ -4306,11 +5107,48 @@ impl<'a> Machine<'a> {
             r?;
             return Ok(None);
         }
-        let target = pr.extproc.clone().unwrap_or_else(|| name.to_string());
+        let target = match &pr.extproc_ptr {
+            // EXTPROC(procedure pointer): the procedure it addresses now.
+            Some(var) => {
+                let (pname, home) = match self.eval(&Expr::name(var))? {
+                    Value::Ptr(p) if p.kind == super::mem::KIND_PROC => super::mem::proc_ref(p.buf)
+                        .ok_or_else(|| anyhow!("MCH3601: procedure pointer {var} is not valid."))?,
+                    Value::Ptr(_) => bail!("MCH3601: {var} is not a procedure pointer."),
+                    _ => bail!("MCH3601: procedure pointer {var} is not set (*NULL)."),
+                };
+                // A procedure of a service program (not this module of
+                // it): called there, in its activation.
+                if let Some((library, sp)) = home {
+                    let (sp, module) = match sp.split_once('/') {
+                        Some((s, m)) => (s.to_string(), Some(m.to_string())),
+                        None => (sp, None),
+                    };
+                    let here = self.current_srvpgm() == Some((library.clone(), sp.clone()))
+                        && module.as_ref().is_none_or(|m| *m == prog.name)
+                        && prog.procs.contains_key(&pname);
+                    if !here {
+                        let a = self.args_for(name, &pr.params, args)?;
+                        return self.call_bound_in(
+                            &pname,
+                            &crate::ile::Target::SrvPgm { library, name: sp },
+                            module.as_deref(),
+                            a,
+                        );
+                    }
+                }
+                pname
+            }
+            None => pr.extproc.clone().unwrap_or_else(|| name.to_string()),
+        };
         match prog.procs.get(&target) {
             Some(pi) => {
                 let a = self.args_for(name, &pr.params, args)?;
                 self.call_proc(pi, a)
+            }
+            None if cee::CEE_APIS.contains(&target.to_ascii_uppercase().as_str()) => {
+                let a = self.args_for(name, &pr.params, args)?;
+                let sym = target.to_ascii_uppercase();
+                self.cee_call(&sym, &a).expect("a CEE API").map(Some)
             }
             None if crt::C_FUNCTIONS.contains(&target.to_ascii_uppercase().as_str()) => {
                 // A C runtime or UNIX-type function. Arguments beyond the
@@ -4318,6 +5156,17 @@ impl<'a> Machine<'a> {
                 let n = args.len().min(pr.params.len());
                 let mut a = self.args_for(name, &pr.params, &args[..n])?;
                 a.truncate(n);
+                // CONST arguments passed by reference: their values (the C
+                // functions take values and pointers).
+                for (x, p) in a.iter_mut().zip(&pr.params) {
+                    if let (Arg::Ref(l), true) = (&*x, p.konst) {
+                        let l = *l;
+                        *x = Arg::Val(data::load(
+                            &l.dtype,
+                            &self.bufs[l.buf][l.off..l.off + l.size],
+                        )?);
+                    }
+                }
                 for x in &args[n..] {
                     a.push(Arg::Val(self.eval(x)?));
                 }
@@ -4354,6 +5203,19 @@ impl<'a> Machine<'a> {
         target: &crate::ile::Target,
         args: Vec<Arg>,
     ) -> Result<Option<Value>> {
+        self.call_bound_in(sym, target, None, args)
+    }
+
+    /// `call_bound`; with `module`, a procedure of that module of the
+    /// service program, exported or not (called through a procedure
+    /// pointer).
+    fn call_bound_in(
+        &mut self,
+        sym: &str,
+        target: &crate::ile::Target,
+        module: Option<&str>,
+        args: Vec<Arg>,
+    ) -> Result<Option<Value>> {
         let client = self.io.client;
         let libl = self.io.libl.clone();
         // Found and compiled at the first call in the activation group
@@ -4362,7 +5224,7 @@ impl<'a> Machine<'a> {
         let bound_key = (
             self.io.job_key.clone(),
             self.io.actgrp.clone(),
-            format!("{}|{:?}|{sym}", self.io.program, target),
+            format!("{}|{:?}|{module:?}|{sym}", self.io.program, target),
         );
         let cached = BOUND
             .lock()
@@ -4372,7 +5234,7 @@ impl<'a> Machine<'a> {
         let (_, unit, binding, prog) = match cached.filter(|c| c.0 == generation) {
             Some(c) => c,
             None => {
-                let mut c = self.resolve_bound(sym, target, client, &libl)?;
+                let mut c = self.resolve_bound(sym, target, module, client, &libl)?;
                 c.0 = generation;
                 if let Ok(mut g) = BOUND.lock() {
                     g.get_or_insert_with(HashMap::new)
@@ -4385,7 +5247,7 @@ impl<'a> Machine<'a> {
         let pi = prog
             .procs
             .get(sym)
-            .filter(|pi| pi.export)
+            .filter(|pi| pi.export || module.is_some())
             .ok_or_else(|| anyhow!("CPD5D02: Module does not export {sym}."))?;
         self.run_bound(sym, target, args, unit, binding, prog, pi)
     }
@@ -4395,6 +5257,7 @@ impl<'a> Machine<'a> {
         &mut self,
         sym: &str,
         target: &crate::ile::Target,
+        module: Option<&str>,
         client: &'a Client,
         libl: &[String],
     ) -> Result<BoundModule> {
@@ -4437,10 +5300,16 @@ impl<'a> Machine<'a> {
                 // The module that exports the procedure.
                 let mut found = None;
                 for m in &b.modules {
+                    if module.is_some_and(|x| x != m.name) {
+                        continue;
+                    }
                     let p = self.block(super::compile_with(
                         client, libl, &m.name, &m.source, &m.options,
                     ))?;
-                    if p.procs.get(sym).is_some_and(|pi| pi.export) {
+                    if p.procs
+                        .get(sym)
+                        .is_some_and(|pi| pi.export || module.is_some())
+                    {
                         found = Some(m.clone());
                         break;
                     }
@@ -4459,7 +5328,11 @@ impl<'a> Machine<'a> {
             &code.source,
             &code.options,
         ))?;
-        if !prog.procs.get(sym).is_some_and(|pi| pi.export) {
+        if !prog
+            .procs
+            .get(sym)
+            .is_some_and(|pi| pi.export || module.is_some())
+        {
             bail!("CPD5D02: Module {} does not export {sym}.", code.name);
         }
         let generation = crate::ile::BINDING_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
@@ -4488,9 +5361,18 @@ impl<'a> Machine<'a> {
         } else {
             self.io.actgrp.clone()
         };
+        // A module of a service program (called from the service program
+        // itself, or from outside it) keeps its storage in the service
+        // program's activation.
+        let act_unit = if srvpgm {
+            Some(unit.clone())
+        } else {
+            self.current_srvpgm()
+                .map(|(l, sp)| format!("{l}/{sp}/{}", prog.name))
+        };
         // The module's global storage: its activation, or its first use.
-        let storage = if srvpgm {
-            crate::ile::activation(&self.io.job_key, &group, &unit)
+        let storage = if let Some(u) = &act_unit {
+            crate::ile::activation(&self.io.job_key, &group, u)
         } else {
             self.io
                 .modules
@@ -4514,7 +5396,7 @@ impl<'a> Machine<'a> {
                 database_url: self.io.database_url.clone(),
                 job_key: self.io.job_key.clone(),
                 binding: Some(binding),
-                unit: srvpgm.then(|| unit.clone()),
+                unit: act_unit.clone(),
                 modules: if srvpgm {
                     Default::default()
                 } else {
@@ -4525,9 +5407,16 @@ impl<'a> Machine<'a> {
                 shared: self.io.shared.clone(),
             },
         );
+        if let Some(u) = &act_unit {
+            m.owner = crate::ile::activation_owner(&self.io.job_key, &group, u);
+        }
         match storage {
             Some(s) => m.bufs.own = s,
-            None => m.user_inz()?,
+            None => {
+                m.user_inz()?;
+                // The module's PSDS, set when it is activated.
+                m.psds_start();
+            }
         }
         // Exported data: the caller's changes go to the shared copy, the
         // callee sees them.
@@ -4535,6 +5424,16 @@ impl<'a> Machine<'a> {
         m.share_seed();
         m.share_in();
         let globals = m.bufs.len();
+        // A service program module calling out: its global storage goes
+        // to its activation first, so a call back into it (through a
+        // procedure pointer) runs on the same storage; what that call
+        // changed comes back after.
+        let reentry = self.io.unit.clone().map(|u| {
+            let n = self.prog.globals.len().min(self.bufs.own.len());
+            let snap = self.bufs.own[..n].to_vec();
+            crate::ile::keep_activation(&self.io.job_key, &self.io.actgrp, &u, snap.clone());
+            (u, snap)
+        });
         // The caller's storage and the heap are lent to the callee for the
         // call: parameters by reference and pointers address them there.
         let k = self.bufs.lent.len();
@@ -4560,12 +5459,16 @@ impl<'a> Machine<'a> {
                 other => other,
             })
             .collect();
-        let sql_key = (self.io.job_key.clone(), group.clone(), unit.clone());
-        if srvpgm {
+        let sql_key = (
+            self.io.job_key.clone(),
+            group.clone(),
+            act_unit.clone().unwrap_or_else(|| unit.clone()),
+        );
+        if act_unit.is_some() {
             m.sql.restore(&sql_key);
         }
         let r = m.call_proc(pi, args);
-        if srvpgm {
+        if act_unit.is_some() {
             m.sql.keep(sql_key);
         }
         m.share_out();
@@ -4573,12 +5476,25 @@ impl<'a> Machine<'a> {
         self.bufs.own = m.bufs.lent.pop().map(|l| l.1).unwrap_or_default();
         self.bufs.lent = std::mem::take(&mut m.bufs.lent);
         self.bufs.heap = std::mem::take(&mut m.bufs.heap);
+        if let Some((u, snap)) = reentry {
+            if let Some(now) = crate::ile::activation(&self.io.job_key, &self.io.actgrp, &u) {
+                for (i, (old, new)) in snap.iter().zip(&now).enumerate() {
+                    if old != new && old.len() == new.len() {
+                        for (j, (o, n)) in old.iter().zip(new).enumerate() {
+                            if o != n {
+                                self.bufs.own[i][j] = *n;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         self.share_in();
         self.messages.append(&mut m.messages);
         self.printed.append(&mut m.printed);
         let kept: Vec<Vec<u8>> = m.bufs.own[..globals].to_vec();
-        if srvpgm {
-            crate::ile::keep_activation(&self.io.job_key, &group, &unit, kept);
+        if let Some(u) = &act_unit {
+            crate::ile::keep_activation(&self.io.job_key, &group, u, kept);
         } else if let Ok(mut g) = self.io.modules.lock() {
             g.insert(unit, kept);
         }
@@ -4598,8 +5514,22 @@ impl<'a> Machine<'a> {
         let mut passed = 0;
         let mut omitted = Vec::new();
         let mut files = HashMap::new();
+        let mut lengths = Vec::new();
         for (i, arg) in args.into_iter().enumerate() {
             let p = &pi.params[i];
+            lengths.push(match &arg {
+                Arg::Ref(l) => Some(match l.dtype {
+                    DType::Varchar(_) => self
+                        .bufs
+                        .get(l.buf)
+                        .and_then(|b| b.get(l.off..l.off + 2))
+                        .map(|x| u16::from_be_bytes([x[0], x[1]]) as usize)
+                        .unwrap_or(0),
+                    _ => l.size,
+                }),
+                Arg::Val(Value::Char(c)) => Some(c.len()),
+                _ => None,
+            });
             match arg {
                 Arg::File(f) => {
                     files.insert(p.name.clone(), f);
@@ -4631,7 +5561,19 @@ impl<'a> Machine<'a> {
             passed,
             omitted,
             files,
+            lengths,
         });
+        let pgm = self.stack_pgm();
+        let lib = self.stack_lib();
+        crate::pgmmsg::stack_line(&self.io.job_key, self.line);
+        let ext = self.external_proc_name(&pi.name);
+        let stack_id = crate::pgmmsg::stack_push(
+            &self.io.job_key,
+            (&lib, &pgm),
+            &self.prog.name,
+            &ext,
+            &self.io.actgrp,
+        );
         let saved_routine = std::mem::replace(&mut self.routine, pi.name.clone());
         let saved_line = self.line;
         let opened = self.open_local_files(pi);
@@ -4675,6 +5617,7 @@ impl<'a> Machine<'a> {
             }
         }
         self.close_local_files(pi);
+        crate::pgmmsg::stack_pop(&self.io.job_key, stack_id);
         self.frames.pop();
         self.bufs.truncate(base);
         self.routine = saved_routine;
@@ -4783,7 +5726,7 @@ impl<'a> Machine<'a> {
             Some(d) => &d.client,
             None => self.io.data.unwrap_or(self.io.client),
         };
-        let fref = self.prog.files[i].fref.clone().unwrap();
+        let fref = self.fref_of(i)?;
         let triggered = match self.files[i].pftrg {
             Some(t) => t,
             None => {
@@ -5018,6 +5961,47 @@ impl<'a> Machine<'a> {
     }
 
     fn call_program(&mut self, name: &str, locs: &[Loc]) -> Result<()> {
+        // A called program sees what this one changed in user spaces
+        // through pointers, and this one sees what it changed.
+        self.spaces_flush()?;
+        crate::pgmmsg::stack_line(&self.io.job_key, self.line);
+        let r = self.call_program_inner(name, locs);
+        self.spaces_reload()?;
+        r
+    }
+
+    /// User spaces this program addresses through pointers, written back.
+    fn spaces_flush(&mut self) -> Result<()> {
+        for (buf, lib, name, len) in self.bufs.heap.spaces.clone() {
+            let data = self.bufs[buf][..len.min(self.bufs[buf].len())].to_vec();
+            self.block(crate::usrspc::put_contents(
+                self.io.client,
+                &lib,
+                &name,
+                &data,
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// User spaces this program addresses, read again (a call may have
+    /// changed them; a deleted one keeps its last bytes).
+    fn spaces_reload(&mut self) -> Result<()> {
+        for (i, (buf, lib, name, _)) in self.bufs.heap.spaces.clone().into_iter().enumerate() {
+            let caller = crate::dtaq::Caller {
+                libl: vec![lib.clone()],
+                ..Default::default()
+            };
+            if let Ok(s) = self.block(crate::usrspc::find(self.io.client, &name, &lib, &caller)) {
+                let data = self.block(crate::usrspc::contents(self.io.client, &s))?;
+                self.bufs.heap.spaces[i].3 = data.len();
+                self.bufs[buf] = space_pages(data, s.initval);
+            }
+        }
+        Ok(())
+    }
+
+    fn call_program_inner(&mut self, name: &str, locs: &[Loc]) -> Result<()> {
         if self.system_program(name, locs)? {
             return Ok(());
         }
@@ -5797,6 +6781,263 @@ fn today_num(name: &str) -> i64 {
     } else {
         (m as i64) * 10_000 + (d as i64) * 100 + (y % 100) as i64
     }
+}
+
+/// The call stack in format CSTK0100 (Retrieve Call Stack API), the
+/// most recent entry first. Header: bytes returned and available, the
+/// number of entries, the offset to the first, the number returned,
+/// thread ID (8) and information status (' ' complete, 'I' incomplete).
+/// Each entry: its length, the displacement to and number of statement
+/// IDs, the displacement to and length of the procedure name, request
+/// level, program and library, MI instruction number, module and
+/// library, control boundary ('1' or '0'), activation group number and
+/// name, ASP names and numbers, then the statement ID and the name.
+/// Statement IDs are the source sequence number with two decimals,
+/// zero-padded to 10 (OPTION(*SRCSTMT); RPGUnit's ASSERTT test expects
+/// '0000008500' for line 85).
+fn cstk0100(stack: &[crate::pgmmsg::Entry]) -> Vec<u8> {
+    const HDR: usize = 32;
+    const FIXED: usize = 128;
+    let field = |s: &str, n: usize| {
+        let mut b = data::e(s);
+        b.resize(n, 0x40);
+        b.truncate(n);
+        b
+    };
+    let i4 = |n: usize| (n as i32).to_be_bytes();
+    // Activation group numbers: the default group 2, others numbered
+    // from 3 as they first appear (fidelity-gaps).
+    let mut groups: Vec<String> = Vec::new();
+    let mut entries = Vec::new();
+    for (i, e) in stack.iter().enumerate().rev() {
+        let default = e.actgrp.is_empty() || e.actgrp == crate::ile::DEFAULT_GROUP;
+        let number = if default {
+            2
+        } else {
+            match groups.iter().position(|g| *g == e.actgrp) {
+                Some(p) => p + 3,
+                None => {
+                    groups.push(e.actgrp.clone());
+                    groups.len() + 2
+                }
+            }
+        };
+        let boundary = i == 0 || stack[i - 1].actgrp != e.actgrp;
+        let stmt = if e.line > 0 {
+            Some(format!("{:010}", e.line * 100))
+        } else {
+            None
+        };
+        let name = data::e(&e.proc);
+        let stmt_len = if stmt.is_some() { 10 } else { 0 };
+        let total = (FIXED + stmt_len + name.len()).div_ceil(4) * 4;
+        let mut b = Vec::with_capacity(total);
+        b.extend(i4(total));
+        b.extend(i4(if stmt.is_some() { FIXED } else { 0 }));
+        b.extend(i4(stmt.is_some() as usize));
+        b.extend(i4(FIXED + stmt_len));
+        b.extend(i4(name.len()));
+        b.extend(i4(0));
+        b.extend(field(&e.pgm, 10));
+        b.extend(field(&e.lib, 10));
+        b.extend(i4(0));
+        b.extend(field(&e.module, 10));
+        b.extend(field(&e.lib, 10));
+        b.extend(field(if boundary { "1" } else { "0" }, 1));
+        b.extend([0u8; 3]);
+        b.extend((number as u32).to_be_bytes());
+        let group = if default {
+            "*DFTACTGRP"
+        } else {
+            e.actgrp.as_str()
+        };
+        b.extend(field(group, 10));
+        b.extend([0u8; 2]);
+        b.extend(field("*SYSBAS", 10));
+        b.extend(field("*SYSBAS", 10));
+        b.extend(i4(1));
+        b.extend(i4(1));
+        b.extend((number as u64).to_be_bytes());
+        b.resize(FIXED, 0);
+        if let Some(s) = stmt {
+            b.extend(field(&s, 10));
+        }
+        b.extend(name);
+        b.resize(total, 0);
+        entries.push(b);
+    }
+    let mut b = Vec::new();
+    let total = HDR + entries.iter().map(|e| e.len()).sum::<usize>();
+    b.extend(i4(total));
+    b.extend(i4(total));
+    b.extend(i4(entries.len()));
+    b.extend(i4(HDR));
+    b.extend(i4(entries.len()));
+    b.extend([0u8; 8]);
+    b.extend(field(" ", 1));
+    b.resize(HDR, 0);
+    for e in entries {
+        b.extend(e);
+    }
+    b
+}
+
+/// How much of a CSTK0100 list fits in `room` bytes: whole entries only;
+/// (bytes, entries).
+fn cstk_fit(b: &[u8], room: usize) -> (usize, usize) {
+    let mut at = 32;
+    let mut n = 0;
+    while at + 4 <= b.len() {
+        let len = i32::from_be_bytes(b[at..at + 4].try_into().unwrap()) as usize;
+        if at + len > room {
+            break;
+        }
+        at += len;
+        n += 1;
+    }
+    (at.min(b.len()), n)
+}
+
+/// A user space's storage as a program addresses it: whole 4096-byte
+/// pages (MI allocates space objects in pages, so a pointer may reach a
+/// little past the size asked for; the bytes past it are the initial
+/// value and are not kept: fidelity-gaps).
+fn space_pages(mut data: Vec<u8>, initval: u8) -> Vec<u8> {
+    let n = data.len().div_ceil(4096).max(1) * 4096;
+    data.resize(n, initval);
+    data
+}
+
+/// A request handle for an open list.
+fn next_list_handle() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The job log messages QGYOLJBL lists, and the fields to return.
+/// Message selection information: list direction (*NEXT or *PRV),
+/// qualified job name ('*': this job), internal job identifier,
+/// starting message key (x'00000000' the oldest, x'FFFFFFFF' the
+/// newest), maximum message and help lengths, offset to and number of
+/// the field identifiers to return, offset to and length of the call
+/// message queue name ('*': all) (Open List of Job Log Messages API).
+fn oljl_select(job: &str, s: &[u8]) -> Result<(Vec<crate::pgmmsg::QMsg>, Vec<i32>)> {
+    let txt = |a: usize, n: usize| -> String {
+        s.get(a..a + n)
+            .map(|b| data::a(b).trim().to_string())
+            .unwrap_or_default()
+    };
+    let i4 = |a: usize| -> i32 {
+        s.get(a..a + 4)
+            .map(|b| i32::from_be_bytes(b.try_into().unwrap()))
+            .unwrap_or(0)
+    };
+    let direction = txt(0, 10).to_ascii_uppercase();
+    let qjob = txt(10, 26);
+    if !qjob.starts_with('*') {
+        bail!("QGYOLJBL of a job other than '*' is not supported");
+    }
+    let start = s.get(52..56).map(|b| b.to_vec()).unwrap_or_default();
+    let fld_off = i4(64).max(0) as usize;
+    let fld_cnt = i4(68).max(0) as usize;
+    let fields: Vec<i32> = (0..fld_cnt).map(|k| i4(fld_off + 4 * k)).collect();
+    let mut msgs = crate::pgmmsg::job_log(job);
+    if direction == "*PRV" {
+        msgs.reverse();
+    }
+    // The starting key: the oldest or newest, or a message's key.
+    if start != [0xFF; 4] && start != [0; 4] {
+        let k = data::a(&start);
+        if let Some(p) = msgs
+            .iter()
+            .position(|m| crate::pgmmsg::key_text(m.key) == k)
+        {
+            msgs.drain(..p);
+        }
+    }
+    Ok((msgs, fields))
+}
+
+/// One job log message in format OLJL0100, at `base` in the receiver
+/// (offsets are from the receiver's start): offset to the next entry,
+/// offset to and number of the fields returned, severity, message ID,
+/// type, key, message file and library, date (CYYMMDD), time and
+/// microseconds sent, thread; then each field: offset to the next,
+/// length of its information, identifier, type of data ('C'), status
+/// (' '), 14 reserved, length of the data, the data.
+fn oljl0100(m: &crate::pgmmsg::QMsg, fields: &[i32], base: usize) -> Vec<u8> {
+    let field = |s: &str, n: usize| {
+        let mut b = data::e(s);
+        b.resize(n, 0x40);
+        b.truncate(n);
+        b
+    };
+    let mut b = Vec::new();
+    b.extend([0u8; 4]);
+    b.extend([0u8; 4]);
+    b.extend((fields.len() as i32).to_be_bytes());
+    b.extend(m.sev.to_be_bytes());
+    b.extend(field(&m.msgid, 7));
+    b.extend(field(crate::pgmmsg::rtntype(&m.ty), 2));
+    b.extend(data::e(&crate::pgmmsg::key_text(m.key)));
+    b.extend(field(&m.msgf, 10));
+    b.extend(field(&m.msgflib, 10));
+    b.extend(field(&m.sent.0, 7));
+    b.extend(field(&m.sent.1, 6));
+    b.extend(field(if m.usec.is_empty() { "000000" } else { &m.usec }, 6));
+    b.extend([0u8; 8]);
+    b.resize(b.len().div_ceil(4) * 4, 0);
+    if !fields.is_empty() {
+        let at = (base + b.len()) as i32;
+        b[4..8].copy_from_slice(&at.to_be_bytes());
+    }
+    for id in fields {
+        let value: Vec<u8> = match id {
+            // Replacement data.
+            201 => m.data.clone(),
+            // Message text, with or without its data replaced.
+            301 | 302 => data::e(&m.text),
+            // Help text.
+            401..=404 => data::e(&m.seclvl),
+            // Sending program, module and procedure names.
+            603 => field(&m.sender.pgm, 12),
+            604 => field(&m.sender.module, 10),
+            605 => data::e(&m.sender.proc),
+            _ => Vec::new(),
+        };
+        let total = (32 + value.len()).div_ceil(4) * 4;
+        let next = base + b.len() + total;
+        let mut f = Vec::with_capacity(total);
+        f.extend((next as i32).to_be_bytes());
+        f.extend((total as i32).to_be_bytes());
+        f.extend(id.to_be_bytes());
+        f.extend(data::e("C"));
+        f.extend(data::e(" "));
+        f.extend([0u8; 14]);
+        f.extend((value.len() as i32).to_be_bytes());
+        f.extend(value);
+        f.resize(total, 0);
+        b.extend(f);
+    }
+    let next = (base + b.len()) as i32;
+    b[0..4].copy_from_slice(&next.to_be_bytes());
+    b
+}
+
+/// A number in character form (%DEC, %INT): blanks, or anything but a
+/// number with an optional sign and decimal point, is an error (status
+/// 00105, ILE RPG Reference; RPGUnit's CMDRUNLOG relies on %INT of
+/// blanks failing).
+fn char_number(t: &str) -> Result<Dec> {
+    if t.trim().is_empty() {
+        bail!("RNQ0105: The character value '{t}' is not a number.");
+    }
+    Dec::parse(t).map_err(|_| {
+        anyhow!(
+            "RNQ0105: The character value '{}' is not a number.",
+            t.trim()
+        )
+    })
 }
 
 #[cfg(test)]

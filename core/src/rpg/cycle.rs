@@ -52,11 +52,38 @@ pub(super) struct Ahead {
 impl Machine<'_> {
     /// A database record as a program-described file sees it: each field
     /// in its stored form, one after another.
+    /// The file a program-described file is over, and its record image's
+    /// layout: as compiled, or (a file not found when the program was
+    /// compiled, opened by EXTFILE) from the file opened.
+    fn described_layout(&self, i: usize) -> Result<(crate::catalog::FileRef, Vec<(DType, usize)>)> {
+        let fi = &self.prog.files[i];
+        if let (Some(f), false) = (&fi.fref, fi.layout.is_empty()) {
+            return Ok((f.clone(), fi.layout.clone()));
+        }
+        let fref = self.files[i]
+            .open
+            .as_ref()
+            .map(|o| o.file.clone())
+            .or_else(|| fi.fref.clone())
+            .ok_or_else(|| anyhow!("file {} is not open", fi.decl.name))?;
+        let mut at = 0usize;
+        let mut layout = Vec::new();
+        for fd in &fref.file.fields {
+            let t = crate::rpg::program::program_type(fd, true, false).unwrap_or(DType::Char(0));
+            layout.push((t, at));
+            at += t.size();
+        }
+        Ok((fref, layout))
+    }
+
     pub(super) fn record_image(&self, i: usize, rec: &Record) -> Result<Vec<u8>> {
         let fi = &self.prog.files[i];
-        let fref = fi.fref.as_ref().unwrap();
+        let (fref, layout) = self.described_layout(i)?;
         let mut img = vec![data::BLANK; fi.record_len];
-        for (fd, (t, off)) in fref.file.fields.iter().zip(&fi.layout) {
+        for (fd, (t, off)) in fref.file.fields.iter().zip(&layout) {
+            if off + t.size() > img.len() {
+                break;
+            }
             let Some(text) = rec.get(&fd.name) else {
                 continue;
             };
@@ -78,10 +105,12 @@ impl Machine<'_> {
 
     /// A record image back into the database record's fields.
     pub(super) fn image_record(&self, i: usize, img: &[u8]) -> Result<Record> {
-        let fi = &self.prog.files[i];
-        let fref = fi.fref.as_ref().unwrap();
+        let (fref, layout) = self.described_layout(i)?;
         let mut rec = Record::new();
-        for (fd, (t, off)) in fref.file.fields.iter().zip(&fi.layout) {
+        for (fd, (t, off)) in fref.file.fields.iter().zip(&layout) {
+            if off + t.size() > img.len() {
+                break;
+            }
             let v = data::load(t, &img[*off..*off + t.size()])?;
             let text = match v {
                 Value::Num(d) => d.rescale(fd.decimals as u8, false)?.to_string(),

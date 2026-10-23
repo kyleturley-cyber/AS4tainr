@@ -11,6 +11,10 @@
 #   the library its SQL scripts name (COM022LIB), then its README's steps
 #   (NXTORDNO, CRTCOMMSG, LOADDATA, COMBNDDIR, the programs bound to it).
 #   Start it with CALL COM022LIB/COMSTART.
+# - RPGUnit (CPL-1.0): its members copied into the source files of
+#   library RPGUNIT (CPYFRMSTMF), built by its own MKMETADATA and
+#   MKRPGUNIT, then its self-test MKRPGUNITT: the sanity check (TESTPGM03
+#   must fail), the unit test suites (MKUT), the acceptance tests.
 #
 #   tools/legacy.sh
 #
@@ -27,6 +31,7 @@ clone() {
 clone https://github.com/ZodandSons/northwind-db2-sql-database.git nwdb
 clone https://github.com/ZodandSons/northwind-ibmi-rpgle-application.git nwapp
 clone https://github.com/ARNAV2684/as400-order-management-modernization.git com
+clone https://github.com/RPGUnit/RPGUnit.git rpgunit
 
 step() {
   echo "== $*"
@@ -75,3 +80,31 @@ done
 "$bin" --libl COM022LIB sql "UPDATE ORDHDR SET STATUS = STATUS WHERE ORDNO = 10001"
 "$bin" --libl COM022LIB sql "SELECT ORDNO, ACTION FROM ORDAUD"
 "$bin" --libl COM022LIB sql "SELECT ORDNO, ACTION, AUDSRC FROM ORDAUDJV"
+
+step "RPGUnit (README: install, then the self-test)"
+"$bin" put "$work/rpgunit" /home/rpgunit >/dev/null
+run "CRTLIB RPGUNIT" | tail -1
+for d in "$work"/rpgunit/*.FILE; do
+  f=$(basename "$d" .FILE)
+  run "CRTSRCPF FILE(RPGUNIT/$f) RCDLEN(112)" >/dev/null
+  for m in "$d"/*.MBR; do
+    n=$(basename "$m" .MBR)
+    run "CPYFRMSTMF FROMSTMF('/home/rpgunit/$f.FILE/$n.MBR') TOMBR('/QSYS.LIB/RPGUNIT.LIB/$f.FILE/$n.MBR') MBROPT(*REPLACE)" >/dev/null
+  done
+done
+run "CRTBNDCL PGM(RPGUNIT/MKMETADATA) SRCFILE(RPGUNIT/RPGUNIT1)" | tail -1
+"$bin" --libl RPGUNIT system "CALL RPGUNIT/MKMETADATA PARM(RPGUNIT)" | tail -1
+run "CRTBNDCL PGM(RPGUNIT/MKRPGUNIT) SRCFILE(RPGUNIT/RPGUNIT1)" | tail -1
+"$bin" --libl RPGUNIT system "CALL RPGUNIT/MKRPGUNIT PARM(RPGUNIT)" | tail -1
+# The fixtures EXTPRCT reads exist already where RPGUnit is developed;
+# its scripts do not build them.
+for n in SRVPGM1 SRVPGM2; do
+  "$bin" --libl RPGUNIT system "CRTRPGMOD MODULE(RPGUNIT/$n) SRCFILE(RPGUNIT/RPGUNITF1)" >/dev/null
+  "$bin" --libl RPGUNIT system "CRTSRVPGM SRVPGM(RPGUNIT/$n) EXPORT(*ALL)" | tail -1
+done
+run "CRTBNDCL PGM(RPGUNIT/MKRPGUNITT) SRCFILE(RPGUNIT/RPGUNITT1)" | tail -1
+# Each suite's result line (Success. / FAILURE. / ERROR.), and how the
+# self-test ended. The acceptance tests read the report's spooled file
+# (docs/fidelity-gaps.md: spooled file APIs).
+"$bin" --libl RPGUNIT system "CALL RPGUNIT/MKRPGUNITT PARM(RPGUNIT)" 2>&1 |
+  grep -E "^DSPLY  (Success|FAILURE|ERROR)|CPF9897|^Error in"

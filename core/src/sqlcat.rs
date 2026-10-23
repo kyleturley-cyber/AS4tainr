@@ -207,10 +207,10 @@ SELECT CAST(s.library AS varchar(128)) COLLATE "C" AS sequence_schema,
   JOIN pg_sequences ps ON ps.schemaname = lower(s.library) AND ps.sequencename = lower(s.name);
 
 -- OUTPUT_QUEUE_ENTRIES_BASIC (IBM i Services): the spooled files. Sizes
--- are the lines' bytes in kilobytes; the output queue's library is QGPL.
+-- are the lines' bytes in kilobytes.
 CREATE OR REPLACE VIEW qsys2.output_queue_entries_basic AS
 SELECT CAST(s.outq AS varchar(10)) COLLATE "C" AS output_queue_name,
-       CAST('QGPL' AS varchar(10)) COLLATE "C" AS output_queue_library_name,
+       CAST(s.outq_lib AS varchar(10)) COLLATE "C" AS output_queue_library_name,
        CAST(s.created AS timestamp) AS create_timestamp,
        CAST(s.file AS varchar(10)) COLLATE "C" AS spooled_file_name,
        CAST(s.user_name AS varchar(10)) COLLATE "C" AS user_name,

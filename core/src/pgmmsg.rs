@@ -37,6 +37,12 @@ pub struct QMsg {
     pub ty: String,
     /// Received with RMV(*NO).
     pub old: bool,
+    /// The program, module and procedure that sent it (RPG programs).
+    pub sender: Sender,
+    /// When it was sent: CYYMMDD and HHMMSS.
+    pub sent: (String, String),
+    /// And the microseconds (6 digits).
+    pub usec: String,
 }
 
 #[derive(Debug, Default)]
@@ -63,6 +69,9 @@ pub struct CallStack {
     /// The printed output (a compiler listing) of the last command, for
     /// the `system` utility to show.
     pub printed: Vec<String>,
+    /// The message data of the last command's completion message, when
+    /// it has some (CRTSRVPGM: the service program and its library).
+    pub message_data: Option<Vec<u8>>,
 }
 
 impl CallStack {
@@ -74,7 +83,8 @@ impl CallStack {
     /// A program ends: its queue and the overrides it made go with it.
     pub fn leave(&mut self) {
         let level = self.stack.len();
-        self.overrides.retain(|o| o.level < level);
+        self.overrides
+            .retain(|o| o.level < level || o.actgrp.is_some());
         self.stack.pop();
     }
 
@@ -364,8 +374,265 @@ pub fn named_messages(job: &str, queue: &str) -> Vec<QMsg> {
         .unwrap_or_default()
 }
 
+/// One call stack entry of the ILE programs a job runs (a program's main
+/// procedure, or a procedure), innermost last, with its call message
+/// queue (ILE Concepts, "Call stack"; the message handling APIs address
+/// queues by call stack entry and counter).
+#[derive(Debug, Clone, Default)]
+pub struct Entry {
+    pub id: u64,
+    /// The program or service program the procedure is in.
+    pub pgm: String,
+    pub module: String,
+    pub proc: String,
+    /// Its activation group: a change marks a control boundary.
+    pub actgrp: String,
+    pub queue: Vec<QMsg>,
+    /// The library of the program or service program.
+    pub lib: String,
+    /// The source line the procedure is running (where it called the
+    /// next entry); 0 when not known.
+    pub line: usize,
+}
+
+/// The job log as the list APIs see it (QGYOLJBL): every message sent
+/// to a call stack entry, oldest first.
+static JOBLOG: std::sync::Mutex<Option<HashMap<String, Vec<QMsg>>>> = std::sync::Mutex::new(None);
+
+/// The job's logged messages, oldest first.
+pub fn job_log(job: &str) -> Vec<QMsg> {
+    JOBLOG
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(job).cloned()))
+        .unwrap_or_default()
+}
+
+static STACKS: std::sync::Mutex<Option<HashMap<String, Vec<Entry>>>> = std::sync::Mutex::new(None);
+static ENTRY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn with_stack<R>(job: &str, f: impl FnOnce(&mut Vec<Entry>) -> R) -> R {
+    let mut g = STACKS.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(HashMap::new)
+        .entry(job.to_string())
+        .or_default())
+}
+
+/// A procedure starts: its call stack entry.
+pub fn stack_push(
+    job: &str,
+    (lib, pgm): (&str, &str),
+    module: &str,
+    proc: &str,
+    actgrp: &str,
+) -> u64 {
+    let id = ENTRY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    with_stack(job, |s| {
+        s.push(Entry {
+            id,
+            lib: lib.to_string(),
+            line: 0,
+            pgm: pgm.to_string(),
+            module: module.to_string(),
+            proc: proc.to_string(),
+            actgrp: actgrp.to_string(),
+            queue: Vec::new(),
+        })
+    });
+    id
+}
+
+/// A procedure ended: its entry (and any above it) and their queues go.
+pub fn stack_pop(job: &str, id: u64) {
+    with_stack(job, |s| {
+        if let Some(i) = s.iter().position(|e| e.id == id) {
+            s.truncate(i);
+        }
+    });
+}
+
+/// The entries, innermost last.
+pub fn stack(job: &str) -> Vec<Entry> {
+    with_stack(job, |s| s.clone())
+}
+
+/// The program of the innermost entry.
+/// The activation group of the running procedure (None: no RPG
+/// procedure is running).
+pub fn stack_actgrp(job: &str) -> Option<String> {
+    with_stack(job, |s| s.last().map(|e| e.actgrp.clone()))
+}
+
+/// The running procedure is at a source line (it calls another).
+pub fn stack_line(job: &str, line: usize) {
+    with_stack(job, |s| {
+        if let Some(e) = s.last_mut() {
+            e.line = line;
+        }
+    })
+}
+
+pub fn stack_top_pgm(job: &str) -> Option<String> {
+    with_stack(job, |s| s.last().map(|e| e.pgm.clone()))
+}
+
+/// The entry a message API names (QMHSNDPM, QMHRCVPM call stack entry
+/// and counter): `*` the current one, `*PGMBDY` the first entry of the
+/// current program, `*CTLBDY` the first of the current activation group,
+/// or a procedure or program name (the innermost such entry); then
+/// `counter` entries toward the caller. None: an entry above the RPG
+/// programs (a CL program, a command line).
+pub fn stack_target(job: &str, entry: &str, counter: usize) -> Option<u64> {
+    with_stack(job, |s| {
+        let top = s.len().checked_sub(1)?;
+        let e = entry.trim().to_ascii_uppercase();
+        let base = match e.as_str() {
+            "*" | "" => top,
+            "*PGMBDY" => {
+                let pgm = &s[top].pgm;
+                let mut i = top;
+                while i > 0 && s[i - 1].pgm == *pgm {
+                    i -= 1;
+                }
+                i
+            }
+            "*CTLBDY" => {
+                let g = &s[top].actgrp;
+                let mut i = top;
+                while i > 0 && s[i - 1].actgrp == *g {
+                    i -= 1;
+                }
+                i
+            }
+            // Procedure names as exported ('assert', or in capitals);
+            // matched ignoring case (fidelity-gaps: QMHSNDPM entry names).
+            name => s.iter().rposition(|x| {
+                x.proc.eq_ignore_ascii_case(name) || x.pgm.eq_ignore_ascii_case(name)
+            })?,
+        };
+        base.checked_sub(counter).map(|i| s[i].id)
+    })
+}
+
+/// Put a message on an entry's queue; its key.
+pub fn stack_send(job: &str, id: u64, mut m: QMsg) -> Option<u32> {
+    let key = NAMED_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    m.key = key;
+    if m.sent.0.is_empty() {
+        let ((y, mo, d), (h, mi, sec), us) = crate::rpg::dates::now();
+        m.sent = (
+            format!("{}{:02}{mo:02}{d:02}", u8::from(y >= 2000), y % 100),
+            format!("{h:02}{mi:02}{sec:02}"),
+        );
+        m.usec = format!("{us:06}");
+    }
+    // Messages on call message queues are in the job log too.
+    if let Ok(mut g) = JOBLOG.lock() {
+        g.get_or_insert_with(HashMap::new)
+            .entry(job.to_string())
+            .or_default()
+            .push(m.clone());
+    }
+    with_stack(job, |s| {
+        let mut i = s.iter().position(|e| e.id == id)?;
+        // QCMDEXC keeps no messages: those sent to it go to its caller
+        // (a command processing program's completion message reaches
+        // the program that ran the command).
+        while i > 0 && s[i].lib == "QSYS" && s[i].pgm == "QCMDEXC" {
+            i -= 1;
+        }
+        s[i].queue.push(m);
+        Some(key)
+    })
+}
+
+/// Receive a message from an entry's queue (QMHRCVPM message type, key
+/// and action *OLD, *REMOVE or *SAME), with the entry it is on.
+pub fn stack_receive(
+    job: &str,
+    id: u64,
+    msgtype: &str,
+    key: Option<u32>,
+    action: &str,
+) -> Option<QMsg> {
+    with_stack(job, |s| {
+        let e = s.iter_mut().find(|e| e.id == id)?;
+        let i = select(&e.queue, msgtype, key)?;
+        match action {
+            "*REMOVE" => Some(e.queue.remove(i)),
+            "*SAME" => Some(e.queue[i].clone()),
+            _ => {
+                e.queue[i].old = true;
+                Some(e.queue[i].clone())
+            }
+        }
+    })
+}
+
+/// The entry with this id.
+pub fn stack_entry(job: &str, id: u64) -> Option<Entry> {
+    with_stack(job, |s| s.iter().find(|e| e.id == id).cloned())
+}
+
+/// An escape message as an error: its text is "ID: text"; the message
+/// itself (data, sender) goes with it to the procedure that handles it.
+#[derive(Debug, Clone)]
+pub struct Escape(pub QMsg, pub Option<u64>);
+
+impl Escape {
+    /// Whether the procedure of call stack entry `current` lets the
+    /// escape message pass: it was sent to an entry nearer the start of
+    /// the stack (still there), so the entries above it end without
+    /// handling it (Send Program Message API, *ESCAPE).
+    pub fn passes(&self, job: &str, current: Option<u64>) -> bool {
+        match (self.1, current) {
+            (Some(t), Some(c)) if t != c => with_stack(job, |s| s.iter().any(|e| e.id == t)),
+            _ => false,
+        }
+    }
+}
+
+/// The running procedure's call stack entry.
+pub fn stack_top_id(job: &str) -> Option<u64> {
+    with_stack(job, |s| s.last().map(|e| e.id))
+}
+
+/// Who sent a message: program, module, procedure.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sender {
+    pub pgm: String,
+    pub module: String,
+    pub proc: String,
+    /// The source line of the statement that sent it (0: not known).
+    pub line: usize,
+}
+
+impl std::fmt::Display for Escape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let id = if self.0.msgid.is_empty() {
+            "CPF9898"
+        } else {
+            &self.0.msgid
+        };
+        write!(f, "{id}: {}", self.0.text)
+    }
+}
+
+impl std::error::Error for Escape {}
+
 /// The job ended: its named queues go.
 pub fn named_end_job(job: &str) {
+    crate::ovr::end_job(job);
+    if let Ok(mut g) = JOBLOG.lock() {
+        if let Some(m) = g.as_mut() {
+            m.remove(job);
+        }
+    }
+    if let Ok(mut g) = STACKS.lock() {
+        if let Some(m) = g.as_mut() {
+            m.remove(job);
+        }
+    }
     if let Ok(mut g) = NAMED.lock() {
         if let Some(m) = g.as_mut() {
             m.retain(|(j, _), _| j != job);

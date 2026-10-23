@@ -4,7 +4,7 @@
 //! fails only when it runs, as before.
 //!
 //! Source: IBM i documentation, "IBM i commands" (the operating system's
-//! commands, 5770-SS1, by name), plus the compiler, SQL, TCP/IP mail and
+//! commands, 5770-SS1, by name), plus the compiler, SQL, TCP/IP (FTP, TELNET, LPR...), mail and
 //! application development commands of other licensed programs.
 
 /// IBM i command names, sorted.
@@ -239,6 +239,7 @@ pub static NAMES: &[&str] = &[
     "CHGFCNUSG",
     "CHGFNTRSC",
     "CHGFNTTBLE",
+    "CHGFTPA",
     "CHGFTR",
     "CHGGRPA",
     "CHGHLLPTR",
@@ -384,6 +385,7 @@ pub static NAMES: &[&str] = &[
     "CHGTCPIFC",
     "CHGTCPRTE",
     "CHGTCPSVR",
+    "CHGTELNA",
     "CHGTFTPA",
     "CHGTIMZON",
     "CHGUSRAUD",
@@ -1021,6 +1023,7 @@ pub static NAMES: &[&str] = &[
     "EXTPGMINF",
     "FILDOC",
     "FMTDTA",
+    "FTP",
     "GENCAT",
     "GENCKMKSFE",
     "GENCMDDOC",
@@ -1065,6 +1068,7 @@ pub static NAMES: &[&str] = &[
     "LODPTF",
     "LODQSTDB",
     "LODRUN",
+    "LPR",
     "MD",
     "MKDIR",
     "MONMSG",
@@ -1403,6 +1407,7 @@ pub static NAMES: &[&str] = &[
     "SNDRPY",
     "SNDSMTPEMM",
     "SNDSRVRQS",
+    "SNDTCPSPLF",
     "SNDTIEF",
     "SNDUSRMSG",
     "STATFS",
@@ -1481,14 +1486,17 @@ pub static NAMES: &[&str] = &[
     "STRSRVJOB",
     "STRSST",
     "STRTCP",
+    "STRTCPFTP",
     "STRTCPIFC",
     "STRTCPPTP",
     "STRTCPSVR",
+    "STRTCPTELN",
     "STRTIESSN",
     "STRTRC",
     "STRTRPMGR",
     "STRWCH",
     "SUBR",
+    "TELNET",
     "TFRBCHJOB",
     "TFRCTL",
     "TFRGRPJOB",

@@ -921,8 +921,12 @@ pub fn parse_create(sql: &str) -> Result<Option<(bool, Routine)>> {
                 p.i += 1;
                 let _ = p.qualified()?;
             }
-            "DYNAMIC" => {
-                p.i += 1;
+            // [DYNAMIC] RESULT SETS n (IBM's company_system sample writes
+            // RESULT SETS 0 without DYNAMIC).
+            "DYNAMIC" | "RESULT" => {
+                if p.word().as_deref() == Some("DYNAMIC") {
+                    p.i += 1;
+                }
                 p.expect("RESULT")?;
                 p.expect("SETS")?;
                 p.skip();
@@ -1422,10 +1426,11 @@ impl<'a, 'e> Run<'a, 'e> {
             }
             None
         };
+        let columns = column_positions(&toks);
         let mut i = 0;
         while i < toks.len() {
             let t = &toks[i];
-            if let Tok::Word(w) = t {
+            if let (Tok::Word(w), false) = (t, columns.contains(&i)) {
                 let up = w.to_ascii_uppercase();
                 let prev = sig(i, -1);
                 let next = sig(i, 1);
@@ -2127,6 +2132,89 @@ impl<'a, 'e> Run<'a, 'e> {
 
 /// `SELECT a, b INTO x, y FROM ...` → (`SELECT a, b FROM ...`, [x, y]);
 /// `VALUES expr INTO x` likewise. None: no INTO.
+/// Names that can only be columns, never SQL variables (Db2 for i SQL
+/// Reference, INSERT and UPDATE): the column list of INSERT INTO t (c1,
+/// c2...) and the targets of UPDATE ... SET c1 = ..., c2 = ....
+fn column_positions(toks: &[Tok]) -> Vec<usize> {
+    let words: Vec<(usize, String)> = toks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !matches!(t, Tok::Space(_)))
+        .map(|(j, t)| {
+            (
+                j,
+                match t {
+                    Tok::Word(w) => w.to_ascii_uppercase(),
+                    Tok::Punct(p) => p.clone(),
+                    _ => String::new(),
+                },
+            )
+        })
+        .collect();
+    let mut cols = Vec::new();
+    let first = words.first().map(|(_, w)| w.as_str());
+    if first == Some("INSERT") {
+        // INSERT INTO name [.name] ( columns )
+        let mut k = 1;
+        if words.get(k).is_some_and(|(_, w)| w == "INTO") {
+            k += 1;
+        }
+        k += 1;
+        while words.get(k).is_some_and(|(_, w)| w == "." || w == "/") {
+            k += 2;
+        }
+        if words.get(k).is_some_and(|(_, w)| w == "(")
+            && !words
+                .get(k + 1)
+                .is_some_and(|(_, w)| w == "SELECT" || w == "VALUES" || w == "WITH")
+        {
+            let mut depth = 0;
+            for (j, w) in &words[k..] {
+                match w.as_str() {
+                    "(" => depth += 1,
+                    ")" => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ if depth == 1 => cols.push(*j),
+                    _ => {}
+                }
+            }
+        }
+    } else if first == Some("UPDATE") {
+        // SET c = ..., c = ... at the statement's top level.
+        let mut depth = 0;
+        let mut in_set = false;
+        let mut target = false;
+        for (j, w) in &words {
+            match w.as_str() {
+                "(" => depth += 1,
+                ")" => depth -= 1,
+                "SET" if depth == 0 => {
+                    in_set = true;
+                    target = true;
+                    continue;
+                }
+                "WHERE" if depth == 0 => in_set = false,
+                "," if depth == 0 && in_set => {
+                    target = true;
+                    continue;
+                }
+                _ => {}
+            }
+            if target && in_set && depth == 0 && !w.is_empty() && w != "=" {
+                cols.push(*j);
+            }
+            if w == "=" || w == "(" {
+                target = false;
+            }
+        }
+    }
+    cols
+}
+
 fn split_into(text: &str) -> Result<Option<(String, Vec<String>)>> {
     let toks = tokenize(text)?;
     let mut depth = 0;

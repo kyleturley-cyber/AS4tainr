@@ -846,6 +846,19 @@ impl Machine<'_> {
     /// A record read into a result data structure: each field into the
     /// subfield of its name.
     pub(super) fn record_to_ds(&mut self, i: usize, rec: &Record, ds: &str) -> Result<()> {
+        // A program-described file: the record image into the data
+        // structure, byte for byte (ILE RPG Reference, result data
+        // structure for a program-described file).
+        if self.prog.files[i].program_described {
+            let img = self.record_image(i, rec)?;
+            let Some(Sym::Ds(d)) = self.sym(ds) else {
+                bail!("{ds} is not a data structure");
+            };
+            let n = img.len().min(d.size);
+            self.bufs[d.buf][d.off..d.off + n].copy_from_slice(&img[..n]);
+            self.files[i].image = Some(img);
+            return Ok(());
+        }
         let members = self.ds_members(ds)?;
         let fi = self.prog.files[i].clone();
         let fref = fi
@@ -877,6 +890,15 @@ impl Machine<'_> {
 
     /// A record to write or update from a data structure's subfields.
     pub(super) fn ds_to_record(&mut self, i: usize, ds: &str) -> Result<Record> {
+        if self.prog.files[i].program_described {
+            let Some(Sym::Ds(d)) = self.sym(ds) else {
+                bail!("{ds} is not a data structure");
+            };
+            let mut img = vec![data::BLANK; self.prog.files[i].record_len];
+            let n = img.len().min(d.size);
+            img[..n].copy_from_slice(&self.bufs[d.buf][d.off..d.off + n]);
+            return self.image_record(i, &img);
+        }
         let members = self.ds_members(ds)?;
         let fi = self.prog.files[i].clone();
         let fref = fi

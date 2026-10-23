@@ -64,6 +64,43 @@ pub struct ListDisplay {
     /// A completion message the command sends when it prints its report
     /// (DSPMSGD: CPC9802), before the report.
     pub print_msg: Option<String>,
+    /// Shown in the Display Spooled File viewer instead (DSPSPLF; DSPFD
+    /// and DSPFFD on a display, whose report IBM i shows there).
+    pub spool: Option<Box<SpoolView>>,
+}
+
+/// What the Display Spooled File viewer shows: the file's name and its
+/// lines with their page and line numbers.
+#[derive(Debug, Clone, Default)]
+pub struct SpoolView {
+    pub file: String,
+    /// (page, line, text).
+    pub lines: Vec<(usize, usize, String)>,
+    /// The record width (132 for IBM's printer files QSYSPRT, QPDSPFD...).
+    pub width: usize,
+}
+
+impl SpoolView {
+    /// Lines on pages (as `spool::pages` gives them).
+    pub fn of_pages(file: &str, pages: &[Vec<String>]) -> SpoolView {
+        let mut lines = Vec::new();
+        for (p, page) in pages.iter().enumerate() {
+            for (l, t) in page.iter().enumerate() {
+                lines.push((p + 1, l + 1, t.clone()));
+            }
+        }
+        let width = lines
+            .iter()
+            .map(|(_, _, t)| t.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(132);
+        SpoolView {
+            file: file.to_string(),
+            lines,
+            width,
+        }
+    }
 }
 
 /// How IBM i 7.5 lays out a list display (observed on PUB400: DSPLIB,
@@ -101,6 +138,44 @@ pub struct IbmLayout {
     pub system_row1: bool,
     /// No blank line between the options and the headings (WRKACTJOB).
     pub tight: bool,
+    /// The title's column, when IBM i does not center it (PDM).
+    pub title_col: Option<u8>,
+    /// The system name alone on line 1 from this column (PDM).
+    pub system_col1: Option<u8>,
+    /// Input fields on the header lines (PDM's file, library and "Position
+    /// to"), with their values.
+    pub header_fields: Vec<HeaderField>,
+    /// The header field whose value positions the list at the first row
+    /// whose name (first word) is not lower.
+    pub position_field: Option<String>,
+    /// The command that shows the list for other header field values:
+    /// `{NAME}` is the value of header field NAME.
+    pub reload: Option<String>,
+    /// The option lines as IBM i lays them out (from column 2), one set
+    /// per F23 press; empty: the options joined three blanks apart.
+    pub option_text: Vec<Vec<String>>,
+    /// The function key lines (from column 2); empty: the usual keys.
+    pub key_text: Vec<String>,
+    /// Commands of options for one row (by row): (option, command). An
+    /// option in `options` that a row's list lacks is not valid for it
+    /// when the list is not empty.
+    pub row_options: Vec<Vec<(u8, String)>>,
+    /// Option 4 asks for a confirmation first (PDM).
+    pub confirm_delete: bool,
+    /// The cursor starts in the first row's option field.
+    pub cursor_on_list: bool,
+    /// The row shown first (WRKMSGD MSGID).
+    pub start_at: usize,
+}
+
+/// An input field on a list display's header lines.
+#[derive(Debug, Clone, Default)]
+pub struct HeaderField {
+    pub name: String,
+    pub row: u8,
+    pub col: u8,
+    pub len: u16,
+    pub value: String,
 }
 
 impl IbmLayout {
@@ -220,6 +295,12 @@ impl Job<'_> {
         if let Some(o) = self.save_command(&cmd).await? {
             return Ok(o);
         }
+        if let Some(o) = self.outq_command(&cmd).await? {
+            return Ok(o);
+        }
+        if let Some(o) = self.pdm_command(&cmd).await? {
+            return Ok(o);
+        }
         if let Some(o) = self.objdesc_command(&cmd).await? {
             return Ok(o);
         }
@@ -248,6 +329,8 @@ impl Job<'_> {
             "CRTMNU" => self.crtmnu(&cmd).await,
             "CRTCMD" => self.crtcmd(&cmd).await,
             "DLTCMD" => self.dltcmd(&cmd).await,
+            "CRTPNLGRP" => self.crtpnlgrp(&cmd).await,
+            "DLTPNLGRP" => self.dltpnlgrp(&cmd).await,
             "DSPCMD" => self.dspcmd(&cmd).await,
             "CRTMSGF" => self.crtmsgf(&cmd).await,
             "OVRDBF" => self.override_file(&cmd, crate::ovr::Kind::Db),
@@ -320,6 +403,8 @@ impl Job<'_> {
             "CHGDTAARA" => self.chgdtaara(&cmd).await,
             "DSPDTAARA" => self.dspdtaara(&cmd).await,
             "DLTDTAARA" => self.dltdtaara(&cmd).await,
+            "CRTDTAQ" => self.crtdtaq(&cmd).await,
+            "DLTDTAQ" => self.dltdtaq(&cmd).await,
             "CHKOBJ" => {
                 self.chkobj(
                     cmd.get("OBJ"),
@@ -502,6 +587,7 @@ impl Job<'_> {
                 ..Default::default()
             }),
             print_msg: None,
+            spool: None,
         }))
     }
 
@@ -1287,6 +1373,12 @@ impl Job<'_> {
         let mut c = runtime::connect_db(&self.env.database_url).await?;
         crate::ile::store(&mut c, &lib, &name, "*SRVPGM", "RPGLE", &text, &json, "").await?;
         authority::set_owner(self.client, &lib, &name, "*SRVPGM", &self.user).await?;
+        // The completion message's data: the service program and its
+        // library (RPGUnit's RUCRTTST reads them; the message ID is not
+        // known without a capture, docs/fidelity-gaps.md).
+        let mut data = crate::rpg::data::e(&format!("{name:<10}{lib:<10}"));
+        data.truncate(20);
+        self.calls.message_data = Some(data);
         Ok(Outcome::Messages(vec![format!(
             "Service program {name} created in library {lib}."
         )]))
@@ -1527,7 +1619,11 @@ impl Job<'_> {
             bail!("CPF2189: Not authorized to delete file {name} in library {lib}.");
         }
         if crate::source::is_source_file(self.client, &lib, &name).await? {
-            bail!("CPF2105: File {name} in library {lib} is a source file; deleting source files is not supported yet.");
+            crate::source::delete_file(self.client, &lib, &name).await?;
+            authority::forget(self.client, &lib, &name, "*FILE").await?;
+            return Ok(Outcome::Messages(vec![format!(
+                "CPC2191: Object {name} of type *FILE in library {lib} was deleted."
+            )]));
         }
         if crate::save::is_save_file(self.client, &lib, &name).await? {
             crate::save::delete_save_file(self.client, &lib, &name).await?;
@@ -1572,6 +1668,10 @@ impl Job<'_> {
                 lib.to_string()
             }
         };
+        let outq = cmd.get("OUTQ").to_ascii_uppercase();
+        if !outq.is_empty() && outq != "*WRKSTN" {
+            crate::outq::find_queue(self.client, &outq, &self.library_list()).await?;
+        }
         users::create(
             self.client,
             users::NewProfile {
@@ -1588,6 +1688,9 @@ impl Job<'_> {
             },
         )
         .await?;
+        if !outq.is_empty() {
+            crate::outq::set_user_outq(self.client, &name, &outq, &self.library_list()).await?;
+        }
         Ok(Outcome::Messages(vec![format!(
             "User profile {name} created."
         )]))
@@ -1682,8 +1785,15 @@ impl Job<'_> {
             inlpgm: same("INLPGM"),
             inlmnu: same("INLMNU"),
         };
+        let outq = cmd.get("OUTQ").to_ascii_uppercase();
+        if !outq.is_empty() && outq != "*SAME" && outq != "*WRKSTN" {
+            crate::outq::find_queue(self.client, &outq, &self.library_list()).await?;
+        }
         if !users::change(self.client, &name, &changes).await? {
             bail!("CPF2204: User profile {name} not found.");
+        }
+        if !outq.is_empty() && outq != "*SAME" {
+            crate::outq::set_user_outq(self.client, &name, &outq, &self.library_list()).await?;
         }
         Ok(Outcome::Messages(vec![format!(
             "User profile {name} changed."
@@ -1815,9 +1925,10 @@ impl Job<'_> {
 
     async fn crtsrcpf(&mut self, cmd: &Command) -> Result<Outcome> {
         let (lib, name) = self.create_target(cmd.get("FILE"));
-        number(cmd.get("RCDLEN"), "RCDLEN")?;
+        let rcdlen = number(cmd.get("RCDLEN"), "RCDLEN")?;
         crate::source::create_file(self.client, &lib, &name, cmd.get("TEXT")).await?;
         let name = name.to_ascii_uppercase();
+        crate::source::set_record_length(self.client, &lib, &name, rcdlen as i32).await?;
         authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
         Ok(Outcome::Messages(vec![format!(
             "CPC7301: File {name} was created in library {lib}."
@@ -2427,6 +2538,18 @@ impl Job<'_> {
                     .into_iter()
                     .filter(|d| d != "*NONE")
                     .collect();
+                // CRTSQLRPGI passes COMPILEOPT's options to the compiler
+                // (BNDDIR, DFTACTGRP...: CL reference, CRTSQLRPGI).
+                let compileopt = if cmd.def.name == "CRTSQLRPGI" {
+                    cmd.get("COMPILEOPT").to_ascii_uppercase()
+                } else {
+                    String::new()
+                };
+                dirs.extend(
+                    option_values(&compileopt, "BNDDIR")
+                        .into_iter()
+                        .filter(|d| d != "*NONE"),
+                );
                 if let Some(k) = crate::rpg::ast::keyword(&prog.control, "BNDDIR") {
                     dirs.extend(
                         k.args
@@ -2440,6 +2563,9 @@ impl Job<'_> {
                 let dft = match ctl("DFTACTGRP").and_then(|k| k.args.first()) {
                     Some(a) => a.trim().eq_ignore_ascii_case("*YES"),
                     None if ctl("BNDDIR").is_some() || ctl("ACTGRP").is_some() => false,
+                    None if !option_values(&compileopt, "DFTACTGRP").is_empty() => {
+                        option_values(&compileopt, "DFTACTGRP")[0] == "*YES"
+                    }
                     None => cmd.def.name == "CRTBNDRPG" && cmd.get("DFTACTGRP") == "*YES",
                 };
                 if dft {
@@ -2955,7 +3081,7 @@ impl Job<'_> {
     /// the job has an identity, and kept for `system` to show.
     async fn print_listing(&mut self, name: &str, lines: Vec<String>) -> Result<()> {
         if let Some(id) = self.id.clone() {
-            crate::spool::print_lines(self.client, &id, name, "", &lines).await?;
+            crate::spool::print_report(self.client, &id, name, "", &lines).await?;
         }
         self.calls.printed = lines;
         Ok(())
@@ -3289,6 +3415,64 @@ impl Job<'_> {
         )]))
     }
 
+    /// CRTPNLGRP: a panel group (UIM help and panels) from its source
+    /// member. as4tainr keeps the source with the object (it does not
+    /// show UIM help yet: docs/fidelity-gaps.md).
+    async fn crtpnlgrp(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = self.create_target(cmd.get("PNLGRP"));
+        let (lib, name) = (lib.to_ascii_uppercase(), name.to_ascii_uppercase());
+        let (libs, file) = self.search(cmd.get("SRCFILE"));
+        let mbr = match cmd.get("SRCMBR").to_ascii_uppercase().as_str() {
+            "*PNLGRP" | "" => name.clone(),
+            m => m.to_string(),
+        };
+        let m = crate::source::find_member(self.client, &libs, &file.to_ascii_uppercase(), &mbr)
+            .await?;
+        if !catalog::library_exists(self.client, &lib).await? {
+            bail!("CPF2110: Library {lib} not found.");
+        }
+        let text = match cmd.get("TEXT") {
+            "*SRCMBRTXT" => m.text.clone(),
+            "*BLANK" => String::new(),
+            t => t.to_string(),
+        };
+        self.client
+            .execute(
+                "INSERT INTO as4tainr.objects (library, name, objtype, attribute, text)
+                 VALUES ($1, $2, '*PNLGRP', 'UIM', $3)
+                 ON CONFLICT (library, name, objtype) DO UPDATE SET text = EXCLUDED.text",
+                &[&lib, &name, &text],
+            )
+            .await?;
+        authority::set_owner(self.client, &lib, &name, "*PNLGRP", &self.user).await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Panel group {name} created in library {lib}."
+        )]))
+    }
+
+    async fn dltpnlgrp(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (libs, name) = self.search(cmd.get("PNLGRP"));
+        let name = name.to_ascii_uppercase();
+        for l in &libs {
+            if catalog::object_exists(self.client, std::slice::from_ref(l), &name, "*PNLGRP")
+                .await?
+            {
+                authority::check(self.client, &self.user, l, &name, "*PNLGRP", Aut::All).await?;
+                self.client
+                    .execute(
+                        "DELETE FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype='*PNLGRP'",
+                        &[l, &name],
+                    )
+                    .await?;
+                authority::forget(self.client, l, &name, "*PNLGRP").await?;
+                return Ok(Outcome::Messages(vec![format!(
+                    "CPC2191: Object {name} of type *PNLGRP in library {l} was deleted."
+                )]));
+            }
+        }
+        bail!("CPF2105: Object {name} of type *PNLGRP in library *LIBL not found.")
+    }
+
     /// DSPCMD: what a command runs and its parameters.
     async fn dspcmd(&mut self, cmd: &Command) -> Result<Outcome> {
         let (libs, name) = self.search(cmd.get("CMD"));
@@ -3429,6 +3613,11 @@ impl Job<'_> {
         } else {
             self.calls.level()
         };
+        let actgrp = match cmd.get("OVRSCOPE") {
+            "*ACTGRPDFN" | "" => self.named_actgrp(),
+            _ => None,
+        };
+        crate::ovr::merge_scoped(&self.job_key(), &mut self.calls.overrides);
         crate::ovr::add(
             &mut self.calls.overrides,
             crate::ovr::Override {
@@ -3439,9 +3628,22 @@ impl Job<'_> {
                 pagesize,
                 ovrflw: num("OVRFLW")?,
                 no_lvlchk: cmd.get("LVLCHK") == "*NO",
+                actgrp,
             },
         );
+        crate::ovr::save_scoped(&self.job_key(), &self.calls.overrides);
         Ok(Outcome::Messages(vec![]))
+    }
+
+    /// The non-default activation group of the RPG procedure running the
+    /// command (through QCMDEXC), if any.
+    fn named_actgrp(&self) -> Option<String> {
+        crate::pgmmsg::stack(&self.job_key())
+            .iter()
+            .rev()
+            .find(|e| !(e.lib == "QSYS" && e.pgm == "QCMDEXC"))
+            .map(|e| e.actgrp.clone())
+            .filter(|g| !g.is_empty() && g != crate::ile::DEFAULT_GROUP)
     }
 
     /// DLTOVR: overrides of the current call level (LVL(*JOB): those for
@@ -3452,16 +3654,28 @@ impl Job<'_> {
         } else {
             self.calls.level()
         };
+        // LVL(*) or *ACTGRPDFN in a non-default activation group: the
+        // overrides scoped to that activation group (DLTOVR, LVL).
+        let actgrp = match cmd.get("LVL") {
+            "*" | "*ACTGRPDFN" | "" => self.named_actgrp(),
+            _ => None,
+        };
         let files = cmd.list("FILE");
+        crate::ovr::merge_scoped(&self.job_key(), &mut self.calls.overrides);
         let before = self.calls.overrides.len();
         self.calls.overrides.retain(|o| {
-            o.level != level
+            let here = match &actgrp {
+                Some(g) => o.actgrp.as_ref() == Some(g),
+                None => o.level == level && o.actgrp.is_none(),
+            };
+            !here
                 || !files.iter().any(|f| {
                     f == "*ALL"
                         || (f == "*PRTF" && o.kind == crate::ovr::Kind::Printer)
                         || f.eq_ignore_ascii_case(&o.file)
                 })
         });
+        crate::ovr::save_scoped(&self.job_key(), &self.calls.overrides);
         // A file with no override at the level: CPF9841 (CL reference,
         // DLTOVR; observed on IBM i 7.5).
         if self.calls.overrides.len() == before
@@ -3601,7 +3815,7 @@ impl Job<'_> {
 
     /// The library of a message file named on a command (CPF2407 when
     /// there is none).
-    async fn message_file(&self, q: &str) -> Result<(String, String)> {
+    pub(crate) async fn message_file(&self, q: &str) -> Result<(String, String)> {
         let (libs, name) = self.search(q);
         let name = name.to_ascii_uppercase();
         match crate::msgf::locate(self.client, &libs, &name).await? {
@@ -3864,6 +4078,7 @@ impl Job<'_> {
                 .collect(),
             print,
             print_msg: Some(printed),
+            spool: None,
             ..Default::default()
         }))
     }
@@ -4231,6 +4446,7 @@ impl Job<'_> {
                 ..Default::default()
             }),
             print_msg: None,
+            spool: None,
         }))
     }
 
@@ -4277,6 +4493,7 @@ impl Job<'_> {
                 ..Default::default()
             }),
             print_msg: None,
+            spool: None,
         }))
     }
 
@@ -4601,7 +4818,7 @@ impl Job<'_> {
                     &f.user,
                     &f.outq,
                     &f.user_data,
-                    &f.status,
+                    crate::outq::short_status(&f.status),
                     &f.pages.to_string(),
                     "",
                     "1",
@@ -4623,8 +4840,11 @@ impl Job<'_> {
             ),
             rows,
             options: vec![
+                (3, "Hold".into(), "HLDSPLF {}".into()),
                 (4, "Delete".into(), "DLTSPLF {}".into()),
                 (5, "Display".into(), "DSPSPLF {}".into()),
+                (6, "Release".into(), "RLSSPLF {}".into()),
+                (8, "Attributes".into(), "WRKSPLFA {}".into()),
             ],
             keys: files
                 .iter()
@@ -4633,6 +4853,23 @@ impl Job<'_> {
             refresh: Some(format!("WRKSPLF SELECT({user})")),
             print: vec![],
             ibm: IbmLayout::some(IbmLayout {
+                // IBM i 7.5's option and key lines (PUB400,
+                // tools/golden/screens4.txt 08_wrksplf): the options done
+                // here at IBM's columns, a blank line, the keys on line 22.
+                option_text: vec![vec![
+                    wrk_cols(&[
+                        (24, "3=Hold"),
+                        (33, "4=Delete"),
+                        (44, "5=Display"),
+                        (56, "6=Release"),
+                    ]),
+                    wrk_cols(&[(4, "8=Attributes")]),
+                    String::new(),
+                ]],
+                key_text: vec![
+                    wrk_cols(&[(2, "F3=Exit"), (25, "F11=View 2"), (38, "F12=Cancel")]),
+                    String::new(),
+                ],
                 heading2: format!("{:24}{:<30}{:>5}{:>8}", "", "Device or", "Total", "Cur"),
                 command_line: Some("Parameters or command".into()),
                 // F11: the job each file belongs to (as4tainr's columns).
@@ -4658,11 +4895,12 @@ impl Job<'_> {
                 ..Default::default()
             }),
             print_msg: None,
+            spool: None,
         }))
     }
 
     /// The spooled file a FILE/JOB/SPLNBR command names.
-    async fn spooled_file(&self, cmd: &Command) -> Result<crate::spool::SpooledFile> {
+    pub(crate) async fn spooled_file(&self, cmd: &Command) -> Result<crate::spool::SpooledFile> {
         let job = self.job_named(cmd.get("JOB")).await?;
         let number = match cmd.get("SPLNBR") {
             "*LAST" | "" => None,
@@ -4682,22 +4920,11 @@ impl Job<'_> {
     async fn dspsplf(&mut self, cmd: &Command) -> Result<Outcome> {
         let f = self.spooled_file(cmd).await?;
         let pages = crate::spool::pages(self.client, f.id).await?;
-        let mut rows = Vec::new();
-        for (i, page) in pages.iter().enumerate() {
-            if i > 0 {
-                rows.push(format!("{:-^40}", format!(" Page {} ", i + 1)));
-            }
-            rows.extend(page.iter().cloned());
-        }
+        let view = SpoolView::of_pages(&f.file, &pages);
         Ok(Outcome::Display(ListDisplay {
             title: "Display Spooled File".into(),
-            info: vec![
-                ("File".into(), f.file.clone()),
-                ("Job".into(), format!("{}   Number {}", f.job_name, f.number)),
-                ("Pages".into(), f.pages.to_string()),
-            ],
-            heading: "*...+....1....+....2....+....3....+....4....+....5....+....6....+....7....+....8....+....9....+....0....+....1....+....2....+....3..".into(),
-            rows,
+            rows: view.lines.iter().map(|(_, _, t)| t.clone()).collect(),
+            spool: Some(Box::new(view)),
             ..Default::default()
         }))
     }
@@ -5237,6 +5464,118 @@ impl Job<'_> {
         }))
     }
 
+    /// CRTDTAQ (CL reference). TYPE(*DDM) is not done; MAXLEN 1-64512,
+    /// KEYLEN 1-256 with SEQ(*KEYED).
+    async fn crtdtaq(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = self.create_target(cmd.get("DTAQ"));
+        let lib = lib.to_ascii_uppercase();
+        if cmd.get("TYPE") == "*DDM" {
+            bail!("CPF9898: as4tainr has no DDM data queues (TYPE(*DDM)).");
+        }
+        let maxlen = number(cmd.get("MAXLEN"), "MAXLEN")? as i32;
+        if !(1..=crate::dtaq::MAX_ENTRY).contains(&maxlen) {
+            bail!("CPF0006: The command has errors and was not run. MAXLEN must be 1 to 64512.");
+        }
+        let seq = match cmd.get("SEQ") {
+            "*LIFO" => 'L',
+            "*KEYED" => 'K',
+            _ => 'F',
+        };
+        let keylen = if seq == 'K' {
+            let k = match cmd.get("KEYLEN") {
+                "" => bail!(
+                    "CPF0006: The command has errors and was not run. SEQ(*KEYED) needs KEYLEN."
+                ),
+                k => number(k, "KEYLEN")? as i32,
+            };
+            if !(1..=crate::dtaq::MAX_KEY).contains(&k) {
+                bail!("CPF0006: The command has errors and was not run. KEYLEN must be 1 to 256.");
+            }
+            k
+        } else {
+            0
+        };
+        let size: Vec<String> = cmd
+            .list("SIZE")
+            .iter()
+            .flat_map(|v| v.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+            .collect();
+        let size_max = match size.first().map(String::as_str) {
+            Some("*MAX2GB") => -2,
+            Some("*MAX16MB") | None => -1,
+            Some(n) => number(n, "SIZE")? as i32,
+        };
+        let size_init = match size.get(1).map(String::as_str) {
+            Some("*DEFAULT") | None => 16,
+            Some(n) => number(n, "SIZE")? as i32,
+        };
+        let yes = |k: &str| cmd.get(k) == "*YES";
+        let text = match cmd.get("TEXT") {
+            "*BLANK" => "",
+            t => t,
+        };
+        crate::dtaq::create(
+            self.client,
+            &crate::dtaq::Create {
+                library: &lib,
+                name: &name,
+                maxlen,
+                seq,
+                keylen,
+                senderid: yes("SENDERID"),
+                force: yes("FORCE"),
+                autorcl: yes("AUTORCL"),
+                size_max,
+                size_init,
+                text,
+            },
+        )
+        .await?;
+        let name = name.to_ascii_uppercase();
+        authority::set_owner(self.client, &lib, &name, "*DTAQ", &self.user).await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Data queue {name} was created in library {lib}."
+        )]))
+    }
+
+    /// DLTDTAQ: CPC2191 as for the other DLTxxx commands; CPF2105 when the
+    /// queue is not found (as IBM i 7.5 does for DLTDTAARA).
+    async fn dltdtaq(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (libs, name) = self.search(cmd.get("DTAQ"));
+        let name = name.to_ascii_uppercase();
+        let label = cmd
+            .get("DTAQ")
+            .to_ascii_uppercase()
+            .split_once('/')
+            .map(|x| x.0.to_string())
+            .unwrap_or_else(|| "*LIBL".into());
+        let mut msgs = Vec::new();
+        for l in &libs {
+            let objs = catalog::list_objects(self.client, l)
+                .await
+                .unwrap_or_default();
+            let hits: Vec<_> = objs
+                .iter()
+                .filter(|o| o.objtype == "*DTAQ" && catalog::name_matches(&name, &o.name))
+                .collect();
+            for o in &hits {
+                authority::check(self.client, &self.user, l, &o.name, "*DTAQ", Aut::All).await?;
+                crate::dtaq::delete(self.client, l, &o.name).await?;
+                msgs.push(format!(
+                    "CPC2191: Object {} of type *DTAQ in library {l} was deleted.",
+                    o.name
+                ));
+            }
+            if !hits.is_empty() && !name.ends_with('*') {
+                break;
+            }
+        }
+        if msgs.is_empty() {
+            bail!("CPF2105: Object {name} of type *DTAQ in library {label} not found.");
+        }
+        Ok(Outcome::Messages(msgs))
+    }
+
     async fn dltdtaara(&mut self, cmd: &Command) -> Result<Outcome> {
         // Not found: CPF2105, as for other objects DLTxxx deletes
         // (observed on IBM i 7.5).
@@ -5319,6 +5658,17 @@ impl Job<'_> {
             Some((l, n)) => (vec![l.to_string()], n.to_string()),
             None => (self.library_list(), pgm.clone()),
         };
+        // System APIs done here (in QSYS on IBM i): data queues, user
+        // spaces, list and retrieve APIs (sysapi.rs).
+        if crate::sysapi::is_api(&name)
+            && matches!(pgm.split_once('/'), None | Some(("*LIBL" | "QSYS", _)))
+        {
+            let caller = self.dtaq_caller();
+            let mut a = crate::dtaq::ClArgs(args);
+            crate::sysapi::call_api(self.client, &caller, &name, &mut a).await?;
+            self.calls.returned = Some(a.0);
+            return Ok(Outcome::Messages(vec![]));
+        }
         // QCMD, the command processor: interactively, the Command Entry
         // display.
         if name == "QCMD" {
@@ -5389,6 +5739,16 @@ impl Job<'_> {
         }
     }
 
+    /// The job as the data queue APIs see it.
+    fn dtaq_caller(&self) -> crate::dtaq::Caller {
+        crate::dtaq::Caller {
+            user: self.user.clone(),
+            job: self.id.clone(),
+            libl: self.library_list(),
+            curlib: self.current_library(),
+        }
+    }
+
     /// Run an RPG program (docs/rpg-engine.md). `library`: where the
     /// program object is; None: PGM.rpgle in AS4TAINR_PGM_PATH.
     async fn call_rpg(
@@ -5452,6 +5812,46 @@ impl Job<'_> {
         Ok(Outcome::Messages(msgs))
     }
 }
+/// A line of texts at screen columns, shown from column 2.
+fn wrk_cols(fields: &[(usize, &str)]) -> String {
+    let shifted: Vec<(usize, &str)> = fields.iter().map(|(c, t)| (c - 1, *t)).collect();
+    crate::report::at(&shifted)
+}
+
+/// The values of KEYWORD(...) in a string of options (CRTSQLRPGI
+/// COMPILEOPT), split at blanks: empty when it is not there.
+fn option_values(opts: &str, keyword: &str) -> Vec<String> {
+    let u = opts.to_ascii_uppercase();
+    let pat = format!("{keyword}(");
+    let Some(i) = u
+        .find(&pat)
+        .filter(|i| *i == 0 || !u.as_bytes()[i - 1].is_ascii_alphanumeric())
+    else {
+        return Vec::new();
+    };
+    let rest = &u[i + pat.len()..];
+    let mut depth = 1;
+    let mut end = rest.len();
+    for (j, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = j;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    rest[..end]
+        .split_whitespace()
+        .map(|v| v.trim_matches(|c| c == '(' || c == ')').to_string())
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
 /// A whole number in a command parameter.
 fn number(s: &str, keyword: &str) -> Result<u32> {
     s.trim().parse().map_err(|_| {
@@ -5526,6 +5926,18 @@ fn typed_parm(a: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::dsp_label;
+
+    #[test]
+    fn compile_options_of_crtsqlrpgi() {
+        // COMPILEOPT passes options to the compiler (Db2 for i embedded
+        // SQL programming, CRTSQLRPGI): the company_system corpus uses
+        // COMPILEOPT('BNDDIR(APP) DFTACTGRP(*NO)').
+        let opts = "BNDDIR(APP QC2LE) DFTACTGRP(*NO)";
+        assert_eq!(super::option_values(opts, "BNDDIR"), ["APP", "QC2LE"]);
+        assert_eq!(super::option_values(opts, "DFTACTGRP"), ["*NO"]);
+        assert!(super::option_values(opts, "ACTGRP").is_empty());
+        assert!(super::option_values("XBNDDIR(A)", "BNDDIR").is_empty());
+    }
 
     #[test]
     fn display_labels_as_ibm_i_writes_them() {

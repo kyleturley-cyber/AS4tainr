@@ -342,7 +342,7 @@ pub fn listing(p: &Prologue, a: &Analysis, created: bool, stamp: &Stamp) -> Vec<
         first.push(label(
             2,
             "Source member name",
-            &format!("{:<10}{changed}", m.name),
+            &format!("{}   {changed}", m.name),
         ));
     }
     let activation = if p.dftactgrp == "*YES" { "" } else { &p.actgrp };

@@ -1249,6 +1249,7 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
                 }
                 f.varlen = varlen;
                 f.null_capable = true;
+                let mut col_constraint: Option<String> = None;
                 // Column options, in any order.
                 loop {
                     if p.eat("NOT") {
@@ -1281,7 +1282,7 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
                         p.expect_punct("(")?;
                         checks.push((None, p.group()?));
                     } else if p.eat("CONSTRAINT") {
-                        p.ident()?;
+                        col_constraint = Some(p.ident()?);
                     } else if p.eat("CCSID") {
                         p.number()?;
                     } else if p.eat("GENERATED") {
@@ -1289,7 +1290,11 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
                         f.null_capable = false;
                         f.default = None;
                     } else if p.eat("REFERENCES") {
-                        bail!("SQL0084: REFERENCES constraints are not supported yet.");
+                        // A column's referential constraint (IBM i SQL
+                        // programming, "Adding referential constraints":
+                        // CONSTRAINT WORKDEPT_EXISTS REFERENCES
+                        // CORPDATA.DEPARTMENT (DEPTNO)).
+                        foreign.push(references(p, col_constraint.take(), vec![sys.clone()])?);
                     } else if p.eat("IMPLICITLY") {
                         p.expect("HIDDEN")?;
                         bail!("SQL0084: IMPLICITLY HIDDEN columns are not supported yet.");
@@ -1427,10 +1432,21 @@ pub struct ForeignKey {
     pub on_update: String,
 }
 
-/// FOREIGN KEY (columns) REFERENCES table [(columns)] [ON DELETE rule]
-/// [ON UPDATE rule], after FOREIGN.
+/// FOREIGN KEY [name] (columns) REFERENCES table [(columns)] [ON DELETE
+/// rule] [ON UPDATE rule], after FOREIGN.
 fn foreign_key(p: &mut P, name: Option<String>) -> Result<ForeignKey> {
     p.expect("KEY")?;
+    // FOREIGN KEY constraint-name (columns): the constraint's name after
+    // KEY, as in the sample tables of IBM i's SQL programming guide
+    // ("Department table": ADD FOREIGN KEY ROD (ADMRDEPT) REFERENCES
+    // DEPARTMENT ON DELETE CASCADE).
+    let mut name = name;
+    if !p.t.get(p.i).is_some_and(|t| *t == Tok::Punct("(".into())) {
+        let n = p.field()?;
+        if name.is_none() {
+            name = Some(n);
+        }
+    }
     let cols = |p: &mut P| -> Result<Vec<String>> {
         p.expect_punct("(")?;
         let mut c = Vec::new();
@@ -1445,6 +1461,24 @@ fn foreign_key(p: &mut P, name: Option<String>) -> Result<ForeignKey> {
     };
     let columns = cols(p)?;
     p.expect("REFERENCES")?;
+    references(p, name, columns)
+}
+
+/// The rest of a referential constraint, after REFERENCES: table
+/// [(columns)] [ON DELETE rule] [ON UPDATE rule].
+fn references(p: &mut P, name: Option<String>, columns: Vec<String>) -> Result<ForeignKey> {
+    let cols = |p: &mut P| -> Result<Vec<String>> {
+        p.expect_punct("(")?;
+        let mut c = Vec::new();
+        loop {
+            c.push(p.field()?);
+            if !p.punct(",") {
+                break;
+            }
+        }
+        p.expect_punct(")")?;
+        Ok(c)
+    };
     let parent = p.name()?;
     let parent_columns = if p.t.get(p.i).is_some_and(|t| *t == Tok::Punct("(".into())) {
         cols(p)?
@@ -1523,11 +1557,47 @@ async fn add_foreign_key(
         .iter()
         .map(|c| column(&child.file, c, table))
         .collect::<Result<_>>()?;
-    let pcols: Vec<String> = fk
+    let mut pcols: Vec<String> = fk
         .parent_columns
         .iter()
         .map(|c| column(&parent.file, c, &fk.parent.name))
         .collect::<Result<_>>()?;
+    // REFERENCES table without columns: the parent's primary key (Db2 for
+    // i SQL reference, referential constraints); SQL0573 when it has none.
+    if pcols.is_empty() {
+        let pk: Option<String> = ctx
+            .client
+            .query_opt(
+                "SELECT name FROM as4tainr.constraints
+                  WHERE library=$1 AND file=$2 AND kind='PRIMARY KEY'",
+                &[&plib, &psys],
+            )
+            .await?
+            .map(|r| r.get(0));
+        let Some(pk) = pk else {
+            bail!(
+                "SQL0573: Table {} has no primary key for the referential constraint.",
+                fk.parent.name
+            );
+        };
+        let index = format!("{}.{}", ident(&plib), ident(&format!("{psys}_{pk}")));
+        pcols = ctx
+            .client
+            .query(
+                "SELECT a.attname::text FROM pg_index i
+                   CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+                   JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                  WHERE i.indexrelid = $1::text::regclass ORDER BY k.ord",
+                &[&index],
+            )
+            .await?
+            .iter()
+            .map(|r| ident(&r.get::<_, String>(0)))
+            .collect();
+        if pcols.len() != cols.len() {
+            bail!("SQL0538: The foreign key and the parent key have different numbers of columns.");
+        }
+    }
     let cname = fk
         .name
         .clone()

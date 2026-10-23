@@ -247,9 +247,20 @@ async fn bind_source(
     let src = src.clone();
     let mut externals = HashMap::new();
     for f in program::external_files(&src) {
-        let fr = crate::catalog::resolve_file(client, libl, &ovr::file_name(ovr, Kind::Db, &f))
-            .await
-            .map_err(|e| anyhow!("file {f} for the program: {e}"))?;
+        let r =
+            crate::catalog::resolve_file(client, libl, &ovr::file_name(ovr, Kind::Db, &f)).await;
+        // A program-described file need not exist when the program is
+        // compiled (it is opened later, by EXTFILE perhaps): the compiler
+        // knows its record length only.
+        let described = src
+            .files
+            .iter()
+            .any(|d| d.name == f && (d.external || d.record_len.is_none()));
+        let fr = match r {
+            Ok(fr) => fr,
+            Err(_) if !described => continue,
+            Err(e) => return Err(anyhow!("file {f} for the program: {e}")),
+        };
         externals.insert(f, fr);
     }
     let mut displays = HashMap::new();

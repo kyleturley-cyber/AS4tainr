@@ -2,8 +2,10 @@
 //! (EXTPROC('open') and so on, bound from QC2LE): the integrated file
 //! system (open, read, write, close, lseek, unlink, mkdir, rmdir, access,
 //! rename), errno (__errno, strerror, perror), strings and memory
-//! (strlen, strcpy, strcmp, memcpy, memmove, memset, memcmp, atoi, atol),
-//! system() and Qp0zLprintf.
+//! (strlen, strcpy, strcmp, memcpy, memmove, memset, memcmp, atoi, atol,
+//! strtok, strstr, strchr, strrchr, strspn, strcspn, strcasecmp and the
+//! like, toupper, tolower), abs, rand and srand, tmpnam, system() and
+//! Qp0zLprintf.
 //!
 //! Written from IBM's UNIX-type API and ILE C runtime references. File
 //! descriptors belong to the job (as on IBM i): a descriptor opened by one
@@ -66,7 +68,33 @@ pub const C_FUNCTIONS: &[&str] = &[
     "ATOLL",
     "SYSTEM",
     "QP0ZLPRINTF",
+    "STRTOK",
+    "STRSTR",
+    "STRCHR",
+    "STRRCHR",
+    "STRSPN",
+    "STRCSPN",
+    "STRCASECMP",
+    "STRNCASECMP",
+    "STRCMPI",
+    "STRICMP",
+    "TOUPPER",
+    "TOLOWER",
+    "ABS",
+    "RAND",
+    "SRAND",
+    "TMPNAM",
+    "_C_IFS_TMPNAM",
 ];
+
+/// strtok's position in the string it is splitting, by job.
+static STRTOK_AT: Mutex<Option<HashMap<String, Option<super::super::mem::Ptr>>>> = Mutex::new(None);
+
+/// rand()'s state, by job (srand sets it; 1 before).
+static RAND_STATE: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+
+/// Names tmpnam made, for the next one.
+static TMPNAM_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// An open stream file.
 #[derive(Debug, Clone)]
@@ -296,6 +324,180 @@ impl<'a> Machine<'a> {
                 let text = self.printf(&vals)?;
                 self.job_log(&text);
                 num(text.len() as i64)
+            }
+            // strtok(string, delimiters): the next token, the string
+            // changed (a null character after the token); NULL for the
+            // string goes on from the last token. The first call copies
+            // the string to storage of its own, so the tokens stay valid
+            // when the argument was a temporary OPTIONS(*STRING) copy.
+            "STRTOK" => {
+                let delims = self.str_at(&val(1), None)?.chars()?;
+                let job = self.job();
+                let start = match val(0) {
+                    Value::Fig(Fig::Null) => {
+                        let g = STRTOK_AT.lock().unwrap_or_else(|e| e.into_inner());
+                        match g.as_ref().and_then(|m| m.get(&job).copied().flatten()) {
+                            Some(p) => Value::Ptr(p),
+                            None => return Ok(Value::Fig(Fig::Null)),
+                        }
+                    }
+                    p => {
+                        let text = self.str_at(&p, None)?.chars()?;
+                        let copy = self.alloc(&Value::Num(Dec::from_i64(text.len() as i64 + 1)))?;
+                        let (b, o) = self.addr(&copy, text.len() + 1)?;
+                        self.bufs[b][o..o + text.len()].copy_from_slice(&text);
+                        self.bufs[b][o + text.len()] = 0;
+                        copy
+                    }
+                };
+                let text = self.str_at(&start, None)?.chars()?;
+                let Value::Ptr(base) = start else {
+                    return Ok(Value::Fig(Fig::Null));
+                };
+                let set = |p: Option<super::super::mem::Ptr>| {
+                    let mut g = STRTOK_AT.lock().unwrap_or_else(|e| e.into_inner());
+                    g.get_or_insert_with(HashMap::new).insert(job.clone(), p);
+                };
+                let Some(k) = text.iter().position(|c| !delims.contains(c)) else {
+                    set(None);
+                    return Ok(Value::Fig(Fig::Null));
+                };
+                let end = text[k..]
+                    .iter()
+                    .position(|c| delims.contains(c))
+                    .map(|j| k + j);
+                match end {
+                    Some(j) => {
+                        let (b, o) = self.addr(&start, j + 1)?;
+                        self.bufs[b][o + j] = 0;
+                        set(base.add(j as i64 + 1));
+                    }
+                    None => set(None),
+                }
+                Ok(Value::Ptr(base.add(k as i64).unwrap_or(base)))
+            }
+            // strstr(string, substring): where it is first found, or NULL.
+            "STRSTR" => {
+                let h = self.str_at(&val(0), None)?.chars()?;
+                let n = self.str_at(&val(1), None)?.chars()?;
+                let at = if n.is_empty() {
+                    Some(0)
+                } else {
+                    h.windows(n.len()).position(|w| w == n.as_slice())
+                };
+                Ok(match (at, val(0)) {
+                    (Some(i), Value::Ptr(p)) => p
+                        .add(i as i64)
+                        .map(Value::Ptr)
+                        .unwrap_or(Value::Fig(Fig::Null)),
+                    _ => Value::Fig(Fig::Null),
+                })
+            }
+            // strchr and strrchr(string, character): the first or last
+            // place of the character (the null character counts).
+            "STRCHR" | "STRRCHR" => {
+                let h = self.str_at(&val(0), None)?.chars()?;
+                let c = int(1) as u8;
+                let at = if c == 0 {
+                    Some(h.len())
+                } else if name == "STRCHR" {
+                    h.iter().position(|&x| x == c)
+                } else {
+                    h.iter().rposition(|&x| x == c)
+                };
+                Ok(match (at, val(0)) {
+                    (Some(i), Value::Ptr(p)) => p
+                        .add(i as i64)
+                        .map(Value::Ptr)
+                        .unwrap_or(Value::Fig(Fig::Null)),
+                    _ => Value::Fig(Fig::Null),
+                })
+            }
+            // strspn and strcspn: how many characters at the start are
+            // (are not) in the set.
+            "STRSPN" | "STRCSPN" => {
+                let h = self.str_at(&val(0), None)?.chars()?;
+                let set = self.str_at(&val(1), None)?.chars()?;
+                let inside = name == "STRSPN";
+                num(h.iter().take_while(|c| set.contains(c) == inside).count() as i64)
+            }
+            // Comparisons that ignore case.
+            "STRCASECMP" | "STRNCASECMP" | "STRCMPI" | "STRICMP" => {
+                let mut x = a(&self.str_at(&val(0), None)?.chars()?).to_lowercase();
+                let mut y = a(&self.str_at(&val(1), None)?.chars()?).to_lowercase();
+                if name == "STRNCASECMP" {
+                    let n = int(2).max(0) as usize;
+                    x = x.chars().take(n).collect();
+                    y = y.chars().take(n).collect();
+                }
+                num(match x.cmp(&y) {
+                    Ordering::Less => -1,
+                    Ordering::Equal => 0,
+                    Ordering::Greater => 1,
+                })
+            }
+            // toupper and tolower of a character (EBCDIC).
+            "TOUPPER" | "TOLOWER" => {
+                let c = int(0);
+                let ch = a(&[c as u8]);
+                let t = if name == "TOUPPER" {
+                    ch.to_uppercase()
+                } else {
+                    ch.to_lowercase()
+                };
+                let b = super::super::data::e(&t);
+                num(if b.len() == 1 && (0..=255).contains(&c) {
+                    b[0] as i64
+                } else {
+                    c
+                })
+            }
+            "ABS" => num(int(0).abs()),
+            // rand(): 0 to 32767 (RAND_MAX), the series srand(seed) starts
+            // (the ANSI C example generator).
+            "RAND" | "SRAND" => {
+                let job = self.job();
+                let mut g = RAND_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                let m = g.get_or_insert_with(HashMap::new);
+                if name == "SRAND" {
+                    m.insert(job, int(0) as u32);
+                    return num(0);
+                }
+                let st = m.entry(job).or_insert(1);
+                *st = st.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                num(((*st / 65536) % 32768) as i64)
+            }
+            // tmpnam(buffer): a name no file has (QTEMP/QACXnnnnnn for
+            // database files, /tmp/QACXnnnnnn in the IFS), in the buffer
+            // or in storage of its own.
+            "TMPNAM" | "_C_IFS_TMPNAM" => {
+                let n = TMPNAM_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_micros())
+                    .unwrap_or(0);
+                let id = format!(
+                    "{:06}",
+                    (n.wrapping_mul(7919).wrapping_add(stamp)) % 1_000_000
+                );
+                let text = if name == "TMPNAM" {
+                    format!("QTEMP/QACX{id}")
+                } else {
+                    format!("/tmp/QACX{id}")
+                };
+                let bytes = super::super::data::e(&text);
+                let dst = match (args.first(), val(0)) {
+                    (Some(Arg::Ref(l)), _) => {
+                        let (b, o) = (l.buf, l.off);
+                        self.ptr_to(b, o)
+                    }
+                    (_, Value::Ptr(p)) => Value::Ptr(p),
+                    _ => self.alloc(&Value::Num(Dec::from_i64(40)))?,
+                };
+                let (b, o) = self.addr(&dst, bytes.len() + 1)?;
+                self.bufs[b][o..o + bytes.len()].copy_from_slice(&bytes);
+                self.bufs[b][o + bytes.len()] = 0;
+                Ok(dst)
             }
             _ => bail!("{name} is not available"),
         }

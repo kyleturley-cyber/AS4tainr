@@ -27,6 +27,10 @@ pub struct VarInfo {
     pub stride: usize,
     /// Local to a procedure (a frame buffer) or global.
     pub local: bool,
+    /// An array overlaying an array of a data structure: the bytes from
+    /// the start of the overlaid element to this one's (SORTA moves whole
+    /// elements).
+    pub lead: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -187,6 +191,12 @@ pub struct Proto {
     pub extpgm: Option<String>,
     /// EXTPROC, or the prototype name: a procedure.
     pub extproc: Option<String>,
+    /// EXTPROC(pointer): a call goes to the procedure the procedure
+    /// pointer of this name addresses (ILE RPG Reference, EXTPROC).
+    pub extproc_ptr: Option<String>,
+    /// EXTPROC('name') as written: the procedure's exported name, its
+    /// case kept (the call stack shows it).
+    pub written: Option<String>,
     pub params: Vec<ParamInfo>,
     pub returns: Option<DType>,
     /// OVERLOAD(a : b ...): the prototypes a call of this one may mean,
@@ -776,9 +786,17 @@ fn param_flags(d: &Def) -> (bool, bool, bool, bool) {
 
 fn ext_name(kws: &[Keyword], key: &str) -> Option<Option<String>> {
     keyword(kws, key).map(|k| {
-        k.args
-            .first()
-            .map(|a| a.trim().trim_matches('\'').to_ascii_uppercase())
+        let first = k.args.first().map(|a| a.trim().to_ascii_uppercase());
+        // EXTPROC(*CL | *CWIDEN | *CNOWIDEN : 'name'): the name is the
+        // second argument; EXTPROC(*DCLCASE): the prototype's name as
+        // declared (ILE RPG Reference, EXTPROC). Names are matched
+        // without regard to case here.
+        let arg = match first.as_deref() {
+            Some("*DCLCASE") => return None,
+            Some("*CL" | "*CWIDEN" | "*CNOWIDEN") => k.args.get(1),
+            _ => k.args.first(),
+        };
+        arg.map(|a| a.trim().trim_matches('\'').to_ascii_uppercase())
             .filter(|a| !a.is_empty())
     })
 }
@@ -829,6 +847,59 @@ impl Binder<'_> {
                 }
             }
         }
+        // A data structure with a subfield LIKEDS a data structure, or LIKE
+        // a field, defined later comes after it (the compiler takes
+        // forward references: OSSILE's message_t has a subfield
+        // LIKEDS(messageSender_t), defined after it; RPGUnit's templates
+        // have subfields LIKE(ProcNm_t)).
+        {
+            let ds_deps = |i: usize| -> Vec<String> {
+                let mut v = Vec::new();
+                let mut k = i;
+                loop {
+                    for kwn in ["LIKEDS", "LIKE"] {
+                        if let Some(kw) = keyword(&defs[k].keywords, kwn) {
+                            if let Some(a) = kw.args.first() {
+                                // LIKE(ds.subfield): the data structure.
+                                let a = a.trim().to_ascii_uppercase();
+                                v.push(a.split('.').next().unwrap_or(&a).to_string());
+                            }
+                        }
+                    }
+                    k += 1;
+                    if k >= defs.len() || defs[k].kind != DefKind::Subfield {
+                        break;
+                    }
+                }
+                v
+            };
+            let is_ds = |i: usize| defs[i].kind == DefKind::Ds;
+            let mut placed: Vec<usize> = Vec::new();
+            let mut pending: Vec<usize> = order.clone();
+            loop {
+                let unplaced: Vec<String> = pending
+                    .iter()
+                    .filter(|&&i| is_ds(i) || defs[i].kind == DefKind::Field)
+                    .map(|&i| defs[i].name.clone())
+                    .collect();
+                let (ready, wait): (Vec<usize>, Vec<usize>) = pending.iter().partition(|&&i| {
+                    !is_ds(i)
+                        || !ds_deps(i)
+                            .iter()
+                            .any(|d| *d != defs[i].name && unplaced.contains(d))
+                });
+                if ready.is_empty() {
+                    placed.extend(wait);
+                    break;
+                }
+                placed.extend(ready);
+                if wait.is_empty() {
+                    break;
+                }
+                pending = wait;
+            }
+            order = placed;
+        }
         // Fields LIKE another field (D specs, *LIKE DEFINE) come after the
         // fields they are like, which may be defined anywhere in the
         // source.
@@ -851,7 +922,42 @@ impl Binder<'_> {
             like = wait;
         }
         order.extend(later);
-        for &i0 in &order {
+        // A procedure's local field may be LIKE one of its parameters
+        // (ILE RPG Reference, LIKE: any field, parameters included),
+        // although the interface is bound after the fields: the
+        // parameters' types are known for LIKE meanwhile.
+        let mut param_types: Vec<String> = Vec::new();
+        let mut in_pi = false;
+        for d in defs {
+            match d.kind {
+                DefKind::Interface => in_pi = true,
+                DefKind::Param if in_pi => {
+                    if !self.file_fields.contains_key(&d.name) && !self.syms.contains_key(&d.name) {
+                        if let Ok(Some(t)) = self.resolve_type(d) {
+                            self.file_fields.insert(d.name.clone(), t);
+                            param_types.push(d.name.clone());
+                        }
+                    }
+                }
+                _ => in_pi = false,
+            }
+        }
+        let r = self.bind_ordered(defs, &order, protos, &mut pi);
+        for n in param_types {
+            self.file_fields.remove(&n);
+        }
+        r?;
+        Ok(pi)
+    }
+
+    fn bind_ordered(
+        &mut self,
+        defs: &[Def],
+        order: &[usize],
+        protos: &mut HashMap<String, Proto>,
+        pi: &mut Option<Interface>,
+    ) -> Result<()> {
+        for &i0 in order {
             let i = i0;
             let d = &defs[i];
             match d.kind {
@@ -987,14 +1093,59 @@ impl Binder<'_> {
                         });
                         j += 1;
                     }
-                    let returns = self.resolve_type(d)?;
+                    // A return value LIKEDS a data structure (ILE RPG
+                    // Reference, LIKEDS on a prototype or interface): its
+                    // bytes.
+                    let returns = match self.resolve_type(d)? {
+                        Some(t) => Some(t),
+                        None => match keyword(&d.keywords, "LIKEDS")
+                            .and_then(|k| k.args.first())
+                            .map(|a| a.trim().to_ascii_uppercase())
+                        {
+                            // With DIM: the elements' bytes, one after another.
+                            Some(n) => match self.syms.get(&n) {
+                                Some(Sym::Ds(ds)) => {
+                                    let dim = match keyword(&d.keywords, "DIM")
+                                        .and_then(|k| k.args.first())
+                                    {
+                                        Some(a) => num_arg(a, &self.syms)?.max(1),
+                                        None => 1,
+                                    };
+                                    Some(DType::Char(ds.size as u32 * dim))
+                                }
+                                _ => bail!("line {}: LIKEDS({n}): not a data structure", d.line),
+                            },
+                            None => None,
+                        },
+                    };
                     if interface {
-                        pi = Some((d.name.clone(), returns, params, d.keywords.clone()));
+                        *pi = Some((d.name.clone(), returns, params, d.keywords.clone()));
                     } else {
                         let extpgm = ext_name(&d.keywords, "EXTPGM")
                             .map(|n| n.unwrap_or_else(|| d.name.clone()));
+                        // EXTPROC(name) without quotes: a named constant
+                        // with the procedure's name, or a procedure
+                        // pointer.
+                        let unquoted = keyword(&d.keywords, "EXTPROC")
+                            .and_then(|k| k.args.first().cloned())
+                            .map(|a| a.trim().to_string())
+                            .filter(|a| {
+                                !a.is_empty() && !a.starts_with('\'') && !a.starts_with('*')
+                            })
+                            .map(|a| a.to_ascii_uppercase());
+                        let mut extproc_ptr = None;
                         let extproc = if extpgm.is_some() {
                             None
+                        } else if let Some(n) = unquoted {
+                            match self.syms.get(&n) {
+                                Some(Sym::Const(v)) => Some(
+                                    crate::rpg::data::a(&v.chars()?).trim().to_ascii_uppercase(),
+                                ),
+                                _ => {
+                                    extproc_ptr = Some(n);
+                                    None
+                                }
+                            }
                         } else {
                             Some(
                                 ext_name(&d.keywords, "EXTPROC")
@@ -1008,6 +1159,7 @@ impl Binder<'_> {
                                 name: d.name.clone(),
                                 extpgm,
                                 extproc,
+                                extproc_ptr,
                                 params,
                                 returns,
                                 overload: keyword(&d.keywords, "OVERLOAD")
@@ -1018,6 +1170,14 @@ impl Binder<'_> {
                                             .collect()
                                     })
                                     .unwrap_or_default(),
+                                written: keyword(&d.keywords, "EXTPROC")
+                                    .and_then(|k| match k.args.first() {
+                                        Some(a) if a.trim().starts_with('*') => k.args.get(1),
+                                        a => a,
+                                    })
+                                    .map(|a| a.trim())
+                                    .filter(|a| a.starts_with('\''))
+                                    .map(|a| a.trim_matches('\'').to_string()),
                             },
                         );
                     }
@@ -1039,12 +1199,17 @@ impl Binder<'_> {
                 self.add_var(&p, DType::Pointer, 0);
             }
         }
-        Ok(pi)
+        Ok(())
     }
 
     /// Store the pending INZ values.
     fn apply_inz(&mut self) -> Result<()> {
         for (name, v) in std::mem::take(&mut self.inz) {
+            // INZ(*LIKEDS) on the data structure: the template's values
+            // were copied already.
+            if matches!(&v, Err(t) if t.trim().eq_ignore_ascii_case("*LIKEDS")) {
+                continue;
+            }
             let v = match v {
                 Ok(v) => v,
                 Err(text) => literal_value(&text, &self.syms)?,
@@ -1105,6 +1270,8 @@ impl Binder<'_> {
                 "ZONED" => DType::Zoned(n(0)?, if k.args.len() > 1 { n(1)? } else { 0 }),
                 "INT" => DType::Int(n(0)?),
                 "UNS" => DType::Uns(n(0)?),
+                // POINTER(*PROC): a procedure pointer.
+                "POINTER" => DType::Pointer,
                 "DATE" => {
                     let f = match k.args.first() {
                         Some(a) if !a.trim().is_empty() => crate::rpg::dates::DateFmt::parse(a)?,
@@ -1130,6 +1297,10 @@ impl Binder<'_> {
                 .unwrap_or_default();
             let base = match self.syms.get(&other) {
                 Some(Sym::Var(v)) => v.dtype,
+                // LIKE of a data structure (a template too): character,
+                // as long as the data structure (ILE RPG Reference, LIKE
+                // keyword).
+                Some(Sym::Ds(ds)) => DType::Char(ds.size as u32),
                 _ => *self
                     .file_fields
                     .get(&other)
@@ -1198,6 +1369,13 @@ impl Binder<'_> {
         for _ in 0..n {
             buf.extend(dtype.initial());
         }
+        // A program's storage is one piece: a pointer to a short field
+        // may read on past it (a 16-byte pointer read through a 5-byte
+        // handle, RPGUnit's EXTTSTT). Some bytes after the field stand in
+        // for the storage that follows (fidelity-gaps).
+        if dim == 0 && buf.len() < 16 {
+            buf.resize(16, 0);
+        }
         self.bufs.push(buf);
         let v = VarInfo {
             dtype,
@@ -1206,6 +1384,7 @@ impl Binder<'_> {
             dim,
             stride: dtype.size(),
             local: self.local,
+            lead: 0,
         };
         self.syms.insert(name.to_string(), Sym::Var(v.clone()));
         v
@@ -1298,10 +1477,18 @@ impl Binder<'_> {
         let likeds = keyword(&d.keywords, "LIKEDS")
             .and_then(|k| k.args.first())
             .map(|a| a.trim().to_ascii_uppercase());
+        let mut template: Option<(String, DsInfo)> = None;
+        // Arrays that overlay an array subfield (ILE RPG Reference,
+        // OVERLAY: "the overlaying field is also an array"): name →
+        // (elements, stride, lead).
+        let mut shape: HashMap<String, (u32, usize, usize)> = HashMap::new();
+        // Group subfields (no type or length) → their index in `subs`.
+        let mut groups: HashMap<String, usize> = HashMap::new();
         if let Some(other) = &likeds {
             let Some(Sym::Ds(o)) = self.syms.get(other).cloned() else {
                 bail!("LIKEDS({other}): not a data structure")
             };
+            template = Some((other.clone(), o.clone()));
             for sf in &o.subfields {
                 let key = if o.qualified {
                     format!("{other}.{sf}")
@@ -1309,7 +1496,14 @@ impl Binder<'_> {
                     sf.clone()
                 };
                 match self.syms.get(&key).cloned() {
-                    Some(Sym::Var(v)) => subs.push((sf.clone(), v.dtype, v.off - o.off, v.dim, d)),
+                    Some(Sym::Var(v)) => {
+                        if v.stride != v.dtype.size() || v.lead > 0 {
+                            shape.insert(sf.clone(), (v.dim, v.stride, v.lead));
+                            subs.push((sf.clone(), v.dtype, v.off - o.off, 0, d));
+                        } else {
+                            subs.push((sf.clone(), v.dtype, v.off - o.off, v.dim, d));
+                        }
+                    }
                     Some(Sym::Ds(n)) => {
                         nested.push((subs.len(), key.clone(), n.clone()));
                         subs.push((
@@ -1397,12 +1591,66 @@ impl Binder<'_> {
             } else {
                 next
             };
+            // A subfield with no type or length that later subfields
+            // overlay: a group, as long as they reach (ILE RPG Reference,
+            // OVERLAY keyword).
+            let is_group = t.is_none()
+                && s.to.is_none()
+                && defs[j + 1..]
+                    .iter()
+                    .take_while(|x| x.kind == DefKind::Subfield)
+                    .any(|x| {
+                        keyword(&x.keywords, "OVERLAY")
+                            .and_then(|k| k.args.first())
+                            .is_some_and(|a| a.trim().eq_ignore_ascii_case(&s.name))
+                    });
+            if is_group {
+                groups.insert(s.name.to_ascii_uppercase(), subs.len());
+                subs.push((s.name.clone(), DType::Char(0), off, 0, s));
+                j += 1;
+                continue;
+            }
             let t = match t {
                 Some(t) => t,
                 None if s.to.is_some() => DType::Char(s.to.unwrap() + 1 - s.from.unwrap_or(1)),
                 None => bail!("subfield {} needs a type and length", s.name),
             };
             let sdim = self.dim(s)?;
+            // A subfield overlaying a group makes the group longer.
+            if let Some(k) = keyword(&s.keywords, "OVERLAY") {
+                let target = k
+                    .args
+                    .first()
+                    .map(|a| a.trim().to_ascii_uppercase())
+                    .unwrap_or_default();
+                if let Some(&g) = groups.get(&target) {
+                    let end = off + t.size() * sdim.max(1) as usize;
+                    let len = end.saturating_sub(subs[g].2);
+                    if let DType::Char(n) = subs[g].1 {
+                        if len as u32 > n {
+                            subs[g].1 = DType::Char(len as u32);
+                        }
+                    }
+                }
+            }
+            if let Some(k) = keyword(&s.keywords, "OVERLAY") {
+                let target = k
+                    .args
+                    .first()
+                    .map(|a| a.trim().to_ascii_uppercase())
+                    .unwrap_or_default();
+                if sdim == 0 {
+                    if let Some(x) = subs.iter().find(|x| x.0 == target) {
+                        let (tdim, tstride, tlead) = match shape.get(&target) {
+                            Some(&sh) => sh,
+                            None => (x.3, x.1.size(), 0),
+                        };
+                        if tdim > 0 {
+                            shape.insert(s.name.clone(), (tdim, tstride, tlead + off - x.2));
+                        }
+                    }
+                }
+            }
             let end = off + t.size() * sdim.max(1) as usize;
             if keyword(&s.keywords, "OVERLAY").is_none() || end > next {
                 next = next.max(end);
@@ -1446,13 +1694,15 @@ impl Binder<'_> {
             } else {
                 sname.clone()
             };
+            let (vdim, stride, lead) = shape.get(sname).copied().unwrap_or((*sdim, t.size(), 0));
             let v = VarInfo {
                 dtype: *t,
                 buf,
                 off: *off,
-                dim: *sdim,
-                stride: t.size(),
+                dim: vdim,
+                stride,
                 local: self.local,
+                lead,
             };
             if has_inz || keyword(&sdef.keywords, "INZ").is_some() && !std::ptr::eq(*sdef, d) {
                 for e in 0..reps as usize {
@@ -1467,6 +1717,47 @@ impl Binder<'_> {
                 self.inz(&key, sdef)?;
             }
             names.push(sname.clone());
+        }
+        // INZ(*LIKEDS): the subfields start with the template's initial
+        // values (ILE RPG Reference, INZ keyword: "*LIKEDS").
+        let inz_likeds = keyword(&d.keywords, "INZ").is_some_and(|k| {
+            k.args
+                .first()
+                .is_some_and(|a| a.trim().eq_ignore_ascii_case("*LIKEDS"))
+        });
+        if let (true, Some((other, o))) = (inz_likeds, &template) {
+            let src = if o.local == self.local {
+                self.bufs.get(o.buf)
+            } else if !o.local {
+                self.globals.get(o.buf)
+            } else {
+                None
+            };
+            if let Some(bytes) = src
+                .and_then(|b| b.get(o.off..o.off + o.size))
+                .map(|b| b.to_vec())
+            {
+                for e in 0..reps as usize {
+                    let at = e * size;
+                    let n = bytes.len().min(size);
+                    self.bufs[buf][at..at + n].copy_from_slice(&bytes[..n]);
+                }
+            }
+            let pending: Vec<(String, Result<Value, String>)> = self
+                .inz
+                .iter()
+                .filter_map(|(n, v)| {
+                    let sf = if o.qualified {
+                        n.strip_prefix(&format!("{other}."))?.to_string()
+                    } else if o.subfields.contains(n) {
+                        n.clone()
+                    } else {
+                        return None;
+                    };
+                    Some((format!("{name}.{sf}"), v.clone()))
+                })
+                .collect();
+            self.inz.extend(pending);
         }
         // A LIKEDS subfield is a qualified data structure at its offset,
         // with the template's subfields (and their own nested ones) under
@@ -1894,10 +2185,15 @@ pub fn bind(
             // A program-described file over a database file: the record
             // image is the fields of its record format, each in its
             // stored form (zoned, packed, binary, characters).
-            let fr = externals
-                .get(&f.name)
-                .ok_or_else(|| anyhow!("file {} is not described (not found)", f.name))?
-                .clone();
+            // Not found when compiled: the file opened (EXTFILE) gives the
+            // layout then; the record length is the declared one.
+            let Some(fr) = externals.get(&f.name).cloned() else {
+                info.record_len = f.record_len.unwrap_or(0) as usize;
+                info.program_described = true;
+                info.format = f.name.clone();
+                files.push(info);
+                continue;
+            };
             let mut at = 0usize;
             for fd in &fr.file.fields {
                 let t = program_type(fd, true, false).unwrap_or(DType::Char(0));
@@ -2201,8 +2497,16 @@ pub fn bind(
     imports.sort();
     imports.dedup();
     let nomain = keyword(&src.control, "NOMAIN").is_some();
-    if nomain && !src.calcs.iter().all(declarative_sql) {
-        bail!("ctl-opt NOMAIN: a module without a main procedure has no calculations outside procedures (RNF3788)");
+    if let Some(c) = src
+        .calcs
+        .iter()
+        .find(|c| !declarative_sql(c))
+        .filter(|_| nomain)
+    {
+        bail!(
+            "line {}: ctl-opt NOMAIN: a module without a main procedure has no calculations outside procedures (RNF3788)",
+            c.line
+        );
     }
     // Every occurrence of a multiple-occurrence data structure starts as
     // the first one was set up (blanks, INZ values).

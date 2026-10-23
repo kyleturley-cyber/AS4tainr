@@ -364,6 +364,7 @@ impl Job<'_> {
             print: vec![],
             ibm: None,
             print_msg: None,
+            spool: None,
         }))
     }
 }

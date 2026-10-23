@@ -641,7 +641,11 @@ impl Machine<'_> {
                                 }
                             }
                         } else {
-                            Value::str(text)
+                            match self.type_of(&t) {
+                                Some(DType::Timestamp) => Value::str(&db2_timestamp(text)),
+                                Some(DType::Time(_)) => Value::str(&text.replace(':', ".")),
+                                _ => Value::str(text),
+                            }
                         };
                         if let Err(e) =
                             self.assign(&t, &val, Fit::Strict { half_adjust: false }, false)
@@ -1005,4 +1009,19 @@ impl Machine<'_> {
         let hosts = host_list(&sql[into + 4..])?;
         Ok(self.assign_hosts(&hosts, &row)?.unwrap_or(Outcome::ok(1)))
     }
+}
+
+/// A timestamp as PostgreSQL gives it ('2026-10-23 13:38:38.84'), in the
+/// form an RPG timestamp holds ('2026-10-23-13.38.38.840000'); other
+/// text as it is.
+fn db2_timestamp(t: &str) -> String {
+    let t = t.trim();
+    let Some((date, time)) = t.split_once(' ') else {
+        return t.to_string();
+    };
+    let time = time.split(['+', '-', 'Z']).next().unwrap_or(time);
+    let (hms, frac) = time.split_once('.').unwrap_or((time, ""));
+    let mut f = frac.to_string();
+    f.truncate(6);
+    format!("{date}-{}.{f:0<6}", hms.replace(':', "."))
 }

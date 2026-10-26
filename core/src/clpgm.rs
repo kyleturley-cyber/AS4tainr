@@ -4773,7 +4773,10 @@ async fn command(
                 write_back(vars, &targets, values)?;
             }
             match o {
-                Outcome::Messages(m) => msgs.extend(m),
+                Outcome::Messages(m) => {
+                    job.calls.own_queue.extend(m.iter().cloned());
+                    msgs.extend(m)
+                }
                 Outcome::SignOff => return Ok(Some(Outcome::SignOff)),
                 _ => {}
             }
@@ -4854,9 +4857,22 @@ async fn command(
                             false,
                         );
                     }
+                    job.calls.own_queue.extend(m.iter().cloned());
                     msgs.extend(m)
                 }
                 Outcome::SignOff => return Ok(Some(Outcome::SignOff)),
+                // A display command with OUTPUT(*PRINT): its report is a
+                // spooled file, which PASE `system` writes out
+                // (PUB400 2026-10-26, tools/golden/qsh.txt q_call: a CL
+                // program's DSPOBJD OUTPUT(*PRINT)).
+                Outcome::Display(d) if !d.print.is_empty() => {
+                    if let Some(id) = job.id.clone() {
+                        crate::spool::print_lines(job.client, &id, "QSYSPRT", &st.name, &d.print)
+                            .await?;
+                    } else {
+                        job.calls.printed.extend(d.print.iter().cloned());
+                    }
+                }
                 Outcome::Display(_)
                 | Outcome::ChangePassword
                 | Outcome::StartSql

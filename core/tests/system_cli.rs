@@ -439,6 +439,35 @@ fn pase_shell_job() {
     assert_eq!((r.out.len(), r.rc), (0, 0), "{:?}", r.out);
     let r = run(&dir, None, &format!("DLTMSGQ MSGQ({lib}/MQ)"));
     assert_eq!((ids(&r.out), r.rc), (vec!["CPC2191"], 0));
+    // A CL program's commands' completion messages stay on its own
+    // queue: `system` CALL shows none of them, only what the program
+    // sends its caller (PUB400 2026-10-26, tools/golden/verify1.txt
+    // v_call: CRTDTAARA's CPC0904 in the job log, nothing on stdout).
+    std::fs::write(
+        dir.join("own.clle"),
+        format!("PGM\n  CRTDTAARA DTAARA({lib}/OWNDA) TYPE(*CHAR)\n  SNDPGMMSG MSG('to caller')\nENDPGM\n"),
+    )
+    .unwrap();
+    let put = Command::new(env!("CARGO_BIN_EXE_as4tainr"))
+        .args(["--database-url", &url, "put"])
+        .arg(dir.join("own.clle"))
+        .arg(format!("{d}/own.clle"))
+        .output()
+        .unwrap();
+    assert!(put.status.success());
+    let r = run(
+        &dir,
+        Some(&lib),
+        &format!("CRTBNDCL PGM({lib}/OWN) SRCSTMF('own.clle')"),
+    );
+    assert_eq!(r.rc, 0, "{:?} {:?}", r.out, r.err);
+    let r = run(&dir, None, &format!("CALL {lib}/OWN"));
+    assert_eq!(
+        (r.out.clone(), r.rc),
+        (vec!["to caller".to_string()], 0),
+        "{:?}",
+        r.err
+    );
     assert_eq!(run(&dir, None, &format!("DLTLIB {lib}")).rc, 0);
 }
 

@@ -79,6 +79,12 @@ pub struct CallStack {
     /// The message data of the last command's completion message, when
     /// it has some (CRTSRVPGM: the service program and its library).
     pub message_data: Option<Vec<u8>>,
+    /// Messages a CL program received on its own queue (the completion
+    /// messages of the commands it ran, what the programs it called sent
+    /// it): in what the program returns, for the job log, but `system`
+    /// does not show them (PUB400 2026-10-26, tools/golden/verify1.txt
+    /// v_call, qsh.txt q_call).
+    pub own_queue: Vec<String>,
 }
 
 impl CallStack {

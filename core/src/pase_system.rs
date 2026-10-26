@@ -88,6 +88,7 @@ pub async fn run(job: &mut Job<'_>, args: &[String]) -> Output {
     };
     job.calls.printed.clear();
     job.calls.terminal.clear();
+    job.calls.own_queue.clear();
     crate::pgmmsg::take_stdout(&job.job_key());
     // The PASE program and QCMDEXC below the command on the call stack
     // (QWVRCSTK on PUB400, 2026-10-26, tools/golden/verify1.txt v_out:
@@ -120,6 +121,25 @@ pub async fn run(job: &mut Job<'_>, args: &[String]) -> Output {
     if result.is_err() {
         out.stdout.extend(printed.iter().cloned());
     }
+    // A CL program's own messages (its commands' completion messages,
+    // what the programs it called sent it) stay in its queue: `system`
+    // shows only what reached the command's caller (PUB400 2026-10-26,
+    // tools/golden/verify1.txt v_call, qsh.txt q_call).
+    let mut own = std::mem::take(&mut job.calls.own_queue);
+    let result = result.map(|o| match o {
+        Outcome::Messages(m) => Outcome::Messages(
+            m.into_iter()
+                .filter(|l| match own.iter().position(|x| x == l) {
+                    Some(i) => {
+                        own.remove(i);
+                        false
+                    }
+                    None => true,
+                })
+                .collect(),
+        ),
+        other => other,
+    });
     match result {
         Ok(Outcome::Messages(m)) if !opts.quiet => {
             out.stdout.extend(m.iter().map(|l| msg(l)));

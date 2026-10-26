@@ -585,6 +585,18 @@ pub fn listed_pop(job: &str, id: u64) {
     }
 }
 
+/// A listed entry's procedure name (an ILE program's entry procedure).
+pub fn listed_set_proc(job: &str, id: u64, proc: &str) {
+    let mut g = LISTED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = g
+        .as_mut()
+        .and_then(|m| m.get_mut(job))
+        .and_then(|s| s.iter_mut().find(|e| e.id == id))
+    {
+        e.proc = proc.to_string();
+    }
+}
+
 /// Every entry, innermost last: the procedures' and the listed ones in
 /// the order they started.
 pub fn stack_listed(job: &str) -> Vec<Entry> {

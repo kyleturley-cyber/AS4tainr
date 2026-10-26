@@ -89,7 +89,14 @@ pub async fn run(job: &mut Job<'_>, args: &[String]) -> Output {
     job.calls.printed.clear();
     job.calls.terminal.clear();
     crate::pgmmsg::take_stdout(&job.job_key());
+    // The PASE program and QCMDEXC below the command on the call stack
+    // (QWVRCSTK on PUB400, 2026-10-26, tools/golden/verify1.txt v_out:
+    // ".../QCMDEXC/QP2USER2"; entries further down were not captured).
+    let key = job.job_key();
+    let below = crate::pgmmsg::listed_push(&key, ("QSYS", "QP2USER2"), crate::ile::DEFAULT_GROUP);
+    crate::pgmmsg::listed_push(&key, ("QSYS", "QCMDEXC"), crate::ile::DEFAULT_GROUP);
     let result = job.run(&command).await;
+    crate::pgmmsg::listed_pop(&key, below);
     // What the command wrote to the terminal (QSH's output) came out
     // while it ran, before its messages (PUB400 2026-10-23).
     out.stdout.append(&mut job.calls.terminal);

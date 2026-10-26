@@ -6,3 +6,5 @@
 .DS_Store
 __pycache__/
 *.pyc
+# Files the Claude app saves into this folder
+/Claude outputs/

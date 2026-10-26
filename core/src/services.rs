@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 26";
+const VERSION: &str = "as4tainr services 27";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -769,6 +769,11 @@ DECLARE
 BEGIN
   IF q = '*' THEN
     q := upper(coalesce(current_setting('as4tainr.job', true), ''));
+    -- A process with no as4tainr job (PASE `system`, `call`) keeps no
+    -- job log in the catalog: no rows (fidelity-gaps).
+    IF q = '' THEN
+      RETURN;
+    END IF;
   END IF;
   IF split_part(q, '/', 1) ~ '^[0-9]{1,6}$' THEN
     n := split_part(q, '/', 1)::bigint;
@@ -1290,7 +1295,9 @@ pub fn view_record(name: &str) -> Option<crate::dds::PhysicalFile> {
 /// QSYS2.ENVIRONMENT_VARIABLE_INFO (IBM i services: ENVIRONMENT_VARIABLE_INFO
 /// view, system name ENV_VARS): the job's environment variables (JOB),
 /// then the system-level ones (SYSTEM). Columns and their system names
-/// from that page; the binary forms are the UTF-8 bytes here.
+/// from that page; the binary forms are the UTF-8 bytes here. A job
+/// variable added with CCSID(*JOB) shows the job's CCSID (273 on PUB400,
+/// 2026-10-26, tools/golden/verify1.txt v_out; as4tainr's jobs are 37).
 const ENV_VARS: &str = r#"
 CREATE OR REPLACE VIEW qsys2.environment_variable_info AS
 SELECT CAST(t AS varchar(6)) COLLATE "C" AS environment_variable_type,
@@ -1298,7 +1305,8 @@ SELECT CAST(t AS varchar(6)) COLLATE "C" AS environment_variable_type,
        CAST(value AS varchar(1024)) COLLATE "C" AS environment_variable_value,
        convert_to(name, 'UTF8') AS environment_variable_binary_name,
        convert_to(value, 'UTF8') AS environment_variable_binary_value,
-       CAST(CASE WHEN ccsid = 0 THEN 65535 ELSE ccsid END AS integer) AS environment_variable_ccsid
+       CAST(CASE WHEN ccsid <> 0 THEN ccsid WHEN t = 'JOB' THEN 37 ELSE 65535 END AS integer)
+         AS environment_variable_ccsid
 FROM (SELECT 'JOB' AS t, 1 AS o, name, value, ccsid FROM as4tainr.job_environment_variables
       WHERE job = current_setting('as4tainr.job_key', true)
       UNION ALL

@@ -6490,6 +6490,7 @@ impl Job<'_> {
                         // programs: for CALLPRC.
                         program.object = format!("{}/{}", p.library, name);
                         program.binding = p.binding.clone();
+                        program.pep = p.attribute == "CLLE";
                         let up = p.options.to_ascii_uppercase();
                         if let (true, Some(i)) = (
                             up.contains("DFTACTGRP(*NO)"),

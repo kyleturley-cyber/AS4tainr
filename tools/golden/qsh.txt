@@ -8,7 +8,7 @@
 q_cleanup|!system -q "DLTPGM PGM(AS4TRAINR1/GLDQSH)"; system -q "DLTF FILE(AS4TRAINR1/GLDQSO)"; system -q "DLTCMD CMD(AS4TRAINR1/GLDCAS)"; system -q "DLTPGM PGM(AS4TRAINR1/GLDCASC)"; system -q "DLTF FILE(AS4TRAINR1/GLDQCMD)"; rm -f /home/AS4TRAINR/gld/qshout.txt; echo cleaned
 q_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLDQSO (ID CHAR(10) NOT NULL, VAL CHAR(150) NOT NULL)') COMMIT(*NONE)
 q_tag|!for f in gldqsh.clle gldcas.cmd gldcasc.clle; do setccsid 819 /home/AS4TRAINR/gld/$f; done; ls -l /home/AS4TRAINR/gld
-q_crt|!system "CRTBNDCL PGM(AS4TRAINR1/GLDQSH) SRCSTMF('/home/AS4TRAINR/gld/gldqsh.clle')" | grep -B2 -E "^ *\* CP" | head -60
+q_crt|!system "CRTBNDCL PGM(AS4TRAINR1/GLDQSH) SRCSTMF('/home/AS4TRAINR/gld/gldqsh.clle')" | awk '/^ *\* CP/ { print p; print } { p = $0 }' | head -60
 q_call|CALL PGM(AS4TRAINR1/GLDQSH)
 q_out|CPYF FROMFILE(AS4TRAINR1/GLDQSO) TOFILE(*PRINT)
 # The output file QSH wrote: its CCSID and contents.

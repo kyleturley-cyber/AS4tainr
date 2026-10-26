@@ -15440,7 +15440,10 @@ PARM KWD(OUT) TYPE(*CHAR) LEN(10) RTNVAL(*YES) MIN(1)
         m,
         [
             format!("PGM CHK/{lib}"),
-            "S |CHK/QCATRS/CALLER/".to_string(),
+            // Each ILE CL program is two entries, its entry procedure and
+            // its procedure (PUB400 2026-10-26, tools/golden/verify1.txt
+            // v_out: "S |GLDVCHK/GLDVCHK/QCATRS/GLDVCALL/GLDVCALL/...").
+            "S |CHK/CHK/QCATRS/CALLER/CALLER/".to_string(),
             // An unquoted value is in capitals.
             "R=got ABC".to_string(),
         ],
@@ -15576,6 +15579,17 @@ async fn qcmdexc_function_lprintf_and_environment_variables_view() {
         ))
         .await,
         ["JOB|job value", "SYSTEM|sys value"]
+    );
+    // A job variable with CCSID(*JOB) shows the job's CCSID (PUB400
+    // 2026-10-26, tools/golden/verify1.txt v_out: 273, its job CCSID;
+    // as4tainr's jobs are CCSID 37).
+    assert_eq!(
+        rows(format!(
+            "select environment_variable_ccsid from qsys2.environment_variable_info
+              where environment_variable_name = '{jv}' and environment_variable_type = 'JOB'"
+        ))
+        .await,
+        ["37"]
     );
     assert_eq!(
         rows(format!("select var_type, var_value from qsys2.env_vars where var_name = '{jv}' and var_type = 'SYSTEM'"))

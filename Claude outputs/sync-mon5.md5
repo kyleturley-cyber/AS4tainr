@@ -1,8 +1,0 @@
-caf1be5e5e906abacad99022b1217c84  ./tools/golden/qsh.txt
-cbff91364d2c58cbb05e7b2135dff2d0  ./docs/fidelity-gaps.md
-7afc96b0deca310902eb4b701cf7c75f  ./core/src/commands.rs
-b88aada362c519d65390cbbdfcc1271f  ./core/src/services.rs
-109556caa9cd8c5362b0b68ee4d8b843  ./core/src/clpgm.rs
-957c6786e5bb96d23fcaef025f42c3ef  ./core/src/pase_system.rs
-f5380d061d08304abaf1beb7cf27d570  ./core/src/pgmmsg.rs
-802b36298882050db8d6e6277635ce6a  ./core/tests/rla_test.rs

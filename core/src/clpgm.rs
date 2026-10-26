@@ -1213,6 +1213,9 @@ pub struct Program {
     pub binding: Option<crate::ile::Binding>,
     pub object: String,
     pub actgrp: String,
+    /// Called as an ILE program (CRTBNDCL): its call stack has the
+    /// program entry procedure below the program's procedure.
+    pub pep: bool,
     /// The files DCLF declares, in order.
     pub files: Vec<DeclaredFile>,
 }
@@ -2498,6 +2501,7 @@ pub fn compile_with(
         binding: None,
         object: String::new(),
         actgrp: crate::ile::DEFAULT_GROUP.into(),
+        pep: false,
         files: declared_files,
     })
 }
@@ -2602,7 +2606,17 @@ pub async fn run(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Result<Ou
         .map(|(l, n)| (l.to_string(), n.to_string()))
         .unwrap_or_else(|| (String::new(), pgm.name.clone()));
     let job_key = job.job_key();
-    let entry = crate::pgmmsg::listed_push(&job_key, (&lib, &name), &pgm.actgrp);
+    // An ILE CL program is two entries, as on IBM i: the program entry
+    // procedure, then the program's own procedure (QWVRCSTK on PUB400,
+    // 2026-10-26, tools/golden/verify1.txt v_out: GLDVCHK twice).
+    let entry = if pgm.pep {
+        let e = crate::pgmmsg::listed_push(&job_key, (&lib, &name), &pgm.actgrp);
+        crate::pgmmsg::listed_set_proc(&job_key, e, "_CL_PEP");
+        crate::pgmmsg::listed_push(&job_key, (&lib, &name), &pgm.actgrp);
+        e
+    } else {
+        crate::pgmmsg::listed_push(&job_key, (&lib, &name), &pgm.actgrp)
+    };
     let r = run_program(job, pgm, args).await;
     crate::pgmmsg::listed_pop(&job_key, entry);
     job.calls.leave();

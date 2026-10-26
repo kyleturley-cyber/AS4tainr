@@ -24,7 +24,7 @@ Physical files also accept `DESCEND` on their key fields now.
 | IBM i | as4tainr |
 | --- | --- |
 | Logical file | A PostgreSQL view over the physical file's table: `rrn` and the chosen fields, `WHERE` the select/omit rules |
-| Its access path | An index on the physical file's table, in key order (DESC for DESCEND keys) then arrival order, partial (`WHERE` select/omit) when there are rules |
+| Its access path | An index on the physical file's table, in key order (DESC for DESCEND keys) then arrival order, partial (`WHERE` select/omit) when there are rules; character keys in EBCDIC order (lowercase, uppercase, digits), as on IBM i |
 | UNIQUE | A partial unique index on the keys, over the records the logical file selects: records it omits do not count as duplicates |
 
 Record-level access needs nothing special: SETLL, SETGT, CHAIN, READ, READP, READE, READPE work on the view, and WRITE, UPDATE and DELETE through it change the physical file (a record written through a logical file that its rules omit is still written, as on IBM i). With a DESCEND key, "after" a key means a smaller value: `SETLL 1250.50` on a descending balance key positions at the first balance at or below 1250.50.

@@ -176,6 +176,16 @@ pub struct ParamInfo {
     /// OPTIONS(*STRING) on a pointer: a character value is passed as a
     /// pointer to a null-terminated copy of it.
     pub string: bool,
+    /// OPTIONS(*VARSIZE): the argument may be shorter or longer than the
+    /// parameter.
+    pub varsize: bool,
+    /// OPTIONS(*TRIM): a character argument is passed with its leading and
+    /// trailing blanks removed (ILE RPG Reference, OPTIONS(*TRIM)).
+    pub trim: bool,
+    /// OPTIONS(*CONVERT): a numeric, date, time or timestamp argument to a
+    /// character parameter passed by value or read-only reference is
+    /// converted as %CHAR converts it (ILE RPG Reference, OPTIONS).
+    pub convert: bool,
     /// In a procedure interface: the buffer the parameter is bound to
     /// (aliased to the caller's storage when passed by reference).
     pub buf: Option<usize>,
@@ -208,6 +218,9 @@ pub struct Proto {
 #[derive(Clone, Debug)]
 pub struct ProcInfo {
     pub name: String,
+    /// The external name its interface gives (EXTPROC('name'),
+    /// EXTPROC(*DCLCASE)), its case kept.
+    pub written: Option<String>,
     /// Local names (variables with `local` set: their buffers are the
     /// frame's), constants and key lists.
     pub syms: HashMap<String, Sym>,
@@ -223,6 +236,8 @@ pub struct ProcInfo {
     pub export: bool,
     /// Based storage (BASED): frame buffer → the basing pointer's name.
     pub based: HashMap<usize, String>,
+    /// Local pointers with INZ(%ADDR(x)): set at each call.
+    pub ptr_inz: Vec<(String, Expr)>,
 }
 
 #[derive(Clone, Debug)]
@@ -279,6 +294,9 @@ pub struct Program {
     pub auto_dtaaras: Vec<(String, String)>,
     /// Global fields with INZ(*USER).
     pub user_inz: Vec<String>,
+    /// Global pointers with INZ(%ADDR(x)) or INZ(%PADDR(x)): set as the
+    /// program starts.
+    pub ptr_inz: Vec<(String, Expr)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -592,7 +610,7 @@ fn display_type(f: &crate::dspf::Field) -> DType {
     match f.dtype {
         'L' => return DType::Date(crate::rpg::dates::DateFmt::iso()),
         'T' => return DType::Time(crate::rpg::dates::TimeFmt::iso()),
-        'Z' => return DType::Timestamp,
+        'Z' => return DType::Timestamp(6),
         _ => {}
     }
     match f.decimals {
@@ -661,6 +679,28 @@ fn const_value(e: &Expr, syms: &HashMap<String, Sym>) -> Result<Value> {
             };
             Value::Num(Dec::from_i64(n))
         }
+        // %DECPOS of a numeric item (ILE RPG Reference, %DECPOS: allowed
+        // in definitions).
+        // A date or time literal (D'...', T'...'): its *ISO text.
+        Expr::Bif(f, a)
+            if (f == "DATE" || f == "TIME")
+                && matches!(a.as_slice(), [Expr::Str(_), Expr::Name { parts, .. }] if parts[0] == "*ISO") =>
+        {
+            let Expr::Str(s) = &a[0] else { unreachable!() };
+            Value::Char(s.clone())
+        }
+        Expr::Bif(f, a) if f == "DECPOS" && a.len() == 1 => {
+            let Expr::Name { parts, args: None } = &a[0] else {
+                bail!("%DECPOS needs the name of a numeric item");
+            };
+            let name = parts.join(".");
+            match syms.get(&name) {
+                Some(Sym::Var(v)) if v.dtype.is_numeric() => {
+                    Value::Num(Dec::from_i64(v.dtype.precision().1 as i64))
+                }
+                _ => bail!("%DECPOS({name}): it is not a numeric item defined before it is used"),
+            }
+        }
         Expr::Bin(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), l, r) => {
             let (l, r) = (const_value(l, syms)?.num()?, const_value(r, syms)?.num()?);
             Value::Num(match op {
@@ -689,11 +729,12 @@ pub const SYSTEM_PROCEDURES: &[&str] = &["QP0ZLPRINTF"];
 impl Program {
     /// Procedures this module exports.
     pub fn exports(&self) -> Vec<String> {
+        // By the name other modules call it by (EXTPROC aliases too).
         let mut v: Vec<String> = self
             .procs
-            .values()
-            .filter(|p| p.export)
-            .map(|p| p.name.clone())
+            .iter()
+            .filter(|(_, p)| p.export)
+            .map(|(k, _)| k.clone())
             .collect();
         v.sort();
         v
@@ -730,7 +771,7 @@ pub fn program_type(f: &crate::dds::FieldDef, in_ds: bool, extbinint: bool) -> O
         DataType::Binary => DType::Binary(f.length, f.decimals),
         DataType::Date => DType::Date(crate::rpg::dates::DateFmt::iso()),
         DataType::Time => DType::Time(crate::rpg::dates::TimeFmt::iso()),
-        DataType::Timestamp => DType::Timestamp,
+        DataType::Timestamp => DType::Timestamp(6),
         DataType::Packed => DType::Packed(f.length, f.decimals),
         DataType::Zoned => {
             if in_ds {
@@ -755,10 +796,20 @@ struct Binder<'a> {
     /// Pending INZ values: (variable, value, or its text when it refers to
     /// a name defined later, as %SIZE of a later subfield can).
     inz: Vec<(String, Result<Value, String>)>,
+    /// INZ(*LIKEDS) copies of a template's storage made once the pending
+    /// INZ values are in: (template in this binder's storage (not the
+    /// globals), its buffer, offset, size, target buffer, target offsets).
+    inz_copies: Vec<(bool, usize, usize, usize, usize, Vec<usize>)>,
     /// INZ(*USER): set to the job's user profile when the program starts.
     user_inz: Vec<String>,
+    /// INZ(%ADDR(x)) of pointers: (pointer, the expression).
+    ptr_inz: Vec<(String, String)>,
     /// Binding a procedure's local storage.
     local: bool,
+    /// The procedure interface's parameters LIKEDS a data structure: name
+    /// → the template (a local DS may be LIKEDS such a parameter, and the
+    /// interface is bound after the data structures).
+    param_likeds: HashMap<String, String>,
     /// Local buffers of STATIC variables (moved to global storage).
     statics: Vec<usize>,
     /// Global storage, seen (for templates) while binding a procedure.
@@ -837,6 +888,22 @@ impl Binder<'_> {
         protos: &mut HashMap<String, Proto>,
     ) -> Result<Option<Interface>> {
         let mut pi = None;
+        {
+            let mut in_pi = false;
+            for d in defs {
+                match d.kind {
+                    DefKind::Interface => in_pi = true,
+                    DefKind::Param if in_pi => {
+                        if let Some(t) = keyword(&d.keywords, "LIKEDS").and_then(|k| k.args.first())
+                        {
+                            self.param_likeds
+                                .insert(d.name.to_ascii_uppercase(), t.trim().to_ascii_uppercase());
+                        }
+                    }
+                    _ => in_pi = false,
+                }
+            }
+        }
         // Prototypes are bound last: they allocate nothing, and a
         // parameter's LIKEDS may name a data structure defined after them.
         let mut order: Vec<usize> = Vec::new();
@@ -935,6 +1002,34 @@ impl Binder<'_> {
                 .map(|a| a.trim().to_ascii_uppercase())
                 .unwrap_or_default()
         };
+        // Constants whose value names a field LIKE another (%LEN(x),
+        // %DECPOS(x) of such a field) come after those fields.
+        let like_names: Vec<String> = like
+            .iter()
+            .map(|&i| defs[i].name.to_ascii_uppercase())
+            .collect();
+        let mut late_consts: Vec<usize> = Vec::new();
+        if !like_names.is_empty() {
+            order.retain(|&i| {
+                if defs[i].kind != DefKind::Const {
+                    return true;
+                }
+                let text: String = defs[i]
+                    .keywords
+                    .iter()
+                    .flat_map(|k| k.args.iter())
+                    .map(|a| a.to_ascii_uppercase())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let names = text
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || "_#$@".contains(c)))
+                    .any(|w| like_names.iter().any(|n| n == w));
+                if names {
+                    late_consts.push(i);
+                }
+                !names
+            });
+        }
         while !like.is_empty() {
             let pending: Vec<String> = like.iter().map(|&i| defs[i].name.clone()).collect();
             let (ready, wait): (Vec<usize>, Vec<usize>) = like
@@ -947,7 +1042,25 @@ impl Binder<'_> {
             order.extend(ready);
             like = wait;
         }
+        order.extend(late_consts);
         order.extend(later);
+        // Named constants of a literal value may be used before they are
+        // defined (DIM(n) above DCL-C n): they come first.
+        let literal_const = |i: usize| {
+            defs[i].kind == DefKind::Const
+                && defs[i].keywords.iter().all(|k| {
+                    k.args.iter().all(|a| {
+                        let t = a.trim();
+                        t.starts_with('\'')
+                            || t.to_ascii_uppercase().starts_with("X'")
+                            || (!t.is_empty()
+                                && t.chars().all(|c| c.is_ascii_digit() || ".,+-".contains(c)))
+                    })
+                })
+        };
+        let (first, rest): (Vec<usize>, Vec<usize>) =
+            order.iter().partition(|&&i| literal_const(i));
+        order = first.into_iter().chain(rest).collect();
         // A procedure's local field may be LIKE one of its parameters
         // (ILE RPG Reference, LIKE: any field, parameters included),
         // although the interface is bound after the fields: the
@@ -1114,6 +1227,21 @@ impl Binder<'_> {
                                     .iter()
                                     .any(|a| a.trim().eq_ignore_ascii_case("*STRING"))
                             }),
+                            varsize: keyword(&p.keywords, "OPTIONS").is_some_and(|k| {
+                                k.args
+                                    .iter()
+                                    .any(|a| a.trim().eq_ignore_ascii_case("*VARSIZE"))
+                            }),
+                            trim: keyword(&p.keywords, "OPTIONS").is_some_and(|k| {
+                                k.args
+                                    .iter()
+                                    .any(|a| a.trim().eq_ignore_ascii_case("*TRIM"))
+                            }),
+                            convert: keyword(&p.keywords, "OPTIONS").is_some_and(|k| {
+                                k.args
+                                    .iter()
+                                    .any(|a| a.trim().eq_ignore_ascii_case("*CONVERT"))
+                            }),
                             buf,
                             file: likefile,
                         });
@@ -1254,6 +1382,24 @@ impl Binder<'_> {
                 }
             }
         }
+        // Then INZ(*LIKEDS) data structures take their templates' storage,
+        // in the order they were defined (a template can itself hold an
+        // INZ(*LIKEDS) subfield).
+        for (own, sbuf, soff, size, dbuf, at) in std::mem::take(&mut self.inz_copies) {
+            let from = if own { &self.bufs } else { &self.globals };
+            let Some(bytes) = from
+                .get(sbuf)
+                .and_then(|b| b.get(soff..soff + size))
+                .map(|b| b.to_vec())
+            else {
+                continue;
+            };
+            for a in at {
+                if let Some(dst) = self.bufs[dbuf].get_mut(a..a + size) {
+                    dst.copy_from_slice(&bytes);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1377,6 +1523,16 @@ impl Binder<'_> {
                     bail!("INZ(*USER) on a local variable of a procedure is not supported yet");
                 }
                 self.user_inz.push(name.to_string());
+                return Ok(());
+            }
+            // A pointer's INZ(%ADDR(x)) or INZ(%PADDR(x)) (ILE RPG
+            // Reference, INZ: a pointer can be initialized with %ADDR or
+            // %PADDR): set when the storage is (program start, call).
+            if let Some(a) = k.args.first().filter(|a| {
+                let u = a.trim().to_ascii_uppercase();
+                u.starts_with("%ADDR") || u.starts_with("%PADDR")
+            }) {
+                self.ptr_inz.push((name.to_string(), a.trim().to_string()));
                 return Ok(());
             }
             if let Some(a) = k.args.first().filter(|a| !a.is_empty()) {
@@ -1511,9 +1667,20 @@ impl Binder<'_> {
         // Group subfields (no type or length) → their index in `subs`.
         let mut groups: HashMap<String, usize> = HashMap::new();
         if let Some(other) = &likeds {
-            let Some(Sym::Ds(o)) = self.syms.get(other).cloned() else {
+            let found = match self.syms.get(other) {
+                Some(Sym::Ds(o)) => Some((other.clone(), o.clone())),
+                _ => self
+                    .param_likeds
+                    .get(other)
+                    .and_then(|t| match self.syms.get(t) {
+                        Some(Sym::Ds(o)) => Some((t.clone(), o.clone())),
+                        _ => None,
+                    }),
+            };
+            let Some((tname, o)) = found else {
                 bail!("LIKEDS({other}): not a data structure")
             };
+            let other = &tname;
             template = Some((other.clone(), o.clone()));
             for sf in &o.subfields {
                 let key = if o.qualified {
@@ -1689,7 +1856,11 @@ impl Binder<'_> {
             .map(|a| num_arg(a, &self.syms))
             .transpose()?
             .map(|n| n as usize)
-            .or(d.to.map(|t| t as usize));
+            .or(d.to.map(|t| t as usize))
+            // LIKEDS: the template's length, LEN included (ILE RPG
+            // Reference, LIKEDS: the new data structure has the same
+            // subfields and length).
+            .or(template.as_ref().map(|(_, o)| o.size));
         let size = explicit
             .unwrap_or(0)
             .max(
@@ -1769,6 +1940,18 @@ impl Binder<'_> {
                     self.bufs[buf][at..at + n].copy_from_slice(&bytes[..n]);
                 }
             }
+            // A template in this storage gets its INZ values later: copy
+            // it again then.
+            if o.local == self.local {
+                self.inz_copies.push((
+                    true,
+                    o.buf,
+                    o.off,
+                    o.size.min(size),
+                    buf,
+                    (0..reps as usize).map(|e| e * size).collect(),
+                ));
+            }
             let pending: Vec<(String, Result<Value, String>)> = self
                 .inz
                 .iter()
@@ -1789,7 +1972,12 @@ impl Binder<'_> {
         // with the template's subfields (and their own nested ones) under
         // its name: LIST.USERS.NAME.
         for (k, template, o) in &nested {
-            let (sname, _, off, sdim, _) = &subs[*k];
+            let (sname, _, off, sdim, sdef) = &subs[*k];
+            let sub_inz_likeds = keyword(&sdef.keywords, "INZ").is_some_and(|k| {
+                k.args
+                    .first()
+                    .is_some_and(|a| a.trim().eq_ignore_ascii_case("*LIKEDS"))
+            });
             let prefix = if qualified || likeds.is_some() || likerec.is_some() {
                 format!("{name}.{sname}")
             } else {
@@ -1845,6 +2033,39 @@ impl Binder<'_> {
                 for n in 0..(*sdim).max(1) as usize {
                     let at = e * size + off + n * o.size;
                     self.bufs[buf][at..at + o.size].copy_from_slice(&src);
+                }
+            }
+            // INZ(*LIKEDS) on the subfield: the template's initial values
+            // (ILE RPG Reference, INZ keyword: "*LIKEDS"), known once the
+            // pending INZ values of this storage are in.
+            if sub_inz_likeds && o.local == self.local {
+                let mut at = Vec::new();
+                for e in 0..reps as usize {
+                    for n in 0..(*sdim).max(1) as usize {
+                        at.push(e * size + off + n * o.size);
+                    }
+                }
+                self.inz_copies.push((true, o.buf, o.off, o.size, buf, at));
+            }
+            // INZ on the data structure: the LIKEDS subfield's own
+            // subfields get their types' initial values too (ILE RPG
+            // Reference, INZ: every subfield of the data structure; a
+            // numeric one in a nested data structure is zero, not blanks).
+            if has_inz && !inz_likeds {
+                for (_, sym) in &add {
+                    let Sym::Var(v) = sym else { continue };
+                    let init = v.dtype.initial();
+                    let n = init.len();
+                    for e in 0..reps as usize {
+                        for s in 0..(*sdim).max(1) as usize {
+                            for k in 0..v.dim.max(1) as usize {
+                                let at = e * size + s * o.size + v.off + k * v.stride;
+                                if let Some(dst) = self.bufs[buf].get_mut(at..at + n) {
+                                    dst.copy_from_slice(&init);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             for (key, sym) in add {
@@ -1934,6 +2155,25 @@ impl Program {
     pub fn timfmt(&self) -> Result<crate::rpg::dates::TimeFmt> {
         control_timfmt(&self.control)
     }
+
+    /// The control specification's DECEDIT: the decimal point
+    /// character, and whether a zero goes before it ('0.', '0,').
+    /// *JOBRUN and no DECEDIT: the job's decimal format, which as4tainr
+    /// keeps as IBM ships QDECFMT (blank: a period, no zero).
+    pub fn decedit(&self) -> (char, bool) {
+        match keyword(&self.control, "DECEDIT").and_then(|k| k.args.first()) {
+            Some(a) => {
+                let v = a.trim().trim_matches('\'');
+                match v {
+                    "," => (',', false),
+                    "0," => (',', true),
+                    "0." => ('.', true),
+                    _ => ('.', false),
+                }
+            }
+            None => ('.', false),
+        }
+    }
 }
 
 /// The control specification's DATFMT (*ISO when it has none).
@@ -1965,7 +2205,9 @@ pub fn bind(
         externals,
         file_fields: HashMap::new(),
         inz: vec![],
+        inz_copies: vec![],
         user_inz: vec![],
+        ptr_inz: vec![],
         globals: vec![],
         extbinint: keyword(&src.control, "EXTBININT")
             .and_then(|k| k.args.first())
@@ -1973,6 +2215,7 @@ pub fn bind(
         datfmt: control_datfmt(&src.control)?,
         timfmt: control_timfmt(&src.control)?,
         local: false,
+        param_likeds: HashMap::new(),
         statics: vec![],
         occurs: vec![],
         based: HashMap::new(),
@@ -2395,8 +2638,11 @@ pub fn bind(
             externals,
             file_fields: b.file_fields.clone(),
             inz: vec![],
+            inz_copies: vec![],
             user_inz: vec![],
+            ptr_inz: vec![],
             local: true,
+            param_likeds: HashMap::new(),
             statics: vec![],
             globals: b.bufs.clone(),
             extbinint: b.extbinint,
@@ -2467,14 +2713,31 @@ pub fn bind(
             pr.name.clone(),
             ProcInfo {
                 name: pr.name.clone(),
+                written: pr
+                    .defs
+                    .iter()
+                    .find(|d| d.kind == DefKind::Interface)
+                    .and_then(|d| keyword(&d.keywords, "EXTPROC"))
+                    .and_then(|k| match k.args.first() {
+                        Some(a) if a.trim().starts_with('*') => k.args.get(1),
+                        a => a,
+                    })
+                    .map(|a| a.trim())
+                    .filter(|a| a.starts_with('\''))
+                    .map(|a| a.trim_matches('\'').to_string()),
                 syms,
-                frame: pb.bufs,
+                frame: pb.bufs.into_iter().map(super::mem::padded).collect(),
                 params,
                 returns,
                 routines: code::build(body).map_err(|e| anyhow!("procedure {}: {e}", pr.name))?,
                 on_exit,
                 export: pr.export,
                 based: pb.based,
+                ptr_inz: pb
+                    .ptr_inz
+                    .iter()
+                    .map(|(n, e)| Ok((n.clone(), expr::parse(e)?)))
+                    .collect::<Result<Vec<_>>>()?,
             },
         );
     }
@@ -2498,6 +2761,25 @@ pub fn bind(
     if let Some(m) = &main {
         if !procs.contains_key(m) {
             bail!("ctl-opt main({m}): there is no procedure {m}");
+        }
+    }
+    // A procedure whose prototype has EXTPROC('name') is that name to
+    // other modules (ILE RPG Reference, EXTPROC: the external name of the
+    // procedure): it is found by both.
+    let aliases: Vec<(String, String)> = procs
+        .keys()
+        .filter_map(|n| {
+            protos
+                .get(n)
+                .and_then(|p| p.extproc.clone())
+                .map(|e| e.to_ascii_uppercase())
+                .filter(|e| e != n && !procs.contains_key(e))
+                .map(|e| (n.clone(), e))
+        })
+        .collect();
+    for (n, e) in aliases {
+        if let Some(pi) = procs.get(&n).cloned() {
+            procs.insert(e, pi);
         }
     }
     let routines = code::build(&src.calcs)?;
@@ -2603,7 +2885,7 @@ pub fn bind(
         nomain,
         name: name.to_ascii_uppercase(),
         syms: b.syms,
-        globals: b.bufs,
+        globals: b.bufs.into_iter().map(super::mem::padded).collect(),
         files,
         routines,
         entry,
@@ -2619,6 +2901,11 @@ pub fn bind(
             .map(ds_key),
         auto_dtaaras: auto_dtaaras(src),
         user_inz: b.user_inz.clone(),
+        ptr_inz: b
+            .ptr_inz
+            .iter()
+            .map(|(n, e)| Ok((n.clone(), expr::parse(e)?)))
+            .collect::<Result<Vec<_>>>()?,
         protos,
         procs,
         main,

@@ -6,12 +6,68 @@
 
 /// The functions, as SQL for the services batch.
 pub fn sql() -> String {
-    format!("{FUNCTIONS}\n{MORE}\n{}", grants())
+    format!("{FUNCTIONS}\n{MORE}\n{}\n{}", grants(), implicit_casts())
+}
+
+/// Implicit casting between strings and numbers (Db2 for i SQL Reference,
+/// "Casting between data types": a character string compared with or
+/// used in arithmetic with a number is cast to a number; as DECFLOAT
+/// there, NUMERIC here). PostgreSQL has no such casts, so these
+/// operators and MOD functions for (text, numeric) and (numeric, text)
+/// stand in, in the schema `as4tainr_cast` that ends every SQL search
+/// path (`sql::search_path`). CHAR and VARCHAR values reach them through
+/// PostgreSQL's own implicit casts to text, integers through theirs to
+/// numeric; a string that is not a number fails as a cast does.
+fn implicit_casts() -> String {
+    let role = crate::sql::SQL_ROLE;
+    let mut out = format!(
+        "CREATE SCHEMA IF NOT EXISTS {s};\nGRANT USAGE ON SCHEMA {s} TO {role};\n",
+        s = crate::sql::CAST_SCHEMA
+    );
+    let s = crate::sql::CAST_SCHEMA;
+    let ops: [(&str, &str, &str, &str); 10] = [
+        ("=", "eq", "boolean", "="),
+        ("<>", "ne", "boolean", "<>"),
+        ("<", "lt", "boolean", "<"),
+        (">", "gt", "boolean", ">"),
+        ("<=", "le", "boolean", "<="),
+        (">=", "ge", "boolean", ">="),
+        ("+", "add", "numeric", "+"),
+        ("-", "sub", "numeric", "-"),
+        ("*", "mul", "numeric", "*"),
+        ("/", "div", "numeric", "/"),
+    ];
+    for (left, right, tag) in [("text", "numeric", "tn"), ("numeric", "text", "nt")] {
+        let (a, b) = if left == "text" {
+            ("CAST($1 AS numeric)", "$2")
+        } else {
+            ("$1", "CAST($2 AS numeric)")
+        };
+        for (op, name, ret, pgop) in ops {
+            out.push_str(&format!(
+                "CREATE OR REPLACE FUNCTION {s}.{name}_{tag}({left}, {right}) RETURNS {ret}
+LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, pg_temp AS $as4tainr$ SELECT {a} {pgop} {b} $as4tainr$;
+DO $as4tainr$ BEGIN
+  CREATE OPERATOR {s}.{op} (LEFTARG = {left}, RIGHTARG = {right}, FUNCTION = {s}.{name}_{tag});
+EXCEPTION WHEN duplicate_function OR duplicate_object THEN NULL;
+END $as4tainr$;
+"
+            ));
+        }
+        out.push_str(&format!(
+            "CREATE OR REPLACE FUNCTION {s}.mod({left}, {right}) RETURNS numeric
+LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, pg_temp AS $as4tainr$ SELECT mod({a}, {b}) $as4tainr$;
+"
+        ));
+    }
+    out
 }
 
 fn grants() -> String {
     let role = crate::sql::SQL_ROLE;
     let sigs = [
+        "job_name()",
+        "source_lines(text, text, text)",
         "char(numeric)",
         "char(smallint)",
         "char(integer)",
@@ -265,6 +321,24 @@ LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, pg_temp AS $as4tainr$
 // The rules and examples are those of the Db2 for i SQL Reference, scalar
 // functions (IBM i 7.5).
 const MORE: &str = r#"
+-- A source member's records, for an alias or an override naming it
+-- (SRCSEQ numbers the lines 1.00, 2.00..., SRCDAT 0, SRCDTA the line).
+CREATE OR REPLACE FUNCTION as4tainr_svc.source_lines(lib text, fil text, mbr text)
+RETURNS TABLE (srcseq numeric(6,2), srcdat numeric(6,0), srcdta varchar(32754))
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $as4tainr$
+BEGIN
+  RETURN QUERY
+  SELECT CAST(l.n AS numeric(6,2)), CAST(0 AS numeric(6,0)), CAST(l.t AS varchar(32754))
+    FROM as4tainr.source_members m,
+         LATERAL regexp_split_to_table(m.source, E'\n') WITH ORDINALITY AS l(t, n)
+   WHERE m.library = lib AND m.file = fil AND m.member = mbr AND m.source <> '';
+END $as4tainr$;
+-- QSYS2.JOB_NAME (Db2 for i SQL Reference, built-in global variables):
+-- the job's qualified name, number/user/name.
+CREATE OR REPLACE FUNCTION as4tainr_svc.job_name() RETURNS varchar(28)
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $as4tainr$
+  SELECT CAST(COALESCE(NULLIF(current_setting('as4tainr.job', true), ''),
+                       NULLIF(current_setting('application_name'), '')) AS varchar(28)) $as4tainr$;
 -- DATE: of a date or timestamp; of a number n, the date n - 1 days after
 -- January 1, 0001; of a string, the date it represents (ISO, USA, EUR,
 -- JIS, a timestamp, or yyyynnn, a year and a day of the year).

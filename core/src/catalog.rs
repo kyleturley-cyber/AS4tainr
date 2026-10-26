@@ -158,8 +158,108 @@ BEGIN
     -- (views are files with `view`); null for files made from DDS.
     ALTER TABLE as4tainr.files ADD COLUMN IF NOT EXISTS sql_type text;
   END IF;
+  -- A generated column (ROW CHANGE TIMESTAMP, auditing columns): what it
+  -- holds (dds::Generated).
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='file_fields' AND column_name='generated') THEN
+    ALTER TABLE as4tainr.file_fields ADD COLUMN IF NOT EXISTS generated text;
+  END IF;
 END $$;
+-- SQL aliases (CREATE ALIAS): the view of that name is the alias.
+CREATE TABLE IF NOT EXISTS as4tainr.sql_aliases (
+    library        text NOT NULL,
+    name           text NOT NULL,
+    target_library text NOT NULL,
+    target_file    text NOT NULL,
+    member         text,
+    PRIMARY KEY (library, name)
+);
+-- INSERT through such an alias: a record added at the member's end.
+CREATE OR REPLACE FUNCTION as4tainr.source_alias_insert() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+BEGIN
+  UPDATE as4tainr.source_members
+     SET source = CASE WHEN source = '' THEN rtrim(coalesce(NEW.srcdta, ''))
+                       ELSE source || E'\n' || rtrim(coalesce(NEW.srcdta, '')) END,
+         changed = now()
+   WHERE library = TG_ARGV[0] AND file = TG_ARGV[1] AND member = TG_ARGV[2];
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Member % of file % in library % not found.', TG_ARGV[2], TG_ARGV[1], TG_ARGV[0]
+      USING ERRCODE = '42704';
+  END IF;
+  RETURN NEW;
+END $f$;
+-- Generated columns: set for each insert and update, by SQL and by
+-- record-level access alike (Db2 for i SQL Programming, "Creating
+-- auditing columns"). The arguments: column, what it holds, in pairs.
+CREATE OR REPLACE FUNCTION as4tainr.generated_columns() RETURNS trigger
+LANGUAGE plpgsql AS $f$
+DECLARE
+  i int := 0;
+  v text;
+  j jsonb := '{}';
+BEGIN
+  WHILE i + 1 < TG_NARGS LOOP
+    v := CASE
+      WHEN TG_ARGV[i + 1] = 'ROWCHG' THEN to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.US')
+      WHEN TG_ARGV[i + 1] = 'DCO' THEN CASE TG_OP WHEN 'INSERT' THEN 'I' ELSE 'U' END
+      WHEN TG_ARGV[i + 1] = 'JOB' THEN COALESCE(NULLIF(current_setting('as4tainr.job', true), ''),
+                                               NULLIF(current_setting('application_name'), ''))
+      WHEN TG_ARGV[i + 1] = 'USER' THEN COALESCE(NULLIF(current_setting('as4tainr.user', true), ''),
+                                                NULLIF(split_part(current_setting('application_name'), '/', 2), ''),
+                                                upper(session_user))
+      WHEN TG_ARGV[i + 1] LIKE 'SERVER=%' THEN substr(TG_ARGV[i + 1], 8)
+    END;
+    j := j || jsonb_build_object(TG_ARGV[i], v);
+    i := i + 2;
+  END LOOP;
+  NEW := jsonb_populate_record(NEW, j);
+  RETURN NEW;
+END $f$;
 "#;
+
+/// The trigger that sets a table's generated columns (none: no trigger).
+pub async fn generated_trigger(
+    c: &impl tokio_postgres::GenericClient,
+    library: &str,
+    name: &str,
+    fields: &[FieldDef],
+) -> Result<()> {
+    let table = format!("{}.{}", ident(library), ident(name));
+    c.batch_execute(&format!(
+        "DROP TRIGGER IF EXISTS as4tainr_generated ON {table}"
+    ))
+    .await?;
+    let args: Vec<String> = fields
+        .iter()
+        .filter_map(|f| {
+            let g = f.generated?;
+            let col = f.column();
+            let col = col.trim_matches('"').replace("\"\"", "\"");
+            let what = match g {
+                crate::dds::Generated::CurrentServer => {
+                    format!("SERVER={}", crate::report::system_name())
+                }
+                other => other.code().to_string(),
+            };
+            Some(format!(
+                "'{}', '{}'",
+                col.replace('\'', "''"),
+                what.replace('\'', "''")
+            ))
+        })
+        .collect();
+    if args.is_empty() {
+        return Ok(());
+    }
+    c.batch_execute(&format!(
+        "CREATE TRIGGER as4tainr_generated BEFORE INSERT OR UPDATE ON {table} \
+         FOR EACH ROW EXECUTE FUNCTION as4tainr.generated_columns({})",
+        args.join(", ")
+    ))
+    .await?;
+    Ok(())
+}
 
 /// Quote an SQL identifier. Object names are validated before use, but we
 /// still quote everything that reaches dynamic SQL.
@@ -195,7 +295,14 @@ pub fn validate_name(kind: &str, name: &str) -> Result<String> {
     let ok_rest = |c: char| ok_first(c) || c.is_ascii_digit() || "_.".contains(c);
     let mut chars = up.chars();
     match chars.next() {
-        Some(c) if ok_first(c) && up.len() <= 10 && chars.all(ok_rest) => Ok(up),
+        // QTEMP is the job's own library (qtemp.rs).
+        Some(c) if ok_first(c) && up.len() <= 10 && chars.all(ok_rest) => {
+            Ok(if kind == "library" || kind == "schema" {
+                crate::qtemp::real(&up)
+            } else {
+                up
+            })
+        }
         _ if up.len() > 10 => {
             bail!("'{name}' is not a valid {kind} name: it is longer than 10 characters")
         }
@@ -269,6 +376,10 @@ pub async fn init(client: &Client) -> Result<()> {
             .await
             .context("creating catalog")?;
         client
+            .batch_execute(crate::jobd::DDL)
+            .await
+            .context("creating catalog")?;
+        client
             .batch_execute(crate::dtaara::DDL)
             .await
             .context("creating catalog")?;
@@ -324,9 +435,23 @@ pub async fn init(client: &Client) -> Result<()> {
             .await
             .context("creating catalog")?;
         client
+            .batch_execute(crate::sysapi::DDL)
+            .await
+            .context("creating catalog")?;
+        client
             .batch_execute(crate::save::DDL)
             .await
             .context("creating catalog")?;
+        // Where the transactions are now (SAVCHGOBJ with a REFDATE), once
+        // a minute at most.
+        client
+            .execute(
+                "INSERT INTO as4tainr.xid_clock (xid)
+                 SELECT pg_snapshot_xmin(pg_current_snapshot())::text
+                  WHERE NOT EXISTS (SELECT 1 FROM as4tainr.xid_clock WHERE at > now() - interval '1 minute')",
+                &[],
+            )
+            .await?;
         for (lib, text) in SYSTEM_LIBRARIES {
             create_library(client, lib, text).await?;
             // Catalogs made by older versions gave every one the same text.
@@ -352,6 +477,8 @@ pub async fn init(client: &Client) -> Result<()> {
         crate::users::init(client).await?;
         crate::outq::init(client).await?;
         crate::envvar::init(client).await?;
+        crate::collate::init(client).await?;
+        crate::qtemp::cleanup(client).await?;
         crate::qsysinc::init(client).await?;
         // SQL runs as a restricted role. A database user who may not
         // create roles still gets a working system, without SQL.
@@ -420,9 +547,10 @@ pub async fn list_objects(client: &Client, library: &str) -> Result<Vec<ObjectEn
     if !library_exists(client, &lib).await? {
         bail!("CPF2110: Library {lib} does not exist.");
     }
+    let co = crate::collate::clause(client).await?;
     Ok(client
         .query(
-            "SELECT name, objtype, attribute, text FROM as4tainr.objects WHERE library=$1 ORDER BY name, objtype",
+            &format!("SELECT name, objtype, attribute, text FROM as4tainr.objects WHERE library=$1 ORDER BY name{co}, objtype"),
             &[&lib],
         )
         .await?
@@ -564,7 +692,8 @@ pub struct Program {
 /// The first program of this name in a list of libraries.
 pub async fn find_program(client: &Client, libs: &[String], name: &str) -> Result<Option<Program>> {
     let name = name.to_ascii_uppercase();
-    for lib in libs {
+    let libs: Vec<String> = libs.iter().map(|l| crate::qtemp::real(l)).collect();
+    for lib in &libs {
         if let Some(r) = client
             .query_opt(
                 "SELECT attribute, source, options, binding FROM as4tainr.programs WHERE library=$1 AND name=$2",
@@ -595,10 +724,14 @@ pub async fn object_exists(
     name: &str,
     objtype: &str,
 ) -> Result<bool> {
-    let libs: Vec<String> = if objtype == "*LIB" {
-        vec!["QSYS".into()]
+    // QTEMP, as a library and as the object of *LIB: the job's own.
+    let (libs, name): (Vec<String>, String) = if objtype == "*LIB" {
+        (vec!["QSYS".into()], crate::qtemp::real(name))
     } else {
-        libs.to_vec()
+        (
+            libs.iter().map(|l| crate::qtemp::real(l)).collect(),
+            name.to_string(),
+        )
     };
     Ok(client
         .query_opt(
@@ -627,9 +760,10 @@ pub async fn object_size(client: &Client, library: &str, name: &str, objtype: &s
 
 /// All libraries, by name.
 pub async fn list_libraries(client: &Client) -> Result<Vec<String>> {
+    let co = crate::collate::clause(client).await?;
     Ok(client
         .query(
-            "SELECT name FROM as4tainr.objects WHERE library='QSYS' AND objtype='*LIB' ORDER BY name",
+            &format!("SELECT name FROM as4tainr.objects WHERE library='QSYS' AND objtype='*LIB' ORDER BY name{co}"),
             &[],
         )
         .await?
@@ -767,12 +901,13 @@ pub async fn create_physical_file(
         .await?;
     }
 
-    // Character columns use the "C" collation so key order is byte order.
-    // NOTE: IBM i orders keys by EBCDIC; see docs/fidelity-gaps.md.
+    // Character columns are in EBCDIC order, as IBM i keeps them
+    // (collate.rs).
     let mut cols: Vec<String> = vec!["rrn bigserial PRIMARY KEY".into()];
+    let ebcdic = crate::collate::clause(&tx).await?;
     for f in &pf.fields {
         let coll = if f.data_type == DataType::Char {
-            " COLLATE \"C\""
+            ebcdic.as_str()
         } else {
             ""
         };
@@ -791,6 +926,7 @@ pub async fn create_physical_file(
     let table = format!("{}.{}", ident(&lib), ident(&name));
     tx.batch_execute(&format!("CREATE TABLE {table} ({})", cols.join(", ")))
         .await?;
+    generated_trigger(&tx, &lib, &name, &pf.fields).await?;
     if !pf.keys.is_empty() {
         let keycols: Vec<String> = pf.keys.iter().map(|k| key_column(&pf.fields, k)).collect();
         // Access path: key order, then arrival order (rrn) for duplicate keys.
@@ -1203,7 +1339,10 @@ pub async fn physical_file_of(
 /// of the name (source.rs: SRCSEQ, SRCDAT, SRCDTA).
 pub async fn resolve_record_file(client: &Client, libl: &[String], name: &str) -> Result<FileRef> {
     let (libs, n) = match name.split_once('/') {
-        Some((l, n)) => (vec![l.to_ascii_uppercase()], n.to_ascii_uppercase()),
+        Some((l, n)) => (
+            vec![crate::qtemp::real(&l.to_ascii_uppercase())],
+            n.to_ascii_uppercase(),
+        ),
         None => (libl.to_vec(), name.to_ascii_uppercase()),
     };
     for lib in &libs {
@@ -1245,7 +1384,7 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
         let Some(row) = row else { continue };
         let fields = client
             .query(
-                "SELECT name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity, flt_double FROM as4tainr.file_fields
+                "SELECT name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity, flt_double, generated FROM as4tainr.file_fields
                  WHERE library=$1 AND file=$2 ORDER BY seq",
                 &[lib, &name],
             )
@@ -1268,6 +1407,9 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
                         .get::<_, Option<&str>>(9)
                         .and_then(|d| serde_json::from_str(d).ok()),
                     double: r.get(10),
+                    generated: r
+                        .get::<_, Option<&str>>(11)
+                        .and_then(|d| serde_json::from_str(d).ok()),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1535,7 +1677,10 @@ pub async fn set_sql_type(
 /// A file found by its system name or its SQL name (SQL statements).
 pub async fn resolve_sql_file(client: &Client, libl: &[String], name: &str) -> Result<FileRef> {
     let (libs, n) = match name.split_once('/') {
-        Some((l, n)) => (vec![l.to_ascii_uppercase()], n.to_ascii_uppercase()),
+        Some((l, n)) => (
+            vec![crate::qtemp::real(&l.to_ascii_uppercase())],
+            n.to_ascii_uppercase(),
+        ),
         None => (libl.to_vec(), name.to_ascii_uppercase()),
     };
     for lib in &libs {
@@ -1832,8 +1977,8 @@ pub async fn insert_field(
     f: &FieldDef,
 ) -> Result<()> {
     c.execute(
-        "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity, flt_double)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+        "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity, flt_double, generated)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
         &[
             &library,
             &file,
@@ -1849,6 +1994,7 @@ pub async fn insert_field(
             &f.alias,
             &f.identity.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
             &f.double,
+            &f.generated.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
         ],
     )
     .await?;

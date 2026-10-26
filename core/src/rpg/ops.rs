@@ -412,6 +412,11 @@ impl Machine<'_> {
                 let a = self.need(f2, code, "an array")?;
                 self.sorta(&a)?;
             }
+            "EVAL-CORR" => {
+                let t = self.need(f1, code, "a target data structure")?;
+                let s = self.need(f2, code, "a source data structure")?;
+                self.eval_corr(&t, &s, ext.half_adjust)?;
+            }
             "MOVEA" => {
                 let from = self.need(f2, code, "factor 2")?;
                 let to = self.need(result, code, "a result field")?;
@@ -421,6 +426,126 @@ impl Machine<'_> {
             _ => return Ok(false),
         }
         Ok(true)
+    }
+
+    /// EVAL-CORR (ILE RPG Reference, EVAL-CORR): each subfield of the
+    /// target with a subfield of the same name in the source gets its
+    /// value; subfields that are data structures in both correspond
+    /// subfield by subfield; arrays element by element, as many as the
+    /// smaller has; subfields whose types do not go together (character
+    /// and numeric...) are left as they are.
+    pub(super) fn eval_corr(&mut self, t: &Expr, s: &Expr, half_adjust: bool) -> Result<()> {
+        let ds = |me: &Self, e: &Expr| -> Option<(String, crate::rpg::program::DsInfo)> {
+            let parts = match e {
+                Expr::Name { parts, .. } | Expr::Path { parts, .. } => parts,
+                _ => return None,
+            };
+            let key = parts.join(".");
+            match me.sym_static(&key) {
+                Some(Sym::Ds(d)) => Some((key, d)),
+                _ => None,
+            }
+        };
+        let (Some((_, td)), Some((_, sd))) = (ds(self, t), ds(self, s)) else {
+            bail!("EVAL-CORR: the target and the source must be data structures");
+        };
+        // The expression of a subfield of a data structure expression.
+        let sub = |e: &Expr, d: &crate::rpg::program::DsInfo, name: &str| -> Expr {
+            match e {
+                Expr::Name { parts, args } if !d.qualified && args.is_none() && parts.len() == 1 => {
+                    Expr::name(name)
+                }
+                Expr::Name { parts, args } => {
+                    let mut p = parts.clone();
+                    p.push(name.to_string());
+                    let mut idx: Vec<Option<Box<Expr>>> = vec![None; p.len()];
+                    if let Some(a) = args.as_ref().and_then(|a| a.first()) {
+                        idx[parts.len() - 1] = Some(Box::new(a.clone()));
+                    }
+                    if args.is_some() {
+                        Expr::Path { parts: p, idx, args: None }
+                    } else {
+                        Expr::Name { parts: p, args: None }
+                    }
+                }
+                Expr::Path { parts, idx, args } => {
+                    let mut p = parts.clone();
+                    p.push(name.to_string());
+                    let mut i = idx.clone();
+                    if let Some(a) = args.as_ref().and_then(|a| a.first()) {
+                        if let Some(last) = i.last_mut() {
+                            *last = Some(Box::new(a.clone()));
+                        }
+                    }
+                    i.push(None);
+                    Expr::Path { parts: p, idx: i, args: None }
+                }
+                other => other.clone(),
+            }
+        };
+        let class = |t: &DType| match t {
+            DType::Char(_) | DType::Varchar(_) => 1,
+            DType::Ucs2(_) | DType::VarUcs2(_) => 2,
+            DType::Date(_) => 3,
+            DType::Time(_) => 4,
+            DType::Timestamp(_) => 5,
+            DType::Ind => 6,
+            DType::Pointer => 7,
+            _ => 0,
+        };
+        for name in td.subfields.clone() {
+            let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+            if !sd
+                .subfields
+                .iter()
+                .any(|x| x.rsplit('.').next().unwrap_or(x) == short)
+            {
+                continue;
+            }
+            let te = sub(t, &td, &short);
+            let se = sub(s, &sd, &short);
+            // Data structures in both: their own corresponding subfields.
+            if ds(self, &te).is_some() && ds(self, &se).is_some() {
+                self.eval_corr(&te, &se, half_adjust)?;
+                continue;
+            }
+            let (Some(tt), Some(st)) = (self.type_of(&te), self.type_of(&se)) else {
+                continue;
+            };
+            if class(&tt) != class(&st) {
+                continue;
+            }
+            let fit = Fit::Strict { half_adjust };
+            let (ta, sa) = (self.array_ref(&te), self.array_ref(&se));
+            match (ta, sa) {
+                (Some(ta), Some(sa)) if ta.index.is_none() && sa.index.is_none() => {
+                    let n = ta.var.dim.min(sa.var.dim) as i128;
+                    for k in 1..=n {
+                        let v = self.load_var(&sa.var, Some(k))?;
+                        let idx = Expr::Num(crate::rpg::dec::Dec::from_i64(k as i64));
+                        let with = |e: &Expr| match e {
+                            Expr::Name { parts, .. } => Expr::Name {
+                                parts: parts.clone(),
+                                args: Some(vec![idx.clone()]),
+                            },
+                            Expr::Path { parts, idx: ix, .. } => Expr::Path {
+                                parts: parts.clone(),
+                                idx: ix.clone(),
+                                args: Some(vec![idx.clone()]),
+                            },
+                            o => o.clone(),
+                        };
+                        self.assign(&with(&te), &v, fit, false)?;
+                    }
+                }
+                (Some(_), _) | (_, Some(_)) => {}
+                _ => {
+                    let v = self.eval(&se)?;
+                    self.assign(&te, &v, fit, false)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn sorta(&mut self, a: &Expr) -> Result<()> {
@@ -865,7 +990,8 @@ pub(super) fn dec_sqrt(x: &Dec, scale: u8) -> Result<Dec> {
     let s = x.scale() as i32;
     let k = scale as i32;
     let e = 2 * k - s;
-    let mut m = x.mantissa() as u128;
+    let mut m =
+        u128::try_from(x.mantissa()).map_err(|_| anyhow!("SQRT: the value is too large"))?;
     if e >= 0 {
         for _ in 0..e {
             m = m

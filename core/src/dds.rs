@@ -175,6 +175,10 @@ pub enum FieldDefault {
     /// No default: an SQL INSERT must give a value (SQL `NOT NULL` with no
     /// DEFAULT).
     Required,
+    /// SQL DEFAULT USER (SESSION_USER, SYSTEM_USER): the user profile of
+    /// the job that adds the row (Db2 for i SQL Reference, CREATE TABLE,
+    /// default-clause).
+    User,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +207,41 @@ pub struct FieldDef {
     /// A float of double precision (DDS FLTPCN(*DOUBLE); SQL DOUBLE).
     #[serde(default)]
     pub double: bool,
+    /// A column the database sets (SQL GENERATED ... ROW CHANGE TIMESTAMP,
+    /// or an auditing column).
+    #[serde(default)]
+    pub generated: Option<Generated>,
+}
+
+/// What a generated column holds (Db2 for i SQL Programming, "Creating
+/// auditing columns"; SQL Reference, CREATE TABLE: ROW CHANGE TIMESTAMP).
+/// Set for every insert and update, by SQL and by record-level access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Generated {
+    /// FOR EACH ROW ON UPDATE AS ROW CHANGE TIMESTAMP: when the row was
+    /// last changed.
+    RowChangeTimestamp,
+    /// AS (DATA CHANGE OPERATION): I for an insert, U for an update.
+    DataChangeOperation,
+    /// AS (QSYS2.JOB_NAME): the job that changed the row.
+    JobName,
+    /// AS (SESSION_USER), (USER), (CURRENT USER): its user.
+    SessionUser,
+    /// AS (CURRENT SERVER): the relational database.
+    CurrentServer,
+}
+
+impl Generated {
+    /// The name the trigger function knows it by.
+    pub fn code(self) -> &'static str {
+        match self {
+            Generated::RowChangeTimestamp => "ROWCHG",
+            Generated::DataChangeOperation => "DCO",
+            Generated::JobName => "JOB",
+            Generated::SessionUser => "USER",
+            Generated::CurrentServer => "SERVER",
+        }
+    }
 }
 
 /// An identity column's generation (Db2 for i, CREATE TABLE).
@@ -263,6 +302,7 @@ impl FieldDef {
             alias: None,
             identity: None,
             double: false,
+            generated: None,
         }
     }
 
@@ -464,6 +504,9 @@ impl FieldDef {
                 self.sql_type()
             ),
             Some(FieldDefault::System) | None => format!(" DEFAULT {}", self.system_default()),
+            Some(FieldDefault::User) => {
+                format!(" DEFAULT CAST({} AS {})", crate::sql::USER_SQL, self.sql_type())
+            }
         }
     }
 

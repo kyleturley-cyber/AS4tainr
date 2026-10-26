@@ -75,7 +75,12 @@ fn pase_system_utility() {
 
     // A value not valid: CPD0084, then CPF0006.
     let r = system(&url, &[&format!("CRTDTAARA DTAARA({lib}/X) TYPE(*BAD)")]);
-    assert_eq!((r.rc, ids(&r.err)), (255, vec!["CPD0084", "CPF0006"]));
+    assert_eq!(
+        (r.rc, ids(&r.err)),
+        (255, vec!["CPD0084", "CPF0006"]),
+        "{:?}",
+        r.err
+    );
 
     // CHKOBJ of an object that is not there: CPF9801; -n leaves the ID
     // out; -v writes the command first, on standard output.
@@ -91,7 +96,7 @@ fn pase_system_utility() {
     assert!(r.out[0].contains(&chk), "{:?}", r.out);
     // -q: no messages at all, the exit status still tells.
     let r = system(&url, &["-q", &chk]);
-    assert_eq!((r.rc, r.out.len(), r.err.len()), (255, 0, 0));
+    assert_eq!((r.rc, r.out.len(), r.err.len()), (255, 0, 0), "{:?}", r.err);
 
     // Completion messages on standard output, exit status 0. The command
     // may be given in pieces (joined with blanks).
@@ -278,5 +283,218 @@ fn pase_system_utility() {
         r.err
     );
 
+    assert_eq!(system(&url, &[&format!("DLTLIB {lib}")]).rc, 0);
+}
+
+/// A PASE shell's job, as a makefile uses it (`liblist -c LIB; system
+/// "CRTBNDRPG ... SRCSTMF('qrpglesrc/x.rpgle')"`): `system` runs in the
+/// shell's current directory, so relative path names start there (IBM's
+/// integrated file system documentation: relative path names start in the
+/// job's current directory, which PASE shares with the job); the current
+/// library is where unqualified SQL objects are created with system naming
+/// (Db2 for i SQL reference, "Unqualified names"); CHGCURDIR changes the
+/// current directory (CL reference); printf writes the program's standard
+/// output (ILE C runtime), which `system` writes out.
+#[test]
+fn pase_shell_job() {
+    let Some(url) = db_url() else {
+        eprintln!("skipped: AS4TAINR_TEST_DATABASE_URL not set");
+        return;
+    };
+    let lib = format!("P{}", std::process::id() % 1_000_000);
+    let run = |dir: &std::path::Path, curlib: Option<&str>, cmd: &str| -> Run {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_as4tainr"));
+        c.current_dir(dir).args(["--database-url", &url]);
+        if let Some(l) = curlib {
+            c.args(["--curlib", l]);
+        }
+        let o = c.args(["system", cmd]).output().unwrap();
+        let lines = |b: &[u8]| -> Vec<String> {
+            String::from_utf8_lossy(b)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+        Run {
+            out: lines(&o.stdout),
+            err: lines(&o.stderr),
+            rc: o.status.code().unwrap_or(-1),
+        }
+    };
+    let dir = std::env::temp_dir().join(format!("pasejob{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("qrpglesrc")).unwrap();
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(
+        dir.join("qrpglesrc/hello.rpgle"),
+        "**free\nctl-opt dftactgrp(*no);\ndcl-pr printf int(10) extproc('printf');\n  f pointer value options(*string);\nend-pr;\nprintf('Hello ');\nprintf('world' + x'25');\nprintf('next' + x'25');\nreturn;\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("sub/note.txt"), "x\n").unwrap();
+    let d = dir.to_str().unwrap();
+    let put = Command::new(env!("CARGO_BIN_EXE_as4tainr"))
+        .args(["--database-url", &url, "put", d, d])
+        .output()
+        .unwrap();
+    assert!(put.status.success());
+    assert_eq!(run(&dir, None, &format!("CRTLIB {lib}")).rc, 0);
+    let r = run(
+        &dir,
+        Some(&lib),
+        &format!("CRTBNDRPG PGM({lib}/HELLO) SRCSTMF('qrpglesrc/hello.rpgle')"),
+    );
+    assert_eq!(r.rc, 0, "{:?} {:?}", r.out, r.err);
+    let r = run(&dir, Some(&lib), &format!("CALL {lib}/HELLO"));
+    assert_eq!(r.out, ["Hello world", "next"], "{:?}", r.err);
+    // The current library: CREATE TABLE without a library.
+    let r = run(
+        &dir,
+        Some(&lib),
+        "RUNSQL SQL('CREATE TABLE PASET1 (C INT)') COMMIT(*NONE) NAMING(*SYS)",
+    );
+    assert_eq!(r.rc, 0, "{:?} {:?}", r.out, r.err);
+    assert_eq!(
+        run(
+            &dir,
+            None,
+            &format!("CHKOBJ OBJ({lib}/PASET1) OBJTYPE(*FILE)")
+        )
+        .rc,
+        0
+    );
+    // CHGCURDIR, then a relative path, in one job (a CL program).
+    std::fs::write(
+        dir.join("cd.clle"),
+        "PGM\n CHGCURDIR DIR('sub')\n MKDIR DIR('made')\nENDPGM\n",
+    )
+    .unwrap();
+    let put = Command::new(env!("CARGO_BIN_EXE_as4tainr"))
+        .args(["--database-url", &url, "put"])
+        .arg(dir.join("cd.clle"))
+        .arg(format!("{d}/cd.clle"))
+        .output()
+        .unwrap();
+    assert!(put.status.success());
+    assert_eq!(
+        run(
+            &dir,
+            None,
+            &format!("CRTBNDCL PGM({lib}/CD) SRCSTMF('cd.clle')")
+        )
+        .rc,
+        0
+    );
+    assert_eq!(run(&dir, None, &format!("CALL {lib}/CD")).rc, 0);
+    let r = run(
+        std::path::Path::new("/"),
+        None,
+        &format!("CHGCURDIR DIR('{d}/sub/made')"),
+    );
+    assert_eq!(r.rc, 0, "{:?} {:?}", r.out, r.err);
+    let r = run(&dir, None, "CHGCURDIR DIR('nosuch')");
+    assert_eq!(r.rc, 255);
+    assert_eq!(run(&dir, None, &format!("DLTLIB {lib}")).rc, 0);
+}
+
+/// REXX/400: STRREXPRC runs a procedure from a source member (SRCFILE,
+/// SRCMBR, PARM): SAY writes to standard output; PARSE (words: the last
+/// variable keeps all but one separating blank, IBM's REXX parsing
+/// documentation); DO loops; compound variables; SELECT; internal
+/// routines with PROCEDURE and RETURN (RESULT); built-in functions;
+/// decimal arithmetic to 9 digits (1/3 = 0.333333333); CL commands: RC is
+/// 0 or the escape message identifier, `&name` is a REXX variable that a
+/// retrieve command fills; SIGNAL ON ERROR with SIGL; a non-zero EXIT is
+/// the escape message CPF7CFF.
+#[test]
+fn rexx_procedures() {
+    let Some(url) = db_url() else {
+        eprintln!("skipped: AS4TAINR_TEST_DATABASE_URL not set");
+        return;
+    };
+    let lib = format!("X{}", std::process::id() % 1_000_000);
+    let src = "/* a test procedure */
+parse arg a b
+say 'args:' a '/' b
+total = 0
+do i = 1 to 5
+  total = total + i
+end
+say 'total' total
+say 'div' 1/3 7%2 7//2 2**10 1.50+1
+s.1 = 'x'; s.2 = 'y'; s.0 = 2
+do k = 1 to s.0; say 'stem' k s.k; end
+say substr('abcdef', 2, 3) strip('  hi  ') words('a b c') c2x('A') x2c('C1') left('ab', 4, '.')'|'
+select
+  when a = 'one' then say 'select one'
+  otherwise say 'select other'
+end
+call twice 3
+say 'result' result twice(5)
+'CHKOBJ OBJ(QSYS/NOSUCHOBJ) OBJTYPE(*PGM)'
+say 'rc' rc
+user = '          '
+'RTVJOBA USER(&user)'
+say 'user' strip(user)
+parse value 'More  words    in data' with v1 v2 v3
+say '['v3']'
+signal on error
+'CHKOBJ OBJ(QSYS/NOSUCHOBJ) OBJTYPE(*PGM)'
+say 'not reached'
+exit 0
+twice: procedure
+  parse arg n
+  return n * 2
+error:
+  say 'trapped' rc 'line' sigl
+  exit 3
+";
+    let dir = std::env::temp_dir().join(format!("rexx{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("t.rexx"), src).unwrap();
+    let put = Command::new(env!("CARGO_BIN_EXE_as4tainr"))
+        .args(["--database-url", &url, "put"])
+        .arg(dir.join("t.rexx"))
+        .arg(format!("/tmp/{lib}.rexx"))
+        .output()
+        .unwrap();
+    assert!(put.status.success());
+    for c in [
+        format!("CRTLIB {lib}"),
+        format!("CRTSRCPF FILE({lib}/QREXSRC) RCDLEN(112)"),
+        format!(
+            "CPYFRMSTMF FROMSTMF('/tmp/{lib}.rexx') TOMBR('/QSYS.LIB/{lib}.LIB/QREXSRC.FILE/T.MBR')"
+        ),
+    ] {
+        let r = system(&url, &[&c]);
+        assert_eq!(r.rc, 0, "{c}: {:?}", r.err);
+    }
+    let r = system(
+        &url,
+        &[&format!(
+            "STRREXPRC SRCMBR(T) SRCFILE({lib}/QREXSRC) PARM('one two')"
+        )],
+    );
+    assert_eq!(
+        r.out[..r.out.len().min(15)],
+        [
+            "args: one / two",
+            "total 15",
+            "div 0.333333333 3 1 1024 2.50",
+            "stem 1 x",
+            "stem 2 y",
+            "bcd hi 3 C1 A ab..|",
+            "select one",
+            "result 6 10",
+            "rc CPF9801",
+            "user QSECOFR",
+            "[   in data]",
+            "trapped CPF9801 line 27",
+        ][..],
+        "{:?} {:?}",
+        r.out,
+        r.err
+    );
+    // EXIT 3: CPF7CFF.
+    assert_eq!(r.rc, 255);
+    assert_eq!(ids(&r.err).last(), Some(&"CPF7CFF"), "{:?}", r.err);
     assert_eq!(system(&url, &[&format!("DLTLIB {lib}")]).rc, 0);
 }

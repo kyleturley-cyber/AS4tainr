@@ -87,7 +87,14 @@ pub async fn run(job: &mut Job<'_>, args: &[String]) -> Output {
         }
     };
     job.calls.printed.clear();
+    job.calls.terminal.clear();
+    crate::pgmmsg::take_stdout(&job.job_key());
     let result = job.run(&command).await;
+    // What the command wrote to the terminal (QSH's output) came out
+    // while it ran, before its messages (PUB400 2026-10-23).
+    out.stdout.append(&mut job.calls.terminal);
+    out.stdout
+        .extend(crate::pgmmsg::take_stdout(&job.job_key()));
     // A compiler listing: after the completion message, or before the
     // failure's messages (observed on IBM i 7.5).
     let printed = std::mem::take(&mut job.calls.printed);

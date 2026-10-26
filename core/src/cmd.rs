@@ -64,6 +64,10 @@ pub struct Definition {
     pub parms: Vec<Parm>,
     /// Mixed lists (ELEM) and qualified names (QUAL) by statement label.
     pub lists: BTreeMap<String, List>,
+    /// PGM(*REXX): the REXX procedure (REXSRCFILE LIB/FILE, REXSRCMBR,
+    /// REXCMDENV).
+    #[serde(default)]
+    pub rexx: Option<(String, String, String)>,
 }
 
 /// The ELEM or QUAL statements under one label.
@@ -95,6 +99,9 @@ pub struct Parm {
     pub min: u32,
     pub max: u32,
     pub vary: bool,
+    /// VARY(*YES *INT4): a 4-byte length.
+    #[serde(default)]
+    pub vary4: bool,
     /// CASE(*MIXED): quoted values keep their case.
     pub mixed: bool,
     /// FULL(*YES): the value must be exactly LEN long.
@@ -418,7 +425,18 @@ fn parse_parm(st: &crate::clpgm::Statement, order: &[&str]) -> Result<Parm> {
         sngval: pairs(get("SNGVAL").unwrap_or(""))?,
         min,
         max,
-        vary: yes("VARY"),
+        // VARY(*YES [*INT2 | *INT4]): the length before the value, in
+        // 2 bytes (the default) or 4 (CL reference, PARM VARY).
+        vary: get("VARY").is_some_and(|v| {
+            v.split_whitespace()
+                .next()
+                .is_some_and(|w| w.eq_ignore_ascii_case("*YES"))
+        }),
+        vary4: get("VARY").is_some_and(|v| {
+            v.split_whitespace()
+                .nth(1)
+                .is_some_and(|w| w.eq_ignore_ascii_case("*INT4"))
+        }),
         mixed: get("CASE").is_some_and(|c| c.trim().eq_ignore_ascii_case("*MIXED")),
         full: yes("FULL"),
         prompt: get("PROMPT").map(raw_text).transpose()?.unwrap_or_default(),
@@ -792,6 +810,69 @@ pub fn bind<'a>(d: &'a Definition, line: &str) -> Result<Vec<Bound<'a>>> {
         .collect())
 }
 
+/// The argument string of a REXX command processing program: every
+/// parameter in PARM order in CL keyword format, `KWD(value)` with the
+/// value as given or its default, a qualified name as LIB/NAME (REXX/400
+/// Programmer's Guide: all parameter values concatenated into one
+/// argument, in keyword format).
+pub fn rexx_args(d: &Definition, line: &str) -> Result<String> {
+    fn fmt(i: &Item) -> String {
+        match i {
+            Item::Atom { text, quoted: true } => format!("'{}'", text.replace('\'', "''")),
+            Item::Atom { text, .. } => text.clone(),
+            Item::List(v) => format!("({})", v.iter().map(fmt).collect::<Vec<_>>().join(" ")),
+        }
+    }
+    let mut out = Vec::new();
+    for (p, given) in bind(d, line)? {
+        let items: Vec<Item> = match (&p.constant, given) {
+            (Some(c), _) => vec![Item::Atom {
+                text: c.clone(),
+                quoted: true,
+            }],
+            (None, Some(v)) => v,
+            (None, None) => match &p.dft {
+                Some(dft) => raw_items(dft)?,
+                None => Vec::new(),
+            },
+        };
+        let qual = d.lists.get(&p.ty).filter(|l| l.qual);
+        let text = match qual {
+            Some(l) => items
+                .iter()
+                .map(|it| {
+                    let given: Vec<String> = match it {
+                        Item::Atom { text, .. } => {
+                            text.split('/').rev().map(str::to_string).collect()
+                        }
+                        other => vec![fmt(other)],
+                    };
+                    let mut parts = Vec::new();
+                    for (k, q) in l.items.iter().enumerate() {
+                        let v = match given.get(k) {
+                            Some(v) => v.clone(),
+                            None => q
+                                .dft
+                                .as_deref()
+                                .and_then(|x| raw_text(x).ok())
+                                .unwrap_or_else(
+                                    || if k > 0 { "*LIBL".into() } else { String::new() },
+                                ),
+                        };
+                        parts.push(v);
+                    }
+                    parts.reverse();
+                    parts.join("/")
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            None => items.iter().map(fmt).collect::<Vec<_>>().join(" "),
+        };
+        out.push(format!("{}({text})", p.kwd));
+    }
+    Ok(out.join(" "))
+}
+
 fn be16(n: usize) -> [u8; 2] {
     (n as u16).to_be_bytes()
 }
@@ -925,6 +1006,20 @@ fn encode_value(d: &Definition, p: &Parm, items: Option<Vec<Item>>) -> Result<Ve
                 Some([x]) => Some(x.clone()),
                 Some(_) => return Err(bad(&p.kwd, "only one value is allowed")),
             };
+            // A single value (SNGVAL) for the qualified name: in the
+            // name's place, the qualifiers blank (CL reference, "Command
+            // definition", SNGVAL: the value is passed instead of the
+            // whole qualified name).
+            if let Some(Item::Atom { text, .. }) = &one {
+                let up = text.to_ascii_uppercase();
+                if let Some((_, to)) = p.sngval.iter().find(|(f, _)| *f == up) {
+                    let mut out = single(d, &l.items[0], to)?;
+                    for q in &l.items[1..] {
+                        out.extend(encode_one(d, q, Some(&Item::word("")))?);
+                    }
+                    return Ok(out);
+                }
+            }
             qualified(d, &p.kwd, l, one.as_ref())
         }
         Some(l) => {
@@ -1107,7 +1202,11 @@ fn encode_scalar(p: &Parm, text: &str, quoted: bool, special: bool) -> Result<Ve
         let mut b = data::e(&t);
         b.resize(len, 0x40);
         if p.vary {
-            let mut v = be16(n).to_vec();
+            let mut v = if p.vary4 {
+                (n as u32).to_be_bytes().to_vec()
+            } else {
+                be16(n).to_vec()
+            };
             v.extend(b);
             return Ok(v);
         }
@@ -1493,6 +1592,39 @@ E1:          ELEM       TYPE(*CHAR) LEN(2) DFT(AA)
             _ => panic!(),
         };
         assert_eq!(pair, [0, 2, 0xC1, 0xC1, 0x00, 0x07]);
+    }
+
+    #[test]
+    fn varying_and_single_values() {
+        // CL reference, PARM: VARY(*YES *INT2) puts a 2-byte length
+        // before the value, *INT4 a 4-byte one; a single value (SNGVAL)
+        // for a list is a list of that one value, for a qualified name
+        // it takes the name's place with the qualifiers blank.
+        let d = compile(
+            "LIB",
+            "TST",
+            "LIB/TSTPGM",
+            "
+             CMD        PROMPT('Test')
+             PARM       KWD(PRC) TYPE(*CHAR) LEN(8) MAX(3) VARY(*YES *INT2) DFT(*ALL) SNGVAL(*ALL)
+             PARM       KWD(TXT) TYPE(*CHAR) LEN(4) VARY(*YES *INT4)
+             PARM       KWD(JOBD) TYPE(Q1) SNGVAL(*DFT) DFT(*DFT)
+Q1:          QUAL       TYPE(*NAME) LEN(10)
+             QUAL       TYPE(*NAME) LEN(10) DFT(*LIBL) SPCVAL((*LIBL))
+",
+        )
+        .unwrap();
+        let args = encode(&d, "TST TXT(ab)").unwrap();
+        let b = |a: &Arg| match a {
+            Arg::Bytes(b) => b.clone(),
+            _ => panic!(),
+        };
+        let prc = b(&args[0]);
+        assert_eq!(&prc[..4], &[0, 1, 0, 4]);
+        assert_eq!(crate::rpg::data::a(&prc[4..8]), "*ALL");
+        let txt = b(&args[1]);
+        assert_eq!(&txt[..4], &[0, 0, 0, 2]);
+        assert_eq!(crate::rpg::data::a(&b(&args[2])), format!("{:<20}", "*DFT"));
     }
 
     #[test]

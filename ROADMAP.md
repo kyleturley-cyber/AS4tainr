@@ -174,6 +174,36 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] Spooled file APIs (QGYOLSPL, QGYGTLE, QSPOPNSP, QSPGETSP SPFR0300, QSPCLOSP), OVRPRTF SPLFNAME/USRDTA, `as4tainr batch`, PASE `system` printed output as on IBM i: RPGUnit's whole self-test passes, all 22 acceptance tests included
 - [x] Real-world corpus 5, QshOni (MIT): built by its own build.sh; environment variables (ADDENVVAR, CHGENVVAR, RMVENVVAR, WRKENVVAR, getenv/putenv), QSH/STRQSH with QIBM_QSH_CMD_OUTPUT and QSH0005/QSH0006 (opt-in AS4TAINR_QSH), source files read by record, CHGLIB, CL expressions as parameter values and `LIB/*ALL` qualifiers
 - [x] QSH commands work on the IFS: the IFS mirrored to disk and bound at its paths in a mount namespace per command, changes written back (docs/qshell.md)
+- [x] Character keys in EBCDIC order: an ICU collation in CCSID 37 byte order for character columns (keyed reads, logical files, SQL ORDER BY and comparisons), earlier databases changed at catalog initialization; CL compares in EBCDIC
+- [x] QTEMP per job: each interactive session, batch job and `system`/`call` process gets its own temporary library, empty at its start and deleted at its end; QTEMP names it in commands, the library list, SQL and APIs
+- [x] Save and restore OMITOBJ and SELECT (*INCLUDE/*OMIT by object, type, attribute), FILEMBR(*ALL), the other save/restore parameters accepted; DSPATR; QTEMP returned as QTEMP by the list, retrieve and spooled file APIs
+- [x] Object, library and member lists in EBCDIC order (DSPLIB, WRKOBJPDM, WRKMBRPDM, QUSLOBJ, QUSLMBR); ADDPFM for source members
+- [x] SAVCHGOBJ: object change times kept (RTVOBJD CHGDATE, QUSROBJD, OBJECT_STATISTICS), changed records since the last SAVLIB or a reference date, OBJJRN
+- [x] The job's current directory (CHGCURDIR, CD, chdir, getcwd; relative paths; `system` starts in its shell's directory), printf/puts to standard output, `--curlib`; IBM's Company System built as its makefile does (tools/legacy.sh)
+- [x] REXX procedures: STRREXPRC, CRTCMD PGM(*REXX), the language and its built-in functions, CL commands with &variables (docs/rexx.md)
+- [x] iRPGUnit installs with its own A_INSTALL REXX procedure; RUCRTRPG and RUCALLTST run its ASSERTT self-test suite (19 of 22 procedures pass; tools/legacy.sh)
+- [x] CVTDAT, CRTDUPOBJ, job descriptions (CRTJOBD, CHGJOBD, DLTJOBD, DSPJOBD, SBMJOB JOBD), CHGCMD; APIs QDBRTVFD, QLICOBJD, QUSROBJD OBJD0300/0400, QUSRJOBI, QSZRTVPR, QSPRILSP, QCAPCMD, RCVM0200
+- [x] RPG: timestamps with 0-12 fractional digits, 63-digit decimals, DECEDIT for %CHAR, date + time, literal continuation, OVERLOAD by exact type, operational descriptors of temporaries, EXTPROC(*DCLCASE) names
+- [x] Message queues: CRTMSGQ/DLTMSGQ, SNDMSG TOMSGQ, QGYOLMSG (LSTM0100)
+- [x] Pointer storage per call vs activation (callbacks into running modules); based items past their variable; freed heap readable
+- [x] RPG: INZ of nested LIKEDS, %LEN assignment, program-described printer WRITE with DS, RPG calls to bound CL modules
+- [x] APIs: QUSRJOBI JOBI0400, QWDRJOBD, QGYOLSPL OSPF0200, binary message keys, QMHRCVPM by key, QMHRMVPM on call stack queues
+- [x] SQL special registers per statement; spooled file numbers not reused; iRPGUnit self-tests: 10 suites pass
+- [x] XML-SAX with %HANDLER (all XML events, doc=string and doc=file)
+- [x] Message APIs: receive by key from ended entries, full-length receivers, job log sender/receiver fields; iRPGUnit PGMMSGT and MSGQT pass
+- [x] Call backs into a running bound module see its live globals; CHKOBJ OBJTYPE validation; QCAPCMD CRTSQLRPGI order
+- [x] RPG INZ(*LIKEDS) through nested LIKEDS subfields, DS arrays and procedures; indicator + indicator concatenates
+- [x] RPG run-time errors signaled as RNX escape messages (MONITOR, ON-EXCP, PSDS, job log); OPTIONS(*TRIM)
+- [x] C runtime: localtime_r/gmtime_r/mitime fill CONST-declared buffers; waittime waits; CRTSQLCBLI defined (QCAPCMD order)
+- [x] iRPGUnit self-tests: STRINGT and STMFT pass; XMLSTMFT 261/264; CRTTSTT no failures
+- [x] Compiled RPG programs/modules kept per process with a file/member/IFS change stamp (iRPGUnit self-tests 4x faster; TESTUTILST passes)
+- [x] rpgle-repl (TOBi project) imported and running: TOBi builds from the IFS with makei defaults, IFS include search order, EVAL-CORR, OPTIONS(*CONVERT), %LOOKUP over DS arrays
+- [x] SQL: auditing/generated columns, RENAME TABLE, CREATE/DROP ALIAS (incl. source members), QSYS2.JOB_NAME, system column names, OVRDBF in embedded SQL, dynamic DDL, SYSTOOLS.SPOOLED_FILE_DATA
+- [x] CL: CRTSRCPF full parameters with MBR; qualified commands checked in their library
+- [x] SQL: DECLARE GLOBAL TEMPORARY TABLE (QTEMP/SESSION), DEFAULT USER, ALTER TABLE with several alterations, Db2 implicit string/number casts
+- [x] Display files: keyboard shift D, usage P; CL: positional IF/ELSE commands
+- [x] Import: IBM-i-RPG-Free-CLP-Code (relative-path includes from the IFS, commands before programs)
+- [ ] DSPFD/DSPOBJD OUTPUT(*OUTFILE) with model files QAFDMBRL/QADSPOBJ (needs DSPFFD capture from PUB400)
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).
 - [x] Journals and trigger programs: COM's SETUPJRN, ORDAUDJV (QSYS2.DISPLAY_JOURNAL) and ORDTRG (ADDPFTRG) run (docs/journals.md).

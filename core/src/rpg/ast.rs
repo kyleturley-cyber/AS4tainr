@@ -380,6 +380,8 @@ pub struct Def {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Proc {
     pub name: String,
+    /// The name as written (its case kept), for EXTPROC(*DCLCASE).
+    pub written: String,
     pub export: bool,
     pub defs: Vec<Def>,
     pub calcs: Vec<CalcLine>,

@@ -560,7 +560,7 @@ pub async fn create(
 /// A printer file through the library list (or its library).
 pub async fn resolve(client: &Client, libl: &[String], name: &str) -> Result<Option<Attributes>> {
     let (libs, name) = match name.split_once('/') {
-        Some((l, n)) => (vec![l.to_string()], n.to_string()),
+        Some((l, n)) => (vec![crate::qtemp::real(l)], n.to_string()),
         None => (libl.to_vec(), name.to_string()),
     };
     for lib in &libs {

@@ -92,11 +92,20 @@ pub async fn open(client: &Client, job: &JobId, file: &str, user_data: &str) -> 
     // The output queue of the job's user (outq.rs: QGPL/QPRINT for
     // OUTQ(*WRKSTN)).
     let (qlib, q) = crate::outq::for_user(client, &job.user).await?;
+    // The job's next spooled file number: one more than the last it
+    // gave, also when that file was deleted (IBM i numbers a job's
+    // spooled files 1, 2, 3... without reusing them).
     let r = client
         .query_one(
-            "INSERT INTO as4tainr.spooled_files (job, job_name, user_name, file, number, user_data, outq_lib, outq)
+            "WITH n AS (
+                UPDATE as4tainr.jobs SET last_splf = greatest(last_splf,
+                    (SELECT coalesce(max(number), 0) FROM as4tainr.spooled_files WHERE job = $1)) + 1
+                 WHERE number = $1 RETURNING last_splf)
+             INSERT INTO as4tainr.spooled_files (job, job_name, user_name, file, number, user_data, outq_lib, outq)
              VALUES ($1, $2, $3, $4,
-                     (SELECT coalesce(max(number), 0) + 1 FROM as4tainr.spooled_files WHERE job = $1), $5, $6, $7)
+                     coalesce((SELECT last_splf FROM n),
+                              (SELECT coalesce(max(number), 0) + 1 FROM as4tainr.spooled_files WHERE job = $1)),
+                     $5, $6, $7)
              RETURNING id",
             &[
                 &job.number,
@@ -119,7 +128,8 @@ pub async fn write(client: &Client, id: i64, lines: &[(i32, i32, String)]) -> Re
             .execute(
                 "INSERT INTO as4tainr.spool_lines (spl, seq, page, line, text)
                  VALUES ($1, (SELECT coalesce(max(seq), 0) + 1 FROM as4tainr.spool_lines WHERE spl = $1), $2, $3, $4)",
-                &[&id, page, line, &text.trim_end()],
+                // The job's QTEMP library is printed as QTEMP.
+                &[&id, page, line, &crate::qtemp::logical(text.trim_end()).trim_end()],
             )
             .await?;
     }

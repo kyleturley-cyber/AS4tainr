@@ -42,6 +42,8 @@ pub struct Override {
     /// group: the override is scoped to that activation group, so it
     /// stays when the program that made it returns.
     pub actgrp: Option<String>,
+    /// OVRDBF MBR: the member to use (None: *FIRST).
+    pub mbr: Option<String>,
 }
 
 /// The override in effect for a file: the one of the highest call level.
@@ -135,6 +137,7 @@ mod tests {
             splfname: None,
             usrdta: None,
             actgrp: None,
+            mbr: None,
         }
     }
 

@@ -19,6 +19,10 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Where a saved character column's collation goes: this system's at
+/// restore (EBCDIC order, or byte order without ICU; collate.rs).
+const CHAR_COLLATION: &str = " COLLATE {{AS4TAINR_CHAR}}";
 use tokio_postgres::Client;
 
 pub const DDL: &str = r#"
@@ -31,6 +35,64 @@ CREATE TABLE IF NOT EXISTS as4tainr.save_files (
 );
 ALTER TABLE as4tainr.objects ADD COLUMN IF NOT EXISTS saved timestamptz;
 ALTER TABLE as4tainr.objects ADD COLUMN IF NOT EXISTS restored timestamptz;
+-- When the object last changed (SAVCHGOBJ, DSPOBJD): made, restored, its
+-- description or contents changed (the triggers below; files' records
+-- are looked at by SAVCHGOBJ itself, `changed_since`).
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'as4tainr' AND table_name = 'objects' AND column_name = 'changed') THEN
+    ALTER TABLE as4tainr.objects ADD COLUMN changed timestamptz;
+    UPDATE as4tainr.objects SET changed = coalesce(restored, created);
+    ALTER TABLE as4tainr.objects ALTER COLUMN changed SET DEFAULT now();
+  END IF;
+END $$;
+-- A library's last SAVLIB (with UPDHST(*YES)) and where the database's
+-- transactions were then; a file's number of records then.
+ALTER TABLE as4tainr.objects ADD COLUMN IF NOT EXISTS savlib timestamptz;
+ALTER TABLE as4tainr.objects ADD COLUMN IF NOT EXISTS savlib_xid text;
+ALTER TABLE as4tainr.objects ADD COLUMN IF NOT EXISTS savlib_rows bigint;
+-- Where the transactions were at a time (saves, catalog initialization):
+-- records changed after a date, without commit timestamps.
+CREATE TABLE IF NOT EXISTS as4tainr.xid_clock (
+    at  timestamptz NOT NULL DEFAULT now(),
+    xid text NOT NULL
+);
+CREATE INDEX IF NOT EXISTS xid_clock_at ON as4tainr.xid_clock (at);
+CREATE OR REPLACE FUNCTION as4tainr.object_changed() RETURNS trigger LANGUAGE plpgsql AS $f$
+BEGIN
+  IF TG_TABLE_NAME = 'objects' THEN
+    IF NEW.text IS DISTINCT FROM OLD.text OR NEW.attribute IS DISTINCT FROM OLD.attribute
+       OR NEW.owner IS DISTINCT FROM OLD.owner THEN
+      NEW.changed := now();
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF TG_TABLE_NAME = 'source_members' THEN
+    UPDATE as4tainr.objects SET changed = now()
+     WHERE library = coalesce(NEW.library, OLD.library) AND name = coalesce(NEW.file, OLD.file)
+       AND objtype = '*FILE' AND changed IS DISTINCT FROM now();
+  ELSE
+    UPDATE as4tainr.objects SET changed = now()
+     WHERE library = coalesce(NEW.library, OLD.library) AND name = coalesce(NEW.name, OLD.name)
+       AND objtype = TG_ARGV[0] AND changed IS DISTINCT FROM now();
+  END IF;
+  RETURN NULL;
+END $f$;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'as4tainr_changed'
+                  AND tgrelid = 'as4tainr.objects'::regclass) THEN
+    CREATE TRIGGER as4tainr_changed BEFORE UPDATE ON as4tainr.objects
+      FOR EACH ROW EXECUTE FUNCTION as4tainr.object_changed();
+    CREATE TRIGGER as4tainr_changed AFTER INSERT OR UPDATE OR DELETE ON as4tainr.source_members
+      FOR EACH ROW EXECUTE FUNCTION as4tainr.object_changed();
+    CREATE TRIGGER as4tainr_changed AFTER UPDATE ON as4tainr.data_areas
+      FOR EACH ROW EXECUTE FUNCTION as4tainr.object_changed('*DTAARA');
+    CREATE TRIGGER as4tainr_changed AFTER UPDATE ON as4tainr.user_spaces
+      FOR EACH ROW EXECUTE FUNCTION as4tainr.object_changed('*USRSPC');
+  END IF;
+END $$;
 "#;
 
 const FORMAT: &str = "as4tainr save 1";
@@ -154,6 +216,13 @@ const CATALOG: &[CatTable] = &[
         libs: &[],
     },
     CatTable {
+        table: "job_descriptions",
+        lib: "library",
+        name: "name",
+        types: &["*JOBD"],
+        libs: &[],
+    },
+    CatTable {
         table: "commands",
         lib: "library",
         name: "name",
@@ -250,6 +319,100 @@ pub struct SavedLib {
     /// Catalog rows by table, as JSON objects.
     pub catalog: Vec<(String, Vec<serde_json::Value>)>,
     pub pg: Vec<PgItem>,
+}
+
+/// OMITOBJ and SELECT of the save and restore commands (CL reference,
+/// RSTLIB: OMITOBJ elements object (library/object, generic or *ALL)
+/// and object type; SELECT elements *INCLUDE or *OMIT, object
+/// (library/object), object type, object attribute (*ALL, *BLANK,
+/// generic) and file member): an object an *INCLUDE entry selects is
+/// saved or restored unless an *OMIT entry or OMITOBJ leaves it out;
+/// with no *INCLUDE entry, every object is.
+#[derive(Debug, Default)]
+struct Filter {
+    omit: Vec<(String, String, String)>,
+    select: Vec<(bool, String, String, String, String)>,
+}
+
+impl Filter {
+    fn from_command(cmd: &Command) -> Result<Filter> {
+        let mut f = Filter::default();
+        let qual = |q: &str| -> (String, String) {
+            match q.split_once('/') {
+                Some((l, o)) => (l.to_string(), o.to_string()),
+                None => ("*ALL".to_string(), q.to_string()),
+            }
+        };
+        for e in cmd.list("OMITOBJ") {
+            let w: Vec<String> = e
+                .split_whitespace()
+                .map(|x| {
+                    x.trim_matches(|c| c == '(' || c == ')')
+                        .to_ascii_uppercase()
+                })
+                .filter(|x| !x.is_empty())
+                .collect();
+            match w.first().map(String::as_str) {
+                None | Some("*NONE") => continue,
+                Some(q) => {
+                    let (l, o) = qual(q);
+                    let t = w.get(1).cloned().unwrap_or_else(|| "*ALL".into());
+                    f.omit.push((l, o, t));
+                }
+            }
+        }
+        for e in cmd.list("SELECT") {
+            let w: Vec<String> = e
+                .split_whitespace()
+                .map(|x| {
+                    x.trim_matches(|c| c == '(' || c == ')')
+                        .to_ascii_uppercase()
+                })
+                .filter(|x| !x.is_empty())
+                .collect();
+            let include = match w.first().map(String::as_str) {
+                None => continue,
+                Some("*ALL") if w.len() <= 1 => continue,
+                Some("*INCLUDE") => true,
+                Some("*OMIT") => false,
+                Some(other) => {
+                    bail!("CPF9898: SELECT({other} ...): *INCLUDE or *OMIT is expected.")
+                }
+            };
+            let (l, o) = qual(w.get(1).map(String::as_str).unwrap_or("*ALL"));
+            let t = w.get(2).cloned().unwrap_or_else(|| "*ALL".into());
+            let a = w.get(3).cloned().unwrap_or_else(|| "*ALL".into());
+            let m = w.get(4).cloned().unwrap_or_else(|| "*ALL".into());
+            if m != "*ALL" {
+                bail!("CPF9898: SELECT with file member {m}: as4tainr saves and restores whole files (member *ALL).");
+            }
+            f.select.push((include, l, o, t, a));
+        }
+        Ok(f)
+    }
+
+    fn allows(&self, lib: &str, name: &str, objtype: &str, attr: &str) -> bool {
+        let hit = |l: &str, o: &str, t: &str| {
+            catalog::name_matches(l, lib)
+                && catalog::name_matches(o, name)
+                && (t == "*ALL" || t == objtype)
+        };
+        let attr_ok = |a: &str| match a {
+            "*ALL" => true,
+            "*BLANK" => attr.trim().is_empty(),
+            a => catalog::name_matches(a, attr),
+        };
+        if self.omit.iter().any(|(l, o, t)| hit(l, o, t)) {
+            return false;
+        }
+        let matches =
+            |(_, l, o, t, a): &&(bool, String, String, String, String)| hit(l, o, t) && attr_ok(a);
+        if self.select.iter().filter(|e| !e.0).any(|e| matches(&e)) {
+            return false;
+        }
+        let includes: Vec<_> = self.select.iter().filter(|e| e.0).collect();
+        includes.is_empty() || includes.iter().any(matches)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -573,8 +736,12 @@ async fn save_library(
                         }
                         _ => {
                             def.push_str(&ty);
-                            if let Some(cl) = &coll {
-                                def.push_str(&format!(" COLLATE {}", q(cl)));
+                            // Character columns saved by earlier
+                            // versions ("C") come back in EBCDIC order too.
+                            match coll.as_deref() {
+                                Some("C" | "ebcdic37") => def.push_str(CHAR_COLLATION),
+                                Some(cl) => def.push_str(&format!(" COLLATE {}", q(cl))),
+                                None => {}
                             }
                             if notnull {
                                 def.push_str(" NOT NULL");
@@ -959,7 +1126,12 @@ async fn restore_library(
             let mut left = Vec::new();
             let mut last_err = None;
             for it in pending {
-                let sql = reschema(&it.sql, to);
+                // Character columns in this system's order (saves made
+                // before EBCDIC order have COLLATE "C").
+                let coll = crate::collate::clause(&tx).await?;
+                let sql = reschema(&it.sql, to)
+                    .replace(CHAR_COLLATION, &coll)
+                    .replace(" COLLATE \"C\"", &coll);
                 let sql = if it.kind == "index" {
                     rename_index(&sql, &it.name, from, to)
                 } else {
@@ -1108,7 +1280,7 @@ async fn restore_library(
     for o in &todo {
         if skip_pg.contains(&(o.name.clone(), o.objtype.clone())) {
             tx.execute(
-                "UPDATE as4tainr.objects SET restored = now() WHERE library=$1 AND name=$2 AND objtype=$3",
+                "UPDATE as4tainr.objects SET restored = now(), changed = now() WHERE library=$1 AND name=$2 AND objtype=$3",
                 &[&to, &o.name, &o.objtype],
             )
             .await?;
@@ -1358,6 +1530,72 @@ pub async fn delete_save_file(client: &Client, lib: &str, name: &str) -> Result<
 /// The object (name, type) a PostgreSQL item belongs to, if any.
 type ObjectRef = Option<(String, String)>;
 
+/// What SAVCHGOBJ compares objects with: a time (None: the library has
+/// no SAVLIB, so everything is changed) and, for REFDATE(*SAVLIB), where
+/// the transactions were when that save began.
+struct Since {
+    time: Option<String>,
+    savlib_xid: Option<String>,
+}
+
+/// REFDATE and REFTIME as a timestamp (UTC, the system's time zone):
+/// the date in the job's date format, QDATFMT MDY (MMDDYY or MMDDYYYY,
+/// separators allowed; YY 40-99 is 19YY, 00-39 20YY); the time HHMMSS or
+/// HHMM, separators allowed; REFTIME(*NONE) is the start of the day.
+fn reference_time(date: &str, time: &str) -> Result<String> {
+    let digits = |s: &str| -> String { s.chars().filter(|c| c.is_ascii_digit()).collect() };
+    let bad = || {
+        anyhow::anyhow!("CPF9898: REFDATE({date}) is not a date in the job's date format (MMDDYY).")
+    };
+    let d = digits(date);
+    let (m, dd, y): (&str, &str, u32) = match d.len() {
+        6 => {
+            let yy: u32 = d[4..6].parse()?;
+            (
+                &d[0..2],
+                &d[2..4],
+                if yy >= 40 { 1900 + yy } else { 2000 + yy },
+            )
+        }
+        8 => (&d[0..2], &d[2..4], d[4..8].parse()?),
+        _ => return Err(bad()),
+    };
+    let (m, dd): (u32, u32) = (m.parse()?, dd.parse()?);
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if !(1..=12).contains(&m) || dd == 0 || dd > days[m as usize - 1] {
+        return Err(bad());
+    }
+    let t = if time.eq_ignore_ascii_case("*NONE") || time.is_empty() {
+        "000000".to_string()
+    } else {
+        let t = digits(time);
+        match t.len() {
+            4 => format!("{t}00"),
+            6 => t,
+            _ => bail!("CPF9898: REFTIME({time}) is not a time (HHMMSS)."),
+        }
+    };
+    let (h, mi, se): (u32, u32, u32) = (t[0..2].parse()?, t[2..4].parse()?, t[4..6].parse()?);
+    if h > 23 || mi > 59 || se > 59 {
+        bail!("CPF9898: REFTIME({time}) is not a time (HHMMSS).");
+    }
+    Ok(format!("{y:04}-{m:02}-{dd:02} {h:02}:{mi:02}:{se:02}+00"))
+}
+
 impl Job<'_> {
     pub(crate) async fn save_command(&mut self, cmd: &Command) -> Result<Option<Outcome>> {
         let msgs = match cmd.def.name {
@@ -1375,9 +1613,10 @@ impl Job<'_> {
                 )]
             }
             "DSPSAVF" => return self.dspsavf(cmd).await.map(Some),
-            "SAVOBJ" | "SAVLIB" => self.save(cmd).await?,
+            "SAVOBJ" | "SAVLIB" | "SAVCHGOBJ" => self.save(cmd).await?,
             "RSTOBJ" | "RSTLIB" => self.restore(cmd).await?,
             "DLTLIB" | "CLRLIB" => self.dltlib(cmd).await?,
+            "CRTDUPOBJ" => self.crtdupobj(cmd).await?,
             _ => return Ok(None),
         };
         Ok(Some(Outcome::Messages(msgs)))
@@ -1584,6 +1823,19 @@ impl Job<'_> {
             command: cmd.def.name.to_string(),
             libraries: Vec::new(),
         };
+        // Where the transactions are before the save: what changes after
+        // this is newer than the save (SAVCHGOBJ).
+        let xid: String = self
+            .client
+            .query_one(
+                "INSERT INTO as4tainr.xid_clock (xid)
+                 VALUES (pg_snapshot_xmin(pg_current_snapshot())::text) RETURNING xid",
+                &[],
+            )
+            .await?
+            .get(0);
+        let changed_only = cmd.def.name == "SAVCHGOBJ";
+        let filter = Filter::from_command(cmd)?;
         let mut msgs = Vec::new();
         let mut c = crate::runtime::connect_db(&self.env.database_url).await?;
         for lib in &libs {
@@ -1594,20 +1846,40 @@ impl Job<'_> {
             let rows = self
                 .client
                 .query(
-                    "SELECT name, objtype, attribute FROM as4tainr.objects WHERE library=$1 ORDER BY name",
+                    &format!(
+                        "SELECT name, objtype, attribute FROM as4tainr.objects WHERE library=$1 ORDER BY name{}",
+                        crate::collate::clause(self.client).await?
+                    ),
                     &[lib],
                 )
                 .await?;
+            let since = if changed_only {
+                Some(self.change_reference(cmd, lib).await?)
+            } else {
+                None
+            };
             let mut chosen = BTreeSet::new();
             let mut not_saved = Vec::new();
+            let mut omitted = false;
             for r in &rows {
                 let (n, t, a): (String, String, String) = (r.get(0), r.get(1), r.get(2));
                 let name_ok = objs
                     .iter()
                     .any(|o| o == "*ALL" || catalog::name_matches(o, &n));
                 let type_ok = types.iter().any(|x| x == "*ALL" || *x == t);
-                if !(name_ok && type_ok) {
+                if !(name_ok && type_ok && filter.allows(lib, &n, &t, &a)) {
+                    if name_ok && type_ok {
+                        omitted = true;
+                    }
                     continue;
+                }
+                if let Some(since) = &since {
+                    if !self
+                        .changed_since(lib, &n, &t, since, cmd.get("OBJJRN"))
+                        .await?
+                    {
+                        continue;
+                    }
                 }
                 if NOT_SAVED.contains(&t.as_str()) || a == "SAVF" {
                     not_saved.push(format!("{n} {t}"));
@@ -1625,10 +1897,16 @@ impl Job<'_> {
                 chosen.insert((n, t));
             }
             if chosen.is_empty() && !whole {
+                // SAVCHGOBJ of a library with nothing changed: CPF3770 as
+                // SAVOBJ (to be checked against a real system).
                 bail!("CPF3770: No objects were saved or restored for library {lib}.");
             }
             let pick = Pick {
-                objects: if whole { None } else { Some(chosen) },
+                objects: if whole && !omitted {
+                    None
+                } else {
+                    Some(chosen)
+                },
             };
             let saved = save_library(&mut c, lib, &pick, whole).await?;
             msgs.push(format!(
@@ -1652,6 +1930,27 @@ impl Job<'_> {
         // Save history (UPDHST(*YES)); a journaled file's save is in its
         // journal (F MS).
         if !cmd.get("UPDHST").eq_ignore_ascii_case("*NO") {
+            for l in img.libraries.iter().filter(|_| whole) {
+                // The library's last SAVLIB, the reference of SAVCHGOBJ
+                // REFDATE(*SAVLIB), and its files' records then.
+                self.client
+                    .execute(
+                        "UPDATE as4tainr.objects SET savlib = $2::text::timestamptz, savlib_xid = $3
+                          WHERE library = 'QSYS' AND name = $1 AND objtype = '*LIB'",
+                        &[&l.name, &img.saved, &xid],
+                    )
+                    .await?;
+                for o in l.objects.iter().filter(|o| o.objtype == "*FILE") {
+                    let rows = self.records(&l.name, &o.name, None).await?.map(|(n, _)| n);
+                    self.client
+                        .execute(
+                            "UPDATE as4tainr.objects SET savlib_rows = $3
+                              WHERE library = $1 AND name = $2 AND objtype = '*FILE'",
+                            &[&l.name, &o.name, &rows],
+                        )
+                        .await?;
+                }
+            }
             for l in &img.libraries {
                 for o in &l.objects {
                     self.client
@@ -1681,6 +1980,304 @@ impl Job<'_> {
                 }
             }
         }
+        Ok(msgs)
+    }
+
+    /// What SAVCHGOBJ compares with: REFDATE and REFTIME, or the
+    /// library's last SAVLIB (none: every object counts as changed).
+    async fn change_reference(&self, cmd: &Command, lib: &str) -> Result<Since> {
+        let date = cmd.get("REFDATE").to_ascii_uppercase();
+        if date == "*SAVLIB" {
+            let r = self
+                .client
+                .query_opt(
+                    "SELECT savlib::text, savlib_xid FROM as4tainr.objects
+                      WHERE library = 'QSYS' AND name = $1 AND objtype = '*LIB'",
+                    &[&lib],
+                )
+                .await?;
+            let (time, xid): (Option<String>, Option<String>) = match r {
+                Some(r) => (r.get(0), r.get(1)),
+                None => (None, None),
+            };
+            return Ok(Since {
+                time,
+                savlib_xid: xid,
+            });
+        }
+        Ok(Since {
+            time: Some(reference_time(&date, cmd.get("REFTIME"))?),
+            savlib_xid: None,
+        })
+    }
+
+    /// The number of records of a physical file (None: not a table), and
+    /// whether one was written after the transactions were at `xid`.
+    async fn records(
+        &self,
+        lib: &str,
+        name: &str,
+        xid: Option<&str>,
+    ) -> Result<Option<(i64, bool)>> {
+        let table = format!("{}.{}", catalog::ident(lib), catalog::ident(name));
+        let is_table: bool = self
+            .client
+            .query_one(
+                "SELECT coalesce((SELECT relkind = 'r' FROM pg_class WHERE oid = to_regclass($1)), false)",
+                &[&table],
+            )
+            .await?
+            .get(0);
+        if !is_table {
+            return Ok(None);
+        }
+        // A record written after `xid` has a younger xmin (frozen records
+        // are the oldest); one transaction more is counted as newer.
+        let r = self
+            .client
+            .query_one(
+                &format!(
+                    "SELECT count(*)::bigint,
+                            coalesce(bool_or(age(t.xmin)::numeric <=
+                              pg_snapshot_xmax(pg_current_snapshot())::text::numeric - $1::text::numeric + 1), false)
+                       FROM {table} t"
+                ),
+                &[&xid.unwrap_or("0")],
+            )
+            .await?;
+        Ok(Some((r.get(0), xid.is_some() && r.get::<_, bool>(1))))
+    }
+
+    /// Has the object changed since the reference? Its description
+    /// (`objects.changed`: made, restored, text, owner, a data area's
+    /// value, a source member...), and a physical file's records.
+    /// OBJJRN(*NO): a file journaled since before the reference is not
+    /// saved (SAVCHGOBJ's OBJJRN parameter).
+    async fn changed_since(
+        &self,
+        lib: &str,
+        name: &str,
+        objtype: &str,
+        since: &Since,
+        objjrn: &str,
+    ) -> Result<bool> {
+        let Some(time) = &since.time else {
+            return Ok(true);
+        };
+        if objtype == "*FILE" && !objjrn.eq_ignore_ascii_case("*YES") {
+            let journaled = self
+                .client
+                .query_opt(
+                    "SELECT 1 FROM as4tainr.journaled_files
+                      WHERE library = $1 AND file = $2 AND started < $3::text::timestamptz",
+                    &[&lib, &name, time],
+                )
+                .await?
+                .is_some();
+            if journaled {
+                return Ok(false);
+            }
+        }
+        let described: bool = self
+            .client
+            .query_opt(
+                "SELECT changed > $4::text::timestamptz FROM as4tainr.objects
+                  WHERE library = $1 AND name = $2 AND objtype = $3",
+                &[&lib, &name, &objtype, time],
+            )
+            .await?
+            .and_then(|r| r.get(0))
+            .unwrap_or(true);
+        if described || objtype != "*FILE" {
+            return Ok(described);
+        }
+        if let Some(xid) = &since.savlib_xid {
+            // Since the last SAVLIB: records written after it, or fewer
+            // or more records than it saved.
+            let then: Option<i64> = self
+                .client
+                .query_opt(
+                    "SELECT savlib_rows FROM as4tainr.objects
+                      WHERE library = $1 AND name = $2 AND objtype = '*FILE'",
+                    &[&lib, &name],
+                )
+                .await?
+                .and_then(|r| r.get(0));
+            return Ok(match self.records(lib, name, Some(xid)).await? {
+                Some((n, newer)) => newer || then != Some(n),
+                None => false,
+            });
+        }
+        // Since a date: with commit timestamps (track_commit_timestamp),
+        // the records committed after it; without them, the records
+        // written after the transactions were where they were at the
+        // last save or initialization before the date (or every file
+        // when there is none).
+        let stamps: bool = self
+            .client
+            .query_one(
+                "SELECT current_setting('track_commit_timestamp') = 'on'",
+                &[],
+            )
+            .await?
+            .get(0);
+        let table = format!("{}.{}", catalog::ident(lib), catalog::ident(name));
+        if stamps {
+            if self.records(lib, name, None).await?.is_none() {
+                return Ok(false);
+            }
+            return Ok(self
+                .client
+                .query_one(
+                    &format!(
+                        "SELECT coalesce(bool_or(pg_xact_commit_timestamp(t.xmin) > $1::text::timestamptz), false)
+                           FROM {table} t"
+                    ),
+                    &[time],
+                )
+                .await?
+                .get(0));
+        }
+        let clock: Option<String> = self
+            .client
+            .query_opt(
+                "SELECT xid FROM as4tainr.xid_clock WHERE at <= $1::text::timestamptz ORDER BY at DESC LIMIT 1",
+                &[time],
+            )
+            .await?
+            .map(|r| r.get(0));
+        Ok(match clock {
+            None => self.records(lib, name, None).await?.is_some(),
+            Some(x) => self
+                .records(lib, name, Some(&x))
+                .await?
+                .is_some_and(|(_, newer)| newer),
+        })
+    }
+
+    /// CRTDUPOBJ (CL reference): copies of objects of a library in
+    /// another library, or one object under a new name (NEWOBJ). Done as
+    /// a save of the objects (the catalog rows, the PostgreSQL objects,
+    /// with records only for DATA(*YES)) restored into TOLIB, renamed
+    /// first for NEWOBJ.
+    async fn crtdupobj(&mut self, cmd: &Command) -> Result<Vec<String>> {
+        let up = |k: &str| cmd.get(k).to_ascii_uppercase();
+        let pattern = up("OBJ");
+        let types: Vec<String> = cmd
+            .list("OBJTYPE")
+            .iter()
+            .map(|t| t.to_ascii_uppercase())
+            .collect();
+        let type_ok = |t: &str| types.iter().any(|x| x == "*ALL" || x == t);
+        // FROMLIB: a library, or the first of the library list or the
+        // current library with a matching object.
+        let from_libs = match up("FROMLIB").as_str() {
+            "*LIBL" => self.library_list(),
+            "*CURLIB" => vec![self.current_library()],
+            l => vec![catalog::validate_name("library", l)?],
+        };
+        let mut from = None;
+        let mut chosen: Vec<(String, String)> = Vec::new();
+        for l in &from_libs {
+            let rows = self
+                .client
+                .query(
+                    "SELECT name, objtype FROM as4tainr.objects WHERE library=$1 ORDER BY name, objtype",
+                    &[l],
+                )
+                .await?;
+            let found: Vec<(String, String)> = rows
+                .iter()
+                .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+                .filter(|(n, t)| {
+                    (pattern == "*ALL" || catalog::name_matches(&pattern, n)) && type_ok(t)
+                })
+                .collect();
+            if !found.is_empty() {
+                from = Some(l.clone());
+                chosen = found;
+                break;
+            }
+        }
+        let Some(from) = from else {
+            bail!(
+                "CPF2105: Object {pattern} in {} type {} not found.",
+                up("FROMLIB"),
+                types.join(" ")
+            );
+        };
+        let to = match up("TOLIB").as_str() {
+            "*FROMLIB" | "*SAME" => from.clone(),
+            "*CURLIB" => self.current_library(),
+            l => catalog::validate_name("library", l)?,
+        };
+        if !catalog::library_exists(self.client, &to).await? {
+            bail!("CPF2110: Library {to} does not exist.");
+        }
+        let newobj = match up("NEWOBJ").as_str() {
+            "*OBJ" | "*SAME" => None,
+            n => Some(catalog::validate_name("object", n)?),
+        };
+        if newobj.is_some() && chosen.len() > 1 {
+            bail!(
+                "CPF9898: NEWOBJ names one object; {} objects match {pattern}.",
+                chosen.len()
+            );
+        }
+        let mut msgs = Vec::new();
+        chosen.retain(|(n, t)| {
+            if NOT_SAVED.contains(&t.as_str()) {
+                msgs.push(format!(
+                    "Object {n} type {t} not duplicated (as4tainr does not copy this type)."
+                ));
+                false
+            } else {
+                true
+            }
+        });
+        for (n, t) in &chosen {
+            crate::authority::check(
+                self.client,
+                &self.user,
+                &from,
+                n,
+                t,
+                crate::authority::Aut::Use,
+            )
+            .await?;
+            let target = newobj.clone().unwrap_or_else(|| n.clone());
+            if catalog::object_exists(self.client, std::slice::from_ref(&to), &target, t).await? {
+                bail!("Object {target} type {t} already exists in library {to}.\nCPF2130: 0 objects duplicated. 1 objects not duplicated.");
+            }
+        }
+        if chosen.is_empty() {
+            bail!(
+                "CPF2105: Object {pattern} in {from} type {} not found.",
+                types.join(" ")
+            );
+        }
+        let pick = Pick {
+            objects: Some(chosen.iter().cloned().collect()),
+        };
+        let mut c = crate::runtime::connect_db(&self.env.database_url).await?;
+        let mut saved = save_library(&mut c, &from, &pick, false).await?;
+        if !up("DATA").eq("*YES") {
+            for it in saved.pg.iter_mut() {
+                if it.kind == "table" {
+                    it.data = None;
+                }
+            }
+        }
+        if let Some(new) = &newobj {
+            let (old, objtype) = chosen[0].clone();
+            rename_saved(&mut saved, &old, new, &objtype);
+        }
+        let (done, mut notes) = restore_library(&mut c, &saved, &to, &|_| true, &self.user).await?;
+        msgs.append(&mut notes);
+        msgs.push(format!(
+            "{} objects duplicated from library {from} to library {to}.",
+            done.len()
+        ));
         Ok(msgs)
     }
 
@@ -1732,10 +2329,32 @@ impl Job<'_> {
                 .map(|l| l.to_ascii_uppercase())
                 .collect()
         };
+        let filter = Filter::from_command(cmd)?;
+        // FILEMBR: whole files only (*ALL members).
+        for e in cmd.list("FILEMBR") {
+            let w: Vec<String> = e
+                .split_whitespace()
+                .map(|x| {
+                    x.trim_matches(|c| c == '(' || c == ')')
+                        .to_ascii_uppercase()
+                })
+                .filter(|x| !x.is_empty())
+                .collect();
+            if w.iter().skip(1).any(|m| m != "*ALL") {
+                bail!("CPF9898: FILEMBR({e}): as4tainr restores whole files (members *ALL).");
+            }
+        }
+        if !matches!(cmd.get("OPTION").to_ascii_uppercase().as_str(), "" | "*ALL") {
+            bail!(
+                "CPF9898: OPTION({}): as4tainr restores every object (OPTION(*ALL)).",
+                cmd.get("OPTION")
+            );
+        }
         let pick = |o: &SavedObj| {
             objs.iter()
                 .any(|x| x == "*ALL" || catalog::name_matches(x, &o.name))
                 && types.iter().any(|x| x == "*ALL" || *x == o.objtype)
+                && filter.allows(&saved.name, &o.name, &o.objtype, &o.attribute)
         };
         if !saved.objects.iter().any(pick) {
             bail!(
@@ -1760,22 +2379,29 @@ impl Job<'_> {
         if !catalog::library_exists(self.client, &lib).await? {
             bail!("CPF2110: Library {lib} does not exist.");
         }
+        let delete = cmd.def.name == "DLTLIB";
+        // CLRLIB QTEMP clears the job's own; it cannot be deleted.
+        let qtemp = crate::qtemp::is_qtemp(&lib);
         if matches!(
             lib.as_str(),
-            "QSYS" | "QSYS2" | "QGPL" | "QTEMP" | "QUSRSYS" | "QHLPSYS"
-        ) {
+            "QSYS" | "QSYS2" | "QGPL" | "QUSRSYS" | "QHLPSYS"
+        ) || (qtemp && (delete || crate::qtemp::current().is_none()))
+        {
+            let lib = if qtemp { "QTEMP" } else { lib.as_str() };
             bail!("CPF9898: Library {lib} is a system library and cannot be deleted or cleared.");
         }
-        crate::authority::check(
-            self.client,
-            &self.user,
-            "QSYS",
-            &lib,
-            "*LIB",
-            crate::authority::Aut::All,
-        )
-        .await?;
-        let delete = cmd.def.name == "DLTLIB";
+        // The job's own QTEMP: the job may clear it.
+        if !qtemp {
+            crate::authority::check(
+                self.client,
+                &self.user,
+                "QSYS",
+                &lib,
+                "*LIB",
+                crate::authority::Aut::All,
+            )
+            .await?;
+        }
         let mut c = crate::runtime::connect_db(&self.env.database_url).await?;
         let n = clear_library(&mut c, &lib, delete).await?;
         Ok(vec![if delete {
@@ -1783,6 +2409,86 @@ impl Job<'_> {
         } else {
             format!("Library {lib} cleared, {n} objects deleted.")
         }])
+    }
+}
+
+/// A saved object under another name (CRTDUPOBJ NEWOBJ): its object
+/// entry, its catalog rows, and for a file its PostgreSQL objects (the
+/// table and what is named after it).
+fn rename_saved(saved: &mut SavedLib, old: &str, new: &str, objtype: &str) {
+    for o in saved.objects.iter_mut() {
+        if o.name == old && o.objtype == objtype {
+            o.name = new.to_string();
+        }
+    }
+    for (table, rows) in saved.catalog.iter_mut() {
+        let Some(c) = CATALOG.iter().find(|c| c.table == table) else {
+            continue;
+        };
+        if !c.types.contains(&objtype) {
+            continue;
+        }
+        for row in rows.iter_mut() {
+            let Some(obj) = row.as_object_mut() else {
+                continue;
+            };
+            if obj.get(c.name).and_then(|v| v.as_str()) != Some(old) {
+                continue;
+            }
+            obj.insert(
+                c.name.to_string(),
+                serde_json::Value::String(new.to_string()),
+            );
+            // A command's definition names itself.
+            if table == "commands" {
+                if let Some(d) = obj.get("definition").and_then(|v| v.as_str()) {
+                    if let Ok(mut j) = serde_json::from_str::<serde_json::Value>(d) {
+                        j["name"] = serde_json::Value::String(new.to_string());
+                        obj.insert(
+                            "definition".into(),
+                            serde_json::Value::String(j.to_string()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let (po, pn) = (pg_name(old), pg_name(new));
+    for it in saved.pg.iter_mut() {
+        if it
+            .object
+            .as_ref()
+            .is_some_and(|(n, t)| n == old && t == objtype)
+        {
+            it.object = Some((new.to_string(), objtype.to_string()));
+            if it.name == po {
+                it.name = pn.clone();
+            } else if let Some(rest) = it.name.strip_prefix(&format!("{po}_")) {
+                it.name = format!("{pn}_{rest}");
+            }
+            let sql = it
+                .sql
+                .replace(&q(&po), &q(&pn))
+                .replace(&format!("\"{po}_"), &format!("\"{pn}_"));
+            // Names made from the table's (ta_pk), unquoted.
+            let mut out = String::new();
+            let cs: Vec<char> = sql.chars().collect();
+            let mut i = 0;
+            let ident =
+                |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '#' || c == '@';
+            while i < cs.len() {
+                let starts = (i == 0 || !ident(cs[i - 1]))
+                    && cs[i..].iter().take(po.len() + 1).collect::<String>() == format!("{po}_");
+                if starts {
+                    out.push_str(&pn);
+                    i += po.len();
+                } else {
+                    out.push(cs[i]);
+                    i += 1;
+                }
+            }
+            it.sql = out;
+        }
     }
 }
 

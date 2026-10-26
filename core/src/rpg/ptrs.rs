@@ -22,10 +22,12 @@ impl<'a> Machine<'a> {
         }
         let p = if buf >= LENT_BASE {
             let k = (buf - LENT_BASE) >> 24;
+            let b = (buf - LENT_BASE) & 0xFF_FFFF;
+            let l = &self.bufs.lent[k];
             Ptr {
                 kind: KIND_STORAGE,
-                owner: self.bufs.lent[k].0,
-                buf: ((buf - LENT_BASE) & 0xFF_FFFF) as u32,
+                owner: if b < l.globals { l.act } else { l.owner },
+                buf: b as u32,
                 off: off as u32,
             }
         } else if buf >= HEAP_BASE {
@@ -36,9 +38,17 @@ impl<'a> Machine<'a> {
                 off: off as u32,
             }
         } else {
+            // A module's global storage belongs to its activation (the
+            // same in every call); a procedure's local storage to this
+            // call of the module only, even when the module is called
+            // again further up the stack (a callback into it).
             Ptr {
                 kind: KIND_STORAGE,
-                owner: self.owner,
+                owner: if buf < self.prog.globals.len() {
+                    self.owner
+                } else {
+                    self.frame_owner
+                },
                 buf: buf as u32,
                 off: off as u32,
             }
@@ -60,15 +70,24 @@ impl<'a> Machine<'a> {
             KIND_PROC | KIND_SYS => {
                 bail!("MCH3601: a procedure or system pointer does not address storage.")
             }
+            // Heap storage freed by DEALLOC stays addressable with what
+            // it held (on IBM i it stays in the heap's storage; a program
+            // that reads it after freeing it, as iRPGUnit's RUNT does,
+            // gets no exception); it is never handed out again here.
             KIND_HEAP => {
                 let h = p.buf as usize;
-                if self.bufs.heap.freed.get(h).copied().unwrap_or(true) {
-                    bail!("MCH3601: the pointer addresses heap storage that was freed (DEALLOC).");
+                if h >= self.bufs.heap.blocks.len() {
+                    bail!("MCH3601: the pointer addresses heap storage that does not exist.");
                 }
                 HEAP_BASE + h
             }
-            _ if p.owner == self.owner => p.buf as usize,
-            _ => match self.bufs.lent.iter().position(|l| l.0 == p.owner) {
+            _ if p.owner == self.frame_owner => p.buf as usize,
+            _ if p.owner == self.owner && (p.buf as usize) < self.prog.globals.len() => {
+                p.buf as usize
+            }
+            _ => match self.bufs.lent.iter().rposition(|l| {
+                l.owner == p.owner || (l.act == p.owner && (p.buf as usize) < l.globals)
+            }) {
                 Some(k) => LENT_BASE + (k << 24) + p.buf as usize,
                 None => bail!(
                     "MCH3601: the pointer addresses storage of a program that is not running, or that this call cannot reach."
@@ -155,8 +174,10 @@ impl<'a> Machine<'a> {
             bail!("RNQ0426: the pointer for DEALLOC does not address heap storage from ALLOC or %ALLOC.");
         }
         let h = buf - HEAP_BASE;
+        if self.bufs.heap.freed[h] {
+            bail!("RNQ0426: the heap storage for DEALLOC was already freed.");
+        }
         self.bufs.heap.freed[h] = true;
-        self.bufs.heap.blocks[h] = Vec::new();
         Ok(())
     }
 

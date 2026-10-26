@@ -50,8 +50,56 @@ BEGIN
                  WHERE table_schema='as4tainr' AND table_name='programs' AND column_name='binding') THEN
     ALTER TABLE as4tainr.programs ADD COLUMN IF NOT EXISTS binding text;
   END IF;
+  -- Where a module came from, and when its source last changed
+  -- (QBNRMODI, RTVOBJD SRCF/SRCFLIB/SRCMBR/SRCDATE).
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='modules' AND column_name='src_changed') THEN
+    ALTER TABLE as4tainr.modules ADD COLUMN IF NOT EXISTS src_file text NOT NULL DEFAULT '',
+                                 ADD COLUMN IF NOT EXISTS src_lib text NOT NULL DEFAULT '',
+                                 ADD COLUMN IF NOT EXISTS src_mbr text NOT NULL DEFAULT '',
+                                 ADD COLUMN IF NOT EXISTS src_changed timestamptz;
+    ALTER TABLE as4tainr.programs ADD COLUMN IF NOT EXISTS src_changed timestamptz;
+  END IF;
 END $$;
 "#;
+
+/// Where a module or program came from: its source member and when the
+/// source last changed (None: a stream file, or not known).
+pub async fn set_source(
+    client: &Client,
+    library: &str,
+    name: &str,
+    objtype: &str,
+    m: &crate::source::Member,
+) -> Result<()> {
+    let table = if objtype == "*MODULE" {
+        "modules"
+    } else {
+        "programs"
+    };
+    let secs: Option<f64> = m.changed_us.map(|us| us as f64 / 1e6);
+    let (file, lib) = if m.stmf.is_empty() {
+        (m.file.clone(), m.library.clone())
+    } else {
+        (String::new(), String::new())
+    };
+    let mbr = if m.stmf.is_empty() {
+        m.name.clone()
+    } else {
+        String::new()
+    };
+    client
+        .execute(
+            &format!(
+                "UPDATE as4tainr.{table} SET src_file=$3, src_lib=$4, src_mbr=$5,
+                        src_changed = CASE WHEN $6::float8 IS NULL THEN NULL ELSE to_timestamp($6::float8) END
+                  WHERE library=$1 AND name=$2"
+            ),
+            &[&library, &name, &file, &lib, &mbr, &secs],
+        )
+        .await?;
+    Ok(())
+}
 
 /// A module's code as bound into an object (a copy: changing the module
 /// afterwards does not change the object).
@@ -162,7 +210,10 @@ pub async fn bnddir_entries(
     bnddir: &str,
 ) -> Result<Vec<(String, String, String)>> {
     let (libs, name) = match bnddir.split_once('/') {
-        Some((l, n)) if l != "*LIBL" => (vec![l.to_ascii_uppercase()], n.to_ascii_uppercase()),
+        Some((l, n)) if l != "*LIBL" => (
+            vec![crate::qtemp::real(&l.to_ascii_uppercase())],
+            n.to_ascii_uppercase(),
+        ),
         Some((_, n)) => (libl.to_vec(), n.to_ascii_uppercase()),
         None => (libl.to_vec(), bnddir.to_ascii_uppercase()),
     };
@@ -202,6 +253,10 @@ pub const SYSTEM_BNDDIRS: &[&str] = &["QC2LE", "QUSAPIBD"];
 /// Procedures of the system's service programs that as4tainr provides.
 pub const SYSTEM_PROCEDURES: &[&str] = crate::rpg::interp::crt::C_FUNCTIONS;
 
+/// Data the ILE C runtime exports (QC2LE): _EXCP_MSGID, the message ID
+/// of the exception a failed system() call ended with.
+pub const SYSTEM_DATA: &[&str] = &["_EXCP_MSGID"];
+
 /// A service program's binding, found through the library list (or in
 /// the library named).
 pub async fn find_srvpgm(
@@ -213,7 +268,7 @@ pub async fn find_srvpgm(
     let libs = if library == "*LIBL" || library.is_empty() {
         libl.to_vec()
     } else {
-        vec![library.to_string()]
+        vec![crate::qtemp::real(library)]
     };
     for lib in &libs {
         if let Some(r) = client
@@ -240,7 +295,7 @@ pub async fn find_module(
     let libs = if library == "*LIBL" || library.is_empty() {
         libl.to_vec()
     } else {
-        vec![library.to_string()]
+        vec![crate::qtemp::real(library)]
     };
     for lib in &libs {
         if let Some(r) = client
@@ -358,6 +413,7 @@ pub async fn bind(
             // Qp0zLprintf): resolved without a binding.
             if !found
                 && (SYSTEM_PROCEDURES.contains(&sym.as_str())
+                    || SYSTEM_DATA.contains(&sym.as_str())
                     || crate::rpg::interp::cee::CEE_APIS.contains(&sym.as_str()))
             {
                 found = true;

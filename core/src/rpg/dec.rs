@@ -1,16 +1,21 @@
 //! Exact decimal numbers for RPG: a signed integer mantissa and a number
 //! of decimal places. No floating point anywhere.
 //!
-//! RPG fields hold at most 63 digits; this type holds 38 (an i128), which
-//! covers every field in practice. Results that need more digits fail with
-//! an error rather than lose digits silently.
+//! RPG fields hold at most 63 digits (ILE RPG Reference, "Numeric Data
+//! Type"); the mantissa is a 256-bit integer, which holds them. Results
+//! that need more digits fail with an error rather than lose digits
+//! silently.
 
 use anyhow::{anyhow, bail, Result};
 use std::cmp::Ordering;
 use std::fmt;
 
 /// The most digits a value can have here.
-pub const MAX_DIGITS: u32 = 38;
+pub const MAX_DIGITS: u32 = 63;
+
+/// The mantissa: a 256-bit signed integer (76 digits), so that 63-digit
+/// values and products before they are cut down fit.
+pub type M = ethnum::I256;
 
 /// Decimal places kept in the quotient of a division before it is
 /// assigned (the assignment then truncates or rounds it to the target).
@@ -19,28 +24,36 @@ pub const DIV_SCALE: u8 = 18;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Dec {
     /// value = m / 10^s
-    m: i128,
+    m: M,
     s: u8,
 }
 
-fn pow10(n: u32) -> Result<i128> {
-    10i128
+fn pow10(n: u32) -> Result<M> {
+    M::new(10)
         .checked_pow(n)
         .ok_or_else(|| anyhow!("a number has more than {MAX_DIGITS} digits"))
 }
 
 impl Dec {
-    pub const ZERO: Dec = Dec { m: 0, s: 0 };
+    pub const ZERO: Dec = Dec { m: M::ZERO, s: 0 };
 
     pub fn new(m: i128, s: u8) -> Dec {
+        Dec { m: M::new(m), s }
+    }
+
+    /// A value from a 256-bit mantissa.
+    pub fn from_m(m: M, s: u8) -> Dec {
         Dec { m, s }
     }
 
     pub fn from_i64(v: i64) -> Dec {
-        Dec { m: v as i128, s: 0 }
+        Dec {
+            m: M::new(i128::from(v)),
+            s: 0,
+        }
     }
 
-    pub fn mantissa(&self) -> i128 {
+    pub fn mantissa(&self) -> M {
         self.m
     }
 
@@ -104,10 +117,12 @@ impl Dec {
         if digits.len() as u32 > MAX_DIGITS {
             bail!("'{text}' has more than {MAX_DIGITS} digits");
         }
-        let m: i128 = if digits.is_empty() {
-            0
+        let m: M = if digits.is_empty() {
+            M::ZERO
         } else {
-            digits.parse()?
+            digits
+                .parse()
+                .map_err(|_| anyhow!("'{text}' is not a valid number"))?
         };
         Ok(Dec {
             m: if neg { -m } else { m },
@@ -135,7 +150,7 @@ impl Dec {
                 if half_adjust {
                     let r = (self.m % f).abs();
                     if r * 2 >= f {
-                        q += if self.m < 0 { -1 } else { 1 };
+                        q += if self.m < 0 { M::MINUS_ONE } else { M::ONE };
                     }
                 }
                 Ok(Dec { m: q, s: scale })
@@ -143,7 +158,7 @@ impl Dec {
         }
     }
 
-    fn aligned(a: &Dec, b: &Dec) -> Result<(i128, i128, u8)> {
+    fn aligned(a: &Dec, b: &Dec) -> Result<(M, M, u8)> {
         let s = a.s.max(b.s);
         Ok((a.rescale(s, false)?.m, b.rescale(s, false)?.m, s))
     }
@@ -219,7 +234,7 @@ impl Dec {
     /// Integer part (truncated toward zero).
     pub fn trunc(&self) -> Dec {
         Dec {
-            m: self.rescale(0, false).map(|d| d.m).unwrap_or(0),
+            m: self.rescale(0, false).map(|d| d.m).unwrap_or(M::ZERO),
             s: 0,
         }
     }
@@ -236,7 +251,7 @@ impl Dec {
 
     /// Digits before the decimal point (0 for a value below 1).
     pub fn int_digits(&self) -> u32 {
-        let mut i = (self.m / 10i128.pow(self.s as u32)).unsigned_abs();
+        let mut i = (self.m / M::new(10).pow(self.s as u32)).unsigned_abs();
         let mut n = 0;
         while i > 0 {
             i /= 10;
@@ -263,13 +278,14 @@ impl Dec {
         })
     }
 
-    /// Exact integer value, if there are no decimal places left.
+    /// Exact integer value, if there are no decimal places left (and it
+    /// fits 128 bits).
     pub fn to_i128(&self) -> Result<i128> {
         let n = self.normalized();
         if n.s != 0 {
             bail!("{} is not a whole number", self);
         }
-        Ok(n.m)
+        i128::try_from(n.m).map_err(|_| anyhow!("{self} is too large for an integer"))
     }
 
     /// The absolute value's digits, `digits` of them with `decimals`
@@ -367,6 +383,27 @@ mod tests {
         );
         assert!(!d("1000").fits(3, 0));
         assert!(d("999.99").fits(5, 2));
+    }
+
+    #[test]
+    fn sixty_three_digits() {
+        // ILE RPG Reference, "Numeric Data Type": packed and zoned
+        // fields hold up to 63 digits.
+        let nines = "9".repeat(63);
+        assert_eq!(d(&nines).to_string(), nines);
+        assert!(Dec::parse(&"9".repeat(64)).is_err());
+        let x = d(&"3".repeat(31));
+        assert_eq!(
+            x.mul(&d("3")).unwrap().to_string(),
+            "9".repeat(31),
+            "31 digits times 3"
+        );
+        assert_eq!(
+            d(&format!("{}.{}", "1".repeat(43), "5".repeat(20)))
+                .digits(63, 20)
+                .unwrap(),
+            format!("{}{}", "1".repeat(43), "5".repeat(20))
+        );
     }
 
     #[test]

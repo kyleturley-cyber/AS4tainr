@@ -42,8 +42,19 @@ pub(super) fn origin(err: &anyhow::Error) -> Option<At> {
 }
 
 /// The message identifier an error starts with (`CPF5026: ...`), if any.
+///
+/// A run-time error as4tainr reports as an ILE RPG inquiry message
+/// (RNQxxxx) is signaled first as the escape message of the same number,
+/// RNXxxxx (ILE RPG Programmer's Guide, "ILE RPG Exception Handling":
+/// the RNX escape message is what MONITOR, *PSSR and the program status
+/// data structure see; the RNQ inquiry is sent only when nothing handles
+/// it). The halt indicators (RNQ0231-0233) are no exception.
 pub(super) fn message_id(err: &anyhow::Error) -> String {
-    crate::jobs::escape_id(&err.root_cause().to_string()).to_string()
+    let id = crate::jobs::escape_id(&err.root_cause().to_string()).to_string();
+    match id.strip_prefix("RNQ") {
+        Some(n) if !matches!(n, "0231" | "0232" | "0233") => format!("RNX{n}"),
+        _ => id,
+    }
 }
 
 /// The RPG status code of an error (ILE RPG Reference, "Program Status

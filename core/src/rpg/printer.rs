@@ -57,6 +57,34 @@ impl Machine<'_> {
             }
             None => None,
         };
+        // The job's last spooled file, for QSPRILSP: its name, job and
+        // number (without a job of as4tainr's, `as4tainr system`, the
+        // lines go to standard output and the number counts opens).
+        let number = match spl {
+            Some(id) => self
+                .block(async {
+                    Ok::<i32, anyhow::Error>(
+                        self.io
+                            .client
+                            .query_one(
+                                "SELECT number FROM as4tainr.spooled_files WHERE id=$1",
+                                &[&id],
+                            )
+                            .await?
+                            .get::<_, i32>(0),
+                    )
+                })
+                .unwrap_or(1),
+            None => crate::rpg::last_spooled_file(&self.io.job_key).map_or(1, |l| l.4 + 1),
+        };
+        let (jname, juser, jnbr) = match &self.io.job {
+            Some(j) => (j.name.clone(), j.user.clone(), format!("{:06}", j.number)),
+            None => (String::new(), self.io.user.clone(), String::new()),
+        };
+        crate::rpg::set_last_spooled_file(
+            &self.io.job_key,
+            (name.clone(), jname, juser, jnbr, number),
+        );
         self.printers.insert(
             file.to_string(),
             Printer {
@@ -104,6 +132,44 @@ impl Machine<'_> {
         let prog = self.prog;
         let fi = &prog.files[i];
         let Some(dds) = fi.printer.clone() else {
+            // WRITE of a program-described printer file with a data
+            // structure (ILE RPG Reference, WRITE: "a data structure
+            // must be specified for a program-described file"): the
+            // structure's bytes are the line, printed as an output
+            // specification without spacing would (one line down).
+            if let Some(ds) = self.io_ds.clone() {
+                let bytes = match self.sym(&ds) {
+                    Some(Sym::Ds(d)) => self.bufs[d.buf][d.off..d.off + d.size].to_vec(),
+                    Some(Sym::Var(v)) => self.bufs[v.buf][v.off..v.off + v.dtype.size()].to_vec(),
+                    _ => bail!("WRITE {fmt}: {ds} is not a data structure"),
+                };
+                let rec = OutRec {
+                    file: fi.decl.name.clone(),
+                    kind: 'E',
+                    fetch_overflow: false,
+                    add: false,
+                    del: false,
+                    cond: Vec::new(),
+                    name: None,
+                    space_before: None,
+                    space_after: None,
+                    skip_before: None,
+                    skip_after: None,
+                    fields: vec![OutField {
+                        cond: Vec::new(),
+                        name: None,
+                        edit_code: None,
+                        blank_after: false,
+                        end: Some(bytes.len() as u32),
+                        relative: None,
+                        edit_word: None,
+                        format: ' ',
+                        literal: Some(bytes),
+                    }],
+                    line: 0,
+                };
+                return self.print_line(&rec);
+            }
             bail!(
                 "WRITE {fmt}: printer file {} is program-described; it is written with EXCEPT and output specifications",
                 fi.decl.name

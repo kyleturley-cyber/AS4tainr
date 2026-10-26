@@ -13,8 +13,14 @@ RPG programs call the UNIX-type APIs through prototypes, bound from QC2LE (`ctl-
 | `unlink`, `mkdir`, `rmdir`, `access`, `rename` | unlink of a directory is EPERM; rmdir of a directory that is not empty is ENOTEMPTY; rename keeps an existing target (EEXIST) |
 | `__errno`, `strerror`, `perror` | errno is an `int(10)` the returned pointer addresses; the values are IBM's (ENOENT 3025, EEXIST 3457, EACCES 3401...); the texts are as4tainr's |
 | `system(command)` | Runs a CL command: 0 when it ran, 1 when it failed, -1 for a null pointer |
+| `chdir(path)`, `getcwd(buf: size)` | The job's current directory (below); getcwd gives NULL with ERANGE when the path and its null do not fit |
+| `printf(format: ...)`, `puts(string)` | The job's standard output, which `as4tainr system` writes out (see docs/fidelity-gaps.md) |
 
 File descriptors belong to the job: a descriptor one program opened can be used by another program of the job until it is closed. A file's bytes are read when it is opened and stored when it is closed, when the program that wrote ends, and when the job ends.
+
+## The current directory
+
+Each job has a current directory, where relative path names start (`SRCSTMF('qrpglesrc/x.rpgle')`, `open('data.csv')`). A job starts in its user's home directory, /home/USER, when it exists, else in /; `as4tainr system` and `as4tainr call` start in the directory they were started in when that path is a directory in the IFS, as PASE `system` runs in its shell's directory. `CHGCURDIR` (`CD`) and `chdir()` change it, for the rest of the job; Qshell commands start in it.
 
 ## CL commands
 
@@ -24,6 +30,7 @@ File descriptors belong to the job: a descriptor one program opened can be used 
 | `RMVDIR` (`RMDIR`, `RD`) `DIR(path) [SUBTREE(*ALL)]` | An empty directory, or with SUBTREE(*ALL) everything in it |
 | `RMVLNK` (`DEL`, `ERASE`) `OBJLNK(path)` | A stream file, or the files a generic name (`/dir/*.txt` is not supported; `/dir/abc*` is) matches; CPFA0A9 when nothing is found |
 | `RNM OBJ(path) NEWOBJ(name)` | |
+| `CHGCURDIR` (`CD`) `DIR(path)` | The job's current directory; CPFA0A9 when it does not exist |
 | `WRKLNK`, `DSPLNK` `OBJ(path)` | The objects in a directory, with options 4 (remove) and 5 (display) |
 | `CPYTOSTMF FROMMBR('/QSYS.LIB/lib.LIB/file.FILE/mbr.MBR') TOSTMF(path)` | A source member's records as lines: trailing blanks removed and ENDLINFMT's line end added (*CRLF by default; *FIXED keeps the records whole); STMFOPT(*NONE, *ADD, *REPLACE); STMFCCSID (a number, *STMF: the existing file's CCSID or 37 for a new file, *PCASCII 1252, *STDASCII 819). CPFA097 when the file exists with STMFOPT(*NONE) |
 | `CPYFRMSTMF FROMSTMF(path) TOMBR('/QSYS.LIB/...')` | Lines into a source member: any combination of CR and LF ends a line, tabs become blanks to the next stop of 8 (TABEXPN(*YES)); MBROPT(*NONE, *ADD, *REPLACE); CPFA095 when it cannot copy |

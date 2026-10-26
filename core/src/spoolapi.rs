@@ -95,7 +95,7 @@ pub fn list_info(
 }
 
 fn field(s: &str, n: usize) -> Vec<u8> {
-    let mut b = ebcdic(s);
+    let mut b = ebcdic(&crate::qtemp::logical(s));
     b.resize(n, 0x40);
     b.truncate(n);
     b
@@ -160,6 +160,51 @@ pub struct Filter {
     pub form_type: String,
     pub user_data: String,
     pub statuses: Vec<String>,
+    /// OSPF0200: the first and last moments created (CYYMMDDHHMMSS), as
+    /// given (*ALL and *LAST: none).
+    pub created_from: Option<String>,
+    pub created_to: Option<String>,
+}
+
+/// Filter information, format OSPF0200 (QGYOLSPL's filter format
+/// parameter): its length; offset to, number and length of the user
+/// names, output queues, statuses and devices; form type, user-specified
+/// data, system name, starting date and time created (*ALL), ending date
+/// and time created (*LAST).
+pub fn parse_filter_0200(b: &[u8]) -> Filter {
+    let i4 = |a: usize| -> usize {
+        b.get(a..a + 4)
+            .map(|x| i32::from_be_bytes(x.try_into().unwrap()).max(0) as usize)
+            .unwrap_or(0)
+    };
+    let txt = |a: usize, n: usize| -> String {
+        b.get(a..a + n)
+            .map(|x| crate::rpg::data::a(x).trim().to_ascii_uppercase())
+            .unwrap_or_default()
+    };
+    let list = |off: usize, n: usize, len: usize| -> Vec<String> {
+        (0..n).map(|k| txt(off + k * len, len)).collect()
+    };
+    let mut f = Filter {
+        users: list(i4(4), i4(8), i4(12).max(1)),
+        ..Default::default()
+    };
+    let qlen = i4(24).max(1);
+    f.outqs = (0..i4(20))
+        .map(|k| {
+            let at = i4(16) + k * qlen;
+            (txt(at, 10), txt(at + 10, 10))
+        })
+        .collect();
+    f.statuses = list(i4(28), i4(32), i4(36).max(1));
+    f.form_type = txt(52, 10);
+    f.user_data = txt(62, 10);
+    let moment = |d: String, t: String, special: &str| -> Option<String> {
+        (!d.is_empty() && d != special).then(|| format!("{d:0<7}{t:0<6}"))
+    };
+    f.created_from = moment(txt(80, 7), txt(87, 6), "*ALL");
+    f.created_to = moment(txt(93, 7), txt(100, 6), "*LAST");
+    f
 }
 
 pub fn parse_filter(b: &[u8]) -> Filter {
@@ -245,7 +290,10 @@ pub async fn select(
             });
         let form_ok = f.form_type.is_empty() || f.form_type == "*ALL" || f.form_type == "*STD";
         let job_ok = job.is_none_or(|j| j == s.job_number);
-        if user_ok && outq_ok && data_ok && status_ok && form_ok && job_ok {
+        let at = format!("{}{}", s.opened.0, s.opened.1);
+        let time_ok = f.created_from.as_ref().is_none_or(|x| at >= *x)
+            && f.created_to.as_ref().is_none_or(|x| at <= *x);
+        if user_ok && outq_ok && data_ok && status_ok && form_ok && job_ok && time_ok {
             out.push(s);
         }
     }

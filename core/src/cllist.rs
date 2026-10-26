@@ -154,7 +154,23 @@ pub fn analyze(source: &str, known: &dyn Fn(&str) -> bool, file_vars: &FileVars)
         if let Some(l) = &st.label {
             a.labels.push((l.clone(), *line));
         }
-        let name = st.name.to_ascii_uppercase();
+        // The command as written, LIB/CMD included (the statement keeps
+        // the bare name).
+        let body = match &st.label {
+            Some(_) => text.split_once(':').map(|x| x.1).unwrap_or(text),
+            None => text.as_str(),
+        };
+        let written = body
+            .trim_start()
+            .split(|c: char| c.is_whitespace() || c == '(')
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        let name = if written.ends_with(&format!("/{}", st.name.to_ascii_uppercase())) {
+            written
+        } else {
+            st.name.to_ascii_uppercase()
+        };
         let bare = name.rsplit('/').next().unwrap_or(&name).to_string();
         let mut vars = variables(text);
         match bare.as_str() {
@@ -213,13 +229,17 @@ pub fn analyze(source: &str, known: &dyn Fn(&str) -> bool, file_vars: &FileVars)
                     }
                 }
             }
-            n if STATEMENTS.contains(&n) || crate::cl::CL_PROGRAM_ONLY.contains(&n) || known(n) => {
+            n if STATEMENTS.contains(&n) || crate::cl::CL_PROGRAM_ONLY.contains(&n) || known(&name) => {
             }
+            // A qualified command is looked for in its library.
             _ => a.diags.push(Diag {
                 line: *line,
                 id: "CPD0030".into(),
                 sev: 30,
-                text: format!("Command {bare} was not found in library *LIBL."),
+                text: format!(
+                    "Command {bare} was not found in library {}.",
+                    name.rsplit_once('/').map(|x| x.0).unwrap_or("*LIBL")
+                ),
             }),
         }
         for v in vars {
@@ -632,4 +652,15 @@ mod tests {
         assert_eq!(a.max_sev(), 40);
         assert!(a.labels.is_empty());
     }
+
+    /// A qualified command (LIB/CMD) is looked for in its library, and
+    /// the message names that library.
+    #[test]
+    fn qualified_command_is_looked_for_in_its_library() {
+        let src = "PGM\nAPPLIB/MYCMD\nOTHER/MYCMD\nENDPGM\n";
+        let a = analyze(src, &|c| c == "APPLIB/MYCMD", &|_| vec![]);
+        let d: Vec<&str> = a.diags.iter().filter(|d| d.id == "CPD0030").map(|d| d.text.as_str()).collect();
+        assert_eq!(d, ["Command MYCMD was not found in library OTHER."]);
+    }
+
 }

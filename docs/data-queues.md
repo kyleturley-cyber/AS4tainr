@@ -37,7 +37,7 @@ The list APIs write IBM's generic header (format 0100) at the start of the space
 
 | API | What it returns |
 | --- | --- |
-| `QUSROBJD` (receiver, length, OBJD0100 or OBJD0200, qualified object, type [, error code]) | Name, library, type, the library found when *LIBL or *CURLIB was given, ASP 1, owner, domain (*U for user spaces, *S otherwise), creation and change dates; OBJD0200 adds the extended attribute and text |
+| `QUSROBJD` (receiver, length, OBJD0100 or OBJD0200, qualified object, type [, error code]) | Name, library, type, the return library (the library the object is in, also when the library was named), ASP 1, owner, domain (*U for user spaces, *S otherwise), creation and change dates; OBJD0200 adds the extended attribute and text |
 | `QUSRMBRD` (receiver, length, MBRD0100 or MBRD0200, qualified file, member (*FIRST, *LAST, a name), override [, error code]) | File, library, member, PF or LF, source type, dates, text, whether a source file; MBRD0200 adds the record count and other counters |
 | `QUSRSPLA` (receiver, length, SPLA0100, qualified job ('*' this job, '*INT'), internal job ID, internal spooled file ID, spooled file name ('*INT'), number (-1 the last, 0 the only one) [, error code]) | The spooled file's identifiers, job, name, number, user data, status (*READY, *OPEN, *HELD), total pages, output queue, the date and time it was created |
 

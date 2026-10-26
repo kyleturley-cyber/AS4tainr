@@ -253,7 +253,22 @@ pub async fn run(stream: tokio::net::TcpStream, cfg: &ServerConfig, device: &str
             id: Some(id.clone()),
             calls: Default::default(),
         };
-        let ended = workstation(&mut term, &mut job, cfg, &mut display_rx, &profile).await;
+        // The job's own QTEMP, deleted when it ends.
+        let key = id.to_string();
+        let user = job.user.clone();
+        let ended = crate::qtemp::scope(
+            &client,
+            &key,
+            &user,
+            Box::pin(workstation(
+                &mut term,
+                &mut job,
+                cfg,
+                &mut display_rx,
+                &profile,
+            )),
+        )
+        .await;
         // The job ends however the session ends (sign-off, F3, the
         // emulator closing).
         crate::jobs::log(&client, &id, "*INFO", &format!("Job {id} ended.")).await;

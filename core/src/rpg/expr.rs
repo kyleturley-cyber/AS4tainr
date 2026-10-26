@@ -3,6 +3,9 @@
 //! "Expressions": operators and their precedence).
 
 use super::ast::{BinOp, Expr, UnOp};
+
+/// The index `(*)`: all the elements of an array of data structures.
+pub const ALL_ELEMENTS: &str = "*ALLELEMENTS";
 use super::data::{e, Fig};
 use super::dec::Dec;
 use anyhow::{anyhow, bail, Result};
@@ -15,6 +18,8 @@ pub enum Tok {
     Num(String),
     Str(String),
     Hex(Vec<u8>),
+    /// D'...' or T'...': a date or time literal (*ISO).
+    Temporal(char, String),
     Op(&'static str),
 }
 
@@ -59,7 +64,14 @@ pub fn tokens(text: &str) -> Result<Vec<Tok>> {
             let ok = match kind {
                 'D' => shape("9999-99-99"),
                 'T' => shape("99.99.99"),
-                _ => shape("9999-99-99-99.99.99.999999"),
+                // 0 to 12 fractional digits (ILE RPG Reference,
+                // "Timestamp Data Type").
+                _ => {
+                    let frac = v.len().saturating_sub(20);
+                    (v.len() == 19 && shape("9999-99-99-99.99.99"))
+                        || ((1..=12).contains(&frac)
+                            && shape(&format!("9999-99-99-99.99.99.{}", "9".repeat(frac))))
+                }
             };
             if !ok {
                 bail!(
@@ -71,7 +83,36 @@ pub fn tokens(text: &str) -> Result<Vec<Tok>> {
                     }
                 );
             }
-            out.push(Tok::Str(v));
+            out.push(if kind == 'Z' {
+                Tok::Str(v)
+            } else {
+                Tok::Temporal(kind, v)
+            });
+            i += end + 3;
+            continue;
+        }
+        // U'..' UCS-2 literal (ILE RPG Reference, "Literals": four hex
+        // digits per character): taken as those characters (a character
+        // literal; converted where a UCS-2 value is needed).
+        if (c == 'u' || c == 'U')
+            && cs.get(i + 1) == Some(&'\'')
+            && (i == 0 || !(cs[i - 1].is_ascii_alphanumeric() || "_#$@".contains(cs[i - 1])))
+        {
+            let end = cs[i + 2..]
+                .iter()
+                .position(|&x| x == '\'')
+                .ok_or_else(|| anyhow!("a literal is not ended: {text}"))?;
+            let h: String = cs[i + 2..i + 2 + end].iter().collect();
+            if !h.len().is_multiple_of(4) {
+                bail!("a UCS-2 literal needs four hexadecimal digits per character: U'{h}'");
+            }
+            let mut t = String::new();
+            for j in (0..h.len()).step_by(4) {
+                let v = u32::from_str_radix(&h[j..j + 4], 16)
+                    .map_err(|_| anyhow!("U'{h}' is not a valid UCS-2 literal"))?;
+                t.push(char::from_u32(v).unwrap_or('\u{FFFD}'));
+            }
+            out.push(Tok::Str(t));
             i += end + 3;
             continue;
         }
@@ -120,7 +161,21 @@ pub fn tokens(text: &str) -> Result<Vec<Tok>> {
             while i < cs.len() && (cs[i].is_ascii_digit() || cs[i] == '.') {
                 i += 1;
             }
-            out.push(Tok::Num(cs[start..i].iter().collect()));
+            let mut n: String = cs[start..i].iter().collect();
+            // A comma as the decimal separator (ILE RPG Reference, numeric
+            // literals: "the decimal separator can be a comma or a period").
+            if !n.contains('.')
+                && cs.get(i) == Some(&',')
+                && cs.get(i + 1).is_some_and(|d| d.is_ascii_digit())
+            {
+                i += 1;
+                n.push('.');
+                while i < cs.len() && cs[i].is_ascii_digit() {
+                    n.push(cs[i]);
+                    i += 1;
+                }
+            }
+            out.push(Tok::Num(n));
             continue;
         }
         if c == '%' {
@@ -375,6 +430,17 @@ impl Parser {
         if self.eat_op(")") {
             return Ok(args);
         }
+        // (*): every element of an array of data structures, as in
+        // %LOOKUP(arg : dsarr(*).key) (ILE RPG Reference, %LOOKUPxx:
+        // searching a subfield of a data structure array).
+        if matches!(self.peek(), Some(Tok::Op("*"))) {
+            let save = self.pos;
+            self.next();
+            if self.eat_op(")") {
+                return Ok(vec![Expr::name(ALL_ELEMENTS)]);
+            }
+            self.pos = save;
+        }
         loop {
             args.push(self.expr()?);
             if self.eat_op(":") {
@@ -389,6 +455,13 @@ impl Parser {
         match self.next() {
             Some(Tok::Num(n)) => Ok(Expr::Num(Dec::parse(&n)?)),
             Some(Tok::Str(s)) => Ok(Expr::Str(e(&s))),
+            // A date or time literal is a date or time value: %DATE or
+            // %TIME of its *ISO text (so that it has the type, as for
+            // an OVERLOAD candidate taking a date).
+            Some(Tok::Temporal(k, s)) => Ok(Expr::Bif(
+                if k == 'D' { "DATE" } else { "TIME" }.to_string(),
+                vec![Expr::Str(e(&s)), Expr::name("*ISO")],
+            )),
             Some(Tok::Hex(b)) => Ok(Expr::Hex(b)),
             Some(Tok::Op("(")) => {
                 let e = self.expr()?;
@@ -485,6 +558,10 @@ impl Parser {
                     Expr::IndArray(None)
                 }
             }
+            // XML-SAX's event special words (*XML_START_ELEMENT...).
+            s if super::interp::xmlsax::event_code(s).is_some() => {
+                Expr::Num(Dec::from_i64(super::interp::xmlsax::event_code(s).unwrap()))
+            }
             s if s.starts_with("*IN") && s.len() > 3 => Expr::Ind(s[3..].to_string()),
             s => Expr::Name {
                 parts: vec![s.to_string()],
@@ -528,6 +605,11 @@ mod tests {
     fn literals_and_names() {
         assert_eq!(parse("'it''s'").unwrap(), Expr::Str(e("it's")));
         assert_eq!(parse("x'C1F0'").unwrap(), Expr::Hex(vec![0xC1, 0xF0]));
+        // ILE RPG Reference, numeric literals: a comma as the decimal
+        // separator.
+        assert_eq!(parse("1000,5").unwrap(), parse("1000.5").unwrap());
+        // ILE RPG Reference, literals: U'002F' is '/'.
+        assert_eq!(parse("u'002F0041'").unwrap(), Expr::Str(e("/A")));
         assert_eq!(parse("*in03").unwrap(), Expr::Ind("03".into()));
         assert_eq!(parse("*inlr").unwrap(), Expr::Ind("LR".into()));
         assert!(matches!(parse("*in(30)").unwrap(), Expr::IndArray(Some(_))));

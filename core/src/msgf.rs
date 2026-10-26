@@ -223,8 +223,21 @@ pub fn values(fmt: &[Field], data: &[u8]) -> Vec<String> {
         };
         let start = at + lenfield;
         let Some(b) = data.get(start..start + len) else {
-            // Shorter than the field: an empty value.
-            out.push(String::new());
+            // Shorter than the field: a character field gets what is
+            // there (PUB400 2026-10-23: '<&1>' with FMT((*CHAR 20)) and
+            // data 'AB' is '<AB>', tools/golden/qsh.txt shortdata); other
+            // types an empty value.
+            let rest = data.get(start..).unwrap_or(&[]);
+            out.push(match f.ty.as_str() {
+                "*CHAR" | "*CCHAR" if !rest.is_empty() => {
+                    crate::rpg::data::a(rest).trim_end().to_string()
+                }
+                "*QTDCHAR" if !rest.is_empty() => format!(
+                    "'{}'",
+                    crate::rpg::data::a(rest).trim_end().replace('\'', "''")
+                ),
+                _ => String::new(),
+            });
             at = data.len();
             continue;
         };
@@ -785,8 +798,7 @@ mod tests {
 
     // ADDMSGD FMT (CL reference): *CHAR without trailing blanks,
     // *QTDCHAR in apostrophes, *DEC with its decimal point and no leading
-    // zeros, *BIN as a number, *VARY with its length first; short data
-    // leaves the variable empty.
+    // zeros, *BIN as a number, *VARY with its length first.
     #[test]
     fn substitution() {
         let fmt = parse_fmt(&[
@@ -807,7 +819,12 @@ mod tests {
             substitute("File &1 has &2 (&3) &4 &5.", &v),
             "File CUSTMAST has 128.00 (-2) 'ok' ."
         );
-        assert_eq!(values(&fmt, &crate::rpg::data::e("AB"))[0], "");
+        // Data shorter than a *CHAR field: what is there (PUB400
+        // 2026-10-23, tools/golden/qsh.txt shortdata, '<AB>'; the CL
+        // reference's ADDMSGD page says a null field), the rest empty.
+        let v = values(&fmt, &crate::rpg::data::e("AB"));
+        assert_eq!(v[0], "AB");
+        assert_eq!(v[1], "");
         assert!(check_msgid("USR0001").is_ok() && check_msgid("US0001").is_err());
     }
 }

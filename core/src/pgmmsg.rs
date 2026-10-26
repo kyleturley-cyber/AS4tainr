@@ -39,6 +39,9 @@ pub struct QMsg {
     pub old: bool,
     /// The program, module and procedure that sent it (RPG programs).
     pub sender: Sender,
+    /// The call stack entry it was sent to (its program, library,
+    /// module and procedure), for the job log.
+    pub receiver: Sender,
     /// When it was sent: CYYMMDD and HHMMSS.
     pub sent: (String, String),
     /// And the microseconds (6 digits).
@@ -69,6 +72,10 @@ pub struct CallStack {
     /// The printed output (a compiler listing) of the last command, for
     /// the `system` utility to show.
     pub printed: Vec<String>,
+    /// What commands wrote to the job's terminal (QSH's standard
+    /// output): `system` writes it as it comes, before the command's
+    /// messages (PUB400 2026-10-23).
+    pub terminal: Vec<String>,
     /// The message data of the last command's completion message, when
     /// it has some (CRTSRVPGM: the service program and its library).
     pub message_data: Option<Vec<u8>>,
@@ -164,6 +171,30 @@ impl CallStack {
     }
 }
 
+impl CallStack {
+    /// RMVMSG on the queue `up` levels above the running program's:
+    /// CLEAR(*ALL), *OLD, *NEW, *KEEPUNANS (here: all, as there are no
+    /// inquiry messages), or the message with `key` (CLEAR(*BYKEY)).
+    pub fn remove_from(&mut self, up: usize, clear: &str, key: Option<u32>) {
+        let Some(n) = self.stack.len().checked_sub(1 + up) else {
+            return;
+        };
+        let Some(q) = self.stack.get_mut(n) else {
+            return;
+        };
+        match clear {
+            "*OLD" => q.retain(|m| !m.old),
+            "*NEW" => q.retain(|m| m.old),
+            "*ALL" | "*KEEPUNANS" => q.clear(),
+            _ => {
+                if let Some(k) = key {
+                    q.retain(|m| m.key != k);
+                }
+            }
+        }
+    }
+}
+
 /// Which message RCVMSG receives (RCVMSG MSGTYPE and MSGKEY).
 pub fn select(q: &[QMsg], msgtype: &str, key: Option<u32>) -> Option<usize> {
     let pos = key.map(|k| q.iter().position(|m| m.key == k));
@@ -215,6 +246,22 @@ pub fn key_text(k: u32) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// A message key as the message APIs give it to a program (QMHSNDPM,
+/// QMHRCVPM, QGYOLJBL): four bytes, binary, as IBM i's are.
+pub fn key_bytes(k: u32) -> [u8; 4] {
+    k.to_be_bytes()
+}
+
+/// A message key a program passes to the message APIs; blanks (or
+/// fewer than four bytes) are no key.
+pub fn key_from_bytes(b: &[u8]) -> Option<u32> {
+    let b: [u8; 4] = b.get(..4)?.try_into().ok()?;
+    if b == [0x40; 4] {
+        return None;
+    }
+    Some(u32::from_be_bytes(b))
+}
+
 pub fn parse_key(s: &str) -> Option<u32> {
     let s = s.trim();
     if s.len() != 4 {
@@ -228,13 +275,17 @@ pub fn parse_key(s: &str) -> Option<u32> {
 /// and its text (without the identifier).
 pub fn from_error(e: &anyhow::Error, id: &str) -> QMsg {
     let s = format!("{e:#}");
+    // An RPG escape message (RNX) of an error written as its inquiry
+    // message (RNQ) of the same number.
+    let alt = id.strip_prefix("RNX").map(|n| format!("RNQ{n}")).unwrap_or_else(|| id.to_string());
     let line = s
         .lines()
-        .find(|l| l.starts_with(id))
+        .find(|l| l.starts_with(id) || l.starts_with(&alt))
         .or_else(|| s.lines().next())
         .unwrap_or("");
     let text = line
         .strip_prefix(id)
+        .or_else(|| line.strip_prefix(alt.as_str()))
         .map(|t| t.trim_start_matches(':').trim())
         .unwrap_or(line)
         .to_string();
@@ -281,7 +332,7 @@ pub async fn describe(
     let search = if lib == "*LIBL" {
         libs.to_vec()
     } else {
-        vec![lib.clone()]
+        vec![crate::qtemp::real(&lib)]
     };
     let mut m = QMsg {
         msgid: msgid.clone(),
@@ -415,6 +466,45 @@ pub fn job_log(job: &str) -> Vec<QMsg> {
 }
 
 static STACKS: std::sync::Mutex<Option<HashMap<String, Vec<Entry>>>> = std::sync::Mutex::new(None);
+
+/// What a job's programs wrote to standard output (C printf, puts): its
+/// lines, and whether the last one is still open (no newline yet).
+type Stdout = HashMap<String, (Vec<String>, bool)>;
+static STDOUT: std::sync::Mutex<Option<Stdout>> = std::sync::Mutex::new(None);
+
+/// A program writes to the job's standard output.
+pub fn write_stdout(job: &str, text: &str) {
+    let mut g = STDOUT.lock().unwrap_or_else(|e| e.into_inner());
+    let (lines, open) = g
+        .get_or_insert_with(HashMap::new)
+        .entry(job.to_string())
+        .or_default();
+    for (i, part) in text.split('\n').enumerate() {
+        if i > 0 {
+            *open = false;
+        }
+        if part.is_empty() && i > 0 {
+            continue;
+        }
+        match lines.last_mut() {
+            Some(last) if *open => last.push_str(part),
+            _ => lines.push(part.to_string()),
+        }
+        *open = true;
+    }
+    if text.ends_with('\n') {
+        *open = false;
+    }
+}
+
+/// The job's standard output so far, taken.
+pub fn take_stdout(job: &str) -> Vec<String> {
+    let mut g = STDOUT.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_mut()
+        .and_then(|m| m.remove(job))
+        .map(|(l, _)| l)
+        .unwrap_or_default()
+}
 static ENTRY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn with_stack<R>(job: &str, f: impl FnOnce(&mut Vec<Entry>) -> R) -> R {
@@ -547,6 +637,21 @@ pub fn stack_send(job: &str, id: u64, mut m: QMsg) -> Option<u32> {
         while i > 0 && s[i].lib == "QSYS" && s[i].pgm == "QCMDEXC" {
             i -= 1;
         }
+        m.receiver = Sender {
+            pgm: s[i].pgm.clone(),
+            lib: crate::qtemp::logical(&s[i].lib),
+            module: s[i].module.clone(),
+            proc: s[i].proc.clone(),
+            line: s[i].line,
+        };
+        // The job log's copy names the receiver too.
+        if let Ok(mut g) = JOBLOG.lock() {
+            if let Some(l) = g.as_mut().and_then(|j| j.get_mut(job)) {
+                if let Some(x) = l.iter_mut().rev().find(|x| x.key == key) {
+                    x.receiver = m.receiver.clone();
+                }
+            }
+        }
         s[i].queue.push(m);
         Some(key)
     })
@@ -561,7 +666,7 @@ pub fn stack_receive(
     key: Option<u32>,
     action: &str,
 ) -> Option<QMsg> {
-    with_stack(job, |s| {
+    let r = with_stack(job, |s| {
         let e = s.iter_mut().find(|e| e.id == id)?;
         let i = select(&e.queue, msgtype, key)?;
         match action {
@@ -572,7 +677,82 @@ pub fn stack_receive(
                 Some(e.queue[i].clone())
             }
         }
+    });
+    if action == "*REMOVE" {
+        if let Some(m) = &r {
+            forget_logged(job, &[m.key]);
+        }
+    }
+    r
+}
+
+/// Receive the message with `key` from whichever call stack entry's
+/// queue has it (message keys are the job's): the message and that
+/// entry's id.
+pub fn stack_receive_key(
+    job: &str,
+    msgtype: &str,
+    key: u32,
+    action: &str,
+) -> Option<(QMsg, Option<u64>)> {
+    let id = with_stack(job, |s| {
+        s.iter()
+            .rev()
+            .find(|e| select(&e.queue, msgtype, Some(key)).is_some())
+            .map(|e| e.id)
+    });
+    if let Some(id) = id {
+        return stack_receive(job, id, msgtype, Some(key), action).map(|m| (m, Some(id)));
+    }
+    // A message on the queue of a call stack entry that has ended is
+    // still the job's (its job log keeps it): received from there
+    // (iRPGUnit's getLatestEscMsg receives the escape message a
+    // procedure that has returned took).
+    let mut g = JOBLOG.lock().ok()?;
+    let l = g.as_mut()?.get_mut(job)?;
+    let i = select(l, msgtype, Some(key))?;
+    let m = match action {
+        "*REMOVE" => l.remove(i),
+        "*SAME" => l[i].clone(),
+        _ => {
+            l[i].old = true;
+            l[i].clone()
+        }
+    };
+    Some((m, None))
+}
+
+/// QMHRMVPM on a call stack entry's queue: *ALL, *BYKEY (the message
+/// with `key`), *OLD, *NEW, *KEEPRQS (all but requests).
+pub fn stack_remove(job: &str, id: u64, which: &str, key: Option<u32>) {
+    let gone = with_stack(job, |s| {
+        let e = s.iter_mut().find(|e| e.id == id)?;
+        let keep = |m: &QMsg| match which {
+            "*BYKEY" => Some(m.key) != key,
+            "*OLD" => !m.old,
+            "*NEW" => m.old,
+            "*KEEPRQS" => m.ty == "*RQS",
+            _ => false,
+        };
+        let gone: Vec<u32> = e.queue.iter().filter(|m| !keep(m)).map(|m| m.key).collect();
+        e.queue.retain(keep);
+        Some(gone)
     })
+    .unwrap_or_default();
+    forget_logged(job, &gone);
+}
+
+/// Messages removed from their queue leave the job log too (IBM i: a
+/// program message queue's messages are the job log's).
+fn forget_logged(job: &str, keys: &[u32]) {
+    if keys.is_empty() {
+        return;
+    }
+    if let Ok(mut g) = JOBLOG.lock() {
+        if let Some(l) = g.as_mut().and_then(|m| m.get_mut(job)) {
+            l.retain(|m| !keys.contains(&m.key));
+        }
+    }
 }
 
 /// The entry with this id.
@@ -607,6 +787,9 @@ pub fn stack_top_id(job: &str) -> Option<u64> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Sender {
     pub pgm: String,
+    /// The library of the program or service program (as the job sees
+    /// it: QTEMP, not the job's own library).
+    pub lib: String,
     pub module: String,
     pub proc: String,
     /// The source line of the statement that sent it (0: not known).

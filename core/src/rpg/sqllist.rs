@@ -207,7 +207,7 @@ pub fn sql_type(t: &DType) -> String {
         DType::Float(_) => "FLOAT(53)".into(),
         DType::Date(_) => "DATE".into(),
         DType::Time(_) => "TIME".into(),
-        DType::Timestamp => "TIMESTAMP".into(),
+        DType::Timestamp(_) => "TIMESTAMP".into(),
         DType::Ind => "CHARACTER(1)".into(),
         DType::Pointer => "POINTER".into(),
         DType::Ucs2(n) => format!("GRAPHIC({n})"),

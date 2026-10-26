@@ -131,7 +131,12 @@ impl Job<'_> {
                     cmd.get("REPLACE").eq_ignore_ascii_case("*YES"),
                 )
                 .await?;
-                Outcome::Messages(vec![])
+                // CPCA980 (PUB400 2026-10-23, tools/golden/qsh.txt: the
+                // completion message after ADDENVVAR; its data not yet
+                // known byte for byte).
+                Outcome::Messages(vec![format!(
+                    "CPCA980: Environment variable {name} was added."
+                )])
             }
             "CHGENVVAR" => {
                 let name = raw(cmd, "ENVVAR");
@@ -176,6 +181,19 @@ impl Job<'_> {
                 })
             }
             "QSH" | "STRQSH" => self.qsh(cmd).await?,
+            "STRREXPRC" => {
+                let parm = match cmd.get("PARM") {
+                    p if p.eq_ignore_ascii_case("*NONE") => "",
+                    p => p,
+                };
+                let (file, mbr, env) = (
+                    cmd.get("SRCFILE").to_string(),
+                    cmd.get("SRCMBR").to_string(),
+                    cmd.get("CMDENV").to_string(),
+                );
+                let msgs = Box::pin(crate::rexx::strrexprc(self, &file, &mbr, parm, &env)).await?;
+                Outcome::Messages(msgs)
+            }
             _ => return Ok(None),
         }))
     }
@@ -216,11 +234,13 @@ impl Job<'_> {
             None
         };
         let home = format!("/home/{}", self.user);
+        let home = match crate::ifs::stat(self.client, &home).await {
+            Ok(Some(e)) if e.dir => e.path,
+            _ => "/".to_string(),
+        };
+        // The job's current directory (Qshell starts in it).
         let start = match &mirror {
-            Some(_) => match crate::ifs::stat(self.client, &home).await {
-                Ok(Some(e)) if e.dir => home.clone(),
-                _ => "/".to_string(),
-            },
+            Some(_) => crate::ifs::current_dir(),
             None => std::env::temp_dir().to_string_lossy().to_string(),
         };
         let mut p = match mirror.as_ref().and_then(|m| m.command(&start, &line)) {
@@ -245,7 +265,14 @@ impl Job<'_> {
             p.env("PATH", "/usr/local/bin:/usr/bin:/bin");
         }
         if setting("HOME").is_none() {
-            p.env("HOME", &start);
+            p.env(
+                "HOME",
+                if mirror.is_some() {
+                    home.as_str()
+                } else {
+                    start.as_str()
+                },
+            );
         }
         p.env("LOGNAME", &self.user);
         let r = p.output().await;
@@ -258,7 +285,7 @@ impl Job<'_> {
         match &out {
             Output::Stdout => self
                 .calls
-                .printed
+                .terminal
                 .extend(text.lines().map(|l| l.to_string())),
             Output::None => {}
             Output::File(path) | Output::Append(path) => {
@@ -277,7 +304,16 @@ impl Job<'_> {
                         }
                         (v, c)
                     }
-                    _ => (text.into_bytes(), 1208),
+                    // A new file: in the job's CCSID (PUB400 2026-10-23,
+                    // tools/golden/qsh.txt q_file: CCSID 273, the job's
+                    // there; as4tainr's jobs are CCSID 37).
+                    _ => {
+                        let mut v = Vec::new();
+                        for ch in text.chars() {
+                            crate::ifs::codec::encode_char(37, ch, &mut v);
+                        }
+                        (v, 37)
+                    }
                 };
                 crate::ifs::write_file(self.client, path, &bytes, ccsid, 0o644, &self.user)
                     .await

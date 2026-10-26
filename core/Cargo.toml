@@ -24,6 +24,7 @@ thiserror = "1"
 argon2 = { version = "0.5", features = ["std"] }
 password-hash = { version = "0.5", features = ["getrandom"] }
 rust_decimal = "1"
+ethnum = "1"
 roxmltree = "0.20"
 base64 = "0.22"
 bytes = "1"

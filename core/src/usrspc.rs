@@ -102,7 +102,7 @@ pub async fn call_api(
 /// A qualified name (name in bytes 1-10, library in 11-20).
 fn qualified(b: &[u8]) -> (String, String) {
     let name = a(b.get(..10).unwrap_or(b)).trim().to_ascii_uppercase();
-    let lib = a(b.get(10..20).unwrap_or(&[])).trim().to_ascii_uppercase();
+    let lib = crate::qtemp::real(&a(b.get(10..20).unwrap_or(&[])).trim().to_ascii_uppercase());
     (name, lib)
 }
 
@@ -134,7 +134,7 @@ pub async fn find(client: &Client, name: &str, lib: &str, caller: &Caller) -> Re
     let libs = match lib {
         "*LIBL" | "" => caller.libl.clone(),
         "*CURLIB" => vec![caller.curlib.clone()],
-        l => vec![l.to_string()],
+        l => vec![crate::qtemp::real(l)],
     };
     for l in &libs {
         if let Some(r) = client
@@ -552,7 +552,8 @@ fn cyymmdd(year: i32, rest: &str) -> String {
 }
 
 fn field(s: &str, n: usize) -> Vec<u8> {
-    let mut b = e(s);
+    // The job's own QTEMP library is QTEMP to the program.
+    let mut b = e(&crate::qtemp::logical(s));
     b.resize(n, 0x40);
     b
 }
@@ -647,7 +648,9 @@ async fn write_list(
 /// gives its size, the service program and library, the name's CCSID,
 /// the offset from the start of the user space to the name and its
 /// length (as4tainr's entries: those fields, 10 bytes of argument
-/// optimization *NO and 2 reserved, then the name; all one size).
+/// optimization *NO and 2 reserved, then the name; all one size). The
+/// names are the exported ones: an RPG procedure's EXTPROC name with its
+/// case.
 async fn list_service_program(
     client: &Client,
     caller: &Caller,
@@ -667,12 +670,31 @@ async fn list_service_program(
     input.extend(field(&format, 8));
     input.extend(field(&sp, 10));
     input.extend(field(&lib, 10));
+    // Each procedure by its exported name: as written for EXTPROC('name')
+    // and EXTPROC(*DCLCASE) (ILE RPG Reference, EXTPROC), else in upper
+    // case.
+    let mut written: std::collections::HashMap<String, String> = Default::default();
+    for m in b.modules.iter().filter(|m| m.attribute != "CLLE") {
+        if let Ok(p) =
+            crate::rpg::compile_with(client, &caller.libl, &m.name, &m.source, &m.options).await
+        {
+            for (k, pi) in &p.procs {
+                if let Some(w) = pi.written.as_ref().filter(|_| pi.export) {
+                    written.insert(k.clone(), w.clone());
+                }
+            }
+        }
+    }
+    let exports: Vec<String> = b
+        .exports
+        .iter()
+        .map(|x| written.get(x).cloned().unwrap_or_else(|| x.clone()))
+        .collect();
     const FIXED: usize = 48;
-    let longest = b.exports.iter().map(|x| x.len()).max().unwrap_or(0);
+    let longest = exports.iter().map(|x| x.len()).max().unwrap_or(0);
     let size = (FIXED + longest.max(1)).div_ceil(4) * 4;
     let list_off = 192 + input.len();
-    let entries: Vec<Vec<u8>> = b
-        .exports
+    let entries: Vec<Vec<u8>> = exports
         .iter()
         .enumerate()
         .map(|(i, name)| {
@@ -720,7 +742,7 @@ async fn list_members(client: &Client, caller: &Caller, args: &mut dyn ApiArgs) 
     let libs = match flib.as_str() {
         "*LIBL" | "" => caller.libl.clone(),
         "*CURLIB" => vec![caller.curlib.clone()],
-        l => vec![l.to_string()],
+        l => vec![crate::qtemp::real(l)],
     };
     let mut found = None;
     for l in &libs {
@@ -752,9 +774,12 @@ async fn list_members(client: &Client, caller: &Caller, args: &mut dyn ApiArgs) 
     if attr == "PF-SRC" {
         for m in client
             .query(
-                "SELECT member, srctype, text, extract(year FROM changed)::int,
-                        to_char(changed, 'YYMMDDHH24MISS')
-                   FROM as4tainr.source_members WHERE library=$1 AND file=$2 ORDER BY member",
+                &format!(
+                    "SELECT member, srctype, text, extract(year FROM changed)::int,
+                            to_char(changed, 'YYMMDDHH24MISS')
+                       FROM as4tainr.source_members WHERE library=$1 AND file=$2 ORDER BY member{}",
+                    crate::collate::clause(client).await?
+                ),
                 &[&lib, &file],
             )
             .await?
@@ -904,7 +929,7 @@ async fn list_fields(client: &Client, caller: &Caller, args: &mut dyn ApiArgs) -
     let libs = match flib.as_str() {
         "*LIBL" | "" => caller.libl.clone(),
         "*CURLIB" => vec![caller.curlib.clone()],
-        l => vec![l.to_string()],
+        l => vec![crate::qtemp::real(l)],
     };
     let mut found = None;
     for l in &libs {

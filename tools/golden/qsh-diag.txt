@@ -1,0 +1,6 @@
+# Why GLDQSH (tools/golden/qsh/gldqsh.clle) was not created on PUB400:
+# the compiler's listing, whole.
+# Capture with: golden.ps1 -List tools\golden\qsh-diag.txt -Files tools\golden\qsh
+d_tag|!setccsid 819 /home/AS4TRAINR/gld/gldqsh.clle; echo tagged
+d_listing|!system "CRTBNDCL PGM(AS4TRAINR1/GLDQSH) SRCSTMF('/home/AS4TRAINR/gld/gldqsh.clle')"
+d_end|!system -q "DLTPGM PGM(AS4TRAINR1/GLDQSH)"; echo cleaned

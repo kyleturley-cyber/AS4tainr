@@ -7,7 +7,15 @@
 ctl-opt dftactgrp(*no) actgrp(*new);
 // The status filter is *ALL: the file may still be open when listed.
 
-dcl-f GLDSPO usage(*output) rename(GLDSPO: OUTR);
+// BLOCK(*NO): each record is written at once, so a run that is ended
+// (a capture's time limit) keeps what it wrote.
+dcl-f GLDSPO usage(*output) block(*no) rename(GLDSPO: OUTR);
+
+// Where an error stopped it (an unhandled one would wait for a reply).
+dcl-ds psds psds qualified;
+  status *status;
+  excid char(7) pos(40);
+end-ds;
 
 // Errors come back here (bytes provided 16), not as exceptions: an
 // exception left unhandled would wait for a reply to its inquiry.
@@ -92,7 +100,7 @@ dcl-ds filter qualified;
   outq char(10) inz('*ALL');
   outqlib char(10) inz(*blank);
   formtype char(10) inz('*ALL');
-  userdata char(10) inz('GLDSPL');
+  userdata char(10) inz('*ALL');
   statuscount int(10) inz(1);
   status char(10) inz('*ALL');
   *n char(2) inz(x'0000');
@@ -112,6 +120,8 @@ dcl-ds rec len(200) qualified;
   splf char(10) pos(27);
   splfnbr int(10) pos(37);
 end-ds;
+dcl-ds one likeds(rec);
+dcl-s i int(10);
 dcl-s sort char(256) inz(*allx'00');
 dcl-s handle int(10);
 dcl-s p pointer;
@@ -119,47 +129,57 @@ dcl-s used int(10) based(pused);
 dcl-s pused pointer;
 dcl-s dummy char(1);
 
-// The spooled file is made here, in this job (submitted with SBMJOB:
-// PASE `system` writes a command's spooled output to standard output and
-// keeps none).
-qcmdexc('CALL PGM(AS4TRAINR1/GLDSPL)' : 28);
-qgyolspl(dummy : 0 : info : -1 : sort : filter : ' ' : 'OSPL0300' : err);
-note('1');
-hexout('L' : %addr(info) : 80);
-if info.total > 0;
-  qgygtle(rec : %size(rec) : info.handle : info : 1 : info.total : err);
-endif;
-note('2');
-hexout('R' : %addr(rec) : %size(rec));
-hexout('I' : %addr(info) : 80);
-qgyclst(info.handle : err);
-note('3');
+// The spooled file is made here, in this job: under PASE `system` it is
+// kept with the user's QPRTJOB spooled files (PUB400 2026-10-23, WRKSPLF).
+monitor;
+  qcmdexc('CALL PGM(AS4TRAINR1/GLDSPL)' : 28);
+  qgyolspl(dummy : 0 : info : -1 : sort : filter : ' ' : 'OSPL0300' : err);
+  note('1');
+  hexout('L' : %addr(info) : 80);
+  // The newest GLDSPL in the list (PUB400 keeps the spooled files of
+  // earlier runs, under the user's QPRTJOB, with blank user data).
+  for i = 1 to info.total;
+    qgygtle(one : %size(one) : info.handle : info : 1 : i : err);
+    if one.splf = 'GLDSPL';
+      rec = one;
+    endif;
+  endfor;
+  note('2');
+  hexout('R' : %addr(rec) : %size(rec));
+  hexout('I' : %addr(info) : 80);
+  qgyclst(info.handle : err);
+  note('3');
 
-quscrtus('GLDSPC    QTEMP' : 'GLDSPC' : 65536 : x'00' : '*ALL' :
-         'golden spooled file data' : '*YES' : err);
-note('4');
-qspopnsp(handle : rec.job + rec.user + rec.number : ' ' : ' ' : rec.splf :
-         rec.splfnbr : -1 : err);
-note('5');
-qspgetsp(handle : 'GLDSPC    QTEMP' : 'SPFR0300' : -1 : '*ERROR' : err);
-note('6');
-qspclosp(handle : err);
-note('7');
-qusptrus('GLDSPC    QTEMP' : p : err);
-note('8');
-// The general header: the size used is at offset 88 (after 64 bytes of
-// user area, header size, structure level, spooled file level, format,
-// completion indicator and a reserved byte).
-if p <> *null;
-  pused = p + 88;
-  if used > 0 and used <= 65536;
-    hexout('S' : p : used);
-  else;
-    hexout('S' : p : 512);
+  quscrtus('GLDSPC    QTEMP' : 'GLDSPC' : 65536 : x'00' : '*ALL' :
+           'golden spooled file data' : '*YES' : err);
+  note('4');
+  qspopnsp(handle : rec.job + rec.user + rec.number : ' ' : ' ' : rec.splf :
+           rec.splfnbr : -1 : err);
+  note('5');
+  qspgetsp(handle : 'GLDSPC    QTEMP' : 'SPFR0300' : -1 : '*ERROR' : err);
+  note('6');
+  qspclosp(handle : err);
+  note('7');
+  qusptrus('GLDSPC    QTEMP' : p : err);
+  note('8');
+  // The general header: the size used is at offset 88 (after 64 bytes of
+  // user area, header size, structure level, spooled file level, format,
+  // completion indicator and a reserved byte).
+  if p <> *null;
+    pused = p + 88;
+    if used > 0 and used <= 65536;
+      hexout('S' : p : used);
+    else;
+      hexout('S' : p : 512);
+    endif;
   endif;
-endif;
-// The spooled file is not needed any more.
-qcmdexc('DLTSPLF FILE(GLDSPL) SPLNBR(*LAST)' : 34);
+  // The spooled file is not needed any more.
+  qcmdexc('DLTSPLF FILE(GLDSPL) SPLNBR(*LAST)' : 34);
+on-error;
+  ID = 'ERR';
+  VAL = %char(psds.status) + ' ' + psds.excid;
+  write OUTR;
+endmon;
 *inlr = *on;
 
 // An API's error (its message ID), or OK: record E<step>.

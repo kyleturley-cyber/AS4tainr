@@ -150,14 +150,39 @@ impl Heap {
     }
 }
 
+/// A caller's storage lent for a bound call: its machine's owner (its
+/// procedures' local storage), its activation's owner (its module's
+/// global storage, the first `globals` buffers) and the buffers.
+#[derive(Clone, Debug, Default)]
+pub struct Lent {
+    pub owner: u32,
+    pub act: u32,
+    pub globals: usize,
+    pub bufs: Vec<Vec<u8>>,
+}
+
 /// A program's storage.
 #[derive(Clone, Debug, Default)]
 pub struct Mem {
     pub own: Vec<Vec<u8>>,
     pub heap: Heap,
-    /// Storage of callers, lent for a bound call: (owner, buffers).
-    pub lent: Vec<(u32, Vec<Vec<u8>>)>,
+    /// Storage of callers, lent for a bound call.
+    pub lent: Vec<Lent>,
     scratch: Vec<u8>,
+}
+
+/// Bytes after each of a program's own variables that a pointer may
+/// still reach. On IBM i a procedure's automatic storage and a module's
+/// static storage are each one area, so a based item a little longer
+/// than the variable whose address it was given (iRPGUnit's job log
+/// reader: a 1047-byte data structure over a VARCHAR(1024)) reaches the
+/// storage that follows instead of failing; here each variable has
+/// storage of its own, followed by this much that belongs to none.
+pub const SLACK: usize = 256;
+
+pub fn padded(mut b: Vec<u8>) -> Vec<u8> {
+    b.resize(b.len() + SLACK, 0);
+    b
 }
 
 impl Mem {
@@ -197,7 +222,7 @@ impl Mem {
             let k = (i - LENT_BASE) >> 24;
             self.lent
                 .get(k)
-                .and_then(|l| l.1.get((i - LENT_BASE) & 0xFF_FFFF))
+                .and_then(|l| l.bufs.get((i - LENT_BASE) & 0xFF_FFFF))
         } else if i >= HEAP_BASE {
             self.heap.blocks.get(i - HEAP_BASE)
         } else {
@@ -212,7 +237,7 @@ impl Mem {
             let k = (i - LENT_BASE) >> 24;
             self.lent
                 .get_mut(k)
-                .and_then(|l| l.1.get_mut((i - LENT_BASE) & 0xFF_FFFF))
+                .and_then(|l| l.bufs.get_mut((i - LENT_BASE) & 0xFF_FFFF))
         } else if i >= HEAP_BASE {
             self.heap.blocks.get_mut(i - HEAP_BASE)
         } else {
@@ -272,7 +297,12 @@ mod tests {
     fn storage_spaces() {
         let mut m = Mem::new(vec![vec![1, 2], vec![3]]);
         let h = m.heap.alloc(4);
-        m.lent.push((9, vec![vec![5, 6, 7]]));
+        m.lent.push(Lent {
+            owner: 9,
+            act: 9,
+            globals: 1,
+            bufs: vec![vec![5, 6, 7]],
+        });
         assert_eq!(m[1], vec![3]);
         m[HEAP_BASE + h][2] = 8;
         assert_eq!(m[HEAP_BASE + h], vec![0, 0, 8, 0]);

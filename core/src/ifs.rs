@@ -60,6 +60,7 @@ pub async fn put_text(client: &Client, path: &str, text: &str) -> Result<()> {
 
 /// errno values (IBM i "Errno Values for UNIX-Type Functions").
 pub mod errno {
+    pub const ERANGE: i32 = 3001;
     pub const EINVAL: i32 = 3021;
     pub const ENOENT: i32 = 3025;
     pub const EPERM: i32 = 3027;
@@ -108,6 +109,7 @@ pub fn errno_text(n: i32) -> String {
         EBUSY => "The object is in use.".into(),
         EACCES => "The user is not authorized to the object.".into(),
         ENOTDIR => "A part of the path is not a directory.".into(),
+        ERANGE => "The result does not fit.".into(),
         EBADF => "The file descriptor is not open, or not open for this use.".into(),
         EMFILE => "Too many files are open in the job.".into(),
         EEXIST => "The file or directory already exists.".into(),
@@ -126,9 +128,101 @@ fn err<T>(n: i32) -> Result<T> {
     Err(Errno(n).into())
 }
 
+// The job's current directory (CHGCURDIR, chdir): kept for the running
+// task (`with_job_dir`) and for the thread an RPG program runs on
+// (`DirScope`), shared, so a change is seen by the whole job. "/" outside
+// a job's scope.
+tokio::task_local! {
+    static TASK_DIR: JobDir;
+}
+
+thread_local! {
+    static THREAD_DIR: std::cell::RefCell<Option<JobDir>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A job's current directory.
+pub type JobDir = std::sync::Arc<std::sync::Mutex<String>>;
+
+/// The current directory's handle, to give a thread of the job.
+pub fn job_dir() -> Option<JobDir> {
+    TASK_DIR
+        .try_with(|d| d.clone())
+        .ok()
+        .or_else(|| THREAD_DIR.with(|t| t.borrow().clone()))
+}
+
+/// The job's current directory.
+pub fn current_dir() -> String {
+    job_dir()
+        .map(|d| d.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        .unwrap_or_else(|| "/".to_string())
+}
+
+/// Change the job's current directory (an absolute path that exists:
+/// the caller checks). False outside a job's scope.
+pub fn set_current_dir(path: &str) -> bool {
+    match job_dir() {
+        Some(d) => {
+            *d.lock().unwrap_or_else(|e| e.into_inner()) = path.to_string();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Run a job's work with a current directory of its own.
+pub async fn with_job_dir<F: std::future::Future>(start: &str, f: F) -> F::Output {
+    TASK_DIR
+        .scope(
+            std::sync::Arc::new(std::sync::Mutex::new(start.to_string())),
+            f,
+        )
+        .await
+}
+
+/// The job's current directory on this thread while it lives.
+pub struct DirScope(Option<JobDir>);
+
+impl DirScope {
+    pub fn new(d: Option<JobDir>) -> DirScope {
+        DirScope(THREAD_DIR.with(|t| t.replace(d)))
+    }
+}
+
+impl Drop for DirScope {
+    fn drop(&mut self) {
+        let before = self.0.take();
+        THREAD_DIR.with(|t| *t.borrow_mut() = before);
+    }
+}
+
+/// The directory a job starts in: the user's home directory, /home/USER
+/// (the user profile's HOMEDIR default), or the root when it does not
+/// exist (IBM's integrated file system documentation: a job's initial
+/// current directory). A PASE-like process (`as4tainr system`, `call`)
+/// starts where it was started, as a PASE shell's `system` runs in the
+/// shell's directory, when that directory is in the IFS.
+pub async fn start_dir(client: &Client, user: &str, process: bool) -> String {
+    if process {
+        if let Some(d) = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+        {
+            if let Ok(Some(e)) = stat(client, &d).await {
+                if e.dir {
+                    return e.path;
+                }
+            }
+        }
+    }
+    match stat(client, &format!("/home/{user}")).await {
+        Ok(Some(e)) if e.dir => e.path,
+        _ => "/".to_string(),
+    }
+}
+
 /// An absolute path without `.`, `..`, empty parts or a trailing `/`.
-/// Relative paths are taken from the root directory (the job's current
-/// directory is always /).
+/// Relative paths are taken from the job's current directory.
 pub fn normalize(path: &str) -> Result<String> {
     let path = path.trim_end_matches('\0').trim();
     if path.is_empty() {
@@ -137,6 +231,13 @@ pub fn normalize(path: &str) -> Result<String> {
     if path.len() > 16 * 1024 {
         return err(errno::ENAMETOOLONG);
     }
+    let full;
+    let path = if path.starts_with('/') {
+        path
+    } else {
+        full = format!("{}/{path}", current_dir());
+        full.as_str()
+    };
     let mut parts: Vec<&str> = Vec::new();
     for p in path.split('/') {
         match p {

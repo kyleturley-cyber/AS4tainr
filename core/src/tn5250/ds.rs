@@ -39,6 +39,7 @@ pub mod ffw {
     pub const BYPASS: u8 = 0x20; // output only
     pub const ALPHA: u8 = 0x00; // alphanumeric shift
     pub const NUMERIC_ONLY: u8 = 0x03;
+    pub const DIGITS_ONLY: u8 = 0x05;
     pub const SIGNED_NUMERIC: u8 = 0x07;
     /// Byte 2: fold input to upper case.
     pub const MONOCASE: u8 = 0x20;

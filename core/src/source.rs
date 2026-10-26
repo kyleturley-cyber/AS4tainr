@@ -62,7 +62,7 @@ pub fn type_for_extension(ext: &str) -> Option<&'static str> {
         "rpg" => "RPG",
         "clle" => "CLLE",
         "clp" => "CLP",
-        "cmd" => "CMD",
+        "cmd" | "cmdsrc" => "CMD",
         "cbl" | "cblle" => "CBLLE",
         // SQL scripts, and the object-type extensions of IBM's build
         // tools (Bob: .table, .view, .index, .sqlprc, .sqludf, .sqltrg,
@@ -239,10 +239,13 @@ pub async fn members(
     library: &str,
     file: &str,
 ) -> Result<Vec<(String, String, String)>> {
+    let co = crate::collate::clause(client).await?;
     Ok(client
         .query(
-            "SELECT member, srctype, text FROM as4tainr.source_members
-             WHERE library=$1 AND file=$2 ORDER BY member",
+            &format!(
+                "SELECT member, srctype, text FROM as4tainr.source_members
+                  WHERE library=$1 AND file=$2 ORDER BY member{co}"
+            ),
             &[&library, &file],
         )
         .await?
@@ -277,6 +280,30 @@ pub async fn remove_member(client: &Client, library: &str, file: &str, member: &
 /// Store a stream file (replacing it) in the IFS, as UTF-8 text.
 pub async fn put_stream_file(client: &Client, path: &str, data: &str) -> Result<()> {
     crate::ifs::put_text(client, path, data).await
+}
+
+/// The first of these paths that is a stream file (exact paths, the IFS's
+/// names compared without case): its path and text.
+pub async fn first_stream_file(
+    client: &Client,
+    paths: &[String],
+) -> Result<Option<(String, String)>> {
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let keys: Vec<String> = paths.iter().map(|p| p.to_lowercase()).collect();
+    let r = client
+        .query_opt(
+            "SELECT path, data, ccsid FROM as4tainr.ifs
+             WHERE kind = 'F' AND path_key = ANY($1)
+             ORDER BY array_position($1, path_key) LIMIT 1",
+            &[&keys],
+        )
+        .await?;
+    Ok(r.map(|r| {
+        let data: Vec<u8> = r.get(1);
+        (r.get(0), crate::ifs::codec::text(r.get(2), &data))
+    }))
 }
 
 /// A stream file by path: an absolute path as is; a relative one (an
@@ -339,7 +366,10 @@ pub async fn expand_cl_includes(client: &Client, libs: &[String], source: &str) 
             } else if let Some(member) = keyword_value(t, "SRCMBR") {
                 let file = keyword_value(t, "SRCFILE").unwrap_or_else(|| "QCLSRC".into());
                 let (libs, file) = match file.split_once('/') {
-                    Some((l, f)) if l != "*LIBL" => (vec![l.to_ascii_uppercase()], f.to_string()),
+                    Some((l, f)) if l != "*LIBL" => (
+                        vec![crate::qtemp::real(&l.to_ascii_uppercase())],
+                        f.to_string(),
+                    ),
                     Some((_, f)) => (libs.to_vec(), f.to_string()),
                     None => (libs.to_vec(), file),
                 };
@@ -373,6 +403,7 @@ pub fn record_file(name: &str, rcdlen: u32) -> crate::dds::PhysicalFile {
         alias: None,
         identity: None,
         double: false,
+        generated: None,
     };
     crate::dds::PhysicalFile {
         name: name.to_string(),

@@ -20,6 +20,17 @@
 #   by as4tainr's `system`) from a clone put in the IFS at the same path,
 #   then QSHEXEC runs a shell command (Qshell needs AS4TAINR_QSH=1) and
 #   its output is in the outfile.
+# - IBM's Company System (Apache-2.0): built as its makefile does (GNU
+#   Make: `liblist -c` and `system` from a shell in the clone, which is
+#   in the IFS at the same path, so relative SRCSTMF paths work), each
+#   step run here with the current library and library list liblist
+#   sets; then MYPGM (printf and DSPLY).
+# - iRPGUnit (CPL-1.0): its members copied into the source files of
+#   library IRPGUNIT (CPYFRMSTMF; RPGUnit has RPGUNIT), built by its own
+#   REXX procedure A_INSTALL (STRREXPRC, as its README says) into that
+#   library; then its self-test suite
+#   ASSERTT made with RUCRTRPG and run with RUCALLTST: the test
+#   procedures that pass here, then the whole suite's result line.
 #
 #   tools/legacy.sh
 #
@@ -38,6 +49,8 @@ clone https://github.com/ZodandSons/northwind-ibmi-rpgle-application.git nwapp
 clone https://github.com/ARNAV2684/as400-order-management-modernization.git com
 clone https://github.com/RPGUnit/RPGUnit.git rpgunit
 clone https://github.com/richardschoen/QshOni.git qshoni
+clone https://github.com/IBM/ibmi-company_system.git cmpsys
+clone https://github.com/tools-400/irpgunit.git irpgunit
 
 step() {
   echo "== $*"
@@ -125,3 +138,56 @@ chmod +x "$shim/system"
 (cd "$work/qshoni" && PATH="$shim:$PATH" bash build.sh 2>&1) |
   grep -E "^(CPF|Error in)|was created and programs compiled" | grep -v CPF0006
 AS4TAINR_QSH=1 "$bin" --libl QSHONI system "QSHEXEC CMDLINE('echo QshOni works') PRTOUTQ(*SAME) OUTFILE(QTEMP/STDOUTQSH) LOGSTDOUT(*NO)" | grep -E "QSH0005|CPF"
+
+step "Company System (makefile: BIN_LIB=CMPSYS)"
+"$bin" put "$work/cmpsys" "$work/cmpsys" >/dev/null
+(
+  cd "$work/cmpsys" || exit 1
+  export AS4TAINR_CURLIB=CMPSYS AS4TAINR_LIBL=CMPSYS,QGPL,QTEMP
+  b="$(cd "$OLDPWD" && cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
+  s() { "$b" system "$1" 2>&1 | grep -E "^(CPF|CPD|RNS9310|SQL[0-9])|created in|with errors" | grep -v "^ "; }
+  s "CRTLIB LIB(CMPSYS)"
+  s "RUNSQLSTM SRCSTMF('qsqlsrc/employee.table') COMMIT(*NONE)"
+  s "RUNSQLSTM SRCSTMF('qsqlsrc/department.table') COMMIT(*NONE)"
+  s "CRTSQLRPGI OBJ(CMPSYS/EMPDET) SRCSTMF('qrpglesrc/empdet.sqlrpgle') COMMIT(*NONE) DBGVIEW(*SOURCE) COMPILEOPT('TGTCCSID(*JOB)') RPGPPOPT(*LVL2) OPTION(*EVENTF) OBJTYPE(*MODULE)"
+  s "CRTBNDDIR BNDDIR(CMPSYS/APP)"
+  s "CRTSRVPGM SRVPGM(CMPSYS/EMPDET) MODULE(EMPDET) SRCSTMF('qrpglesrc/empdet.bnd') BNDDIR((CMPSYS/APP)) REPLACE(*YES)"
+  s "ADDBNDDIRE BNDDIR(CMPSYS/APP) OBJ((*LIBL/EMPDET *SRVPGM *IMMED))"
+  s "CRTSRCPF FILE(CMPSYS/QTMPSRC) RCDLEN(112) CCSID(*JOB)"
+  for d in depts emps nemp; do
+    u=$(echo "$d" | tr a-z A-Z)
+    s "CPYFRMSTMF FROMSTMF('qddssrc/$d.dspf') TOMBR('/QSYS.LIB/CMPSYS.LIB/QTMPSRC.FILE/$u.MBR') MBROPT(*REPLACE)" >/dev/null
+    s "CRTDSPF FILE(CMPSYS/$u) SRCFILE(CMPSYS/QTMPSRC) SRCMBR($u) OPTION(*EVENTF)"
+  done
+  for p in employees newemp depts; do
+    u=$(echo "$p" | tr a-z A-Z)
+    s "CRTSQLRPGI OBJ(CMPSYS/$u) SRCSTMF('qrpglesrc/$p.pgm.sqlrpgle') COMMIT(*NONE) DBGVIEW(*SOURCE) OPTION(*EVENTF) RPGPPOPT(*LVL2) COMPILEOPT('TGTCCSID(*JOB) BNDDIR(APP) DFTACTGRP(*no)')"
+  done
+  s "CRTBNDRPG PGM(CMPSYS/MYPGM) SRCSTMF('qrpglesrc/mypgm.pgm.rpgle') OPTION(*EVENTF) DBGVIEW(*SOURCE) TGTRLS(*CURRENT) TGTCCSID(*JOB) BNDDIR(APP) DFTACTGRP(*NO)"
+  s "RUNSQLSTM SRCSTMF('qsqlsrc/popdept.sqlprc') COMMIT(*NONE)"
+  s "RUNSQLSTM SRCSTMF('qsqlsrc/popemp.sqlprc') COMMIT(*NONE)"
+  "$b" system "CALL CMPSYS/MYPGM"
+)
+
+step "iRPGUnit (STRREXPRC A_INSTALL, then RUCRTRPG and RUCALLTST of ASSERTT)"
+src="$work/irpgunit/host/iRPGUnit"
+"$bin" put "$src" /home/irpgunit >/dev/null
+run "CRTLIB IRPGUNIT" >/dev/null
+for d in "$src"/Q*; do
+  f=$(basename "$d")
+  run "CRTSRCPF FILE(IRPGUNIT/$f) RCDLEN(112)" >/dev/null
+  for m in "$d"/*; do
+    b=$(basename "$m"); n="${b%%.*}"; t="${b##*.}"
+    [ ${#n} -le 10 ] || continue
+    run "CPYFRMSTMF FROMSTMF('/home/irpgunit/$f/$b') TOMBR('/QSYS.LIB/IRPGUNIT.LIB/$f.FILE/$n.MBR') MBROPT(*REPLACE)" >/dev/null
+    run "CHGPFM FILE(IRPGUNIT/$f) MBR($n) SRCTYPE($t)" >/dev/null
+  done
+done
+irpg() { "$bin" --libl IRPGUNIT,QGPL,QTEMP system "$1" 2>&1; }
+irpg "STRREXPRC SRCMBR(A_INSTALL) SRCFILE(IRPGUNIT/QBUILD) PARM('INSTALL IRPGUNIT')" | grep -E "^(CPF|REX)" | grep -v CPF2105
+# As its A_SELFTEST does: the modules again (CMPMOD), then the suite.
+irpg "STRREXPRC SRCMBR(A_INSTALL) SRCFILE(IRPGUNIT/QBUILD) PARM('CMPMOD IRPGUNIT')" | grep -E "^(CPF|REX)" | grep -v CPF2105
+irpg "RUCRTRPG TSTPGM(IRPGUNIT/ASSERTT) SRCFILE(IRPGUNIT/QUNITTEST) BNDDIR(IRPGUNIT/IRPGUNIT) BOPTION(*DUPPROC *DUPVAR)" | grep -a -E "Test program|CPF9897"
+irpg "RUCALLTST TSTPGM(IRPGUNIT/ASSERTT) TSTPRC(TESTASSERTCLEAR TESTASSERTCOUNT TESTASSERTEQUAL_DATE TESTASSERTEQUAL_IND TESTASSERTEQUAL_INTEGER TESTASSERTEQUAL_STRING TESTASSERTEQUAL_TIME TESTASSERTEQUAL_TIMESTAMP TESTASSERTWITHFAILURE TESTASSERTWITHSUCCESS TESTBIGINTEGEREQUALITY TESTCLEARASSERTFAILEVENT TESTGETASSERTFAILEVT TESTGETLOGVALUE TESTGOODBYEISNOTHELLO TESTHELLOEQUALSHELLO TESTTOIND TESTTWOANDTWOEQUALSFOUR TESTTWOANDTWOISNOTEQUALTOFIVE)" |
+  grep -E "^ *(Success|FAILURE|ERROR)\."
+irpg "RUCALLTST TSTPGM(IRPGUNIT/ASSERTT)" | grep -a -E "^ *(Success|FAILURE|ERROR)\."

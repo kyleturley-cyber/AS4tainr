@@ -20,10 +20,12 @@ RSTOBJ  OBJ(ORDHDR ORDLIN) SAVLIB(ORDERS) DEV(*SAVF) OBJTYPE(*FILE) SAVF(BACKUP/
 | `DSPSAVF FILE(...)` | The save command, when it was saved, and the objects in it (name, library, type, attribute, owner, text) |
 | `SAVLIB LIB(lib ...) DEV(*SAVF) SAVF(...) [CLEAR] [UPDHST]` | Every object of the libraries, and the library's SQL procedures and functions |
 | `SAVOBJ OBJ(name generic* *ALL ...) LIB(lib ...) DEV(*SAVF) [OBJTYPE(...)] SAVF(...) [CLEAR] [UPDHST]` | The objects named, of the types named; CPF3770 when none are found |
+| `SAVCHGOBJ OBJ(...) LIB(lib ...) DEV(*SAVF) [OBJTYPE] [REFDATE] [REFTIME] [OBJJRN] SAVF(...)` | The objects changed since the library's last SAVLIB (`REFDATE(*SAVLIB)`, with UPDHST(*YES); every object when there was none) or since `REFDATE` (the job's date format, MMDDYY) and `REFTIME` (HHMMSS, UTC); OBJJRN(*NO), the default, leaves out files journaled since before then. CPF3770 when nothing changed. RSTOBJ restores what it saved |
 | `RSTLIB SAVLIB(lib) DEV(*SAVF) SAVF(...) [RSTLIB(lib)]` | Everything saved from the library, into it or into another (made if it does not exist) |
 | `RSTOBJ OBJ(...) SAVLIB(lib) DEV(*SAVF) [OBJTYPE(...)] SAVF(...) [RSTLIB(lib)]` | The objects named; the library restored into must exist (CPF2110) |
-| `DLTLIB LIB(lib)`, `CLRLIB LIB(lib)` | Delete a library and everything in it, or everything in it only. System libraries (QSYS, QSYS2, QGPL, QTEMP, QUSRSYS, QHLPSYS) cannot be deleted or cleared |
+| `DLTLIB LIB(lib)`, `CLRLIB LIB(lib)` | Delete a library and everything in it, or everything in it only. System libraries (QSYS, QSYS2, QGPL, QUSRSYS, QHLPSYS) cannot be deleted or cleared; CLRLIB QTEMP clears the job's own QTEMP, which cannot be deleted |
 | `DLTF FILE(lib/savf)` | Deletes a save file |
+| `OMITOBJ((lib/obj type) ...)`, `SELECT((*INCLUDE\|*OMIT lib/obj type attribute member) ...)` | On the four save and restore commands: OMITOBJ leaves objects out; *INCLUDE entries choose objects (every object when there are none) and *OMIT entries leave them out; names, libraries and attributes can be generic or *ALL, the member must be *ALL (whole files). RSTOBJ FILEMBR((*ALL *ALL)) is taken |
 
 A save file that has data is only saved into again with `CLEAR(*ALL)` or `CLEAR(*REPLACE)` (IBM i would ask; as4tainr ends with CPF9898). Journals, journal receivers and save files are not saved: each is named in a message.
 
@@ -31,7 +33,11 @@ A save file that has data is only saved into again with `CLEAR(*ALL)` or `CLEAR(
 
 For each object, its description (type, attribute, text, owner, *PUBLIC and private authorities) and everything as4tainr knows about it: file descriptions, fields, keys, logical files, display and printer files, source members, programs, modules, service programs, binding directories, commands, menus, data areas, message descriptions, constraints, trigger programs (ADDPFTRG), SQL triggers, journaling. With it go the PostgreSQL objects that hold it: tables with their records (at the same relative record numbers), identity columns and their next values, sequences and their last values, indexes, constraints, views, SQL triggers and their functions. A save is one repeatable-read transaction, so files that change while it runs are saved as they were when it started.
 
-With `UPDHST(*YES)` (the default) each object's last save date is kept, and a journaled file gets an F MS entry in its journal.
+With `UPDHST(*YES)` (the default) each object's last save date is kept, and a journaled file gets an F MS entry in its journal; SAVLIB also keeps the library's save time, where the database's transactions were then, and each file's number of records, which SAVCHGOBJ compares with.
+
+## What counts as changed
+
+An object changes when it is made or restored, when its text, attribute or owner changes, when a data area's value or a user space's contents change, and when a source member is added, changed or removed (the `objects.changed` timestamp, kept by triggers on the catalog tables; RTVOBJD CHGDATE, QUSROBJD and OBJECT_STATISTICS show it). A physical file's records are looked at when SAVCHGOBJ runs: since a SAVLIB, a record written after it (its PostgreSQL `xmin`) or another number of records means changed; since a date, a record committed after it when PostgreSQL keeps commit timestamps (`track_commit_timestamp = on`), else a record written after the last save or catalog initialization before that date (or every file with records, when there was none). Records deleted after a date, with nothing written, are not seen then.
 
 ## Restoring over objects that exist
 

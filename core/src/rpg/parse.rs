@@ -30,6 +30,16 @@ fn include_target(directive_rest: &str) -> String {
     if let Some(q) = t.strip_prefix('\'') {
         return q.split('\'').next().unwrap_or("").to_string();
     }
+    // A path in double quotes (ILE RPG Reference, /COPY: "The path can be
+    // enclosed in single or double quotes").
+    // (Quoted QSYS names, "LIB"/"FILE","MBR", are taken as written.)
+    if let Some(q) = t.strip_prefix('"') {
+        if let Some((path, after)) = q.split_once('"') {
+            if after.is_empty() || after.starts_with(char::is_whitespace) {
+                return path.to_string();
+            }
+        }
+    }
     t.split_whitespace().next().unwrap_or("").to_string()
 }
 
@@ -103,6 +113,41 @@ struct Lines<'a> {
 /// Line numbers of /COPY members start at their order times this.
 pub const COPY_LINES: usize = 1_000_000;
 
+/// Strip SQL comments from a line of an embedded SQL statement: `--` to
+/// the end of the line and `/* ... */`, which may span lines (`in_block`)
+/// (Db2 for i SQL Reference, "Comments"), outside string constants.
+fn strip_sql_comments(s: &str, in_block: &mut bool) -> String {
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut quoted = false;
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if *in_block {
+            if c == '*' && cs.get(i + 1) == Some(&'/') {
+                *in_block = false;
+                out.push(' ');
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '\'' {
+            quoted = !quoted;
+        } else if !quoted && c == '-' && cs.get(i + 1) == Some(&'-') {
+            break;
+        } else if !quoted && c == '/' && cs.get(i + 1) == Some(&'*') {
+            *in_block = true;
+            i += 2;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 /// Strip `//` comments (outside literals) from free-form text.
 fn strip_comment(s: &str) -> String {
     let mut out = String::new();
@@ -128,6 +173,8 @@ impl Lines<'_> {
         let free_source = is_fully_free(source);
         let mut free_region = false;
         let mut pending = String::new();
+        // Inside an SQL block comment of an embedded SQL statement.
+        let mut sql_block = false;
         let mut pending_line = 0;
         // Fixed-form embedded SQL: C/EXEC SQL, C+ lines, C/END-EXEC.
         let mut sql_fixed: Option<(String, usize)> = None;
@@ -289,15 +336,51 @@ impl Lines<'_> {
                 if !active(&cond) {
                     continue;
                 }
-                let text = strip_comment(&text);
-                if text.trim().is_empty() {
-                    continue;
+                // A literal continued on this line (ILE RPG Reference,
+                // "Continuation rules": in free form, '+' at the end of
+                // a line continues the literal with the first nonblank
+                // character of the next line, '-' with its first
+                // character).
+                let open_literal = pending.chars().filter(|&c| c == '\'').count() % 2 == 1;
+                if open_literal {
+                    // The line starts inside the literal: a comment can
+                    // only follow its end.
+                    let quoted = format!("'{text}");
+                    let text = strip_comment(&quoted)[1..].to_string();
+                    let t = pending.trim_end();
+                    if let Some(head) = t.strip_suffix('+') {
+                        pending = head.to_string();
+                        pending.push_str(text.trim_start());
+                    } else if let Some(head) = t.strip_suffix('-') {
+                        pending = head.to_string();
+                        pending.push_str(&text);
+                    } else {
+                        pending.push(' ');
+                        pending.push_str(&text);
+                    }
+                } else {
+                    // Embedded SQL keeps SQL's comments out.
+                    let in_sql = if pending.trim().is_empty() {
+                        text.trim_start().to_ascii_uppercase().starts_with("EXEC SQL")
+                            || text.trim_start().to_ascii_uppercase().starts_with("EXEC\tSQL")
+                    } else {
+                        pending.trim_start().to_ascii_uppercase().starts_with("EXEC SQL")
+                    };
+                    let text = if in_sql || sql_block {
+                        strip_sql_comments(&text, &mut sql_block)
+                    } else {
+                        text.to_string()
+                    };
+                    let text = strip_comment(&text);
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    if pending.trim().is_empty() {
+                        pending_line = lineno;
+                    }
+                    pending.push(' ');
+                    pending.push_str(&text);
                 }
-                if pending.trim().is_empty() {
-                    pending_line = lineno;
-                }
-                pending.push(' ');
-                pending.push_str(&text);
                 // Statements end with ';' outside literals.
                 loop {
                     let mut quoted = false;
@@ -519,7 +602,7 @@ fn fixed_type(
         }
         'D' => DType::Date(crate::rpg::dates::DateFmt::unset()),
         'T' => DType::Time(crate::rpg::dates::TimeFmt::unset()),
-        'Z' => DType::Timestamp,
+        'Z' => DType::Timestamp(6),
         '*' => DType::Pointer,
         other => bail!("data type {other} is not supported yet"),
     }))
@@ -570,7 +653,19 @@ fn free_type(word: &str, args: &[String]) -> Result<Option<DType>> {
             Some(f) if !f.trim().is_empty() => crate::rpg::dates::TimeFmt::parse(f)?,
             _ => crate::rpg::dates::TimeFmt::unset(),
         }),
-        "TIMESTAMP" => DType::Timestamp,
+        // TIMESTAMP(n): n fractional digits, 0 to 12 (6 without).
+        "TIMESTAMP" => match args.first().map(|a| a.trim()).filter(|a| !a.is_empty()) {
+            Some(a) => {
+                let n: u8 = a
+                    .parse()
+                    .map_err(|_| anyhow!("TIMESTAMP({a}): the fractional digits are a number"))?;
+                if n > 12 {
+                    bail!("TIMESTAMP({n}): a timestamp has 0 to 12 fractional digits");
+                }
+                DType::Timestamp(n)
+            }
+            None => DType::Timestamp(6),
+        },
         "POINTER" => DType::Pointer,
         _ => return Ok(None),
     }))
@@ -603,6 +698,14 @@ const FREE_TYPES: &[&str] = &[
 ];
 
 /// A free-form declaration's name, type and keywords from its words.
+/// The name a free-form declaration starts with, as written.
+fn written_name(text: &str) -> String {
+    text.split(|c: char| c.is_whitespace() || c == ';' || c == '(')
+        .find(|w| !w.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
 fn free_decl(text: &str) -> Result<(String, Option<DType>, Vec<Keyword>)> {
     let kws = keywords(text)?;
     let mut it = kws.into_iter();
@@ -699,19 +802,42 @@ impl Ctx {
 /// Parse a source member. `includes` gives the text of `/COPY` and
 /// `/INCLUDE` members by the id written in the directive.
 pub fn parse(source: &str, includes: &dyn Fn(&str) -> Option<String>) -> Result<Source> {
+    parse_defined(source, includes, &[])
+}
+
+/// Parse with condition names defined by the create command (DEFINE).
+pub fn parse_defined(
+    source: &str,
+    includes: &dyn Fn(&str) -> Option<String>,
+    defines: &[String],
+) -> Result<Source> {
     let mut lines = Lines {
         includes,
         defined: [
             "*ILERPG",
             "*CRTBNDRPG",
+            // *VxRyMz for this release and every one before it back to
+            // V4R4M0 (ILE RPG Reference, "Predefined conditions").
             "*V7R5M0",
             "*V7R4M0",
             "*V7R3M0",
             "*V7R2M0",
             "*V7R1M0",
+            "*V6R1M0",
+            "*V5R4M0",
+            "*V5R3M0",
+            "*V5R2M0",
+            "*V5R1M0",
+            "*V4R5M0",
+            "*V4R4M0",
         ]
         .iter()
         .map(|s| s.to_string())
+        // CRTRPGMOD: *CRTRPGMOD instead of *CRTBNDRPG.
+        .filter(|s| {
+            !(s == "*CRTBNDRPG" && defines.iter().any(|d| d.eq_ignore_ascii_case("*CRTRPGMOD")))
+        })
+        .chain(defines.iter().map(|d| d.to_ascii_uppercase()))
         .collect(),
         units: Vec::new(),
         ctdata: Vec::new(),
@@ -1055,6 +1181,7 @@ fn fixed_p(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
             }
             ctx.open = None;
             ctx.proc = Some(Proc {
+                written: name.clone(),
                 name,
                 export: keyword(&kws, "EXPORT").is_some(),
                 defs: vec![],
@@ -1472,6 +1599,18 @@ fn fixed_c(ctx: &mut Ctx, cs: &[char], ext2: &str, lineno: usize) -> Result<()> 
     }
     let what = match op.as_str() {
         "" => return Ok(()),
+        // EVAL-CORR target = source (ILE RPG Reference, EVAL-CORR).
+        "EVAL-CORR" => {
+            let (t, v) = split_assign(ext2)?;
+            Line::Stmt(Stmt::Op {
+                code: "EVAL-CORR".into(),
+                f1: Some(t),
+                f2: Some(v),
+                result: None,
+                ext: ext.clone(),
+                ind: ResultInd::default(),
+            })
+        }
         "EVAL" | "EVALR" => {
             let (t, v) = split_assign(ext2)?;
             Line::Stmt(Stmt::Eval {
@@ -2292,6 +2431,24 @@ fn free(ctx: &mut Ctx, text: &str, lineno: usize) -> Result<()> {
         }
         "DCL-DS" | "DCL-PR" | "DCL-PI" => {
             let (name, dtype, mut kws) = free_decl(&rest)?;
+            // EXTPROC(*DCLCASE): the name as declared, its case kept (a
+            // prototype's own; an interface's, its procedure's), kept as
+            // the keyword's second value.
+            let declared = if first.as_str() == "DCL-PI" {
+                ctx.proc.as_ref().map(|p| p.written.clone())
+            } else {
+                Some(written_name(&rest))
+            };
+            for k in kws.iter_mut() {
+                if k.name == "EXTPROC"
+                    && k.args.len() == 1
+                    && k.args[0].trim().eq_ignore_ascii_case("*DCLCASE")
+                {
+                    if let Some(d) = &declared {
+                        k.args.push(format!("'{d}'"));
+                    }
+                }
+            }
             // `dcl-pi *n int(10) end-pi;`: an empty list ends on its line.
             let ends_here = kws.iter().any(|k| {
                 matches!(k.name.as_str(), "END-DS" | "END-PR" | "END-PI") && k.args.is_empty()
@@ -2387,6 +2544,7 @@ fn free(ctx: &mut Ctx, text: &str, lineno: usize) -> Result<()> {
                 bail!("procedure {name} begins inside another procedure");
             }
             ctx.proc = Some(Proc {
+                written: written_name(&rest),
                 name,
                 export: keyword(&kws, "EXPORT").is_some(),
                 defs: vec![],
@@ -2641,6 +2799,17 @@ fn free_calc(text: &str) -> Result<Line> {
                 .collect(),
         ),
         "ENDMON" => Line::EndMon,
+        "EVAL-CORR" => {
+            let (t, v) = split_assign(rest_t)?;
+            Line::Stmt(Stmt::Op {
+                code: "EVAL-CORR".into(),
+                f1: Some(t),
+                f2: Some(v),
+                result: None,
+                ext: ext.clone(),
+                ind: ResultInd::default(),
+            })
+        }
         "EVAL" | "EVALR" => {
             let (t, v) = split_assign(rest_t)?;
             Line::Stmt(Stmt::Eval {
@@ -2744,15 +2913,15 @@ fn free_calc(text: &str) -> Result<Line> {
         }
         // XML-INTO receiver %XML(doc : options); DATA-INTO receiver
         // %DATA(doc : options) %PARSER(program : options).
-        "XML-INTO" | "DATA-INTO" => {
+        "XML-INTO" | "DATA-INTO" | "XML-SAX" => {
             let t = rest_t.trim();
             let up = t.to_ascii_uppercase();
             let at = up
-                .find(if op == "XML-INTO" { "%XML" } else { "%DATA" })
+                .find(if op == "DATA-INTO" { "%DATA" } else { "%XML" })
                 .ok_or_else(|| {
                     anyhow!(
                         "{op} needs {}",
-                        if op == "XML-INTO" { "%XML" } else { "%DATA" }
+                        if op == "DATA-INTO" { "%DATA" } else { "%XML" }
                     )
                 })?;
             Line::Stmt(Stmt::Op {

@@ -147,7 +147,7 @@ fn libraries(lib: &str, caller: &Caller) -> Vec<String> {
     match lib.trim().to_ascii_uppercase().as_str() {
         "*LIBL" | "" => caller.libl.clone(),
         "*CURLIB" => vec![caller.curlib.clone()],
-        l => vec![l.to_string()],
+        l => vec![crate::qtemp::real(l)],
     }
 }
 
@@ -233,12 +233,18 @@ impl ApiArgs for ClArgs {
         if let Ok(d) = crate::rpg::dec::Dec::parse(t) {
             return Ok(d.to_i128()? as i64);
         }
-        // A *CHAR 4 variable holding a binary number (%BIN).
-        let b = e(s);
-        if b.len() == 4 {
-            return Ok(i32::from_be_bytes(b[..4].try_into().unwrap()) as i64);
+        // A *CHAR variable holding a binary number (%BIN), or a hex
+        // constant: its first four bytes. A character constant is passed
+        // as 32 bytes padded with blanks (CL reference, CALL PARM), so
+        // X'01F4' is read as X'01F44040'.
+        let mut b = e(s);
+        if b.is_empty() {
+            bail!("CPF24B4: Parameter {} is not a number.", i + 1)
         }
-        bail!("CPF24B4: Parameter {} is not a number.", i + 1)
+        if b.len() < 4 {
+            b.resize(4, 0x40);
+        }
+        Ok(i32::from_be_bytes(b[..4].try_into().unwrap()) as i64)
     }
     fn set_bytes(&mut self, i: usize, b: &[u8]) {
         if let Some(s) = self.0.get_mut(i) {

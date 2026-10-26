@@ -89,6 +89,22 @@ impl Job<'_> {
                     .map_err(|e| cl_error(e, dir))?;
                 msg(format!("CPCA083: Directory {dir} was created."))
             }
+            // CHGCURDIR (CL reference): the job's current directory,
+            // where relative path names start.
+            "CHGCURDIR" | "CD" => {
+                let dir = cmd.get("DIR");
+                match ifs::stat(self.client, dir)
+                    .await
+                    .map_err(|e| cl_error(e, dir))?
+                {
+                    Some(e) if e.dir => {
+                        ifs::set_current_dir(&e.path);
+                        msg("Current directory changed.".into())
+                    }
+                    Some(_) => Err(cl_error(ifs::Errno(errno::ENOTDIR).into(), dir)),
+                    None => Err(cl_error(ifs::Errno(errno::ENOENT).into(), dir)),
+                }
+            }
             "RMVDIR" | "RMDIR" | "RD" => {
                 let dir = cmd.get("DIR");
                 if cmd.get("SUBTREE").eq_ignore_ascii_case("*ALL") {
@@ -118,6 +134,53 @@ impl Job<'_> {
                     .await
                     .map_err(|e| cl_error(e, obj))?;
                 msg(format!("Object {obj} renamed to {new}."))
+            }
+            // DSPATR (CL reference): an IFS object's attributes, here
+            // those the IFS keeps (as4tainr's own layout).
+            "DSPATR" => {
+                let obj = cmd.get("OBJ");
+                let Some(e) = ifs::stat(self.client, obj)
+                    .await
+                    .map_err(|e| cl_error(e, obj))?
+                else {
+                    return Err(cl_error(ifs::Errno(errno::ENOENT).into(), obj));
+                };
+                let changed = {
+                    let secs = e.changed_us.div_euclid(1_000_000);
+                    let row = self
+                        .client
+                        .query_one(
+                            "SELECT to_char(to_timestamp($1::bigint), 'MM/DD/YY HH24:MI:SS')",
+                            &[&secs],
+                        )
+                        .await?;
+                    row.get::<_, String>(0)
+                };
+                let info: Vec<(String, String)> = vec![
+                    ("Object".into(), e.path.clone()),
+                    (
+                        "Type of object".into(),
+                        if e.dir { "*DIR" } else { "*STMF" }.into(),
+                    ),
+                    ("Owner".into(), e.owner.clone()),
+                    ("Coded character set ID".into(), e.ccsid.to_string()),
+                    ("Size of object data in bytes".into(), e.size.to_string()),
+                    ("Last change date/time".into(), changed),
+                    (
+                        "Mode (permissions)".into(),
+                        format!("{:04o}", e.mode & 0o7777),
+                    ),
+                ];
+                let print: Vec<String> = info
+                    .iter()
+                    .map(|(k, v)| format!(" {:.<40}: {v}", format!("{k} ")))
+                    .collect();
+                Ok(Some(Outcome::Display(ListDisplay {
+                    title: "Display Attributes".into(),
+                    info,
+                    print,
+                    ..Default::default()
+                })))
             }
             "WRKLNK" | "DSPLNK" => {
                 let obj = match cmd.get("OBJ") {

@@ -9,7 +9,7 @@ use super::ast::*;
 use super::code::{Code, Ins};
 use super::data::{self, a, DType, Fig, Fit, Value};
 use super::dec::Dec;
-use super::program::{Display, ProcInfo, Program, Sym, VarInfo};
+use super::program::{Display, DsInfo, ProcInfo, Program, Sym, VarInfo};
 use crate::rla::{OpenFile, ReadResult, Record};
 use crate::workstn::Workstation;
 use anyhow::{anyhow, bail, Result};
@@ -39,6 +39,8 @@ mod printer;
 mod ptrs;
 #[path = "xmlinto.rs"]
 mod xmlinto;
+#[path = "xmlsax.rs"]
+pub mod xmlsax;
 
 /// What the program runs with: the database, the job.
 pub struct Io<'a> {
@@ -299,8 +301,11 @@ enum Flow {
 pub struct Machine<'a> {
     prog: &'a Program,
     bufs: super::mem::Mem,
-    /// This run's number in pointers to its storage.
+    /// The number in pointers to this module's global storage: its
+    /// activation's (a service program module's), else this run's.
     owner: u32,
+    /// This run's number in pointers to its procedures' local storage.
+    frame_owner: u32,
     /// A pointer that addressed nothing during the statement running.
     ptr_fault: std::cell::RefCell<Option<String>>,
     /// Heap blocks holding OPTIONS(*STRING) arguments of calls running.
@@ -397,9 +402,11 @@ struct Frame<'a> {
     omitted: Vec<String>,
     /// File parameters (LIKEFILE): the caller's file.
     files: HashMap<String, usize>,
-    /// The length of each argument, as an operational descriptor gives
-    /// it (CEEDOD).
-    lengths: Vec<Option<usize>>,
+    /// Each argument as an operational descriptor gives it (CEEDOD,
+    /// CEEGSI): its current length, its data type code (2 character, 4
+    /// character with a 2-byte length, 9 graphic, 11 graphic with a 2-byte
+    /// length) and its maximum length.
+    lengths: Vec<Option<(usize, i32, usize)>>,
 }
 
 /// Where an argument passed by reference lives.
@@ -428,10 +435,6 @@ struct Printer {
 }
 
 /// The bytes a variable (all its elements) takes.
-fn var_span(v: &VarInfo) -> usize {
-    v.stride * (v.dim.max(1) as usize - 1) + v.dtype.size()
-}
-
 /// Function key indicators *INKA-*INKY for F1-F24 (there is no *INKO).
 const FKEYS: &[u8; 24] = b"ABCDEFGHIJKLMNPQRSTUVWXY";
 
@@ -443,14 +446,34 @@ fn ind_name(n: &str) -> String {
     }
 }
 
+/// A value as a float: a big float as it is, a number converted.
+fn float_value(v: &Value) -> Result<f64> {
+    match v {
+        Value::Float(x) => Ok(*x),
+        other => Ok(other.num()?.to_string().parse().unwrap_or(0.0)),
+    }
+}
+
 /// Number text as %CHAR gives it: leading zeros removed (also the zero
 /// before the decimal point), a leading '-' for negative values.
 pub fn char_of_num(d: &Dec) -> String {
+    char_of_num_edit(d, '.', false)
+}
+
+/// %CHAR of a number with the control specification's DECEDIT: the
+/// decimal point character, and a zero before it when the value has no
+/// integer digits ('0.' or '0,') (ILE RPG Reference, DECEDIT, %CHAR).
+pub fn char_of_num_edit(d: &Dec, point: char, zero: bool) -> String {
     let s = d.abs().to_string();
-    let s = if d.scale() > 0 {
-        s.trim_start_matches('0').to_string()
+    let s = if zero && s.starts_with("0.") && d.scale() > 0 {
+        s.replacen('.', &point.to_string(), 1)
     } else {
-        s
+        let t = if d.scale() > 0 {
+            s.trim_start_matches('0').to_string()
+        } else {
+            s
+        };
+        t.replacen('.', &point.to_string(), 1)
     };
     let s = if s.is_empty() { "0".to_string() } else { s };
     if d.is_negative() {
@@ -462,6 +485,7 @@ pub fn char_of_num(d: &Dec) -> String {
 
 impl<'a> Machine<'a> {
     pub fn new(prog: &'a Program, io: Io<'a>) -> Machine<'a> {
+        let owner = super::mem::new_owner();
         Machine {
             prog,
             bufs: {
@@ -469,7 +493,8 @@ impl<'a> Machine<'a> {
                 m.scratch(Self::largest_based(prog));
                 m
             },
-            owner: super::mem::new_owner(),
+            owner,
+            frame_owner: owner,
             ptr_fault: Default::default(),
             temp_strings: Vec::new(),
             errno_block: None,
@@ -594,7 +619,9 @@ impl<'a> Machine<'a> {
                 return Some(match s.clone() {
                     Sym::Var(mut v) if v.local => {
                         (v.buf, v.off) = match f.proc.based.get(&v.buf) {
-                            Some(p) => self.based_place(p, v.off, var_span(&v)),
+                            // Based storage need hold only what is used: one
+                            // element here; each element is checked as used.
+                            Some(p) => self.based_place(p, v.off, v.dtype.size()),
                             None => place(v.buf, v.off),
                         };
                         v.local = false;
@@ -602,7 +629,7 @@ impl<'a> Machine<'a> {
                     }
                     Sym::Ds(mut d) if d.local => {
                         (d.buf, d.off) = match f.proc.based.get(&d.buf) {
-                            Some(p) => self.based_place(p, d.off, d.size * d.dim.max(1) as usize),
+                            Some(p) => self.based_place(p, d.off, d.size),
                             None => place(d.buf, d.off),
                         };
                         d.local = false;
@@ -616,13 +643,12 @@ impl<'a> Machine<'a> {
         match self.prog.syms.get(name) {
             Some(Sym::Var(v)) if self.prog.based.contains_key(&v.buf) => {
                 let mut v = v.clone();
-                (v.buf, v.off) = self.based_place(&self.prog.based[&v.buf], v.off, var_span(&v));
+                (v.buf, v.off) = self.based_place(&self.prog.based[&v.buf], v.off, v.dtype.size());
                 return Some(Sym::Var(v));
             }
             Some(Sym::Ds(d)) if self.prog.based.contains_key(&d.buf) => {
                 let mut d = d.clone();
-                let size = d.size * d.dim.max(1) as usize;
-                (d.buf, d.off) = self.based_place(&self.prog.based[&d.buf], d.off, size);
+                (d.buf, d.off) = self.based_place(&self.prog.based[&d.buf], d.off, d.size);
                 return Some(Sym::Ds(d));
             }
             _ => {}
@@ -712,7 +738,9 @@ impl<'a> Machine<'a> {
                         d.dim
                     );
                 }
-                Ok(d.off + (i as usize - 1) * d.size)
+                let at = d.off + (i as usize - 1) * d.size;
+                self.reach(d.buf, at, d.size)?;
+                Ok(at)
             }
         }
     }
@@ -753,9 +781,28 @@ impl<'a> Machine<'a> {
                         v.dim
                     );
                 }
-                Ok(v.off + (i as usize - 1) * v.stride)
+                let at = v.off + (i as usize - 1) * v.stride;
+                self.reach(v.buf, at, v.dtype.size())?;
+                Ok(at)
             }
         }
+    }
+
+    /// An array element of based storage must be in the storage its
+    /// pointer addresses (MCH0601 otherwise).
+    fn reach(&self, buf: usize, at: usize, size: usize) -> Result<()> {
+        if buf == super::mem::BAD_BUF {
+            return Ok(());
+        }
+        if let Some(b) = self.bufs.get(buf) {
+            if at + size > b.len() {
+                bail!(
+                    "MCH0601: {size} bytes at offset {at} are outside the {} bytes of storage the pointer addresses.",
+                    b.len()
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Storage reached through a pointer that addresses nothing: the
@@ -773,7 +820,16 @@ impl<'a> Machine<'a> {
     fn load_var(&self, v: &VarInfo, index: Option<i128>) -> Result<Value> {
         self.check_buf(v.buf)?;
         let off = self.elem_off(v, index)?;
-        data::load(&v.dtype, &self.bufs[v.buf][off..off + v.dtype.size()])
+        let b = &self.bufs[v.buf];
+        let n = v.dtype.size();
+        if off + n > b.len() {
+            // A parameter longer than the argument passed for it
+            // (OPTIONS(*VARSIZE)): what is there, then blanks.
+            let mut tmp = b.get(off..).unwrap_or(&[]).to_vec();
+            tmp.resize(n, 0x40);
+            return data::load(&v.dtype, &tmp);
+        }
+        data::load(&v.dtype, &b[off..off + n])
     }
 
     fn store_var(
@@ -791,7 +847,18 @@ impl<'a> Machine<'a> {
             _ => vec![self.elem_off(v, index)?],
         };
         for off in offs {
-            let out = &mut self.bufs[v.buf][off..off + v.dtype.size()];
+            let n = v.dtype.size();
+            let have = self.bufs[v.buf].len();
+            if off + n > have {
+                // A parameter longer than its argument (OPTIONS(*VARSIZE)):
+                // only the argument's storage is changed.
+                let mut tmp = vec![0x40u8; n];
+                data::store(&v.dtype, val, &mut tmp, fit, right)?;
+                let k = have.saturating_sub(off);
+                self.bufs[v.buf][off.min(have)..have].copy_from_slice(&tmp[..k]);
+                continue;
+            }
+            let out = &mut self.bufs[v.buf][off..off + n];
             data::store(&v.dtype, val, out, fit, right)?;
         }
         Ok(())
@@ -919,9 +986,31 @@ impl<'a> Machine<'a> {
                 if let Some(r) = self.ptr_arith(op, &x, &y) {
                     return r;
                 }
+                // A date plus a time is a timestamp (ILE RPG Reference,
+                // date and time arithmetic in expressions).
+                if *op == BinOp::Add {
+                    let (lt, rt) = (self.temporal_type(l), self.temporal_type(r));
+                    let pair = match (lt, rt) {
+                        (Some(DType::Date(_)), Some(DType::Time(_))) => Some((&x, &y)),
+                        (Some(DType::Time(_)), Some(DType::Date(_))) => Some((&y, &x)),
+                        _ => None,
+                    };
+                    if let Some((d, t)) = pair {
+                        let d = a(&d.chars()?);
+                        let t = a(&t.chars()?);
+                        let ts = format!("{}-{}.000000", d.trim(), t.trim().replace(':', "."));
+                        super::dates::parse_ts(&ts)?;
+                        return Ok(Value::str(&ts));
+                    }
+                }
                 match op {
                     BinOp::Add => match (&x, &y) {
-                        (Value::Char(_), _) | (_, Value::Char(_)) => {
+                        // An indicator is character data of length 1 (ILE
+                        // RPG Reference, "Indicator Data Type"): + of two
+                        // concatenates them.
+                        (Value::Char(_), _)
+                        | (_, Value::Char(_))
+                        | (Value::Ind(_), Value::Ind(_)) => {
                             let mut s = x.chars()?;
                             s.extend(y.chars()?);
                             Value::Char(s)
@@ -1107,8 +1196,8 @@ impl<'a> Machine<'a> {
                     Some(DType::Float(4)) => 4,
                     _ => 8,
                 };
-                let x = arg(self, 0)?.num()?;
-                Value::str(&data::float_text(x.to_string().parse().unwrap_or(0.0), n))
+                let x = float_value(&arg(self, 0)?)?;
+                Value::str(&data::float_text(x, n))
             }
             "CHAR"
                 if matches!(
@@ -1119,22 +1208,29 @@ impl<'a> Machine<'a> {
                 let Some(DType::Float(n)) = args.first().and_then(|a| self.type_of(a)) else {
                     unreachable!()
                 };
-                let x = arg(self, 0)?.num()?;
-                Value::str(&data::float_text(x.to_string().parse().unwrap_or(0.0), n))
+                let x = float_value(&arg(self, 0)?)?;
+                Value::str(&data::float_text(x, n))
             }
             // %UCS2 and %GRAPH: UCS-2 and graphic values are converted to
             // and from character data when they are used (see data.rs).
             "UCS2" | "GRAPH" => Value::Char(arg(self, 0)?.chars()?),
             // %FLOAT: the value as a float (8 bytes).
             "FLOAT" => {
-                let x: f64 = arg(self, 0)?.num()?.to_string().parse().unwrap_or(0.0);
-                Value::Num(data::float_dec(x)?)
+                let x = float_value(&arg(self, 0)?)?;
+                match data::float_dec(x) {
+                    Ok(d) => Value::Num(d),
+                    Err(_) => Value::Float(x),
+                }
             }
             "CHAR" => {
                 let v = arg(self, 0)?;
                 match v {
-                    Value::Num(d) => Value::str(&char_of_num(&d)),
+                    Value::Num(d) => {
+                        let (point, zero) = self.prog.decedit();
+                        Value::str(&char_of_num_edit(&d, point, zero))
+                    }
                     Value::Ind(x) => Value::Char(vec![if x { 0xF1 } else { 0xF0 }]),
+                    Value::Float(x) => Value::str(&data::float_text(x, 8)),
                     other => Value::Char(other.chars()?),
                 }
             }
@@ -1169,7 +1265,13 @@ impl<'a> Machine<'a> {
                 }
                 let from = start as usize - 1;
                 let len = match args.get(2) {
-                    Some(x) => self.eval(x)?.num()?.to_i128()? as usize,
+                    Some(x) => {
+                        let n = self.eval(x)?.num()?.to_i128()?;
+                        if n < 0 {
+                            bail!("RNQ0100: %SUBST length {n} is negative.");
+                        }
+                        n as usize
+                    }
                     None => s.len() - from,
                 };
                 if from + len > s.len() {
@@ -1184,6 +1286,16 @@ impl<'a> Machine<'a> {
                 let a0 = args
                     .first()
                     .ok_or_else(|| anyhow!("%LEN needs an argument"))?;
+                // %LEN(varying : *MAX): the most characters it can hold
+                // (ILE RPG Reference, %LEN).
+                if self.special_arg(args, 1).as_deref() == Some("*MAX") {
+                    return Ok(match self.type_of(a0) {
+                        Some(DType::Varchar(n) | DType::VarUcs2(n)) => {
+                            Value::Num(Dec::from_i64(i64::from(n)))
+                        }
+                        _ => bail!("%LEN(...: *MAX) needs a varying-length value"),
+                    });
+                }
                 match (self.type_of(a0), self.eval(a0)?) {
                     (Some(DType::Varchar(_)), Value::Char(c)) => {
                         Value::Num(Dec::from_i64(c.len() as i64))
@@ -1210,7 +1322,22 @@ impl<'a> Machine<'a> {
                                     1
                                 }
                         }
-                        Some(Sym::Ds(d)) => d.size,
+                        Some(Sym::Ds(d)) => {
+                            d.size
+                                * if args.len() > 1 {
+                                    d.dim.max(1) as usize
+                                } else {
+                                    1
+                                }
+                        }
+                        // A named constant (ILE RPG Reference, %SIZE): a
+                        // character constant's length; a numeric one's
+                        // size as packed decimal of its digits.
+                        Some(Sym::Const(Value::Num(d))) => {
+                            let digits = (d.int_digits() + d.scale() as u32).max(1);
+                            digits as usize / 2 + 1
+                        }
+                        Some(Sym::Const(c)) => c.chars()?.len(),
                         _ => bail!("%SIZE of {a0:?}"),
                     },
                     _ => self.eval(a0)?.chars()?.len(),
@@ -1381,6 +1508,13 @@ impl<'a> Machine<'a> {
                 let Some(target) = args.first() else {
                     bail!("%ADDR needs a variable");
                 };
+                // An omitted parameter (*OMIT) has no storage: its
+                // address is *NULL (ILE RPG Reference, OPTIONS(*OMIT)).
+                if let Expr::Name { parts, args: None } = target {
+                    if parts.len() == 1 && self.omitted(&parts[0].to_ascii_uppercase()) {
+                        return Ok(Value::Fig(Fig::Null));
+                    }
+                }
                 let l = self.loc_of(target)?;
                 let data = args.get(1).is_some_and(
                     |a| matches!(a, Expr::Name { parts, .. } if parts.len() == 1 && parts[0] == "*DATA"),
@@ -1413,19 +1547,27 @@ impl<'a> Machine<'a> {
                 // the program is bound to for it.
                 // A procedure the module does not export: its module too
                 // ("SRVPGM/MODULE"), a pointer reaches it all the same.
+                // A procedure of a module bound into a program (not its
+                // entry module): "*MODULE" and the module, so that another
+                // module of the program reaches it through the pointer.
+                let bound_module = self.io.program.strip_prefix("*BOUND/").map(str::to_string);
                 let home = if let Some(pi) = self.prog.procs.get(&n) {
                     let exported = pi.export;
-                    self.current_srvpgm().map(|(l, sp)| {
-                        if exported {
+                    match self.current_srvpgm() {
+                        Some((l, sp)) => Some(if exported {
                             (l, sp)
                         } else {
                             (l, format!("{sp}/{}", self.prog.name))
-                        }
-                    })
+                        }),
+                        None => bound_module.map(|m| ("*MODULE".to_string(), m)),
+                    }
                 } else {
                     match self.io.binding.as_ref().and_then(|b| b.imports.get(&n)) {
                         Some(crate::ile::Target::SrvPgm { library, name }) => {
                             Some((library.clone(), name.clone()))
+                        }
+                        Some(crate::ile::Target::Module(m)) => {
+                            Some(("*MODULE".to_string(), m.clone()))
                         }
                         _ => None,
                     }
@@ -1458,6 +1600,8 @@ impl<'a> Machine<'a> {
                 Some(f) => f.passed,
                 None => self.parms_passed,
             } as i64)),
+            // The string of the XML-SAX event being handled.
+            "_SAXSTRING" => xmlsax::current_string(),
             other => match self.bif_more(other, args)? {
                 Some(v) => v,
                 None => bail!("%{other} is not supported yet"),
@@ -1468,6 +1612,56 @@ impl<'a> Machine<'a> {
     // ---- assignment -----------------------------------------------------
 
     fn assign(&mut self, target: &Expr, val: &Value, fit: Fit, right: bool) -> Result<()> {
+        self.assign_value(target, val, fit, right)?;
+        if let (Expr::Name { parts, args: None }, Value::Ptr(p)) = (target, val) {
+            if matches!(p.kind, super::mem::KIND_STORAGE | super::mem::KIND_HEAP) {
+                self.room_for_based(&parts.join("."), p);
+            }
+        }
+        Ok(())
+    }
+
+    /// A basing pointer set: the storage it addresses made long enough
+    /// for the longest item based on it. On IBM i a based item may run
+    /// past the variable whose address was taken into the storage after
+    /// it (iRPGUnit's ASSERT bases a CHAR(32766) at an offset in a
+    /// CHAR(32766) list and uses its first bytes); here the variable's
+    /// (or heap block's) storage grows (zeros), up to 16 MB.
+    fn room_for_based(&mut self, name: &str, p: &super::mem::Ptr) {
+        let mut need = 0usize;
+        if let Some(f) = self.frames.last() {
+            for (b, ptr) in &f.proc.based {
+                if ptr.eq_ignore_ascii_case(name) {
+                    need = need.max(f.proc.frame.get(*b).map_or(0, |x| x.len()));
+                }
+            }
+        }
+        for (b, ptr) in &self.prog.based {
+            if ptr.eq_ignore_ascii_case(name) {
+                need = need.max(self.prog.globals.get(*b).map_or(0, |x| x.len()));
+            }
+        }
+        if need == 0 {
+            return;
+        }
+        let Ok((buf, off)) = self.addr(&Value::Ptr(*p), 0) else {
+            return;
+        };
+        let want = off + need;
+        // Heap storage too: a based structure longer than the block
+        // (iRPGUnit's list of test events: a 5244-byte abstract event
+        // over a smaller specific one) reads the heap after it on IBM i.
+        if want > 16 * 1024 * 1024 {
+            return;
+        }
+        if let Some(b) = self.bufs.get_mut(buf) {
+            if b.len() < want {
+                b.resize(want, 0);
+            }
+        }
+    }
+
+    fn assign_value(&mut self, target: &Expr, val: &Value, fit: Fit, right: bool) -> Result<()> {
         // A data structure array given all its elements at once (the
         // value of a procedure returning LIKEDS(ds) DIM(n)).
         if let (Some(d), Value::Char(b)) = (self.whole_ds_array(target), val) {
@@ -1496,6 +1690,23 @@ impl<'a> Machine<'a> {
                     let on = s.get(n - 1) == Some(&0xF1);
                     self.set_ind(&format!("{n:02}"), on);
                 }
+            }
+            // %LEN(varying) = n: its current length (ILE RPG Reference,
+            // %LEN used for its result: the characters past the old
+            // length are what the storage has).
+            Expr::Bif(b, args) if b == "LEN" && args.len() == 1 => {
+                let l = self.loc_of(&args[0])?;
+                let max = match l.dtype {
+                    DType::Varchar(n) | DType::VarUcs2(n) => i128::from(n),
+                    _ => {
+                        bail!("%LEN as the target of an assignment needs a varying-length variable")
+                    }
+                };
+                let n = val.num()?.to_i128()?;
+                if !(0..=max).contains(&n) {
+                    bail!("RNQ0100: The length {n} is out of range (0 to {max}) for the varying-length variable.");
+                }
+                self.bufs[l.buf][l.off..l.off + 2].copy_from_slice(&(n as u16).to_be_bytes());
             }
             Expr::Bif(b, args) if b == "ELEM" => {
                 // %ELEM(array) = n: the elements in use of a varying-
@@ -2392,6 +2603,21 @@ impl<'a> Machine<'a> {
                 false,
             )?;
         }
+        let prog = self.prog;
+        self.ptr_inz(&prog.ptr_inz)
+    }
+
+    /// Pointers with INZ(%ADDR(x)): their addresses.
+    fn ptr_inz(&mut self, list: &[(String, Expr)]) -> Result<()> {
+        for (n, e) in list {
+            let v = self.eval(e)?;
+            self.assign(
+                &Expr::name(n),
+                &v,
+                Fit::Truncate { half_adjust: false },
+                false,
+            )?;
+        }
         Ok(())
     }
 
@@ -2920,9 +3146,11 @@ impl<'a> Machine<'a> {
                     o == Ordering::Equal,
                 );
             }
+            Stmt::Reset(Expr::Name { parts, args: None })
+                if self.reset_to_initial(&parts.join("."))? => {}
             Stmt::Clear(t) | Stmt::Reset(t) => {
-                // CLEAR: blanks, zeros, '0' by type. (RESET to the INZ
-                // values: same as CLEAR here for now.)
+                // CLEAR: blanks, zeros, '0' by type. (RESET of what has no
+                // initial image here, e.g. based storage: as CLEAR.)
                 match t {
                     Expr::Name { parts, args: None } => match self.sym(&parts.join(".")) {
                         Some(Sym::Var(v)) => {
@@ -2932,22 +3160,7 @@ impl<'a> Machine<'a> {
                                     .copy_from_slice(&v.dtype.initial());
                             }
                         }
-                        Some(Sym::Ds(d)) => {
-                            let prefix = if d.qualified {
-                                format!("{}.", parts.join("."))
-                            } else {
-                                String::new()
-                            };
-                            for sf in &d.subfields {
-                                if let Some(Sym::Var(v)) = self.sym(&format!("{prefix}{sf}")) {
-                                    for k in 0..v.dim.max(1) as usize {
-                                        let at = v.off + k * v.stride;
-                                        self.bufs[v.buf][at..at + v.dtype.size()]
-                                            .copy_from_slice(&v.dtype.initial());
-                                    }
-                                }
-                            }
-                        }
+                        Some(Sym::Ds(d)) => self.clear_ds(&parts.join("."), &d),
                         _ => bail!("CLEAR of {} is not supported", parts.join(".")),
                     },
                     Expr::Ind(n) => self.set_ind(n, false),
@@ -3090,7 +3303,7 @@ impl<'a> Machine<'a> {
         let kind = |t: Option<DType>| match t {
             Some(DType::Date(f)) => Some(K::D(f)),
             Some(DType::Time(f)) => Some(K::T(f)),
-            Some(DType::Timestamp) => Some(K::Z),
+            Some(DType::Timestamp(_)) => Some(K::Z),
             _ => None,
         };
         let st = self.type_of(from);
@@ -3437,6 +3650,20 @@ impl<'a> Machine<'a> {
                     self.data_into(&target, &arg("DATA").unwrap_or_default(), &arg("PARSER"))?;
                 }
             }
+            "XML-SAX" => {
+                let handler = need(f1, "%HANDLER")?;
+                let Some(Expr::Bif(_, parts)) = f2 else {
+                    bail!("XML-SAX: %XML is needed");
+                };
+                let xml = parts
+                    .iter()
+                    .find_map(|p| match p {
+                        Expr::Bif(b, a) if b == "XML" => Some(a.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                self.xml_sax(&handler, &xml)?;
+            }
             other => bail!("operation {other} is not supported yet"),
         }
         let _ = ind;
@@ -3742,6 +3969,16 @@ impl<'a> Machine<'a> {
         };
         let mut parms = Vec::new();
         for (t, a) in types.iter().zip(args) {
+            // Bytes of exactly the parameter's size (a command's
+            // parameters for its processing program: a VARYING value with
+            // its length first) are the parameter's storage as they are.
+            if !t.is_numeric() {
+                let raw = data::e(a);
+                if raw.len() == t.size() && matches!(t, DType::Varchar(_) | DType::VarUcs2(_)) {
+                    parms.push(raw);
+                    continue;
+                }
+            }
             let v = if t.is_numeric() {
                 Value::Num(Dec::parse(a).map_err(|_| anyhow!("parameter '{a}' is not a number"))?)
             } else {
@@ -3775,10 +4012,11 @@ impl<'a> Machine<'a> {
         let pgm = self.stack_pgm();
         let main = self.prog.main.clone().unwrap_or_else(|| pgm.clone());
         let lib = self.stack_lib();
+        let module = self.stack_module();
         let id = crate::pgmmsg::stack_push(
             &self.io.job_key,
             (&lib, &pgm),
-            &self.prog.name,
+            &module,
             &main,
             &self.io.actgrp,
         );
@@ -3815,7 +4053,16 @@ impl<'a> Machine<'a> {
 
     /// A procedure's name as the module exports it: EXTPROC of its
     /// prototype as written ('assert'), else the name in capitals.
-    fn external_proc_name(&self, name: &str) -> String {
+    pub(super) fn external_proc_name(&self, name: &str) -> String {
+        if let Some(w) = self
+            .prog
+            .procs
+            .get(&name.to_ascii_uppercase())
+            .and_then(|p| p.written.clone())
+            .filter(|e| e.eq_ignore_ascii_case(name))
+        {
+            return w;
+        }
         self.prog
             .protos
             .get(&name.to_ascii_uppercase())
@@ -3826,6 +4073,24 @@ impl<'a> Machine<'a> {
 
     /// The program object (or service program) the running code is in,
     /// as the call stack names it.
+    /// The module name a call stack entry of this module shows: a
+    /// program's entry module by its own name (CRTPGM ENTMOD), which
+    /// need not be the program's.
+    fn stack_module(&self) -> String {
+        if !self.io.program.starts_with("*BOUND/") && self.io.unit.is_none() {
+            if let Some(m) = self
+                .io
+                .binding
+                .as_ref()
+                .map(|b| b.entry_module.clone())
+                .filter(|m| !m.is_empty())
+            {
+                return m;
+            }
+        }
+        self.prog.name.clone()
+    }
+
     pub(super) fn stack_pgm(&self) -> String {
         if let Some((_, sp)) = self.current_srvpgm() {
             return sp;
@@ -3838,7 +4103,7 @@ impl<'a> Machine<'a> {
         p
     }
 
-    /// A received message in format RCVM0100 or RCVM0300 (Receive
+    /// A received message in format RCVM0100, RCVM0200 or RCVM0300 (Receive
     /// Program Message API): bytes returned and available, severity,
     /// message ID, type, key, then (RCVM0100) the replacement data, or
     /// (RCVM0300) the message file, the lengths of the replacement data,
@@ -3860,7 +4125,7 @@ impl<'a> Machine<'a> {
         b.extend_from_slice(&m.sev.to_be_bytes());
         b.extend(field(&m.msgid, 7));
         b.extend(field(crate::pgmmsg::rtntype(&m.ty), 2));
-        b.extend(data::e(&crate::pgmmsg::key_text(m.key)));
+        b.extend(crate::pgmmsg::key_bytes(m.key));
         let text = data::e(&m.text);
         let help = data::e(&m.seclvl);
         if format == "RCVM0100" {
@@ -3870,6 +4135,52 @@ impl<'a> Machine<'a> {
             b.extend_from_slice(&i4(m.data.len()));
             b.extend_from_slice(&i4(m.data.len()));
             b.extend_from_slice(&m.data);
+        } else if format == "RCVM0200" {
+            // RCVM0200: the message file, the sending job, program and
+            // time, the receiving program, the CCSIDs, then the
+            // replacement data, the text and the help.
+            let job = self.io.job.clone().unwrap_or(crate::jobs::JobId {
+                number: 0,
+                user: self.io.user.clone(),
+                name: String::new(),
+            });
+            let (date, time) = &m.sent;
+            let rp = receiver
+                .map(|r| r.pgm.clone())
+                .unwrap_or_else(|| m.receiver.pgm.clone());
+            b.extend(field(&m.msgf, 10));
+            b.extend(field(&m.msgflib, 10));
+            b.extend(field(&m.msgflib, 10));
+            b.extend(field(&job.name, 10));
+            b.extend(field(&job.user, 10));
+            b.extend(field(&format!("{:06}", job.number), 6));
+            b.extend(field(&m.sender.pgm, 12));
+            b.extend(field("", 4));
+            b.extend(field(date, 7));
+            b.extend(field(time, 6));
+            b.extend(field(&rp, 10));
+            b.extend(field("", 4));
+            b.extend(field("1", 1));
+            b.extend(field("1", 1));
+            b.extend(field("", 1));
+            b.extend_from_slice(&i4(0));
+            b.extend_from_slice(&i4(0));
+            b.extend(field("*NO", 9));
+            b.extend_from_slice(&i4(37));
+            b.extend_from_slice(&i4(37));
+            for v in [
+                m.data.len(),
+                m.data.len(),
+                text.len(),
+                text.len(),
+                help.len(),
+                help.len(),
+            ] {
+                b.extend_from_slice(&i4(v));
+            }
+            b.extend_from_slice(&m.data);
+            b.extend_from_slice(&text);
+            b.extend_from_slice(&help);
         } else {
             b.extend(field(&m.msgf, 10));
             b.extend(field(&m.msgflib, 10));
@@ -3906,9 +4217,16 @@ impl<'a> Machine<'a> {
                 snd.extend_from_slice(&i4(0));
                 snd.extend(field("", 30));
             }
+            // The entry's, or (the entry has ended) as noted when sent.
             let (rp, rm, rpr) = receiver
                 .map(|r| (r.pgm.clone(), r.module.clone(), r.proc.clone()))
-                .unwrap_or_default();
+                .unwrap_or_else(|| {
+                    (
+                        m.receiver.pgm.clone(),
+                        m.receiver.module.clone(),
+                        m.receiver.proc.clone(),
+                    )
+                });
             snd.extend(field(&rp, 10));
             snd.extend(field(&rm, 10));
             snd.extend(field(&rpr, 256));
@@ -3945,12 +4263,14 @@ impl<'a> Machine<'a> {
         match s.last() {
             Some(e) => crate::pgmmsg::Sender {
                 pgm: e.pgm.clone(),
+                lib: crate::qtemp::logical(&e.lib),
                 module: e.module.clone(),
                 proc: e.proc.clone(),
                 line: self.line,
             },
             None => crate::pgmmsg::Sender {
                 pgm: self.stack_pgm(),
+                lib: crate::qtemp::logical(&self.stack_lib()),
                 module: self.prog.name.clone(),
                 proc: self.prog.name.clone(),
                 line: self.line,
@@ -4052,7 +4372,9 @@ impl<'a> Machine<'a> {
                     let l = self.loc_of(&p.target)?;
                     let whole = l.off == 0
                         && bytes.len() > l.size
-                        && self.bufs.get(l.buf).is_some_and(|b| b.len() == l.size);
+                        && self.bufs.get(l.buf).is_some_and(|b| {
+                            b.len() == l.size || b.len() == l.size + super::mem::SLACK
+                        });
                     if whole {
                         self.bufs[l.buf] = bytes.clone();
                     } else {
@@ -4173,6 +4495,155 @@ impl Machine<'_> {
                 let c: String = text(self, cmd).chars().take(n).collect();
                 self.run_cl(c.trim())?;
             }
+            // QCAPCMD (command, length, options control block, its
+            // length, CPOP0100, changed command, its length, length of
+            // the changed command available, error code) (Process
+            // Commands API): type of command processing 0 runs the
+            // command as QCMDEXC does; the other types check it and
+            // return it with a keyword for every value given
+            // (cl::checked_command; the exact text IBM i returns is to
+            // be checked against a real system, docs/fidelity-gaps.md).
+            "QCAPCMD" => {
+                let [cmd, len, opt, _, _, chg, chglen, chgavl, rest @ ..] = locs else {
+                    bail!("QCAPCMD needs nine parameters");
+                };
+                let n = num(self, len)?.to_i128()?.max(0) as usize;
+                let c: String = text(self, cmd).chars().take(n).collect();
+                let ty = if opt.size >= 4 {
+                    i32::from_be_bytes(self.bufs[opt.buf][opt.off..opt.off + 4].try_into().unwrap())
+                } else {
+                    0
+                };
+                let out = if ty == 0 {
+                    self.run_cl(c.trim()).map(|_| c.trim().to_string())
+                } else {
+                    crate::cl::checked_command(c.trim())
+                };
+                let out = match out {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if std::env::var("AS4TAINR_TRACE_ERRORS").is_ok_and(|v| v == "1") {
+                            eprintln!("as4tainr: QCAPCMD {}: {e:#}", c.trim());
+                        }
+                        return self.api_error(rest.first(), e).map(|_| true);
+                    }
+                };
+                let want = (num(self, chglen)?.to_i128()?.max(0) as usize).min(chg.size);
+                let mut b = data::e(&out);
+                let avail = b.len();
+                b.resize(want, 0x40);
+                self.bufs[chg.buf][chg.off..chg.off + want].copy_from_slice(&b[..want]);
+                if chgavl.size >= 4 {
+                    self.bufs[chgavl.buf][chgavl.off..chgavl.off + 4]
+                        .copy_from_slice(&(avail as i32).to_be_bytes());
+                }
+                self.api_ok(rest.first());
+            }
+            // QSPRILSP (receiver, its length, SPRL0100, error code)
+            // (Retrieve Identity of Last Spooled File Created API): the
+            // spooled file's name, job name, user and number, its number,
+            // the system, and its creation date and time (now: the
+            // spooled file was just opened). No spooled file yet: an
+            // error without a message ID (IBM i's is to be checked).
+            "QSPRILSP" => {
+                let [rcv, len, fmt, rest @ ..] = locs else {
+                    bail!("QSPRILSP needs 3 parameters and an error code");
+                };
+                let f = text(self, fmt).trim().to_ascii_uppercase();
+                let r = if f != "SPRL0100" {
+                    Err(anyhow!("CPF3C21: Format name {f} is not valid."))
+                } else {
+                    super::last_spooled_file(&self.io.job_key)
+                        .ok_or_else(|| anyhow!("No spooled file was created by this job."))
+                };
+                let (file, jname, juser, jnbr, number) = match r {
+                    Ok(x) => x,
+                    Err(e) => return self.api_error(rest.first(), e).map(|_| true),
+                };
+                let fld = |s: &str, n: usize| {
+                    let mut b = data::e(s);
+                    b.resize(n, 0x40);
+                    b.truncate(n);
+                    b
+                };
+                let ((y, mo, d), (h, mi, sec), _) = crate::rpg::dates::now();
+                let mut o = vec![0u8; 8];
+                o.extend(fld(&file, 10));
+                o.extend(fld(&jname, 10));
+                o.extend(fld(&juser, 10));
+                o.extend(fld(&jnbr, 6));
+                o.extend(number.to_be_bytes());
+                o.extend(fld(&crate::report::system_name(), 8));
+                o.extend(fld(
+                    &format!("{}{:02}{mo:02}{d:02}", u8::from(y >= 2000), y % 100),
+                    7,
+                ));
+                o.extend(fld("", 1));
+                o.extend(fld(&format!("{h:02}{mi:02}{sec:02}"), 6));
+                let room = (num(self, len)?.to_i128()?.max(0) as usize)
+                    .min(self.rcv_room(rcv))
+                    .min(o.len());
+                let avail = o.len() as i32;
+                if room >= 8 {
+                    o[0..4].copy_from_slice(&(room as i32).to_be_bytes());
+                    o[4..8].copy_from_slice(&avail.to_be_bytes());
+                }
+                self.bufs[rcv.buf][rcv.off..rcv.off + room].copy_from_slice(&o[..room]);
+                self.api_ok(rest.first());
+            }
+            // QLICHGLL (current library, product library 1 and 2, user
+            // libraries (CHAR(11) each), their number, error code)
+            // (Change Library List API): the job's current library
+            // (*SAME keeps it, *CRTDFT: none) and user portion, without a
+            // message; product libraries are not kept here.
+            "QLICHGLL" => {
+                let [cur, _p1, _p2, list, count, rest @ ..] = locs else {
+                    bail!("QLICHGLL needs 5 parameters and an error code");
+                };
+                let cur = text(self, cur).trim().to_ascii_uppercase();
+                let n = num(self, count)?.to_i128()?.max(0) as usize;
+                let raw = self.bufs[list.buf].get(list.off..).unwrap_or(&[]).to_vec();
+                let libs: Vec<String> = (0..n)
+                    .map(|i| {
+                        a(raw.get(i * 11..i * 11 + 11).unwrap_or(&[]))
+                            .trim()
+                            .to_ascii_uppercase()
+                    })
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                let client = self.io.client;
+                for l in &libs {
+                    let exists = self.block(crate::catalog::library_exists(
+                        client,
+                        &crate::qtemp::real(l),
+                    ))?;
+                    if !exists {
+                        return self
+                            .api_error(rest.first(), anyhow!("CPF2110: Library {l} not found."))
+                            .map(|_| true);
+                    }
+                }
+                if let Some(c) = self.io.cl.as_mut() {
+                    match cur.as_str() {
+                        "*SAME" | "" => {}
+                        "*CRTDFT" => c.curlib = None,
+                        l => c.curlib = Some(l.to_string()),
+                    }
+                    c.user_libl = libs;
+                    let mut full: Vec<String> = crate::commands::SYSTEM_LIBRARY_LIST
+                        .iter()
+                        .map(|l| l.to_string())
+                        .collect();
+                    full.extend(c.curlib.iter().cloned());
+                    for l in &c.user_libl {
+                        if !full.contains(l) {
+                            full.push(l.clone());
+                        }
+                    }
+                    self.io.libl = full.iter().map(|l| crate::qtemp::real(l)).collect();
+                }
+                self.api_ok(rest.first());
+            }
             // QUSPTRUS (qualified user space name, pointer [, error
             // code]): a pointer to the space's bytes, which this program
             // then changes in place (written back at calls and at its end).
@@ -4242,9 +4713,20 @@ impl Machine<'_> {
             // The data queue APIs (dtaq.rs): the parameters' storage is
             // copied out, and back after the call (by reference).
             n if crate::sysapi::is_api(n) => {
+                // A receiver over more storage than its variable (a based
+                // structure in heap storage of the length passed): that
+                // much, as far as the storage goes.
+                let mut sizes: Vec<usize> = locs.iter().map(|l| l.size).collect();
+                if crate::sysapi::receiver_first(n) && locs.len() > 1 {
+                    let want = num(self, &locs[1])?.to_i128()?.max(0) as usize;
+                    let l = &locs[0];
+                    let room = self.bufs[l.buf].len().saturating_sub(l.off);
+                    sizes[0] = l.size.max(want.min(room));
+                }
                 let mut args = crate::dtaq::RpgArgs(
                     locs.iter()
-                        .map(|l| (self.bufs[l.buf][l.off..l.off + l.size].to_vec(), l.dtype))
+                        .zip(&sizes)
+                        .map(|(l, &n)| (self.bufs[l.buf][l.off..l.off + n].to_vec(), l.dtype))
                         .collect(),
                 );
                 let caller = crate::dtaq::Caller {
@@ -4265,7 +4747,8 @@ impl Machine<'_> {
                     &mut args,
                 ))?;
                 for (l, (b, _)) in locs.iter().zip(args.0) {
-                    self.bufs[l.buf][l.off..l.off + l.size].copy_from_slice(&b);
+                    let n = b.len();
+                    self.bufs[l.buf][l.off..l.off + n].copy_from_slice(&b);
                 }
             }
             // QDCXLATE (length, data, table): translate bytes in place
@@ -4379,10 +4862,7 @@ impl Machine<'_> {
                         );
                     }
                     if let Some(k) = rest.first() {
-                        let kb: Vec<u8> = crate::pgmmsg::key_text(key)
-                            .bytes()
-                            .map(|c| crate::tn5250::ebcdic::FROM_UNICODE[c as usize])
-                            .collect();
+                        let kb = crate::pgmmsg::key_bytes(key);
                         let n = k.size.min(4);
                         self.bufs[k.buf][k.off..k.off + n].copy_from_slice(&kb[..n]);
                     }
@@ -4398,11 +4878,7 @@ impl Machine<'_> {
                 };
                 let key = crate::pgmmsg::named_send(&self.io.job_key, &queue, msg);
                 if let Some(k) = rest.first() {
-                    let kb = crate::pgmmsg::key_text(key).into_bytes();
-                    let kb: Vec<u8> = kb
-                        .iter()
-                        .map(|c| crate::tn5250::ebcdic::FROM_UNICODE[*c as usize])
-                        .collect();
+                    let kb = crate::pgmmsg::key_bytes(key);
                     let n = k.size.min(4);
                     self.bufs[k.buf][k.off..k.off + n].copy_from_slice(&kb[..n]);
                 }
@@ -4418,7 +4894,7 @@ impl Machine<'_> {
                     bail!("QMHRCVPM needs 9 parameters and an error code");
                 };
                 let format = text(self, fmt).trim().to_ascii_uppercase();
-                if !matches!(format.as_str(), "RCVM0100" | "RCVM0300") {
+                if !matches!(format.as_str(), "RCVM0100" | "RCVM0200" | "RCVM0300") {
                     return self
                         .api_error(
                             rest.first(),
@@ -4434,13 +4910,39 @@ impl Machine<'_> {
                 } else {
                     msgtype
                 };
-                let k = crate::pgmmsg::parse_key(&text(self, key));
+                let k = crate::pgmmsg::key_from_bytes(
+                    &self.bufs[key.buf][key.off..key.off + key.size.min(4)],
+                );
                 let action = text(self, action).trim().to_ascii_uppercase();
-                let m = target.and_then(|id| {
+                let mut m = target.and_then(|id| {
                     crate::pgmmsg::stack_receive(&self.io.job_key, id, &msgtype, k, &action)
                 });
+                let mut target = target;
+                // A key names one message of the job: one on another call
+                // stack entry's queue is received from there (iRPGUnit's
+                // getLatestEscMsg, run on IBM i, receives the escape
+                // messages of its callers' procedures this way; to be
+                // checked against a capture).
+                if let (None, Some(key)) = (&m, k) {
+                    if let Some((x, id)) =
+                        crate::pgmmsg::stack_receive_key(&self.io.job_key, &msgtype, key, &action)
+                    {
+                        m = Some(x);
+                        target = id;
+                    }
+                }
                 let receiver_entry =
                     target.and_then(|id| crate::pgmmsg::stack_entry(&self.io.job_key, id));
+                // A key no message on that queue has: CPF2410 (QMHRCVPM,
+                // error messages).
+                if m.is_none() && k.is_some() {
+                    return self
+                        .api_error(
+                            rest.first(),
+                            anyhow!("CPF2410: Message key not found in message queue *."),
+                        )
+                        .map(|_| true);
+                }
                 let bytes = match m {
                     None => {
                         let mut b = vec![0u8; 8];
@@ -4450,9 +4952,108 @@ impl Machine<'_> {
                     Some(m) => self.rcvm_format(&format, &m, receiver_entry.as_ref()),
                 };
                 let n = (num(self, len)?.to_i128()?.max(0) as usize)
-                    .min(rcv.size)
+                    .min(self.rcv_room(rcv))
                     .min(bytes.len());
                 self.bufs[rcv.buf][rcv.off..rcv.off + n].copy_from_slice(&bytes[..n]);
+                self.api_ok(rest.first());
+            }
+            // QGYOLMSG (receiver, its length, list information, number
+            // of records to return, sort ('0': none), message selection
+            // information, its size, user or queue information, message
+            // queues used, error code) (Open List of Messages API): a
+            // user's or a message queue's messages in format LSTM0100.
+            "QGYOLMSG" => {
+                let [rcv, len, info, count, _sort, sel, sel_len, uq, used, rest @ ..] = locs else {
+                    bail!("QGYOLMSG needs 9 parameters and an error code");
+                };
+                let room = self.bufs[sel.buf].len().saturating_sub(sel.off);
+                let n = (num(self, sel_len)?.to_i128()?.max(0) as usize).min(room);
+                let s = self.bufs[sel.buf][sel.off..sel.off + n].to_vec();
+                let q = a(self.bufs[uq.buf].get(uq.off..uq.off + 21).unwrap_or(&[]));
+                let (ind, qname, qlib) = (
+                    q.get(0..1).unwrap_or("0").to_string(),
+                    q.get(1..11).unwrap_or("").trim().to_ascii_uppercase(),
+                    q.get(11..21).unwrap_or("").trim().to_ascii_uppercase(),
+                );
+                let client = self.io.client;
+                let (key, shown) = if ind == "1" {
+                    let libs: Vec<String> = match qlib.as_str() {
+                        "*LIBL" | "" => self.io.libl.clone(),
+                        "*CURLIB" => self
+                            .io
+                            .cl
+                            .as_ref()
+                            .and_then(|c| c.curlib.clone())
+                            .into_iter()
+                            .collect(),
+                        l => vec![crate::qtemp::real(l)],
+                    };
+                    match self.block(crate::jobs::msgq_key(client, &libs, &qname))? {
+                        Some(k) => {
+                            let lib = k
+                                .split_once('/')
+                                .map(|x| crate::qtemp::logical(x.0))
+                                .unwrap_or_else(|| "QUSRSYS".into());
+                            (k, (qname.clone(), lib))
+                        }
+                        None => {
+                            return self
+                                .api_error(
+                                    rest.first(),
+                                    anyhow!("CPF2403: Message queue {qname} in {qlib} not found."),
+                                )
+                                .map(|_| true);
+                        }
+                    }
+                } else {
+                    let user = if qname == "*CURRENT" || qname.is_empty() {
+                        self.io.user.to_ascii_uppercase()
+                    } else {
+                        qname.clone()
+                    };
+                    (user.clone(), (user, "QUSRSYS".to_string()))
+                };
+                let (msgs, fields, max_len) =
+                    lstm_select(self.block(crate::jobs::queue_messages(client, &key))?, &s);
+                let room = (num(self, len)?.to_i128()?.max(0) as usize).min(self.rcv_room(rcv));
+                let want = num(self, count)?.to_i128()?;
+                let mut out: Vec<u8> = Vec::new();
+                let mut returned = 0usize;
+                for (us, m) in &msgs {
+                    let e = lstm0100(*us, m, &shown, &fields, max_len, out.len());
+                    if out.len() + e.len() > room || (want >= 0 && returned as i128 >= want) {
+                        break;
+                    }
+                    out.extend(e);
+                    returned += 1;
+                }
+                self.bufs[rcv.buf][rcv.off..rcv.off + out.len()].copy_from_slice(&out);
+                let kept: Vec<Vec<u8>> = msgs
+                    .iter()
+                    .map(|(us, m)| lstm0100(*us, m, &shown, &fields, max_len, 0))
+                    .collect();
+                let li = crate::spoolapi::list_info(
+                    msgs.len(),
+                    returned,
+                    crate::spoolapi::list_open(kept),
+                    0,
+                    usize::from(returned > 0),
+                    out.len(),
+                );
+                let k = info.size.min(80);
+                self.bufs[info.buf][info.off..info.off + k].copy_from_slice(&li[..k]);
+                // Message queues used: their number, then each qualified
+                // name.
+                let mut u = Vec::with_capacity(44);
+                u.extend(1i32.to_be_bytes());
+                for (v, n) in [(&shown.0, 10), (&shown.1, 10)] {
+                    let mut b = data::e(v);
+                    b.resize(n, 0x40);
+                    u.extend(b);
+                }
+                u.resize(44, 0x40);
+                let k = used.size.min(44);
+                self.bufs[used.buf][used.off..used.off + k].copy_from_slice(&u[..k]);
                 self.api_ok(rest.first());
             }
             // QGYOLJBL (receiver, its length, list information, number of
@@ -4463,16 +5064,19 @@ impl Machine<'_> {
                 let [rcv, len, info, count, sel, sel_len, rest @ ..] = locs else {
                     bail!("QGYOLJBL needs 6 parameters and an error code");
                 };
-                let n = (num(self, sel_len)?.to_i128()?.max(0) as usize).min(sel.size);
+                // The size given: the field identifiers and message queue
+                // name follow the fixed part in the caller's storage.
+                let room = self.bufs[sel.buf].len().saturating_sub(sel.off);
+                let n = (num(self, sel_len)?.to_i128()?.max(0) as usize).min(room);
                 let s = self.bufs[sel.buf][sel.off..sel.off + n].to_vec();
-                let (msgs, fields) = oljl_select(&self.io.job_key, &s)?;
-                let room = (num(self, len)?.to_i128()?.max(0) as usize).min(rcv.size);
+                let (msgs, fields, max_len) = oljl_select(&self.io.job_key, &s)?;
+                let room = (num(self, len)?.to_i128()?.max(0) as usize).min(self.rcv_room(rcv));
                 let want = num(self, count)?.to_i128()?;
                 // Whole entries that fit (and no more than asked for).
                 let mut out: Vec<u8> = Vec::new();
                 let mut returned: i32 = 0;
                 for m in &msgs {
-                    let e = oljl0100(m, &fields, out.len());
+                    let e = oljl0100(m, &fields, max_len, out.len());
                     if out.len() + e.len() > room || (want >= 0 && returned as i128 >= want) {
                         break;
                     }
@@ -4483,7 +5087,13 @@ impl Machine<'_> {
                 let mut li = [0u8; 80];
                 li[0..4].copy_from_slice(&(msgs.len() as i32).to_be_bytes());
                 li[4..8].copy_from_slice(&returned.to_be_bytes());
-                li[8..12].copy_from_slice(&crate::spoolapi::list_open(Vec::new()).to_be_bytes());
+                // QGYGTLE gets the entries from the list, each as the
+                // first in its receiver.
+                let kept: Vec<Vec<u8>> = msgs
+                    .iter()
+                    .map(|m| oljl0100(m, &fields, max_len, 0))
+                    .collect();
+                li[8..12].copy_from_slice(&crate::spoolapi::list_open(kept).to_be_bytes());
                 li[16] = data::e("C")[0];
                 let ((y, mo, d), (h, mi, sec), _) = crate::rpg::dates::now();
                 let created = format!(
@@ -4514,7 +5124,9 @@ impl Machine<'_> {
                 if rest.len() > 1 {
                     bail!("QMHRSNEM with a to call stack entry is not supported");
                 }
-                let k = crate::pgmmsg::parse_key(&text(self, key));
+                let k = crate::pgmmsg::key_from_bytes(
+                    &self.bufs[key.buf][key.off..key.off + key.size.min(4)],
+                );
                 let job = self.io.job_key.clone();
                 let here = crate::pgmmsg::stack_top_id(&job);
                 let m = crate::pgmmsg::stack(&job)
@@ -4584,7 +5196,7 @@ impl Machine<'_> {
                     b.extend(e);
                 }
                 let room = (num(self, len)?.to_i128()?.max(0) as usize)
-                    .min(rcv.size)
+                    .min(self.rcv_room(rcv))
                     .min(b.len());
                 self.bufs[rcv.buf][rcv.off..rcv.off + room].copy_from_slice(&b[..room]);
                 self.api_ok(rest.first());
@@ -4617,8 +5229,18 @@ impl Machine<'_> {
                         )
                         .map(|_| true);
                 }
-                let fb = self.bufs[filter.buf][filter.off..filter.off + filter.size].to_vec();
-                let f = crate::spoolapi::parse_filter(&fb);
+                let fb = self.bufs[filter.buf][filter.off..].to_vec();
+                // The filter's format (after the error code): OSPF0100 or
+                // OSPF0200.
+                let ffmt = rest
+                    .get(1)
+                    .map(|l| text(self, l).trim().to_ascii_uppercase())
+                    .unwrap_or_default();
+                let f = if ffmt == "OSPF0200" {
+                    crate::spoolapi::parse_filter_0200(&fb)
+                } else {
+                    crate::spoolapi::parse_filter(&fb)
+                };
                 let jt = text(self, qjob);
                 let job = if jt.trim().is_empty() {
                     None
@@ -4636,7 +5258,7 @@ impl Machine<'_> {
                 let files = self.block(crate::spoolapi::select(client, &f, &user, job))?;
                 let records: Vec<Vec<u8>> = files.iter().map(crate::spoolapi::ospl0300).collect();
                 let total = records.len();
-                let room = (num(self, len)?.to_i128()?.max(0) as usize).min(rcv.size);
+                let room = (num(self, len)?.to_i128()?.max(0) as usize).min(self.rcv_room(rcv));
                 let want = num(self, count)?.to_i128()?;
                 let mut out = Vec::new();
                 let mut returned = 0usize;
@@ -4677,7 +5299,7 @@ impl Machine<'_> {
                         .api_error(rest.first(), anyhow!("The request handle is not valid."))
                         .map(|_| true);
                 };
-                let room = (num(self, len)?.to_i128()?.max(0) as usize).min(rcv.size);
+                let room = (num(self, len)?.to_i128()?.max(0) as usize).min(self.rcv_room(rcv));
                 let mut out = Vec::new();
                 let mut returned = 0;
                 for r in &recs {
@@ -4818,7 +5440,7 @@ impl Machine<'_> {
                 }
                 crate::pgmmsg::stack_line(&self.io.job_key, self.line);
                 let bytes = cstk0100(&crate::pgmmsg::stack(&self.io.job_key));
-                let n = (num(self, len)?.to_i128()?.max(0) as usize).min(rcv.size);
+                let n = (num(self, len)?.to_i128()?.max(0) as usize).min(self.rcv_room(rcv));
                 let mut out = bytes.clone();
                 // Bytes returned: what fits (whole entries only).
                 let (fit, count) = cstk_fit(&bytes, n);
@@ -4840,9 +5462,17 @@ impl Machine<'_> {
                 };
                 let queue = self.stack_entry(&text(self, entry), num(self, counter)?.to_i128()?);
                 let which = text(self, which).trim().to_ascii_uppercase();
-                let k = crate::pgmmsg::parse_key(&text(self, key));
+                let k = crate::pgmmsg::key_from_bytes(
+                    &self.bufs[key.buf][key.off..key.off + key.size.min(4)],
+                );
                 if let Some(queue) = queue {
                     crate::pgmmsg::named_remove(&self.io.job_key, &queue, &which, k);
+                }
+                let up = num(self, counter)?.to_i128()?.max(0) as usize;
+                if let Some(id) =
+                    crate::pgmmsg::stack_target(&self.io.job_key, &text(self, entry), up)
+                {
+                    crate::pgmmsg::stack_remove(&self.io.job_key, id, &which, k);
                 }
                 self.api_ok(rest.first());
             }
@@ -4866,6 +5496,17 @@ impl Machine<'_> {
         let up = counter as usize;
         let c = &self.io.callers;
         (up <= c.len()).then(|| c[c.len() - up].clone())
+    }
+
+    /// How far an API may write into a receiver: the storage its
+    /// variable is in, from the variable on (IBM i writes as many bytes
+    /// as the length parameter says, into whatever storage follows; a
+    /// based variable shorter than the length given, as iRPGUnit's
+    /// RCVM0300 header over a 2048-byte heap block, gets them all).
+    fn rcv_room(&self, rcv: &Loc) -> usize {
+        self.bufs
+            .get(rcv.buf)
+            .map_or(rcv.size, |b| b.len().saturating_sub(rcv.off).max(rcv.size))
     }
 
     /// An API's error code structure (ERRC0100): bytes provided 0 means
@@ -4943,6 +5584,13 @@ impl Machine<'_> {
         crate::pgmmsg::stack_pop(&self.io.job_key, qcmdexc);
         if let Some(c) = self.io.cl.as_mut() {
             c.overrides = job.calls.overrides.clone();
+            // The library list is the job's: what the command changed
+            // (CHGLIBL, ADDLIBLE, CHGCURLIB) counts from now on.
+            if c.user_libl != job.libl || c.curlib != job.curlib {
+                c.user_libl = job.libl.clone();
+                c.curlib = job.curlib.clone();
+                self.io.libl = job.library_list();
+            }
         }
         let returned = job.calls.returned.take();
         let data = job.calls.message_data.take();
@@ -5269,14 +5917,40 @@ impl<'a> Machine<'a> {
                 // A whole array for an array parameter (CONST DIM(n)): its
                 // elements, by reference.
                 Arg::Ref(self.loc_of(a)?)
-            } else if p.konst && !p.by_value && self.same_type_variable(a, &p.dtype) {
+            } else if p.konst
+                && !p.by_value
+                && !p.trim
+                && !p.convert
+                && (self.same_type_variable(a, &p.dtype)
+                    || p.varsize && self.char_variable(a) && matches!(p.dtype, DType::Char(_)))
+            {
                 // CONST: a variable of the parameter's own type is passed
                 // by reference (ILE RPG Reference, CONST: a temporary is
                 // used only when the value is not of the right type), so
                 // the callee addresses the caller's storage.
                 Arg::Ref(self.loc_of(a)?)
             } else if p.by_value || p.konst {
-                let v = self.eval(a)?;
+                // OPTIONS(*CONVERT): %CHAR of a numeric, date, time or
+                // timestamp argument for a character parameter.
+                let converts = p.convert
+                    && matches!(p.dtype, DType::Char(_) | DType::Varchar(_))
+                    && !matches!(
+                        self.type_of(a),
+                        Some(DType::Char(_)) | Some(DType::Varchar(_)) | None
+                    );
+                let mut v = if converts {
+                    self.bif("CHAR", std::slice::from_ref(a))?
+                } else {
+                    self.eval(a)?
+                };
+                // OPTIONS(*TRIM): without leading and trailing blanks.
+                if p.trim {
+                    if let Value::Char(b) = &v {
+                        let start = b.iter().position(|&c| c != 0x40).unwrap_or(b.len());
+                        let end = b.iter().rposition(|&c| c != 0x40).map_or(start, |e| e + 1);
+                        v = Value::Char(b[start..end].to_vec());
+                    }
+                }
                 // OPTIONS(*STRING): a character value goes as a pointer to
                 // a null-terminated copy (ILE RPG Reference, OPTIONS).
                 if p.string && p.dtype == DType::Pointer && matches!(v, Value::Char(_)) {
@@ -5298,6 +5972,111 @@ impl<'a> Machine<'a> {
 
     /// Is the expression a variable (not an expression or a literal) of
     /// exactly this type?
+    /// RESET (ILE RPG Reference, RESET): a variable or data structure
+    /// back to its initial value (INZ), from the program's initial
+    /// storage (a procedure's for a local one). False when it has none
+    /// (based storage), for CLEAR's rule.
+    fn reset_to_initial(&mut self, name: &str) -> Result<bool> {
+        let local = self
+            .frames
+            .last()
+            .is_some_and(|f| f.proc.syms.contains_key(name));
+        let (tbuf, off, len) = match self.sym_static(name) {
+            Some(Sym::Var(v)) => (
+                v.buf,
+                v.off,
+                v.stride * (v.dim.max(1) as usize - 1) + v.dtype.size(),
+            ),
+            Some(Sym::Ds(d)) => (d.buf, d.off, d.size * d.dim.max(1) as usize),
+            _ => return Ok(false),
+        };
+        let based = if local {
+            self.frames
+                .last()
+                .is_some_and(|f| f.proc.based.contains_key(&tbuf))
+        } else {
+            self.prog.based.contains_key(&tbuf)
+        };
+        if based {
+            return Ok(false);
+        }
+        let image = if local {
+            self.frames
+                .last()
+                .and_then(|f| f.proc.frame.get(tbuf))
+                .cloned()
+        } else {
+            self.prog.globals.get(tbuf).cloned()
+        };
+        let Some(image) = image.filter(|b| off + len <= b.len()) else {
+            return Ok(false);
+        };
+        let (buf, at) = match self.sym(name) {
+            Some(Sym::Var(v)) => (v.buf, v.off),
+            Some(Sym::Ds(d)) => (d.buf, d.off),
+            _ => return Ok(false),
+        };
+        if at + len > self.bufs[buf].len() {
+            return Ok(false);
+        }
+        self.bufs[buf][at..at + len].copy_from_slice(&image[off..off + len]);
+        Ok(true)
+    }
+
+    /// CLEAR of a data structure: each subfield to its type's initial
+    /// value, the subfields of a LIKEDS subfield too (ILE RPG
+    /// Reference, CLEAR: every subfield of a data structure is cleared
+    /// according to its type).
+    fn clear_ds(&mut self, name: &str, d: &DsInfo) {
+        let prefix = if d.qualified {
+            format!("{name}.")
+        } else {
+            String::new()
+        };
+        for sf in &d.subfields {
+            let full = format!("{prefix}{sf}");
+            match self.sym(&full) {
+                Some(Sym::Var(v)) => {
+                    for k in 0..v.dim.max(1) as usize {
+                        let at = v.off + k * v.stride;
+                        self.bufs[v.buf][at..at + v.dtype.size()]
+                            .copy_from_slice(&v.dtype.initial());
+                    }
+                }
+                Some(Sym::Ds(inner)) if d.qualified && full != name => {
+                    self.clear_ds(&full, &inner);
+                    // A LIKEDS DIM subfield: the other elements as the
+                    // first (its subfields address the first element).
+                    let one = self.bufs[inner.buf][inner.off..inner.off + inner.size].to_vec();
+                    for k in 1..inner.dim.max(1) as usize {
+                        let at = inner.off + k * inner.size;
+                        if at + inner.size <= self.bufs[inner.buf].len() {
+                            self.bufs[inner.buf][at..at + inner.size].copy_from_slice(&one);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A fixed-length character variable (or data structure) the
+    /// argument names: CONST OPTIONS(*VARSIZE) passes its storage, of
+    /// whatever length (QGYOLJBL's selection information is longer than
+    /// the data structure passed for it).
+    fn char_variable(&mut self, a: &Expr) -> bool {
+        if !matches!(
+            a,
+            Expr::Name { args: None, .. } | Expr::Path { args: None, .. }
+        ) {
+            return false;
+        }
+        if matches!(a, Expr::Name { parts, .. } if parts.len() == 1 && parts[0].starts_with('*')) {
+            return false;
+        }
+        matches!(self.loc_of(a), Ok(l) if matches!(l.dtype, DType::Char(_)))
+    }
+
     fn same_type_variable(&mut self, a: &Expr, t: &DType) -> bool {
         if !matches!(
             a,
@@ -5402,7 +6181,20 @@ impl<'a> Machine<'a> {
                 };
                 // A procedure of a service program (not this module of
                 // it): called there, in its activation.
-                if let Some((library, sp)) = home {
+                // A procedure of another module bound into the program.
+                if let Some(("*MODULE", m)) = home.as_ref().map(|(l, m)| (l.as_str(), m.clone())) {
+                    let here =
+                        self.io.program == format!("*BOUND/{m}") && prog.procs.contains_key(&pname);
+                    if !here {
+                        let a = self.args_for(name, &pr.params, args)?;
+                        return self.call_bound_in(
+                            &pname,
+                            &crate::ile::Target::Module(m.clone()),
+                            Some(&m),
+                            a,
+                        );
+                    }
+                } else if let Some((library, sp)) = home {
                     let (sp, module) = match sp.split_once('/') {
                         Some((s, m)) => (s.to_string(), Some(m.to_string())),
                         None => (sp, None),
@@ -5441,10 +6233,17 @@ impl<'a> Machine<'a> {
                 let mut a = self.args_for(name, &pr.params, &args[..n])?;
                 a.truncate(n);
                 // CONST arguments passed by reference: their values (the C
-                // functions take values and pointers).
-                for (x, p) in a.iter_mut().zip(&pr.params) {
+                // functions take values and pointers); a buffer the function
+                // fills (getcwd's, stat's; declared CONST in some
+                // prototypes, as iRPGUnit's) goes as its address.
+                let sym_name = target.to_ascii_uppercase();
+                for (k, (x, p)) in a.iter_mut().zip(&pr.params).enumerate() {
                     if let (Arg::Ref(l), true) = (&*x, p.konst) {
                         let l = *l;
+                        if crt::C_OUT_BUFFERS.contains(&(sym_name.as_str(), k)) {
+                            *x = Arg::Val(self.ptr_to(l.buf, l.off));
+                            continue;
+                        }
                         *x = Arg::Val(data::load(
                             &l.dtype,
                             &self.bufs[l.buf][l.off..l.off + l.size],
@@ -5502,6 +6301,12 @@ impl<'a> Machine<'a> {
     ) -> Result<Option<Value>> {
         let client = self.io.client;
         let libl = self.io.libl.clone();
+        // A CL module's procedure (ILE CL: one procedure, named as the
+        // module): it runs in the job as a CL program does, its
+        // parameters by reference.
+        if let Some(m) = self.cl_module(sym, target, module)? {
+            return self.call_cl_module(&m, args);
+        }
         // Found and compiled at the first call in the activation group
         // (ILE Concepts: a service program is activated once, then its
         // procedures are called directly).
@@ -5534,6 +6339,125 @@ impl<'a> Machine<'a> {
             .filter(|pi| pi.export || module.is_some())
             .ok_or_else(|| anyhow!("CPD5D02: Module does not export {sym}."))?;
         self.run_bound(sym, target, args, unit, binding, prog, pi)
+    }
+
+    /// The CL module a bound call of `sym` goes to, if it is one.
+    fn cl_module(
+        &mut self,
+        sym: &str,
+        target: &crate::ile::Target,
+        module: Option<&str>,
+    ) -> Result<Option<crate::ile::ModuleCopy>> {
+        use crate::ile::Target;
+        let is_cl = |m: &crate::ile::ModuleCopy| {
+            m.attribute == "CLLE"
+                && m.name.eq_ignore_ascii_case(sym)
+                && module.is_none_or(|x| x.eq_ignore_ascii_case(&m.name))
+        };
+        Ok(match target {
+            Target::Module(name) => self.io.binding.as_ref().and_then(|b| {
+                b.modules
+                    .iter()
+                    .find(|x| &x.name == name && is_cl(x))
+                    .cloned()
+            }),
+            Target::SrvPgm { library, name } => {
+                let client = self.io.client;
+                let libl = self.io.libl.clone();
+                let (_, b) = self.block(crate::ile::find_srvpgm(client, &libl, library, name))?;
+                b.modules.iter().find(|x| is_cl(x)).cloned()
+            }
+        })
+    }
+
+    /// Call a CL module's procedure: the arguments as CALL passes them
+    /// (text), the values it leaves in its parameters come back.
+    fn call_cl_module(
+        &mut self,
+        m: &crate::ile::ModuleCopy,
+        args: Vec<Arg>,
+    ) -> Result<Option<Value>> {
+        let ctx = self.io.cl.clone().ok_or_else(|| {
+            anyhow!(
+                "CL procedure {} cannot run here: the program has no job",
+                m.name
+            )
+        })?;
+        let client = self.io.client;
+        let libl = self.io.libl.clone();
+        let pgm = self.block(crate::clpgm::compile_in(client, &libl, &m.name, &m.source))?;
+        let mut texts = Vec::new();
+        let mut locs = Vec::new();
+        for a in &args {
+            let v = match a {
+                Arg::Ref(l) => {
+                    locs.push(Some(*l));
+                    data::load(&l.dtype, &self.bufs[l.buf][l.off..l.off + l.size])?
+                }
+                Arg::Val(v) => {
+                    locs.push(None);
+                    v.clone()
+                }
+                Arg::Omit | Arg::File(_) => break,
+            };
+            texts.push(match v {
+                Value::Num(d) => d.to_string(),
+                other => a_text(&other.chars()?),
+            });
+        }
+        let mut job = crate::commands::Job {
+            client,
+            env: &ctx.env,
+            user: self.io.user.clone(),
+            curlib: ctx.curlib.clone(),
+            libl: ctx.user_libl.clone(),
+            display: self.io.display.clone(),
+            id: self.io.job.clone(),
+            calls: Default::default(),
+        };
+        job.calls.overrides = ctx.overrides.clone();
+        let out = self
+            .io
+            .rt
+            .block_on(crate::clpgm::run(&mut job, &pgm, &texts));
+        let back = job.calls.returned.take().unwrap_or_default();
+        if let Some(c) = self.io.cl.as_mut() {
+            if c.user_libl != job.libl || c.curlib != job.curlib {
+                c.user_libl = job.libl.clone();
+                c.curlib = job.curlib.clone();
+                self.io.libl = job.library_list();
+            }
+        }
+        if let crate::commands::Outcome::Messages(msgs) = out? {
+            self.messages
+                .extend(msgs.into_iter().filter(|x| x.starts_with("DSPLY ")));
+        }
+        for (l, v) in locs.iter().zip(back) {
+            let Some(l) = l else { continue };
+            let val = if l.dtype.is_numeric() {
+                match Dec::parse(v.trim()) {
+                    Ok(d) => Value::Num(d),
+                    Err(_) => continue,
+                }
+            } else {
+                let mut b = crate::rpg::data::e(&v);
+                let old = &self.bufs[l.buf][l.off..l.off + l.size];
+                if b.len() < old.len() {
+                    b.extend_from_slice(&old[b.len()..]);
+                }
+                Value::Char(b)
+            };
+            let mut buf = self.bufs[l.buf][l.off..l.off + l.size].to_vec();
+            data::store(
+                &l.dtype,
+                &val,
+                &mut buf,
+                Fit::Truncate { half_adjust: false },
+                false,
+            )?;
+            self.bufs[l.buf][l.off..l.off + l.size].copy_from_slice(&buf);
+        }
+        Ok(None)
     }
 
     /// The module a bound call runs: (unit, binding, compiled module).
@@ -5584,7 +6508,7 @@ impl<'a> Machine<'a> {
                 // The module that exports the procedure.
                 let mut found = None;
                 for m in &b.modules {
-                    if module.is_some_and(|x| x != m.name) {
+                    if module.is_some_and(|x| x != m.name) || m.attribute == "CLLE" {
                         continue;
                     }
                     let p = self.block(super::compile_with(
@@ -5653,6 +6577,28 @@ impl<'a> Machine<'a> {
         } else {
             self.current_srvpgm()
                 .map(|(l, sp)| format!("{l}/{sp}/{}", prog.name))
+        };
+        // The caller's module storage first goes where a call back into
+        // that module finds it (its activation, or the program's copy of a
+        // bound module's storage), so the callee (or a procedure it calls
+        // through a pointer) runs on the same storage; what such a call
+        // changed comes back after.
+        let reentry: Option<(Option<String>, String, Vec<Vec<u8>>)> = {
+            let n = self.prog.globals.len().min(self.bufs.own.len());
+            if let Some(u) = self.io.unit.clone() {
+                let snap = self.bufs.own[..n].to_vec();
+                crate::ile::keep_activation(&self.io.job_key, &self.io.actgrp, &u, snap.clone());
+                Some((Some(u), String::new(), snap))
+            } else if let Some(m) = self.io.program.strip_prefix("*BOUND/") {
+                let key = format!("MODULE {m}");
+                let snap = self.bufs.own[..n].to_vec();
+                if let Ok(mut g) = self.io.modules.lock() {
+                    g.insert(key.clone(), snap.clone());
+                }
+                Some((None, key, snap))
+            } else {
+                None
+            }
         };
         // The module's global storage: its activation, or its first use.
         let storage = if let Some(u) = &act_unit {
@@ -5731,19 +6677,18 @@ impl<'a> Machine<'a> {
         // to its activation first, so a call back into it (through a
         // procedure pointer) runs on the same storage; what that call
         // changed comes back after.
-        let reentry = self.io.unit.clone().map(|u| {
-            let n = self.prog.globals.len().min(self.bufs.own.len());
-            let snap = self.bufs.own[..n].to_vec();
-            crate::ile::keep_activation(&self.io.job_key, &self.io.actgrp, &u, snap.clone());
-            (u, snap)
-        });
+        // (The caller's module storage was put where a call back into it
+        // finds it before the callee's storage was fetched: `reentry`.)
         // The caller's storage and the heap are lent to the callee for the
         // call: parameters by reference and pointers address them there.
         let k = self.bufs.lent.len();
         m.bufs.lent = std::mem::take(&mut self.bufs.lent);
-        m.bufs
-            .lent
-            .push((self.owner, std::mem::take(&mut self.bufs.own)));
+        m.bufs.lent.push(super::mem::Lent {
+            owner: self.frame_owner,
+            act: self.owner,
+            globals: self.prog.globals.len(),
+            bufs: std::mem::take(&mut self.bufs.own),
+        });
         m.bufs.heap = std::mem::take(&mut self.bufs.heap);
         let lent = |b: usize| -> usize {
             if b < super::mem::HEAP_BASE {
@@ -5776,11 +6721,15 @@ impl<'a> Machine<'a> {
         }
         m.share_out();
         // The caller's storage comes back.
-        self.bufs.own = m.bufs.lent.pop().map(|l| l.1).unwrap_or_default();
+        self.bufs.own = m.bufs.lent.pop().map(|l| l.bufs).unwrap_or_default();
         self.bufs.lent = std::mem::take(&mut m.bufs.lent);
         self.bufs.heap = std::mem::take(&mut m.bufs.heap);
-        if let Some((u, snap)) = reentry {
-            if let Some(now) = crate::ile::activation(&self.io.job_key, &self.io.actgrp, &u) {
+        if let Some((u, key, snap)) = reentry {
+            let now = match u {
+                Some(u) => crate::ile::activation(&self.io.job_key, &self.io.actgrp, &u),
+                None => self.io.modules.lock().ok().and_then(|g| g.get(&key).cloned()),
+            };
+            if let Some(now) = now {
                 for (i, (old, new)) in snap.iter().zip(&now).enumerate() {
                     if old != new && old.len() == new.len() {
                         for (j, (o, n)) in old.iter().zip(new).enumerate() {
@@ -5834,16 +6783,42 @@ impl<'a> Machine<'a> {
         for (i, arg) in args.into_iter().enumerate() {
             let p = &pi.params[i];
             lengths.push(match &arg {
-                Arg::Ref(l) => Some(match l.dtype {
-                    DType::Varchar(_) => self
-                        .bufs
-                        .get(l.buf)
-                        .and_then(|b| b.get(l.off..l.off + 2))
-                        .map(|x| u16::from_be_bytes([x[0], x[1]]) as usize)
-                        .unwrap_or(0),
-                    _ => l.size,
-                }),
-                Arg::Val(Value::Char(c)) => Some(c.len()),
+                Arg::Ref(l) => {
+                    let cur = || {
+                        self.bufs
+                            .get(l.buf)
+                            .and_then(|b| b.get(l.off..l.off + 2))
+                            .map(|x| u16::from_be_bytes([x[0], x[1]]) as usize)
+                            .unwrap_or(0)
+                    };
+                    Some(match l.dtype {
+                        DType::Varchar(n) => (cur(), 4, n as usize),
+                        DType::VarUcs2(n) => (cur(), 11, n as usize),
+                        DType::Ucs2(n) => (n as usize, 9, n as usize),
+                        _ => (l.size, 2, l.size),
+                    })
+                }
+                // A value passed for a CONST or VALUE parameter: the
+                // descriptor is the temporary's, of the parameter's type
+                // (a VARYING parameter: 2-byte length and characters).
+                Arg::Val(v) => {
+                    let len = match v {
+                        Value::Char(c) => Some(c.len()),
+                        Value::Fig(_) => Some(0),
+                        _ => None,
+                    };
+                    match (p.dtype, len) {
+                        (DType::Varchar(n), Some(k)) => Some((k.min(n as usize), 4, n as usize)),
+                        (DType::VarUcs2(n), Some(k)) => {
+                            Some(((k / 2).min(n as usize), 11, n as usize))
+                        }
+                        // A character value for a character parameter is
+                        // passed as it is (OPTIONS(*VARSIZE)): its own length.
+                        (_, Some(k)) if matches!(v, Value::Char(_)) => Some((k, 2, k)),
+                        (DType::Char(n), Some(_)) => Some((n as usize, 2, n as usize)),
+                        _ => None,
+                    }
+                }
                 _ => None,
             });
             match arg {
@@ -5887,15 +6862,19 @@ impl<'a> Machine<'a> {
             crate::pgmmsg::stack_line(&self.io.job_key, self.line);
         }
         let ext = self.external_proc_name(&pi.name);
+        let module = self.stack_module();
         let stack_id = crate::pgmmsg::stack_push(
             &self.io.job_key,
             (&lib, &pgm),
-            &self.prog.name,
+            &module,
             &ext,
             &self.io.actgrp,
         );
         let saved_routine = std::mem::replace(&mut self.routine, pi.name.clone());
         let saved_line = self.line;
+        if !pi.ptr_inz.is_empty() {
+            self.ptr_inz(&pi.ptr_inz)?;
+        }
         let opened = self.open_local_files(pi);
         let mut r = (|| -> Result<Option<Value>> {
             opened?;
@@ -7211,9 +8190,153 @@ fn cstk_fit(b: &[u8], room: usize) -> (usize, usize) {
 /// little past the size asked for; the bytes past it are the initial
 /// value and are not kept: fidelity-gaps).
 fn space_pages(mut data: Vec<u8>, initval: u8) -> Vec<u8> {
-    let n = data.len().div_ceil(4096).max(1) * 4096;
+    // Whole pages, and one more: a based item read a little past the
+    // space's end (iRPGUnit reads a procedure name as CHAR(256) at the
+    // end of its QBNLSPGM list) stays in the space's segment on IBM i.
+    let n = data.len().div_ceil(4096).max(1) * 4096 + 4096;
     data.resize(n, initval);
     data
+}
+
+/// EBCDIC bytes as text (a CL parameter's value).
+fn a_text(b: &[u8]) -> String {
+    data::a(b)
+}
+
+/// The messages QGYOLMSG lists, the fields to return and the most of a
+/// message's text to return. Message selection information: list
+/// direction (*NEXT or *PRV), 2 reserved, severity criteria, maximum
+/// message and help lengths, offset to and number of the selection
+/// criteria (CHAR(10) each: *ALL, *MNR, *MNNR, *SCNMNR...), offset to
+/// the starting message keys, offset to and number of the field
+/// identifiers (Open List of Messages API).
+fn lstm_select(
+    mut msgs: Vec<(i64, crate::jobs::Message)>,
+    s: &[u8],
+) -> (Vec<(i64, crate::jobs::Message)>, Vec<i32>, usize) {
+    let txt = |a: usize, n: usize| -> String {
+        s.get(a..a + n)
+            .map(|b| data::a(b).trim().to_ascii_uppercase())
+            .unwrap_or_default()
+    };
+    let i4 = |a: usize| -> i32 {
+        s.get(a..a + 4)
+            .map(|b| i32::from_be_bytes(b.try_into().unwrap()))
+            .unwrap_or(0)
+    };
+    let direction = txt(0, 10);
+    let severity = i4(12);
+    let max_len = i4(16);
+    let (sel_off, sel_cnt) = (i4(24).max(0) as usize, i4(28).max(0) as usize);
+    let key_off = i4(32).max(0) as usize;
+    let (fld_off, fld_cnt) = (i4(36).max(0) as usize, i4(40).max(0) as usize);
+    let criteria: Vec<String> = (0..sel_cnt).map(|k| txt(sel_off + 10 * k, 10)).collect();
+    let fields: Vec<i32> = (0..fld_cnt).map(|k| i4(fld_off + 4 * k)).collect();
+    let sev = |m: &crate::jobs::Message| if m.kind == "*INQ" { 99 } else { 0 };
+    msgs.retain(|(_, m)| {
+        sev(m) >= severity
+            && criteria.iter().any(|c| match c.as_str() {
+                "*MNR" => m.kind == "*INQ",
+                "*MNNR" => m.kind != "*INQ",
+                _ => true,
+            })
+    });
+    if direction == "*PRV" {
+        msgs.reverse();
+    }
+    // The starting key: the oldest or newest, or a message's key.
+    let start = s
+        .get(key_off..key_off + 4)
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
+    if start.len() == 4 && start != [0xFF; 4] && start != [0; 4] {
+        let k = i64::from(u32::from_be_bytes(start.try_into().unwrap()));
+        if let Some(p) = msgs.iter().position(|(_, m)| m.id == k) {
+            msgs.drain(..p);
+        }
+    }
+    let max_len = if max_len < 0 {
+        usize::MAX
+    } else {
+        max_len as usize
+    };
+    (msgs, fields, max_len)
+}
+
+/// One message in format LSTM0100, at `base` in the receiver (offsets
+/// are from the receiver's start): offset to the next entry, offset to
+/// and number of the fields returned, severity, message ID, type, key,
+/// message file and library, message queue and library, date (CYYMMDD),
+/// time and microseconds sent, 10 more bytes; then the fields as
+/// QGYOLJBL returns them.
+fn lstm0100(
+    us: i64,
+    m: &crate::jobs::Message,
+    queue: &(String, String),
+    fields: &[i32],
+    max_len: usize,
+    base: usize,
+) -> Vec<u8> {
+    let field = |s: &str, n: usize| {
+        let mut b = data::e(s);
+        b.resize(n, 0x40);
+        b.truncate(n);
+        b
+    };
+    let ((y, mo, d), (h, mi, sec), usec) = crate::rpg::dates::from_epoch_us(us);
+    let mut b = Vec::new();
+    b.extend([0u8; 4]);
+    b.extend([0u8; 4]);
+    b.extend((fields.len() as i32).to_be_bytes());
+    b.extend((if m.kind == "*INQ" { 99i32 } else { 0 }).to_be_bytes());
+    b.extend(field(&m.msgid, 7));
+    b.extend(field(crate::pgmmsg::rtntype(&m.kind), 2));
+    b.extend((m.id as u32).to_be_bytes());
+    b.extend(field("", 20));
+    b.extend(field(&queue.0, 10));
+    b.extend(field(&queue.1, 10));
+    b.extend(field(
+        &format!("{}{:02}{mo:02}{d:02}", u8::from(y >= 2000), y % 100),
+        7,
+    ));
+    b.extend(field(&format!("{h:02}{mi:02}{sec:02}"), 6));
+    b.extend(field(&format!("{usec:06}"), 6));
+    b.extend([0u8; 10]);
+    b.resize(b.len().div_ceil(4) * 4, 0);
+    if !fields.is_empty() {
+        let at = (base + b.len()) as i32;
+        b[4..8].copy_from_slice(&at.to_be_bytes());
+    }
+    // An impromptu message's text is kept with its message ID in front
+    // ("CPF1234: text") when it has one.
+    let text = crate::jobs::shown_text(&m.text);
+    let mut text = data::e(&text);
+    text.truncate(max_len);
+    for id in fields {
+        let value: Vec<u8> = match id {
+            201 | 301 | 302 => text.clone(),
+            // Reply status: N (accepts no reply), W (waiting for one).
+            1001 => data::e(if m.kind == "*INQ" { "W" } else { "N" }),
+            607 => field(&m.from_user, 10),
+            _ => Vec::new(),
+        };
+        let total = (32 + value.len()).div_ceil(4) * 4;
+        let next = base + b.len() + total;
+        let mut f = Vec::with_capacity(total);
+        f.extend((next as i32).to_be_bytes());
+        f.extend((total as i32).to_be_bytes());
+        f.extend(id.to_be_bytes());
+        f.extend(data::e("C"));
+        f.extend(data::e(" "));
+        f.extend([0u8; 14]);
+        f.extend((value.len() as i32).to_be_bytes());
+        f.extend(value);
+        f.resize(total, 0);
+        b.extend(f);
+    }
+    let next = (base + b.len()) as i32;
+    b[0..4].copy_from_slice(&next.to_be_bytes());
+    b
 }
 
 /// The job log messages QGYOLJBL lists, and the fields to return.
@@ -7223,7 +8346,10 @@ fn space_pages(mut data: Vec<u8>, initval: u8) -> Vec<u8> {
 /// newest), maximum message and help lengths, offset to and number of
 /// the field identifiers to return, offset to and length of the call
 /// message queue name ('*': all) (Open List of Job Log Messages API).
-fn oljl_select(job: &str, s: &[u8]) -> Result<(Vec<crate::pgmmsg::QMsg>, Vec<i32>)> {
+fn oljl_select(
+    job: &str,
+    s: &[u8],
+) -> Result<(Vec<crate::pgmmsg::QMsg>, Vec<i32>, (usize, usize))> {
     let txt = |a: usize, n: usize| -> String {
         s.get(a..a + n)
             .map(|b| data::a(b).trim().to_string())
@@ -7240,6 +8366,9 @@ fn oljl_select(job: &str, s: &[u8]) -> Result<(Vec<crate::pgmmsg::QMsg>, Vec<i32
         bail!("QGYOLJBL of a job other than '*' is not supported");
     }
     let start = s.get(52..56).map(|b| b.to_vec()).unwrap_or_default();
+    // The most of a message's text and help returned (-1: all of it).
+    let most = |n: i32| if n < 0 { usize::MAX } else { n as usize };
+    let max_len = (most(i4(56)), most(i4(60)));
     let fld_off = i4(64).max(0) as usize;
     let fld_cnt = i4(68).max(0) as usize;
     let fields: Vec<i32> = (0..fld_cnt).map(|k| i4(fld_off + 4 * k)).collect();
@@ -7249,15 +8378,12 @@ fn oljl_select(job: &str, s: &[u8]) -> Result<(Vec<crate::pgmmsg::QMsg>, Vec<i32
     }
     // The starting key: the oldest or newest, or a message's key.
     if start != [0xFF; 4] && start != [0; 4] {
-        let k = data::a(&start);
-        if let Some(p) = msgs
-            .iter()
-            .position(|m| crate::pgmmsg::key_text(m.key) == k)
-        {
+        let k = crate::pgmmsg::key_from_bytes(&start);
+        if let Some(p) = msgs.iter().position(|m| Some(m.key) == k) {
             msgs.drain(..p);
         }
     }
-    Ok((msgs, fields))
+    Ok((msgs, fields, max_len))
 }
 
 /// One job log message in format OLJL0100, at `base` in the receiver
@@ -7267,7 +8393,16 @@ fn oljl_select(job: &str, s: &[u8]) -> Result<(Vec<crate::pgmmsg::QMsg>, Vec<i32
 /// microseconds sent, thread; then each field: offset to the next,
 /// length of its information, identifier, type of data ('C'), status
 /// (' '), 14 reserved, length of the data, the data.
-fn oljl0100(m: &crate::pgmmsg::QMsg, fields: &[i32], base: usize) -> Vec<u8> {
+fn oljl0100(
+    m: &crate::pgmmsg::QMsg,
+    fields: &[i32],
+    max_len: (usize, usize),
+    base: usize,
+) -> Vec<u8> {
+    let cut = |mut b: Vec<u8>, n: usize| {
+        b.truncate(n);
+        b
+    };
     let field = |s: &str, n: usize| {
         let mut b = data::e(s);
         b.resize(n, 0x40);
@@ -7281,7 +8416,7 @@ fn oljl0100(m: &crate::pgmmsg::QMsg, fields: &[i32], base: usize) -> Vec<u8> {
     b.extend(m.sev.to_be_bytes());
     b.extend(field(&m.msgid, 7));
     b.extend(field(crate::pgmmsg::rtntype(&m.ty), 2));
-    b.extend(data::e(&crate::pgmmsg::key_text(m.key)));
+    b.extend(crate::pgmmsg::key_bytes(m.key));
     b.extend(field(&m.msgf, 10));
     b.extend(field(&m.msgflib, 10));
     b.extend(field(&m.sent.0, 7));
@@ -7298,13 +8433,20 @@ fn oljl0100(m: &crate::pgmmsg::QMsg, fields: &[i32], base: usize) -> Vec<u8> {
             // Replacement data.
             201 => m.data.clone(),
             // Message text, with or without its data replaced.
-            301 | 302 => data::e(&m.text),
+            301 | 302 => cut(data::e(&m.text), max_len.0),
             // Help text.
-            401..=404 => data::e(&m.seclvl),
+            401..=404 => cut(data::e(&m.seclvl), max_len.1),
             // Sending program, module and procedure names.
             603 => field(&m.sender.pgm, 12),
             604 => field(&m.sender.module, 10),
             605 => data::e(&m.sender.proc),
+            // Sending program library; receiving program, module,
+            // procedure and library (QGYOLJBL field identifiers).
+            608 => field(&m.sender.lib, 10),
+            703 => field(&m.receiver.pgm, 10),
+            704 => field(&m.receiver.module, 10),
+            705 => data::e(&m.receiver.proc),
+            708 => field(&m.receiver.lib, 10),
             _ => Vec::new(),
         };
         let total = (32 + value.len()).div_ceil(4) * 4;
@@ -7369,6 +8511,19 @@ mod tests {
         assert_eq!(char_of_num(&Dec::parse("0.50").unwrap()), ".50");
         assert_eq!(char_of_num(&Dec::parse("5").unwrap()), "5");
         assert_eq!(char_of_num(&Dec::parse("0").unwrap()), "0");
+        // DECEDIT('0,'): a decimal comma and a zero before it.
+        assert_eq!(
+            char_of_num_edit(&Dec::parse("0.50").unwrap(), ',', true),
+            "0,50"
+        );
+        assert_eq!(
+            char_of_num_edit(&Dec::parse("-123.00").unwrap(), ',', true),
+            "-123,00"
+        );
+        assert_eq!(
+            char_of_num_edit(&Dec::parse("0.50").unwrap(), ',', false),
+            ",50"
+        );
     }
 
     #[test]

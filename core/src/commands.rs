@@ -221,6 +221,16 @@ pub const SYSTEM_LIBRARY_LIST: &[&str] = &["QSYS", "QSYS2", "QHLPSYS", "QUSRSYS"
 /// shipped).
 pub const USER_LIBRARY_LIST: &[&str] = &["QGPL", "QTEMP"];
 
+/// A library as the job's library list keeps it: the job's own QTEMP
+/// library as QTEMP (`Job::library_list` gives the library again).
+fn lib_entry(lib: &str) -> String {
+    if crate::qtemp::is_qtemp(lib) {
+        "QTEMP".to_string()
+    } else {
+        lib.to_string()
+    }
+}
+
 /// The library objects are created in when there is no current library.
 pub const DEFAULT_CURRENT_LIBRARY: &str = "QGPL";
 
@@ -243,13 +253,113 @@ pub enum Outcome {
 /// DSPPFM shows at most this many records.
 pub const DSPPFM_MAX_RECORDS: i64 = 9999;
 
+/// CRTRPGMOD's condition names: DEFINE's and *CRTRPGMOD.
+fn module_defines(cmd: &Command) -> String {
+    let d = define_option(cmd);
+    match d.strip_suffix(')') {
+        Some(x) => format!("{x} *CRTRPGMOD)"),
+        None => "DEFINE(*CRTRPGMOD)".into(),
+    }
+}
+
+/// Where an RPG compile searches its /COPY and /INCLUDE files, as a
+/// compile option recorded with the object (`rpg::IncludePath`): the
+/// current directory, INCDIR (CRTSQLRPGI: INCDIR and COMPILEOPT's
+/// INCDIR), the RPGINCDIR environment variable and, for a stream file
+/// source, its directory (ILE RPG Programmer's Guide, "Search Path Within
+/// The IFS"). None for a member compiled without INCDIR or RPGINCDIR,
+/// which searches the library list as before.
+async fn include_path_option(
+    client: &Client,
+    job: &str,
+    cmd: &Command,
+    m: &crate::source::Member,
+) -> String {
+    let unquote = |v: &str| v.trim().trim_matches('\'').trim_matches('"').to_string();
+    let mut incdir: Vec<String> = Vec::new();
+    if cmd.def.params.iter().any(|p| p.keyword == "INCDIR") {
+        for v in cmd.list("INCDIR") {
+            for part in v.split_whitespace() {
+                let d = unquote(part);
+                if !d.is_empty() && !d.eq_ignore_ascii_case("*NONE") {
+                    incdir.push(d);
+                }
+            }
+        }
+    }
+    if cmd.def.params.iter().any(|p| p.keyword == "COMPILEOPT") {
+        for v in option_values(cmd.get("COMPILEOPT"), "INCDIR") {
+            for part in v.split_whitespace() {
+                let d = unquote(part);
+                if !d.is_empty() && !d.eq_ignore_ascii_case("*NONE") {
+                    incdir.push(d);
+                }
+            }
+        }
+    }
+    let env: Vec<String> = crate::envvar::get(client, job, "RPGINCDIR")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.value)
+        .map(|v| {
+            v.split(':')
+                .filter(|d| !d.trim().is_empty())
+                .map(|d| d.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if m.stmf.is_empty() && incdir.is_empty() && env.is_empty() {
+        return String::new();
+    }
+    let mut dirs = vec![crate::ifs::current_dir()];
+    for d in incdir.into_iter().chain(env) {
+        if let Ok(n) = crate::ifs::normalize(&d) {
+            dirs.push(n);
+        }
+    }
+    if !m.stmf.is_empty() {
+        if let Ok(n) = crate::ifs::normalize(&m.stmf) {
+            let dir = match n.rfind('/') {
+                Some(0) | None => "/".to_string(),
+                Some(i) => n[..i].to_string(),
+            };
+            dirs.push(dir);
+        }
+    }
+    crate::rpg::IncludePath {
+        ifs_first: !m.stmf.is_empty(),
+        dirs,
+    }
+    .option()
+}
+
+/// DEFINE(names) of a compile command, as compile options ("" for none).
+fn define_option(cmd: &Command) -> String {
+    let names: Vec<String> = cmd
+        .list("DEFINE")
+        .iter()
+        .flat_map(|v| v.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+        .map(|n| {
+            n.trim_matches(|c| c == '(' || c == ')' || c == '\'')
+                .to_string()
+        })
+        .filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case("*NONE"))
+        .collect();
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!("DEFINE({})", names.join(" "))
+    }
+}
+
 impl Job<'_> {
     /// The library list as searched: system part, current library, user
     /// part.
     pub fn library_list(&self) -> Vec<String> {
         self.library_list_entries()
             .into_iter()
-            .map(|(l, _)| l)
+            .map(|(l, _)| crate::qtemp::real(&l))
             .collect()
     }
 
@@ -273,12 +383,54 @@ impl Job<'_> {
 
     /// *CURLIB: the current library, or QGPL when there is none.
     pub fn current_library(&self) -> String {
-        self.curlib
-            .clone()
-            .unwrap_or_else(|| DEFAULT_CURRENT_LIBRARY.to_string())
+        crate::qtemp::real(self.curlib.as_deref().unwrap_or(DEFAULT_CURRENT_LIBRARY))
     }
 
+    /// Run a command; what it says names the job's QTEMP library QTEMP.
     pub async fn run(&mut self, line: &str) -> Result<Outcome> {
+        // Boxed: commands run commands (CALL, CL programs), and the
+        // futures would otherwise nest on the stack.
+        if crate::qtemp::current().is_none() {
+            return Box::pin(self.run_command(line)).await;
+        }
+        let l = crate::qtemp::logical;
+        let r = match Box::pin(self.run_command(line)).await {
+            Ok(Outcome::Messages(m)) => Ok(Outcome::Messages(m.iter().map(|x| l(x)).collect())),
+            Ok(Outcome::Display(mut d)) => {
+                d.title = l(&d.title);
+                d.heading = l(&d.heading);
+                for (k, v) in d.info.iter_mut() {
+                    *k = l(k);
+                    *v = l(v);
+                }
+                for r in d
+                    .rows
+                    .iter_mut()
+                    .chain(d.print.iter_mut())
+                    .chain(d.keys.iter_mut())
+                {
+                    *r = l(r);
+                }
+                Ok(Outcome::Display(d))
+            }
+            Ok(o) => Ok(o),
+            Err(e) => {
+                let t = format!("{e:#}");
+                let m = l(&t);
+                if m == t {
+                    Err(e)
+                } else {
+                    Err(anyhow!(m))
+                }
+            }
+        };
+        for p in self.calls.printed.iter_mut() {
+            *p = l(p);
+        }
+        r
+    }
+
+    async fn run_command(&mut self, line: &str) -> Result<Outcome> {
         if let Some(d) = self.user_command(line).await? {
             return self.run_user_command(&d, line).await;
         }
@@ -299,6 +451,9 @@ impl Job<'_> {
             return Ok(o);
         }
         if let Some(o) = self.qsh_command(&cmd).await? {
+            return Ok(o);
+        }
+        if let Some(o) = self.jobd_command(&cmd).await? {
             return Ok(o);
         }
         if let Some(o) = self.pdm_command(&cmd).await? {
@@ -332,6 +487,7 @@ impl Job<'_> {
             "CVTRPGFREE" => self.cvtrpgfree(&cmd).await,
             "CRTMNU" => self.crtmnu(&cmd).await,
             "CRTCMD" => self.crtcmd(&cmd).await,
+            "CHGCMD" => self.chgcmd(&cmd).await,
             "DLTCMD" => self.dltcmd(&cmd).await,
             "CRTPNLGRP" => self.crtpnlgrp(&cmd).await,
             "DLTPNLGRP" => self.dltpnlgrp(&cmd).await,
@@ -410,6 +566,8 @@ impl Job<'_> {
             "DLTDTAARA" => self.dltdtaara(&cmd).await,
             "CRTDTAQ" => self.crtdtaq(&cmd).await,
             "DLTDTAQ" => self.dltdtaq(&cmd).await,
+            "CRTMSGQ" => self.crtmsgq(&cmd).await,
+            "DLTMSGQ" => self.dltmsgq(&cmd).await,
             "CHKOBJ" => {
                 self.chkobj(
                     cmd.get("OBJ"),
@@ -459,7 +617,7 @@ impl Job<'_> {
     }
 
     /// CHGLIB: the library's text and type (*SAME keeps them). The
-    /// completion message has no ID here (not captured).
+    /// completion message of a change has no ID here (not captured).
     async fn chglib(&mut self, cmd: &Command) -> Result<Outcome> {
         let lib = cmd.get("LIB").to_ascii_uppercase();
         if !catalog::library_exists(self.client, &lib).await? {
@@ -468,6 +626,13 @@ impl Job<'_> {
         authority::check(self.client, &self.user, "QSYS", &lib, "*LIB", Aut::Change).await?;
         let text = cmd.get("TEXT");
         let ty = cmd.get("TYPE");
+        // Nothing to change: CPC2105 (PUB400 2026-10-23, CHGLIB with
+        // TEXT(*SAME), tools/golden/qsh.txt q_chglib).
+        if text.eq_ignore_ascii_case("*SAME") && ty.eq_ignore_ascii_case("*SAME") {
+            return Ok(Outcome::Messages(vec![format!(
+                "CPC2105: No change was made to {lib} in QSYS type *LIB."
+            )]));
+        }
         let n = self
             .client
             .execute(
@@ -623,7 +788,7 @@ impl Job<'_> {
     }
 
     async fn rmvlible(&mut self, cmd: &Command) -> Result<Outcome> {
-        let lib = cmd.get("LIB").to_string();
+        let lib = lib_entry(cmd.get("LIB"));
         let before = self.libl.len();
         self.libl.retain(|l| *l != lib);
         if self.libl.len() == before {
@@ -655,7 +820,7 @@ impl Job<'_> {
                 if !catalog::library_exists(self.client, lib).await? {
                     bail!("CPF2110: Library {lib} does not exist.");
                 }
-                self.curlib = Some(lib.to_string());
+                self.curlib = Some(lib_entry(lib));
                 Ok(Outcome::Messages(vec![format!(
                     "Current library changed to {lib}."
                 )]))
@@ -675,6 +840,7 @@ impl Job<'_> {
                     if !catalog::library_exists(self.client, &l).await? {
                         bail!("CPF2110: Library {l} does not exist.");
                     }
+                    let l = lib_entry(&l);
                     if v.contains(&l) {
                         bail!("Library {l} is in the list more than once.");
                     }
@@ -690,7 +856,7 @@ impl Job<'_> {
                 if !catalog::library_exists(self.client, lib).await? {
                     bail!("CPF2110: Library {lib} does not exist.");
                 }
-                self.curlib = Some(lib.to_string());
+                self.curlib = Some(lib_entry(lib));
             }
         }
         if let Some(v) = new_libl {
@@ -700,11 +866,11 @@ impl Job<'_> {
     }
 
     async fn addlible(&mut self, cmd: &Command) -> Result<Outcome> {
-        let lib = cmd.get("LIB").to_string();
-        if !catalog::library_exists(self.client, &lib).await? {
+        let lib = lib_entry(cmd.get("LIB"));
+        if !catalog::library_exists(self.client, &crate::qtemp::real(&lib)).await? {
             bail!("CPF2110: Library {lib} does not exist.");
         }
-        if self.library_list().contains(&lib) {
+        if self.library_list().contains(&crate::qtemp::real(&lib)) {
             bail!("CPF2103: Library {lib} is already in the library list.");
         }
         // Only the user part of the library list can be changed.
@@ -802,7 +968,9 @@ impl Job<'_> {
 
     /// Run the statements of an SQL script (RUNSQLSTM). `schema`: the
     /// default schema; with `set_schema` false, SET SCHEMA statements are
-    /// skipped (`as4tainr import` keeps every object in its library).
+    /// skipped (`as4tainr import` keeps every object in its library), but
+    /// for SET SCHEMA SESSION, which names the job's QTEMP and its declared
+    /// temporary tables.
     pub async fn run_sql_script(
         &mut self,
         source: &str,
@@ -821,7 +989,7 @@ impl Job<'_> {
             if !set_schema
                 && matches!(
                     crate::ddl::parse(stmt),
-                    Ok(Some(crate::ddl::Ddl::SetSchema(_)))
+                    Ok(Some(crate::ddl::Ddl::SetSchema(ref s))) if !s.eq_ignore_ascii_case("QTEMP")
                 )
             {
                 lines.push(format!("Statement {}: SET SCHEMA skipped.", k + 1));
@@ -1263,10 +1431,15 @@ impl Job<'_> {
                 None => ("*LIBL".to_string(), x.to_ascii_uppercase()),
             })
             .collect();
+        // An element may be in parentheses of its own: BNDDIR((LIB/DIR)).
         let dirs = cmd
             .list("BNDDIR")
             .into_iter()
-            .filter(|x| x != "*NONE")
+            .map(|x| {
+                x.trim_matches(|c: char| c == '(' || c == ')' || c.is_whitespace())
+                    .to_string()
+            })
+            .filter(|x| x != "*NONE" && !x.is_empty())
             .collect();
         (srv, dirs)
     }
@@ -1282,6 +1455,13 @@ impl Job<'_> {
             libl.insert(0, lib.clone());
         }
         let cl = cmd.def.name == "CRTCLMOD";
+        // DEFINE(*CRTRPGMOD ...) and where the includes are found.
+        let module_options = if cl {
+            String::new()
+        } else {
+            let inc = include_path_option(self.client, &self.job_key(), cmd, &m).await;
+            format!("{} {inc}", module_defines(cmd)).trim().to_string()
+        };
         let mut severity = 0u8;
         let mut cl_listing = None;
         let mut m = m;
@@ -1293,7 +1473,7 @@ impl Job<'_> {
             m.source = src;
         } else {
             severity = self
-                .compile_rpg(cmd, &lib, &name, &m, &libl, "", true)
+                .compile_rpg(cmd, &lib, &name, &m, &libl, &module_options, true)
                 .await?
                 .1;
         }
@@ -1317,9 +1497,10 @@ impl Job<'_> {
             if cl { "CLLE" } else { "RPGLE" },
             &text,
             &m.source,
-            "",
+            &module_options,
         )
         .await?;
+        crate::ile::set_source(self.client, &lib, &name, "*MODULE", &m).await?;
         authority::set_owner(self.client, &lib, &name, "*MODULE", &self.user).await?;
         if let Some((shown, analysis)) = &cl_listing {
             self.cl_listing(cmd, &lib, &name, shown, analysis, true)
@@ -1329,8 +1510,19 @@ impl Job<'_> {
                 "CPC0816: Module {name} was created in library {lib}."
             )]));
         }
-        // RNS9305 with the highest severity (observed on IBM i 7.5).
+        // RNS9305 with the highest severity (observed on IBM i 7.5). Its
+        // data starts with the module and its library (iRPGUnit's
+        // RUCRTRPG reads them from the job log: CRTTST jobLogCallback);
+        // what follows them is not known here (docs/fidelity-gaps.md).
         if !cl {
+            let shown = if crate::qtemp::is_qtemp(&lib) {
+                "QTEMP".to_string()
+            } else {
+                lib.clone()
+            };
+            let mut data = crate::rpg::data::e(&format!("{name:<10}{shown:<10}"));
+            data.truncate(20);
+            self.calls.message_data = Some(data);
             return Ok(Outcome::Messages(vec![format!(
                 "RNS9305: Module {name} was created in library {lib}; highest severity {severity:02}."
             )]));
@@ -1363,6 +1555,10 @@ impl Job<'_> {
                 exports: all.clone(),
                 ..Default::default()
             }
+        } else if !cmd.get("SRCSTMF").is_empty() {
+            // The binder language in a stream file.
+            let src = self.source_member(cmd, &name).await?;
+            crate::ile::binder_language(&src.source).map_err(not_created)?
         } else {
             let (libs, file) = self.search(cmd.get("SRCFILE"));
             let member = match cmd.get("SRCMBR") {
@@ -1407,7 +1603,12 @@ impl Job<'_> {
         // The completion message CPC5D0B (PUB400 2026-10-23), its data
         // the service program and its library (RPGUnit's RUCRTTST reads
         // them).
-        let mut data = crate::rpg::data::e(&format!("{name:<10}{lib:<10}"));
+        let shown = if crate::qtemp::is_qtemp(&lib) {
+            "QTEMP".to_string()
+        } else {
+            lib.clone()
+        };
+        let mut data = crate::rpg::data::e(&format!("{name:<10}{shown:<10}"));
         data.truncate(20);
         self.calls.message_data = Some(data);
         Ok(Outcome::Messages(vec![format!(
@@ -1846,7 +2047,7 @@ impl Job<'_> {
         match q.split_once('/') {
             Some(("*LIBL", n)) => (self.library_list(), n.to_string()),
             Some(("*CURLIB", n)) => (vec![self.current_library()], n.to_string()),
-            Some((l, n)) => (vec![l.to_string()], n.to_string()),
+            Some((l, n)) => (vec![crate::qtemp::real(l)], n.to_string()),
             None => (self.library_list(), q.to_string()),
         }
     }
@@ -1961,6 +2162,26 @@ impl Job<'_> {
         let name = name.to_ascii_uppercase();
         crate::source::set_record_length(self.client, &lib, &name, rcdlen as i32).await?;
         authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
+        // MBR: a member added with the file (*FILE: named like it).
+        let mbr = match cmd.get("MBR") {
+            "*NONE" | "" => None,
+            "*FILE" => Some(name.clone()),
+            m => Some(m.to_ascii_uppercase()),
+        };
+        if let Some(m) = mbr {
+            crate::source::put_member(
+                self.client,
+                &crate::source::Member {
+                    library: lib.clone(),
+                    file: name.clone(),
+                    name: m,
+                    ccsid: 37,
+                    ..Default::default()
+                },
+                false,
+            )
+            .await?;
+        }
         Ok(Outcome::Messages(vec![format!(
             "CPC7301: File {name} was created in library {lib}."
         )]))
@@ -2455,7 +2676,11 @@ impl Job<'_> {
             if !libl.contains(&lib) {
                 libl.insert(0, lib.clone());
             }
-            crate::rpg::compile(self.client, &libl, &name, &m.source).await?;
+            let inc = include_path_option(self.client, &self.job_key(), cmd, &m).await;
+            let options = format!("SQLCOMMIT({}) {inc}", cmd.get("COMMIT"))
+                .trim()
+                .to_string();
+            crate::rpg::compile_with(self.client, &libl, &name, &m.source, &options).await?;
             let text = match cmd.get("TEXT") {
                 "*SRCMBRTXT" => m.text.clone(),
                 "*BLANK" => String::new(),
@@ -2470,9 +2695,10 @@ impl Job<'_> {
                 "SQLRPGLE",
                 &text,
                 &m.source,
-                &format!("SQLCOMMIT({})", cmd.get("COMMIT")),
+                &options,
             )
             .await?;
+            crate::ile::set_source(self.client, &lib, &name, "*MODULE", &m).await?;
             authority::set_owner(self.client, &lib, &name, "*MODULE", &self.user).await?;
             return Ok(Outcome::Messages(vec![format!(
                 "Module {name} created in library {lib}."
@@ -2534,12 +2760,22 @@ impl Job<'_> {
             "CRTSQLRPGI" => format!("SQLCOMMIT({})", cmd.get("COMMIT")),
             _ => String::new(),
         };
+        if cmd.def.name == "CRTBNDRPG" {
+            options = format!("{options} {}", define_option(cmd))
+                .trim()
+                .to_string();
+        }
         // CRTBNDRPG DFTACTGRP(*NO) ACTGRP(...): the activation group the
         // program runs in (the source's control keywords win).
         if cmd.def.name == "CRTBNDRPG" && cmd.get("DFTACTGRP") == "*NO" {
             options = format!("{options} DFTACTGRP(*NO) ACTGRP({})", cmd.get("ACTGRP"))
                 .trim()
                 .to_string();
+        }
+        // Where its includes are found (RPG).
+        if matches!(attribute, "RPGLE" | "SQLRPGLE") {
+            let inc = include_path_option(self.client, &self.job_key(), cmd, &m).await;
+            options = format!("{options} {inc}").trim().to_string();
         }
         // CL: includes are part of the program; then it is checked.
         let source = if attribute == "RPGLE" || attribute == "SQLRPGLE" || attribute == "RPG" {
@@ -2649,6 +2885,7 @@ impl Job<'_> {
         catalog::set_program_options(self.client, &lib, &name, &options).await?;
         catalog::set_program_source(self.client, &lib, &name, (&m.file, &m.library, &m.name))
             .await?;
+        crate::ile::set_source(self.client, &lib, &name, "*PGM", &m).await?;
         crate::ile::set_program_binding(self.client, &lib, &name, binding.as_ref()).await?;
         authority::set_owner(self.client, &lib, &name, "*PGM", &self.user).await?;
         // A CL program: CPC0815; an ILE RPG program: RNS9304 with the
@@ -2697,20 +2934,34 @@ impl Job<'_> {
         let files = crate::clpgm::resolve_files(self.client, libl, src)
             .await
             .unwrap_or_default();
-        let user_cmds: Vec<String> = self
+        let user_cmds: Vec<(String, String)> = self
             .client
             .query(
-                "SELECT name FROM as4tainr.objects WHERE objtype='*CMD' AND library = ANY($1)",
-                &[&libl],
+                "SELECT library, name FROM as4tainr.objects WHERE objtype='*CMD'",
+                &[],
             )
             .await?
             .iter()
-            .map(|r| r.get(0))
+            .map(|r| (r.get(0), r.get(1)))
             .collect();
+        // A command: a system one, or one of the library list's (LIB/CMD:
+        // of that library).
         let known = |c: &str| {
-            crate::cl::find(c).is_some()
-                || crate::ibmcmds::is_ibm(c)
-                || user_cmds.iter().any(|u| u == c)
+            let (lib, bare) = match c.rsplit_once('/') {
+                Some((l, b)) => (Some(crate::qtemp::real(l)), b),
+                None => (None, c),
+            };
+            match &lib {
+                Some(l) if l != "QSYS" && l != "*LIBL" => {
+                    user_cmds.iter().any(|(ul, u)| ul == l && u == bare)
+                        || l == "*SYSTEM" && (crate::cl::find(bare).is_some() || crate::ibmcmds::is_ibm(bare))
+                }
+                _ => {
+                    crate::cl::find(bare).is_some()
+                        || crate::ibmcmds::is_ibm(bare)
+                        || user_cmds.iter().any(|(ul, u)| u == bare && libl.contains(ul))
+                }
+            }
         };
         let mut analysis =
             crate::cllist::analyze(src, &known, &|st| crate::clpgm::dclf_variables(st, &files));
@@ -2823,7 +3074,7 @@ impl Job<'_> {
         let max = checked.diags.iter().map(|d| d.sev).max().unwrap_or(0);
         let ok = compiled.is_ok() && max <= 10;
         if listed {
-            let copies = crate::rpg::listing_copies(self.client, libl, &m.source).await;
+            let copies = crate::rpg::listing_copies(self.client, libl, &m.source, options).await;
             self.rpg_listing(
                 cmd,
                 lib,
@@ -3388,11 +3639,92 @@ impl Job<'_> {
             Aut::Use,
         )
         .await?;
+        if let Some((file, mbr, env)) = &d.rexx {
+            // PGM(*REXX): the procedure gets the parameters as one string.
+            let arg = crate::cmd::rexx_args(d, line)?;
+            let msgs = Box::pin(crate::rexx::strrexprc(self, file, mbr, &arg, env)).await?;
+            return Ok(Outcome::Messages(msgs));
+        }
         let args = crate::cmd::call_args(crate::cmd::encode(d, line)?);
         if let Some(v) = &d.vldckr {
             self.call_program_boxed(v, args.clone()).await?;
         }
         self.call_program_boxed(&d.pgm, args).await
+    }
+
+    /// CHGCMD (CL reference): a command's processing program (or REXX
+    /// procedure), validity checker and text; the other attributes are
+    /// accepted.
+    async fn chgcmd(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (libs, name) = self.search(cmd.get("CMD"));
+        let Some(mut d) = crate::cmd::find(self.client, &libs, &name).await? else {
+            bail!(
+                "CPF9801: Object {} type *CMD not found.",
+                name.to_ascii_uppercase()
+            );
+        };
+        authority::check(
+            self.client,
+            &self.user,
+            &d.library,
+            &d.name,
+            "*CMD",
+            Aut::Change,
+        )
+        .await?;
+        let same = |k: &str| cmd.get(k).is_empty() || cmd.get(k).eq_ignore_ascii_case("*SAME");
+        let qualified = |q: &str| -> String {
+            let q = q.to_ascii_uppercase();
+            if q.contains('/') || q.starts_with('*') {
+                q
+            } else {
+                format!("*LIBL/{q}")
+            }
+        };
+        if !same("PGM") {
+            let pgm = cmd.get("PGM").to_ascii_uppercase();
+            if pgm == "*REXX" {
+                let (file, mbr, env) = d
+                    .rexx
+                    .clone()
+                    .unwrap_or_else(|| ("*LIBL/QREXSRC".into(), d.name.clone(), "*COMMAND".into()));
+                d.rexx = Some((file, mbr, env));
+                d.pgm = "*REXX".into();
+            } else {
+                d.rexx = None;
+                d.pgm = qualified(&pgm);
+            }
+        }
+        if let Some((file, mbr, env)) = d.rexx.as_mut() {
+            if !same("REXSRCFILE") {
+                *file = qualified(cmd.get("REXSRCFILE"));
+            }
+            if !same("REXSRCMBR") {
+                *mbr = cmd.get("REXSRCMBR").to_ascii_uppercase();
+            }
+            if !same("REXCMDENV") {
+                *env = cmd.get("REXCMDENV").to_ascii_uppercase();
+            }
+        }
+        if !same("VLDCKR") {
+            d.vldckr = match cmd.get("VLDCKR").to_ascii_uppercase().as_str() {
+                "*NONE" => None,
+                v => Some(qualified(v)),
+            };
+        }
+        if !same("TEXT") {
+            d.text = match cmd.get("TEXT") {
+                "*BLANK" => String::new(),
+                t => t.to_string(),
+            };
+        }
+        let text = d.text.clone();
+        let mut c = runtime::connect_db(&self.env.database_url).await?;
+        crate::cmd::create(&mut c, &d, &text, true).await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Command {} in library {} changed.",
+            d.name, d.library
+        )]))
     }
 
     /// CRTCMD: a command from command definition source.
@@ -3417,6 +3749,20 @@ impl Job<'_> {
             v => Some(qualified(v)),
         };
         d.maxpos = cmd.get("MAXPOS").parse().ok();
+        if cmd.get("PGM").eq_ignore_ascii_case("*REXX") {
+            let file = cmd.get("REXSRCFILE").to_ascii_uppercase();
+            let file = if file.contains('/') {
+                file
+            } else {
+                format!("*LIBL/{file}")
+            };
+            let mbr = match cmd.get("REXSRCMBR").to_ascii_uppercase() {
+                m if m == "*CMD" || m.is_empty() => name.clone(),
+                m => m,
+            };
+            d.rexx = Some((file, mbr, cmd.get("REXCMDENV").to_ascii_uppercase()));
+            d.pgm = "*REXX".into();
+        }
         let text = match cmd.get("TEXT") {
             "*SRCMBRTXT" => m.text.clone(),
             "*BLANK" => String::new(),
@@ -3426,8 +3772,9 @@ impl Job<'_> {
         let mut c = runtime::connect_db(&self.env.database_url).await?;
         crate::cmd::create(&mut c, &d, &text, cmd.get("REPLACE") != "*NO").await?;
         authority::set_owner(self.client, &lib, &name, "*CMD", &self.user).await?;
+        // CPC0202 (PUB400 2026-10-23, tools/golden/qsh.txt q_crtcmd).
         Ok(Outcome::Messages(vec![format!(
-            "Command {name} created in library {lib}."
+            "CPC0202: Command {name} created in library {lib}."
         )]))
     }
 
@@ -3668,6 +4015,10 @@ impl Job<'_> {
                     d => Some(d.to_string()),
                 },
                 actgrp,
+                mbr: match cmd.get("MBR") {
+                    "" | "*FIRST" => None,
+                    m => Some(m.to_ascii_uppercase()),
+                },
             },
         );
         crate::ovr::save_scoped(&self.job_key(), &self.calls.overrides);
@@ -4387,8 +4738,27 @@ impl Job<'_> {
         if self.user_command(&command).await?.is_none() {
             cl::parse(&command)?;
         }
+        // JOBD: *USRPRF (as4tainr's profiles name none: QDFTJOBD's
+        // defaults), or a job description: the job's name (JOB(*JOBD))
+        // and its initial library list (INLLIBL(*JOBD)).
+        let jobd = match cmd.get("JOBD").to_ascii_uppercase().as_str() {
+            "" | "*USRPRF" => None,
+            q => {
+                let (libs, n) = self.search(q);
+                match crate::jobd::find(self.client, &libs, &n).await? {
+                    Some(d) => Some(d),
+                    None => bail!(
+                        "CPF1338: Errors on SBMJOB command. Job description {} not found.",
+                        n.to_ascii_uppercase()
+                    ),
+                }
+            }
+        };
         let name = match cmd.get("JOB") {
-            "*JOBD" => jobs::DEFAULT_BATCH_JOB_NAME.to_string(),
+            "*JOBD" => jobd
+                .as_ref()
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| jobs::DEFAULT_BATCH_JOB_NAME.to_string()),
             n => n.to_string(),
         };
         let jobq = match cmd.get("JOBQ") {
@@ -4407,9 +4777,20 @@ impl Job<'_> {
                 Some(l.to_string())
             }
         };
-        let inllibl = cmd.list("INLLIBL");
+        let inllibl: Vec<String> = cmd
+            .list("INLLIBL")
+            .iter()
+            .map(|l| l.to_ascii_uppercase())
+            .collect();
         let libl = if inllibl.is_empty() || inllibl == ["*CURRENT"] {
             self.libl.clone()
+        } else if inllibl == ["*JOBD"] {
+            match jobd.as_ref().and_then(|d| d.inllibl.clone()) {
+                Some(l) => l,
+                None => vec!["QGPL".into(), "QTEMP".into()],
+            }
+        } else if inllibl == ["*SYSVAL"] {
+            vec!["QGPL".into(), "QTEMP".into()]
         } else {
             inllibl
         };
@@ -4638,8 +5019,144 @@ impl Job<'_> {
         )
     }
 
+    /// CRTMSGQ: a *MSGQ object; its messages are kept under "LIB/NAME"
+    /// (jobs::msgq_key). No completion message (docs/fidelity-gaps.md).
+    async fn crtmsgq(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name) = self.create_target(cmd.get("MSGQ"));
+        let lib = crate::qtemp::real(&lib.to_ascii_uppercase());
+        let name = name.trim().to_ascii_uppercase();
+        if !catalog::library_exists(self.client, &lib).await? {
+            bail!("CPF2110: Library {} not found.", crate::qtemp::logical(&lib));
+        }
+        let text = match cmd.get("TEXT") {
+            "*BLANK" => "",
+            t => t,
+        };
+        let n = self
+            .client
+            .execute(
+                "INSERT INTO as4tainr.objects (library, name, objtype, attribute, text)
+                 VALUES ($1, $2, '*MSGQ', '', $3) ON CONFLICT DO NOTHING",
+                &[&lib, &name, &text],
+            )
+            .await?;
+        if n == 0 {
+            bail!(
+                "CPF2112: Object {name} in {} type *MSGQ already exists.",
+                crate::qtemp::logical(&lib)
+            );
+        }
+        // Messages left by an earlier queue of that name (a QTEMP that
+        // went with its job) are not this queue's.
+        self.client
+            .execute(
+                "DELETE FROM as4tainr.messages WHERE msgq=$1",
+                &[&format!("{lib}/{name}")],
+            )
+            .await?;
+        authority::set_owner(self.client, &lib, &name, "*MSGQ", &self.user).await?;
+        Ok(Outcome::Messages(vec![]))
+    }
+
+    /// DLTMSGQ: the queue and its messages; CPC2191 / CPF2105 as for
+    /// DLTDTAQ.
+    async fn dltmsgq(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (libs, name) = self.search(cmd.get("MSGQ"));
+        let name = name.to_ascii_uppercase();
+        let label = cmd
+            .get("MSGQ")
+            .to_ascii_uppercase()
+            .split_once('/')
+            .map(|x| x.0.to_string())
+            .unwrap_or_else(|| "*LIBL".into());
+        let mut msgs = Vec::new();
+        for l in &libs {
+            let objs = catalog::list_objects(self.client, l)
+                .await
+                .unwrap_or_default();
+            for o in objs
+                .iter()
+                .filter(|o| o.objtype == "*MSGQ" && catalog::name_matches(&name, &o.name))
+            {
+                authority::check(self.client, &self.user, l, &o.name, "*MSGQ", Aut::All).await?;
+                self.client
+                    .execute(
+                        "DELETE FROM as4tainr.messages WHERE msgq=$1",
+                        &[&format!("{l}/{}", o.name)],
+                    )
+                    .await?;
+                authority::forget(self.client, l, &o.name, "*MSGQ").await?;
+                self.client
+                    .execute(
+                        "DELETE FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype='*MSGQ'",
+                        &[l, &o.name],
+                    )
+                    .await?;
+                msgs.push(format!(
+                    "CPC2191: Object {} of type *MSGQ in library {} was deleted.",
+                    o.name,
+                    crate::qtemp::logical(l)
+                ));
+            }
+            if !msgs.is_empty() && !name.ends_with('*') {
+                break;
+            }
+        }
+        if msgs.is_empty() {
+            bail!("CPF2105: Object {name} of type *MSGQ in library {label} not found.");
+        }
+        Ok(Outcome::Messages(msgs))
+    }
+
     async fn sndmsg(&mut self, cmd: &Command) -> Result<Outcome> {
+        let queues: Vec<String> = cmd
+            .list("TOMSGQ")
+            .iter()
+            .flat_map(|v| v.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+            .filter(|q| q != "*NONE")
+            .collect();
+        if !queues.is_empty() {
+            let kind = match cmd.get("MSGTYPE") {
+                "*INQ" => "*INQ",
+                _ => "*INFO",
+            };
+            let from_job = self.id.as_ref().map(|i| i.to_string()).unwrap_or_default();
+            let mut keys = Vec::new();
+            for q in &queues {
+                let q = q.to_ascii_uppercase();
+                let (libs, name) = match q.split_once('/') {
+                    Some(_) => self.search(&q),
+                    None => (self.library_list(), q.clone()),
+                };
+                let mut libs = libs;
+                if q.starts_with("*LIBL/") || !q.contains('/') {
+                    libs.push("QUSRSYS".into());
+                }
+                match crate::jobs::msgq_key(self.client, &libs, &name).await? {
+                    Some(k) => keys.push(k),
+                    None => {
+                        let lib = q.split_once('/').map(|x| x.0).unwrap_or("*LIBL");
+                        bail!("CPF2403: Message queue {name} in {lib} not found.");
+                    }
+                }
+            }
+            for k in &keys {
+                crate::jobs::send_message(
+                    self.client,
+                    k,
+                    &self.user,
+                    &from_job,
+                    kind,
+                    cmd.get("MSG"),
+                )
+                .await?;
+            }
+            return Ok(Outcome::Messages(vec![]));
+        }
         let to = cmd.get("TOUSR").to_string();
+        if to.is_empty() {
+            bail!("CPF0006: The command has errors and was not run. SNDMSG needs TOUSR or TOMSGQ.");
+        }
         let to = if to == "*SYSOPR" {
             "QSYSOPR".to_string()
         } else {
@@ -5202,6 +5719,13 @@ impl Job<'_> {
     pub async fn chkobj(&mut self, obj: &str, objtype: &str, mbr: &str, aut: &str) -> Result<()> {
         let obj = obj.trim().to_ascii_uppercase();
         let objtype = objtype.trim().to_ascii_uppercase();
+        // OBJTYPE takes an object type only (the command analyzer's
+        // check comes before the object is looked for: CPD0084, CPF0006).
+        if !crate::cl::OBJECT_TYPES.contains(&objtype.as_str()) {
+            return Err(crate::cl::value_error(&format!(
+                "Value '{objtype}' for parameter OBJTYPE is not an object type."
+            )));
+        }
         let (label, name) = match obj.split_once('/') {
             Some((l, n)) => (l.to_string(), n.to_string()),
             None => ("*LIBL".to_string(), obj.clone()),
@@ -5694,7 +6218,7 @@ impl Job<'_> {
         let (libs, name) = match pgm.split_once('/') {
             Some(("*LIBL", n)) => (self.library_list(), n.to_string()),
             Some(("*CURLIB", n)) => (vec![self.current_library()], n.to_string()),
-            Some((l, n)) => (vec![l.to_string()], n.to_string()),
+            Some((l, n)) => (vec![crate::qtemp::real(l)], n.to_string()),
             None => (self.library_list(), pgm.clone()),
         };
         // System APIs done here (in QSYS on IBM i): data queues, user

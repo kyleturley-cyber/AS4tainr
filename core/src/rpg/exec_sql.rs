@@ -24,6 +24,9 @@ pub(super) struct SqlState {
     prepared: HashMap<String, String>,
     /// How the last statement other than GET DIAGNOSTICS ended.
     last: Option<Outcome>,
+    /// File names an override gives another file for SQL: name → what
+    /// its temporary view shows.
+    ovr_views: HashMap<String, String>,
 }
 
 /// The cursors and prepared statements of a module that stays active (a
@@ -153,6 +156,11 @@ fn sqlstate(code: i64) -> &'static str {
 /// An error from the SQL layer ("SQL0204: ...") as SQLCODE and text.
 fn sql_error(e: &anyhow::Error) -> Option<Outcome> {
     let m = format!("{e:#}");
+    // AS4TAINR_TRACE_ERRORS=1: SQL errors a program gets in its SQLCA
+    // too (they are not exceptions).
+    if std::env::var_os("AS4TAINR_TRACE_ERRORS").is_some() {
+        eprintln!("[SQL error] {m}");
+    }
     let digits: String = m.strip_prefix("SQL")?.chars().take(4).collect();
     if digits.len() != 4 || !digits.chars().all(|c| c.is_ascii_digit()) {
         return None;
@@ -422,10 +430,125 @@ impl Machine<'_> {
     }
 
     fn run_sql(&mut self, sql: &str) -> Result<Exec> {
+        self.sql_overrides(sql)?;
         let client = self.io.client;
         let rt = self.io.rt.clone();
         let s = self.session()?;
         rt.block_on(s.exec(client, sql))
+    }
+
+    /// Database file overrides in effect for the names the statement uses
+    /// (OVRDBF FILE TOFILE MBR; Db2 for i SQL Programming, "Using
+    /// overrides with SQL": SQL statements use the overriding file and
+    /// member): a temporary view of that name, over the other file or the
+    /// source member.
+    fn sql_overrides(&mut self, sql: &str) -> Result<()> {
+        let mut all: Vec<crate::ovr::Override> = self
+            .io
+            .cl
+            .as_ref()
+            .map(|c| c.overrides.clone())
+            .unwrap_or_default();
+        // Those scoped to activation groups (OVRSCOPE(*ACTGRPDFN) in a
+        // named or *NEW group) last after the program that made them.
+        crate::ovr::merge_scoped(&self.io.job_key, &mut all);
+        let ovr: Vec<crate::ovr::Override> = all
+            .into_iter()
+            .filter(|o| o.kind == crate::ovr::Kind::Db)
+            .collect();
+        if ovr.is_empty() && self.sql.ovr_views.is_empty() {
+            return Ok(());
+        }
+        let up = sql.to_ascii_uppercase();
+        let uses = |name: &str| find_word(&up, name).is_some();
+        let mut names: Vec<String> = ovr.iter().map(|o| o.file.to_ascii_uppercase()).collect();
+        names.extend(self.sql.ovr_views.keys().cloned());
+        names.sort();
+        names.dedup();
+        for name in names {
+            if !uses(&name) {
+                continue;
+            }
+            let body = match crate::ovr::effective(&ovr, crate::ovr::Kind::Db, &name) {
+                Some(o) => {
+                    let to = o.tofile.clone().unwrap_or_else(|| name.clone());
+                    let (lib, file) = match to.split_once('/') {
+                        Some((l, f)) if l != "*LIBL" => (Some(crate::qtemp::real(l)), f.to_string()),
+                        Some((_, f)) => (None, f.to_string()),
+                        None => (None, to.clone()),
+                    };
+                    let libs = match &lib {
+                        Some(l) => vec![l.clone()],
+                        None => self.io.libl.clone(),
+                    };
+                    let rt = self.io.rt.clone();
+                    let client = self.io.client;
+                    let mut found = None;
+                    for l in &libs {
+                        let attr: Option<String> = rt
+                            .block_on(client.query_opt(
+                                "SELECT attribute FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+                                &[l, &file],
+                            ))?
+                            .map(|r| r.get(0));
+                        if let Some(a) = attr {
+                            found = Some((l.clone(), a));
+                            break;
+                        }
+                    }
+                    let Some((l, attr)) = found else { continue };
+                    let q = |v: &str| format!("'{}'", v.replace('\'', "''"));
+                    if attr == "PF-SRC" {
+                        let mbr = match &o.mbr {
+                            Some(m) if !m.starts_with('*') => m.clone(),
+                            _ => rt
+                                .block_on(client.query_opt(
+                                    "SELECT member FROM as4tainr.source_members WHERE library=$1 AND file=$2 ORDER BY added, member LIMIT 1",
+                                    &[&l, &file],
+                                ))?
+                                .map(|r| r.get(0))
+                                .unwrap_or_default(),
+                        };
+                        Some(format!(
+                            "SELECT srcseq, srcdat, srcdta FROM as4tainr_svc.source_lines({}, {}, {})",
+                            q(&l),
+                            q(&file),
+                            q(&mbr)
+                        ))
+                    } else {
+                        let f = rt.block_on(crate::catalog::resolve_file(
+                            client,
+                            std::slice::from_ref(&l),
+                            &file,
+                        ))?;
+                        let cols: Vec<String> = f.file.fields.iter().map(|x| x.column()).collect();
+                        Some(format!(
+                            "SELECT {} FROM {}.{}",
+                            cols.join(", "),
+                            crate::catalog::ident(&l),
+                            crate::catalog::ident(&file)
+                        ))
+                    }
+                }
+                None => None,
+            };
+            let had = self.sql.ovr_views.get(&name).cloned();
+            if had.as_deref() == body.as_deref() {
+                continue;
+            }
+            let rt = self.io.rt.clone();
+            let s = self.session()?;
+            rt.block_on(s.temp_view(&name, body.as_deref()))?;
+            match body {
+                Some(b) => {
+                    self.sql.ovr_views.insert(name, b);
+                }
+                None => {
+                    self.sql.ovr_views.remove(&name);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The value of a host variable as a literal (`:ds` is its subfields,
@@ -642,7 +765,7 @@ impl Machine<'_> {
                             }
                         } else {
                             match self.type_of(&t) {
-                                Some(DType::Timestamp) => Value::str(&db2_timestamp(text)),
+                                Some(DType::Timestamp(_)) => Value::str(&db2_timestamp(text)),
                                 Some(DType::Time(_)) => Value::str(&text.replace(':', ".")),
                                 _ => Value::str(text),
                             }
@@ -713,6 +836,9 @@ impl Machine<'_> {
             "EXECUTE" if second == "IMMEDIATE" => {
                 let at = find_word(sql, "IMMEDIATE").unwrap();
                 let text = self.statement_text(sql[at + 9..].trim())?;
+                if let Some(o) = self.sql_ddl(&text)? {
+                    return Ok(o);
+                }
                 return self.sql_change(&text);
             }
             "EXECUTE" => {
@@ -724,6 +850,9 @@ impl Machine<'_> {
                     .ok_or_else(|| anyhow!("SQL0518: Statement {second} was not prepared."))?;
                 let values = self.using_values(sql)?;
                 let text = fill_markers(&text, &values)?;
+                if let Some(o) = self.sql_ddl(&text)? {
+                    return Ok(o);
+                }
                 return self.sql_change(&text);
             }
             "SET" if second.starts_with(':') => {
@@ -746,25 +875,13 @@ impl Machine<'_> {
                     return self.single_row(&query, &hosts);
                 }
             }
-            "CREATE" | "DROP" | "LABEL" | "COMMENT" => {
-                // Data definition runs as it does in RUNSQLSTM; the
-                // statement has no host variables.
-                let curlib = self.io.cl.as_ref().and_then(|c| c.curlib.clone());
-                let rt = self.io.rt.clone();
-                let r = rt.block_on(crate::ddl::try_run(
-                    &self.io.database_url,
-                    &self.io.user,
-                    &self.io.libl,
-                    curlib,
-                    &mut None,
-                    sql,
-                ))?;
-                if r.is_some() {
-                    return Ok(Outcome::ok(0));
+            "CREATE" | "DROP" | "LABEL" | "COMMENT" | "ALTER" | "RENAME" => {
+                if let Some(o) = self.sql_ddl(sql)? {
+                    return Ok(o);
                 }
             }
             "CALL" => return self.sql_call(sql),
-            "GET" | "ALTER" | "GRANT" | "REVOKE" | "RENAME" | "LOCK" | "MERGE" => {
+            "GET" | "GRANT" | "REVOKE" | "LOCK" | "MERGE" => {
                 return Ok(Outcome::error(
                     -84,
                     format!("SQL0084: {first} statements are not supported in embedded SQL yet."),
@@ -782,6 +899,40 @@ impl Machine<'_> {
         }
         let text = self.bind_host(sql)?;
         self.sql_change(&text)
+    }
+
+    /// Data definition (CREATE, DROP, ALTER, RENAME, LABEL, COMMENT), static
+    /// or prepared: run as RUNSQLSTM runs it (no host variables). None when
+    /// it is not one; an SQL error goes to the SQLCA.
+    fn sql_ddl(&mut self, sql: &str) -> Result<Option<Outcome>> {
+        let first = sql
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if !matches!(
+            first.as_str(),
+            "CREATE" | "DROP" | "LABEL" | "COMMENT" | "ALTER" | "RENAME"
+        ) {
+            return Ok(None);
+        }
+        let curlib = self.io.cl.as_ref().and_then(|c| c.curlib.clone());
+        let rt = self.io.rt.clone();
+        match rt.block_on(crate::ddl::try_run(
+            &self.io.database_url,
+            &self.io.user,
+            &self.io.libl,
+            curlib,
+            &mut None,
+            sql,
+        )) {
+            Ok(Some(_)) => Ok(Some(Outcome::ok(0))),
+            Ok(None) => Ok(None),
+            Err(e) => match sql_error(&e) {
+                Some(o) => Ok(Some(o)),
+                None => Err(e),
+            },
+        }
     }
 
     /// The statement of PREPARE / EXECUTE IMMEDIATE: a host variable or

@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS as4tainr.jobs (
     ended        timestamptz,
     end_code     text NOT NULL DEFAULT ''  -- NORMAL, ABNORMAL
 );
+-- The last spooled file number the job gave (numbers are not reused
+-- within a job when files are deleted).
+ALTER TABLE as4tainr.jobs ADD COLUMN IF NOT EXISTS last_splf integer NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS as4tainr.job_log (
     seq    bigserial PRIMARY KEY,
     job    bigint NOT NULL,
@@ -652,6 +655,64 @@ pub async fn receive_message(
     Ok(Some(m))
 }
 
+/// The key a message queue's messages are kept under: a queue made with
+/// CRTMSGQ by "LIB/NAME" (the library's real name, so QTEMP is the
+/// job's), a user profile's queue (QUSRSYS/user, QSYS/QSYSOPR) by the
+/// user's name. `libs`: the libraries to look in, in order (real
+/// names). None: no such queue.
+pub async fn msgq_key(client: &Client, libs: &[String], name: &str) -> Result<Option<String>> {
+    let name = name.trim().to_ascii_uppercase();
+    for l in libs {
+        let hit = client
+            .query_opt(
+                "SELECT 1 FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype='*MSGQ'",
+                &[l, &name],
+            )
+            .await?
+            .is_some();
+        if hit {
+            return Ok(Some(format!("{l}/{name}")));
+        }
+    }
+    if libs.iter().any(|l| l == "QUSRSYS" || l == "QSYS") {
+        if name == "QSYSOPR" || crate::users::get(client, &name).await?.is_some() {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+/// A message queue's messages for the list APIs (QGYOLMSG), oldest
+/// first, with the moment each was sent in microseconds since 1970.
+pub async fn queue_messages(client: &Client, key: &str) -> Result<Vec<(i64, Message)>> {
+    let rows = client
+        .query(
+            "SELECT id, (extract(epoch FROM sent) * 1000000)::bigint, from_user, from_job,
+                    msgid, kind, text, is_new
+             FROM as4tainr.messages WHERE msgq=$1 ORDER BY id",
+            &[&key],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<_, i64>(1),
+                Message {
+                    id: r.get(0),
+                    sent: String::new(),
+                    from_user: r.get(2),
+                    from_job: r.get(3),
+                    msgid: r.get(4),
+                    kind: r.get(5),
+                    text: r.get(6),
+                    is_new: r.get(7),
+                },
+            )
+        })
+        .collect())
+}
+
 /// Number of new messages waiting on a user's queue.
 pub async fn new_messages(client: &Client, user: &str) -> Result<i64> {
     Ok(client
@@ -716,7 +777,10 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
         .unwrap_or("")
         .to_ascii_uppercase();
     set_function(&client, &id, &format!("CMD-{first}"), "RUN").await;
-    let normal = match job.run(&info.command).await {
+    // The job's own QTEMP, deleted when it ends.
+    let key = id.to_string();
+    let user = job.user.clone();
+    let normal = match crate::qtemp::scope(&client, &key, &user, job.run(&info.command)).await {
         Ok(crate::commands::Outcome::Messages(m)) => {
             for line in m {
                 log(

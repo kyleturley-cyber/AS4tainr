@@ -1,23 +1,45 @@
 /* Golden: environment variables, QSH from CL, short message data,    */
 /* an expression as a parameter value, a qualified *ALL/*ALL. Each    */
 /* result goes into AS4TRAINR1/GLDQSO (ID, VAL), printed by the list. */
+/* A message's data is written in hexadecimal (its first 40 bytes).   */
 PGM
   DCL &ID   *CHAR 7
-  DCL &D    *CHAR 100
+  DCL &D    *CHAR 400
   DCL &DL   *DEC (5 0)
   DCL &N    *DEC (10 0)
   DCL &M    *CHAR 100
   DCL &T    *CHAR 50
   DCL &K    *CHAR 10
   DCL &V    *CHAR 150
+  DCL &HX   *CHAR 80
+  DCL &I    *INT 4
+  DCL &J    *INT 4
+  DCL &B2   *CHAR 2
+  DCL &BY   *DEC (5 0)
+  DCL &HI   *DEC (5 0)
+  DCL &P    *INT 4
+  DCL &DIGS *CHAR 16 VALUE('0123456789ABCDEF')
 
   /* A qualified name whose object part is a special value: not a    */
   /* comment.                                                         */
   DSPOBJD OBJ(AS4TRAINR1/*ALL) OBJTYPE(*DTAARA) OUTPUT(*PRINT)
   MONMSG CPF0000
 
-  /* ADDENVVAR twice, REPLACE(*NO): the second one's message.         */
+  /* The completion messages of ADDENVVAR, CHGENVVAR, RMVENVVAR.      */
+  RMVMSG CLEAR(*ALL)
   ADDENVVAR ENVVAR(GLDVAR) VALUE('one') REPLACE(*YES)
+  CHGVAR &K 'addcomp'
+  CALLSUBR COMP
+  RMVMSG CLEAR(*ALL)
+  CHGENVVAR ENVVAR(GLDVAR) VALUE('two')
+  CHGVAR &K 'chgcomp'
+  CALLSUBR COMP
+  RMVMSG CLEAR(*ALL)
+  ADDENVVAR ENVVAR(GLDVAR) VALUE('three') REPLACE(*YES)
+  CHGVAR &K 'replcomp'
+  CALLSUBR COMP
+
+  /* ADDENVVAR again, REPLACE(*NO): its escape message.              */
   ADDENVVAR ENVVAR(GLDVAR) VALUE('two')
   MONMSG CPF0000 EXEC(DO)
     RCVMSG MSGTYPE(*EXCP) MSGID(&ID)
@@ -25,6 +47,10 @@ PGM
     CHGVAR &V &ID
     CALLSUBR PUT
   ENDDO
+  RMVMSG CLEAR(*ALL)
+  RMVENVVAR ENVVAR(GLDVAR)
+  CHGVAR &K 'rmvcomp'
+  CALLSUBR COMP
   RMVENVVAR ENVVAR(GLDNOPE)
   MONMSG CPF0000 EXEC(DO)
     RCVMSG MSGTYPE(*EXCP) MSGID(&ID)
@@ -47,29 +73,47 @@ PGM
     CALLSUBR PUT
   ENDDO
 
-  /* QSH: the completion message and its data (exit status 3).       */
+  /* QSH: the completion message and its data.                       */
   ADDENVVAR ENVVAR(QIBM_QSH_CMD_OUTPUT) VALUE(NONE) REPLACE(*YES)
+  RMVMSG CLEAR(*ALL)
   QSH CMD('exit 3')
   CHGVAR &K 'exit3'
   CALLSUBR COMP
+  RMVMSG CLEAR(*ALL)
   QSH CMD('exit 0')
   CHGVAR &K 'exit0'
   CALLSUBR COMP
+  RMVMSG CLEAR(*ALL)
   QSH CMD('kill -9 $$')
-  MONMSG CPF0000
+  MONMSG CPF0000 EXEC(DO)
+    RCVMSG MSGTYPE(*EXCP) MSGID(&ID)
+    CHGVAR &K 'sig9excp'
+    CHGVAR &V &ID
+    CALLSUBR PUT
+  ENDDO
   CHGVAR &K 'signal9'
   CALLSUBR COMP
 
-  /* QIBM_QSH_CMD_ESCAPE_MSG=Y: an exit status above 0 is an escape. */
+  /* QIBM_QSH_CMD_ESCAPE_MSG=Y: an exit status above 0 is an escape;  */
+  /* MONMSG CPF0000 does not name QSH0005, so a function check.       */
   ADDENVVAR ENVVAR(QIBM_QSH_CMD_ESCAPE_MSG) VALUE(Y) REPLACE(*YES)
+  RMVMSG CLEAR(*ALL)
   QSH CMD('exit 4')
   MONMSG CPF0000 EXEC(DO)
-    RCVMSG MSGTYPE(*EXCP) MSGDTA(&D) MSGDTALEN(&DL) MSGID(&ID)
-    CHGVAR &N %BIN(&D 1 4)
+    RCVMSG MSGTYPE(*EXCP) MSGDTA(&D) MSGDTALEN(&DL) MSGID(&ID) RMV(*NO)
     CHGVAR &K 'esc4'
-    CHGVAR &V (&ID *BCAT %CHAR(&DL) *BCAT %CHAR(&N))
-    CALLSUBR PUT
+    CALLSUBR DATA
+    RCVMSG MSGTYPE(*ESCAPE) MSGDTA(&D) MSGDTALEN(&DL) MSGID(&ID)
+    CHGVAR &K 'esc4esc'
+    CALLSUBR DATA
   ENDDO
+  QSH CMD('exit 4')
+  MONMSG QSH0005 EXEC(DO)
+    RCVMSG MSGTYPE(*EXCP) MSGDTA(&D) MSGDTALEN(&DL) MSGID(&ID)
+    CHGVAR &K 'esc4mon'
+    CALLSUBR DATA
+  ENDDO
+  RMVMSG CLEAR(*ALL)
   QSH CMD('exit 0')
   CHGVAR &K 'esc0'
   CALLSUBR COMP
@@ -86,31 +130,59 @@ PGM
   CRTMSGF MSGF(AS4TRAINR1/GLDMSGF)
   ADDMSGD MSGID(GLD0001) MSGF(AS4TRAINR1/GLDMSGF) MSG('<&1>') +
     FMT((*CHAR 20))
+  ADDMSGD MSGID(GLD0002) MSGF(AS4TRAINR1/GLDMSGF) MSG('<&1:&2>') +
+    FMT((*CHAR 4) (*CHAR 4))
   SNDPGMMSG MSGID(GLD0001) MSGF(AS4TRAINR1/GLDMSGF) MSGDTA('AB') +
     TOPGMQ(*SAME) MSGTYPE(*INFO)
   RCVMSG MSGTYPE(*INFO) MSG(&M)
   CHGVAR &K 'shortdata'
   CHGVAR &V &M
   CALLSUBR PUT
+  SNDPGMMSG MSGID(GLD0002) MSGF(AS4TRAINR1/GLDMSGF) MSGDTA('ABCDEF') +
+    TOPGMQ(*SAME) MSGTYPE(*INFO)
+  RCVMSG MSGTYPE(*INFO) MSG(&M)
+  CHGVAR &K 'short2'
+  CHGVAR &V &M
+  CALLSUBR PUT
 
-  /* An expression as a parameter's value.                            */
+  /* An expression as a parameter's value (*BCAT, *TCAT: the symbols */
+  /* |> and |< are other characters on PUB400, whose CCSID is 273).   */
   DLTDTAARA DTAARA(AS4TRAINR1/GLDEXP)
   MONMSG CPF0000
   CHGVAR &T 'Gold'
   CRTDTAARA DTAARA(AS4TRAINR1/GLDEXP) TYPE(*CHAR) LEN(10) +
-    TEXT(&T |> 'text' |< 'x')
+    TEXT(&T *BCAT 'text' *TCAT 'x')
   RTVOBJD OBJ(AS4TRAINR1/GLDEXP) OBJTYPE(*DTAARA) TEXT(&T)
   CHGVAR &K 'exprtext'
   CHGVAR &V &T
   CALLSUBR PUT
   RETURN
 
-  /* The next *COMP message: its ID, data length and first 4 bytes.  */
+  /* The next *COMP message: its ID, data length and data.           */
   SUBR COMP
     CHGVAR &ID ' '
+    CHGVAR &DL 0
     RCVMSG MSGTYPE(*COMP) MSGDTA(&D) MSGDTALEN(&DL) MSGID(&ID)
-    CHGVAR &N %BIN(&D 1 4)
-    CHGVAR &V (&ID *BCAT %CHAR(&DL) *BCAT %CHAR(&N))
+    CALLSUBR DATA
+  ENDSUBR
+
+  /* &ID, &DL and the first 40 bytes of &D in hexadecimal.           */
+  SUBR DATA
+    CHGVAR &HX ' '
+    CHGVAR &J 0
+    DOFOR VAR(&I) FROM(1) TO(40)
+      IF COND(&I *GT &DL) THEN(LEAVE)
+      CHGVAR &B2 (X'00' *CAT %SST(&D &I 1))
+      CHGVAR &BY %BIN(&B2)
+      CHGVAR &HI (&BY / 16)
+      CHGVAR &J (&J + 1)
+      CHGVAR &P (&HI + 1)
+      CHGVAR %SST(&HX &J 1) %SST(&DIGS &P 1)
+      CHGVAR &J (&J + 1)
+      CHGVAR &P (&BY - &HI * 16 + 1)
+      CHGVAR %SST(&HX &J 1) %SST(&DIGS &P 1)
+    ENDDO
+    CHGVAR &V (&ID *BCAT %CHAR(&DL) *BCAT &HX)
     CALLSUBR PUT
   ENDSUBR
 

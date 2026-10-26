@@ -8,7 +8,7 @@
 //! views of the structure's bytes, so overlays behave as on IBM i.
 //! (Formats: ILE RPG Reference, "Data Types and Data Formats".)
 
-use super::dec::Dec;
+use super::dec::{Dec, M};
 use crate::tn5250::ebcdic;
 use anyhow::{anyhow, bail, Result};
 
@@ -51,8 +51,9 @@ pub enum DType {
     /// Time (T), stored in its format (TIMFMT); its value in expressions
     /// is the *ISO form.
     Time(crate::rpg::dates::TimeFmt),
-    /// Timestamp (Z), 26 characters.
-    Timestamp,
+    /// Timestamp (Z) with this many fractional digits (0-12; TIMESTAMP
+    /// is 6): 19 characters, then a period and the fraction.
+    Timestamp(u8),
     /// Pointer (*): 16 bytes, opaque here.
     Pointer,
     /// Float (F): 4 or 8 bytes, IEEE binary floating point.
@@ -95,7 +96,7 @@ impl DType {
             DType::Ind => 1,
             DType::Date(f) => f.len(),
             DType::Time(_) => 8,
-            DType::Timestamp => 26,
+            DType::Timestamp(n) => ts_len(n),
             DType::Pointer => 16,
         }
     }
@@ -119,7 +120,7 @@ impl DType {
                 | DType::Varchar(_)
                 | DType::Date(_)
                 | DType::Time(_)
-                | DType::Timestamp
+                | DType::Timestamp(_)
                 | DType::Ucs2(_)
                 | DType::VarUcs2(_)
         )
@@ -142,7 +143,7 @@ impl DType {
             DType::Ind => 1,
             DType::Date(f) => f.len() as u32,
             DType::Time(_) => 8,
-            DType::Timestamp => 26,
+            DType::Timestamp(n) => ts_len(n) as u32,
             DType::Pointer => 16,
             n => n.precision().0,
         }
@@ -179,7 +180,7 @@ impl DType {
                 b.copy_from_slice(&e(&crate::rpg::dates::format_date((y, 1, 1), &f)))
             }
             DType::Time(f) => b.copy_from_slice(&e(&crate::rpg::dates::format_time((0, 0, 0), &f))),
-            DType::Timestamp => b.copy_from_slice(&e("0001-01-01-00.00.00.000000")),
+            DType::Timestamp(n) => b.copy_from_slice(&ts_fraction(&e("0001-01-01-00.00.00"), n)),
             DType::Pointer => {}
         }
         b
@@ -215,6 +216,9 @@ pub enum Value {
     List(Vec<Value>),
     /// A pointer with an address (*NULL is `Fig(Null)`).
     Ptr(super::mem::Ptr),
+    /// A float too large (or too small) for an exact decimal of 63
+    /// digits: FLOAT(8) *HIVAL, 1E300. Floats that fit are `Num`.
+    Float(f64),
 }
 
 /// The unit of a duration (ILE RPG Reference, %DIFF and the duration
@@ -257,6 +261,10 @@ impl Value {
             Value::Num(d) => Ok(*d),
             Value::Fig(Fig::Zeros) | Value::Fig(Fig::LoVal) => Ok(Dec::ZERO),
             Value::Ind(b) => Ok(Dec::from_i64(*b as i64)),
+            Value::Float(x) => bail!(
+                "RNQ0103: The float value {} does not fit a decimal of 63 digits.",
+                float_text(*x, 8)
+            ),
             other => bail!("expected a number, got {}", other.describe()),
         }
     }
@@ -292,6 +300,7 @@ impl Value {
             Value::Dur(u, n) => format!("{n} {u:?}"),
             Value::List(v) => format!("a list of {} values", v.len()),
             Value::Ptr(_) => "a pointer".into(),
+            Value::Float(x) => float_text(*x, 8),
         }
     }
 }
@@ -354,7 +363,7 @@ pub fn encode_num(t: &DType, v: &Dec, out: &mut [u8]) -> Result<()> {
             }
             let bytes = m.to_be_bytes();
             let n = out.len();
-            out.copy_from_slice(&bytes[16 - n..]);
+            out.copy_from_slice(&bytes[bytes.len() - n..]);
         }
         _ => bail!("not a numeric type"),
     }
@@ -369,15 +378,15 @@ pub fn decode_num(t: &DType, b: &[u8]) -> Result<Dec> {
     }
     let (_, decimals) = t.precision();
     let bad = || anyhow!("RNQ0907: Decimal-data error occurred (field contains invalid digits).");
-    let m: i128 = match *t {
+    let m: M = match *t {
         DType::Zoned(..) => {
-            let mut m: i128 = 0;
+            let mut m = M::ZERO;
             for &x in b {
                 let d = x & 0x0F;
                 if d > 9 {
                     return Err(bad());
                 }
-                m = m * 10 + d as i128;
+                m = m * 10 + M::from(d);
             }
             let zone = b.last().map(|x| x >> 4).unwrap_or(0xF);
             if zone == 0xD || zone == 0xB {
@@ -387,20 +396,20 @@ pub fn decode_num(t: &DType, b: &[u8]) -> Result<Dec> {
             }
         }
         DType::Packed(..) => {
-            let mut m: i128 = 0;
+            let mut m = M::ZERO;
             let n = b.len();
             for (i, &x) in b.iter().enumerate() {
                 let hi = x >> 4;
                 if hi > 9 {
                     return Err(bad());
                 }
-                m = m * 10 + hi as i128;
+                m = m * 10 + M::from(hi);
                 if i + 1 < n {
                     let lo = x & 0x0F;
                     if lo > 9 {
                         return Err(bad());
                     }
-                    m = m * 10 + lo as i128;
+                    m = m * 10 + M::from(lo);
                 }
             }
             let sign = b.last().map(|x| x & 0x0F).unwrap_or(0xF);
@@ -417,16 +426,16 @@ pub fn decode_num(t: &DType, b: &[u8]) -> Result<Dec> {
                 [0u8; 16]
             };
             buf[16 - b.len()..].copy_from_slice(b);
-            i128::from_be_bytes(buf)
+            M::new(i128::from_be_bytes(buf))
         }
         DType::Uns(_) => {
             let mut buf = [0u8; 16];
             buf[16 - b.len()..].copy_from_slice(b);
-            i128::from_be_bytes(buf)
+            M::new(i128::from_be_bytes(buf))
         }
         _ => bail!("not a numeric type"),
     };
-    Ok(Dec::new(m, decimals as u8))
+    Ok(Dec::from_m(m, decimals as u8))
 }
 
 /// Store a value in a field of type `t` (bytes `out`), converting as RPG
@@ -459,7 +468,15 @@ pub fn store(t: &DType, v: &Value, out: &mut [u8], fit: Fit, right: bool) -> Res
         _ => {}
     }
     match t {
-        DType::Char(_) | DType::Date(_) | DType::Time(_) | DType::Timestamp => {
+        DType::Timestamp(n) => {
+            let src = match v {
+                Value::Fig(f) => return fill_fig(t, f, out),
+                Value::Num(_) => bail!("A numeric value cannot be assigned to a character field."),
+                other => other.chars()?,
+            };
+            put_chars(&ts_fraction(&src, *n), out, right);
+        }
+        DType::Char(_) | DType::Date(_) | DType::Time(_) => {
             let src = match v {
                 Value::Fig(f) => return fill_fig(t, f, out),
                 Value::Num(_) => bail!("A numeric value cannot be assigned to a character field."),
@@ -533,6 +550,14 @@ pub fn store(t: &DType, v: &Value, out: &mut [u8], fit: Fit, right: bool) -> Res
             ),
         },
         DType::Float(n) => {
+            if let Value::Float(x) = v {
+                if *n == 4 {
+                    out.copy_from_slice(&(*x as f32).to_be_bytes());
+                } else {
+                    out.copy_from_slice(&x.to_be_bytes());
+                }
+                return Ok(());
+            }
             let x = match v {
                 Value::Fig(Fig::Zeros) => Dec::ZERO,
                 Value::Fig(Fig::HiVal) | Value::Fig(Fig::LoVal) => {
@@ -566,8 +591,8 @@ pub fn store(t: &DType, v: &Value, out: &mut [u8], fit: Fit, right: bool) -> Res
             let n = match v {
                 Value::Fig(Fig::HiVal) | Value::Fig(Fig::LoVal) => {
                     let (d, p) = t.precision();
-                    let nines = Dec::parse(&"9".repeat(d as usize))?
-                        .div_scale(&Dec::from_i64(10i64.pow(p)), p as u8)?;
+                    let nines =
+                        Dec::from_m(Dec::parse(&"9".repeat(d as usize))?.mantissa(), p as u8);
                     if matches!(v, Value::Fig(Fig::HiVal)) {
                         nines
                     } else if matches!(t, DType::Uns(_)) {
@@ -615,7 +640,7 @@ pub fn load(t: &DType, b: &[u8]) -> Result<Value> {
                 Err(_) => Value::Char(b.to_vec()),
             }
         }
-        DType::Char(_) | DType::Date(_) | DType::Time(_) | DType::Timestamp => {
+        DType::Char(_) | DType::Date(_) | DType::Time(_) | DType::Timestamp(_) => {
             Value::Char(b.to_vec())
         }
         DType::Varchar(max) => {
@@ -634,6 +659,15 @@ pub fn load(t: &DType, b: &[u8]) -> Result<Value> {
             Some(p) => Value::Ptr(p),
             None => Value::Fig(Fig::Null),
         },
+        // A float beyond what a 63-digit decimal holds stays a float.
+        DType::Float(n) => {
+            let x = float_of(*n, b);
+            match float_dec(x) {
+                Ok(d) => Value::Num(d),
+                Err(_) if x.is_finite() => Value::Float(x),
+                Err(e) => return Err(e),
+            }
+        }
         _ => Value::Num(decode_num(t, b)?),
     })
 }
@@ -699,6 +733,21 @@ pub fn compare(x: &Value, y: &Value) -> Result<std::cmp::Ordering> {
             _ => bail!("{} and {} cannot be compared", x.describe(), y.describe()),
         };
     }
+    // A float too large for a decimal: compared as floats.
+    if matches!(x, Value::Float(_)) || matches!(y, Value::Float(_)) {
+        let f = |v: &Value| -> Result<f64> {
+            match v {
+                Value::Float(x) => Ok(*x),
+                Value::Fig(Fig::HiVal) => Ok(f64::INFINITY),
+                Value::Fig(Fig::LoVal) => Ok(f64::NEG_INFINITY),
+                other => fig_num(other)?
+                    .to_string()
+                    .parse::<f64>()
+                    .map_err(|_| anyhow!("{} is not a number", other.describe())),
+            }
+        };
+        return Ok(f(x)?.partial_cmp(&f(y)?).unwrap_or(Ordering::Equal));
+    }
     Ok(match (x, y) {
         (Value::Num(a), b) => a.cmp(&fig_num(b)?),
         (a, Value::Num(b)) => fig_num(a)?.cmp(b),
@@ -720,9 +769,25 @@ pub fn compare(x: &Value, y: &Value) -> Result<std::cmp::Ordering> {
 
 fn fig_num(v: &Value) -> Result<Dec> {
     match v {
-        Value::Fig(Fig::HiVal) => Ok(Dec::new(i128::MAX / 10, 0)),
-        Value::Fig(Fig::LoVal) => Ok(Dec::new(-(i128::MAX / 10), 0)),
-        other => other.num(),
+        Value::Fig(Fig::HiVal) => Ok(Dec::from_m(M::MAX / 10, 0)),
+        Value::Fig(Fig::LoVal) => Ok(Dec::from_m(-(M::MAX / 10), 0)),
+        other => other.num().or_else(|e| hex_unsigned(other).ok_or(e)),
+    }
+}
+
+/// A hexadecimal literal (or a constant defined by one) where a number
+/// is expected, as in `%bitand(flags: x'0800') = x'0800'`: its bytes as an
+/// unsigned integer. ILE RPG takes hex literals of up to 8 bytes as
+/// numeric values there (iRPGUnit's SRCMBR compares QDBRTVFD's flags this
+/// way). At run time a hex literal is character data, so this applies to
+/// character values of 1 to 8 bytes that are not a number's text.
+pub fn hex_unsigned(v: &Value) -> Option<Dec> {
+    match v {
+        Value::Char(b) if !b.is_empty() && b.len() <= 8 => Some(Dec::new(
+            b.iter().fold(0i128, |acc, &x| (acc << 8) | i128::from(x)),
+            0,
+        )),
+        _ => None,
     }
 }
 
@@ -932,4 +997,42 @@ mod float_tests {
         // UCS-2: two bytes a character, blanks are U+0020.
         assert_eq!(DType::Ucs2(2).initial(), vec![0, 0x20, 0, 0x20]);
     }
+}
+
+/// The length of a timestamp with N fractional digits.
+pub fn ts_len(n: u8) -> usize {
+    if n == 0 {
+        19
+    } else {
+        20 + n as usize
+    }
+}
+
+/// A timestamp's text (EBCDIC) with N fractional digits: a shorter
+/// fraction gets zeros, a longer one is cut (ILE RPG Reference,
+/// "Timestamp Data Type": assignment between timestamps of different
+/// precision pads with zeros or truncates). Text that is not a
+/// timestamp is left as it is, for the checks that follow.
+pub fn ts_fraction(src: &[u8], n: u8) -> Vec<u8> {
+    const DOT: u8 = 0x4B;
+    const ZERO: u8 = 0xF0;
+    let body = src.len().min(19);
+    if src.len() < 19 || (src.len() > 19 && src[19] != DOT) {
+        return src.to_vec();
+    }
+    let frac: Vec<u8> = src
+        .get(20..)
+        .unwrap_or(&[])
+        .iter()
+        .copied()
+        .take_while(|c| (ZERO..=0xF9).contains(c))
+        .collect();
+    let mut out = src[..body].to_vec();
+    if n > 0 {
+        out.push(DOT);
+        for i in 0..n as usize {
+            out.push(frac.get(i).copied().unwrap_or(ZERO));
+        }
+    }
+    out
 }

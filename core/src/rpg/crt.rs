@@ -37,6 +37,24 @@ const JOB_CCSID: i32 = 37;
 const MAX_FDS: usize = 200;
 
 /// The C functions as4tainr provides, as bound names (upper case).
+/// C functions whose parameter (by its position) is a buffer they fill:
+/// passed by reference, it goes as the buffer's address even when the
+/// prototype says CONST.
+pub(super) const C_OUT_BUFFERS: &[(&str, usize)] = &[
+    ("GETCWD", 0),
+    ("STAT", 1),
+    ("LSTAT", 1),
+    ("STAT64", 1),
+    ("LSTAT64", 1),
+    ("FSTAT", 1),
+    ("FSTAT64", 1),
+    // localtime_r and gmtime_r fill the struct tm they are given.
+    ("LOCALTIME_R", 1),
+    ("GMTIME_R", 1),
+    // mitime builds the MI time in the variable it is given.
+    ("MITIME", 0),
+];
+
 pub const C_FUNCTIONS: &[&str] = &[
     "OPEN",
     "OPEN64",
@@ -72,6 +90,32 @@ pub const C_FUNCTIONS: &[&str] = &[
     "ATOLL",
     "SYSTEM",
     "QP0ZLPRINTF",
+    "PRINTF",
+    "PUTS",
+    "CHDIR",
+    "GETCWD",
+    "CVTHC",
+    "CVTCH",
+    "MITIME",
+    "WAITTIME",
+    "_ROPEN",
+    "_RWRITE",
+    "_RCLOSE",
+    "PREAD",
+    "PWRITE",
+    "PREAD64",
+    "PWRITE64",
+    "GETHOSTNAME",
+    "STAT",
+    "LSTAT",
+    "STAT64",
+    "LSTAT64",
+    "TIME",
+    "LOCALTIME",
+    "LOCALTIME_R",
+    "GMTIME",
+    "GMTIME_R",
+    "STRFTIME",
     "STRTOK",
     "STRSTR",
     "STRCHR",
@@ -203,6 +247,328 @@ impl<'a> Machine<'a> {
                     }),
                 };
                 self.c_result(r.map(|_| 0))
+            }
+            // The MI functions cvthc(result, source, n): n hexadecimal
+            // digits (EBCDIC '0'-'9', 'A'-'F') of the source's bytes; and
+            // cvtch(result, source, n): the bytes n hexadecimal digits
+            // stand for (ILE C/MI built-ins, bound from the system).
+            "CVTHC" | "CVTCH" => {
+                let n = int(2).max(0) as usize;
+                let digits = b"0123456789ABCDEF";
+                if name == "CVTHC" {
+                    let (sb, so) = self.addr(&val(1), n.div_ceil(2))?;
+                    let src: Vec<u8> = self.bufs[sb][so..so + n.div_ceil(2)].to_vec();
+                    let hex: Vec<u8> = (0..n)
+                        .map(|i| {
+                            let byte = src[i / 2];
+                            let d = if i % 2 == 0 { byte >> 4 } else { byte & 15 };
+                            data::e(&(digits[d as usize] as char).to_string())[0]
+                        })
+                        .collect();
+                    let (rb, ro) = self.addr(&val(0), n)?;
+                    self.bufs[rb][ro..ro + n].copy_from_slice(&hex);
+                } else {
+                    let (sb, so) = self.addr(&val(1), n)?;
+                    let src = data::a(&self.bufs[sb][so..so + n]);
+                    let nib: Vec<u8> = src
+                        .chars()
+                        .map(|c| c.to_digit(16).unwrap_or(0) as u8)
+                        .collect();
+                    let out: Vec<u8> = nib
+                        .chunks(2)
+                        .map(|c| (c[0] << 4) | c.get(1).copied().unwrap_or(0))
+                        .collect();
+                    let (rb, ro) = self.addr(&val(0), out.len())?;
+                    self.bufs[rb][ro..ro + out.len()].copy_from_slice(&out);
+                }
+                Ok(Value::Fig(Fig::Null))
+            }
+            // Record I/O to a printer file (ILE C _Ropen, _Rwrite,
+            // _Rclose): each _Rwrite prints a line on the job's spooled
+            // file (overrides apply as for RPG printer files). The _RFILE
+            // pointer addresses the file's name. Database files are not
+            // opened this way here (NULL).
+            "_ROPEN" => {
+                let f = self.c_string(&val(0))?.trim().to_ascii_uppercase();
+                let file = f.rsplit('/').next().unwrap_or(&f).to_string();
+                let libs = self.io.libl.clone();
+                let is_db = self
+                    .block(crate::catalog::object_exists(
+                        self.io.client,
+                        &libs,
+                        &file,
+                        "*FILE",
+                    ))
+                    .unwrap_or(false)
+                    && file != "QSYSPRT";
+                if is_db {
+                    return Ok(Value::Fig(Fig::Null));
+                }
+                self.ensure_printer(&file)?;
+                Ok(self.c_static_string(&file))
+            }
+            "_RWRITE" => {
+                let file = self.c_string(&val(0))?;
+                let n = int(2).max(0) as usize;
+                let (b, o) = self.addr(&val(1), n)?;
+                let text = data::a(&self.bufs[b][o..o + n]);
+                if let Some(p) = self.printers.get_mut(&file) {
+                    if p.line > crate::spool::PAGE_LENGTH {
+                        p.page += 1;
+                        p.line = 1;
+                    }
+                    p.buffer.push((p.page, p.line, text.trim_end().to_string()));
+                    p.line += 1;
+                }
+                self.flush_printer(&file)?;
+                Ok(self.c_static_string(""))
+            }
+            "_RCLOSE" => {
+                let file = self.c_string(&val(0))?;
+                self.flush_printer(&file)?;
+                if let Some(p) = self.printers.remove(&file) {
+                    if let Some(id) = p.spl {
+                        let client = self.io.client;
+                        self.block(crate::spool::close(client, id))?;
+                    }
+                }
+                num(0)
+            }
+            // pread/pwrite(fd, buf, n, offset): at the offset, the file
+            // position left as it was.
+            "PREAD" | "PWRITE" | "PREAD64" | "PWRITE64" => {
+                let fd = int(0) as i32;
+                let r = (|| -> Result<i64> {
+                    let here = self.c_lseek(fd, 0, 1)?;
+                    self.c_lseek(fd, int(3), 0)?;
+                    let n = if name.starts_with("PREAD") {
+                        self.c_read(fd, &val(1), int(2))
+                    } else {
+                        self.c_write(fd, &val(1), int(2))
+                    };
+                    self.c_lseek(fd, here, 0)?;
+                    n
+                })();
+                self.c_result(r)
+            }
+            // gethostname(buf, len): the system's name.
+            "GETHOSTNAME" => {
+                let host =
+                    std::env::var("AS4TAINR_SYSTEM_NAME").unwrap_or_else(|_| "AS4TAINR".into());
+                let mut bytes = data::e(&host);
+                bytes.push(0);
+                if (int(1).max(0) as usize) < bytes.len() {
+                    return self.c_result(Err(ifs::Errno(errno::EINVAL).into()));
+                }
+                let (b, o) = self.addr(&val(0), bytes.len())?;
+                self.bufs[b][o..o + bytes.len()].copy_from_slice(&bytes);
+                num(0)
+            }
+            // stat(path, buf), lstat: the IFS object's attributes in
+            // struct stat (QSYSINC/H SYSSTAT): mode (S_IFDIR 0040000 or
+            // S_IFREG 0100000 and the permission bits), size, access,
+            // modification and change times, block size, allocated size,
+            // object type (*DIR, *STMF), CCSID; 0, or -1 with errno.
+            "STAT" | "LSTAT" | "STAT64" | "LSTAT64" => {
+                let path = self.c_string(&val(0))?;
+                let r = self.block(ifs::stat(self.io.client, &path));
+                let e = match r {
+                    Ok(Some(e)) => e,
+                    Ok(None) => return self.c_result(Err(ifs::Errno(errno::ENOENT).into())),
+                    Err(e) => return self.c_result(Err(e)),
+                };
+                let secs = (e.changed_us / 1_000_000) as i32;
+                let mode: u32 = if e.dir { 0o040000 } else { 0o100000 } | (e.mode as u32 & 0o7777);
+                let mut b = Vec::with_capacity(128);
+                b.extend(mode.to_be_bytes());
+                b.extend(0u32.to_be_bytes()); // ino
+                b.extend(1u16.to_be_bytes()); // nlink
+                b.extend([0u8; 2]);
+                b.extend(0u32.to_be_bytes()); // uid
+                b.extend(0u32.to_be_bytes()); // gid
+                b.extend((e.size as i32).to_be_bytes());
+                for _ in 0..3 {
+                    b.extend(secs.to_be_bytes());
+                }
+                b.extend(0u32.to_be_bytes()); // dev
+                b.extend(4096u32.to_be_bytes()); // blksize
+                b.extend((((e.size + 4095) / 4096 * 4096) as u32).to_be_bytes());
+                b.extend(data::e(&format!(
+                    "{:<11}",
+                    if e.dir { "*DIR" } else { "*STMF" }
+                )));
+                b.push(0);
+                b.extend(0u16.to_be_bytes()); // codepage
+                b.extend((e.ccsid as u16).to_be_bytes());
+                b.resize(128, 0);
+                match args.get(1) {
+                    Some(Arg::Ref(l)) => {
+                        let (bf, o) = (l.buf, l.off);
+                        let n = 128.min(self.bufs[bf].len().saturating_sub(o));
+                        self.bufs[bf][o..o + n].copy_from_slice(&b[..n]);
+                    }
+                    _ => {
+                        let (bf, o) = self.addr(&val(1), 128)?;
+                        self.bufs[bf][o..o + 128].copy_from_slice(&b);
+                    }
+                }
+                num(0)
+            }
+            // time(ptr): seconds since 1970 (UTC, the job's time zone),
+            // also stored where ptr points.
+            "TIME" => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                if let Value::Ptr(_) = val(0) {
+                    let (b, o) = self.addr(&val(0), 4)?;
+                    self.bufs[b][o..o + 4].copy_from_slice(&(now as i32).to_be_bytes());
+                }
+                num(now)
+            }
+            // localtime(time), localtime_r(time, tm), gmtime, gmtime_r:
+            // the broken-down time (struct tm: nine int(10): sec, min,
+            // hour, mday, mon 0-11, year - 1900, wday 0 Sunday, yday 0-365,
+            // isdst), UTC.
+            "LOCALTIME" | "LOCALTIME_R" | "GMTIME" | "GMTIME_R" => {
+                let t: i64 = match args.first() {
+                    Some(Arg::Ref(l)) => self.bufs[l.buf]
+                        .get(l.off..l.off + 4)
+                        .map(|x| i32::from_be_bytes(x.try_into().unwrap_or([0; 4])) as i64)
+                        .unwrap_or(0),
+                    Some(Arg::Val(Value::Ptr(_))) => {
+                        let (b, o) = self.addr(&val(0), 4)?;
+                        i32::from_be_bytes(self.bufs[b][o..o + 4].try_into().unwrap_or([0; 4]))
+                            as i64
+                    }
+                    _ => int(0),
+                };
+                let tm = broken_down(t);
+                let bytes: Vec<u8> = tm.iter().flat_map(|v| v.to_be_bytes()).collect();
+                if name.ends_with("_R") {
+                    match args.get(1) {
+                        Some(Arg::Ref(l)) => {
+                            let (b, o) = (l.buf, l.off);
+                            if let Some(d) = self.bufs[b].get_mut(o..o + 36) {
+                                d.copy_from_slice(&bytes);
+                            }
+                            Ok(self.ptr_to(b, o))
+                        }
+                        _ => {
+                            let (b, o) = self.addr(&val(1), 36)?;
+                            self.bufs[b][o..o + 36].copy_from_slice(&bytes);
+                            Ok(val(1))
+                        }
+                    }
+                } else {
+                    let p = self.alloc(&Value::Num(Dec::from_i64(36)))?;
+                    let (b, o) = self.addr(&p, 36)?;
+                    self.bufs[b][o..o + 36].copy_from_slice(&bytes);
+                    Ok(p)
+                }
+            }
+            // strftime(dest, max, format, tm): %Y %y %m %d %H %M %S %j %a
+            // %A %b %B %p %e %I %%; the length, or 0 when it does not fit.
+            "STRFTIME" => {
+                let fmt = self.c_string(&val(2))?;
+                let tm: Vec<i32> = {
+                    let raw: Vec<u8> = match args.get(3) {
+                        Some(Arg::Ref(l)) => self.bufs[l.buf]
+                            .get(l.off..l.off + 36)
+                            .map(|x| x.to_vec())
+                            .unwrap_or_default(),
+                        Some(Arg::Val(Value::Char(c))) => c.clone(),
+                        _ => {
+                            let (b, o) = self.addr(&val(3), 36)?;
+                            self.bufs[b][o..o + 36].to_vec()
+                        }
+                    };
+                    raw.chunks(4)
+                        .take(9)
+                        .map(|c| i32::from_be_bytes(c.try_into().unwrap_or([0; 4])))
+                        .collect()
+                };
+                let text = strftime(&fmt, &tm);
+                let bytes = data::e(&text);
+                let max = int(1).max(0) as usize;
+                if bytes.len() + 1 > max {
+                    return num(0);
+                }
+                let (b, o) = self.addr(&val(0), bytes.len() + 1)?;
+                self.bufs[b][o..o + bytes.len()].copy_from_slice(&bytes);
+                self.bufs[b][o + bytes.len()] = 0;
+                num(bytes.len() as i64)
+            }
+            // mitime(time, hours, minutes, seconds, hundredths): an MI
+            // time interval in the 8-byte system clock format (bit 51 is
+            // one microsecond: microseconds × 4096); waittime(time,
+            // option): wait that long (at most a minute here).
+            "MITIME" => {
+                let us = ((int(1) * 3600 + int(2) * 60 + int(3)) * 1_000_000 + int(4) * 10_000)
+                    .max(0) as u64;
+                let bytes = (us << 12).to_be_bytes();
+                if let Some(Arg::Ref(l)) = args.first() {
+                    let (b, o) = (l.buf, l.off);
+                    if let Some(dst) = self.bufs[b].get_mut(o..o + 8) {
+                        dst.copy_from_slice(&bytes);
+                    }
+                    return Ok(self.ptr_to(b, o));
+                }
+                // The variable's address (a CONST-declared one included).
+                if let Some(Arg::Val(Value::Ptr(_))) = args.first() {
+                    let (b, o) = self.addr(&val(0), 8)?;
+                    self.bufs[b][o..o + 8].copy_from_slice(&bytes);
+                    return Ok(val(0));
+                }
+                Ok(Value::Fig(Fig::Null))
+            }
+            "WAITTIME" => {
+                let us = match args.first() {
+                    Some(Arg::Ref(l)) => self.bufs[l.buf]
+                        .get(l.off..l.off + 8)
+                        .map(|x| u64::from_be_bytes(x.try_into().unwrap_or([0; 8])) >> 12)
+                        .unwrap_or(0),
+                    Some(Arg::Val(Value::Char(c))) if c.len() >= 8 => {
+                        u64::from_be_bytes(c[..8].try_into().unwrap_or([0; 8])) >> 12
+                    }
+                    _ => 0,
+                };
+                std::thread::sleep(std::time::Duration::from_micros(us.min(60_000_000)));
+                Ok(Value::Fig(Fig::Null))
+            }
+            // chdir(path): the job's current directory (an existing
+            // directory: ENOENT, ENOTDIR). getcwd(buf, size): the path
+            // into buf, or NULL with ERANGE when it does not fit.
+            "CHDIR" => {
+                let path = self.c_string(&val(0))?;
+                let r = self
+                    .block(ifs::stat(self.io.client, &path))
+                    .and_then(|e| match e {
+                        Some(e) if e.dir => {
+                            ifs::set_current_dir(&e.path);
+                            Ok(0)
+                        }
+                        Some(_) => Err(ifs::Errno(errno::ENOTDIR).into()),
+                        None => Err(ifs::Errno(errno::ENOENT).into()),
+                    });
+                self.c_result(r)
+            }
+            "GETCWD" => {
+                let mut bytes = data::e(&ifs::current_dir());
+                bytes.push(0);
+                let dst = val(0);
+                if matches!(dst, Value::Fig(Fig::Null)) {
+                    self.set_errno(errno::EINVAL);
+                    return Ok(Value::Fig(Fig::Null));
+                }
+                if (int(1).max(0) as usize) < bytes.len() {
+                    self.set_errno(errno::ERANGE);
+                    return Ok(Value::Fig(Fig::Null));
+                }
+                let (b, o) = self.addr(&dst, bytes.len())?;
+                self.bufs[b][o..o + bytes.len()].copy_from_slice(&bytes);
+                Ok(dst)
             }
             "RENAME" => {
                 let old = self.c_string(&val(0))?;
@@ -343,11 +709,21 @@ impl<'a> Machine<'a> {
                     Value::Fig(Fig::Null) => return num(-1),
                     p => a(&self.str_at(&p, None)?.chars()?),
                 };
-                num(if self.run_cl(cmd.trim()).is_ok() {
-                    0
-                } else {
-                    1
-                })
+                // A failure's exception message ID goes to the runtime's
+                // exported data item _EXCP_MSGID (ILE C, system()).
+                match self.run_cl(cmd.trim()) {
+                    Ok(()) => num(0),
+                    Err(e) => {
+                        let id = crate::clpgm::error_id(&e);
+                        let mut b = data::e(&id);
+                        b.resize(7, 0x40);
+                        if let Ok(mut sh) = self.io.shared.lock() {
+                            sh.insert("_EXCP_MSGID".to_string(), b);
+                        }
+                        self.share_in();
+                        num(1)
+                    }
+                }
             }
             "QP0ZLPRINTF" => {
                 let mut vals = Vec::new();
@@ -362,6 +738,31 @@ impl<'a> Machine<'a> {
                 let text = self.printf(&vals)?;
                 self.job_log(&text);
                 num(text.len() as i64)
+            }
+            // printf and puts: the job's standard output, which PASE
+            // `system` writes out (to be checked against a real system);
+            // without a job (`as4tainr call`), the program's output.
+            "PRINTF" | "PUTS" => {
+                let text = if name == "PUTS" {
+                    let s = a(&self.str_at(&val(0), None)?.chars()?);
+                    format!("{s}\n")
+                } else {
+                    let mut vals = Vec::new();
+                    for i in 0..args.len() {
+                        let v = val(i);
+                        vals.push(match v {
+                            Value::Ptr(_) => self.str_at(&v, None)?,
+                            other => other,
+                        });
+                    }
+                    self.printf(&vals)?
+                };
+                if self.io.job.is_some() || !self.io.job_key.is_empty() {
+                    crate::pgmmsg::write_stdout(&self.io.job_key, &text);
+                } else {
+                    self.messages.push(text.trim_end_matches('\n').to_string());
+                }
+                num(if name == "PUTS" { 1 } else { text.len() as i64 })
             }
             // strtok(string, delimiters): the next token, the string
             // changed (a null character after the token); NULL for the
@@ -633,6 +1034,9 @@ impl<'a> Machine<'a> {
         let given = flags & (O_CCSID | O_CODEPAGE) != 0 && nargs >= 4;
         // A code page is taken as the CCSID of that number.
         let conv = if given && conv > 0 { conv as i32 } else { 0 };
+        // What this job wrote through other descriptors is in the file
+        // (IBM i: writes are seen by other opens at once).
+        self.c_flush();
         let client = self.io.client;
         let existing = self.block(ifs::stat(client, path))?;
         let (data, file_ccsid, created) = match existing {
@@ -859,5 +1263,113 @@ impl<'a> Machine<'a> {
             s.pos = to as usize;
             Ok(to)
         })
+    }
+}
+
+/// struct tm of a time in seconds since 1970, UTC.
+fn broken_down(t: i64) -> [i32; 9] {
+    let days = t.div_euclid(86_400);
+    let secs = t.rem_euclid(86_400);
+    // Civil date from days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let before = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334][(m - 1) as usize]
+        + i64::from(leap && m > 2);
+    [
+        (secs % 60) as i32,
+        (secs / 60 % 60) as i32,
+        (secs / 3600) as i32,
+        d as i32,
+        (m - 1) as i32,
+        (y - 1900) as i32,
+        (days + 4).rem_euclid(7) as i32,
+        (before + d - 1) as i32,
+        0,
+    ]
+}
+
+/// strftime's conversions on a struct tm.
+fn strftime(fmt: &str, tm: &[i32]) -> String {
+    const MON: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    const DAY: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    let g = |i: usize| tm.get(i).copied().unwrap_or(0);
+    let mut out = String::new();
+    let mut cs = fmt.chars();
+    while let Some(c) = cs.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match cs.next() {
+            Some('Y') => out.push_str(&format!("{:04}", g(5) + 1900)),
+            Some('y') => out.push_str(&format!("{:02}", (g(5) + 1900) % 100)),
+            Some('m') => out.push_str(&format!("{:02}", g(4) + 1)),
+            Some('d') => out.push_str(&format!("{:02}", g(3))),
+            Some('e') => out.push_str(&format!("{:2}", g(3))),
+            Some('H') => out.push_str(&format!("{:02}", g(2))),
+            Some('I') => out.push_str(&format!(
+                "{:02}",
+                if g(2) % 12 == 0 { 12 } else { g(2) % 12 }
+            )),
+            Some('M') => out.push_str(&format!("{:02}", g(1))),
+            Some('S') => out.push_str(&format!("{:02}", g(0))),
+            Some('j') => out.push_str(&format!("{:03}", g(7) + 1)),
+            Some('p') => out.push_str(if g(2) < 12 { "AM" } else { "PM" }),
+            Some('a') => out.push_str(&DAY[g(6).rem_euclid(7) as usize][..3]),
+            Some('A') => out.push_str(DAY[g(6).rem_euclid(7) as usize]),
+            Some('b') | Some('h') => out.push_str(&MON[g(4).rem_euclid(12) as usize][..3]),
+            Some('B') => out.push_str(MON[g(4).rem_euclid(12) as usize]),
+            Some('%') => out.push('%'),
+            Some(x) => {
+                out.push('%');
+                out.push(x);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod time_tests {
+    // The C runtime's struct tm (ISO C): 2026-10-24 12:34:56 UTC is a
+    // Saturday, day 296 of the year (0-based 296: Jan 1 is 0).
+    #[test]
+    fn broken_down_time() {
+        let tm = super::broken_down(1_792_845_296);
+        assert_eq!(tm[..8], [56, 34, 12, 24, 9, 126, 6, 296]);
+        assert_eq!(
+            super::strftime("%Y-%m-%d%H.%M.%S %a", &tm),
+            "2026-10-2412.34.56 Sat"
+        );
     }
 }

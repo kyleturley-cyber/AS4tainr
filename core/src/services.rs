@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 17";
+const VERSION: &str = "as4tainr services 24";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -92,7 +92,8 @@ SELECT o.library, o.name, o.objtype, o.attribute, o.text, o.created, o.owner,
             WHEN o.objtype = '*PGM'
             THEN coalesce((SELECT octet_length(p.source) FROM as4tainr.programs p
                            WHERE p.library = o.library AND p.name = o.name), 0)
-            ELSE 0 END AS size
+            ELSE 0 END AS size,
+       o.changed
 FROM as4tainr.objects o
 LEFT JOIN as4tainr.files f ON o.objtype = '*FILE' AND f.library = o.library AND f.name = o.name;
 
@@ -198,6 +199,7 @@ SELECT CAST(coalesce(ff.alias, ff.name) AS varchar(128)) COLLATE "C" AS column_n
                  WHEN ff.data_type IN ('H', 'BLOB') THEN 65535 END AS integer) AS ccsid,
        CAST(o.library AS varchar(128)) COLLATE "C" AS table_schema,
        CAST(CASE WHEN ff.dft = '"Null"' THEN 'NULL'
+                 WHEN ff.dft = '"User"' THEN 'USER'
                  WHEN ff.dft LIKE '{"Value":%' THEN ff.dft::jsonb ->> 'Value' END AS varchar(2000)) COLLATE "C" AS column_default,
        CAST(CASE WHEN ff.data_type IN ('A', 'H', 'G', 'CLOB', 'BLOB', 'DBCLOB', 'XML') THEN ff.length END AS integer)
             AS character_maximum_length,
@@ -335,7 +337,7 @@ const OBJECT_STATISTICS_COLUMNS: &[(&str, &str, &str)] = &[
     ("text", "varchar(50)", "o.text"),
     ("sql_object_type", "varchar(9)", "o.sql_object_type"),
     ("objlib", "varchar(10)", "o.library"),
-    ("change_timestamp", "timestamp", "o.created"),
+    ("change_timestamp", "timestamp", "o.changed"),
     ("user_changed", "varchar(3)", "'NO'"),
     ("source_file", "varchar(10)", "NULL"),
     ("source_library", "varchar(10)", "NULL"),
@@ -493,6 +495,9 @@ pub async fn init(client: &Client) -> Result<()> {
     if have.is_some() {
         drop_views(client).await;
     }
+    // The views' character columns are in the order of the files'
+    // (EBCDIC: collate.rs), so they compare with them.
+    let coll = crate::collate::clause(client).await?;
     client
         .batch_execute(&format!(
             "CREATE SCHEMA IF NOT EXISTS as4tainr_svc;
@@ -504,6 +509,9 @@ pub async fn init(client: &Client) -> Result<()> {
              GRANT USAGE ON SCHEMA as4tainr_svc TO {SQL_ROLE};
              GRANT SELECT ON as4tainr_svc.objects TO {SQL_ROLE};
              GRANT USAGE ON SCHEMA qsys2 TO {SQL_ROLE};
+             {SPOOLED_FILE_DATA}
+             GRANT USAGE ON SCHEMA systools TO {SQL_ROLE};
+             GRANT EXECUTE ON FUNCTION systools.spooled_file_data(varchar, varchar, integer) TO {SQL_ROLE};
              GRANT SELECT ON qsys2.sysschemas, qsys2.systables, qsys2.syscolumns,
                    qsys2.sysindexes, qsys2.syskeys, qsys2.sysviews TO {SQL_ROLE};
              GRANT EXECUTE ON FUNCTION qsys2.object_statistics(varchar, varchar, varchar) TO {SQL_ROLE};
@@ -513,7 +521,7 @@ pub async fn init(client: &Client) -> Result<()> {
             object_statistics(),
             work_services(),
             crate::journal::sql_functions() + &crate::pftrg::sql_functions() + &crate::sqlcat::sql() + &crate::sqlfn::sql()
-        ))
+        ).replace(" COLLATE \"C\"", &coll))
         .await
         .context("creating the QSYS2 services")?;
     Ok(())
@@ -554,7 +562,8 @@ fn library_list_info() -> String {
                 CAST(nullif(o.text, '') AS varchar(50)) COLLATE \"C\" AS text_description
          FROM unnest(current_schemas(false)) WITH ORDINALITY AS x(s, n)
          LEFT JOIN as4tainr.objects o
-           ON o.library = 'QSYS' AND o.objtype = '*LIB' AND o.name = upper(x.s);",
+           ON o.library = 'QSYS' AND o.objtype = '*LIB' AND o.name = upper(x.s)
+         WHERE x.s <> 'as4tainr_cast';",
         sys = system.join(", ")
     )
 }
@@ -695,6 +704,43 @@ fn system_value_info() -> String {
         rows.join(", ")
     )
 }
+
+/// SYSTOOLS.SPOOLED_FILE_DATA(job, spooled file name, number) (Db2 for i
+/// services, SPOOLED_FILE_DATA): the lines of a job's spooled file, the
+/// highest-numbered of that name when no number is given; QPJOBLOG by
+/// default; '*' is the statement's own job. None found: no rows (IBM i's
+/// CPYSPLF-based function ends in error).
+const SPOOLED_FILE_DATA: &str = r#"
+CREATE SCHEMA IF NOT EXISTS systools;
+DROP FUNCTION IF EXISTS systools.spooled_file_data(varchar, varchar, integer);
+CREATE FUNCTION systools.spooled_file_data(job_name varchar,
+    spooled_file_name varchar DEFAULT 'QPJOBLOG', spooled_file_number integer DEFAULT NULL)
+RETURNS TABLE (ordinal_position integer, spooled_data varchar(200))
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+  q text := upper(trim(job_name));
+  n bigint;
+  f bigint;
+BEGIN
+  IF q = '*' THEN
+    q := upper(coalesce(current_setting('as4tainr.job', true), ''));
+  END IF;
+  IF split_part(q, '/', 1) ~ '^[0-9]{1,6}$' THEN
+    n := split_part(q, '/', 1)::bigint;
+  END IF;
+  SELECT s.id INTO f FROM as4tainr.spooled_files s
+   WHERE s.job = n AND s.user_name = split_part(q, '/', 2) AND s.job_name = split_part(q, '/', 3)
+     AND s.file = upper(trim(spooled_file_name))
+     AND (spooled_file_number IS NULL OR s.number = spooled_file_number)
+   ORDER BY s.number DESC LIMIT 1;
+  IF f IS NULL THEN
+    RETURN;
+  END IF;
+  RETURN QUERY
+  SELECT CAST(row_number() OVER (ORDER BY l.seq) AS integer), CAST(left(l.text, 200) AS varchar(200))
+    FROM as4tainr.spool_lines l WHERE l.spl = f ORDER BY l.seq;
+END $$;
+"#;
 
 /// QSYS2.JOBLOG_INFO(job [, ignore errors]): a job's log, oldest first
 /// ('*' is the statement's own job).

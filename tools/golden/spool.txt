@@ -18,9 +18,8 @@ s_print|CALL PGM(AS4TRAINR1/GLDSPL)
 s_wrksplf|WRKSPLF SELECT(*CURRENT *ALL *ALL GLDSPL)
 s_dspsplf|DSPSPLF FILE(GLDSPL) SPLNBR(*LAST)
 s_dumpclr|RUNSQL SQL('DELETE FROM AS4TRAINR1/GLDSPO') COMMIT(*NONE)
-# In a batch job: its spooled files stay while it runs.
-s_dump|SBMJOB CMD(CALL PGM(AS4TRAINR1/GLDSPD)) JOB(GLDSPD)
-s_wait|!sleep 90; echo waited
+# Under `system` the spooled file is kept with QPRTJOB's (WRKSPLF).
+s_dump|CALL PGM(AS4TRAINR1/GLDSPD)
 s_out|CPYF FROMFILE(AS4TRAINR1/GLDSPO) TOFILE(*PRINT)
 # CRTSRVPGM: its completion message (ID and text), as `system` shows it.
 s_crtmod|!system "CRTRPGMOD MODULE(AS4TRAINR1/GLDSRV) SRCSTMF('/home/AS4TRAINR/gld/gldsrv.rpgle')" | tail -3

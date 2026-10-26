@@ -107,7 +107,7 @@ pub async fn find_queue(client: &Client, q: &str, libl: &[String]) -> Result<(St
     let q = q.trim().to_ascii_uppercase();
     let (libs, name, label) = match q.split_once('/') {
         Some(("*LIBL", n)) => (libl.to_vec(), n.to_string(), "*LIBL".to_string()),
-        Some((l, n)) => (vec![l.to_string()], n.to_string(), l.to_string()),
+        Some((l, n)) => (vec![crate::qtemp::real(l)], n.to_string(), l.to_string()),
         None => (libl.to_vec(), q.clone(), "*LIBL".to_string()),
     };
     for l in &libs {
@@ -454,10 +454,13 @@ impl Job<'_> {
             for r in self
                 .client
                 .query(
-                    "SELECT q.name, q.held,
+                    &format!(
+                        "SELECT q.name, q.held,
                             (SELECT count(*) FROM as4tainr.spooled_files s
                               WHERE s.outq_lib=q.library AND s.outq=q.name)
-                       FROM as4tainr.output_queues q WHERE q.library=$1 ORDER BY q.name",
+                       FROM as4tainr.output_queues q WHERE q.library=$1 ORDER BY q.name{}",
+                        crate::collate::clause(self.client).await?
+                    ),
                     &[l],
                 )
                 .await?

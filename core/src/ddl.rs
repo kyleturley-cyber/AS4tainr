@@ -46,6 +46,24 @@ impl std::fmt::Display for Name {
 pub enum Ddl {
     /// CREATE SCHEMA: a library.
     CreateSchema(String),
+    /// CREATE [OR REPLACE] ALIAS name FOR table [(member)] (Db2 for i SQL
+    /// Reference, CREATE ALIAS): a name for a table, or for one member of
+    /// a source file.
+    CreateAlias {
+        name: Name,
+        replace: bool,
+        target: Name,
+        member: Option<String>,
+    },
+    /// DROP ALIAS name.
+    DropAlias { name: Name, if_exists: bool },
+    /// RENAME [TABLE] name TO new [FOR SYSTEM NAME sys] (Db2 for i SQL
+    /// Reference, RENAME): the table's SQL name.
+    Rename {
+        name: Name,
+        to: String,
+        system: Option<String>,
+    },
     /// GRANT (or REVOKE) privileges ON a table or view TO users or PUBLIC;
     /// `object` None for schemas and routines (accepted, not kept).
     Grant {
@@ -194,6 +212,9 @@ pub struct Trigger {
 /// (queries and changes, which `sql::run` handles); an error for data
 /// definition that is not supported yet.
 pub fn parse(sql: &str) -> Result<Option<Ddl>> {
+    if let Some(create) = declared_temporary_table(sql) {
+        return parse(&create);
+    }
     let toks: Vec<Tok> = tokenize(sql)?
         .into_iter()
         .filter(|t| !matches!(t, Tok::Space(_)))
@@ -245,6 +266,26 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
                 Some("TRIGGER") if !unique => {
                     return create_trigger(sql, replace).map(Some);
                 }
+                Some("ALIAS") if !unique => {
+                    p.i += 1;
+                    let name = p.name()?;
+                    p.expect("FOR")?;
+                    let _ = p.eat("TABLE");
+                    let target = p.name()?;
+                    let member = if p.punct("(") {
+                        let m = p.ident()?;
+                        p.expect_punct(")")?;
+                        Some(m.to_ascii_uppercase())
+                    } else {
+                        None
+                    };
+                    Ddl::CreateAlias {
+                        name,
+                        replace,
+                        target,
+                        member,
+                    }
+                }
                 Some("SEQUENCE") if !unique => {
                     p.i += 1;
                     let name = p.name()?;
@@ -274,6 +315,18 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
                     bail!("SQL0104: Token {} not valid here.", show(t));
                 }
                 return Ok(Some(Ddl::DropTrigger { name, if_exists }));
+            }
+            if p.word().as_deref() == Some("ALIAS") {
+                p.i += 1;
+                let if_exists = p.eat("IF");
+                if if_exists {
+                    p.expect("EXISTS")?;
+                }
+                let name = p.name()?;
+                if let Some(t) = p.t.get(p.i) {
+                    bail!("SQL0104: Token {} not valid here.", show(t));
+                }
+                return Ok(Some(Ddl::DropAlias { name, if_exists }));
             }
             let kind = match p.word().as_deref() {
                 Some("TABLE") => "TABLE",
@@ -340,6 +393,8 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
                 Some(Tok::Str(s)) => s.to_ascii_uppercase(),
                 _ => bail!("SQL0104: SET SCHEMA needs a schema name."),
             };
+            // SESSION: the schema of declared temporary tables, QTEMP.
+            let schema = if schema == "SESSION" { "QTEMP".to_string() } else { schema };
             Ddl::SetSchema(validate_name("library", &schema).map_err(sql0104)?)
         }
         "ALTER" => {
@@ -357,7 +412,25 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
             p.i += 1;
             grant(&mut p, first == "REVOKE")?
         }
-        "RENAME" | "TRUNCATE" => {
+        "RENAME" => {
+            p.i += 1;
+            if p.eat("INDEX") {
+                bail!("SQL0084: RENAME INDEX is not supported yet.");
+            }
+            let _ = p.eat("TABLE");
+            let name = p.name()?;
+            p.expect("TO")?;
+            let to = p.ident()?;
+            let system = if p.eat("FOR") {
+                p.expect("SYSTEM")?;
+                p.expect("NAME")?;
+                Some(p.ident()?)
+            } else {
+                None
+            };
+            Ddl::Rename { name, to, system }
+        }
+        "TRUNCATE" => {
             bail!("SQL0084: {first} is not supported yet.")
         }
         _ => return Ok(None),
@@ -867,6 +940,16 @@ fn default_value(p: &mut P, f: &FieldDef) -> Result<FieldDefault> {
                     p.i += 1;
                     FieldDefault::Null
                 }
+                "USER" | "SESSION_USER" | "SYSTEM_USER" => {
+                    p.i += 1;
+                    if !matches!(f.data_type, DataType::Char) {
+                        bail!(
+                            "SQL0574: Default value {w} does not fit column {}.",
+                            f.name
+                        );
+                    }
+                    FieldDefault::User
+                }
                 "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" | "CURRENT" => {
                     p.i += 1;
                     let reg = if w == "CURRENT" {
@@ -876,6 +959,10 @@ fn default_value(p: &mut P, f: &FieldDef) -> Result<FieldDefault> {
                     };
                     if w == "CURRENT" {
                         p.i += 1;
+                    }
+                    // CURRENT USER: as USER.
+                    if reg == "USER" && matches!(f.data_type, DataType::Char) {
+                        return Ok(FieldDefault::User);
                     }
                     let fits = matches!(
                         (reg.as_str(), f.data_type),
@@ -979,6 +1066,66 @@ fn check_sql(toks: &[Tok], fields: &[FieldDef]) -> Result<String> {
 /// GENERATED ALWAYS | BY DEFAULT AS IDENTITY [(options)], after
 /// GENERATED (Db2 for i, CREATE TABLE): only integers and decimals with no
 /// decimal places can be identity columns.
+/// What GENERATED makes a column: an identity column, or one the
+/// database sets (ROW CHANGE TIMESTAMP, an auditing column).
+enum GeneratedSpec {
+    Identity(crate::dds::Identity),
+    Column(crate::dds::Generated),
+}
+
+/// GENERATED ALWAYS | BY DEFAULT, then AS IDENTITY [(options)], FOR EACH
+/// ROW ON UPDATE AS ROW CHANGE TIMESTAMP, or AS (DATA CHANGE OPERATION |
+/// special register | QSYS2.JOB_NAME) (Db2 for i SQL Reference, CREATE
+/// TABLE; SQL Programming, "Creating auditing columns").
+fn generated_spec(p: &mut P, f: &FieldDef) -> Result<GeneratedSpec> {
+    use crate::dds::Generated;
+    let save = p.i;
+    let _always = if p.eat("ALWAYS") {
+        true
+    } else {
+        p.expect("BY")?;
+        p.expect("DEFAULT")?;
+        false
+    };
+    if p.eat("FOR") {
+        for w in ["EACH", "ROW", "ON", "UPDATE", "AS", "ROW", "CHANGE", "TIMESTAMP"] {
+            p.expect(w)?;
+        }
+        return Ok(GeneratedSpec::Column(Generated::RowChangeTimestamp));
+    }
+    if p.eat("AS") && p.punct("(") {
+        let g = if p.eat("DATA") {
+            p.expect("CHANGE")?;
+            p.expect("OPERATION")?;
+            Some(Generated::DataChangeOperation)
+        } else if p.eat("SESSION_USER") || p.eat("USER") {
+            Some(Generated::SessionUser)
+        } else if p.eat("CURRENT") {
+            if p.eat("USER") {
+                Some(Generated::SessionUser)
+            } else if p.eat("SERVER") {
+                Some(Generated::CurrentServer)
+            } else {
+                None
+            }
+        } else if p.eat("CURRENT_SERVER") {
+            Some(Generated::CurrentServer)
+        } else if p.eat("QSYS2") && p.punct(".") && p.eat("JOB_NAME") {
+            Some(Generated::JobName)
+        } else {
+            None
+        };
+        if let Some(g) = g {
+            if p.punct(")") {
+                return Ok(GeneratedSpec::Column(g));
+            }
+        }
+        bail!("SQL0084: GENERATED columns with expressions other than DATA CHANGE OPERATION, SESSION_USER, USER, CURRENT USER, CURRENT SERVER and QSYS2.JOB_NAME are not supported yet.");
+    }
+    p.i = save;
+    identity(p, f).map(GeneratedSpec::Identity)
+}
+
 fn identity(p: &mut P, f: &FieldDef) -> Result<crate::dds::Identity> {
     let always = if p.eat("ALWAYS") {
         true
@@ -1286,8 +1433,13 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
                     } else if p.eat("CCSID") {
                         p.number()?;
                     } else if p.eat("GENERATED") {
-                        f.identity = Some(identity(p, &f)?);
-                        f.null_capable = false;
+                        match generated_spec(p, &f)? {
+                            GeneratedSpec::Identity(i) => {
+                                f.identity = Some(i);
+                                f.null_capable = false;
+                            }
+                            GeneratedSpec::Column(g) => f.generated = Some(g),
+                        }
                         f.default = None;
                     } else if p.eat("REFERENCES") {
                         // A column's referential constraint (IBM i SQL
@@ -1834,8 +1986,6 @@ fn alter_table(p: &mut P) -> Result<Ddl> {
     Ok(Ddl::AlterTable { table, action })
 }
 
-/// Top-level words of a statement with their byte offsets (outside
-/// constants, quoted names, comments and parentheses).
 /// CREATE [OR REPLACE] TRIGGER name [NO CASCADE] BEFORE | AFTER |
 /// INSTEAD OF  INSERT | DELETE | UPDATE [OF columns] [OR ...]  ON table
 /// [REFERENCING OLD [ROW] [AS] o NEW [ROW] [AS] n]  [FOR EACH ROW |
@@ -1994,6 +2144,51 @@ fn create_trigger(sql: &str, replace: bool) -> Result<Ddl> {
     }))
 }
 
+/// ALTER TABLE name alteration alteration ... (Db2 for i SQL Reference,
+/// ALTER TABLE: ADD, DROP and ALTER clauses one after another, without
+/// commas) as one ALTER TABLE statement per alteration; a statement with
+/// one alteration (or another statement) as it is. In ALTER [COLUMN] c
+/// DROP DEFAULT | NOT NULL | ..., that DROP belongs to the ALTER.
+pub(crate) fn alter_table_clauses(sql: &str) -> Vec<String> {
+    let words = top_words(sql);
+    let whole = vec![sql.to_string()];
+    if words.len() < 4 || words[0].1 != "ALTER" || words[1].1 != "TABLE" {
+        return whole;
+    }
+    let mut starts: Vec<usize> = Vec::new();
+    for j in 3..words.len() {
+        let w = words[j].1.as_str();
+        if !matches!(w, "ADD" | "DROP" | "ALTER") {
+            continue;
+        }
+        if w == "DROP" {
+            if let Some(&s) = starts.last() {
+                let col = if words[s + 1].1 == "COLUMN" { s + 2 } else { s + 1 };
+                if words[s].1 == "ALTER" && j == col + 1 {
+                    continue;
+                }
+            }
+        }
+        starts.push(j);
+    }
+    if starts.len() < 2 {
+        return whole;
+    }
+    let prefix = &sql[..words[starts[0]].0];
+    let body = sql.trim_end().trim_end_matches(';');
+    starts
+        .iter()
+        .enumerate()
+        .map(|(n, &j)| {
+            let from = words[j].0;
+            let to = starts.get(n + 1).map(|&k| words[k].0).unwrap_or(body.len());
+            format!("{prefix}{}", sql[from..to].trim_end())
+        })
+        .collect()
+}
+
+/// Top-level words of a statement with their byte offsets (outside
+/// constants, quoted names, comments and parentheses).
 fn top_words(sql: &str) -> Vec<(usize, String)> {
     let b: Vec<(usize, char)> = sql.char_indices().collect();
     let mut out = Vec::new();
@@ -3010,7 +3205,7 @@ async fn create_trigger_run(ctx: &mut Ctx<'_>, t: &Trigger) -> Result<String> {
         format!(
         "CREATE OR REPLACE FUNCTION {func}() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER \
          SET search_path = {} AS ${tag}$ BEGIN\n{code}RETURN {result};\nEND ${tag}$",
-        if path.is_empty() { "\"qgpl\"".to_string() } else { path.join(", ") }
+        crate::sql::joined_path(&path)
     );
     let exists = ctx
         .client
@@ -3124,6 +3319,42 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
             Ok(format!("Default schema set to {s}."))
         }
         Ddl::Comment => Ok("Comment accepted (not kept).".into()),
+        Ddl::Rename { name, to, system } => rename(ctx, name, to, system.as_deref()).await,
+        Ddl::CreateAlias {
+            name,
+            replace,
+            target,
+            member,
+        } => create_alias(ctx, name, *replace, target, member.as_deref()).await,
+        Ddl::DropAlias { name, if_exists } => {
+            let lib = crate::qtemp::real(&ctx.target(name));
+            let view = format!("{}.{}", ident(&lib), ident(&name.name));
+            let exists = ctx
+                .client
+                .query_opt(
+                    "SELECT 1 FROM as4tainr.sql_aliases WHERE library=$1 AND name=$2",
+                    &[&lib, &name.name],
+                )
+                .await?
+                .is_some();
+            if !exists {
+                if *if_exists {
+                    return Ok(format!("{} does not exist; nothing dropped.", name.name));
+                }
+                bail!("SQL0204: {} in {lib} type *FILE not found.", name.name);
+            }
+            ctx.client
+                .batch_execute(&format!("DROP VIEW IF EXISTS {view}"))
+                .await
+                .map_err(db)?;
+            ctx.client
+                .execute(
+                    "DELETE FROM as4tainr.sql_aliases WHERE library=$1 AND name=$2",
+                    &[&lib, &name.name],
+                )
+                .await?;
+            Ok(format!("Alias {} in {lib} dropped.", name.name))
+        }
         Ddl::CreateTrigger(t) => create_trigger_run(ctx, t).await,
         Ddl::DropTrigger { name, if_exists } => {
             let lib = ctx.target(name);
@@ -3477,6 +3708,12 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
                     .iter()
                     .map(|f| f.alias.clone().unwrap_or_else(|| f.name.clone()))
                     .collect();
+                // The job's QTEMP is written QTEMP (sql.rs maps it).
+                let lib = if crate::qtemp::is_qtemp(&lib) {
+                    "QTEMP".to_string()
+                } else {
+                    lib
+                };
                 let target = format!("{lib}.{}", name.name);
                 let insert = format!(
                     "INSERT INTO {target} ({}) SELECT {} FROM ({query}) AS AS4TAINR_Q",
@@ -3596,10 +3833,24 @@ pub async fn try_run(
             .await
             .map(Some);
     }
+    // ALTER TABLE with several alterations: one after another.
+    let parts = alter_table_clauses(stmt);
+    if parts.len() > 1 {
+        let mut last = None;
+        for part in &parts {
+            last = Box::pin(try_run(database_url, user, libl, curlib.clone(), schema, part)).await?;
+        }
+        return Ok(last);
+    }
     let Some(ddl) = parse(stmt)? else {
         return Ok(None);
     };
     let mut client = crate::runtime::connect_db(database_url).await?;
+    // The USER special register in what the definition runs (a column
+    // added with DEFAULT USER gets it in the rows already there).
+    client
+        .execute("SELECT set_config('as4tainr.user', $1, false)", &[&user])
+        .await?;
     let mut ctx = Ctx {
         client: &mut client,
         user,
@@ -3611,6 +3862,68 @@ pub async fn try_run(
     let msg = run(&mut ctx, &ddl).await?;
     *schema = ctx.schema;
     Ok(Some(msg))
+}
+
+/// DECLARE GLOBAL TEMPORARY TABLE name ... (Db2 for i SQL Reference): a
+/// table in the job's QTEMP (schema SESSION), written as the CREATE TABLE
+/// it amounts to; WITH REPLACE replaces one declared before, and the
+/// ON COMMIT, LOGGED and NOT LOGGED options change nothing here.
+fn declared_temporary_table(sql: &str) -> Option<String> {
+    let words: Vec<&str> = sql.split_whitespace().collect();
+    let up: Vec<String> = words.iter().take(4).map(|w| w.to_ascii_uppercase()).collect();
+    if up != ["DECLARE", "GLOBAL", "TEMPORARY", "TABLE"] {
+        return None;
+    }
+    let mut rest = sql.trim().trim_end_matches(';').trim_end().to_string();
+    // Past the four words.
+    for _ in 0..4 {
+        rest = rest.trim_start().split_once(char::is_whitespace)?.1.to_string();
+    }
+    let rest = rest.trim_start();
+    let (name, mut tail) = match rest.find(|c: char| c.is_whitespace() || c == '(') {
+        Some(i) => (rest[..i].to_string(), rest[i..].to_string()),
+        None => (rest.to_string(), String::new()),
+    };
+    let name = name
+        .rsplit(['.', '/'])
+        .next()
+        .unwrap_or(&name)
+        .to_string();
+    // The trailing options, last first.
+    let mut replace = false;
+    loop {
+        let t = tail.trim_end().to_string();
+        let u = t.to_ascii_uppercase();
+        let cut = [
+            ("WITH REPLACE", true),
+            ("ON COMMIT DELETE ROWS", false),
+            ("ON COMMIT PRESERVE ROWS", false),
+            ("ON ROLLBACK DELETE ROWS", false),
+            ("ON ROLLBACK PRESERVE ROWS", false),
+            ("NOT LOGGED", false),
+            ("LOGGED", false),
+        ]
+        .iter()
+        .find(|(o, _)| {
+            u.ends_with(o)
+                && u[..u.len() - o.len()]
+                    .chars()
+                    .last()
+                    .is_none_or(|c| c.is_whitespace() || c == ')')
+        });
+        match cut {
+            Some((o, r)) => {
+                replace |= *r;
+                tail = t[..t.len() - o.len()].to_string();
+            }
+            None => break,
+        }
+    }
+    Some(format!(
+        "CREATE {}TABLE QTEMP.{name} {}",
+        if replace { "OR REPLACE " } else { "" },
+        tail.trim()
+    ))
 }
 
 /// Split an SQL script into statements at semicolons outside constants,
@@ -3824,6 +4137,158 @@ async fn remake_alias(c: &Client, view: &Option<String>, tbl: &str) -> Result<()
     Ok(())
 }
 
+/// CREATE ALIAS (Db2 for i SQL Reference, CREATE ALIAS): a view of the
+/// table's columns; for a source file, of the member's records (SRCSEQ,
+/// SRCDAT, SRCDTA), an INSERT adding a record at the member's end, as a
+/// write does. Aliases are not objects here (no DDM file is made).
+async fn create_alias(
+    ctx: &mut Ctx<'_>,
+    name: &Name,
+    replace: bool,
+    target: &Name,
+    member: Option<&str>,
+) -> Result<String> {
+    let lib = crate::qtemp::real(&ctx.target(name));
+    let alias = validate_name("file", &name.name).map_err(sql0104)?;
+    let target = Name {
+        lib: target.lib.as_ref().map(|l| crate::qtemp::real(l)),
+        name: target.name.clone(),
+    };
+    let Some((tlib, attr, tsys)) = ctx.find(&target).await? else {
+        return Err(not_found(&target, "table"));
+    };
+    let view = format!("{}.{}", ident(&lib), ident(&alias));
+    let taken = ctx
+        .client
+        .query_opt(
+            "SELECT 1 FROM as4tainr.sql_aliases WHERE library=$1 AND name=$2",
+            &[&lib, &alias],
+        )
+        .await?
+        .is_some();
+    if taken && !replace
+        || catalog::object_exists(ctx.client, std::slice::from_ref(&lib), &alias, "*FILE").await?
+    {
+        bail!("SQL0601: {alias} in {lib} type *FILE already exists.");
+    }
+    let fields = if attr == "PF-SRC" {
+        vec![]
+    } else {
+        catalog::resolve_file(ctx.client, std::slice::from_ref(&tlib), &tsys)
+            .await?
+            .file
+            .fields
+    };
+    let tx = ctx.client.transaction().await?;
+    tx.batch_execute(&format!("DROP VIEW IF EXISTS {view}"))
+        .await
+        .map_err(db)?;
+    if attr == "PF-SRC" {
+        let member = match member {
+            Some(m) => m.to_string(),
+            None => tx
+                .query_opt(
+                    "SELECT member FROM as4tainr.source_members WHERE library=$1 AND file=$2
+                      ORDER BY added, member LIMIT 1",
+                    &[&tlib, &tsys],
+                )
+                .await?
+                .map(|r| r.get(0))
+                .unwrap_or_else(|| tsys.clone()),
+        };
+        let q = |v: &str| format!("'{}'", v.replace('\'', "''"));
+        tx.batch_execute(&format!(
+            "CREATE VIEW {view} AS SELECT srcseq, srcdat, srcdta \
+               FROM as4tainr_svc.source_lines({}, {}, {}); \
+             CREATE TRIGGER as4tainr_alias INSTEAD OF INSERT ON {view} \
+               FOR EACH ROW EXECUTE FUNCTION as4tainr.source_alias_insert({}, {}, {})",
+            q(&tlib),
+            q(&tsys),
+            q(&member),
+            q(&tlib),
+            q(&tsys),
+            q(&member)
+        ))
+        .await
+        .map_err(db)?;
+    } else {
+        let cols: Vec<String> = fields.iter().map(|x| x.column()).collect();
+        tx.batch_execute(&format!(
+            "CREATE VIEW {view} AS SELECT {} FROM {}.{}",
+            cols.join(", "),
+            ident(&tlib),
+            ident(&tsys)
+        ))
+        .await
+        .map_err(db)?;
+    }
+    tx.execute(
+        "INSERT INTO as4tainr.sql_aliases (library, name, target_library, target_file, member)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (library, name) DO UPDATE SET target_library=EXCLUDED.target_library,
+           target_file=EXCLUDED.target_file, member=EXCLUDED.member",
+        &[&lib, &alias, &tlib, &tsys, &member],
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(format!("Alias {alias} created in {lib}."))
+}
+
+/// RENAME TABLE (Db2 for i SQL Reference, RENAME): the new name is the
+/// table's SQL name; its system name is the FOR SYSTEM NAME one, else the
+/// new name when that is a valid system name. Only the SQL name can change
+/// here: a new system name (renaming the object) is not supported yet.
+async fn rename(ctx: &mut Ctx<'_>, table: &Name, to: &str, system: Option<&str>) -> Result<String> {
+    let Some((lib, attr, sys)) = ctx.find(table).await? else {
+        return Err(not_found(table, "table"));
+    };
+    let f = catalog::resolve_file(ctx.client, std::slice::from_ref(&lib), &sys).await?;
+    if attr != "PF" || f.file.view.is_some() {
+        bail!("SQL0156: {} is not a table.", table.name);
+    }
+    ctx.may_delete(&lib, &sys).await?;
+    let to = to.to_ascii_uppercase();
+    let new_sys = match system {
+        Some(s) => s.to_ascii_uppercase(),
+        None if validate_name("file", &to).is_ok() => to.clone(),
+        None => sys.clone(),
+    };
+    if new_sys != sys {
+        bail!("SQL0084: RENAME to another system name ({new_sys}) is not supported yet.");
+    }
+    if catalog::resolve_sql_file(ctx.client, std::slice::from_ref(&lib), &to)
+        .await
+        .is_ok_and(|x| x.file.name != sys)
+    {
+        bail!("SQL0601: {to} in {lib} already exists.");
+    }
+    let old: Option<String> = ctx
+        .client
+        .query_one(
+            "SELECT sql_name FROM as4tainr.files WHERE library=$1 AND name=$2",
+            &[&lib, &sys],
+        )
+        .await?
+        .get(0);
+    if let Some(o) = &old {
+        ctx.client
+            .batch_execute(&format!("DROP VIEW IF EXISTS {}.{}", ident(&lib), ident(o)))
+            .await
+            .map_err(db)?;
+    }
+    if to == sys {
+        ctx.client
+            .execute(
+                "UPDATE as4tainr.files SET sql_name=NULL WHERE library=$1 AND name=$2",
+                &[&lib, &sys],
+            )
+            .await?;
+    } else {
+        catalog::set_sql_name(ctx.client, &lib, &sys, &to, true).await?;
+    }
+    Ok(format!("Table {} renamed to {to}.", table.name))
+}
+
 /// ALTER TABLE.
 async fn alter(ctx: &mut Ctx<'_>, table: &Name, action: &Alter) -> Result<String> {
     let Some((lib, attr, sys)) = ctx.find(table).await? else {
@@ -3888,8 +4353,9 @@ async fn alter(ctx: &mut Ctx<'_>, table: &Name, action: &Alter) -> Result<String
             let tx = ctx.client.transaction().await?;
             let seq = fields.len() as i32;
             catalog::insert_field(&tx, &lib, &sys, seq, &new).await?;
+            let ebcdic = crate::collate::clause(&tx).await?;
             let coll = if new.data_type == DataType::Char {
-                " COLLATE \"C\""
+                ebcdic.as_str()
             } else {
                 ""
             };
@@ -3905,6 +4371,14 @@ async fn alter(ctx: &mut Ctx<'_>, table: &Name, action: &Alter) -> Result<String
             ))
             .await
             .map_err(db)?;
+            // A generated column: the table's trigger sets it from now on
+            // (existing rows keep null; Db2 fills them as of the ALTER, a
+            // gap: docs/fidelity-gaps.md).
+            if new.generated.is_some() {
+                let mut all = fields.clone();
+                all.push(new.clone());
+                catalog::generated_trigger(&tx, &lib, &sys, &all).await?;
+            }
             tx.commit().await?;
             constraints(ctx.client, &lib, &sys, &uniques, Some("PK"), checks).await?;
             remake_alias(ctx.client, &alias_view, &tbl).await?;
@@ -4275,6 +4749,32 @@ fn title(kind: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn alter_table_with_several_alterations() {
+        // Db2 for i SQL Reference, ALTER TABLE: alterations follow one
+        // another without commas.
+        assert_eq!(
+            alter_table_clauses(
+                "ALTER TABLE custmast\nADD COLUMN ChgTime TIMESTAMP not null DEFAULT CURRENT_TIMESTAMP\nADD column ChgUser varchar(18) not null DEFAULT USER;"
+            ),
+            [
+                "ALTER TABLE custmast\nADD COLUMN ChgTime TIMESTAMP not null DEFAULT CURRENT_TIMESTAMP",
+                "ALTER TABLE custmast\nADD column ChgUser varchar(18) not null DEFAULT USER",
+            ]
+        );
+        assert_eq!(
+            alter_table_clauses("ALTER TABLE t ALTER COLUMN a DROP DEFAULT DROP COLUMN b"),
+            ["ALTER TABLE t ALTER COLUMN a DROP DEFAULT", "ALTER TABLE t DROP COLUMN b"]
+        );
+        assert_eq!(
+            alter_table_clauses("ALTER TABLE t ALTER a DROP NOT NULL"),
+            ["ALTER TABLE t ALTER a DROP NOT NULL"]
+        );
+        for one in alter_table_clauses("ALTER TABLE l.t ADD x INT ADD CONSTRAINT k UNIQUE (x)") {
+            assert!(parse(&one).unwrap().is_some(), "{one}");
+        }
+    }
+
     fn table(sql: &str) -> (PhysicalFile, Uniques, Checks) {
         match parse(sql).unwrap().unwrap() {
             Ddl::CreateTable {
@@ -4398,6 +4898,7 @@ mod tests {
     fn unsupported_definitions_say_so() {
         for sql in [
             "CREATE TABLE T (A INT GENERATED ALWAYS AS (B + 1))",
+            "CREATE TABLE T (A VARCHAR(18) GENERATED ALWAYS AS (CURRENT CLIENT_APPLNAME))",
             "CREATE VIEW V AS SELECT 1 FROM T WITH LOCAL CHECK OPTION",
             "ALTER TABLE T ADD COLUMN B INT BEFORE A",
             "CREATE TABLE \"lower\" (A INT)",

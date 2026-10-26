@@ -41,6 +41,7 @@ pub const CEE_APIS: &[&str] = &[
     "CEECZST",
     "CEEDSHP",
     "CEEDOD",
+    "CEEGSI",
     "CEEUTCO",
     "CEEUTC",
     "CEEGMT",
@@ -765,26 +766,39 @@ impl<'a> Machine<'a> {
             // descriptor information 1 and 2, length, fc): the length of
             // the argument the current procedure got for that parameter
             // (as4tainr gives the length only: the other values are 0).
-            "CEEDOD" => {
+            "CEEDOD" | "CEEGSI" => {
                 let n = self.cee_num(g(0))?.to_i128()? as usize;
-                let len = self
+                let desc = self
                     .frames
                     .last()
                     .and_then(|f| f.lengths.get(n.wrapping_sub(1)).copied().flatten());
-                let Some(len) = len else {
+                let Some((len, ty, max)) = desc else {
+                    let fc = if name == "CEEGSI" { g(4) } else { g(6) };
                     return self.cee_end(
                         name,
-                        g(6),
+                        fc,
                         Some(Cond(
                             502,
                             "there is no operational descriptor for the parameter",
                         )),
                     );
                 };
-                for k in 1..=4 {
-                    self.cee_set(g(k), Value::Num(Dec::from_i64(0)))?;
+                let num = |v: i64| Value::Num(Dec::from_i64(v));
+                if name == "CEEGSI" {
+                    // CEEGSI (posn, data type, current length, maximum
+                    // length, fc).
+                    self.cee_set(g(1), num(ty as i64))?;
+                    self.cee_set(g(2), num(len as i64))?;
+                    self.cee_set(g(3), num(max as i64))?;
+                    return self.cee_end(name, g(4), None);
                 }
-                self.cee_set(g(5), Value::Num(Dec::from_i64(len as i64)))?;
+                // CEEDOD (posn, descriptor type: 2 an element, data type,
+                // descriptor information 1 and 2, data length, fc).
+                self.cee_set(g(1), num(2))?;
+                self.cee_set(g(2), num(ty as i64))?;
+                self.cee_set(g(3), num(0))?;
+                self.cee_set(g(4), num(0))?;
+                self.cee_set(g(5), num(len as i64))?;
                 self.cee_end(name, g(6), None)
             }
             // QlgConvertCase(request control block, input, output,
@@ -911,7 +925,7 @@ impl<'a> Machine<'a> {
                 let libs = if lib.is_empty() || lib == "*LIBL" {
                     self.io.libl.clone()
                 } else {
-                    vec![lib.clone()]
+                    vec![crate::qtemp::real(&lib)]
                 };
                 let client = self.io.client;
                 let mut found = None;

@@ -2387,7 +2387,7 @@ pub async fn find(
 ) -> Result<Option<Routine>> {
     let name = name.trim().to_ascii_uppercase().replace('.', "/");
     let (libs, n) = match name.split_once('/') {
-        Some((l, n)) => (vec![l.to_string()], n.to_string()),
+        Some((l, n)) => (vec![crate::qtemp::real(l)], n.to_string()),
         None => (libl.to_vec(), name.clone()),
     };
     for lib in libs {

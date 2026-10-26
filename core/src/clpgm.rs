@@ -299,7 +299,22 @@ pub(crate) fn parse_statement(line: usize, text: &str) -> Result<Statement> {
 pub(crate) fn named(st: &Statement, order: &[&str]) -> Result<HashMap<String, String>> {
     let mut out = HashMap::new();
     let mut pos = order.iter();
+    // A command parameter (IF THEN, ELSE CMD, WHEN THEN, OTHERWISE CMD,
+    // MONMSG EXEC) given positionally without parentheses: the command is
+    // the rest of the statement, as in `IF (&A=&B) GOTO LABEL` ("IF command
+    // in a CL program or procedure": COND and THEN "can be omitted for
+    // positional entry").
+    let mut open_cmd: Option<String> = None;
     for p in &st.params {
+        if let Some(k) = &open_cmd {
+            let v: &mut String = out.get_mut(k).unwrap();
+            v.push(' ');
+            match &p.keyword {
+                Some(kw) => v.push_str(&format!("{kw}({})", p.value)),
+                None => v.push_str(&p.value),
+            }
+            continue;
+        }
         let key = match &p.keyword {
             Some(k) => {
                 if !order.contains(&k.as_str()) {
@@ -326,6 +341,15 @@ pub(crate) fn named(st: &Statement, order: &[&str]) -> Result<HashMap<String, St
             (None, Some(inner)) => inner.to_string(),
             _ => p.value.clone(),
         };
+        if p.keyword.is_none()
+            && !p.value.starts_with('(')
+            && matches!(key.as_str(), "THEN" | "CMD" | "EXEC")
+            && order.last() == Some(&key.as_str())
+        {
+            open_cmd = Some(key.clone());
+        }
+        // QTEMP: the job's own library (qtemp.rs).
+        let value = crate::qtemp::in_value(&value);
         if out.insert(key.clone(), value).is_some() {
             bail!("line {}: {key} is given more than once", st.line);
         }
@@ -778,10 +802,13 @@ pub fn parse_expr(s: &str) -> Result<Expr> {
     Ok(e)
 }
 
+/// Character values compared as IBM i compares them: the shorter padded
+/// with blanks, then byte by byte in EBCDIC (CL programming, "Relational
+/// expressions": 'a' < 'A' < '1').
 fn pad_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     let n = a.chars().count().max(b.chars().count());
-    let pa = format!("{a:<n$}");
-    let pb = format!("{b:<n$}");
+    let pa = crate::tn5250::ebcdic::encode(&format!("{a:<n$}"));
+    let pb = crate::tn5250::ebcdic::encode(&format!("{b:<n$}"));
     pa.cmp(&pb)
 }
 
@@ -2534,6 +2561,198 @@ pub async fn run(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Result<Ou
     r.map(|(o, _)| o)
 }
 
+/// CVTDAT's conversion (CL reference): *MDY, *DMY, *YMD, *JUL (two-digit
+/// years: 40-99 are 19xx, 00-39 20xx), *MDYY, *DMYY, *YYMD, *CYMD (0 for
+/// 19xx, 1 for 20xx), *LONGJUL, *ISO, *USA, *EUR, *JIS; *JOB and *SYSVAL
+/// are *MDY (QDATFMT) with '/' (QDATSEP). TOSEP: a character, *NONE,
+/// *BLANK, *JOB, *SYSVAL (not used by *ISO, *USA, *EUR, *JIS). A date not
+/// valid: CPF0555.
+pub fn cvtdat(date: &str, from: &str, to: &str, sep: &str) -> Result<String> {
+    let bad = || anyhow!("CPF0555: Date {date} is not valid or not in format {from}.");
+    let fmt = |f: &str| -> String {
+        match f {
+            "*JOB" | "*SYSVAL" => "*MDY".into(),
+            other => other.to_string(),
+        }
+    };
+    let (from, to) = (fmt(from), fmt(to));
+    let d: String = date.chars().filter(|c| c.is_ascii_digit()).collect();
+    let n = |s: &str| -> Result<u32> { s.parse::<u32>().map_err(|_| bad()) };
+    let yy = |s: &str| -> Result<u32> {
+        let y = n(s)?;
+        Ok(if y >= 40 { 1900 + y } else { 2000 + y })
+    };
+    let need = |len: usize| -> Result<()> {
+        if d.len() == len {
+            Ok(())
+        } else {
+            Err(bad())
+        }
+    };
+    let from_jul = |y: u32, ddd: u32| -> Result<(u32, u32, u32)> {
+        let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
+        let lens = [
+            31,
+            if leap { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+        let mut left = ddd;
+        for (i, l) in lens.iter().enumerate() {
+            if left >= 1 && left <= *l {
+                return Ok((y, i as u32 + 1, left));
+            }
+            left = left.checked_sub(*l).ok_or_else(bad)?;
+        }
+        Err(bad())
+    };
+    let (y, m, dd) = match from.as_str() {
+        "*MDY" => {
+            need(6)?;
+            (yy(&d[4..6])?, n(&d[0..2])?, n(&d[2..4])?)
+        }
+        "*DMY" => {
+            need(6)?;
+            (yy(&d[4..6])?, n(&d[2..4])?, n(&d[0..2])?)
+        }
+        "*YMD" => {
+            need(6)?;
+            (yy(&d[0..2])?, n(&d[2..4])?, n(&d[4..6])?)
+        }
+        "*JUL" => {
+            need(5)?;
+            from_jul(yy(&d[0..2])?, n(&d[2..5])?)?
+        }
+        "*MDYY" | "*USA" => {
+            need(8)?;
+            (n(&d[4..8])?, n(&d[0..2])?, n(&d[2..4])?)
+        }
+        "*DMYY" | "*EUR" => {
+            need(8)?;
+            (n(&d[4..8])?, n(&d[2..4])?, n(&d[0..2])?)
+        }
+        "*YYMD" | "*ISO" | "*JIS" => {
+            need(8)?;
+            (n(&d[0..4])?, n(&d[4..6])?, n(&d[6..8])?)
+        }
+        "*CYMD" => {
+            need(7)?;
+            let c = n(&d[0..1])?;
+            (1900 + 100 * c + n(&d[1..3])?, n(&d[3..5])?, n(&d[5..7])?)
+        }
+        "*LONGJUL" => {
+            need(7)?;
+            from_jul(n(&d[0..4])?, n(&d[4..7])?)?
+        }
+        other => bail!("CPF0550: Date format {other} is not valid."),
+    };
+    let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
+    let lens = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if !(1..=12).contains(&m) || dd == 0 || dd > lens[m as usize - 1] {
+        return Err(bad());
+    }
+    let s = match sep {
+        "*NONE" => String::new(),
+        "*BLANK" => " ".into(),
+        "*JOB" | "*SYSVAL" => "/".into(),
+        other => other.trim_matches('\'').to_string(),
+    };
+    let two = |y: u32| -> Result<u32> {
+        if (1940..=2039).contains(&y) {
+            Ok(y % 100)
+        } else {
+            bail!("CPF0557: Date {date} is outside the range of format {to}.")
+        }
+    };
+    let jul = {
+        let mut t = dd;
+        for l in &lens[..m as usize - 1] {
+            t += l;
+        }
+        t
+    };
+    Ok(match to.as_str() {
+        "*MDY" => format!("{m:02}{s}{dd:02}{s}{:02}", two(y)?),
+        "*DMY" => format!("{dd:02}{s}{m:02}{s}{:02}", two(y)?),
+        "*YMD" => format!("{:02}{s}{m:02}{s}{dd:02}", two(y)?),
+        "*JUL" => format!("{:02}{s}{jul:03}", two(y)?),
+        "*MDYY" => format!("{m:02}{s}{dd:02}{s}{y:04}"),
+        "*DMYY" => format!("{dd:02}{s}{m:02}{s}{y:04}"),
+        "*YYMD" => format!("{y:04}{s}{m:02}{s}{dd:02}"),
+        "*CYMD" => {
+            if !(1900..=2899).contains(&y) {
+                bail!("CPF0557: Date {date} is outside the range of format {to}.");
+            }
+            format!("{}{:02}{s}{m:02}{s}{dd:02}", (y - 1900) / 100, y % 100)
+        }
+        "*LONGJUL" => format!("{y:04}{s}{jul:03}"),
+        "*ISO" | "*JIS" => format!("{y:04}-{m:02}-{dd:02}"),
+        "*USA" => format!("{m:02}/{dd:02}/{y:04}"),
+        "*EUR" => format!("{dd:02}.{m:02}.{y:04}"),
+        other => bail!("CPF0550: Date format {other} is not valid."),
+    })
+}
+
+/// One command with CL variables, outside a CL program: REXX's CL command
+/// environment, where `&NAME` is a REXX variable (in `vars` as `&NAME`,
+/// given back changed by a retrieve command or a CALL). The command's
+/// messages.
+pub async fn command_with_vars(
+    job: &mut Job<'_>,
+    text: &str,
+    vars: &mut HashMap<String, Var>,
+) -> Result<Vec<String>> {
+    let st = parse_statement(1, text)?;
+    let pgm = compile("REXX", "PGM\nENDPGM\n")?;
+    let mut msgs = Vec::new();
+    let mut io = FileIo::default();
+    command(job, &pgm, &st, vars, &mut msgs, &mut io).await?;
+    Ok(msgs)
+}
+
+/// A character variable for `command_with_vars`.
+pub fn char_var(value: &str, len: usize) -> Var {
+    let mut s: String = value.chars().take(len).collect();
+    while s.chars().count() < len {
+        s.push(' ');
+    }
+    Var {
+        ty: VarType::Char,
+        len: len as u32,
+        decimals: 0,
+        value: Value::Char(s),
+        defined: None,
+        based: None,
+        shadow: None,
+    }
+}
+
+/// A variable's value as text.
+pub fn var_text(v: &Var) -> String {
+    returned_text(v)
+}
+
 /// The parameters' values, for the caller.
 fn param_values(pgm: &Program, vars: &HashMap<String, Var>) -> Vec<String> {
     pgm.params
@@ -2772,6 +2991,22 @@ async fn run_program(
                                 .take()
                                 .unwrap_or_else(|| crate::pgmmsg::from_error(&e, &original));
                             job.calls.put(m, false);
+                            // A function check is an exception of its own,
+                            // the one RCVMSG MSGTYPE(*EXCP) gets; its data
+                            // starts with the unmonitored message's ID
+                            // (PUB400 2026-10-23, tools/golden/qsh.txt esc4).
+                            if id != original {
+                                let mut f = crate::pgmmsg::from_error(
+                                    &anyhow!(
+                                        "CPF9999: Function check: {original} was not monitored by {} at line {}.",
+                                        pgm.name,
+                                        st.line
+                                    ),
+                                    "CPF9999",
+                                );
+                                f.data = crate::rpg::data::e(&original);
+                                job.calls.put(f, false);
+                            }
                         }
                         if let Some((_, start)) = monitors
                             .iter()
@@ -3440,6 +3675,47 @@ async fn command(
             }
             Ok(None)
         }
+        // RMVMSG (CL reference): messages removed from the program's
+        // queue (PGMQ(*SAME) or *PRV): CLEAR(*ALL), *OLD, *NEW,
+        // *KEEPUNANS, or the one MSGKEY names (*BYKEY).
+        "RMVMSG" => {
+            let p = named(st, &["PGMQ", "MSGQ", "MSGKEY", "CLEAR", "RMVEXCP"])?;
+            let up = |k: &str, d: &str| -> String {
+                p.get(k)
+                    .map(|v| {
+                        v.trim()
+                            .trim_start_matches('(')
+                            .trim_end_matches(')')
+                            .trim()
+                            .to_ascii_uppercase()
+                    })
+                    .unwrap_or_else(|| d.to_string())
+            };
+            if p.contains_key("MSGQ") {
+                bail!("line {}: RMVMSG MSGQ is not supported yet", st.line);
+            }
+            let levels = match up("PGMQ", "*SAME")
+                .split_whitespace()
+                .next()
+                .unwrap_or("*SAME")
+            {
+                "*SAME" => 0,
+                "*PRV" => 1,
+                other => bail!(
+                    "line {}: RMVMSG PGMQ({other}) is not supported yet",
+                    st.line
+                ),
+            };
+            let key = match p.get("MSGKEY") {
+                None => None,
+                Some(k) => {
+                    let v = eval(&parse_expr(k.trim())?, vars)?.as_char()?;
+                    crate::pgmmsg::parse_key(&v)
+                }
+            };
+            job.calls.remove_from(levels, &up("CLEAR", "*BYKEY"), key);
+            Ok(None)
+        }
         // RCVMSG: a message from the program's own queue into variables;
         // with no message, character variables are blank and numbers zero.
         "RCVMSG" => {
@@ -3754,7 +4030,7 @@ async fn command(
                 Some(("*CURLIB", n)) => {
                     (vec![job.current_library()], n.to_string(), "*CURLIB".into())
                 }
-                Some((l, n)) => (vec![l.to_string()], n.to_string(), l.to_string()),
+                Some((l, n)) => (vec![crate::qtemp::real(l)], n.to_string(), l.to_string()),
                 None => (job.library_list(), obj.clone(), "*LIBL".into()),
             };
             let libs = if objtype == "*LIB" {
@@ -3769,7 +4045,9 @@ async fn command(
                     .query_opt(
                         "SELECT library, attribute, text, owner,
                                 to_char(created AT TIME ZONE 'UTC', 'YYMMDDHH24MISS'),
-                                extract(year FROM created)::int
+                                extract(year FROM created)::int,
+                                to_char(changed AT TIME ZONE 'UTC', 'YYMMDDHH24MISS'),
+                                extract(year FROM changed)::int
                            FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype=$3",
                         &[lib, &name, &objtype],
                     )
@@ -3799,17 +4077,59 @@ async fn command(
                 if year >= 2000 { 1 } else { 0 },
                 r.get::<_, String>(4)
             );
+            let cyear: i32 = r.get(7);
+            let changed = format!(
+                "{}{}",
+                if cyear >= 2000 { 1 } else { 0 },
+                r.get::<_, String>(6)
+            );
             let owner: String = r.get(3);
+            // Where a program or module came from (SRCF, SRCFLIB, SRCMBR,
+            // SRCDATE: CYYMMDDHHMMSS of the source member's change).
+            let src: Option<(String, String, String, String)> = match objtype.as_str() {
+                "*PGM" | "*MODULE" => {
+                    let table = if objtype == "*PGM" {
+                        "programs"
+                    } else {
+                        "modules"
+                    };
+                    job.client
+                        .query_opt(
+                            &format!(
+                                "SELECT src_file, src_lib, src_mbr,
+                                        coalesce(CASE WHEN extract(year FROM src_changed) >= 2000 THEN '1' ELSE '0' END
+                                                 || to_char(src_changed AT TIME ZONE 'UTC', 'YYMMDDHH24MISS'), '')
+                                   FROM as4tainr.{table} WHERE library=$1 AND name=$2"
+                            ),
+                            &[&lib, &name],
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+                }
+                _ => None,
+            };
             for (k, target) in &p {
                 let v = match k.as_str() {
                     "OBJ" | "OBJTYPE" | "ASPDEV" => continue,
-                    "RTNLIB" => Value::Char(lib.clone()),
+                    "RTNLIB" => Value::Char(crate::qtemp::logical(&lib)),
                     "OBJATR" => Value::Char(r.get(1)),
                     "TEXT" => Value::Char(r.get(2)),
                     "OWNER" | "CRTUSER" => Value::Char(owner.clone()),
-                    "CRTDATE" | "CHGDATE" => Value::Char(stamp.clone()),
+                    "CRTDATE" => Value::Char(stamp.clone()),
+                    "CHGDATE" => Value::Char(changed.clone()),
                     "OBJDMN" => Value::Char("*SYSTEM".into()),
                     "PGP" => Value::Char("*NONE".into()),
+                    "SRCF" | "SRCFLIB" | "SRCMBR" | "SRCDATE" if src.is_some() => {
+                        let s = src.clone().unwrap_or_default();
+                        Value::Char(match k.as_str() {
+                            "SRCF" => s.0,
+                            "SRCFLIB" => s.1,
+                            "SRCMBR" => s.2,
+                            _ => s.3,
+                        })
+                    }
                     _ => {
                         let name = target.trim().to_ascii_uppercase();
                         match vars.get(&name).map(|v| v.ty) {
@@ -3883,7 +4203,7 @@ async fn command(
                 Some(("*CURLIB", n)) => {
                     (vec![job.current_library()], n.to_string(), "*CURLIB".into())
                 }
-                Some((l, n)) => (vec![l.to_string()], n.to_string(), l.to_string()),
+                Some((l, n)) => (vec![crate::qtemp::real(l)], n.to_string(), l.to_string()),
                 None => (job.library_list(), file.clone(), "*LIBL".into()),
             };
             let mut found = None;
@@ -3912,13 +4232,16 @@ async fn command(
             let mut text: String = r.get(1);
             let source = attr.ends_with("-SRC") || attr == "PF-SRC";
             let (member, srctype, count): (String, String, i64) = if source {
+                let co = crate::collate::clause(job.client).await?;
                 let rows = job
                     .client
                     .query(
-                        "SELECT member, srctype, text, source,
-                                to_char(changed AT TIME ZONE 'UTC', 'YYMMDDHH24MISS'),
-                                extract(year FROM changed)::int
-                           FROM as4tainr.source_members WHERE library=$1 AND file=$2 ORDER BY member",
+                        &format!(
+                            "SELECT member, srctype, text, source,
+                                    to_char(changed AT TIME ZONE 'UTC', 'YYMMDDHH24MISS'),
+                                    extract(year FROM changed)::int
+                               FROM as4tainr.source_members WHERE library=$1 AND file=$2 ORDER BY member{co}"
+                        ),
                         &[&lib, &fname],
                     )
                     .await?;
@@ -3957,7 +4280,7 @@ async fn command(
             for (k, target) in &p {
                 let v = match k.as_str() {
                     "FILE" | "MBR" => continue,
-                    "RTNLIB" => Value::Char(lib.clone()),
+                    "RTNLIB" => Value::Char(crate::qtemp::logical(&lib)),
                     "RTNSYSNAME" => Value::Char(String::new()),
                     "RTNMBR" => Value::Char(member.clone()),
                     "FILEATR" => Value::Char(if attr.starts_with("LF") {
@@ -3990,12 +4313,68 @@ async fn command(
             }
             Ok(None)
         }
+        // CVTDAT (CL reference): a date from one format to another, into
+        // TOVAR.
+        "CVTDAT" => {
+            let p = named(st, &["DATE", "TOVAR", "FROMFMT", "TOFMT", "TOSEP"])?;
+            let get = |k: &str, d: &str| -> Result<String> {
+                Ok(match p.get(k) {
+                    Some(v) => substitute_text(v, vars)?
+                        .trim()
+                        .trim_matches('\'')
+                        .to_string(),
+                    None => d.to_string(),
+                })
+            };
+            let date = match p.get("DATE") {
+                Some(d) => eval(&parse_expr(d)?, vars)?.as_char()?,
+                None => bail!("line {}: CVTDAT needs DATE", st.line),
+            };
+            let out = cvtdat(
+                &date,
+                &get("FROMFMT", "*JOB")?.to_ascii_uppercase(),
+                &get("TOFMT", "*JOB")?.to_ascii_uppercase(),
+                &get("TOSEP", "*JOB")?.to_ascii_uppercase(),
+            )?;
+            let target = p
+                .get("TOVAR")
+                .ok_or_else(|| anyhow!("line {}: CVTDAT needs TOVAR", st.line))?;
+            set_var(vars, target, Value::Char(out))?;
+            Ok(None)
+        }
         "RTVJOBA" => {
-            let p = named(st, &["JOB", "USER", "NBR", "CURUSER", "TYPE", "CURLIB"])?;
+            let p = named(
+                st,
+                &[
+                    "JOB", "USER", "NBR", "CURUSER", "TYPE", "CURLIB", "USRLIBL", "SYSLIBL",
+                    "DATFMT", "DATSEP", "TIMSEP", "DECFMT", "CCSID", "DFTCCSID", "LANGID",
+                    "CNTRYID",
+                ],
+            )?;
+            // A library list as RTVJOBA returns it: each name in 11
+            // characters (CL reference, RTVJOBA USRLIBL and SYSLIBL).
+            let names = |l: &[String]| -> String { l.iter().map(|x| format!("{x:<11}")).collect() };
             for (k, target) in &p {
                 let v = match k.as_str() {
                     "USER" | "CURUSER" => Value::Char(job.user.clone()),
                     "CURLIB" => Value::Char(job.curlib.clone().unwrap_or_else(|| "*CRTDFT".into())),
+                    "USRLIBL" => Value::Char(names(&job.libl)),
+                    "SYSLIBL" => Value::Char(names(
+                        &crate::commands::SYSTEM_LIBRARY_LIST
+                            .iter()
+                            .map(|l| l.to_string())
+                            .collect::<Vec<_>>(),
+                    )),
+                    // The job's attributes: the system values' (as
+                    // QUSRJOBI JOBI0400 gives them).
+                    "DATFMT" => Value::Char("*MDY".into()),
+                    "DATSEP" => Value::Char("/".into()),
+                    "TIMSEP" => Value::Char(":".into()),
+                    "DECFMT" => Value::Char(" ".into()),
+                    "CCSID" => Value::Dec(Decimal::from(65535)),
+                    "DFTCCSID" => Value::Dec(Decimal::from(37)),
+                    "LANGID" => Value::Char("ENU".into()),
+                    "CNTRYID" => Value::Char("US".into()),
                     "TYPE" => Value::Char(if job.display.is_some() { "1" } else { "0" }.into()),
                     "JOB" => {
                         Value::Char(job.id.as_ref().map(|i| i.name.clone()).unwrap_or_default())
@@ -4319,6 +4698,32 @@ async fn command(
 }
 
 #[cfg(test)]
+mod cvtdat_tests {
+    // CL reference, CVTDAT: the formats' layouts; *CYMD's century digit
+    // (0: 1900s, 1: 2000s); two-digit years 1940-2039.
+    #[test]
+    fn formats() {
+        let c = super::cvtdat;
+        assert_eq!(c("1261024", "*CYMD", "*ISO", "*JOB").unwrap(), "2026-10-24");
+        assert_eq!(c("10/24/26", "*MDY", "*YYMD", "*NONE").unwrap(), "20261024");
+        assert_eq!(c("2026-10-24", "*ISO", "*JUL", "*NONE").unwrap(), "26297");
+        assert_eq!(c("991231", "*YMD", "*USA", "*JOB").unwrap(), "12/31/1999");
+        assert_eq!(
+            c("24.10.2026", "*EUR", "*CYMD", "*NONE").unwrap(),
+            "1261024"
+        );
+        assert!(c("1261324", "*CYMD", "*ISO", "*JOB")
+            .unwrap_err()
+            .to_string()
+            .starts_with("CPF0555"));
+        assert!(c("1401231", "*CYMD", "*MDY", "*JOB")
+            .unwrap_err()
+            .to_string()
+            .starts_with("CPF0557"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     // CL reference: a qualified name's object part can be a special
     // value (`OBJ(LIB/*ALL)`, RSTOBJ SELECT `*ALL/*ALL`); `/*` after a
@@ -4329,6 +4734,17 @@ mod tests {
         assert_eq!(l[0].1.trim(), "DSPOBJD OBJ(MYLIB/*ALL) OBJTYPE(*PGM)");
         let l = super::logical_lines("RSTOBJ SELECT((*INCLUDE *ALL/*ALL *ALL))\n").unwrap();
         assert!(l[0].1.contains("*ALL/*ALL"));
+    }
+
+    // CL programming, relational expressions: character values compare
+    // in EBCDIC, the shorter padded with blanks.
+    #[test]
+    fn character_comparison_is_ebcdic() {
+        use std::cmp::Ordering::*;
+        assert_eq!(super::pad_cmp("a", "A"), Less);
+        assert_eq!(super::pad_cmp("Z", "1"), Less);
+        assert_eq!(super::pad_cmp("AB", "AB   "), Equal);
+        assert_eq!(super::pad_cmp("A", "A1"), Less);
     }
 
     // CL programming, expressions in parameters: *CAT, *BCAT, *TCAT and
@@ -4535,6 +4951,29 @@ mod tests {
             "CPF2110"
         );
         assert_eq!(error_id(&anyhow!("no id here")), "CPF9898");
+    }
+
+    #[test]
+    fn positional_command_parameters_take_the_rest_of_the_statement() {
+        // "IF command in a CL program or procedure": COND and THEN can be
+        // omitted for positional entry, as in IF (&A=&B) GOTO LABEL.
+        let src = "PGM\nDCL &A *CHAR 2\nIF (&A = ' ') CHGVAR &A ('0')\n\
+                   IF (&A *EQ '0') GOTO END\nELSE CHGVAR VAR(&A) VALUE('9')\n\
+                   END: ENDPGM";
+        compile("T", src).unwrap();
+        let st = parse_statement(1, "IF (&A = ' ') CHGVAR &A ('0')").unwrap();
+        let p = named(&st, &["COND", "THEN"]).unwrap();
+        assert_eq!(p["THEN"], "CHGVAR &A ('0')");
+        let st = parse_statement(1, "ELSE GOTO X").unwrap();
+        assert_eq!(named(&st, &["CMD"]).unwrap()["CMD"], "GOTO X");
+        let st = parse_statement(1, "ELSE CHGVAR VAR(&A) VALUE('9')").unwrap();
+        assert_eq!(
+            named(&st, &["CMD"]).unwrap()["CMD"],
+            "CHGVAR VAR(&A) VALUE('9')"
+        );
+        // Not after a parenthesized command.
+        let st = parse_statement(1, "IF (&A = ' ') (GOTO X) Y").unwrap();
+        assert!(named(&st, &["COND", "THEN"]).is_err());
     }
 
     #[test]

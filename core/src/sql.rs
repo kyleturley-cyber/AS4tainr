@@ -31,6 +31,28 @@ use crate::catalog::{self, ident};
 /// The PostgreSQL role user SQL runs as.
 pub const SQL_ROLE: &str = "as4tainr_sql";
 
+/// The schema of the operators and functions for Db2's implicit casts
+/// between strings and numbers (`sqlfn::implicit_casts`), last in every
+/// SQL search path.
+pub const CAST_SCHEMA: &str = "as4tainr_cast";
+
+/// The PostgreSQL search path of a library list: its libraries, QGPL for
+/// none, then the implicit-cast schema.
+pub fn search_path(libl: &[String]) -> String {
+    let path: Vec<String> = libl.iter().map(|l| ident(l)).collect();
+    joined_path(&path)
+}
+
+/// `search_path` of library names already quoted.
+pub fn joined_path(quoted: &[String]) -> String {
+    let mut path = quoted.to_vec();
+    if path.is_empty() {
+        path.push("\"qgpl\"".into());
+    }
+    path.push(CAST_SCHEMA.into());
+    path.join(", ")
+}
+
 /// Create the SQL login role with a random password (made once, then
 /// kept, so processes starting together agree on it) and give it the
 /// library schemas (idempotent). Called from `catalog::init`. Fails if
@@ -74,7 +96,16 @@ pub async fn init(client: &Client) -> Result<()> {
         .batch_execute(&format!("ALTER ROLE {SQL_ROLE} PASSWORD '{password}'"))
         .await?;
     for lib in catalog::list_libraries(client).await? {
-        grant_library(client, &lib).await?;
+        // Another job's QTEMP may be gone by now.
+        if let Err(e) = grant_library(client, &lib).await {
+            let gone = e
+                .downcast_ref::<tokio_postgres::Error>()
+                .and_then(|e| e.code())
+                == Some(&tokio_postgres::error::SqlState::INVALID_SCHEMA_NAME);
+            if !gone {
+                return Err(e);
+            }
+        }
     }
     crate::services::init(client).await?;
     Ok(())
@@ -93,11 +124,30 @@ pub(crate) async fn connect_as_sql_role(client: &Client, database_url: &str) -> 
         })?;
     let mut cfg: tokio_postgres::Config = database_url.parse()?;
     cfg.user(SQL_ROLE);
-    cfg.password(password);
-    let (c, conn) = cfg
-        .connect(tokio_postgres::NoTls)
-        .await
-        .map_err(|e| anyhow!("SQL is not available: cannot log in as {SQL_ROLE} ({e})."))?;
+    cfg.password(password.clone());
+    let first = cfg.connect(tokio_postgres::NoTls).await;
+    let (c, conn) = match first {
+        Ok(x) => x,
+        // The role belongs to the PostgreSQL cluster, the password to
+        // each database: another as4tainr database of the cluster
+        // initialized after this one gave the role its own. This
+        // database's password again, then once more.
+        Err(e)
+            if e.code() == Some(&tokio_postgres::error::SqlState::INVALID_PASSWORD)
+                && password
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "+/".contains(c)) =>
+        {
+            client
+                .batch_execute(&format!("ALTER ROLE {SQL_ROLE} PASSWORD '{password}'"))
+                .await
+                .map_err(|_| anyhow!("SQL is not available: cannot log in as {SQL_ROLE} ({e})."))?;
+            cfg.connect(tokio_postgres::NoTls)
+                .await
+                .map_err(|e| anyhow!("SQL is not available: cannot log in as {SQL_ROLE} ({e})."))?
+        }
+        Err(e) => bail!("SQL is not available: cannot log in as {SQL_ROLE} ({e})."),
+    };
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -136,6 +186,13 @@ pub(crate) enum Tok {
 /// NEXT VALUE FOR seq (NEXTVAL FOR) and PREVIOUS VALUE FOR seq (PREVVAL
 /// FOR) (Db2 for i SQL Reference, sequence reference): the sequence's
 /// next value, and the last one NEXT VALUE gave in this session.
+
+/// The special registers CURRENT DATE, CURRENT TIME and CURRENT TIMESTAMP
+/// as PostgreSQL computes them: the time the statement started.
+const STMT_DATE: &str = "CAST(statement_timestamp() AS date)";
+const STMT_TIME: &str = "CAST(statement_timestamp() AS time(0))";
+const STMT_TIMESTAMP: &str = "CAST(statement_timestamp() AS timestamp)";
+
 fn sequence_values(toks: Vec<Tok>, is_library: &dyn Fn(&str) -> bool) -> Vec<Tok> {
     let mut out: Vec<Tok> = Vec::with_capacity(toks.len());
     let mut i = 0;
@@ -357,9 +414,112 @@ fn function_position(out: &[Tok]) -> bool {
 /// The USER special register (and SESSION_USER, SYSTEM_USER, CURRENT
 /// USER): the job's user profile; record-level access and triggers know
 /// the job by its name (number/user/name).
-const USER_SQL: &str = "CAST(COALESCE(NULLIF(current_setting('as4tainr.user', true), ''), \
+pub const USER_SQL: &str = "CAST(COALESCE(NULLIF(current_setting('as4tainr.user', true), ''), \
      NULLIF(split_part(current_setting('application_name'), '/', 2), ''), \
      upper(session_user)) AS varchar(18))";
+
+/// Columns named by their system name (`FOR COLUMN` of CREATE TABLE, DDS
+/// ALIAS's field name): SQL statements may use either name (Db2 for i SQL
+/// Reference, "Column names"); the PostgreSQL column carries the SQL name.
+/// A system name of the files in the library list whose SQL name differs
+/// is written as that SQL name (when its files agree on it).
+async fn system_column_names(client: &Client, libl: &[String], sql: &str) -> Result<String> {
+    // The words outside literals and quoted names: (start, end).
+    let cs: Vec<(usize, char)> = sql.char_indices().collect();
+    let is_word = |c: char| c.is_ascii_alphanumeric() || "_#@$".contains(c);
+    let mut words: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i].1;
+        if c == '\'' || c == '"' {
+            i += 1;
+            while i < cs.len() && cs[i].1 != c {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if is_word(c) && !c.is_ascii_digit() && (i == 0 || !is_word(cs[i - 1].1)) {
+            let start = cs[i].0;
+            while i < cs.len() && is_word(cs[i].1) {
+                i += 1;
+            }
+            let end = if i < cs.len() { cs[i].0 } else { sql.len() };
+            words.push((start, end));
+            continue;
+        }
+        i += 1;
+    }
+    let names: Vec<String> = words
+        .iter()
+        .map(|(a, b)| sql[*a..*b].to_ascii_uppercase())
+        .filter(|w| w.len() <= 10)
+        .collect();
+    if names.is_empty() || libl.is_empty() {
+        return Ok(sql.to_string());
+    }
+    let rows = client
+        .query(
+            "SELECT DISTINCT name, alias FROM as4tainr.file_fields
+              WHERE library = ANY($1) AND alias IS NOT NULL AND alias <> name AND name = ANY($2)",
+            &[&libl, &names],
+        )
+        .await?;
+    if rows.is_empty() {
+        return Ok(sql.to_string());
+    }
+    let mut map: std::collections::HashMap<String, Option<String>> = Default::default();
+    for r in rows {
+        let (n, a): (String, String) = (r.get(0), r.get(1));
+        map.entry(n)
+            .and_modify(|v| {
+                if v.as_deref() != Some(a.as_str()) {
+                    *v = None;
+                }
+            })
+            .or_insert(Some(a));
+    }
+    // A name that is some file's own column (SQL name) stays as it is.
+    let real: Vec<String> = client
+        .query(
+            "SELECT DISTINCT alias FROM as4tainr.file_fields
+              WHERE library = ANY($1) AND alias = ANY($2)",
+            &[&libl, &names],
+        )
+        .await?
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
+    // Nor do names of files and libraries.
+    let objects: Vec<String> = client
+        .query(
+            "SELECT DISTINCT name FROM as4tainr.objects
+              WHERE (library = ANY($1) AND objtype = '*FILE' OR objtype = '*LIB') AND name = ANY($2)",
+            &[&libl, &names],
+        )
+        .await?
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
+    let mut out = String::new();
+    let mut last = 0;
+    for (a, b) in words {
+        let w = sql[a..b].to_ascii_uppercase();
+        if let Some(Some(alias)) = map.get(&w) {
+            if !real.contains(&w) && !objects.contains(&w) {
+                out.push_str(&sql[last..a]);
+                out.push_str(&crate::catalog::pg_name(alias));
+                last = b;
+            }
+        }
+    }
+    out.push_str(&sql[last..]);
+    Ok(out)
+}
+
+/// The built-in global variable QSYS2.JOB_NAME (Db2 for i SQL Reference,
+/// built-in global variables): the job's qualified name, number/user/name.
+pub const JOB_NAME_SQL: &str = "as4tainr_svc.job_name()";
 
 /// LISTAGG(x [, separator]) WITHIN GROUP (ORDER BY ...) (Db2 for i SQL
 /// Reference, LISTAGG) as PostgreSQL's string_agg(x, separator ORDER BY
@@ -650,6 +810,38 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
         crate::sqljsonfn::rewrite(crate::sqljson::rewrite(tokenize(sql.trim())?)?)?,
         is_library,
     )));
+    // QTEMP.X and QTEMP/X: the job's own library (qtemp.rs). SESSION.X
+    // names a declared global temporary table, which lives in QTEMP.
+    for i in 0..toks.len() {
+        let dot = matches!(toks.get(i + 1), Some(Tok::Punct(p)) if p == ".");
+        if dot
+            && matches!(&toks[i], Tok::Word(w) if w.eq_ignore_ascii_case("SESSION"))
+            && !is_library("SESSION")
+        {
+            toks[i] = Tok::Word("QTEMP".into());
+        }
+    }
+    if let Some(real) = crate::qtemp::current() {
+        let mut i = 0;
+        while i < toks.len() {
+            let next = toks.get(i + 1).cloned();
+            if let (Tok::Word(w), Some(Tok::Punct(p))) = (&toks[i], next) {
+                if w.eq_ignore_ascii_case("QTEMP") {
+                    if p == "." {
+                        toks[i] = Tok::Word(ident(&real));
+                    } else if p == "/" {
+                        if let Some(Tok::Word(file)) = toks.get(i + 2).cloned() {
+                            toks.splice(
+                                i..i + 3,
+                                [Tok::Word(format!("{}.{}", ident(&real), ident(&file)))],
+                            );
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
     // One statement: a trailing ';' is allowed, no other.
     while matches!(toks.last(), Some(Tok::Space(_))) {
         toks.pop();
@@ -955,19 +1147,42 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
                 i += 1;
                 continue;
             }
+            // CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME: Db2's other
+            // spelling of the special registers (Db2 for i SQL Reference,
+            // special registers), read once for the statement as
+            // CURRENT TIMESTAMP is.
+            Some(w @ ("CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME"))
+                if call_open.is_none() =>
+            {
+                out.push(Tok::Word(
+                    match w {
+                        "CURRENT_TIME" => STMT_TIME,
+                        "CURRENT_TIMESTAMP" => STMT_TIMESTAMP,
+                        _ => STMT_DATE,
+                    }
+                    .into(),
+                ));
+                i += 1;
+                continue;
+            }
             Some("CURRENT") => {
                 if let Some(j) = next_non_space(&toks, i + 1) {
                     if let Some(n) = word(&toks[j]) {
                         // CURRENT TIME and CURRENT TIMESTAMP are local
                         // values without a time zone, TIME without
-                        // fractions (Db2 for i SQL Reference, special
-                        // registers).
+                        // fractions; each is read once for the statement,
+                        // not for its unit of work (Db2 for i SQL
+                        // Reference, special registers): PostgreSQL's
+                        // statement_timestamp(), not its transaction's
+                        // LOCALTIMESTAMP (a program under commitment
+                        // control would see the time its transaction
+                        // started).
                         if ["DATE", "TIME", "TIMESTAMP"].contains(&n.as_str()) {
                             out.push(Tok::Word(
                                 match n.as_str() {
-                                    "TIME" => "LOCALTIME(0)",
-                                    "TIMESTAMP" => "LOCALTIMESTAMP",
-                                    _ => "CURRENT_DATE",
+                                    "TIME" => STMT_TIME,
+                                    "TIMESTAMP" => STMT_TIMESTAMP,
+                                    _ => STMT_DATE,
                                 }
                                 .into(),
                             ));
@@ -1141,6 +1356,25 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
                     continue;
                 }
             }
+            // QSYS2.JOB_NAME: the built-in global variable.
+            Some("QSYS2")
+                if next_non_space(&toks, i + 1).is_some_and(
+                    |j| matches!(&toks[j], Tok::Punct(p) if p == "."),
+                ) && {
+                    let j = next_non_space(&toks, i + 1).unwrap_or(i);
+                    next_non_space(&toks, j + 1)
+                        .is_some_and(|k| word(&toks[k]).as_deref() == Some("JOB_NAME"))
+                        && !next_non_space(&toks, j + 1)
+                            .and_then(|k| next_non_space(&toks, k + 1))
+                            .is_some_and(|m| matches!(&toks[m], Tok::Punct(p) if p == "("))
+                } =>
+            {
+                let j = next_non_space(&toks, i + 1).unwrap_or(i);
+                let k = next_non_space(&toks, j + 1).unwrap_or(j);
+                out.push(Tok::Punct(JOB_NAME_SQL.into()));
+                i = k + 1;
+                continue;
+            }
             // USER (Db2 for i SQL Reference, special registers): the
             // job's user profile; record-level access and triggers know
             // the job by its name (number/user/name).
@@ -1156,6 +1390,30 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
             {
                 out.push(Tok::Punct(USER_SQL.into()));
                 i += 1;
+                continue;
+            }
+            // CAST(x AS CLOB(10M)): large objects are text and bytea
+            // here (the length, with its K, M or G, is not kept).
+            Some(w @ ("CLOB" | "DBCLOB" | "BLOB"))
+                if out
+                    .iter()
+                    .rev()
+                    .find(|t| !matches!(t, Tok::Space(_)))
+                    .and_then(word)
+                    .as_deref()
+                    == Some("AS") =>
+            {
+                out.push(Tok::Word(if w == "BLOB" { "bytea" } else { "text" }.into()));
+                i += 1;
+                if let Some(o) = next_non_space(&toks, i) {
+                    if toks[o] == Tok::Punct("(".into()) {
+                        if let Some(c) =
+                            (o..toks.len()).find(|&j| toks[j] == Tok::Punct(")".into()))
+                        {
+                            i = c + 1;
+                        }
+                    }
+                }
                 continue;
             }
             // CAST(x AS DOUBLE): Db2's DOUBLE is DOUBLE PRECISION.
@@ -1315,9 +1573,9 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
                     {
                         out.push(Tok::Word(
                             if f == "CURDATE" {
-                                "CURRENT_DATE"
+                                STMT_DATE
                             } else {
-                                "LOCALTIME(0)"
+                                STMT_TIME
                             }
                             .into(),
                         ));
@@ -1614,6 +1872,22 @@ pub enum Outcome {
 /// The most rows one SELECT returns to a display.
 pub const MAX_ROWS: usize = 9999;
 
+/// A constraint's name as the SQL statement gave it, and its library:
+/// constraints are named FILE_NAME in PostgreSQL (ddl.rs), the name
+/// being per table there and per schema in Db2.
+fn constraint_name(db: &tokio_postgres::error::DbError) -> Option<(String, String)> {
+    let c = db.constraint()?;
+    let t = db.table().unwrap_or("");
+    let name = c
+        .strip_prefix(&format!("{t}_"))
+        .filter(|_| !t.is_empty())
+        .unwrap_or(c);
+    Some((
+        name.to_ascii_uppercase(),
+        db.schema().unwrap_or("").to_ascii_uppercase(),
+    ))
+}
+
 pub(crate) fn map_error(e: &tokio_postgres::Error, sql: &str) -> anyhow::Error {
     let Some(db) = e.as_db_error() else {
         return anyhow!("SQL0901: {e}");
@@ -1638,13 +1912,26 @@ pub(crate) fn map_error(e: &tokio_postgres::Error, sql: &str) -> anyhow::Error {
         ),
         "42601" => anyhow!("SQL0104: Statement not valid: {msg}."),
         "23505" => anyhow!("SQL0803: Duplicate key value: the record was not written."),
-        "23514" => anyhow!("SQL0545: The row does not satisfy a check constraint: {msg}."),
+        "23514" => match constraint_name(db) {
+            Some((c, l)) => {
+                anyhow!("SQL0545: The row does not satisfy check constraint {c} in {l}.")
+            }
+            None => anyhow!("SQL0545: The row does not satisfy a check constraint: {msg}."),
+        },
         // A referential constraint: a foreign key with no parent row
         // (INSERT, UPDATE), or a parent row still referenced (DELETE).
-        "23503" if msg.contains("is still referenced") => {
-            anyhow!("SQL0532: Delete prevented by referential constraint: {msg}.")
-        }
-        "23503" => anyhow!("SQL0530: Operation not allowed by referential constraint: {msg}."),
+        "23503" if msg.contains("is still referenced") => match constraint_name(db) {
+            Some((c, l)) => anyhow!(
+                "SQL0532: Referential constraint {c} in {l} keeps the row from being deleted."
+            ),
+            None => anyhow!("SQL0532: Delete prevented by referential constraint: {msg}."),
+        },
+        "23503" => match constraint_name(db) {
+            Some((c, l)) => {
+                anyhow!("SQL0530: Referential constraint {c} in {l} has no parent row for the key.")
+            }
+            None => anyhow!("SQL0530: Operation not allowed by referential constraint: {msg}."),
+        },
         "2BP01" => anyhow!("SQL0478: Other objects depend on this one: {msg}."),
         "23502" => anyhow!("SQL0407: Null value not allowed in a NOT NULL column: {msg}."),
         "42501" => anyhow!("SQL0551: Not authorized to an object in the statement."),
@@ -1781,7 +2068,7 @@ pub async fn run_as(
     }
     let libraries = catalog::list_libraries(client).await?;
     let t = translate(sql, &|n| libraries.iter().any(|l| l == n))?;
-    let mut text = t.sql.clone();
+    let mut text = system_column_names(client, libl, &t.sql).await?;
     if let Some((target, at)) = &t.insert_needs_columns {
         // The file's fields, in order, as the column list.
         let name = if target.contains('.') {
@@ -1857,11 +2144,7 @@ async fn run_in_transaction(
 ) -> Result<Outcome> {
     tx.batch_execute(&format!(
         "SET LOCAL search_path TO {}",
-        if path.is_empty() {
-            "\"qgpl\"".to_string()
-        } else {
-            path.join(", ")
-        }
+        joined_path(&path)
     ))
     .await?;
     let stmt = tx.prepare(text).await.map_err(|e| map_error(&e, text))?;
@@ -2089,9 +2372,29 @@ mod tests {
         assert_eq!(crate::catalog::ibm_name("~ctid"), "CTID");
     }
 
+    // Db2 for i SQL reference, CLOB/BLOB data types: a length with K, M
+    // or G (CLOB(10M)); large objects are text and bytea here.
+    #[test]
+    fn lob_types_in_cast() {
+        assert_eq!(
+            tr("select cast(x as clob(10M)), cast(y as blob(1K)), cast(z as dbclob) from t").sql,
+            "select cast(x as text), cast(y as bytea), cast(z as text) from t"
+        );
+    }
+
     #[test]
     fn db2_dialect() {
-        assert_eq!(tr("values current date").sql, "values (CURRENT_DATE)");
+        assert_eq!(
+            tr("values current date").sql,
+            "values (CAST(statement_timestamp() AS date))"
+        );
+        // Db2 for i SQL Reference, special registers: CURRENT_TIMESTAMP is
+        // CURRENT TIMESTAMP (iRPGUnit's getFullTimestamp sets a host
+        // variable from it).
+        assert_eq!(
+            tr("values current_timestamp").sql,
+            tr("values current timestamp").sql
+        );
         // DB2: VALUES with a list of expressions gives one row per expression.
         assert_eq!(
             tr("values 1, (2), substr('ab', 1, 1)").sql,
@@ -2121,11 +2424,11 @@ mod tests {
         assert_eq!(t.sql, "select c.rrn, cusnam from custmast c");
         assert!(t.wants_rrn);
         assert!(!tr("select * from custmast").wants_rrn);
-        // CURRENT TIMESTAMP is a TIMESTAMP without a time zone (Db2 for i
-        // SQL Reference, special registers): PostgreSQL's LOCALTIMESTAMP.
+        // CURRENT TIMESTAMP is a TIMESTAMP without a time zone, read once
+        // for the statement (Db2 for i SQL Reference, special registers).
         assert_eq!(
             tr("select current timestamp from sysibm.sysdummy1").sql,
-            "select LOCALTIMESTAMP from (VALUES ('Y')) AS sysdummy1(ibmreqd)"
+            "select CAST(statement_timestamp() AS timestamp) from (VALUES ('Y')) AS sysdummy1(ibmreqd)"
         );
         assert_eq!(tr("select * from t with nc").sql, "select * from t");
         assert_eq!(
@@ -2253,11 +2556,7 @@ impl Session {
         sql_client
             .batch_execute(&format!(
                 "SET search_path TO {}",
-                if path.is_empty() {
-                    "\"qgpl\"".to_string()
-                } else {
-                    path.join(", ")
-                }
+                joined_path(&path)
             ))
             .await?;
         Ok(Session {
@@ -2271,11 +2570,32 @@ impl Session {
         })
     }
 
+    /// A temporary view of this name in the session the statements run
+    /// in (it comes before the library list), or none (`body` None): what
+    /// a database file override (OVRDBF TOFILE, MBR) makes of a file name
+    /// for SQL.
+    pub async fn temp_view(&self, name: &str, body: Option<&str>) -> Result<()> {
+        let client: &Client = match &self.cmt {
+            Some(d) => &d.client,
+            None => &self.client,
+        };
+        let view = format!("pg_temp.{}", ident(name));
+        client
+            .batch_execute(&format!("DROP VIEW IF EXISTS {view}"))
+            .await?;
+        if let Some(b) = body {
+            client
+                .batch_execute(&format!("CREATE TEMP VIEW {} AS {b}", ident(name)))
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Run one statement (host variables already in it as literals).
     /// `catalog_client` reads file descriptions (INSERT without columns).
     pub async fn exec(&self, catalog_client: &Client, sql: &str) -> Result<Exec> {
         let t = translate(sql, &|n| self.libraries.iter().any(|l| l == n))?;
-        let mut text = t.sql.clone();
+        let mut text = system_column_names(catalog_client, &self.libl, &t.sql).await?;
         if let Some((target, at)) = &t.insert_needs_columns {
             let name = if target.contains('.') {
                 target
@@ -2316,11 +2636,7 @@ impl Session {
         d.client
             .batch_execute(&format!(
                 "SAVEPOINT as4tainr_stmt; SET LOCAL search_path TO {}",
-                if path.is_empty() {
-                    "\"qgpl\"".to_string()
-                } else {
-                    path.join(", ")
-                }
+                joined_path(&path)
             ))
             .await?;
         if let Some((u, c, j)) = &self.context {

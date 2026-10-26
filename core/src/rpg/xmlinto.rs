@@ -200,6 +200,8 @@ impl Machine<'_> {
         let o = XmlOpts::parse(&opts)?;
         let text = if o.file {
             let path = a(&doc.chars()?).trim().to_string();
+            // What this job wrote to files it still has open is in them.
+            self.c_flush();
             let (bytes, ccsid) = self
                 .block(crate::ifs::read_file(self.io.client, &path))
                 .map_err(|e| anyhow!("RNX0351: The XML document {path} cannot be read: {e:#}."))?;
@@ -530,7 +532,7 @@ impl Machine<'_> {
                     .map_err(|_| bad("a time is expected"))?;
                 Value::str(&dates::format_time(h, &dates::TimeFmt::iso()))
             }
-            DType::Timestamp => {
+            DType::Timestamp(_) => {
                 use crate::rpg::dates;
                 let ts = dates::parse_ts(raw.trim()).map_err(|_| bad("a timestamp is expected"))?;
                 Value::str(&dates::format_ts(&ts, false))

@@ -130,6 +130,21 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[p("CMD", Kind::Text, false, Some("*NONE"), "Command").ch("*NONE")],
     },
     CommandDef {
+        name: "STRREXPRC",
+        description: "Start REXX Procedure",
+        params: &[
+            p("SRCMBR", Kind::Name, true, None, "Source member").ch("Name"),
+            p("SRCFILE", Kind::Qualified, false, Some("QREXSRC"), "Source file").ch("Name"),
+            p("PARM", Kind::Text, false, Some("*NONE"), "Parameters").ch("Character value, *NONE"),
+            p("CMDENV", Kind::Name, false, Some("*COMMAND"), "Command environment")
+                .ch("*COMMAND, Name")
+                .keyword_only(),
+            p("EXITPGM", Kind::List, false, Some("*NONE"), "Exit program")
+                .ch("*NONE")
+                .keyword_only(),
+        ],
+    },
+    CommandDef {
         name: "STRQSH",
         description: "Start QSH",
         params: &[p("CMD", Kind::Text, false, Some("*NONE"), "Command").ch("*NONE")],
@@ -429,6 +444,127 @@ pub static COMMANDS: &[CommandDef] = &[
         name: "DLTPNLGRP",
         description: "Delete Panel Group",
         params: &[p("PNLGRP", Kind::Qualified, true, None, "Panel group").ch("Name, generic*")],
+    },
+    CommandDef {
+        name: "CRTJOBD",
+        description: "Create Job Description",
+        params: &[
+            p("JOBD", Kind::Qualified, true, None, "Job description").ch("Name"),
+            p("JOBQ", Kind::Qualified, false, Some("QBATCH"), "Job queue").ch("Name").keyword_only(),
+            p("TEXT", Kind::Text, false, Some("*BLANK"), "Text 'description'").keyword_only(),
+            p("USER", Kind::Name, false, Some("*RQD"), "User").ch("Name, *RQD").keyword_only(),
+            p("INLLIBL", Kind::List, false, Some("*SYSVAL"), "Initial library list").ch("Name, *SYSVAL, *NONE").keyword_only(),
+            p("RQSDTA", Kind::Text, false, Some("*NONE"), "Request data or command").keyword_only(),
+            p("JOBPTY", Kind::Text, false, None, "Job priority").keyword_only(),
+            p("OUTPTY", Kind::Text, false, None, "Output priority").keyword_only(),
+            p("PRTDEV", Kind::Text, false, None, "Print device").keyword_only(),
+            p("OUTQ", Kind::Text, false, None, "Output queue").keyword_only(),
+            p("PRTTXT", Kind::Text, false, None, "Print text").keyword_only(),
+            p("ACGCDE", Kind::Text, false, None, "Accounting code").keyword_only(),
+            p("RTGDTA", Kind::Text, false, None, "Routing data").keyword_only(),
+            p("SYNTAX", Kind::Text, false, None, "CL syntax check").keyword_only(),
+            p("INQMSGRPY", Kind::Text, false, None, "Inquiry message reply").keyword_only(),
+            p("HOLD", Kind::Text, false, None, "Hold on job queue").keyword_only(),
+            p("DATE", Kind::Text, false, None, "Job date").keyword_only(),
+            p("SWS", Kind::Text, false, None, "Job switches").keyword_only(),
+            p("JOBMSGQMX", Kind::Text, false, None, "Job message queue maximum size").keyword_only(),
+            p("JOBMSGQFL", Kind::Text, false, None, "Job message queue full action").keyword_only(),
+            p("LOG", Kind::Text, false, None, "Message logging").keyword_only(),
+            p("LOGCLPGM", Kind::Text, false, None, "Log CL program commands").keyword_only(),
+            p("LOGOUTPUT", Kind::Text, false, None, "Job log output").keyword_only(),
+            p("ENDSEV", Kind::Text, false, None, "End severity").keyword_only(),
+            p("ALWMLTTHD", Kind::Text, false, None, "Allow multiple threads").keyword_only(),
+            p("SPLFACN", Kind::Text, false, None, "Spooled file action").keyword_only(),
+            p("DDMCNV", Kind::Text, false, None, "DDM conversation").keyword_only(),
+            p("INLASPGRP", Kind::Text, false, None, "Initial ASP group").keyword_only(),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CHGJOBD",
+        description: "Change Job Description",
+        params: &[
+            p("JOBD", Kind::Qualified, true, None, "Job description").ch("Name"),
+            p("JOBQ", Kind::Qualified, false, Some("*SAME"), "Job queue").ch("Name").keyword_only(),
+            p("TEXT", Kind::Text, false, Some("*SAME"), "Text 'description'").keyword_only(),
+            p("USER", Kind::Name, false, Some("*SAME"), "User").ch("Name, *RQD").keyword_only(),
+            p("INLLIBL", Kind::List, false, Some("*SAME"), "Initial library list").ch("Name, *SYSVAL, *NONE").keyword_only(),
+            p("RQSDTA", Kind::Text, false, Some("*SAME"), "Request data or command").keyword_only(),
+            p("JOBPTY", Kind::Text, false, None, "Job priority").keyword_only(),
+            p("OUTPTY", Kind::Text, false, None, "Output priority").keyword_only(),
+            p("PRTDEV", Kind::Text, false, None, "Print device").keyword_only(),
+            p("OUTQ", Kind::Text, false, None, "Output queue").keyword_only(),
+            p("PRTTXT", Kind::Text, false, None, "Print text").keyword_only(),
+            p("ACGCDE", Kind::Text, false, None, "Accounting code").keyword_only(),
+            p("RTGDTA", Kind::Text, false, None, "Routing data").keyword_only(),
+            p("SYNTAX", Kind::Text, false, None, "CL syntax check").keyword_only(),
+            p("INQMSGRPY", Kind::Text, false, None, "Inquiry message reply").keyword_only(),
+            p("HOLD", Kind::Text, false, None, "Hold on job queue").keyword_only(),
+            p("DATE", Kind::Text, false, None, "Job date").keyword_only(),
+            p("SWS", Kind::Text, false, None, "Job switches").keyword_only(),
+            p("JOBMSGQMX", Kind::Text, false, None, "Job message queue maximum size").keyword_only(),
+            p("JOBMSGQFL", Kind::Text, false, None, "Job message queue full action").keyword_only(),
+            p("LOG", Kind::Text, false, None, "Message logging").keyword_only(),
+            p("LOGCLPGM", Kind::Text, false, None, "Log CL program commands").keyword_only(),
+            p("LOGOUTPUT", Kind::Text, false, None, "Job log output").keyword_only(),
+            p("ENDSEV", Kind::Text, false, None, "End severity").keyword_only(),
+            p("ALWMLTTHD", Kind::Text, false, None, "Allow multiple threads").keyword_only(),
+            p("SPLFACN", Kind::Text, false, None, "Spooled file action").keyword_only(),
+            p("DDMCNV", Kind::Text, false, None, "DDM conversation").keyword_only(),
+            p("INLASPGRP", Kind::Text, false, None, "Initial ASP group").keyword_only(),
+
+        ],
+    },
+    CommandDef {
+        name: "DLTJOBD",
+        description: "Delete Job Description",
+        params: &[p("JOBD", Kind::Qualified, true, None, "Job description").ch("Name, generic*")],
+    },
+    CommandDef {
+        name: "DSPJOBD",
+        description: "Display Job Description",
+        params: &[
+            p("JOBD", Kind::Qualified, true, None, "Job description").ch("Name"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
+    },
+    CommandDef {
+        name: "CRTWSCST",
+        description: "Create Workstation Customizing Object",
+        params: &[
+            p("WSCST", Kind::Qualified, true, None, "Workstation customizing object").ch("Name"),
+            p("SRCFILE", Kind::Qualified, false, Some("QTXTSRC"), "Source file").ch("Name"),
+            p("SRCMBR", Kind::Name, false, Some("*WSCST"), "Source member").ch("Name, *WSCST"),
+            p("TEXT", Kind::Text, false, Some("*SRCMBRTXT"), "Text 'description'").keyword_only(),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority").keyword_only(),
+            p("REPLACE", Kind::Name, false, Some("*YES"), "Replace object").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "DLTWSCST",
+        description: "Delete Workstation Customizing Object",
+        params: &[p("WSCST", Kind::Qualified, true, None, "Workstation customizing object").ch("Name")],
+    },
+    CommandDef {
+        name: "CHGCMD",
+        description: "Change Command",
+        params: &[
+            p("CMD", Kind::Qualified, true, None, "Command").ch("Name"),
+            p("PGM", Kind::Qualified, false, Some("*SAME"), "Program to process command").ch("Name, *SAME, *REXX"),
+            p("REXSRCFILE", Kind::Qualified, false, Some("*SAME"), "REXX source file").keyword_only(),
+            p("REXSRCMBR", Kind::Name, false, Some("*SAME"), "REXX source member").keyword_only(),
+            p("REXCMDENV", Kind::Name, false, Some("*SAME"), "REXX command environment").keyword_only(),
+            p("REXEXITPGM", Kind::List, false, Some("*SAME"), "REXX exit programs").keyword_only(),
+            p("VLDCKR", Kind::Qualified, false, Some("*SAME"), "Validity checker").keyword_only(),
+            p("MODE", Kind::List, false, Some("*SAME"), "Mode in which valid").keyword_only(),
+            p("ALLOW", Kind::List, false, Some("*SAME"), "Where allowed to run").keyword_only(),
+            p("ALWLMTUSR", Kind::Name, false, Some("*SAME"), "Allow limited users").keyword_only(),
+            p("HLPPNLGRP", Kind::Qualified, false, Some("*SAME"), "Help panel group").keyword_only(),
+            p("HLPID", Kind::Name, false, Some("*SAME"), "Help identifier").keyword_only(),
+            p("PMTOVRPGM", Kind::Qualified, false, Some("*SAME"), "Prompt override program").keyword_only(),
+            p("TEXT", Kind::Text, false, Some("*SAME"), "Text 'description'").keyword_only(),
+            p("THDSAFE", Kind::Name, false, Some("*SAME"), "Threadsafe").keyword_only(),
+        ],
     },
     CommandDef {
         name: "CRTCMD",
@@ -1222,6 +1358,24 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "ADDPFM",
+        description: "Add Physical File Member",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "Physical file").ch("Name"),
+            p("MBR", Kind::Name, true, None, "Member").ch("Name"),
+            p("TEXT", Kind::Text, false, Some("*BLANK"), "Text 'description'"),
+            p("EXPDATE", Kind::Name, false, Some("*NONE"), "Expiration date for member")
+                .ch("Date, *NONE")
+                .keyword_only(),
+            p("SHARE", Kind::Name, false, Some("*NO"), "Share open data path")
+                .ch("*NO, *YES")
+                .keyword_only(),
+            p("SRCTYPE", Kind::Name, false, Some("*NONE"), "Source type")
+                .ch("Name, *NONE")
+                .keyword_only(),
+        ],
+    },
+    CommandDef {
         name: "RMVM",
         description: "Remove Member",
         params: &[
@@ -1235,6 +1389,7 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[
             p("CMD", Kind::Command, true, None, "Command to run"),
             p("JOB", Kind::Name, false, Some("*JOBD"), "Job name").ch("Name, *JOBD"),
+            p("JOBD", Kind::Qualified, false, Some("*USRPRF"), "Job description").ch("Name, *USRPRF"),
             p("JOBQ", Kind::Name, false, Some("*JOBD"), "Job queue").ch("QBATCH, *JOBD"),
             p(
                 "CURLIB",
@@ -1252,7 +1407,7 @@ pub static COMMANDS: &[CommandDef] = &[
                 Some("*CURRENT"),
                 "Initial library list",
             )
-            .ch("Name, *CURRENT")
+            .ch("Name, *CURRENT, *JOBD, *SYSVAL")
             .keyword_only(),
         ],
     },
@@ -1420,7 +1575,9 @@ pub static COMMANDS: &[CommandDef] = &[
         description: "Send Message",
         params: &[
             p("MSG", Kind::Text, true, None, "Message text"),
-            p("TOUSR", Kind::Name, true, None, "To user profile").ch("Name"),
+            p("TOUSR", Kind::Name, false, None, "To user profile").ch("Name, *SYSOPR"),
+            p("TOMSGQ", Kind::List, false, None, "To message queue").ch("Name, *SYSOPR"),
+            p("MSGTYPE", Kind::Name, false, Some("*INFO"), "Message type").ch("*INFO, *INQ"),
         ],
     },
     CommandDef {
@@ -1490,6 +1647,22 @@ pub static COMMANDS: &[CommandDef] = &[
             p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
                 .ch("*LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE"),
         ],
+    },
+    CommandDef {
+        name: "CRTMSGQ",
+        description: "Create Message Queue",
+        params: &[
+            p("MSGQ", Kind::Qualified, true, None, "Message queue").ch("Name"),
+            p("TEXT", Kind::Text, false, Some("*BLANK"), "Text 'description'"),
+            p("FORCE", Kind::Name, false, Some("*NO"), "Force to auxiliary storage").ch("*NO, *YES"),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
+                .ch("*LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE"),
+        ],
+    },
+    CommandDef {
+        name: "DLTMSGQ",
+        description: "Delete Message Queue",
+        params: &[p("MSGQ", Kind::Qualified, true, None, "Message queue").ch("Name, generic*")],
     },
     CommandDef {
         name: "DLTDTAQ",
@@ -1574,13 +1747,55 @@ pub static COMMANDS: &[CommandDef] = &[
     CommandDef {
         name: "CRTSRCPF",
         description: "Create Source Physical File",
+        // IBM i 7.5 CL reference, CRTSRCPF: the parameters in its order
+        // (FILE, RCDLEN and MBR positional). Kept: FILE, RCDLEN, MBR,
+        // TEXT, CCSID; the storage and access path attributes are accepted.
         params: &[
             p("FILE", Kind::Qualified, true, None, "File").ch("Name"),
             p("RCDLEN", Kind::Text, false, Some("92"), "Record length").ch("Number"),
+            p("MBR", Kind::Name, false, Some("*NONE"), "Member, if desired")
+                .ch("Name, *NONE, *FILE"),
+            p("IGCDTA", Kind::Name, false, Some("*NO"), "User specified DBCS data")
+                .ch("*NO, *YES")
+                .keyword_only(),
             p("TEXT", Kind::Text, false, Some(""), "Text 'description'").keyword_only(),
+            p("SYSTEM", Kind::Name, false, Some("*LCL"), "System")
+                .ch("*LCL, *RMT, *FILETYPE")
+                .keyword_only(),
+            p("EXPDATE", Kind::Text, false, Some("*NONE"), "Expiration date for member")
+                .keyword_only(),
+            p("MAXMBRS", Kind::Text, false, Some("*NOMAX"), "Maximum members").keyword_only(),
+            p("ACCPTHSIZ", Kind::Name, false, Some("*MAX1TB"), "Access path size")
+                .keyword_only(),
+            p("PAGESIZE", Kind::Text, false, Some("*KEYLEN"), "Access path logical page size")
+                .keyword_only(),
+            p("ACCPTH", Kind::Name, false, Some("*ARRIVAL"), "Access path type").keyword_only(),
+            p("MAINT", Kind::Name, false, Some("*IMMED"), "Access path maintenance")
+                .keyword_only(),
+            p("RECOVER", Kind::Name, false, Some("*NO"), "Access path recovery").keyword_only(),
+            p("FRCACCPTH", Kind::Name, false, Some("*NO"), "Force keyed access path")
+                .keyword_only(),
+            p("SIZE", Kind::List, false, Some("10000 1000 499"), "Member size").keyword_only(),
+            p("ALLOCATE", Kind::Name, false, Some("*NO"), "Allocate storage").keyword_only(),
+            p("CONTIG", Kind::Name, false, Some("*NO"), "Contiguous storage").keyword_only(),
+            p("UNIT", Kind::Text, false, Some("*ANY"), "Preferred storage unit").keyword_only(),
+            p("FRCRATIO", Kind::Text, false, Some("*NONE"), "Records to force a write")
+                .keyword_only(),
+            p("WAITFILE", Kind::Text, false, Some("*IMMED"), "Maximum file wait time")
+                .keyword_only(),
+            p("WAITRCD", Kind::Text, false, Some("60"), "Maximum record wait time")
+                .keyword_only(),
+            p("SHARE", Kind::Name, false, Some("*NO"), "Share open data path").keyword_only(),
+            p("DLTPCT", Kind::Text, false, Some("*NONE"), "Max % deleted records allowed")
+                .keyword_only(),
             p("CCSID", Kind::Text, false, Some("*JOB"), "Coded character set ID")
                 .ch("1-65535, *JOB, *HEX")
                 .keyword_only(),
+            p("ALWUPD", Kind::Name, false, Some("*YES"), "Allow update operation")
+                .keyword_only(),
+            p("ALWDLT", Kind::Name, false, Some("*YES"), "Allow delete operation")
+                .keyword_only(),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority").keyword_only(),
         ],
     },
     CommandDef {
@@ -1712,6 +1927,9 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("")
             .keyword_only(),
+            p("OPTION", Kind::List, false, Some("*SRC"), "Source listing options")
+                .ch("*SRC, *NOSRC, *LIST, *NOLIST, *EVENTF, *NOEVENTF...")
+                .keyword_only(),
             p("RSTDSP", Kind::Name, false, Some("*NO"), "Restore display")
                 .ch("*NO, *YES")
                 .keyword_only(),
@@ -1892,6 +2110,15 @@ pub static COMMANDS: &[CommandDef] = &[
             p("LOG", Kind::Name, false, Some("*JOB"), "Log commands")
                 .ch("*JOB, *YES, *NO")
                 .keyword_only(),
+            p("OPTIMIZE", Kind::Text, false, None, "Optimize").keyword_only(),
+            p("ENBPFRCOL", Kind::Text, false, None, "Enbpfrcol").keyword_only(),
+            p("DBGENCKEY", Kind::Text, false, None, "Dbgenckey").keyword_only(),
+            p("SRTSEQ", Kind::Text, false, None, "Srtseq").keyword_only(),
+            p("LANGID", Kind::Text, false, None, "Langid").keyword_only(),
+            p("INCFILE", Kind::Text, false, None, "Incfile").keyword_only(),
+            p("INCDIR", Kind::Text, false, None, "Incdir").keyword_only(),
+            p("TGTCCSID", Kind::Text, false, None, "Tgtccsid").keyword_only(),
+            p("STGMDL", Kind::Text, false, None, "Stgmdl").keyword_only(),
         ],
     },
     CommandDef {
@@ -2033,6 +2260,28 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*PRINT, *NONE")
             .keyword_only(),
+            p("DEFINE", Kind::List, false, Some("*NONE"), "Define condition names")
+                .ch("Name, *NONE")
+                .keyword_only(),
+            p("OPTIMIZE", Kind::Name, false, Some("*NONE"), "Optimization level")
+                .ch("*NONE, *BASIC, *FULL")
+                .keyword_only(),
+            p("TRUNCNBR", Kind::Name, false, Some("*YES"), "Truncate numeric").keyword_only(),
+            p("FIXNBR", Kind::List, false, Some("*NONE"), "Fix numeric").keyword_only(),
+            p("STGMDL", Kind::Name, false, Some("*INHERIT"), "Storage model").keyword_only(),
+            p("INCDIR", Kind::List, false, Some("*NONE"), "Include directory").keyword_only(),
+            p("PGMINFO", Kind::List, false, Some("*NO"), "Program interface").keyword_only(),
+            p("INFOSTMF", Kind::Text, false, None, "Program interface stream file").keyword_only(),
+            p("PPGENOPT", Kind::List, false, Some("*DFT"), "Preprocessor options").keyword_only(),
+            p("ENBPFRCOL", Kind::Name, false, Some("*PEP"), "Enable performance collection").keyword_only(),
+            p("PRFDTA", Kind::Name, false, Some("*NOCOL"), "Profiling data").keyword_only(),
+            p("LICOPT", Kind::Text, false, None, "Licensed Internal Code options").keyword_only(),
+            p("INDENT", Kind::Text, false, Some("*NONE"), "Indentation").keyword_only(),
+            p("CVTOPT", Kind::List, false, Some("*NONE"), "Type conversion options").keyword_only(),
+            p("SRTSEQ", Kind::Name, false, Some("*HEX"), "Sort sequence").keyword_only(),
+            p("LANGID", Kind::Name, false, Some("*JOBRUN"), "Language identifier").keyword_only(),
+            p("GENLVL", Kind::Text, false, Some("10"), "Severity level").keyword_only(),
+            p("DBGENCKEY", Kind::Text, false, Some("*NONE"), "Debug encryption key").keyword_only(),
             p(
                 "TGTRLS",
                 Kind::Name,
@@ -2042,6 +2291,9 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*CURRENT, *PRV, VxRxMx")
             .keyword_only(),
+            p("TGTCCSID", Kind::Text, false, Some("*SRC"), "Target CCSID")
+                .ch("*SRC, *JOB, *HEX, 1-65534")
+                .keyword_only(),
             p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
                 .ch("Name, *LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE")
                 .keyword_only(),
@@ -2115,6 +2367,16 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*CURRENT, *PRV, VxRxMx")
             .keyword_only(),
+            p("OPTIMIZE", Kind::Text, false, None, "Optimize").keyword_only(),
+            p("ENBPFRCOL", Kind::Text, false, None, "Enbpfrcol").keyword_only(),
+            p("DBGENCKEY", Kind::Text, false, None, "Dbgenckey").keyword_only(),
+            p("SRTSEQ", Kind::Text, false, None, "Srtseq").keyword_only(),
+            p("LANGID", Kind::Text, false, None, "Langid").keyword_only(),
+            p("INCFILE", Kind::Text, false, None, "Incfile").keyword_only(),
+            p("INCDIR", Kind::Text, false, None, "Incdir").keyword_only(),
+            p("TGTCCSID", Kind::Text, false, None, "Tgtccsid").keyword_only(),
+            p("ALWRTVSRC", Kind::Text, false, None, "Alwrtvsrc").keyword_only(),
+            p("AUT", Kind::Text, false, None, "Aut").keyword_only(),
         ],
     },
     CommandDef {
@@ -2182,6 +2444,29 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*PRINT, *NONE")
             .keyword_only(),
+            p("DEFINE", Kind::List, false, Some("*NONE"), "Define condition names")
+                .ch("Name, *NONE")
+                .keyword_only(),
+            p("OPTIMIZE", Kind::Name, false, Some("*NONE"), "Optimization level")
+                .ch("*NONE, *BASIC, *FULL")
+                .keyword_only(),
+            p("TRUNCNBR", Kind::Name, false, Some("*YES"), "Truncate numeric").keyword_only(),
+            p("FIXNBR", Kind::List, false, Some("*NONE"), "Fix numeric").keyword_only(),
+            p("STGMDL", Kind::Name, false, Some("*INHERIT"), "Storage model").keyword_only(),
+            p("INCDIR", Kind::List, false, Some("*NONE"), "Include directory").keyword_only(),
+            p("PGMINFO", Kind::List, false, Some("*NO"), "Program interface").keyword_only(),
+            p("INFOSTMF", Kind::Text, false, None, "Program interface stream file").keyword_only(),
+            p("PPGENOPT", Kind::List, false, Some("*DFT"), "Preprocessor options").keyword_only(),
+            p("ENBPFRCOL", Kind::Name, false, Some("*PEP"), "Enable performance collection").keyword_only(),
+            p("PRFDTA", Kind::Name, false, Some("*NOCOL"), "Profiling data").keyword_only(),
+            p("LICOPT", Kind::Text, false, None, "Licensed Internal Code options").keyword_only(),
+            p("INDENT", Kind::Text, false, Some("*NONE"), "Indentation").keyword_only(),
+            p("CVTOPT", Kind::List, false, Some("*NONE"), "Type conversion options").keyword_only(),
+            p("SRTSEQ", Kind::Name, false, Some("*HEX"), "Sort sequence").keyword_only(),
+            p("LANGID", Kind::Name, false, Some("*JOBRUN"), "Language identifier").keyword_only(),
+            p("GENLVL", Kind::Text, false, Some("10"), "Severity level").keyword_only(),
+            p("DBGENCKEY", Kind::Text, false, Some("*NONE"), "Debug encryption key").keyword_only(),
+            p("ALWNULL", Kind::Name, false, Some("*NO"), "Allow null values").keyword_only(),
             p(
                 "TGTRLS",
                 Kind::Name,
@@ -2191,6 +2476,9 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*CURRENT, *PRV, VxRxMx")
             .keyword_only(),
+            p("TGTCCSID", Kind::Text, false, Some("*SRC"), "Target CCSID")
+                .ch("*SRC, *JOB, *HEX, 1-65534")
+                .keyword_only(),
             p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
                 .ch("Name, *LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE")
                 .keyword_only(),
@@ -2223,6 +2511,9 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("Name, *SRVPGM")
             .keyword_only(),
+            p("SRCSTMF", Kind::Text, false, None, "Export source stream file")
+                .ch("Path name")
+                .keyword_only(),
             p(
                 "TEXT",
                 Kind::Text,
@@ -2258,6 +2549,15 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("Name, *CALLER")
             .keyword_only(),
+            p("OPTION", Kind::List, false, Some("*GEN"), "Creation options")
+                .ch("*GEN, *NOGEN, *NODUPPROC, *DUPPROC, *NODUPVAR, *DUPVAR, *WARN, *NOWARN, *RSLVREF, *UNRSLVREF")
+                .keyword_only(),
+            p("DETAIL", Kind::Text, false, None, "Detail").keyword_only(),
+            p("ALWUPD", Kind::Text, false, None, "Alwupd").keyword_only(),
+            p("ALWLIBUPD", Kind::Text, false, None, "Alwlibupd").keyword_only(),
+            p("USRPRF", Kind::Name, false, Some("*USER"), "User profile")
+                .ch("*USER, *OWNER")
+                .keyword_only(),
             p(
                 "REPLACE",
                 Kind::Name,
@@ -2267,18 +2567,17 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*YES, *NO")
             .keyword_only(),
-            p("OPTION", Kind::List, false, Some("*GEN"), "Creation options")
-                .ch("*GEN, *NOGEN, *NODUPPROC, *DUPPROC, *NODUPVAR, *DUPVAR, *WARN, *NOWARN, *RSLVREF, *UNRSLVREF")
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
+                .ch("Name, *LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE")
                 .keyword_only(),
             p("TGTRLS", Kind::Name, false, Some("*CURRENT"), "Target release")
                 .ch("*CURRENT, *PRV, VxRxMx")
                 .keyword_only(),
-            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
-                .ch("Name, *LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE")
-                .keyword_only(),
-            p("USRPRF", Kind::Name, false, Some("*USER"), "User profile")
-                .ch("*USER, *OWNER")
-                .keyword_only(),
+            p("ALWRINZ", Kind::Text, false, None, "Alwrinz").keyword_only(),
+            p("STGMDL", Kind::Text, false, None, "Stgmdl").keyword_only(),
+            p("ARGOPT", Kind::Text, false, None, "Argopt").keyword_only(),
+            p("IPA", Kind::Text, false, None, "Ipa").keyword_only(),
+            p("IPACTLFILE", Kind::Text, false, None, "Ipactlfile").keyword_only(),
         ],
     },
     CommandDef {
@@ -2346,6 +2645,15 @@ pub static COMMANDS: &[CommandDef] = &[
             p("TGTRLS", Kind::Name, false, Some("*CURRENT"), "Target release")
                 .ch("*CURRENT, *PRV, VxRxMx")
                 .keyword_only(),
+            p("STGMDL", Kind::Text, false, None, "Stgmdl").keyword_only(),
+            p("DETAIL", Kind::Text, false, None, "Detail").keyword_only(),
+            p("ALWUPD", Kind::Text, false, None, "Alwupd").keyword_only(),
+            p("ALWLIBUPD", Kind::Text, false, None, "Alwlibupd").keyword_only(),
+            p("ALWRINZ", Kind::Text, false, None, "Alwrinz").keyword_only(),
+            p("ARGOPT", Kind::Text, false, None, "Argopt").keyword_only(),
+            p("IPA", Kind::Text, false, None, "Ipa").keyword_only(),
+            p("IPACTLFILE", Kind::Text, false, None, "Ipactlfile").keyword_only(),
+            p("USRPRF", Kind::Text, false, None, "Usrprf").keyword_only(),
         ],
     },
     CommandDef {
@@ -2617,37 +2925,9 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*CHG, *ALL, *CS, *NONE, *RR")
             .keyword_only(),
+            p("RDB", Kind::Text, false, None, "Rdb").keyword_only(),
             p("OBJTYPE", Kind::Name, false, Some("*PGM"), "Type of object")
                 .ch("*PGM, *SRVPGM, *MODULE")
-                .keyword_only(),
-            p(
-                "TEXT",
-                Kind::Text,
-                false,
-                Some("*SRCMBRTXT"),
-                "Text 'description'",
-            )
-            .keyword_only(),
-            p(
-                "REPLACE",
-                Kind::Name,
-                false,
-                Some("*YES"),
-                "Replace program",
-            )
-            .ch("*YES, *NO")
-            .keyword_only(),
-            p(
-                "DBGVIEW",
-                Kind::Name,
-                false,
-                Some("*NONE"),
-                "Debugging views",
-            )
-            .ch("*STMT, *SOURCE, *LIST, *COPY, *ALL, *NONE")
-            .keyword_only(),
-            p("OPTION", Kind::List, false, None, "Compiler options")
-                .ch("*XREF, *NOXREF, *SRCSTMT, *NOSRCSTMT...")
                 .keyword_only(),
             p(
                 "OUTPUT",
@@ -2658,6 +2938,17 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*PRINT, *NONE")
             .keyword_only(),
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*SRCMBRTXT"),
+                "Text 'description'",
+            )
+            .keyword_only(),
+            p("OPTION", Kind::List, false, None, "Compiler options")
+                .ch("*XREF, *NOXREF, *SRCSTMT, *NOSRCSTMT...")
+                .keyword_only(),
             p(
                 "TGTRLS",
                 Kind::Name,
@@ -2676,6 +2967,9 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*NONE, *LVL1, *LVL2")
             .keyword_only(),
+            p("INCFILE", Kind::Text, false, None, "Incfile").keyword_only(),
+            p("INCDIR", Kind::Text, false, None, "Incdir").keyword_only(),
+            p("ALWCPYDTA", Kind::Text, false, None, "Alwcpydta").keyword_only(),
             p(
                 "CLOSQLCSR",
                 Kind::Name,
@@ -2685,6 +2979,48 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*ENDACTGRP, *ENDMOD")
             .keyword_only(),
+            p("ALWBLK", Kind::Text, false, None, "Alwblk").keyword_only(),
+            p("DLYPRP", Kind::Text, false, None, "Dlyprp").keyword_only(),
+            p("DATFMT", Kind::Text, false, None, "Datfmt").keyword_only(),
+            p("DATSEP", Kind::Text, false, None, "Datsep").keyword_only(),
+            p("TIMFMT", Kind::Text, false, None, "Timfmt").keyword_only(),
+            p("TIMSEP", Kind::Text, false, None, "Timsep").keyword_only(),
+            p(
+                "REPLACE",
+                Kind::Name,
+                false,
+                Some("*YES"),
+                "Replace program",
+            )
+            .ch("*YES, *NO")
+            .keyword_only(),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
+                .ch("Name, *LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE")
+                .keyword_only(),
+            p("DFTRDBCOL", Kind::Text, false, None, "Dftrdbcol").keyword_only(),
+            p("DYNDFTCOL", Kind::Text, false, None, "Dyndftcol").keyword_only(),
+            p("SQLPATH", Kind::Text, false, None, "Sqlpath").keyword_only(),
+            p("SQLCURRULE", Kind::Text, false, None, "Sqlcurrule").keyword_only(),
+            p("USRPRF", Kind::Name, false, Some("*USER"), "User profile")
+                .ch("*USER, *OWNER")
+                .keyword_only(),
+            p("DYNUSRPRF", Kind::Text, false, None, "Dynusrprf").keyword_only(),
+            p("SRTSEQ", Kind::Text, false, None, "Srtseq").keyword_only(),
+            p("LANGID", Kind::Text, false, None, "Langid").keyword_only(),
+            p(
+                "DBGVIEW",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "Debugging views",
+            )
+            .ch("*STMT, *SOURCE, *LIST, *COPY, *ALL, *NONE")
+            .keyword_only(),
+            p("DBGENCKEY", Kind::Text, false, None, "Dbgenckey").keyword_only(),
+            p("TOSRCFILE", Kind::Text, false, None, "Tosrcfile").keyword_only(),
+            p("DECRESULT", Kind::Text, false, None, "Decresult").keyword_only(),
+            p("CONACC", Kind::Text, false, None, "Conacc").keyword_only(),
+            p("CVTCCSID", Kind::Text, false, None, "Cvtccsid").keyword_only(),
             p(
                 "COMPILEOPT",
                 Kind::Text,
@@ -2693,12 +3029,62 @@ pub static COMMANDS: &[CommandDef] = &[
                 "Compiler options",
             )
             .keyword_only(),
-            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
-                .ch("Name, *LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE")
-                .keyword_only(),
-            p("USRPRF", Kind::Name, false, Some("*USER"), "User profile")
-                .ch("*USER, *OWNER")
-                .keyword_only(),
+        ],
+    },
+    // CRTSQLCBLI: its parameters in IBM's order (IBM i 7.5 CL reference,
+    // "Create SQL ILE COBOL Object (CRTSQLCBLI)"), so that QCAPCMD gives
+    // the checked command as IBM i does; there is no COBOL compiler, so
+    // running it ends with CPD0030.
+    CommandDef {
+        name: "CRTSQLCBLI",
+        description: "Create SQL ILE COBOL Object",
+        params: &[
+            p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
+            p("SRCFILE", Kind::Qualified, false, Some("QCBLLESRC"), "Source file").ch("Name"),
+            p("SRCMBR", Kind::Name, false, Some("*OBJ"), "Source member").ch("Name, *OBJ"),
+            p("SRCSTMF", Kind::Text, false, None, "Source stream file").keyword_only(),
+            p("COMMIT", Kind::Text, false, None, "Commitment control").keyword_only(),
+            p("RDB", Kind::Text, false, None, "Relational database").keyword_only(),
+            p("OBJTYPE", Kind::Text, false, None, "Compile type").keyword_only(),
+            p("OUTPUT", Kind::Text, false, None, "Listing output").keyword_only(),
+            p("TEXT", Kind::Text, false, None, "Text 'description'").keyword_only(),
+            p("USER", Kind::Text, false, None, "RDB user").keyword_only(),
+            p("PASSWORD", Kind::Password, false, None, "RDB user password").keyword_only(),
+            p("OPTION", Kind::List, false, None, "Precompiler options").keyword_only(),
+            p("TGTRLS", Kind::Text, false, None, "Target release").keyword_only(),
+            p("INCFILE", Kind::Text, false, None, "INCLUDE file").keyword_only(),
+            p("INCDIR", Kind::Text, false, None, "SQL INCLUDE directory").keyword_only(),
+            p("ALWCPYDTA", Kind::Text, false, None, "Allow copy of data").keyword_only(),
+            p("CLOSQLCSR", Kind::Text, false, None, "Close SQL cursor").keyword_only(),
+            p("ALWBLK", Kind::Text, false, None, "Allow blocking").keyword_only(),
+            p("DLYPRP", Kind::Text, false, None, "Delay PREPARE").keyword_only(),
+            p("CONACC", Kind::Text, false, None, "Concurrent access resolution").keyword_only(),
+            p("GENLVL", Kind::Text, false, None, "Severity level").keyword_only(),
+            p("DATFMT", Kind::Text, false, None, "Date format").keyword_only(),
+            p("DATSEP", Kind::Text, false, None, "Date separator character").keyword_only(),
+            p("TIMFMT", Kind::Text, false, None, "Time format").keyword_only(),
+            p("TIMSEP", Kind::Text, false, None, "Time separator character").keyword_only(),
+            p("REPLACE", Kind::Text, false, None, "Replace").keyword_only(),
+            p("RDBCNNMTH", Kind::Text, false, None, "RDB connect method").keyword_only(),
+            p("DFTRDBCOL", Kind::Text, false, None, "Default collection").keyword_only(),
+            p("DYNDFTCOL", Kind::Text, false, None, "Dynamic default collection").keyword_only(),
+            p("SQLPKG", Kind::Text, false, None, "Package").keyword_only(),
+            p("SQLPATH", Kind::List, false, None, "SQL path").keyword_only(),
+            p("SQLCURRULE", Kind::Text, false, None, "SQL rules").keyword_only(),
+            p("SAAFLAG", Kind::Text, false, None, "IBM SQL flagging").keyword_only(),
+            p("FLAGSTD", Kind::Text, false, None, "ANS flagging").keyword_only(),
+            p("PRTFILE", Kind::Text, false, None, "Print file").keyword_only(),
+            p("DBGVIEW", Kind::Text, false, None, "Debugging view").keyword_only(),
+            p("DBGENCKEY", Kind::Text, false, None, "Debug encryption key").keyword_only(),
+            p("USRPRF", Kind::Text, false, None, "User profile").keyword_only(),
+            p("DYNUSRPRF", Kind::Text, false, None, "Dynamic user profile").keyword_only(),
+            p("SRTSEQ", Kind::Text, false, None, "Sort sequence").keyword_only(),
+            p("LANGID", Kind::Text, false, None, "Language id").keyword_only(),
+            p("CVTCCSID", Kind::Text, false, None, "Conversion CCSID").keyword_only(),
+            p("TOSRCFILE", Kind::Text, false, None, "To source file").keyword_only(),
+            p("DECRESULT", Kind::List, false, None, "Decimal result options").keyword_only(),
+            p("DECFLTRND", Kind::Text, false, None, "Decimal float rounding mode").keyword_only(),
+            p("COMPILEOPT", Kind::Text, false, None, "Compiler options").keyword_only(),
         ],
     },
     CommandDef {
@@ -2771,6 +3157,16 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "CHGCURDIR",
+        description: "Change Current Directory",
+        params: &[p("DIR", Kind::Text, true, None, "Directory").ch("Path name")],
+    },
+    CommandDef {
+        name: "CD",
+        description: "Change Current Directory",
+        params: &[p("DIR", Kind::Text, true, None, "Directory").ch("Path name")],
+    },
+    CommandDef {
         name: "RMVDIR",
         description: "Remove Directory",
         params: &[
@@ -2824,6 +3220,15 @@ pub static COMMANDS: &[CommandDef] = &[
         name: "WRKLNK",
         description: "Work with Object Links",
         params: &[p("OBJ", Kind::Text, false, Some("*"), "Object").ch("Path name, *")],
+    },
+    CommandDef {
+        name: "DSPATR",
+        description: "Display Attributes",
+        params: &[
+            p("OBJ", Kind::Text, true, None, "Object").ch("Path name"),
+            p("ATR", Kind::List, false, Some("*ALL"), "Attributes").ch("*ALL"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
     },
     CommandDef {
         name: "DSPLNK",
@@ -3370,6 +3775,15 @@ pub static COMMANDS: &[CommandDef] = &[
             p("CLEAR", Kind::Name, false, Some("*NONE"), "Clear")
                 .ch("*NONE, *ALL, *REPLACE")
                 .keyword_only(),
+            p("OMITOBJ", Kind::List, false, Some("*NONE"), "Objects to omit").ch("Name, generic*, *ALL, *NONE").keyword_only(),
+            p("SELECT", Kind::List, false, Some("*ALL"), "Select").ch("*ALL, *INCLUDE, *OMIT").keyword_only(),
+            p("TGTRLS", Kind::Name, false, Some("*CURRENT"), "Target release").keyword_only(),
+            p("PRECHK", Kind::Name, false, Some("*NO"), "Object pre-check").keyword_only(),
+            p("SAVACT", Kind::List, false, Some("*NO"), "Save active").keyword_only(),
+            p("SAVFDTA", Kind::Name, false, Some("*YES"), "Save file data").keyword_only(),
+            p("SPLFDTA", Kind::Name, false, Some("*NONE"), "Spooled file data").keyword_only(),
+            p("QDTA", Kind::Name, false, Some("*NONE"), "Queue data").keyword_only(),
+            p("DTACPR", Kind::Name, false, Some("*DEV"), "Data compression").keyword_only(),
         ],
     },
     CommandDef {
@@ -3387,6 +3801,52 @@ pub static COMMANDS: &[CommandDef] = &[
             p("CLEAR", Kind::Name, false, Some("*NONE"), "Clear")
                 .ch("*NONE, *ALL, *REPLACE")
                 .keyword_only(),
+            p("OMITOBJ", Kind::List, false, Some("*NONE"), "Objects to omit").ch("Name, generic*, *ALL, *NONE").keyword_only(),
+            p("SELECT", Kind::List, false, Some("*ALL"), "Select").ch("*ALL, *INCLUDE, *OMIT").keyword_only(),
+            p("TGTRLS", Kind::Name, false, Some("*CURRENT"), "Target release").keyword_only(),
+            p("PRECHK", Kind::Name, false, Some("*NO"), "Object pre-check").keyword_only(),
+            p("SAVACT", Kind::List, false, Some("*NO"), "Save active").keyword_only(),
+            p("SAVFDTA", Kind::Name, false, Some("*YES"), "Save file data").keyword_only(),
+            p("SPLFDTA", Kind::Name, false, Some("*NONE"), "Spooled file data").keyword_only(),
+            p("QDTA", Kind::Name, false, Some("*NONE"), "Queue data").keyword_only(),
+            p("DTACPR", Kind::Name, false, Some("*DEV"), "Data compression").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "SAVCHGOBJ",
+        description: "Save Changed Objects",
+        params: &[
+            p("OBJ", Kind::List, false, Some("*ALL"), "Objects").ch("Name, generic*, *ALL"),
+            p("LIB", Kind::List, true, None, "Library").ch("Name, generic*"),
+            p("DEV", Kind::List, true, None, "Device").ch("*SAVF"),
+            p("OBJTYPE", Kind::List, false, Some("*ALL"), "Object types")
+                .ch("*ALL, *FILE, *PGM..."),
+            p("REFDATE", Kind::Text, false, Some("*SAVLIB"), "Reference date")
+                .ch("Date, *SAVLIB")
+                .keyword_only(),
+            p("REFTIME", Kind::Text, false, Some("*NONE"), "Reference time")
+                .ch("Time, *NONE")
+                .keyword_only(),
+            p("OBJJRN", Kind::Name, false, Some("*NO"), "Journaled objects")
+                .ch("*NO, *YES")
+                .keyword_only(),
+            p("SAVF", Kind::Qualified, false, None, "Save file")
+                .ch("Name")
+                .keyword_only(),
+            p("UPDHST", Kind::Name, false, Some("*YES"), "Update history")
+                .ch("*YES, *NO")
+                .keyword_only(),
+            p("CLEAR", Kind::Name, false, Some("*NONE"), "Clear")
+                .ch("*NONE, *ALL, *REPLACE")
+                .keyword_only(),
+            p("OMITOBJ", Kind::List, false, Some("*NONE"), "Objects to omit").ch("Name, generic*, *ALL, *NONE").keyword_only(),
+            p("TGTRLS", Kind::Name, false, Some("*CURRENT"), "Target release").keyword_only(),
+            p("PRECHK", Kind::Name, false, Some("*NO"), "Object pre-check").keyword_only(),
+            p("SAVACT", Kind::List, false, Some("*NO"), "Save active").keyword_only(),
+            p("SAVFDTA", Kind::Name, false, Some("*YES"), "Save file data").keyword_only(),
+            p("SPLFDTA", Kind::Name, false, Some("*NONE"), "Spooled file data").keyword_only(),
+            p("QDTA", Kind::Name, false, Some("*NONE"), "Queue data").keyword_only(),
+            p("DTACPR", Kind::Name, false, Some("*DEV"), "Data compression").keyword_only(),
         ],
     },
     CommandDef {
@@ -3428,6 +3888,14 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("Name, *SAVLIB")
             .keyword_only(),
+            p("OMITOBJ", Kind::List, false, Some("*NONE"), "Objects to omit").ch("Name, generic*, *ALL, *NONE").keyword_only(),
+            p("SELECT", Kind::List, false, Some("*ALL"), "Select").ch("*ALL, *INCLUDE, *OMIT").keyword_only(),
+            p("FILEMBR", Kind::List, false, Some("*ALL"), "File member").ch("*ALL").keyword_only(),
+            p("OPTION", Kind::Name, false, Some("*ALL"), "Option").ch("*ALL").keyword_only(),
+            p("SPLFDTA", Kind::Name, false, Some("*NONE"), "Spooled file data").keyword_only(),
+            p("PVTAUT", Kind::Name, false, Some("*NO"), "Restore private authorities").keyword_only(),
+            p("STRJRN", Kind::Name, false, Some("*NO"), "Start journaling").keyword_only(),
+            p("FRCOBJCVN", Kind::List, false, Some("*SYSVAL"), "Force object conversion").keyword_only(),
         ],
     },
     CommandDef {
@@ -3448,6 +3916,34 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("Name, *SAVLIB")
             .keyword_only(),
+            p("OMITOBJ", Kind::List, false, Some("*NONE"), "Objects to omit").ch("Name, generic*, *ALL, *NONE").keyword_only(),
+            p("SELECT", Kind::List, false, Some("*ALL"), "Select").ch("*ALL, *INCLUDE, *OMIT").keyword_only(),
+            p("MBROPT", Kind::Name, false, Some("*MATCH"), "Data base member option").ch("*MATCH, *ALL").keyword_only(),
+            p("ALWOBJDIF", Kind::List, false, Some("*NONE"), "Allow object differences").ch("*NONE, *ALL").keyword_only(),
+            p("RSTLIB", Kind::Name, false, Some("*SAVLIB"), "Restore to library").ch("Name, *SAVLIB").keyword_only(),
+            p("OPTION", Kind::Name, false, Some("*ALL"), "Option").ch("*ALL").keyword_only(),
+            p("SPLFDTA", Kind::Name, false, Some("*NONE"), "Spooled file data").keyword_only(),
+            p("PVTAUT", Kind::Name, false, Some("*NO"), "Restore private authorities").keyword_only(),
+            p("STRJRN", Kind::Name, false, Some("*NO"), "Start journaling").keyword_only(),
+            p("FRCOBJCVN", Kind::List, false, Some("*SYSVAL"), "Force object conversion").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CRTDUPOBJ",
+        description: "Create Duplicate Object",
+        params: &[
+            p("OBJ", Kind::Name, true, None, "From object").ch("Name, generic*, *ALL"),
+            p("FROMLIB", Kind::Name, true, None, "From library").ch("Name, *LIBL, *CURLIB"),
+            p("OBJTYPE", Kind::List, true, None, "Object type").ch("*ALL, *FILE, *PGM, *CMD..."),
+            p("TOLIB", Kind::Name, false, Some("*FROMLIB"), "To library").ch("Name, *FROMLIB, *SAME, *CURLIB"),
+            p("NEWOBJ", Kind::Name, false, Some("*OBJ"), "New object").ch("Name, *OBJ, *SAME"),
+            p("ASPDEV", Kind::Name, false, Some("*"), "From ASP device").keyword_only(),
+            p("TOASPDEV", Kind::Name, false, Some("*ASPDEV"), "To ASP device").keyword_only(),
+            p("DATA", Kind::Name, false, Some("*NO"), "Duplicate data").ch("*NO, *YES").keyword_only(),
+            p("CST", Kind::Name, false, Some("*YES"), "Duplicate constraints").keyword_only(),
+            p("TRG", Kind::Name, false, Some("*YES"), "Duplicate triggers").keyword_only(),
+            p("FILEID", Kind::Name, false, Some("*NO"), "Duplicate file identifiers").keyword_only(),
+            p("ACCCTL", Kind::Name, false, Some("*NONE"), "Duplicate row and column access controls").keyword_only(),
         ],
     },
     CommandDef {
@@ -3512,6 +4008,22 @@ pub static COMMANDS: &[CommandDef] = &[
 /// errors in (after its diagnostic messages).
 pub const CPF0006: &str = "CPF0006: The command has errors and was not run.";
 
+/// The IBM i object types (IBM documentation, "External object types"):
+/// what an OBJTYPE parameter takes besides special values.
+pub const OBJECT_TYPES: &[&str] = &[
+    "*ALRTBL", "*AUTL", "*BNDDIR", "*CFGL", "*CHTFMT", "*CLD", "*CLS", "*CMD", "*CNNL",
+    "*COSD", "*CRG", "*CRQD", "*CSI", "*CSPMAP", "*CSPTBL", "*CTLD", "*DEVD", "*DOC",
+    "*DTAARA", "*DTADCT", "*DTAQ", "*EDTD", "*EXITRG", "*FCT", "*FILE", "*FLR", "*FNTRSC",
+    "*FNTTBL", "*FORMDF", "*FTR", "*GSS", "*IGCDCT", "*IGCSRT", "*IGCTBL", "*IMGCLG", "*IPXD",
+    "*JOBD", "*JOBQ", "*JOBSCD", "*JRN", "*JRNRCV", "*LIB", "*LIND", "*LOCALE", "*M36",
+    "*M36CFG", "*MEDDFN", "*MENU", "*MGTCOL", "*MODD", "*MODULE", "*MSGF", "*MSGQ",
+    "*NODGRP", "*NODL", "*NTBD", "*NWID", "*NWSCFG", "*NWSD", "*OUTQ", "*OVL", "*PAGDFN",
+    "*PAGSEG", "*PDFMAP", "*PDG", "*PGM", "*PNLGRP", "*PRDAVL", "*PRDDFN", "*PRDLOD",
+    "*PSFCFG", "*QMFORM", "*QMQRY", "*QRYDFN", "*RCT", "*S36", "*SBSD", "*SCHIDX", "*SPADCT",
+    "*SQLPKG", "*SQLUDT", "*SQLXSR", "*SRVPGM", "*SSND", "*SVRSTG", "*TBL", "*TIMZON",
+    "*USRIDX", "*USRPRF", "*USRQ", "*USRSPC", "*VLDL", "*WSCST",
+];
+
 /// A value the command analyzer does not take: diagnostic CPD0084, then
 /// CPF0006 (observed on IBM i 7.5: `CRTDTAARA ... TYPE(*BAD)`).
 pub fn value_error(detail: &str) -> anyhow::Error {
@@ -3568,6 +4080,7 @@ pub static GROUPS: &[Group] = &[
             "DSPFFD",
             "CPYF",
             "DLTF",
+            "ADDPFM",
             "RMVM",
             "WRKMBRPDM",
             "WRKOBJPDM",
@@ -3598,12 +4111,18 @@ pub static GROUPS: &[Group] = &[
         title: "Job and Message Commands",
         commands: &[
             "SBMJOB",
+            "CRTJOBD",
+            "CHGJOBD",
+            "DLTJOBD",
+            "DSPJOBD",
             "WRKACTJOB",
             "WRKSBMJOB",
             "DSPJOBLOG",
             "ENDJOB",
             "SNDMSG",
             "DSPMSG",
+            "CRTMSGQ",
+            "DLTMSGQ",
             "DLYJOB",
             "DSPSYSVAL",
             "ADDENVVAR",
@@ -3635,6 +4154,7 @@ pub static GROUPS: &[Group] = &[
             "CRTCLPGM",
             "CRTBNDRPG",
             "CRTSQLRPGI",
+            "CRTSQLCBLI",
             "CRTCLMOD",
             "CRTRPGPGM",
             "CVTRPGSRC",
@@ -3661,7 +4181,16 @@ pub static GROUPS: &[Group] = &[
     Group {
         item: "Command definition commands",
         title: "Command Definition Commands",
-        commands: &["CRTCMD", "DLTCMD", "DSPCMD", "CRTPNLGRP", "DLTPNLGRP"],
+        commands: &[
+            "CRTCMD",
+            "CHGCMD",
+            "DLTCMD",
+            "DSPCMD",
+            "CRTPNLGRP",
+            "DLTPNLGRP",
+            "CRTWSCST",
+            "DLTWSCST",
+        ],
     },
     Group {
         item: "File override and commitment commands",
@@ -3705,6 +4234,8 @@ pub static GROUPS: &[Group] = &[
         commands: &[
             "QSH",
             "STRQSH",
+            "STRREXPRC",
+            "DSPATR",
             "WRKLNK",
             "DSPLNK",
             "MKDIR",
@@ -3717,6 +4248,8 @@ pub static GROUPS: &[Group] = &[
             "DEL",
             "ERASE",
             "RNM",
+            "CHGCURDIR",
+            "CD",
             "CPYTOSTMF",
             "CPYFRMSTMF",
         ],
@@ -3725,7 +4258,15 @@ pub static GROUPS: &[Group] = &[
         item: "Save and restore commands",
         title: "Save and Restore Commands",
         commands: &[
-            "CRTSAVF", "CLRSAVF", "DSPSAVF", "SAVOBJ", "SAVLIB", "RSTOBJ", "RSTLIB",
+            "CRTSAVF",
+            "CLRSAVF",
+            "DSPSAVF",
+            "SAVOBJ",
+            "SAVLIB",
+            "SAVCHGOBJ",
+            "RSTOBJ",
+            "RSTLIB",
+            "CRTDUPOBJ",
         ],
     },
     Group {
@@ -3874,6 +4415,10 @@ fn tokenize(s: &str) -> Result<Vec<Tok>> {
                         }
                     }
                 }
+                // A path in the job's QTEMP (/QSYS.LIB/QTEMP.LIB/...).
+                if v.to_ascii_uppercase().contains("/QTEMP.LIB") {
+                    v = crate::qtemp::in_value(&v);
+                }
                 out.push(Tok::Quoted(v));
             }
             _ => {
@@ -3881,9 +4426,10 @@ fn tokenize(s: &str) -> Result<Vec<Tok>> {
                 while i < cs.len() && !matches!(cs[i], ' ' | '\t' | '(' | ')' | '\'') {
                     i += 1;
                 }
-                out.push(Tok::Word(
-                    cs[start..i].iter().collect::<String>().to_ascii_uppercase(),
-                ));
+                // QTEMP, or QTEMP/name: the job's own library.
+                out.push(Tok::Word(crate::qtemp::in_value(
+                    &cs[start..i].iter().collect::<String>().to_ascii_uppercase(),
+                )));
             }
         }
     }
@@ -4007,6 +4553,7 @@ pub const CL_PROGRAM_ONLY: &[&str] = &[
     "DCLF",
     "CHGVAR",
     "RTVJOBA",
+    "CVTDAT",
     "RTVSYSVAL",
     "RTVDTAARA",
     "RTVOBJD",
@@ -4042,6 +4589,41 @@ pub const CL_PROGRAM_ONLY: &[&str] = &[
     "TFRCTL",
     "CLOSE",
 ];
+
+/// A command checked as QCMDCHK and QCAPCMD check it: the command name
+/// and every value given with its keyword, in the order of the
+/// command's parameters (positional values get their keywords),
+/// quoted values in quotes. A command not in the table (made with
+/// CRTCMD) comes back as it was written.
+pub fn checked_command(line: &str) -> Result<String> {
+    let name = line.split_whitespace().next().unwrap_or("");
+    if find(name).is_none() && !CL_PROGRAM_ONLY.contains(&name.to_ascii_uppercase().as_str()) {
+        return Ok(line.trim().to_string());
+    }
+    parse(line)?;
+    let (def, params) = parse_partial(line)?;
+    let mut out = def.name.to_string();
+    for pd in def.params {
+        let Some(vals) = params.get(pd.keyword) else {
+            continue;
+        };
+        // A list of elements (BNDSRVPGM: service program and activation)
+        // shows each element in parentheses: BNDSRVPGM((LIB/NAME)).
+        let elements = pd.keyword == "BNDSRVPGM";
+        let vals: Vec<String> = vals
+            .iter()
+            .map(|v| match v {
+                Value::Word(w) if elements && !w.starts_with('(') && !w.starts_with('*') => {
+                    format!("({w})")
+                }
+                Value::Word(w) => w.clone(),
+                Value::Quoted(q) => format!("'{}'", q.replace('\'', "''")),
+            })
+            .collect();
+        out.push_str(&format!(" {}({})", pd.keyword, vals.join(" ")));
+    }
+    Ok(out)
+}
 
 /// Parse a command without checking for required parameters or filling in
 /// defaults: what F4 prompting starts from.
@@ -4235,7 +4817,12 @@ pub fn parse(line: &str) -> Result<Command> {
             let t = v.text();
             match pd.kind {
                 Kind::Name if !t.starts_with('*') && !t.is_empty() => {
-                    crate::catalog::validate_name(&pd.prompt.to_ascii_lowercase(), t)
+                    // A generic name (prefix*) where the parameter takes one.
+                    let base = match t.strip_suffix('*') {
+                        Some(b) if pd.choices.contains("generic") && !b.is_empty() => b,
+                        _ => t,
+                    };
+                    crate::catalog::validate_name(&pd.prompt.to_ascii_lowercase(), base)
                         .map_err(name_err)?;
                 }
                 Kind::Qualified => check_qualified(pd, t)?,
@@ -4302,6 +4889,48 @@ pub fn prompt_text(kind: Kind, vals: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_command_has_keywords() {
+        // IBM documentation, "Check Command Syntax (QCMDCHK) API" and
+        // "Process Commands (QCAPCMD) API": the changed command string
+        // has keywords for the values given without them. The spacing
+        // and order here are as4tainr's (docs/fidelity-gaps.md).
+        assert_eq!(
+            checked_command("CRTLIB MYLIB TEXT('It''s mine')").unwrap(),
+            "CRTLIB LIB(MYLIB) TEXT('It''s mine')"
+        );
+        assert!(checked_command("CRTLIB").is_err());
+        // The parameters in the command's order (CRTSRVPGM: DETAIL before
+        // TGTRLS) and BNDSRVPGM's elements in parentheses, as iRPGUnit's
+        // CRTTSTT self-test (run on IBM i) expects QCAPCMD to give them.
+        assert_eq!(
+            checked_command(
+                "CRTSRVPGM SRVPGM(*CURLIB/PGM_NAME) BNDSRVPGM(SRVPGM_LIB/SRVPGM_NM SRVPGM_LB2/SRVPGM_NM2) TGTRLS(*CURRENT) DETAIL('*BASIC')"
+            )
+            .unwrap(),
+            "CRTSRVPGM SRVPGM(*CURLIB/PGM_NAME) BNDSRVPGM((SRVPGM_LIB/SRVPGM_NM) (SRVPGM_LB2/SRVPGM_NM2)) DETAIL('*BASIC') TGTRLS(*CURRENT)"
+        );
+        // CRTSQLRPGI: OBJTYPE, RPGPPOPT, INCDIR, DBGVIEW, CVTCCSID and
+        // COMPILEOPT in the order iRPGUnit's CRTTSTT self-test (run on IBM
+        // i) expects from QCAPCMD.
+        assert_eq!(
+            checked_command(
+                "CRTSQLRPGI OBJ(*CURLIB/X) SRCSTMF('a.sqlrpgle') COMPILEOPT('TGTCCSID(*JOB)') CVTCCSID(*JOB) DBGVIEW(*LIST) INCDIR('/d') RPGPPOPT(*LVL2) OBJTYPE(*MODULE)"
+            )
+            .unwrap(),
+            "CRTSQLRPGI OBJ(*CURLIB/X) SRCSTMF('a.sqlrpgle') OBJTYPE(*MODULE) RPGPPOPT(*LVL2) INCDIR('/d') DBGVIEW(*LIST) CVTCCSID(*JOB) COMPILEOPT('TGTCCSID(*JOB)')"
+        );
+        // CRTSQLCBLI in its CL reference order (iRPGUnit's CRTTSTT
+        // expects OBJ SRCSTMF OBJTYPE INCDIR CVTCCSID COMPILEOPT).
+        assert_eq!(
+            checked_command(
+                "CRTSQLCBLI OBJ(*CURLIB/S) SRCSTMF('s.sqlcblle') COMPILEOPT('TGTCCSID(*JOB) INCDIR(''/d'')') CVTCCSID(*JOB) INCDIR('/d') OBJTYPE(*MODULE)"
+            )
+            .unwrap(),
+            "CRTSQLCBLI OBJ(*CURLIB/S) SRCSTMF('s.sqlcblle') OBJTYPE(*MODULE) INCDIR('/d') CVTCCSID(*JOB) COMPILEOPT('TGTCCSID(*JOB) INCDIR(''/d'')')"
+        );
+    }
 
     #[test]
     fn keyword_and_positional_forms_are_equivalent() {

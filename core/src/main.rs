@@ -30,6 +30,11 @@ struct Cli {
     )]
     libl: Vec<String>,
 
+    /// Current library of `system`, `call` and `batch` (as `liblist -c`
+    /// sets it for a PASE shell's job); none by default.
+    #[arg(long, global = true, env = "AS4TAINR_CURLIB")]
+    curlib: Option<String>,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -183,8 +188,33 @@ fn split_lib_file(q: &str) -> Result<(String, String)> {
     }
 }
 
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
+fn main() -> std::process::ExitCode {
+    // Programs call programs that run CL, REXX and SQL that call programs
+    // again (iRPGUnit's self-tests run its build scripts from a test):
+    // each nested call is a frame of the interpreters on the thread's
+    // stack, so the threads get more than tokio's default 2 MiB.
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(64 * 1024 * 1024)
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("as4tainr: {e:#}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    // The command itself runs on a thread with that stack too.
+    let main = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || rt.block_on(async_main()));
+    match main.map(|t| t.join()) {
+        Ok(Ok(code)) => code,
+        _ => std::process::ExitCode::from(1),
+    }
+}
+
+async fn async_main() -> std::process::ExitCode {
     match run(Cli::parse()).await {
         Ok(code) => std::process::ExitCode::from(code),
         Err(e) => {
@@ -201,6 +231,12 @@ async fn run(cli: Cli) -> Result<u8> {
         .iter()
         .map(|l| catalog::validate_name("library", l))
         .collect::<Result<_>>()?;
+    let curlib = cli
+        .curlib
+        .as_deref()
+        .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("*CRTDFT"))
+        .map(|c| catalog::validate_name("library", c))
+        .transpose()?;
 
     match cli.cmd {
         Cmd::Init => {
@@ -408,7 +444,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 client: &client,
                 env: &env,
                 user: "QSECOFR".into(),
-                curlib: None,
+                curlib: curlib.clone(),
                 libl: libl.clone(),
                 display: None,
                 id: None,
@@ -439,13 +475,22 @@ async fn run(cli: Cli) -> Result<u8> {
                 client: &client,
                 env: &env,
                 user: "QSECOFR".into(),
-                curlib: None,
+                curlib: curlib.clone(),
                 libl: libl.clone(),
                 display: None,
                 id: None,
                 calls: Default::default(),
             };
-            let out = as4tainr_core::pase_system::run(&mut job, &args).await;
+            // Its own QTEMP, gone when it ends (each `system` is a job).
+            let key = job.job_key();
+            let user = job.user.clone();
+            let out = as4tainr_core::qtemp::scope(
+                &client,
+                &key,
+                &user,
+                as4tainr_core::pase_system::run(&mut job, &args),
+            )
+            .await;
             for l in &out.stdout {
                 println!("{l}");
             }
@@ -529,7 +574,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     user: user.clone(),
                     command,
                     jobq: as4tainr_core::jobs::BATCH_QUEUE.to_string(),
-                    curlib: None,
+                    curlib: curlib.clone(),
                     libl: libl.clone(),
                     submitted_by: String::new(),
                     submitter: None,
@@ -576,13 +621,17 @@ async fn run(cli: Cli) -> Result<u8> {
                 client: &client,
                 env: &env,
                 user: "QSECOFR".into(),
-                curlib: None,
+                curlib: curlib.clone(),
                 libl: libl.clone(),
                 display: None,
                 id: None,
                 calls: Default::default(),
             };
-            let result = job.call_program(&program, args).await;
+            let key = job.job_key();
+            let user = job.user.clone();
+            let result =
+                as4tainr_core::qtemp::scope(&client, &key, &user, job.call_program(&program, args))
+                    .await;
             // Printed output, as it would be on paper (no job: no
             // spooled file).
             let printed = std::mem::take(&mut job.calls.printed);

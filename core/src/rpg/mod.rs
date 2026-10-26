@@ -27,31 +27,207 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tokio_postgres::Client;
 
-/// The text of an include: `FILE,MEMBER`, `LIB/FILE,MEMBER`, `MEMBER`
-/// (QRPGLESRC), or a stream file path.
-async fn fetch_include(client: &Client, libl: &[String], id: &str) -> Option<String> {
-    if id.contains('.') && !id.contains(',') || id.starts_with('/') {
-        return crate::source::find_stream_file(client, id)
-            .await
-            .ok()
-            .flatten()
-            .map(|x| x.1);
+/// Where a compile looks for /COPY and /INCLUDE files (ILE RPG
+/// Programmer's Guide, "Search Path Within The IFS"; ILE RPG Reference,
+/// "/COPY or /INCLUDE"): recorded when the object is created, as
+/// `INCPATH(*IFS|*QSYS 'dir' ...)` in its compile options.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct IncludePath {
+    /// The source is a stream file: the IFS is searched before the
+    /// library list (a member: the library list first).
+    pub ifs_first: bool,
+    /// The directories in order: the current directory, INCDIR, the
+    /// RPGINCDIR environment variable, the source's directory.
+    pub dirs: Vec<String>,
+}
+
+impl IncludePath {
+    /// The compile option that records it.
+    pub fn option(&self) -> String {
+        let mut s = format!("INCPATH({}", if self.ifs_first { "*IFS" } else { "*QSYS" });
+        for d in &self.dirs {
+            s.push_str(&format!(" '{}'", d.replace('\'', "''")));
+        }
+        s.push(')');
+        s
     }
-    let up = id.to_ascii_uppercase();
-    let (libs, file, member) = match up.split_once(',') {
-        Some((f, m)) => match f.split_once('/') {
-            Some((l, f)) => (vec![l.to_string()], f.to_string(), m.to_string()),
-            None => (libl.to_vec(), f.to_string(), m.to_string()),
-        },
-        None => (libl.to_vec(), "QRPGLESRC".to_string(), up.clone()),
+
+    /// The candidates in the IFS for an include name, in search order: a
+    /// name without a suffix also as name.rpgleinc and name.rpgle, all in
+    /// one directory before the next.
+    fn candidates(&self, id: &str) -> Vec<String> {
+        let base = id.rsplit('/').next().unwrap_or(id);
+        let names: Vec<String> = if base.contains('.') {
+            vec![id.to_string()]
+        } else {
+            vec![id.to_string(), format!("{id}.rpgleinc"), format!("{id}.rpgle")]
+        };
+        let mut out = Vec::new();
+        if id.starts_with('/') {
+            out.extend(names);
+        } else {
+            for d in &self.dirs {
+                for n in &names {
+                    out.push(format!("{}/{n}", d.trim_end_matches('/')));
+                }
+            }
+        }
+        out.into_iter()
+            .filter_map(|p| crate::ifs::normalize(&p).ok())
+            .collect()
+    }
+}
+
+/// INCPATH(...) out of compile options: (the other options, the path).
+fn take_incpath(options: &str) -> (String, Option<IncludePath>) {
+    let up = options.to_ascii_uppercase();
+    let Some(at) = up.find("INCPATH(") else {
+        return (options.to_string(), None);
     };
-    match crate::source::find_member(client, &libs, &file, &member).await {
-        Ok(m) => Some(m.source),
-        Err(_) => crate::source::find_stream_file(client, id)
+    let rest = &options[at + 8..];
+    // Up to the closing parenthesis outside quotes.
+    let mut end = rest.len();
+    let mut quoted = false;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '\'' => quoted = !quoted,
+            ')' if !quoted => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let inner = &rest[..end];
+    let mut path = IncludePath::default();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            let mut v = String::new();
+            while let Some(c) = chars.next() {
+                if c == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        chars.next();
+                        v.push('\'');
+                    } else {
+                        break;
+                    }
+                } else {
+                    v.push(c);
+                }
+            }
+            path.dirs.push(v);
+        } else if c == '*' {
+            let w: String = std::iter::once(c)
+                .chain(std::iter::from_fn(|| chars.next_if(|c| c.is_ascii_alphanumeric())))
+                .collect();
+            path.ifs_first = w.eq_ignore_ascii_case("*IFS");
+        }
+    }
+    let others = format!("{}{}", &options[..at], rest.get(end + 1..).unwrap_or(""));
+    (others.trim().to_string(), Some(path))
+}
+
+/// An include file found: a member, or a stream file (its path).
+enum Found {
+    Member(crate::source::Member),
+    Stream(String, String),
+}
+
+impl Found {
+    fn text(&self) -> &str {
+        match self {
+            Found::Member(m) => &m.source,
+            Found::Stream(_, t) => t,
+        }
+    }
+}
+
+/// Find an include: `FILE,MEMBER`, `LIB/FILE,MEMBER`, `MEMBER`
+/// (QRPGLESRC), or a stream file path. With a recorded search path: the
+/// library list and the IFS directories in the order the source's kind
+/// gives; then (as4tainr's own fallback, as before search paths were
+/// recorded) a stream file of that name anywhere.
+async fn find_include(
+    client: &Client,
+    libl: &[String],
+    id: &str,
+    path: Option<&IncludePath>,
+) -> Option<Found> {
+    let ifs_form = id.contains('.') && !id.contains(',') || id.starts_with('/');
+    let member = || async {
+        if id.starts_with('/') {
+            return None;
+        }
+        let up = id.to_ascii_uppercase();
+        let (libs, file, member) = match up.split_once(',') {
+            Some((f, m)) => match f.split_once('/') {
+                Some((l, f)) => (vec![l.to_string()], f.to_string(), m.to_string()),
+                None => (libl.to_vec(), f.to_string(), m.to_string()),
+            },
+            None => (libl.to_vec(), "QRPGLESRC".to_string(), up.clone()),
+        };
+        crate::source::find_member(client, &libs, &file, &member)
             .await
             .ok()
-            .flatten()
-            .map(|x| x.1),
+            .map(Found::Member)
+    };
+    if let Some(path) = path {
+        let ifs = || async {
+            crate::source::first_stream_file(client, &path.candidates(id))
+                .await
+                .ok()
+                .flatten()
+                .map(|(p, t)| Found::Stream(p, t))
+        };
+        let found = if path.ifs_first {
+            match ifs().await {
+                Some(f) => Some(f),
+                None if !ifs_form => member().await,
+                None => None,
+            }
+        } else {
+            match if ifs_form { None } else { member().await } {
+                Some(f) => Some(f),
+                None => ifs().await,
+            }
+        };
+        if found.is_some() {
+            return found;
+        }
+    } else if !ifs_form {
+        if let Some(f) = member().await {
+            return Some(f);
+        }
+    }
+    crate::source::find_stream_file(client, id)
+        .await
+        .ok()
+        .flatten()
+        .map(|(p, t)| Found::Stream(p, t))
+}
+
+/// The search path for an include of a file found: one found in the IFS
+/// searches its own directory and the IFS first.
+fn nested_path(path: Option<&IncludePath>, found: &Found) -> Option<IncludePath> {
+    let path = path?;
+    match found {
+        Found::Stream(p, _) => {
+            let dir = match p.rfind('/') {
+                Some(0) | None => "/".to_string(),
+                Some(i) => p[..i].to_string(),
+            };
+            let mut dirs = path.dirs.clone();
+            if path.ifs_first {
+                dirs.pop();
+            }
+            dirs.push(dir);
+            Some(IncludePath {
+                ifs_first: true,
+                dirs,
+            })
+        }
+        Found::Member(_) => Some(path.clone()),
     }
 }
 
@@ -60,16 +236,21 @@ pub async fn load_includes(
     client: &Client,
     libl: &[String],
     source: &str,
+    path: Option<&IncludePath>,
 ) -> HashMap<String, String> {
     let mut out: HashMap<String, String> = HashMap::new();
-    let mut todo: Vec<String> = parse::includes(source);
-    while let Some(id) = todo.pop() {
+    let mut todo: Vec<(String, Option<IncludePath>)> = parse::includes(source)
+        .into_iter()
+        .map(|i| (i, path.cloned()))
+        .collect();
+    while let Some((id, p)) = todo.pop() {
         if out.contains_key(&id) {
             continue;
         }
-        if let Some(text) = fetch_include(client, libl, &id).await {
-            todo.extend(parse::includes(&text));
-            out.insert(id, text);
+        if let Some(f) = find_include(client, libl, &id, p.as_ref()).await {
+            let inner = nested_path(p.as_ref(), &f);
+            todo.extend(parse::includes(f.text()).into_iter().map(|i| (i, inner.clone())));
+            out.insert(id, f.text().to_string());
         }
     }
     out
@@ -77,54 +258,52 @@ pub async fn load_includes(
 
 /// The /COPY and /INCLUDE members a source brings in (and theirs), with
 /// what the compiler listing shows of them.
-pub async fn listing_copies(client: &Client, libl: &[String], source: &str) -> Vec<listing::Copy> {
+pub async fn listing_copies(
+    client: &Client,
+    libl: &[String],
+    source: &str,
+    options: &str,
+) -> Vec<listing::Copy> {
+    let (_, path) = take_incpath(options);
     let mut out: Vec<listing::Copy> = Vec::new();
-    let mut todo: Vec<String> = parse::includes(source);
+    let mut todo: Vec<(String, Option<IncludePath>)> = parse::includes(source)
+        .into_iter()
+        .map(|i| (i, path.clone()))
+        .collect();
     todo.reverse();
-    while let Some(id) = todo.pop() {
+    while let Some((id, p)) = todo.pop() {
         if out.iter().any(|c| c.id == id) {
             continue;
         }
-        let up = id.to_ascii_uppercase();
-        let member = if id.contains('.') && !id.contains(',') || id.starts_with('/') {
-            None
-        } else {
-            let (libs, file, member) = match up.split_once(',') {
-                Some((f, m)) => match f.split_once('/') {
-                    Some((l, f)) => (vec![l.to_string()], f.to_string(), m.to_string()),
-                    None => (libl.to_vec(), f.to_string(), m.to_string()),
-                },
-                None => (libl.to_vec(), "QRPGLESRC".to_string(), up.clone()),
-            };
-            crate::source::find_member(client, &libs, &file, &member)
-                .await
-                .ok()
+        let Some(found) = find_include(client, libl, &id, p.as_ref()).await else {
+            continue;
         };
-        let member = match member {
-            Some(m) => m,
-            None => match crate::source::find_stream_file(client, &id).await {
-                Ok(Some((path, text))) => {
-                    let stat = crate::ifs::stat(client, &path).await.ok().flatten();
-                    crate::source::Member {
-                        name: path
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or(&path)
-                            .split('.')
-                            .next()
-                            .unwrap_or("")
-                            .to_ascii_uppercase(),
-                        source: text,
-                        ccsid: stat.as_ref().map(|s| s.ccsid).unwrap_or(37),
-                        changed_us: stat.map(|s| s.changed_us),
-                        stmf: path,
-                        ..Default::default()
-                    }
+        let inner_path = nested_path(p.as_ref(), &found);
+        let member = match found {
+            Found::Member(m) => m,
+            Found::Stream(path, text) => {
+                let stat = crate::ifs::stat(client, &path).await.ok().flatten();
+                crate::source::Member {
+                    name: path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&path)
+                        .split('.')
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_uppercase(),
+                    source: text,
+                    ccsid: stat.as_ref().map(|s| s.ccsid).unwrap_or(37),
+                    changed_us: stat.map(|s| s.changed_us),
+                    stmf: path,
+                    ..Default::default()
                 }
-                _ => continue,
-            },
+            }
         };
-        let mut inner = parse::includes(&member.source);
+        let mut inner: Vec<(String, Option<IncludePath>)> = parse::includes(&member.source)
+            .into_iter()
+            .map(|i| (i, inner_path.clone()))
+            .collect();
         inner.reverse();
         todo.extend(inner);
         out.push(listing::Copy { id, member });
@@ -142,7 +321,7 @@ async fn rpg3_copies(client: &Client, libl: &[String], source: &str) -> HashMap<
             continue;
         }
         let (libs, rest) = match id.split_once('/') {
-            Some((l, r)) => (vec![l.to_string()], r.to_string()),
+            Some((l, r)) => (vec![crate::qtemp::real(l)], r.to_string()),
             None => (libl.to_vec(), id.clone()),
         };
         let Some((file, member)) = rest.split_once(',') else {
@@ -207,8 +386,75 @@ pub async fn compile_ovr(
     options: &str,
     ovr: &[crate::ovr::Override],
 ) -> Result<program::Program> {
+    // A program is compiled when it is created on IBM i; here the
+    // source is compiled when the program is activated, so the result is
+    // kept for the process while nothing it may depend on has changed
+    // (files, source members, which carry /COPY members, stream files).
+    // Stream files count only for a source that includes one.
+    let ids = parse::includes(source);
+    let uses_ifs = !ids.is_empty() && options.to_ascii_uppercase().contains("INCPATH(")
+        || ids
+            .iter()
+            .any(|id| id.starts_with('/') || id.contains('.') && !id.contains(','));
+    let stamp = compile_stamp(client, uses_ifs).await;
+    let key = format!("{name}\u{1}{options}\u{1}{}\u{1}{ovr:?}\u{1}{source}", libl.join(","));
+    if let Some(stamp) = &stamp {
+        let cache = COMPILED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((s, p)) = cache.get(&key) {
+            if s == stamp {
+                return Ok((**p).clone());
+            }
+        }
+    }
     let (_, prog) = compile_parts(client, libl, name, source, options, ovr).await;
+    if let (Some(stamp), Ok(p)) = (stamp, &prog) {
+        let mut cache = COMPILED.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert(key, (stamp, std::sync::Arc::new(p.clone())));
+    }
     prog
+}
+
+/// Compiled programs of this process, by what they were compiled from.
+#[allow(clippy::type_complexity)]
+static COMPILED: std::sync::Mutex<
+    std::sync::LazyLock<HashMap<String, (String, std::sync::Arc<program::Program>)>>,
+> = std::sync::Mutex::new(std::sync::LazyLock::new(HashMap::new));
+
+/// What a compiled program depends on, as of now: the files (created,
+/// deleted, changed, and their source members), and the stream files.
+async fn compile_stamp(client: &Client, uses_ifs: bool) -> Option<String> {
+    let files = "SELECT (SELECT count(*)::text || '/' || coalesce(max(created)::text, '') || '/' \
+                 || coalesce(max(changed)::text, '') FROM as4tainr.objects WHERE objtype = '*FILE') \
+             || '|' || (SELECT count(*)::text FROM as4tainr.file_fields)";
+    let sql = if uses_ifs {
+        format!(
+            "{files} || '|' || (SELECT count(*)::text || '/' || coalesce(max(changed)::text, '') FROM as4tainr.ifs)"
+        )
+    } else {
+        files.to_string()
+    };
+    let row = client.query_one(sql.as_str(), &[]).await.ok()?;
+    row.try_get::<_, String>(0).ok()
+}
+
+/// DEFINE(...) out of compile options: (the other options, the names).
+fn take_defines(options: &str) -> (String, Vec<String>) {
+    let up = options.to_ascii_uppercase();
+    let Some(at) = up.find("DEFINE(") else {
+        return (options.to_string(), Vec::new());
+    };
+    let rest = &options[at + 7..];
+    let end = rest.find(')').unwrap_or(rest.len());
+    let names: Vec<String> = rest[..end]
+        .split(|c: char| c.is_whitespace() || c == '\'')
+        .filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case("*NONE"))
+        .map(|n| n.to_ascii_uppercase())
+        .collect();
+    let others = format!("{}{}", &options[..at], rest.get(end + 1..).unwrap_or(""));
+    (others.trim().to_string(), names)
 }
 
 /// Parse and bind a program, keeping the parsed source (for the compiler
@@ -221,8 +467,20 @@ pub async fn compile_parts(
     options: &str,
     ovr: &[crate::ovr::Override],
 ) -> (Option<ast::Source>, Result<program::Program>) {
-    let includes = load_includes(client, libl, source).await;
-    let mut src = match parse::parse(source, &|id| includes.get(id).cloned()) {
+    // INCPATH(...): where the includes are searched, recorded when the
+    // object was created.
+    // AS4TAINR_DUMP_SOURCE=dir: each source compiled is written there
+    // (NAME.rpgle), to look at code programs generate and compile.
+    if let Some(dir) = std::env::var_os("AS4TAINR_DUMP_SOURCE") {
+        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{name}.rpgle")), source);
+    }
+    let (options, incpath) = take_incpath(options);
+    let includes = load_includes(client, libl, source, incpath.as_ref()).await;
+    // DEFINE(names) from the create command: condition names for /IF
+    // DEFINED, not a control keyword.
+    let (options, defines) = take_defines(&options);
+    let options = options.as_str();
+    let mut src = match parse::parse_defined(source, &|id| includes.get(id).cloned(), &defines) {
         Ok(s) => s,
         Err(e) => return (None, Err(e)),
     };
@@ -448,7 +706,12 @@ async fn call_any(
     } = code;
     let rt = tokio::runtime::Handle::current();
     let url = database_url.to_string();
+    // The job's QTEMP, for the thread the program runs on.
+    let qtemp = crate::qtemp::current();
+    let dir = crate::ifs::job_dir();
     tokio::task::spawn_blocking(move || -> Result<(CallResult, Vec<Vec<u8>>)> {
+        let _q = crate::qtemp::ThreadScope::new(qtemp);
+        let _d = crate::ifs::DirScope::new(dir);
         let client = rt.block_on(crate::runtime::connect_db(&url))?;
         rt.block_on(crate::runtime::job_session(
             &client,
@@ -545,7 +808,11 @@ pub async fn call_procedure(
     use crate::ile::Target;
     let rt = tokio::runtime::Handle::current();
     let url = database_url.to_string();
+    let qtemp = crate::qtemp::current();
+    let dir = crate::ifs::job_dir();
     tokio::task::spawn_blocking(move || {
+        let _q = crate::qtemp::ThreadScope::new(qtemp);
+        let _d = crate::ifs::DirScope::new(dir);
         let client = rt.block_on(crate::runtime::connect_db(&url))?;
         let target = binding.imports.get(&sym).cloned().ok_or_else(|| {
             anyhow!("CPD5D02: Procedure {sym} is not bound to program {program}.")
@@ -568,7 +835,7 @@ pub async fn call_procedure(
                     }
                 }
                 let mut found = None;
-                for m in &sb.modules {
+                for m in sb.modules.iter().filter(|m| m.attribute != "CLLE") {
                     let p = rt.block_on(compile_with(&client, &libl, &m.name, &m.source, &m.options))?;
                     if p.procs.get(&sym).is_some_and(|pi| pi.export) {
                         found = Some(m.clone());
@@ -649,4 +916,25 @@ pub fn source_from_path(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// A job's last spooled file opened (QSPRILSP): file, job name, user,
+/// job number, spooled file number.
+pub type LastSplf = (String, String, String, String, i32);
+
+static LAST_SPLF: std::sync::Mutex<Option<std::collections::HashMap<String, LastSplf>>> =
+    std::sync::Mutex::new(None);
+
+pub fn set_last_spooled_file(job: &str, s: LastSplf) {
+    if let Ok(mut g) = LAST_SPLF.lock() {
+        g.get_or_insert_with(Default::default)
+            .insert(job.to_string(), s);
+    }
+}
+
+pub fn last_spooled_file(job: &str) -> Option<LastSplf> {
+    LAST_SPLF
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(job).cloned()))
 }

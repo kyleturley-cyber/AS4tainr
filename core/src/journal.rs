@@ -1060,9 +1060,11 @@ impl Job<'_> {
                 let rows = self
                     .client
                     .query(
-                        "SELECT name FROM as4tainr.objects WHERE library=$1 AND objtype='*FILE' AND attribute='PF'
+                        &format!("SELECT name FROM as4tainr.objects WHERE library=$1 AND objtype='*FILE' AND attribute='PF'
                            AND (name=$2 OR ($3 AND ($2 = '*ALL' OR name LIKE rtrim($2, '*') || '%')))
-                         ORDER BY name",
+                         ORDER BY name{}",
+                        crate::collate::clause(self.client).await?
+                    ),
                         &[l, &name, &generic],
                     )
                     .await?;

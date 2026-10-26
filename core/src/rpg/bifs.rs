@@ -64,7 +64,7 @@ fn num(n: i128) -> Value {
 
 impl Machine<'_> {
     /// A special value written as an argument: *ISO, *DAYS, *ALLSEP...
-    fn special_arg(&self, args: &[Expr], i: usize) -> Option<String> {
+    pub(super) fn special_arg(&self, args: &[Expr], i: usize) -> Option<String> {
         match args.get(i) {
             Some(Expr::Name { parts, args: None })
                 if parts.len() == 1 && parts[0].starts_with('*') =>
@@ -78,7 +78,7 @@ impl Machine<'_> {
     fn type_is_temporal(&self, e: &Expr) -> bool {
         matches!(
             self.temporal_type(e),
-            Some(DType::Date(_)) | Some(DType::Time(_)) | Some(DType::Timestamp)
+            Some(DType::Date(_)) | Some(DType::Time(_)) | Some(DType::Timestamp(_))
         )
     }
 
@@ -92,15 +92,17 @@ impl Machine<'_> {
             Expr::Bif(b, _) => match b.as_str() {
                 "DATE" => Some(dft_d),
                 "TIME" => Some(dft_t),
-                "TIMESTAMP" => Some(DType::Timestamp),
+                "TIMESTAMP" => Some(DType::Timestamp(6)),
                 _ => self.type_of(e),
             },
             Expr::Bin(BinOp::Add | BinOp::Sub, l, r) => {
                 match (self.temporal_type(l), self.temporal_type(r)) {
+                    (Some(DType::Date(_)), Some(DType::Time(_)))
+                    | (Some(DType::Time(_)), Some(DType::Date(_))) => Some(DType::Timestamp(6)),
                     (Some(DType::Date(_)), None) | (None, Some(DType::Date(_))) => Some(dft_d),
                     (Some(DType::Time(_)), None) | (None, Some(DType::Time(_))) => Some(dft_t),
-                    (Some(DType::Timestamp), None) | (None, Some(DType::Timestamp)) => {
-                        Some(DType::Timestamp)
+                    (Some(DType::Timestamp(n)), None) | (None, Some(DType::Timestamp(n))) => {
+                        Some(DType::Timestamp(n))
                     }
                     _ => None,
                 }
@@ -112,6 +114,36 @@ impl Machine<'_> {
     /// The elements of an array (or the values of a list): those in use
     /// of a varying-dimension array.
     pub(super) fn list_of(&mut self, e: &Expr) -> Result<Vec<Value>> {
+        // DSARR(*).SUBFIELD: the subfield of every element of an array of
+        // data structures (ILE RPG Reference, %LOOKUPxx).
+        if let Expr::Path { parts, idx, args } = e {
+            let all = |x: &Option<Box<Expr>>| {
+                matches!(x.as_deref(), Some(Expr::Name { parts, args: None })
+                    if parts.len() == 1 && parts[0] == crate::rpg::expr::ALL_ELEMENTS)
+            };
+            if let Some(j) = idx.iter().position(all) {
+                let key = parts[..=j].join(".");
+                let dim = match self.sym_static(&key) {
+                    Some(Sym::Ds(d)) => d.dim,
+                    Some(Sym::Var(v)) => v.dim,
+                    _ => 0,
+                };
+                if dim == 0 {
+                    bail!("{key}(*): {key} is not an array of data structures");
+                }
+                let mut out = Vec::with_capacity(dim as usize);
+                for k in 1..=dim as i64 {
+                    let mut idx = idx.clone();
+                    idx[j] = Some(Box::new(Expr::Num(Dec::from_i64(k))));
+                    out.push(self.eval(&Expr::Path {
+                        parts: parts.clone(),
+                        idx,
+                        args: args.clone(),
+                    })?);
+                }
+                return Ok(out);
+            }
+        }
         if let Some(arr) = self.array_ref(e) {
             if arr.index.is_none() {
                 let n = self.elems_in_use(&arr.name, &arr.var);
@@ -207,7 +239,15 @@ impl Machine<'_> {
                         };
                         dates::format_time(h, &f)
                     }
-                    Temporal::Ts(ts) => dates::format_ts(&ts, fmt.as_deref() == Some("*ISO0")),
+                    // A timestamp keeps its own fractional digits (0-12).
+                    Temporal::Ts(_) => {
+                        let text = a(&v.chars()?).trim_end().to_string();
+                        if fmt.as_deref() == Some("*ISO0") {
+                            text.chars().filter(|c| c.is_ascii_digit()).collect()
+                        } else {
+                            text
+                        }
+                    }
                 })))
             }
             "DEC" if !args.is_empty() && args.len() <= 2 => {
@@ -271,7 +311,12 @@ impl Machine<'_> {
                     .ok_or_else(|| anyhow!("%{b} needs more arguments"))?,
             )
         };
-        let int_arg = |m: &mut Self, i: usize| -> Result<i128> { arg(m, i)?.num()?.to_i128() };
+        let int_arg = |m: &mut Self, i: usize| -> Result<i128> {
+            let v = arg(m, i)?;
+            v.num()
+                .or_else(|e| data::hex_unsigned(&v).ok_or(e))?
+                .to_i128()
+        };
         Ok(Some(match b {
             // ---- dates and times ---------------------------------------
             "DATE" => {
@@ -715,11 +760,13 @@ impl Machine<'_> {
                 }
                 Value::List(v)
             }
+            // %PROC: the procedure's external name (ILE RPG Reference,
+            // %PROC: EXTPROC's name, case kept).
             "PROC" => Value::str(
                 &self
                     .frames
                     .last()
-                    .map(|f| f.proc.name.clone())
+                    .map(|f| self.external_proc_name(&f.proc.name))
                     .unwrap_or_else(|| self.prog.name.clone()),
             ),
             "PARMNUM" | "PASSED" | "OMITTED" => {
@@ -758,18 +805,49 @@ impl Machine<'_> {
             match t {
                 DType::Date(_) => 'D',
                 DType::Time(_) => 'T',
-                DType::Timestamp => 'Z',
+                DType::Timestamp(_) => 'Z',
                 DType::Ind => 'I',
+                DType::Float(_) => 'F',
                 t if t.is_numeric() => 'N',
                 _ => 'C',
             }
         };
+        // *ON and *OFF are indicator values.
+        // *ON and *OFF: an indicator, or the character '1' or '0'
+        // (iRPGUnit's assertEqual(*on: *off), with no indicator
+        // candidate, calls assertEqual_string).
+        if matches!(e, Expr::Fig(Fig::On | Fig::Off)) {
+            return Ok(vec!['I', 'C']);
+        }
+        // A date, time or timestamp expression (a D'...' literal,
+        // %DATE(...), date arithmetic): that type only.
+        if matches!(e, Expr::Bif(..) | Expr::Bin(..)) {
+            match self.temporal_type(e) {
+                Some(DType::Date(_)) => return Ok(vec!['D']),
+                Some(DType::Time(_)) => return Ok(vec!['T']),
+                Some(DType::Timestamp(_)) => return Ok(vec!['Z']),
+                _ => {}
+            }
+        }
         if let Some(t) = self.type_of(e) {
+            // An indicator is also CHAR(1) data for a character
+            // parameter (iRPGUnit's assertEqual(ind1: ind2)).
+            if t == DType::Ind {
+                return Ok(vec!['I', 'C']);
+            }
+            // A float is a number too.
+            if matches!(t, DType::Float(_)) {
+                return Ok(vec!['F', 'N']);
+            }
+            // A decimal or integer may go to a float parameter.
+            if t.is_numeric() {
+                return Ok(vec!['N', 'F']);
+            }
             return Ok(vec![of_type(t)]);
         }
         Ok(match self.eval(e)? {
-            Value::Num(_) => vec!['N'],
-            Value::Ind(_) | Value::Fig(Fig::On) | Value::Fig(Fig::Off) => vec!['I'],
+            Value::Num(_) => vec!['N', 'F'],
+            Value::Ind(_) | Value::Fig(Fig::On) | Value::Fig(Fig::Off) => vec!['I', 'C'],
             v @ Value::Char(_) => match temporal(&v) {
                 // A literal in date form may be meant as a date.
                 Some(Temporal::Date(_)) => vec!['D', 'C'],
@@ -794,29 +872,38 @@ impl Machine<'_> {
             kinds.push(self.arg_kind(a)?);
         }
         let prog = self.prog;
-        for cand in &pr.overload {
-            let params = match (prog.protos.get(cand), prog.procs.get(cand)) {
-                (Some(p), _) => &p.params,
-                (None, Some(p)) => &p.params,
-                _ => bail!("OVERLOAD({cand}): {cand} is not a prototype or procedure"),
-            };
-            let required = params.iter().filter(|p| !p.nopass).count();
-            if args.len() < required || args.len() > params.len() {
-                continue;
-            }
-            let fits = params.iter().zip(&kinds).all(|(p, k)| {
-                let want = match p.dtype {
-                    DType::Date(_) => 'D',
-                    DType::Time(_) => 'T',
-                    DType::Timestamp => 'Z',
-                    DType::Ind => 'I',
-                    t if t.is_numeric() => 'N',
-                    _ => 'C',
+        // First a candidate whose parameters are each argument's own
+        // kind, then one that takes the arguments by conversion.
+        for exact in [true, false] {
+            for cand in &pr.overload {
+                let params = match (prog.protos.get(cand), prog.procs.get(cand)) {
+                    (Some(p), _) => &p.params,
+                    (None, Some(p)) => &p.params,
+                    _ => bail!("OVERLOAD({cand}): {cand} is not a prototype or procedure"),
                 };
-                k.contains(&want)
-            });
-            if fits {
-                return Ok(cand.clone());
+                let required = params.iter().filter(|p| !p.nopass).count();
+                if args.len() < required || args.len() > params.len() {
+                    continue;
+                }
+                let fits = params.iter().zip(&kinds).all(|(p, k)| {
+                    let want = match p.dtype {
+                        DType::Date(_) => 'D',
+                        DType::Time(_) => 'T',
+                        DType::Timestamp(_) => 'Z',
+                        DType::Ind => 'I',
+                        DType::Float(_) => 'F',
+                        t if t.is_numeric() => 'N',
+                        _ => 'C',
+                    };
+                    if exact {
+                        k.first() == Some(&want)
+                    } else {
+                        k.contains(&want)
+                    }
+                });
+                if fits {
+                    return Ok(cand.clone());
+                }
             }
         }
         bail!(
@@ -1000,6 +1087,10 @@ impl Machine<'_> {
         let client = self.io.client;
         let libl = self.io.libl.clone();
         for m in &b.modules {
+            // A CL module has no exported data.
+            if m.attribute == "CLLE" {
+                continue;
+            }
             let p = self.block(super::super::compile_with(
                 client, &libl, &m.name, &m.source, &m.options,
             ))?;
@@ -1031,7 +1122,7 @@ impl Machine<'_> {
     }
 
     /// Whether a parameter was passed as *OMIT.
-    fn omitted(&self, name: &str) -> bool {
+    pub(super) fn omitted(&self, name: &str) -> bool {
         self.frames
             .last()
             .is_some_and(|f| f.omitted.iter().any(|n| n == name))

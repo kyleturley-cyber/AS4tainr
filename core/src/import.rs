@@ -247,26 +247,93 @@ fn read_rules(text: &str, out: &mut BTreeMap<String, (String, Vec<String>)>) {
         let Some((target, deps)) = line.split_once(':') else {
             continue;
         };
+        // A target's variable (`X.SRVPGM: private TEXT := ...`, as makei
+        // reads them) is no rule: kept as `X.SRVPGM:TEXT`.
+        if let Some((var, value)) = deps.split_once(":=") {
+            let var = var.split_whitespace().last().unwrap_or("").to_ascii_uppercase();
+            if !var.is_empty() {
+                out.insert(
+                    format!("{}:{var}", target.trim().to_ascii_uppercase()),
+                    (var, vec![value.trim().to_string()]),
+                );
+            }
+            continue;
+        }
+        if deps.trim_start().starts_with('=') {
+            continue;
+        }
         let Some((name, kind)) = target.trim().rsplit_once('.') else {
             continue;
         };
         if name.contains(' ') || name.contains('$') || name.contains('=') {
             continue;
         }
-        out.insert(
-            name.to_ascii_uppercase(),
-            (
-                kind.to_ascii_uppercase(),
-                deps.split_whitespace().map(|d| d.to_string()).collect(),
-            ),
-        );
+        let (name, kind) = (name.to_ascii_uppercase(), kind.to_ascii_uppercase());
+        // X.MODULE and X.SRVPGM (or X.PGM) of the same name (a service
+        // program or program made from its module): the service program's
+        // or program's rule is kept, the module noted.
+        let deps_list: Vec<String> = deps.split_whitespace().map(|d| d.to_string()).collect();
+        if kind == "MODULE" {
+            out.insert(format!("{name}.MODULE"), ("MODULE".into(), deps_list.clone()));
+        }
+        if !matches!(kind.as_str(), "SRVPGM" | "PGM")
+            && out.get(&name).is_some_and(|r| r.0 == "SRVPGM" || r.0 == "PGM")
+        {
+            continue;
+        }
+        out.insert(name, (kind, deps_list));
     }
 }
 
 /// Walk DIR and its folders. A folder named like a source file
 /// (`QRPGLESRC`) puts its members in that file; other folders (project
 /// folders) are only for grouping.
+/// Does the directory hold a file of this name (case not compared, as
+/// in the IFS's root file system)?
+fn dir_has(dir: &Path, name: &str) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|rd| {
+        rd.flatten().any(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|f| f.eq_ignore_ascii_case(name))
+        })
+    })
+}
+
+/// A source that includes files by a relative path (`/COPY
+/// ../Copy_Mbrs/X.RPGLE`): such a path is only found from the source's
+/// directory in the IFS, so the source is compiled from there (SRCSTMF).
+fn includes_relative_paths(path: &Path) -> bool {
+    read_text(path).is_ok_and(|t| {
+        crate::rpg::parse::includes(&t)
+            .iter()
+            .any(|id| id.contains('/') && !id.starts_with('/') && !id.contains(','))
+    })
+}
+
+/// A TOBi (makei) project: `iproj.json` at its root. Its sources are
+/// compiled from the IFS (SRCSTMF), with the project's include path.
+fn is_tobi(dir: &Path) -> bool {
+    dir.join("iproj.json").is_file()
+}
+
+/// iproj.json's includePath: directories relative to the project.
+fn tobi_include_path(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("iproj.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("includePath").cloned())
+        .and_then(|v| v.as_array().cloned())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn scan(dir: &Path) -> Result<Scan> {
+    let tobi = is_tobi(dir);
     let mut out = Scan::default();
     // Files whose names cannot be member names (ARRAYLIST_H is 11
     // characters): still include files when a source names them.
@@ -406,8 +473,13 @@ fn scan(dir: &Path) -> Result<Scan> {
         .rules
         .iter()
         .filter_map(|(target, (_, deps))| {
-            deps.first()
-                .map(|d| (target.clone(), d.to_ascii_lowercase()))
+            // X.MODULE: the module of X (also when X is a service program).
+            let target = match target.split_once('.') {
+                Some((t, "MODULE")) => t.to_string(),
+                Some(_) => return None,
+                None => target.clone(),
+            };
+            deps.first().map(|d| (target, d.to_ascii_lowercase()))
         })
         .collect();
     for (target, dep) in renames {
@@ -443,7 +515,22 @@ fn scan(dir: &Path) -> Result<Scan> {
         for id in crate::rpg::parse::includes(&t) {
             let id = id.trim().trim_matches(|c| c == '\'' || c == '"');
             let base = id.rsplit('/').next().unwrap_or(id).to_ascii_lowercase();
-            if base.contains('.') && !id.contains(',') {
+            // A TOBi project compiles from its stream files: a name
+            // without a suffix is first an IFS file next to the source
+            // (name, name.rpgleinc, name.rpgle; ILE RPG Programmer's
+            // Guide, "Search Path Within The IFS"), then a member.
+            let sibling = if tobi && !id.contains(',') && !base.contains('.') {
+                m.path.parent().and_then(|d| {
+                    [base.clone(), format!("{base}.rpgleinc"), format!("{base}.rpgle")]
+                        .into_iter()
+                        .find(|n| dir_has(d, n))
+                })
+            } else {
+                None
+            };
+            if let Some(n) = sibling {
+                wanted.insert(n);
+            } else if base.contains('.') && !id.contains(',') {
                 wanted.insert(base);
             } else {
                 // A member: MBR (in QRPGLESRC), FILE,MBR or LIB/FILE,MBR.
@@ -541,6 +628,27 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         );
     }
     let mut report = Report::default();
+    // A TOBi project: RPG sources compiled from the IFS (SRCSTMF, as
+    // makei does), copied under /<library>/ with the include files, the
+    // project's includePath as INCDIR.
+    // (makei: TOBi's src/mk/def_rules.mk, COMMIT := *NONE and so on.)
+    let tobi = is_tobi(dir);
+    let ifs_root = format!("/{}", lib.to_ascii_lowercase());
+    let incdir: String = tobi_include_path(dir)
+        .iter()
+        .map(|d| format!(" '{ifs_root}/{}'", d.trim_start_matches("./").trim_end_matches('/')))
+        .collect();
+    let incdir = if incdir.is_empty() {
+        String::new()
+    } else {
+        format!(" INCDIR({})", incdir.trim())
+    };
+    let rel_of = |p: &Path| {
+        p.strip_prefix(dir)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
     // The library goes in front: its files and programs are found first.
     job.curlib = Some(lib.clone());
     if !catalog::library_exists(job.client, &lib).await? {
@@ -751,7 +859,11 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         .iter()
         .filter(|m| matches!(m.srctype.as_str(), "RPGLE" | "SQLRPGLE") && !m.included)
     {
-        let rule = rules.get(&m.member).map(|r| r.0.as_str());
+        let rule = if rules.contains_key(&format!("{}.MODULE", m.member)) {
+            Some("MODULE")
+        } else {
+            rules.get(&m.member).map(|r| r.0.as_str())
+        };
         let nomain = read_text(&m.path)
             .map(|t| {
                 let u = t.to_ascii_uppercase();
@@ -771,7 +883,27 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
             continue;
         }
         is_module.insert((m.file.clone(), m.member.clone()));
-        let cmd = if m.srctype == "SQLRPGLE" {
+        let stmf = if tobi || includes_relative_paths(&m.path) {
+            let path = format!("{ifs_root}/{}", rel_of(&m.path));
+            source::put_stream_file(job.client, &path, &read_text(&m.path)?).await?;
+            Some(path)
+        } else {
+            None
+        };
+        let cmd = if let Some(path) = &stmf {
+            if m.srctype == "SQLRPGLE" {
+                format!(
+                    "CRTSQLRPGI OBJ({lib}/{}) SRCSTMF('{path}') OBJTYPE(*MODULE){}{incdir}",
+                    m.member,
+                    if tobi { " COMMIT(*NONE)" } else { "" }
+                )
+            } else {
+                format!(
+                    "CRTRPGMOD MODULE({lib}/{}) SRCSTMF('{path}'){incdir}",
+                    m.member
+                )
+            }
+        } else if m.srctype == "SQLRPGLE" {
             format!(
                 "CRTSQLRPGI OBJ({lib}/{}) SRCFILE({lib}/{}) SRCMBR({}) OBJTYPE(*MODULE)",
                 m.member, m.file, m.member
@@ -784,7 +916,38 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         };
         step(job, &mut report, &m.member, &cmd).await;
     }
-    for m in of_type("BND") {
+    // Service programs after those they bind (BNDSRVPGM), as make builds
+    // a rule's prerequisites first.
+    let mut bnds: Vec<&Found> = of_type("BND").collect();
+    {
+        let srv_deps = |m: &Found| -> Vec<String> {
+            match rules.get(&m.member) {
+                Some((kind, deps)) if kind == "SRVPGM" => deps
+                    .iter()
+                    .filter_map(|d| d.to_ascii_uppercase().strip_suffix(".SRVPGM").map(String::from))
+                    .collect(),
+                _ => vec![],
+            }
+        };
+        let names: Vec<String> = bnds.iter().map(|m| m.member.clone()).collect();
+        let mut ordered: Vec<&Found> = Vec::new();
+        let mut done: std::collections::BTreeSet<String> = Default::default();
+        while !bnds.is_empty() {
+            let pick = bnds
+                .iter()
+                .position(|m| {
+                    srv_deps(m)
+                        .iter()
+                        .all(|d| done.contains(d) || !names.contains(d))
+                })
+                .unwrap_or(0);
+            let m = bnds.remove(pick);
+            done.insert(m.member.clone());
+            ordered.push(m);
+        }
+        bnds = ordered;
+    }
+    for m in bnds {
         let deps_of = |suffix: &str| -> Vec<String> {
             match rules.get(&m.member) {
                 Some((kind, deps)) if kind == "SRVPGM" => deps
@@ -816,7 +979,48 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
                 format!(" BNDSRVPGM({})", srvpgms.join(" "))
             }
         );
+        let cmd = match rules
+            .get(&format!("{}.SRVPGM:TEXT", m.member))
+            .and_then(|r| r.1.first())
+        {
+            Some(t) => format!("{cmd} TEXT('{}')", t.replace('\'', "''")),
+            None => cmd,
+        };
         step(job, &mut report, &m.member, &cmd).await;
+    }
+    // Programs bound from modules (TOBi `X.PGM: X.MODULE Y.SRVPGM`), with
+    // the rule's TEXT and ACTGRP.
+    for (name, (kind, deps)) in rules.iter() {
+        if kind != "PGM" || name.contains('.') || name.contains(':') {
+            continue;
+        }
+        let pick = |suffix: &str| -> Vec<String> {
+            deps.iter()
+                .filter_map(|d| d.to_ascii_uppercase().strip_suffix(suffix).map(String::from))
+                .map(|d| format!("{lib}/{d}"))
+                .collect()
+        };
+        let modules = pick(".MODULE");
+        if modules.is_empty() {
+            continue;
+        }
+        let srvpgms = pick(".SRVPGM");
+        let var = |v: &str| {
+            rules
+                .get(&format!("{name}.PGM:{v}"))
+                .and_then(|r| r.1.first().cloned())
+        };
+        let mut cmd = format!("CRTPGM PGM({lib}/{name}) MODULE({})", modules.join(" "));
+        if !srvpgms.is_empty() {
+            cmd.push_str(&format!(" BNDSRVPGM({})", srvpgms.join(" ")));
+        }
+        if let Some(a) = var("ACTGRP") {
+            cmd.push_str(&format!(" ACTGRP({a})"));
+        }
+        if let Some(t) = var("TEXT") {
+            cmd.push_str(&format!(" TEXT('{}')", t.replace('\'', "''")));
+        }
+        step(job, &mut report, name, &cmd).await;
     }
     for m in of_type("BNDDIR") {
         // A TOBi binding directory script: CL commands with &O (the
@@ -852,6 +1056,17 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         }
     }
 
+    // 5a. Commands, before the programs: a CL program's commands must
+    // exist when it is compiled; the command processing program is the
+    // program of the same name (as build tools for IBM i name them by
+    // default), and need not exist yet.
+    for m in of_type("CMD") {
+        let cmd = format!(
+            "CRTCMD CMD({lib}/{}) PGM({lib}/{}) SRCFILE({lib}/{}) SRCMBR({})",
+            m.member, m.member, m.file, m.member
+        );
+        step(job, &mut report, &m.member, &cmd).await;
+    }
     // 5. Programs (replaced: they are built from the source just added).
     for (t, command) in [
         ("CLLE", "CRTBNDCL"),
@@ -869,21 +1084,30 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
             } else {
                 "PGM"
             };
-            let cmd = format!(
-                "{command} {target}({lib}/{}) SRCFILE({lib}/{}) SRCMBR({})",
-                m.member, m.file, m.member
-            );
+            let cmd = if matches!(t, "RPGLE" | "SQLRPGLE")
+                && (tobi || includes_relative_paths(&m.path))
+            {
+                let path = format!("{ifs_root}/{}", rel_of(&m.path));
+                source::put_stream_file(job.client, &path, &read_text(&m.path)?).await?;
+                // makei's defaults (TOBi def_rules.mk): COMMIT(*NONE) for
+                // SQL, DFTACTGRP(*NO) for bound programs.
+                let extra = match command {
+                    "CRTSQLRPGI" if tobi => " COMMIT(*NONE)",
+                    "CRTBNDRPG" if tobi => " DFTACTGRP(*NO)",
+                    _ => "",
+                };
+                format!(
+                    "{command} {target}({lib}/{}) SRCSTMF('{path}'){extra}{incdir}",
+                    m.member
+                )
+            } else {
+                format!(
+                    "{command} {target}({lib}/{}) SRCFILE({lib}/{}) SRCMBR({})",
+                    m.member, m.file, m.member
+                )
+            };
             step(job, &mut report, &m.member, &cmd).await;
         }
-    }
-    // 6. Commands: the command processing program is the program of the
-    // same name (as build tools for IBM i name them by default).
-    for m in of_type("CMD") {
-        let cmd = format!(
-            "CRTCMD CMD({lib}/{}) PGM({lib}/{}) SRCFILE({lib}/{}) SRCMBR({})",
-            m.member, m.member, m.file, m.member
-        );
-        step(job, &mut report, &m.member, &cmd).await;
     }
     for m in members.iter().filter(|m| {
         !matches!(
@@ -1090,4 +1314,23 @@ mod tests {
             .collect();
         assert_eq!(m, [("QCPYSRC", "NWUTILPR", "RPGLEINC")]);
     }
+
+    /// makei's Rules.mk: a service program and its module of one name
+    /// (REPL_PM.MODULE, REPL_PM.SRVPGM), and target variables
+    /// (`X.SRVPGM: private TEXT := ...`), which are no rules.
+    #[test]
+    fn rules_keep_service_program_and_module_of_one_name() {
+        let mut r = BTreeMap::new();
+        read_rules(
+            "REPL_PM.MODULE: REPL_PM.RPGLE\nREPL_PM.SRVPGM: private TEXT := Program messages\nREPL_PM.SRVPGM: REPL_PM.BND REPL_PM.MODULE\nREPL_USR.SRVPGM: REPL_USR.BND REPL_USR.MODULE REPL_PM.SRVPGM\nREPL_USR.MODULE: REPL_USR.RPGLE\n",
+            &mut r,
+        );
+        assert_eq!(
+            r.get("REPL_PM"),
+            Some(&("SRVPGM".to_string(), vec!["REPL_PM.BND".to_string(), "REPL_PM.MODULE".to_string()]))
+        );
+        assert_eq!(r.get("REPL_USR").map(|x| x.1.len()), Some(3));
+        assert!(r.contains_key("REPL_PM.MODULE") && r.contains_key("REPL_USR.MODULE"));
+    }
+
 }

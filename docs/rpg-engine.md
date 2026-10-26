@@ -91,7 +91,7 @@ What R5 added, from running the corpus (Nick Litten's examples, `tools/corpus.sh
 - **Nested data structures:** a subfield defined with `LIKEDS` is a data structure inside the other one (`list.users(i).name`), also through a `LIKEDS` copy of the whole structure and as a parameter; `ds(i).field` for data structure arrays.
 
 **R4 is done (Oct 19, 2026).** Programs call each other and are built from procedures:
-- **Procedures** (`DCL-PROC`, P specs) with their own local storage on each call, `STATIC` locals, parameters by reference, `CONST` and `VALUE`, `LIKEDS` parameters, `OPTIONS(*NOPASS : *OMIT)`, `%PARMS`, return values in the declared type, recursion, subroutines inside procedures, `ON-EXIT`.
+- **Procedures** (`DCL-PROC`, P specs) with their own local storage on each call, `STATIC` locals, parameters by reference, `CONST` and `VALUE`, `LIKEDS` parameters, `OPTIONS(*NOPASS : *OMIT)`, `OPTIONS(*TRIM)` (CONST and VALUE character arguments without leading and trailing blanks), `%PARMS`, return values in the declared type, recursion, subroutines inside procedures, `ON-EXIT`.
 - **Prototypes** (`DCL-PR`, PR specs): calls to procedures (`EXTPROC`, or the prototype's name) and to programs (`EXTPGM`).
 - **Program calls:** `CALL` with `PARM` (factor 2 moved in first; error indicator in 73-74) and `CALLP` through an `EXTPGM` prototype. The called RPG program comes from the library list (CRTBNDRPG) or `AS4TAINR_PGM_PATH`; its parameters are passed by reference (`*ENTRY PLIST`, or a procedure interface outside procedures). Its DSPLY and printed output go to the caller's job.
 - **`ctl-opt main(name)`:** the program runs that procedure (no cycle); its interface is the program's parameter list.

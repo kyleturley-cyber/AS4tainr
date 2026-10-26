@@ -637,7 +637,11 @@ pub fn parse(name: &str, source: &str) -> Result<DisplayFile> {
                 ("", None) => 'A',
                 (d, _) => d.chars().next().unwrap(),
             };
-            if !"AYSNXWLTZ".contains(dtype) {
+            // D: digits only (0-9). Like the other keyboard shifts it says
+            // what can be typed; the decimal positions say whether the
+            // program sees a character or a zoned decimal field (DDS for
+            // display files, "Data type/keyboard shift (position 35)").
+            if !"AYSNXWLTZD".contains(dtype) {
                 bail!("line {lineno}: data type {dtype} is not supported");
             }
             let usage = match usage.as_str() {
@@ -646,6 +650,11 @@ pub fn parse(name: &str, source: &str) -> Result<DisplayFile> {
                 "I" => Usage::Input,
                 "B" => Usage::Both,
                 "H" => Usage::Hidden,
+                // P: a program-to-system field, which the program sets for
+                // keywords that name it (&field) and the screen never
+                // shows; like a hidden field, it has no place on the
+                // screen.
+                "P" => Usage::Hidden,
                 other => bail!("line {lineno}: usage {other} is not supported"),
             };
             if usage != Usage::Hidden && pos.is_none() {
@@ -1169,7 +1178,9 @@ pub fn draw(
             f.length
         };
         if input_capable && !protect {
-            let shift = if f.is_numeric() {
+            let shift = if f.dtype == 'D' {
+                ffw::DIGITS_ONLY
+            } else if f.is_numeric() {
                 if f.dtype == 'Y' {
                     ffw::NUMERIC_ONLY
                 } else {
@@ -1621,6 +1632,36 @@ mod tests {
         let text = crate::tn5250::ebcdic::decode(&r.screen.to_stream());
         assert!(text.contains("75.25-"), "{text}");
         assert!(r.inputs.is_empty());
+    }
+
+    #[test]
+    fn digits_only_and_program_to_system_fields() {
+        // DDS for display files: keyboard shift D lets only the digits 0-9
+        // be typed (5250 field format word shift 101, digits only); the
+        // decimal positions make it zoned or character for the program.
+        // Usage P: a program-to-system field, not on the screen.
+        let src = "     A          R DIGITS
+     A            CODE           4D  B  2  3
+     A            AMT            5D 0B  3  3
+     A            CHOICE1T       5A  P
+";
+        let f = parse("DIGITS", src).unwrap();
+        let r = &f.records[0];
+        assert_eq!((r.fields[0].dtype, r.fields[0].is_numeric()), ('D', false));
+        assert_eq!((r.fields[1].dtype, r.fields[1].is_numeric()), ('D', true));
+        assert_eq!(r.fields[2].usage, Usage::Hidden);
+        let ctx = Context {
+            user: "QSECOFR",
+            system: "AS4TAINR",
+            date: "10/15/26".into(),
+            time: "12:00:00".into(),
+        };
+        let out = render(&f, r, &BTreeMap::new(), &[false; 100], &ctx, None, None);
+        assert_eq!(out.inputs, vec!["CODE", "AMT"]);
+        let st = out.screen.to_stream();
+        // Start of field orders (0x1D) with the digits-only shift.
+        let sf = st.windows(2).filter(|w| w[0] == 0x1D && w[1] == 0x45).count();
+        assert_eq!(sf, 2, "{st:02X?}");
     }
 
     #[test]

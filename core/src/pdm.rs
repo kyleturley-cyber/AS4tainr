@@ -111,6 +111,7 @@ impl Job<'_> {
             "WRKOBJPDM" => self.wrkobjpdm(cmd).await?,
             "WRKMSGD" => self.wrkmsgd(cmd).await?,
             "RMVM" => self.rmvm(cmd).await?,
+            "ADDPFM" => self.addpfm(cmd).await?,
             _ => return Ok(None),
         }))
     }
@@ -126,6 +127,49 @@ impl Job<'_> {
         }
         let lib = q.split_once('/').map(|(l, _)| l).unwrap_or("*LIBL");
         bail!("CPF9812: File {name} in library {lib} not found.")
+    }
+
+    /// ADDPFM: add a member to a source file. A member that is there
+    /// already is CPF5812, then the escape CPF7306 (the messages a CL
+    /// program monitors for after ADDPFM; IBM's ADDPFM command
+    /// documentation). Data files keep one member in as4tainr.
+    async fn addpfm(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, file) = self.pdm_file(cmd.get("FILE")).await?;
+        authority::check(self.client, &self.user, &lib, &file, "*FILE", Aut::Change).await?;
+        let mbr = catalog::validate_name("member", cmd.get("MBR"))?;
+        if !crate::source::is_source_file(self.client, &lib, &file).await? {
+            bail!(
+                "CPF7306: Member {mbr} not added to file {file} in library {lib}: as4tainr keeps one member in a data file."
+            );
+        }
+        let text = match cmd.get("TEXT") {
+            t if t.eq_ignore_ascii_case("*BLANK") => String::new(),
+            t => t.to_string(),
+        };
+        let srctype = match cmd.get("SRCTYPE").to_ascii_uppercase() {
+            t if t == "*NONE" => String::new(),
+            t => t,
+        };
+        let m = crate::source::Member {
+            library: lib.clone(),
+            file: file.clone(),
+            name: mbr.clone(),
+            srctype,
+            text,
+            ccsid: 37,
+            ..Default::default()
+        };
+        if crate::source::put_member(self.client, &m, false)
+            .await
+            .is_err()
+        {
+            bail!(
+                "CPF5812: Member {mbr} already exists in file {file} in library {lib}.\nCPF7306: Member {mbr} not added to file {file} in library {lib}."
+            );
+        }
+        Ok(Outcome::Messages(vec![format!(
+            "CPC7305: Member {mbr} was added to file {file} in library {lib}."
+        )]))
     }
 
     /// RMVM: remove a member from a source file.

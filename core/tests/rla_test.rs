@@ -15670,3 +15670,151 @@ dsply %char(%size(jidf));
     assert!(r.error.is_none(), "{:?}", r.error);
     assert_eq!(r.messages, ["ABCDEFGHIJ", "12"]);
 }
+
+/// DSPOBJD OUTPUT(*OUTFILE) and DSPFD TYPE(*MBRLIST) OUTPUT(*OUTFILE):
+/// the output file is made like the model in QSYS (QADSPOBJ, format
+/// QLIDOBJD, 116 fields, record length 726; QAFDMBRL, format QWHFDML, 32
+/// fields, record length 202: DSPFFD on PUB400 2026-10-26,
+/// tools/golden/verify1.txt v_ffd_objd, v_ffd_mbrl), a record per object
+/// or member. The field descriptions there give the formats: creation
+/// dates MMDDYY for DSPOBJD and YYMMDD for DSPFD, each with a century
+/// field (1 = 20xx). OUTMBR(*FIRST *ADD) adds; *REPLACE (the default)
+/// replaces.
+#[tokio::test]
+async fn dspobjd_and_dspfd_outfiles() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    for c in [
+        format!("CRTDTAARA DTAARA({lib}/ODA) TYPE(*CHAR) TEXT('outfile test')"),
+        format!("CRTSRCPF FILE({lib}/QOSRC)"),
+        format!("ADDPFM FILE({lib}/QOSRC) MBR(A1) SRCTYPE(CLLE) TEXT('first')"),
+        format!("ADDPFM FILE({lib}/QOSRC) MBR(B2) SRCTYPE(RPGLE)"),
+    ] {
+        run_in(&client, &url, &lib, &c)
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e:#}"));
+    }
+    // The models: their fields and record lengths.
+    for (file, fields, len) in [("QADSPOBJ", 116i64, 726i64), ("QAFDMBRL", 32, 202)] {
+        let r = client
+            .query_one(
+                "SELECT count(*), coalesce(sum(CASE WHEN data_type = 'P' THEN length / 2 + 1 ELSE length END), 0)::bigint
+                   FROM as4tainr.file_fields WHERE library = 'QSYS' AND file = $1",
+                &[&file],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (r.get::<_, i64>(0), r.get::<_, i64>(1)),
+            (fields, len),
+            "{file}"
+        );
+    }
+    run_in(
+        &client,
+        &url,
+        &lib,
+        &format!("DSPOBJD OBJ({lib}/ODA) OBJTYPE(*DTAARA) OUTPUT(*OUTFILE) OUTFILE({lib}/OBJS)"),
+    )
+    .await
+    .unwrap();
+    let today: (String, String) = {
+        let r = client
+            .query_one(
+                "SELECT to_char(now() AT TIME ZONE 'UTC', 'MMDDYY'), to_char(now() AT TIME ZONE 'UTC', 'YYMMDD')",
+                &[],
+            )
+            .await
+            .unwrap();
+        (r.get(0), r.get(1))
+    };
+    let t = format!("{}.objs", lib.to_ascii_lowercase());
+    let r = client
+        .query_one(
+            &format!(
+                "SELECT rtrim(odlbnm), rtrim(odobnm), rtrim(odobtp), rtrim(odobtx), rtrim(oddtl),
+                        odccen, odcdat, rtrim(odobow) FROM {t}"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let got: Vec<String> = (0..8).map(|i| r.get(i)).collect();
+    assert_eq!(
+        got,
+        [
+            lib.as_str(),
+            "ODA",
+            "*DTAARA",
+            "outfile test",
+            "*BASIC",
+            "1",
+            today.0.as_str(),
+            "QSECOFR"
+        ]
+    );
+    run_in(
+        &client,
+        &url,
+        &lib,
+        &format!("DSPOBJD OBJ({lib}/ODA) OBJTYPE(*DTAARA) OUTPUT(*OUTFILE) OUTFILE({lib}/OBJS) OUTMBR(*FIRST *ADD)"),
+    )
+    .await
+    .unwrap();
+    let n: i64 = client
+        .query_one(&format!("SELECT count(*) FROM {t}"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 2);
+    run_in(
+        &client,
+        &url,
+        &lib,
+        &format!("DSPFD FILE({lib}/QOSRC) TYPE(*MBRLIST) OUTPUT(*OUTFILE) OUTFILE({lib}/MBRS)"),
+    )
+    .await
+    .unwrap();
+    let rows = client
+        .query(
+            &format!(
+                "SELECT rtrim(mlfile), rtrim(mlname), rtrim(mlseu2), rtrim(mlmtxt), mlnomb::text,
+                        mlftyp, rtrim(mlfila), rtrim(mlfatr), mlccen, mlcdat
+                   FROM {}.mbrs ORDER BY mlname",
+                lib.to_ascii_lowercase()
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let got: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| (0..10).map(|i| r.get(i)).collect())
+        .collect();
+    let row = |m: &str, t: &str, x: &str| {
+        vec![
+            "QOSRC".to_string(),
+            m.into(),
+            t.into(),
+            x.into(),
+            "2".into(),
+            "P".into(),
+            "*PHY".into(),
+            "PF".into(),
+            "1".into(),
+            today.1.clone(),
+        ]
+    };
+    assert_eq!(got, [row("A1", "CLLE", "first"), row("B2", "RPGLE", "")]);
+    // Only TYPE(*MBRLIST) goes to an output file here.
+    let e = run_in(
+        &client,
+        &url,
+        &lib,
+        &format!("DSPFD FILE({lib}/QOSRC) TYPE(*ATR) OUTPUT(*OUTFILE) OUTFILE({lib}/ATRS)"),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(e.starts_with("CPD0084"), "{e}");
+}

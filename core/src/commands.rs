@@ -6142,6 +6142,9 @@ impl Job<'_> {
             // i 7.5).
             bail!("CPF2105: Object {name} of type {objtype} in library {label} not found.");
         }
+        if cmd.get("OUTPUT").eq_ignore_ascii_case("*OUTFILE") {
+            return self.dspobjd_outfile(cmd, &groups).await;
+        }
         // Printed layout: PUB400 (IBM i 7.5) `system "DSPOBJD
         // OBJ(QSYS/QCMD) OBJTYPE(*PGM)"`, 2026-10-21. Size: what this
         // system stores for the object (fidelity-gaps.md).
@@ -6234,6 +6237,121 @@ impl Job<'_> {
             ibm,
             ..Default::default()
         }))
+    }
+
+    /// DSPOBJD OUTPUT(*OUTFILE): a record per object in the format of
+    /// QSYS/QADSPOBJ (QLIDOBJD; outfile.rs), DETAIL(*BASIC)'s fields:
+    /// dates are MMDDYY (the creation, change and display dates) or
+    /// YYMMDD (the source's change date), each with its century field
+    /// (0 = 19xx, 1 = 20xx), times HHMMSS (the model's field
+    /// descriptions, PUB400 2026-10-26, tools/golden/verify1.txt
+    /// v_ffd_objd). Fields as4tainr has no value for are blank or zero
+    /// (fidelity-gaps).
+    async fn dspobjd_outfile(
+        &mut self,
+        cmd: &Command,
+        groups: &[(String, Vec<catalog::ObjectEntry>)],
+    ) -> Result<Outcome> {
+        let outfile = cmd.get("OUTFILE").trim().to_string();
+        if outfile.is_empty() {
+            return Err(crate::cl::value_error(
+                "OUTPUT(*OUTFILE) needs OUTFILE, the file to receive the records.",
+            ));
+        }
+        let option = cmd
+            .list("OUTMBR")
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| "*REPLACE".into());
+        let now = self
+            .client
+            .query_one(
+                "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY'),
+                        to_char(now() AT TIME ZONE 'UTC', 'MMDDYY'),
+                        to_char(now() AT TIME ZONE 'UTC', 'HH24MISS')",
+                &[],
+            )
+            .await?;
+        let (ny, nd, nt): (String, String, String) = (now.get(0), now.get(1), now.get(2));
+        let system = crate::report::system_name();
+        let mut records = Vec::new();
+        for (lib, objs) in groups {
+            for o in objs {
+                let size = catalog::object_size(self.client, lib, &o.name, &o.objtype)
+                    .await
+                    .unwrap_or(0);
+                let r = self
+                    .client
+                    .query_opt(
+                        "SELECT to_char(created AT TIME ZONE 'UTC', 'YYYY'),
+                                to_char(created AT TIME ZONE 'UTC', 'MMDDYY'),
+                                to_char(created AT TIME ZONE 'UTC', 'HH24MISS'),
+                                to_char(coalesce(changed, created) AT TIME ZONE 'UTC', 'YYYY'),
+                                to_char(coalesce(changed, created) AT TIME ZONE 'UTC', 'MMDDYY'),
+                                to_char(coalesce(changed, created) AT TIME ZONE 'UTC', 'HH24MISS'),
+                                coalesce(owner, ''), coalesce(src_file, ''), coalesce(src_lib, ''),
+                                coalesce(src_mbr, ''),
+                                coalesce(to_char(nullif(src_changed, '')::timestamptz AT TIME ZONE 'UTC', 'YYYY'), ''),
+                                coalesce(to_char(nullif(src_changed, '')::timestamptz AT TIME ZONE 'UTC', 'YYMMDD'), ''),
+                                coalesce(to_char(nullif(src_changed, '')::timestamptz AT TIME ZONE 'UTC', 'HH24MISS'), ''),
+                                coalesce(user_attr, '')
+                           FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype=$3",
+                        &[lib, &o.name, &o.objtype],
+                    )
+                    .await?;
+                let g = |i: usize| -> String {
+                    r.as_ref()
+                        .and_then(|r| r.try_get::<_, Option<String>>(i).ok().flatten())
+                        .unwrap_or_default()
+                };
+                let mut rec: crate::outfile::Record = vec![
+                    ("ODDCEN", crate::outfile::century(&ny)),
+                    ("ODDDAT", nd.clone()),
+                    ("ODDTIM", nt.clone()),
+                    ("ODLBNM", crate::qtemp::logical(lib)),
+                    ("ODOBNM", o.name.clone()),
+                    ("ODOBTP", o.objtype.clone()),
+                    ("ODOBAT", o.attribute.clone()),
+                    ("ODOBFR", "0".into()),
+                    ("ODOBSZ", size.to_string()),
+                    ("ODOBTX", o.text.clone()),
+                    ("ODOBLK", "0".into()),
+                    ("ODOBDM", "0".into()),
+                    ("ODOBOW", g(6)),
+                    ("ODSRCF", g(7)),
+                    ("ODSRCL", g(8)),
+                    ("ODSRCM", g(9)),
+                    ("ODOBSY", system.clone()),
+                    ("ODCRTU", g(6)),
+                    ("ODCRTS", system.clone()),
+                    ("ODASP", "1".into()),
+                    ("ODUATR", g(13)),
+                    ("ODSIZU", size.to_string()),
+                    ("ODBPUN", "1".into()),
+                    ("ODDTL", "*BASIC".into()),
+                ];
+                if !g(0).is_empty() {
+                    rec.extend([
+                        ("ODCCEN", crate::outfile::century(&g(0))),
+                        ("ODCDAT", g(1)),
+                        ("ODCTIM", g(2)),
+                        ("ODLCEN", crate::outfile::century(&g(3))),
+                        ("ODLDAT", g(4)),
+                        ("ODLTIM", g(5)),
+                    ]);
+                }
+                if !g(10).is_empty() {
+                    rec.extend([
+                        ("ODSRCC", crate::outfile::century(&g(10))),
+                        ("ODSRCD", g(11)),
+                        ("ODSRCT", g(12)),
+                    ]);
+                }
+                records.push(rec);
+            }
+        }
+        crate::outfile::write(self, &outfile, &option, &crate::outfile::QADSPOBJ, &records).await?;
+        Ok(Outcome::Messages(vec![]))
     }
 
     /// CRTDTAQ (CL reference). TYPE(*DDM) is not done; MAXLEN 1-64512,

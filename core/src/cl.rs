@@ -1730,6 +1730,9 @@ pub static COMMANDS: &[CommandDef] = &[
             p("DETAIL", Kind::Name, false, Some("*BASIC"), "Detail").ch("*BASIC"),
             p("ASPDEV", Kind::Name, false, Some("*"), "ASP device").ch("*").keyword_only(),
             p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT, *OUTFILE"),
+            p("OUTFILE", Kind::Qualified, false, None, "File to receive output").ch("Name"),
+            p("OUTMBR", Kind::List, false, Some("*FIRST *REPLACE"), "Output member options")
+                .ch("*FIRST, *REPLACE, *ADD"),
         ],
     },
     CommandDef {
@@ -1844,7 +1847,10 @@ pub static COMMANDS: &[CommandDef] = &[
                 "Type of information",
             )
             .ch("*ALL, *ATR, *MBRLIST, *ACCPTH"),
-            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT, *OUTFILE"),
+            p("OUTFILE", Kind::Qualified, false, None, "File to receive output").ch("Name"),
+            p("OUTMBR", Kind::List, false, Some("*FIRST *REPLACE"), "Output member options")
+                .ch("*FIRST, *REPLACE, *ADD"),
         ],
     },
     CommandDef {

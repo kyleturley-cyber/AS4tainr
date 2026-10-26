@@ -211,7 +211,7 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] PUB400-verified spooled file data: QSPGETSP SPFR0300 header and SCS print data, `system` print job (QPRTJOB), DSPSPLF CPD0031
 - [x] CRTCMD/CMD ALLOW enforced (CPD0031); QCMDEXC scalar function in plain INSERT/UPDATE/DELETE/MERGE
 - [x] Clean-room audit at 0: message texts that matched IBM's rewritten
-- [ ] DSPFD/DSPOBJD OUTPUT(*OUTFILE) with model files QAFDMBRL/QADSPOBJ (needs DSPFFD capture from PUB400)
+- [x] DSPFD/DSPOBJD OUTPUT(*OUTFILE) with model files QAFDMBRL/QADSPOBJ: DSPOBJD *BASIC and DSPFD *MBRLIST, layouts from PUB400 DSPFFD captures
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).
 - [x] Journals and trigger programs: COM's SETUPJRN, ORDAUDJV (QSYS2.DISPLAY_JOURNAL) and ORDTRG (ADDPFTRG) run (docs/journals.md).

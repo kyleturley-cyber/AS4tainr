@@ -43,6 +43,7 @@ pub mod journal;
 pub mod menus;
 pub mod msgf;
 pub mod objdesc;
+pub mod outfile;
 pub mod outq;
 pub mod ovr;
 pub mod pase_system;

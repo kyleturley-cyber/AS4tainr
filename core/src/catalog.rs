@@ -480,6 +480,7 @@ pub async fn init(client: &Client) -> Result<()> {
         crate::collate::init(client).await?;
         crate::qtemp::cleanup(client).await?;
         crate::qsysinc::init(client).await?;
+        crate::outfile::init(client).await?;
         // SQL runs as a restricted role. A database user who may not
         // create roles still gets a working system, without SQL.
         if let Err(e) = crate::sql::init(client).await {
@@ -859,6 +860,21 @@ pub async fn create_physical_file(
         validate_name("field", &f.name)?;
     }
     let tx = client.transaction().await?;
+    create_physical_file_in(&tx, &lib, &name, pf).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// CRTPF's work in a transaction the caller commits (`create_physical_file`)
+/// or in its own BEGIN/COMMIT (the system's outfile models, made at
+/// catalog initialization on the init connection).
+pub async fn create_physical_file_in(
+    tx: &impl tokio_postgres::GenericClient,
+    lib: &str,
+    name: &str,
+    pf: &PhysicalFile,
+) -> Result<()> {
+    let (lib, name) = (lib.to_string(), name.to_string());
     let exists = tx
         .query_opt(
             "SELECT 1 FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
@@ -889,7 +905,7 @@ pub async fn create_physical_file(
     )
     .await?;
     for (i, f) in pf.fields.iter().enumerate() {
-        insert_field(&tx, &lib, &name, i as i32, f).await?;
+        insert_field(tx, &lib, &name, i as i32, f).await?;
     }
     for (i, k) in pf.keys.iter().enumerate() {
         let seq = i as i32;
@@ -904,7 +920,7 @@ pub async fn create_physical_file(
     // Character columns are in EBCDIC order, as IBM i keeps them
     // (collate.rs).
     let mut cols: Vec<String> = vec!["rrn bigserial PRIMARY KEY".into()];
-    let ebcdic = crate::collate::clause(&tx).await?;
+    let ebcdic = crate::collate::clause(tx).await?;
     for f in &pf.fields {
         let coll = if f.data_type == DataType::Char {
             ebcdic.as_str()
@@ -926,7 +942,7 @@ pub async fn create_physical_file(
     let table = format!("{}.{}", ident(&lib), ident(&name));
     tx.batch_execute(&format!("CREATE TABLE {table} ({})", cols.join(", ")))
         .await?;
-    generated_trigger(&tx, &lib, &name, &pf.fields).await?;
+    generated_trigger(tx, &lib, &name, &pf.fields).await?;
     if !pf.keys.is_empty() {
         let keycols: Vec<String> = pf.keys.iter().map(|k| key_column(&pf.fields, k)).collect();
         // Access path: key order, then arrival order (rrn) for duplicate keys.
@@ -945,7 +961,6 @@ pub async fn create_physical_file(
             .await?;
         }
     }
-    tx.commit().await?;
     Ok(())
 }
 

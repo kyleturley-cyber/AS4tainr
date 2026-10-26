@@ -56,6 +56,14 @@ impl Job<'_> {
         };
         authority::check(self.client, &self.user, &lib, &name, "*FILE", Aut::Use).await?;
         let ty = cmd.get("TYPE").to_ascii_uppercase();
+        if cmd.get("OUTPUT").eq_ignore_ascii_case("*OUTFILE") {
+            if ty != "*MBRLIST" {
+                return Err(crate::cl::value_error(&format!(
+                    "OUTPUT(*OUTFILE) is done for TYPE(*MBRLIST) only, not TYPE({ty})."
+                )));
+            }
+            return self.dspfd_mbrlist_outfile(cmd, &lib, &name, &attr).await;
+        }
         // A data physical file's attributes: the printed report.
         if ty == "*ATR"
             && attr == "PF"
@@ -244,6 +252,131 @@ impl Job<'_> {
             spool: Some(Box::new(view)),
             ..Default::default()
         }))
+    }
+
+    /// DSPFD TYPE(*MBRLIST) OUTPUT(*OUTFILE): a record per member in the
+    /// format of QSYS/QAFDMBRL (QWHFDML; outfile.rs). Dates are YYMMDD
+    /// with a century field (0 = 19xx, 1 = 20xx), times HHMMSS (the
+    /// model's field descriptions, PUB400 2026-10-26,
+    /// tools/golden/verify1.txt v_ffd_mbrl). A source member's records
+    /// are its lines; a data member's its rows. Fields as4tainr has no
+    /// value for are blank or zero (fidelity-gaps).
+    async fn dspfd_mbrlist_outfile(
+        &mut self,
+        cmd: &Command,
+        lib: &str,
+        name: &str,
+        attr: &str,
+    ) -> Result<Outcome> {
+        let outfile = cmd.get("OUTFILE").trim().to_string();
+        if outfile.is_empty() {
+            return Err(crate::cl::value_error(
+                "OUTPUT(*OUTFILE) needs OUTFILE, the file to receive the records.",
+            ));
+        }
+        let option = cmd
+            .list("OUTMBR")
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| "*REPLACE".into());
+        let logical = attr == "LF";
+        let source = crate::source::is_source_file(self.client, lib, name).await?;
+        let size = catalog::object_size(self.client, lib, name, "*FILE")
+            .await
+            .unwrap_or(0);
+        let stamp =
+            "SELECT to_char(t AT TIME ZONE 'UTC', 'YYYY'), to_char(t AT TIME ZONE 'UTC', 'YYMMDD'),
+                            to_char(t AT TIME ZONE 'UTC', 'HH24MISS')
+                       FROM (SELECT CAST($1::text AS timestamptz) AS t) x";
+        let now = self.client.query_one(stamp, &[&"now"]).await?;
+        let (ny, nd, nt): (String, String, String) = (now.get(0), now.get(1), now.get(2));
+        // (member, source type, text, records, created, changed)
+        type Member = (String, String, String, i64, String, String);
+        let members: Vec<Member> = if source {
+            self.client
+                .query(
+                    "SELECT member, srctype, text,
+                            CASE WHEN source = '' THEN 0
+                                 ELSE array_length(string_to_array(rtrim(source, E'\n'), E'\n'), 1) END::bigint,
+                            coalesce(added, now())::text, coalesce(changed, added, now())::text
+                       FROM as4tainr.source_members WHERE library=$1 AND file=$2 ORDER BY member",
+                    &[&lib, &name],
+                )
+                .await?
+                .iter()
+                .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5)))
+                .collect()
+        } else if attr == "PF" || logical {
+            let o = self
+                .client
+                .query_one(
+                    "SELECT text, created::text, coalesce(changed, created)::text FROM as4tainr.objects
+                      WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+                    &[&lib, &name],
+                )
+                .await?;
+            let rows: i64 = self
+                .client
+                .query_one(
+                    &format!(
+                        "SELECT count(*) FROM {}.{}",
+                        catalog::ident(lib),
+                        catalog::ident(name)
+                    ),
+                    &[],
+                )
+                .await
+                .map(|r| r.get(0))
+                .unwrap_or(0);
+            vec![(
+                name.to_string(),
+                String::new(),
+                o.get(0),
+                rows,
+                o.get(1),
+                o.get(2),
+            )]
+        } else {
+            return Err(crate::cl::value_error(&format!(
+                "File {name} in library {lib} has no members to list."
+            )));
+        };
+        let system: String = crate::report::system_name().chars().take(8).collect();
+        let mut records = Vec::new();
+        for (m, srctype, text, nrec, created, changed) in &members {
+            let c = self.client.query_one(stamp, &[created]).await?;
+            let h = self.client.query_one(stamp, &[changed]).await?;
+            let (cy, cd): (String, String) = (c.get(0), c.get(1));
+            let (hy, hd, ht): (String, String, String) = (h.get(0), h.get(1), h.get(2));
+            records.push(vec![
+                ("MLRCEN", crate::outfile::century(&ny)),
+                ("MLRDAT", nd.clone()),
+                ("MLRTIM", nt.clone()),
+                ("MLFILE", name.to_string()),
+                ("MLLIB", crate::qtemp::logical(lib)),
+                ("MLFTYP", if logical { "L" } else { "P" }.to_string()),
+                ("MLFILA", if logical { "*LGL" } else { "*PHY" }.to_string()),
+                ("MLFATR", if logical { "LF" } else { "PF" }.to_string()),
+                ("MLSYSN", system.clone()),
+                ("MLASP", "1".to_string()),
+                ("MLNOMB", members.len().to_string()),
+                ("MLNAME", m.clone()),
+                ("MLNRCD", nrec.to_string()),
+                ("MLNDTR", "0".to_string()),
+                ("MLSIZE", size.to_string()),
+                ("MLSEU", srctype.clone()),
+                ("MLCCEN", crate::outfile::century(&cy)),
+                ("MLCDAT", cd),
+                ("MLCHGC", crate::outfile::century(&hy)),
+                ("MLCHGD", hd),
+                ("MLCHGT", ht),
+                ("MLMTXT", text.clone()),
+                ("MLSEU2", srctype.clone()),
+                ("MLSIZ2", size.to_string()),
+            ]);
+        }
+        crate::outfile::write(self, &outfile, &option, &crate::outfile::QAFDMBRL, &records).await?;
+        Ok(Outcome::Messages(vec![]))
     }
 
     /// DSPFFD: a file's record format and its fields, in the layout of

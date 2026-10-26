@@ -91,6 +91,15 @@ pub enum Ddl {
         foreign: Vec<ForeignKey>,
         /// OR REPLACE ... ON REPLACE PRESERVE ROWS: the rows are kept.
         preserve: bool,
+        /// PERIOD SYSTEM_TIME (row begin column, row end column).
+        period: Option<(String, String)>,
+    },
+    /// CREATE TABLE name LIKE source.
+    CreateTableLike {
+        name: Name,
+        system: Option<String>,
+        replace: bool,
+        source: Name,
     },
     CreateIndex {
         name: Name,
@@ -1106,6 +1115,24 @@ fn generated_spec(p: &mut P, f: &FieldDef) -> Result<GeneratedSpec> {
         }
         return Ok(GeneratedSpec::Column(Generated::RowChangeTimestamp));
     }
+    // A system-period temporal table's columns (Db2 for i SQL Reference,
+    // CREATE TABLE: AS ROW BEGIN, AS ROW END, AS TRANSACTION START ID).
+    let at = p.i;
+    if p.eat("AS") {
+        if p.eat("ROW") {
+            if p.eat("BEGIN") {
+                return Ok(GeneratedSpec::Column(Generated::RowBegin));
+            }
+            p.expect("END")?;
+            return Ok(GeneratedSpec::Column(Generated::RowEnd));
+        }
+        if p.eat("TRANSACTION") {
+            p.expect("START")?;
+            p.expect("ID")?;
+            return Ok(GeneratedSpec::Column(Generated::TransactionStartId));
+        }
+    }
+    p.i = at;
     if p.eat("AS") && p.punct("(") {
         let g = if p.eat("DATA") {
             p.expect("CHANGE")?;
@@ -1309,6 +1336,30 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
     } else {
         None
     };
+    // CREATE TABLE t LIKE s (Db2 for i SQL Reference, CREATE TABLE,
+    // LIKE): s's columns, names, types, lengths and nullability, without
+    // their defaults, identity, generated or hidden attributes (the
+    // EXCLUDING copy options, the defaults; INCLUDING ones are not done).
+    if p.eat("LIKE") {
+        let source = p.name()?;
+        while p.eat("EXCLUDING") {
+            while p
+                .word()
+                .is_some_and(|w| !matches!(w.as_str(), "EXCLUDING" | "INCLUDING"))
+            {
+                p.i += 1;
+            }
+        }
+        if p.word().as_deref() == Some("INCLUDING") {
+            bail!("SQL0084: LIKE ... INCLUDING copy options are not supported yet.");
+        }
+        return Ok(Ddl::CreateTableLike {
+            name,
+            system,
+            replace,
+            source,
+        });
+    }
     p.expect_punct("(")?;
     let mut fields: Vec<FieldDef> = Vec::new();
     let mut uniques: Vec<(String, Vec<String>)> = Vec::new();
@@ -1317,6 +1368,7 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
     let mut checks: Vec<(Option<String>, Vec<Tok>)> = Vec::new();
     let mut not_null: Vec<String> = Vec::new();
     let mut foreign: Vec<ForeignKey> = Vec::new();
+    let mut period: Option<(String, String)> = None;
     loop {
         let constraint = if p.eat("CONSTRAINT") {
             // [schema.]name: the constraint is in the table's schema.
@@ -1374,6 +1426,18 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
             Some("FOREIGN") => {
                 p.i += 1;
                 foreign.push(foreign_key(p, constraint)?);
+            }
+            // PERIOD SYSTEM_TIME (row begin, row end): a system-period
+            // temporal table (Db2 for i SQL Reference, CREATE TABLE).
+            Some("PERIOD") if constraint.is_none() => {
+                p.i += 1;
+                p.expect("SYSTEM_TIME")?;
+                p.expect_punct("(")?;
+                let b = p.field()?;
+                p.expect_punct(",")?;
+                let e = p.field()?;
+                p.expect_punct(")")?;
+                period = Some((b, e));
             }
             _ if constraint.is_some() => {
                 bail!("SQL0104: a constraint is expected{}.", p.at())
@@ -1462,7 +1526,7 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
                         foreign.push(references(p, col_constraint.take(), vec![sys.clone()])?);
                     } else if p.eat("IMPLICITLY") {
                         p.expect("HIDDEN")?;
-                        bail!("SQL0084: IMPLICITLY HIDDEN columns are not supported yet.");
+                        f.hidden = true;
                     } else {
                         break;
                     }
@@ -1579,6 +1643,7 @@ fn create_table(p: &mut P, replace: bool) -> Result<Ddl> {
         checks,
         foreign,
         preserve,
+        period,
     })
 }
 
@@ -1837,6 +1902,14 @@ pub enum Alter {
         column: String,
         change: ColumnChange,
     },
+    /// ADD VERSIONING USE HISTORY TABLE (a system-period temporal table).
+    AddVersioning {
+        history: Name,
+        extra_row: bool,
+    },
+    DropVersioning,
+    /// Several actions in one ALTER TABLE, done in order.
+    Several(Vec<Alter>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1844,6 +1917,8 @@ pub enum ColumnChange {
     /// SET DATA TYPE: (type, length or digits, decimals, varying).
     DataType(DataType, u32, u32, bool),
     SetDefault(FieldDefault),
+    /// SET IMPLICITLY HIDDEN (true), SET NOT HIDDEN (false).
+    Hidden(bool),
     DropDefault,
     SetNotNull,
     DropNotNull,
@@ -1855,6 +1930,21 @@ pub enum ColumnChange {
 /// action per statement.
 fn alter_table(p: &mut P) -> Result<Ddl> {
     let table = p.name()?;
+    // Several actions in one statement (ALTER COLUMN a ... ALTER COLUMN
+    // b ...), each starting with ADD, ALTER or DROP.
+    let mut actions = vec![alter_action(p)?];
+    while matches!(p.word().as_deref(), Some("ADD" | "ALTER" | "DROP")) {
+        actions.push(alter_action(p)?);
+    }
+    let action = if actions.len() == 1 {
+        actions.remove(0)
+    } else {
+        Alter::Several(actions)
+    };
+    Ok(Ddl::AlterTable { table, action })
+}
+
+fn alter_action(p: &mut P) -> Result<Alter> {
     let action = if p.eat("ADD") {
         let constraint = if p.eat("CONSTRAINT") {
             let mut c = p.field()?;
@@ -1866,6 +1956,24 @@ fn alter_table(p: &mut P) -> Result<Ddl> {
             None
         };
         match p.word().as_deref() {
+            // ADD VERSIONING USE HISTORY TABLE h [ON DELETE ADD EXTRA ROW]
+            // (Db2 for i SQL Reference, ALTER TABLE).
+            Some("VERSIONING") if constraint.is_none() => {
+                p.i += 1;
+                p.expect("USE")?;
+                p.expect("HISTORY")?;
+                p.expect("TABLE")?;
+                let history = p.name()?;
+                let extra_row = if p.eat("ON") {
+                    for w in ["DELETE", "ADD", "EXTRA", "ROW"] {
+                        p.expect(w)?;
+                    }
+                    true
+                } else {
+                    false
+                };
+                Alter::AddVersioning { history, extra_row }
+            }
             Some("PRIMARY") | Some("UNIQUE") => {
                 let primary = p.eat("PRIMARY");
                 if primary {
@@ -1937,7 +2045,9 @@ fn alter_table(p: &mut P) -> Result<Ddl> {
             }
         }
     } else if p.eat("DROP") {
-        if p.eat("PRIMARY") {
+        if p.eat("VERSIONING") {
+            Alter::DropVersioning
+        } else if p.eat("PRIMARY") {
             p.expect("KEY")?;
             Alter::DropConstraint { name: "PK".into() }
         } else if p.eat("CONSTRAINT") || p.eat("UNIQUE") || p.eat("CHECK") {
@@ -1962,8 +2072,15 @@ fn alter_table(p: &mut P) -> Result<Ddl> {
                 let (t, l, d, v) = data_type(p)?;
                 ColumnChange::DataType(t, l, d, v)
             } else if p.eat("NOT") {
-                p.expect("NULL")?;
-                ColumnChange::SetNotNull
+                if p.eat("HIDDEN") {
+                    ColumnChange::Hidden(false)
+                } else {
+                    p.expect("NULL")?;
+                    ColumnChange::SetNotNull
+                }
+            } else if p.eat("IMPLICITLY") {
+                p.expect("HIDDEN")?;
+                ColumnChange::Hidden(true)
             } else {
                 let _ = p.eat("WITH");
                 p.expect("DEFAULT")?;
@@ -1996,7 +2113,7 @@ fn alter_table(p: &mut P) -> Result<Ddl> {
     } else {
         bail!("SQL0084: this ALTER TABLE action is not supported yet.");
     };
-    Ok(Ddl::AlterTable { table, action })
+    Ok(action)
 }
 
 /// CREATE [OR REPLACE] TRIGGER name [NO CASCADE] BEFORE | AFTER |
@@ -2172,6 +2289,10 @@ pub(crate) fn alter_table_clauses(sql: &str) -> Vec<String> {
     for j in 3..words.len() {
         let w = words[j].1.as_str();
         if !matches!(w, "ADD" | "DROP" | "ALTER") {
+            continue;
+        }
+        // ADD VERSIONING ... ON DELETE ADD EXTRA ROW: one clause.
+        if w == "ADD" && words[j - 1].1 == "DELETE" {
             continue;
         }
         if w == "DROP" {
@@ -3439,6 +3560,62 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
                 name.name
             ))
         }
+        Ddl::CreateTableLike {
+            name,
+            system,
+            replace,
+            source,
+        } => {
+            let Some((slib, sattr, ssys)) = ctx.find(source).await? else {
+                return Err(not_found(source, "table"));
+            };
+            if sattr != "PF" && sattr != "LF" {
+                bail!("SQL0156: {} is not a table.", source.name);
+            }
+            let from =
+                catalog::resolve_file(ctx.client, std::slice::from_ref(&slib), &ssys).await?;
+            let fields: Vec<FieldDef> = from
+                .file
+                .fields
+                .iter()
+                .map(|f| {
+                    let mut f = f.clone();
+                    f.default = if f.null_capable {
+                        None
+                    } else {
+                        Some(FieldDefault::Required)
+                    };
+                    f.identity = None;
+                    f.generated = None;
+                    f.hidden = false;
+                    f.text = String::new();
+                    f
+                })
+                .collect();
+            let create = Ddl::CreateTable {
+                name: name.clone(),
+                system: system.clone(),
+                replace: *replace,
+                file: PhysicalFile {
+                    name: name.name.clone(),
+                    format: String::new(),
+                    text: String::new(),
+                    unique: false,
+                    fields,
+                    keys: Vec::new(),
+                    descending: Vec::new(),
+                    view: None,
+                    source: None,
+                },
+                uniques: vec![],
+                primary: None,
+                checks: vec![],
+                foreign: vec![],
+                preserve: false,
+                period: None,
+            };
+            Box::pin(run(ctx, &create)).await
+        }
         Ddl::CreateTable {
             name,
             system,
@@ -3449,6 +3626,7 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
             checks,
             foreign,
             preserve,
+            period,
         } => {
             let lib = ctx.target(name);
             if !catalog::library_exists(ctx.client, &lib).await? {
@@ -3532,6 +3710,27 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
             }
             authority::set_owner(ctx.client, &lib, &sys, "*FILE", ctx.user).await?;
             catalog::set_sql_type(ctx.client, &lib, &sys, "TABLE").await?;
+            if let Some((b, e)) = period {
+                let sys_of = |c: &str| {
+                    file.fields
+                        .iter()
+                        .find(|f| f.is_named(c))
+                        .map(|f| (f.name.clone(), f.generated))
+                };
+                use crate::dds::Generated;
+                match (sys_of(b), sys_of(e)) {
+                    (
+                        Some((bs, Some(Generated::RowBegin))),
+                        Some((es, Some(Generated::RowEnd))),
+                    ) => {
+                        crate::temporal::set_period(ctx.client, &lib, &sys, &bs, &es).await?;
+                    }
+                    _ => {
+                        let _ = catalog::delete_file(ctx.client, &lib, &sys, true).await;
+                        bail!("SQL0084: PERIOD SYSTEM_TIME needs a ROW BEGIN column and a ROW END column.");
+                    }
+                }
+            }
             Ok(if sys == name.name {
                 format!("Table {sys} created in {lib}.")
             } else {
@@ -3716,6 +3915,7 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
                 checks: vec![],
                 foreign: vec![],
                 preserve: false,
+                period: None,
             };
             let msg = Box::pin(run(ctx, &create)).await?;
             if *with_data {
@@ -3769,7 +3969,22 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
                 );
             }
             ctx.may_delete(&lib, &sys).await?;
+            // A system-period temporal table's history table goes with it
+            // (Db2 for i SQL Reference, DROP TABLE).
+            let period = crate::temporal::period(ctx.client, &lib, &sys).await?;
             catalog::delete_file(ctx.client, &lib, &sys, true).await?;
+            if let Some((_, _, history)) = period {
+                ctx.client
+                    .execute(
+                        "DELETE FROM as4tainr.temporal_tables WHERE library = $1 AND file = $2",
+                        &[&lib, &sys],
+                    )
+                    .await?;
+                if let Some((hlib, hfile)) = history {
+                    ctx.may_delete(&hlib, &hfile).await?;
+                    catalog::delete_file(ctx.client, &hlib, &hfile, true).await?;
+                }
+            }
             Ok(format!("{} {} in {lib} dropped.", title(kind), name.name))
         }
         Ddl::LabelObject { name, text } => {
@@ -4319,6 +4534,13 @@ async fn rename(ctx: &mut Ctx<'_>, table: &Name, to: &str, system: Option<&str>)
 
 /// ALTER TABLE.
 async fn alter(ctx: &mut Ctx<'_>, table: &Name, action: &Alter) -> Result<String> {
+    if let Alter::Several(list) = action {
+        let mut done = Vec::new();
+        for a in list {
+            done.push(Box::pin(alter(ctx, table, a)).await?);
+        }
+        return Ok(done.join(" "));
+    }
     let Some((lib, attr, sys)) = ctx.find(table).await? else {
         return Err(not_found(table, "table"));
     };
@@ -4350,6 +4572,37 @@ async fn alter(ctx: &mut Ctx<'_>, table: &Name, action: &Alter) -> Result<String
         .as_ref()
         .map(|a| format!("{}.{}", ident(&lib), ident(a)));
     match action {
+        Alter::Several(_) => unreachable!(),
+        Alter::AddVersioning { history, extra_row } => {
+            let Some((hlib, hattr, hsys)) = ctx.find(history).await? else {
+                return Err(not_found(history, "table"));
+            };
+            if hattr != "PF" {
+                bail!("SQL0156: {} is not a table.", history.name);
+            }
+            crate::temporal::add_versioning(
+                ctx.client, &lib, &sys, &fields, &hlib, &hsys, *extra_row,
+            )
+            .await?;
+            Ok(format!("Versioning added to {}.", table.name))
+        }
+        Alter::DropVersioning => {
+            crate::temporal::drop_versioning(ctx.client, &lib, &sys).await?;
+            Ok(format!("Versioning dropped from {}.", table.name))
+        }
+        Alter::AlterColumn {
+            column,
+            change: ColumnChange::Hidden(h),
+        } => {
+            let fd = field(column)?;
+            ctx.client
+                .execute(
+                    "UPDATE as4tainr.file_fields SET hidden = $4 WHERE library=$1 AND file=$2 AND name=$3",
+                    &[&lib, &sys, &fd.name, h],
+                )
+                .await?;
+            Ok(format!("Column {column} of {} changed.", table.name))
+        }
         Alter::AddColumn {
             field: new,
             uniques,
@@ -4641,6 +4894,7 @@ async fn alter(ctx: &mut Ctx<'_>, table: &Name, action: &Alter) -> Result<String
                     format!("ALTER TABLE {tbl} ALTER COLUMN {col} SET{clause}")
                 }
                 ColumnChange::SetDefault(_) => unreachable!("parsed as a value"),
+                ColumnChange::Hidden(_) => unreachable!(),
                 ColumnChange::DropDefault => {
                     nf.default = if fd.null_capable {
                         None

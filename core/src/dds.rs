@@ -211,6 +211,10 @@ pub struct FieldDef {
     /// or an auditing column).
     #[serde(default)]
     pub generated: Option<Generated>,
+    /// IMPLICITLY HIDDEN (Db2 for i SQL Reference, CREATE TABLE): not in
+    /// SELECT * or an INSERT without a column list.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 /// What a generated column holds (Db2 for i SQL Programming, "Creating
@@ -229,6 +233,16 @@ pub enum Generated {
     SessionUser,
     /// AS (CURRENT SERVER): the relational database.
     CurrentServer,
+    /// AS ROW BEGIN: when the row's version began (a system-period
+    /// temporal table's start column; Db2 for i SQL Programming,
+    /// "Temporal tables").
+    RowBegin,
+    /// AS ROW END: when it ended; 9999-12-30-00.00.00 in the current
+    /// table.
+    RowEnd,
+    /// AS TRANSACTION START ID: when the transaction that changed it
+    /// started.
+    TransactionStartId,
 }
 
 impl Generated {
@@ -240,6 +254,9 @@ impl Generated {
             Generated::JobName => "JOB",
             Generated::SessionUser => "USER",
             Generated::CurrentServer => "SERVER",
+            Generated::RowBegin => "RBEGIN",
+            Generated::RowEnd => "REND",
+            Generated::TransactionStartId => "TSID",
         }
     }
 }
@@ -303,6 +320,7 @@ impl FieldDef {
             identity: None,
             double: false,
             generated: None,
+            hidden: false,
         }
     }
 

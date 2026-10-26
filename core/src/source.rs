@@ -467,6 +467,7 @@ pub fn record_file(name: &str, rcdlen: u32) -> crate::dds::PhysicalFile {
         identity: None,
         double: false,
         generated: None,
+        hidden: false,
     };
     crate::dds::PhysicalFile {
         name: name.to_string(),

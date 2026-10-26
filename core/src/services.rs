@@ -1225,6 +1225,7 @@ pub fn view_record(name: &str) -> Option<crate::dds::PhysicalFile> {
         identity: None,
         double: false,
         generated: None,
+        hidden: false,
     };
     let fields = match name.to_ascii_uppercase().as_str() {
         "ENV_VARS" | "ENVIRONMENT_VARIABLE_INFO" => vec![

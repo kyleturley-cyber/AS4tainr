@@ -1056,6 +1056,25 @@ impl Job<'_> {
                 lines.push(format!("Statement {}: SET SCHEMA skipped.", k + 1));
                 continue;
             }
+            // COMMIT [WORK]: each statement here is committed when it
+            // runs, so there is nothing left to commit (fidelity-gaps).
+            let words: Vec<String> = stmt
+                .trim()
+                .trim_end_matches(';')
+                .split_whitespace()
+                .map(|w| w.to_ascii_uppercase())
+                .collect();
+            if matches!(
+                words
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                ["COMMIT"] | ["COMMIT", "WORK"]
+            ) {
+                lines.push(format!("Statement {}: COMMIT done.", k + 1));
+                continue;
+            }
             let libl = match &schema {
                 Some(s) => vec![s.clone()],
                 None => self.library_list(),

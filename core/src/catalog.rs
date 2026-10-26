@@ -164,6 +164,11 @@ BEGIN
                  WHERE table_schema='as4tainr' AND table_name='file_fields' AND column_name='generated') THEN
     ALTER TABLE as4tainr.file_fields ADD COLUMN IF NOT EXISTS generated text;
   END IF;
+  -- IMPLICITLY HIDDEN columns.
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='file_fields' AND column_name='hidden') THEN
+    ALTER TABLE as4tainr.file_fields ADD COLUMN IF NOT EXISTS hidden boolean NOT NULL DEFAULT false;
+  END IF;
 END $$;
 -- SQL aliases (CREATE ALIAS): the view of that name is the alias.
 CREATE TABLE IF NOT EXISTS as4tainr.sql_aliases (
@@ -209,6 +214,12 @@ BEGIN
                                                 NULLIF(split_part(current_setting('application_name'), '/', 2), ''),
                                                 upper(session_user))
       WHEN TG_ARGV[i + 1] LIKE 'SERVER=%' THEN substr(TG_ARGV[i + 1], 8)
+      -- A system-period temporal table's columns: the version starts when
+      -- the transaction did (its first change, approximated by its
+      -- start) and ends at the end of time (Db2 for i SQL Programming,
+      -- "Temporal tables").
+      WHEN TG_ARGV[i + 1] IN ('RBEGIN', 'TSID') THEN to_char(now(), 'YYYY-MM-DD HH24:MI:SS.US')
+      WHEN TG_ARGV[i + 1] = 'REND' THEN '9999-12-30 00:00:00'
     END;
     j := j || jsonb_build_object(TG_ARGV[i], v);
     i := i + 2;
@@ -369,6 +380,10 @@ pub async fn init(client: &Client) -> Result<()> {
             .context("creating catalog")?;
         client
             .batch_execute(crate::authority::DDL)
+            .await
+            .context("creating catalog")?;
+        client
+            .batch_execute(crate::temporal::DDL)
             .await
             .context("creating catalog")?;
         client
@@ -1408,7 +1423,7 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
         let Some(row) = row else { continue };
         let fields = client
             .query(
-                "SELECT name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity, flt_double, generated FROM as4tainr.file_fields
+                "SELECT name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity, flt_double, generated, hidden FROM as4tainr.file_fields
                  WHERE library=$1 AND file=$2 ORDER BY seq",
                 &[lib, &name],
             )
@@ -1434,6 +1449,7 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
                     generated: r
                         .get::<_, Option<&str>>(11)
                         .and_then(|d| serde_json::from_str(d).ok()),
+                    hidden: r.get(12),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2001,8 +2017,8 @@ pub async fn insert_field(
     f: &FieldDef,
 ) -> Result<()> {
     c.execute(
-        "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity, flt_double, generated)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+        "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity, flt_double, generated, hidden)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
         &[
             &library,
             &file,
@@ -2019,6 +2035,7 @@ pub async fn insert_field(
             &f.identity.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
             &f.double,
             &f.generated.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
+            &f.hidden,
         ],
     )
     .await?;

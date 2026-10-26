@@ -15818,3 +15818,176 @@ async fn dspobjd_and_dspfd_outfiles() {
     .to_string();
     assert!(e.starts_with("CPD0084"), "{e}");
 }
+
+/// System-period temporal tables (Db2 for i SQL Programming, "Temporal
+/// tables"; SQL Reference, CREATE TABLE PERIOD SYSTEM_TIME, ALTER TABLE
+/// ADD VERSIONING, table-reference period-specification, DROP TABLE), as
+/// IBMi-topics' cmdgrp.sql makes one: ROW BEGIN, ROW END and TRANSACTION
+/// START ID columns, a history table made with LIKE, ADD VERSIONING ...
+/// ON DELETE ADD EXTRA ROW, columns SET IMPLICITLY HIDDEN in one ALTER.
+/// An update moves the old row to the history table, ending when the new
+/// version begins; a delete moves it and, with the extra row, adds one
+/// for the delete itself (DATA CHANGE OPERATION D); the current row's end
+/// is 9999-12-30-00.00.00. FOR SYSTEM_TIME AS OF reads the version of
+/// that time from both tables. Dropping the table drops its history.
+#[tokio::test]
+async fn system_period_temporal_tables() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let script = format!(
+        "set schema = {lib};
+         create table TGRP (
+           GRP char(10) not null, SEQ int not null, CMD varchar(100) not null,
+           AUDIT_OPER char(1) generated always as (data change operation),
+           SYS_START timestamp(12) not null generated always as row begin,
+           SYS_END timestamp(12) not null generated always as row end,
+           TS_ID timestamp(12) not null generated always as transaction start id,
+           period system_time (SYS_START, SYS_END));
+         alter table TGRP add primary key (GRP, SEQ);
+         create table TGRP_HST like TGRP;
+         alter table TGRP add versioning use history table TGRP_HST on delete add extra row;
+         alter table TGRP
+           alter column SYS_START set implicitly hidden
+           alter column SYS_END set implicitly hidden
+           alter column TS_ID set implicitly hidden;
+         commit;"
+    );
+    let lines = job
+        .run_sql_script(&script, "test", 0, Some(lib.clone()), true)
+        .await
+        .unwrap();
+    assert!(!lines.iter().any(|l| l.contains(": SQL")), "{lines:?}");
+    let rows = |sql: String| {
+        let client = &client;
+        let url = url.clone();
+        let lib = lib.clone();
+        async move {
+            match as4tainr_core::sql::run(client, &url, &[lib], &sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+            {
+                as4tainr_core::sql::Outcome::Rows { rows, .. } => {
+                    rows.into_iter().map(|r| r.join("|")).collect::<Vec<_>>()
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    };
+    let change = |sql: String| {
+        let client = &client;
+        let url = url.clone();
+        let lib = lib.clone();
+        async move {
+            as4tainr_core::sql::run(client, &url, &[lib], &sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+        }
+    };
+    change(format!(
+        "insert into {lib}.tgrp (grp, seq, cmd) values('G1', 1, 'DSPLIBL')"
+    ))
+    .await;
+    assert_eq!(
+        rows(format!("select audit_oper, char(sys_end) from {lib}.tgrp")).await,
+        ["I|9999-12-30-00.00.00.000000"]
+    );
+    let first = rows(format!("select char(sys_start) from {lib}.tgrp")).await;
+    change(format!("update {lib}.tgrp set cmd = 'WRKACTJOB'")).await;
+    let second = rows(format!("select char(sys_start) from {lib}.tgrp")).await;
+    // The old version: in the history table, ending when the new began.
+    assert_eq!(
+        rows(format!(
+            "select cmd, audit_oper, char(sys_start), char(sys_end) from {lib}.tgrp_hst"
+        ))
+        .await,
+        [format!("DSPLIBL|I|{}|{}", first[0], second[0])]
+    );
+    // AS OF the first version's start: that version.
+    assert_eq!(
+        rows(format!(
+            "select cmd from {lib}.tgrp for system_time as of '{}'",
+            first[0]
+        ))
+        .await,
+        ["DSPLIBL"]
+    );
+    assert_eq!(
+        rows(format!(
+            "select count(*) from {lib}.tgrp for system_time from '2000-01-01-00.00.00' to '9999-12-30-00.00.00' t"
+        ))
+        .await,
+        ["2"]
+    );
+    change(format!("delete from {lib}.tgrp")).await;
+    let hist = rows(format!(
+        "select cmd, audit_oper, sys_start = sys_end from {lib}.tgrp_hst order by sys_start, sys_end"
+    ))
+    .await;
+    assert_eq!(hist.len(), 3, "{hist:?}");
+    assert_eq!(
+        hist[1].split('|').take(2).collect::<Vec<_>>(),
+        ["WRKACTJOB", "U"]
+    );
+    assert_eq!(
+        hist[2].split('|').take(2).collect::<Vec<_>>(),
+        ["WRKACTJOB", "D"]
+    );
+    // Without versioning, a delete leaves no history.
+    let lines = job
+        .run_sql_script(
+            &format!(
+                "insert into {lib}.tgrp (grp, seq, cmd) values('G2', 1, 'X');
+                 alter table {lib}.tgrp drop versioning;
+                 delete from {lib}.tgrp;"
+            ),
+            "test",
+            0,
+            Some(lib.clone()),
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(!lines.iter().any(|l| l.contains(": SQL")), "{lines:?}");
+    assert_eq!(
+        rows(format!("select count(*) from {lib}.tgrp_hst")).await,
+        ["3"]
+    );
+    // Dropping a versioned table drops its history table.
+    let lines = job
+        .run_sql_script(
+            &format!(
+                "alter table {lib}.tgrp add versioning use history table {lib}.tgrp_hst;
+                 drop table {lib}.tgrp;"
+            ),
+            "test",
+            0,
+            Some(lib.clone()),
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(!lines.iter().any(|l| l.contains(": SQL")), "{lines:?}");
+    let left: i64 = client
+        .query_one(
+            "SELECT count(*) FROM as4tainr.objects WHERE library = $1 AND name IN ('TGRP', 'TGRP_HST')",
+            &[&lib],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(left, 0);
+}

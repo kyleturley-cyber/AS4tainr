@@ -207,7 +207,7 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] Commands: CMD statement VLDCKR/ALLOW/MAXPOS/TEXT, PARM RTNVAL(*YES), validity checker called by QCATRS; CL DCLPRCOPT binding, CALLPRC _MATPGMNM, CL programs listed by QWVRCSTK
 - [x] SQL: QSYS2.QCMDEXC scalar function in SQL PL, SYSTOOLS.LPRINTF, QSYS2.ENVIRONMENT_VARIABLE_INFO (ENV_VARS, also as RPG EXTNAME)
 - [x] QUSLSPL SPLF0300; DDS relative positions (+n); RPG LIKE of an outer field inside a qualified DS
-- [ ] System-period temporal tables (ROW BEGIN/END, TRANSACTION START ID, PERIOD SYSTEM_TIME, ADD VERSIONING, FOR SYSTEM_TIME queries)
+- [x] System-period temporal tables (ROW BEGIN/END, TRANSACTION START ID, PERIOD SYSTEM_TIME, ADD VERSIONING, FOR SYSTEM_TIME queries; CREATE TABLE LIKE, SET IMPLICITLY HIDDEN)
 - [x] PUB400-verified spooled file data: QSPGETSP SPFR0300 header and SCS print data, `system` print job (QPRTJOB), DSPSPLF CPD0031
 - [x] CRTCMD/CMD ALLOW enforced (CPD0031); QCMDEXC scalar function in plain INSERT/UPDATE/DELETE/MERGE
 - [x] Clean-room audit at 0: message texts that matched IBM's rewritten

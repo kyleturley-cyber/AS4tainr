@@ -72,6 +72,7 @@ pub mod sqljson;
 pub mod sqljsonfn;
 pub mod sqlpl;
 pub mod sysapi;
+pub mod temporal;
 pub mod tn5250;
 pub mod users;
 pub mod usrspc;

@@ -581,6 +581,7 @@ pub async fn record_format(
             identity: None,
             double: false,
             generated: None,
+            hidden: false,
         };
         return Ok((
             name.to_string(),

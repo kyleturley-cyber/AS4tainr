@@ -87,6 +87,74 @@ fn row(r: &tokio_postgres::Row) -> SpooledFile {
     }
 }
 
+/// `as4tainr system` and `call` (no job of as4tainr's): a program's
+/// spooled files belong to the user's print job QPRTJOB while the command
+/// runs (other programs of the command see them: list APIs, WRKSPLF),
+/// and go when it ends, their lines having gone to standard output (as
+/// PASE `system` on IBM i 7.5: PUB400 2026-10-26, tools/golden/spool.txt
+/// s_dump lists GLDSPL under QPRTJOB while the command runs; s_wrksplf
+/// finds no spooled file afterwards).
+static PRINT_JOB_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TEMPORARY: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+
+/// Turn the print job mode on (main.rs: `system`, `call`).
+pub fn set_print_job_mode(on: bool) {
+    PRINT_JOB_MODE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn print_job_mode() -> bool {
+    PRINT_JOB_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A spooled file to delete when the command ends.
+pub fn note_temporary(id: i64) {
+    TEMPORARY.lock().unwrap_or_else(|e| e.into_inner()).push(id);
+}
+
+/// The command ended: its print job's spooled files go.
+pub async fn delete_temporary(client: &Client) {
+    let ids = std::mem::take(&mut *TEMPORARY.lock().unwrap_or_else(|e| e.into_inner()));
+    for id in ids {
+        let _ = delete(client, id).await;
+    }
+}
+
+/// The user's print job (QPRTJOB), made the first time: the job the
+/// spooled files of work without a job of its own belong to.
+pub async fn print_job(client: &Client, user: &str) -> Result<JobId> {
+    let user = user.to_ascii_uppercase();
+    if let Some(r) = client
+        .query_opt(
+            "SELECT number FROM as4tainr.jobs WHERE name = 'QPRTJOB' AND user_name = $1
+              ORDER BY number LIMIT 1",
+            &[&user],
+        )
+        .await?
+    {
+        return Ok(JobId {
+            number: r.get(0),
+            user,
+            name: "QPRTJOB".into(),
+        });
+    }
+    let number: i64 = client
+        .query_one("SELECT nextval('as4tainr.job_number')", &[])
+        .await?
+        .get(0);
+    client
+        .execute(
+            "INSERT INTO as4tainr.jobs (number, name, user_name, type, subsystem, status, started, ended)
+             VALUES ($1, 'QPRTJOB', $2, 'BCH', '', 'OUTQ', now(), now())",
+            &[&number, &user],
+        )
+        .await?;
+    Ok(JobId {
+        number,
+        user,
+        name: "QPRTJOB".into(),
+    })
+}
+
 /// Start a spooled file for a job (status OPN until [`close`]).
 pub async fn open(client: &Client, job: &JobId, file: &str, user_data: &str) -> Result<i64> {
     // The output queue of the job's user (outq.rs: QGPL/QPRINT for
@@ -243,7 +311,7 @@ pub async fn find(
         .map(|r| row(&r))
         .ok_or_else(|| {
             anyhow!(
-                "Spooled file {} not found in job number {job:06}.",
+                "CPF3303: Spooled file {} is not in job number {job:06}.",
                 file.to_ascii_uppercase()
             )
         })

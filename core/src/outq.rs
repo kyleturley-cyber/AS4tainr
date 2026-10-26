@@ -160,7 +160,7 @@ impl Job<'_> {
         let lib = catalog::validate_name("library", &lib)?;
         let name = catalog::validate_name("output queue", &name)?;
         if !catalog::library_exists(self.client, &lib).await? {
-            bail!("CPF9810: Library {lib} not found.");
+            bail!("CPF9810: There is no library {lib}.");
         }
         let text = match cmd.get("TEXT") {
             "*BLANK" => "",

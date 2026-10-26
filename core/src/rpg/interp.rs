@@ -432,6 +432,8 @@ struct Printer {
     buffer: Vec<(i32, i32, String)>,
     /// Without a job: (page, line) last written to `printed`.
     out_pos: (i32, i32),
+    /// The lines also go to `printed` (standard output of `system`).
+    echo: bool,
 }
 
 /// The bytes a variable (all its elements) takes.
@@ -4619,7 +4621,7 @@ impl Machine<'_> {
                     ))?;
                     if !exists {
                         return self
-                            .api_error(rest.first(), anyhow!("CPF2110: Library {l} not found."))
+                            .api_error(rest.first(), anyhow!("CPF2110: There is no library {l}."))
                             .map(|_| true);
                     }
                 }
@@ -5303,11 +5305,19 @@ impl Machine<'_> {
                 let mut out = Vec::new();
                 let mut returned = 0;
                 for r in &recs {
-                    if out.len() + r.len() > room {
+                    // A receiver shorter than a record gets the part that
+                    // fits: RPGUnit's 132-byte OSPL0300 receiver, written
+                    // for releases before the format had its IPP job ID,
+                    // reads the spooled file's name and number from it.
+                    let k = r.len().min(room - out.len());
+                    if k == 0 {
                         break;
                     }
-                    out.extend(r);
+                    out.extend(&r[..k]);
                     returned += 1;
+                    if k < r.len() {
+                        break;
+                    }
                 }
                 self.bufs[rcv.buf][rcv.off..rcv.off + out.len()].copy_from_slice(&out);
                 let rl = recs.first().map_or(0, |r| r.len());
@@ -5327,7 +5337,7 @@ impl Machine<'_> {
             // spooled file identifiers, spooled file name and number,
             // number of buffers, error code) (Open Spooled File API).
             "QSPOPNSP" => {
-                let [handle, qjob, _ijob, _isplf, name, number, _buffers, rest @ ..] = locs else {
+                let [handle, qjob, _ijob, _isplf, name, number, buffers, rest @ ..] = locs else {
                     bail!("QSPOPNSP needs 7 parameters and an error code");
                 };
                 let jt = text(self, qjob);
@@ -5339,8 +5349,9 @@ impl Machine<'_> {
                 let this = self.io.job.as_ref().map(|j| j.number);
                 let file = text(self, name);
                 let nbr = num(self, number)?.to_i128()? as i32;
+                let nbuf = num(self, buffers)?.to_i128()? as i32;
                 let client = self.io.client;
-                let r = self.block(crate::spoolapi::open(client, job, this, &file, nbr));
+                let r = self.block(crate::spoolapi::open(client, job, this, &file, nbr, nbuf));
                 let h = match r {
                     Ok(h) => h,
                     Err(e) => return self.api_error(rest.first(), e).map(|_| true),
@@ -5360,7 +5371,7 @@ impl Machine<'_> {
                     bail!("QSPGETSP format {format} is not supported");
                 }
                 let h = num(self, handle)?.to_i128()? as i32;
-                let Some(id) = crate::spoolapi::opened(h) else {
+                let Some((id, requested)) = crate::spoolapi::opened(h) else {
                     return self
                         .api_error(
                             rest.first(),
@@ -5386,7 +5397,7 @@ impl Machine<'_> {
                 let r = self.block(async {
                     let s = crate::usrspc::find(client, &name, &lib, &caller).await?;
                     let (data, pages) = crate::spoolapi::scs(client, id).await?;
-                    let b = crate::spoolapi::spfr0300(&data, &pages);
+                    let b = crate::spoolapi::spfr0300(&data, &pages, requested);
                     let mut cur = crate::usrspc::contents(client, &s).await?;
                     if cur.len() < b.len() {
                         cur.resize(b.len(), s.initval);
@@ -5604,6 +5615,9 @@ impl Machine<'_> {
         }
         let returned = job.calls.returned.take();
         let data = job.calls.message_data.take();
+        // What the command printed (a program it called, under `system`)
+        // is this program's printed output too.
+        self.printed.extend(std::mem::take(&mut job.calls.printed));
         let out = out?;
         if let crate::commands::Outcome::Messages(msgs) = out {
             // The command's messages go to the call message queue of the
@@ -7738,14 +7752,15 @@ impl Machine<'_> {
             return Ok(());
         };
         let lines = std::mem::take(&mut p.buffer);
-        match p.spl {
-            Some(id) => {
-                let client = self.io.client;
-                self.io
-                    .rt
-                    .block_on(crate::spool::write(client, id, &lines))?;
-            }
-            None => {
+        if let Some(id) = p.spl {
+            let client = self.io.client;
+            self.io
+                .rt
+                .block_on(crate::spool::write(client, id, &lines))?;
+        }
+        match (p.spl, p.echo) {
+            (Some(_), false) => {}
+            _ => {
                 for (page, line, text) in lines {
                     if page > p.out_pos.0 {
                         self.printed.push("\x0c".to_string());

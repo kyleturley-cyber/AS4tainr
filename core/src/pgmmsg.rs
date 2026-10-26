@@ -374,7 +374,7 @@ pub async fn describe(
             };
             m.sev = if msgid == "CPF9898" { 40 } else { 0 };
         }
-        None => bail!("CPF2407: Message file {name} in {lib} not found."),
+        None => bail!("CPF2407: There is no message file {name} in library {lib}."),
     }
     Ok(m)
 }

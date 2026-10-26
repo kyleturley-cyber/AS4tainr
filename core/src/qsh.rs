@@ -74,7 +74,7 @@ pub enum End {
 pub fn end_message(end: End, escape_msg: bool) -> (String, Vec<u8>, bool) {
     match end {
         End::Exit(n) => (
-            format!("QSH0005: Command ended normally with exit status {n}."),
+            format!("QSH0005: The command ended with exit status {n}."),
             n.to_be_bytes().to_vec(),
             escape_msg && n > 0,
         ),

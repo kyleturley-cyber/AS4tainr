@@ -1433,7 +1433,8 @@ pub static COMMANDS: &[CommandDef] = &[
         name: "WRKSPLF",
         description: "Work with Spooled Files",
         params: &[
-            p("SELECT", Kind::Name, false, Some("*CURRENT"), "User").ch("*CURRENT, user name")
+            p("SELECT", Kind::List, false, Some("*CURRENT"), "Select files for")
+                .ch("User, print device, form type, user data, ASP")
         ],
     },
     CommandDef {

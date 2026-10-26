@@ -2009,6 +2009,17 @@ pub async fn run_as(
     sql: &str,
 ) -> Result<Outcome> {
     let context = context_sql(user, curlib.as_deref(), job.as_deref());
+    // A data change statement that calls the QSYS2.QCMDEXC scalar
+    // function (RUNSQL INSERT ... SELECT QSYS2.QCMDEXC(...): PUB400
+    // 2026-10-26, tools/golden/verify1.txt v_qcmdexc1/2) runs as a
+    // compound statement, where its calls are made.
+    let compound;
+    let sql = if !crate::sqlpl::is_compound(sql) && crate::sqlpl::calls_qcmdexc(sql) {
+        compound = format!("BEGIN {}; END", sql.trim().trim_end_matches(';'));
+        compound.as_str()
+    } else {
+        sql
+    };
     // A dynamic compound statement (BEGIN ... END).
     if crate::sqlpl::is_compound(sql) {
         let session = Session::open(client, database_url, libl).await?;

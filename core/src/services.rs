@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 25";
+const VERSION: &str = "as4tainr services 26";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -724,6 +724,10 @@ DECLARE
 BEGIN
   IF q = '*' THEN
     q := upper(coalesce(current_setting('as4tainr.job', true), ''));
+    -- Work without a job of as4tainr's (`system`): no job log is kept.
+    IF q = '' THEN
+      RETURN;
+    END IF;
   END IF;
   IF split_part(q, '/', 1) ~ '^[0-9]{1,6}$' THEN
     n := split_part(q, '/', 1)::bigint;

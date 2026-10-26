@@ -1,0 +1,36 @@
+# Golden: what the 2026-10-26 changes assumed (IBMi-topics corpus):
+# a validity checker's call stack (QCATRS?), MI _MATPGMNM's template
+# (bytes available, type/subtype bytes), QWVRCSTK's information status
+# with a receiver of only the header, the CMD statement's VLDCKR and
+# ALLOW, RTNVAL, ENVIRONMENT_VARIABLE_INFO's type for a job variable,
+# QSYS2.QCMDEXC as a scalar function in a plain statement, RCVMSG
+# RMV(*YES) and the job log (read back with QSYS2.JOBLOG_INFO); CRTMSGQ/SNDMSG completion messages; the
+# field layouts of the DSPFD/DSPOBJD outfile models.
+# Capture with: golden.ps1 -List tools\golden\verify1.txt -Files tools\golden\verify1
+v_cleanup|!for o in GLDVCHK GLDVCPP GLDVCALL; do system -q "DLTPGM PGM(AS4TRAINR1/$o)"; done; system -q "DLTSRVPGM SRVPGM(AS4TRAINR1/GLDVSTK)"; system -q "DLTMOD MODULE(AS4TRAINR1/GLDVSTK)"; system -q "DLTCMD CMD(AS4TRAINR1/GLDVCMD)"; system -q "DLTF FILE(AS4TRAINR1/GLDVO)"; system -q "DLTF FILE(AS4TRAINR1/GLDVSRC)"; system -q "DLTDTAARA DTAARA(AS4TRAINR1/GLDVDA)"; system -q "DLTMSGQ MSGQ(AS4TRAINR1/GLDVMQ)"; echo cleaned
+v_tag|!for f in /home/AS4TRAINR/gld/gldv*; do setccsid 819 $f; done; ls -l /home/AS4TRAINR/gld
+v_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLDVO (SEQ INTEGER GENERATED ALWAYS AS IDENTITY, VAL VARCHAR(200))') COMMIT(*NONE)
+v_crtmod|!system "CRTRPGMOD MODULE(AS4TRAINR1/GLDVSTK) SRCSTMF('/home/AS4TRAINR/gld/gldvstk.rpgle')" | tail -2
+v_crtsrv|CRTSRVPGM SRVPGM(AS4TRAINR1/GLDVSTK) MODULE(AS4TRAINR1/GLDVSTK) EXPORT(*ALL)
+v_crtchk|!system "CRTBNDCL PGM(AS4TRAINR1/GLDVCHK) SRCSTMF('/home/AS4TRAINR/gld/gldvchk.clle')" | tail -3
+v_crtcpp|!system "CRTBNDCL PGM(AS4TRAINR1/GLDVCPP) SRCSTMF('/home/AS4TRAINR/gld/gldvcpp.clle')" | tail -2
+v_cmdsrc|!system -q "CRTSRCPF FILE(AS4TRAINR1/GLDVSRC) RCDLEN(92)"; system "CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gldvcmd.cmd') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLDVSRC.FILE/GLDVCMD.MBR') MBROPT(*REPLACE)"
+v_crtcmd|CRTCMD CMD(AS4TRAINR1/GLDVCMD) PGM(AS4TRAINR1/GLDVCPP) SRCFILE(AS4TRAINR1/GLDVSRC) VLDCKR(*NONE)
+v_dspcmd|DSPCMD CMD(AS4TRAINR1/GLDVCMD)
+# ALLOW(*BPGM *IPGM): run from the command line (system), not a program.
+v_allow|AS4TRAINR1/GLDVCMD IN(X) OUT(Y)
+v_crtcall|!system "CRTBNDCL PGM(AS4TRAINR1/GLDVCALL) SRCSTMF('/home/AS4TRAINR/gld/gldvcall.clle')" | tail -3
+v_call|CALL PGM(AS4TRAINR1/GLDVCALL)
+# QCMDEXC as a scalar function in a plain INSERT ... SELECT (twice: the
+# second CRTDTAARA fails, -1).
+v_qcmdexc1|RUNSQL SQL('INSERT INTO AS4TRAINR1/GLDVO (VAL) SELECT ''QC '' CONCAT CHAR(QSYS2.QCMDEXC(''CRTDTAARA DTAARA(AS4TRAINR1/GLDVDA) TYPE(*CHAR)'')) FROM SYSIBM.SYSDUMMY1') COMMIT(*NONE)
+v_qcmdexc2|RUNSQL SQL('INSERT INTO AS4TRAINR1/GLDVO (VAL) SELECT ''QC '' CONCAT CHAR(QSYS2.QCMDEXC(''CRTDTAARA DTAARA(AS4TRAINR1/GLDVDA) TYPE(*CHAR)'')) FROM SYSIBM.SYSDUMMY1') COMMIT(*NONE)
+v_out|CPYF FROMFILE(AS4TRAINR1/GLDVO) TOFILE(*PRINT)
+# Message queue commands' completion messages.
+v_crtmsgq|CRTMSGQ MSGQ(AS4TRAINR1/GLDVMQ) TEXT('golden')
+v_sndmsg|SNDMSG MSG('hello') TOMSGQ(AS4TRAINR1/GLDVMQ)
+v_dltmsgq|DLTMSGQ MSGQ(AS4TRAINR1/GLDVMQ)
+# The outfile models DSPFD TYPE(*MBRLIST) and DSPOBJD write.
+v_ffd_mbrl|DSPFFD FILE(QSYS/QAFDMBRL)
+v_ffd_objd|DSPFFD FILE(QSYS/QADSPOBJ)
+v_end|!for o in GLDVCHK GLDVCPP GLDVCALL; do system -q "DLTPGM PGM(AS4TRAINR1/$o)"; done; system -q "DLTSRVPGM SRVPGM(AS4TRAINR1/GLDVSTK)"; system -q "DLTMOD MODULE(AS4TRAINR1/GLDVSTK)"; system -q "DLTCMD CMD(AS4TRAINR1/GLDVCMD)"; system -q "DLTF FILE(AS4TRAINR1/GLDVO)"; system -q "DLTF FILE(AS4TRAINR1/GLDVSRC)"; system -q "DLTDTAARA DTAARA(AS4TRAINR1/GLDVDA)"; system -q "RMVENVVAR ENVVAR(GLDVENV)"; echo cleaned

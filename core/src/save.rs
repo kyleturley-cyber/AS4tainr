@@ -2201,7 +2201,7 @@ impl Job<'_> {
         }
         let Some(from) = from else {
             bail!(
-                "CPF2105: Object {pattern} in {} type {} not found.",
+                "CPF2105: There is no object {pattern} of type {} in library {}.",
                 up("FROMLIB"),
                 types.join(" ")
             );
@@ -2252,7 +2252,7 @@ impl Job<'_> {
         }
         if chosen.is_empty() {
             bail!(
-                "CPF2105: Object {pattern} in {from} type {} not found.",
+                "CPF2105: There is no object {pattern} of type {} in library {from}.",
                 types.join(" ")
             );
         }

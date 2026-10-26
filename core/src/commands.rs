@@ -439,9 +439,61 @@ impl Job<'_> {
         r
     }
 
+    /// Where a command runs, as ALLOW names it: in a CL program (*IPGM or
+    /// *BPGM), else on the job's command line or through QCMDEXC
+    /// (*INTERACT or *BATCH, *EXEC); interactive when the job has a
+    /// display.
+    fn allowed_here(&self, allow: &[String]) -> bool {
+        if allow.is_empty() {
+            return true;
+        }
+        let has = |v: &str| allow.iter().any(|a| a == v);
+        let interactive = self.display.is_some();
+        if self.calls.level() > 0 {
+            has(if interactive { "*IPGM" } else { "*BPGM" })
+        } else {
+            has(if interactive { "*INTERACT" } else { "*BATCH" })
+                || has("*EXEC")
+                || has("*IREXX")
+                || has("*BREXX")
+        }
+    }
+
     async fn run_command(&mut self, line: &str) -> Result<Outcome> {
         if let Some(d) = self.user_command(line).await? {
+            // ALLOW: where the command may run (CPD0031 then CPF0006,
+            // PUB400 2026-10-26 tools/golden/verify1.txt v_allow: a
+            // command with ALLOW(*BPGM *IPGM) run by `system`).
+            if !self.allowed_here(&d.allow) {
+                return Err(cl::diag_error(
+                    "CPD0031",
+                    &format!(
+                        "Command {} cannot be run from here (see its ALLOW values).",
+                        d.name
+                    ),
+                ));
+            }
             return self.run_user_command(&d, line).await;
+        }
+        // DSPSPLF runs only where it can show the file (IBM i 7.5 refuses
+        // it in `system` with CPD0031: PUB400 2026-10-26, tools/golden/
+        // spool.txt s_dspsplf). Only there: a job run through the library
+        // has no display either, and shows the viewer's rows.
+        let first = line
+            .trim()
+            .split(|c: char| c.is_whitespace() || c == '(')
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if first == "DSPSPLF"
+            && crate::spool::print_job_mode()
+            && self.display.is_none()
+            && self.calls.level() == 0
+        {
+            return Err(cl::diag_error(
+                "CPD0031",
+                "Command DSPSPLF cannot be run from here (see its ALLOW values).",
+            ));
         }
         let cmd = cl::parse(line)?;
         if let Some(o) = self.ifs_command(&cmd).await? {
@@ -1626,7 +1678,7 @@ impl Job<'_> {
         data.truncate(20);
         self.calls.message_data = Some(data);
         Ok(Outcome::Messages(vec![format!(
-            "CPC5D0B: Service program {name} created in library {lib}."
+            "CPC5D0B: Service program {name} is now in library {lib}."
         )]))
     }
 
@@ -3903,7 +3955,7 @@ impl Job<'_> {
         authority::set_owner(self.client, &lib, &name, "*CMD", &self.user).await?;
         // CPC0202 (PUB400 2026-10-23, tools/golden/qsh.txt q_crtcmd).
         Ok(Outcome::Messages(vec![format!(
-            "CPC0202: Command {name} created in library {lib}."
+            "CPC0202: Command {name} is now in library {lib}."
         )]))
     }
 
@@ -3936,7 +3988,7 @@ impl Job<'_> {
         let m = crate::source::find_member(self.client, &libs, &file.to_ascii_uppercase(), &mbr)
             .await?;
         if !catalog::library_exists(self.client, &lib).await? {
-            bail!("CPF2110: Library {lib} not found.");
+            bail!("CPF2110: There is no library {lib}.");
         }
         let text = match cmd.get("TEXT") {
             "*SRCMBRTXT" => m.text.clone(),
@@ -4341,7 +4393,7 @@ impl Job<'_> {
             Some(lib) => Ok((lib, name)),
             None => {
                 let lib = q.split_once('/').map(|(l, _)| l).unwrap_or("*LIBL");
-                bail!("CPF2407: Message file {name} in {lib} not found.")
+                bail!("CPF2407: There is no message file {name} in library {lib}.")
             }
         }
     }
@@ -4577,7 +4629,7 @@ impl Job<'_> {
             &crate::report::system_name(),
         );
         // CPC9802 comes with the printed report (observed with `system`).
-        let printed = "CPC9802: Printer output created.".to_string();
+        let printed = "CPC9802: The printed output was spooled.".to_string();
         if cmd.get("OUTPUT") == "*PRINT" {
             if let Some(me) = self.id.clone() {
                 crate::spool::print_lines(self.client, &me, "QPMSGD", &name, &print).await?;
@@ -5149,14 +5201,14 @@ impl Job<'_> {
     }
 
     /// CRTMSGQ: a *MSGQ object; its messages are kept under "LIB/NAME"
-    /// (jobs::msgq_key). No completion message (docs/fidelity-gaps.md).
+    /// (jobs::msgq_key). Completion message CPC9801.
     async fn crtmsgq(&mut self, cmd: &Command) -> Result<Outcome> {
         let (lib, name) = self.create_target(cmd.get("MSGQ"));
         let lib = crate::qtemp::real(&lib.to_ascii_uppercase());
         let name = name.trim().to_ascii_uppercase();
         if !catalog::library_exists(self.client, &lib).await? {
             bail!(
-                "CPF2110: Library {} not found.",
+                "CPF2110: There is no library {}.",
                 crate::qtemp::logical(&lib)
             );
         }
@@ -5187,7 +5239,11 @@ impl Job<'_> {
             )
             .await?;
         authority::set_owner(self.client, &lib, &name, "*MSGQ", &self.user).await?;
-        Ok(Outcome::Messages(vec![]))
+        // CPC9801 (PUB400 2026-10-26, tools/golden/verify1.txt v_crtmsgq).
+        Ok(Outcome::Messages(vec![format!(
+            "CPC9801: Message queue {name} was made in library {}.",
+            crate::qtemp::logical(&lib)
+        )]))
     }
 
     /// DLTMSGQ: the queue and its messages; CPC2191 / CPF2105 as for
@@ -5475,8 +5531,15 @@ impl Job<'_> {
     }
 
     async fn wrksplf(&mut self, cmd: &Command) -> Result<Outcome> {
-        let user = match cmd.get("SELECT") {
-            "*CURRENT" => self.user.clone(),
+        // SELECT(user print-device form-type user-data ASP) (CL reference,
+        // WRKSPLF): the user and the user data select here.
+        let select = cmd.list("SELECT");
+        let udata = select
+            .get(3)
+            .map(|d| d.to_ascii_uppercase())
+            .filter(|d| d != "*ALL");
+        let user = match select.first().map(String::as_str).unwrap_or("*CURRENT") {
+            "*CURRENT" | "" => self.user.clone(),
             u => {
                 if u != self.user {
                     self.require_secadm("work with other users' spooled files")
@@ -5485,7 +5548,10 @@ impl Job<'_> {
                 u.to_string()
             }
         };
-        let files = crate::spool::for_user(self.client, &user).await?;
+        let mut files = crate::spool::for_user(self.client, &user).await?;
+        if let Some(d) = &udata {
+            files.retain(|f| f.user_data.eq_ignore_ascii_case(d));
+        }
         // IBM i 7.5's WRKSPLF display (PUB400): file, user, output queue,
         // user data, status, total pages, current page, copies.
         let fmt = |file: &str,
@@ -5589,6 +5655,17 @@ impl Job<'_> {
 
     /// The spooled file a FILE/JOB/SPLNBR command names.
     pub(crate) async fn spooled_file(&self, cmd: &Command) -> Result<crate::spool::SpooledFile> {
+        // `system` (no job of as4tainr's): its own job has no spooled
+        // files (they are its print job's), so JOB(*) finds none: CPF3303
+        // (PUB400 2026-10-26, tools/golden/spool.txt s_dump, GLDSPD's
+        // DLTSPLF FILE(GLDSPL) SPLNBR(*LAST)).
+        let spec = cmd.get("JOB").trim();
+        if (spec == "*" || spec.is_empty()) && self.id.is_none() {
+            bail!(
+                "CPF3303: Spooled file {} is not in the job running the command.",
+                cmd.get("FILE").to_ascii_uppercase()
+            );
+        }
         let job = self.job_named(cmd.get("JOB")).await?;
         let number = match cmd.get("SPLNBR") {
             "*LAST" | "" => None,

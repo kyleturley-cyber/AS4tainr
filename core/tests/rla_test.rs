@@ -6517,10 +6517,11 @@ ENDPGM
     )
     .await
     .unwrap();
-    // CPC0202: PUB400 2026-10-23 (tools/golden/qsh.txt q_crtcmd).
+    // CPC0202: PUB400 2026-10-23 (tools/golden/qsh.txt q_crtcmd); the
+    // text is as4tainr's own.
     assert_eq!(
         m,
-        [format!("CPC0202: Command HELLO created in library {lib}.")]
+        [format!("CPC0202: Command HELLO is now in library {lib}.")]
     );
     let run = |line: String| {
         let client = &client;
@@ -9075,7 +9076,7 @@ async fn compiler_listings_and_dspmsgd_reports() {
     let o = sys!(format!("DSPMSGD RANGE(*ALL) MSGF({lib}/GLDMSGF)"));
     assert_eq!(o.status, 0);
     let m = mask(&o.stdout);
-    assert_eq!(m[0], "CPC9999: Printer output created.");
+    assert_eq!(m[0], "CPC9999: The printed output was spooled.");
     assert!(
         m[1].contains("Message Description (Formatted Text)") && m[1].ends_with("Page       9")
     );
@@ -11649,12 +11650,28 @@ async fn spooled_file_apis_and_printed_output_of_system() {
     assert_eq!(&rec[0..10], &e("SPLAPI    ")[..]);
     assert_eq!(&rec[26..36], &e("GLDSPL    ")[..]);
     assert_eq!(&rec[68..78], &e("GLDSPL    ")[..]);
-    // SPFR0300: completion indicator 'C', the size used, the first
-    // buffer; the print data ends the space.
+    // SPFR0300 as IBM i 7.5 writes it (PUB400 2026-10-26, tools/golden/
+    // spool.txt s_dump, GLDSPD's dump of GLDSPL): header size 64,
+    // structure level 0200, spooled file level V6R1M0, complete 'C', the
+    // size used, the offset to the first buffer 128 (for SPFR0300 the
+    // print data itself), first page 1 at offset 0 of the print data.
     let sp = hex('S');
+    let i4 = |o: usize| i32::from_be_bytes(sp[o..o + 4].try_into().unwrap());
+    assert_eq!(i4(64), 64);
+    assert_eq!(&sp[68..72], &e("0200")[..]);
+    assert_eq!(&sp[72..78], &e("V6R1M0")[..]);
     assert_eq!(sp[86], e("C")[0]);
-    let used = i32::from_be_bytes(sp[88..92].try_into().unwrap()) as usize;
+    let used = i4(88) as usize;
     assert_eq!(used, sp.len());
+    assert_eq!(i4(92), 128);
+    assert_eq!(i4(104) as usize, sp.len() - 128);
+    assert_eq!((i4(108), i4(112), i4(116)), (2, 1, 0));
+    // The print data: each line's text then a carriage return, new lines
+    // before it for each line moved down, the line printed over the one
+    // before right after its carriage return, a form feed after each
+    // page (the same capture; its NUL bytes, absolute vertical positions
+    // for skips and PUB400's page footer are not written here:
+    // fidelity-gaps).
     let mut want = Vec::new();
     for (moves, text) in [
         (1, "LINE ONE"),
@@ -11662,17 +11679,20 @@ async fn spooled_file_apis_and_printed_output_of_system() {
         (1, "A    B    C"),
         (2, "AFTER A BLANK LINE"),
         (4, "SKIPPED TO LINE 10"),
+        (0, "SPACE AFTER 3"),
     ] {
         want.extend(std::iter::repeat_n(0x15u8, moves));
         want.extend(e(text));
+        want.push(0x0D);
     }
-    want.push(0x0D);
-    want.extend(e("SPACE AFTER 3"));
     want.push(0x0C);
     want.extend(e("PAGE TWO"));
+    want.push(0x0D);
     want.push(0x15);
     want.extend(e("LAST"));
+    want.push(0x0D);
     want.push(0x0C);
+    assert_eq!(&sp[128..], &want[..]);
     assert!(
         sp.ends_with(&want),
         "{:02X?}",
@@ -11825,10 +11845,7 @@ async fn environment_variables_and_qshell_from_cl() {
     // PUB400 (tools/golden/qsh.txt q_stdout): the output, then QSH0005.
     assert_eq!(
         m,
-        [
-            "plain",
-            "QSH0005: Command ended normally with exit status 2."
-        ]
+        ["plain", "QSH0005: The command ended with exit status 2."]
     );
     // A command processing program's completion message to its caller
     // is on the caller's queue once: a CL caller receives it, then the
@@ -12147,10 +12164,7 @@ async fn qsh_commands_work_on_the_ifs() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        m,
-        ["3", "QSH0005: Command ended normally with exit status 0."]
-    );
+    assert_eq!(m, ["3", "QSH0005: The command ended with exit status 0."]);
     let read = |p: String| {
         let client = &client;
         async move {
@@ -12203,7 +12217,7 @@ async fn qsh_commands_work_on_the_ifs() {
             "in.txt",
             "out.txt",
             "sub",
-            "QSH0005: Command ended normally with exit status 0."
+            "QSH0005: The command ended with exit status 0."
         ]
     );
 }
@@ -15317,8 +15331,10 @@ dcl-proc Callers export;
     len int(10) pos(1);
     pgm char(10) pos(25);
   end-ds;
-  %subst(jid:1:10) = '*';
-  %subst(jid:27:16) = *allx'00';
+  jid = '*';
+  %subst(jid:43:2) = x'0000';
+  %subst(jid:45:4) = x'00000001';
+  %subst(jid:49:8) = *allx'00';
   getStack(hdr:%size(hdr):'CSTK0100':jid:'JIDF0100':err);
   res = 'S' + hdr.status + '|';
   getStack(buf:%size(buf):'CSTK0100':jid:'JIDF0100':err);
@@ -15410,6 +15426,13 @@ PARM KWD(OUT) TYPE(*CHAR) LEN(10) RTNVAL(*YES) MIN(1)
     assert_eq!(def.vldckr.as_deref(), Some("*LIBL/CHK"));
     assert_eq!(def.allow, ["*BPGM", "*IPGM"]);
     assert_eq!(def.text, "Test");
+    // ALLOW(*BPGM *IPGM): not from a command line or `system` (CPD0031,
+    // CPF0006: PUB400 2026-10-26, tools/golden/verify1.txt v_allow).
+    let e = run_in(&client, &url, &lib, "TCMD IN(x) OUT(y)")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPD0031") && e.contains("CPF0006"), "{e}");
     let m = run_in(&client, &url, &lib, &format!("CALL {lib}/CALLER"))
         .await
         .unwrap();
@@ -15497,6 +15520,25 @@ async fn qcmdexc_function_lprintf_and_environment_variables_view() {
     assert_eq!(
         rows(format!("select n, rc from {lib}.res order by n")).await,
         ["1|1", "2|-1", "3|1"]
+    );
+    // In a statement of its own (RUNSQL INSERT ... SELECT QSYS2.QCMDEXC:
+    // PUB400 2026-10-26, tools/golden/verify1.txt v_qcmdexc1/2 gave 1,
+    // then -1 for the same CRTDTAARA).
+    for _ in 0..2 {
+        as4tainr_core::sql::run(
+            &client,
+            &url,
+            std::slice::from_ref(&lib),
+            &format!(
+                "insert into {lib}.res select 4, qsys2.qcmdexc('CRTDTAARA DTAARA({lib}/TOPICS2) TYPE(*CHAR)') from sysibm.sysdummy1"
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        rows(format!("select rc from {lib}.res where n = 4")).await,
+        ["1", "-1"]
     );
     let v: String = client
         .query_one(

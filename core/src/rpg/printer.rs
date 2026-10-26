@@ -51,9 +51,23 @@ impl Machine<'_> {
         let usrdta = o
             .and_then(|o| o.usrdta.clone())
             .unwrap_or_else(|| self.prog.name.clone());
+        let mut echo = false;
+        let mut print_job = None;
         let spl = match &self.io.job {
             Some(job) => {
                 Some(self.block(crate::spool::open(self.io.client, job, &name, &usrdta))?)
+            }
+            // `system` and `call`: the user's print job's, while the
+            // command runs; its lines also go to standard output.
+            None if crate::spool::print_job_mode() => {
+                echo = true;
+                let client = self.io.client;
+                let user = self.io.user.clone();
+                let pj = self.block(crate::spool::print_job(client, &user))?;
+                let id = self.block(crate::spool::open(client, &pj, &name, &usrdta))?;
+                crate::spool::note_temporary(id);
+                print_job = Some(pj);
+                Some(id)
             }
             None => None,
         };
@@ -77,7 +91,7 @@ impl Machine<'_> {
                 .unwrap_or(1),
             None => crate::rpg::last_spooled_file(&self.io.job_key).map_or(1, |l| l.4 + 1),
         };
-        let (jname, juser, jnbr) = match &self.io.job {
+        let (jname, juser, jnbr) = match self.io.job.as_ref().or(print_job.as_ref()) {
             Some(j) => (j.name.clone(), j.user.clone(), format!("{:06}", j.number)),
             None => (String::new(), self.io.user.clone(), String::new()),
         };
@@ -94,6 +108,7 @@ impl Machine<'_> {
                 printed_on_page: false,
                 buffer: Vec::new(),
                 out_pos: (1, 0),
+                echo,
             },
         );
         Ok(())

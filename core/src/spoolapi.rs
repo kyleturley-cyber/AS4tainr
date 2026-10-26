@@ -331,7 +331,8 @@ fn status_number(st: &str) -> i32 {
 /// number, spooled file name and number, status, date and time opened,
 /// schedule, job system name, user-specified data, form type, output
 /// queue and library, auxiliary storage pool, size, size multiplier,
-/// total pages, copies left, priority, 3 reserved.
+/// total pages, copies left, priority, 3 reserved, the Internet print
+/// protocol job identifier (QGYOLSPL API, OSPL0300 format).
 pub fn ospl0300(s: &Splf) -> Vec<u8> {
     let mut b = Vec::with_capacity(136);
     b.extend(field(&s.job_name, 10));
@@ -343,7 +344,7 @@ pub fn ospl0300(s: &Splf) -> Vec<u8> {
     b.extend(field(&s.opened.0, 7));
     b.extend(field(&s.opened.1, 6));
     b.extend(field("2", 1));
-    b.extend(field("AS4TAINR", 10));
+    b.extend(field(&crate::report::system_name(), 10));
     b.extend(field(&s.user_data, 10));
     b.extend(field("*STD", 10));
     b.extend(field(&s.outq, 10));
@@ -355,11 +356,14 @@ pub fn ospl0300(s: &Splf) -> Vec<u8> {
     b.extend(1i32.to_be_bytes());
     b.extend(field("5", 1));
     b.extend([0u8; 3]);
+    // The Internet print protocol job identifier (offset 132): no IPP
+    // jobs here.
+    b.extend(0i32.to_be_bytes());
     b
 }
 
 /// Open spooled files (QSPOPNSP): handle → spooled file.
-static OPEN: std::sync::Mutex<Option<HashMap<i32, i64>>> = std::sync::Mutex::new(None);
+static OPEN: std::sync::Mutex<Option<HashMap<i32, (i64, i32)>>> = std::sync::Mutex::new(None);
 static NEXT_SPLF_HANDLE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
 
 /// QSPOPNSP: the spooled file of a job (`job`: None for this job) by
@@ -370,6 +374,7 @@ pub async fn open(
     this_job: Option<i64>,
     file: &str,
     number: i32,
+    buffers: i32,
 ) -> Result<i32> {
     let job = job
         .or(this_job)
@@ -396,12 +401,14 @@ pub async fn open(
     };
     let h = NEXT_SPLF_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut g) = OPEN.lock() {
-        g.get_or_insert_with(HashMap::new).insert(h, id);
+        g.get_or_insert_with(HashMap::new).insert(h, (id, buffers));
     }
     Ok(h)
 }
 
-pub fn opened(handle: i32) -> Option<i64> {
+/// The spooled file a handle opened and the number of buffers asked for
+/// at the open.
+pub fn opened(handle: i32) -> Option<(i64, i32)> {
     OPEN.lock().ok()?.as_ref()?.get(&handle).copied()
 }
 
@@ -414,10 +421,13 @@ pub fn close(handle: i32) -> bool {
 
 /// The print data of a spooled file in SCS: per page a form feed before
 /// it (not before the first), then for each line as many new lines as it
-/// moves down from the line before (from line 1 at the top of a page),
-/// or a carriage return for a line printed over, then its text. (A
-/// report printed with space before 1 has one new line before each line:
-/// RPGUnit's acceptance tests find each line after a new line.)
+/// moves down from the line before (from line 1 at the top of a page), its text and
+/// a carriage return (a line printed over the one before: its text after
+/// that carriage return); the last page ends with a form feed. IBM i 7.5
+/// writes a report so (PUB400 2026-10-26, tools/golden/spool.txt s_dump,
+/// GLDSPL's spooled file: "text CR NL text CR ... CR FF"), with NUL bytes
+/// before some controls and absolute vertical positions for skips, which
+/// as4tainr does not write (fidelity-gaps).
 pub async fn scs(client: &Client, id: i64) -> Result<(Vec<u8>, Vec<usize>)> {
     let rows = client
         .query(
@@ -428,7 +438,6 @@ pub async fn scs(client: &Client, id: i64) -> Result<(Vec<u8>, Vec<usize>)> {
     let mut b = Vec::new();
     let mut page_starts = Vec::new();
     let (mut page, mut line) = (0i32, 0i32);
-    let mut printed = false;
     for r in &rows {
         let (p, l, t): (i32, i32, String) = (r.get(0), r.get(1), r.get(2));
         if p != page {
@@ -438,17 +447,13 @@ pub async fn scs(client: &Client, id: i64) -> Result<(Vec<u8>, Vec<usize>)> {
             page_starts.push(b.len());
             page = p;
             line = 1;
-            printed = false;
         }
         if l > line {
             b.extend(std::iter::repeat_n(0x15u8, (l - line) as usize));
             line = l;
-        } else if printed {
-            // The same line again (overprinting): a carriage return.
-            b.push(0x0D);
         }
-        b.extend(ebcdic(&t));
-        printed = true;
+        b.extend(ebcdic(t.trim_end()));
+        b.push(0x0D);
     }
     if page != 0 {
         b.push(0x0C);
@@ -456,56 +461,32 @@ pub async fn scs(client: &Client, id: i64) -> Result<(Vec<u8>, Vec<usize>)> {
     Ok((b, page_starts))
 }
 
-/// QSPGETSP format SPFR0300 into a user space: the general header (64
-/// bytes for the user, header size, structure level, spooled file level,
-/// format name, completion indicator ('C'), size of the space used,
-/// offset to the first buffer, buffers requested and returned, size of
-/// print data, complete pages, first page, offset to the first page),
-/// then one buffer: its information (length, ordinal number, offset to
-/// and size of the general information, offset to and size of the page
-/// data, number and size of page entries, offset to and size of the
-/// print data), the page entries (offset of each page's data), the
-/// print data.
-pub fn spfr0300(data: &[u8], page_starts: &[usize]) -> Vec<u8> {
+/// QSPGETSP format SPFR0300 into a user space (Get Spooled File Data
+/// API, generic header section; the values as IBM i 7.5 gives them,
+/// PUB400 2026-10-26 tools/golden/spool.txt s_dump): 64 bytes for the
+/// user, the header's size (64), structure level 0200, spooled file
+/// level V6R1M0, the format, complete ('C'), the size of the space used,
+/// the offset to the first buffer (for SPFR0300 the print data, at 128),
+/// buffers requested (as at the open) and returned (1), the size of the
+/// print data, complete pages, the first page (1) and the offset to it in
+/// the print data (0); then the print data.
+pub fn spfr0300(data: &[u8], page_starts: &[usize], requested: i32) -> Vec<u8> {
     const HDR: usize = 128;
-    const BUFINFO: usize = 40;
     let mut b = vec![0u8; HDR];
-    b[64..68].copy_from_slice(&(HDR as i32).to_be_bytes());
-    b[68..72].copy_from_slice(&ebcdic("0100"));
-    b[72..78].copy_from_slice(&ebcdic("V5R1M0"));
+    b[64..68].copy_from_slice(&64i32.to_be_bytes());
+    b[68..72].copy_from_slice(&ebcdic("0200"));
+    b[72..78].copy_from_slice(&ebcdic("V6R1M0"));
     b[78..86].copy_from_slice(&ebcdic("SPFR0300"));
     b[86] = ebcdic("C")[0];
-    let pages_at = HDR + BUFINFO;
-    let page_entry = 4usize;
-    let data_at = pages_at + page_entry * page_starts.len();
-    let used = data_at + data.len();
+    let used = HDR + data.len();
     b[88..92].copy_from_slice(&(used as i32).to_be_bytes());
     b[92..96].copy_from_slice(&(HDR as i32).to_be_bytes());
-    b[96..100].copy_from_slice(&1i32.to_be_bytes());
+    b[96..100].copy_from_slice(&requested.to_be_bytes());
     b[100..104].copy_from_slice(&1i32.to_be_bytes());
     b[104..108].copy_from_slice(&(data.len() as i32).to_be_bytes());
     b[108..112].copy_from_slice(&(page_starts.len() as i32).to_be_bytes());
-    b[112..116].copy_from_slice(&1i32.to_be_bytes());
-    b[116..120].copy_from_slice(&(pages_at as i32).to_be_bytes());
-    let mut info = Vec::with_capacity(BUFINFO);
-    for v in [
-        BUFINFO,
-        1,
-        0,
-        0,
-        pages_at,
-        page_entry * page_starts.len(),
-        page_starts.len(),
-        page_entry,
-        data_at,
-        data.len(),
-    ] {
-        info.extend((v as i32).to_be_bytes());
-    }
-    b.extend(info);
-    for p in page_starts {
-        b.extend(((data_at + p) as i32).to_be_bytes());
-    }
+    b[112..116].copy_from_slice(&i32::from(!page_starts.is_empty()).to_be_bytes());
+    b[116..120].copy_from_slice(&(page_starts.first().copied().unwrap_or(0) as i32).to_be_bytes());
     b.extend(data);
     b
 }

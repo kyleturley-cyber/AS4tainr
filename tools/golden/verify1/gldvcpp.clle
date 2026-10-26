@@ -1,0 +1,6 @@
+/* Golden: a command processing program with a RTNVAL parameter. */
+PGM PARM(&IN &OUT)
+DCL VAR(&IN) TYPE(*CHAR) LEN(10)
+DCL VAR(&OUT) TYPE(*CHAR) LEN(10)
+CHGVAR VAR(&OUT) VALUE('got' *BCAT &IN)
+ENDPGM

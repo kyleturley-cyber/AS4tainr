@@ -2123,6 +2123,8 @@ impl<'a, 'e> Run<'a, 'e> {
     /// SELECT ... INTO, VALUES ... INTO, COMMIT, ROLLBACK, and the other
     /// statements.
     async fn sql(&mut self, text: &str) -> Result<()> {
+        let expanded = self.expand_qcmdexc(text).await?;
+        let text = expanded.as_str();
         let up: Vec<String> = text
             .split_whitespace()
             .take(2)
@@ -2683,6 +2685,16 @@ pub async fn call_exprs(
     // Parameters left out take their defaults.
     let out = run_procedure(env, &r, values, 0).await?;
     Ok((r, out))
+}
+
+/// A data change statement (INSERT, UPDATE, DELETE, MERGE) that calls
+/// the QCMDEXC scalar function.
+pub fn calls_qcmdexc(sql: &str) -> bool {
+    let up = sql.trim_start().to_ascii_uppercase();
+    ["INSERT", "UPDATE", "DELETE", "MERGE"]
+        .iter()
+        .any(|k| up.starts_with(k))
+        && up.contains("QCMDEXC")
 }
 
 /// The IBM i services that are procedures (QSYS2.IFS_WRITE,

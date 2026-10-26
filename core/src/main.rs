@@ -484,6 +484,7 @@ async fn run(cli: Cli) -> Result<u8> {
             // Its own QTEMP, gone when it ends (each `system` is a job).
             let key = job.job_key();
             let user = job.user.clone();
+            as4tainr_core::spool::set_print_job_mode(true);
             let out = as4tainr_core::qtemp::scope(
                 &client,
                 &key,
@@ -491,6 +492,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 as4tainr_core::pase_system::run(&mut job, &args),
             )
             .await;
+            as4tainr_core::spool::delete_temporary(&client).await;
             for l in &out.stdout {
                 println!("{l}");
             }
@@ -629,9 +631,11 @@ async fn run(cli: Cli) -> Result<u8> {
             };
             let key = job.job_key();
             let user = job.user.clone();
+            as4tainr_core::spool::set_print_job_mode(true);
             let result =
                 as4tainr_core::qtemp::scope(&client, &key, &user, job.call_program(&program, args))
                     .await;
+            as4tainr_core::spool::delete_temporary(&client).await;
             // Printed output, as it would be on paper (no job: no
             // spooled file).
             let printed = std::mem::take(&mut job.calls.printed);

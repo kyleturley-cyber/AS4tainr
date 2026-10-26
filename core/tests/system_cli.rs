@@ -392,6 +392,53 @@ fn pase_shell_job() {
     assert_eq!(r.rc, 0, "{:?} {:?}", r.out, r.err);
     let r = run(&dir, None, "CHGCURDIR DIR('nosuch')");
     assert_eq!(r.rc, 255);
+    // A program's printed output under `system`: its spooled file is
+    // the user's print job's (QPRTJOB), not the command's own job, so
+    // DLTSPLF of JOB(*) does not find it (CPF3303), and its lines go to
+    // standard output (PUB400 2026-10-26, tools/golden/spool.txt s_dump:
+    // GLDSPD lists GLDSPL under QPRTJOB, its DLTSPLF ends with CPF3303).
+    std::fs::write(
+        dir.join("prt.rpgle"),
+        "**free\nctl-opt dftactgrp(*no);\ndcl-f qsysprt printer(80) usropn;\ndcl-ds line len(80) end-ds;\ndcl-pr qcmdexc extpgm('QCMDEXC');\n  c char(200) const;\n  l packed(15:5) const;\nend-pr;\ndcl-ds psds psds;\n  excid char(7) pos(40);\nend-ds;\nopen qsysprt;\nline = 'PRINTED';\nwrite qsysprt line;\nclose qsysprt;\nmonitor;\n  qcmdexc('DLTSPLF FILE(QSYSPRT) SPLNBR(*LAST)' : 35);\n  dsply 'deleted';\non-error;\n  dsply excid;\nendmon;\nreturn;\n",
+    )
+    .unwrap();
+    let put = Command::new(env!("CARGO_BIN_EXE_as4tainr"))
+        .args(["--database-url", &url, "put"])
+        .arg(dir.join("prt.rpgle"))
+        .arg(format!("{d}/prt.rpgle"))
+        .output()
+        .unwrap();
+    assert!(put.status.success());
+    let r = run(
+        &dir,
+        Some(&lib),
+        &format!("CRTBNDRPG PGM({lib}/PRT) SRCSTMF('prt.rpgle')"),
+    );
+    assert_eq!(r.rc, 0, "{:?} {:?}", r.out, r.err);
+    let r = run(&dir, Some(&lib), &format!("CALL {lib}/PRT"));
+    assert!(
+        r.out.iter().any(|l| l.contains("CPF3303")),
+        "{:?} {:?}",
+        r.out,
+        r.err
+    );
+    assert!(r.out.iter().any(|l| l == "PRINTED"), "{:?}", r.out);
+    // DSPSPLF does not run under `system` (CPD0031 then CPF0006: the
+    // same capture, s_dspsplf). CRTMSGQ's completion message is CPC9801,
+    // SNDMSG sends none, DLTMSGQ's is CPC2191 (PUB400 2026-10-26,
+    // tools/golden/verify1.txt v_crtmsgq, v_sndmsg, v_dltmsgq).
+    let r = run(&dir, None, "DSPSPLF FILE(QSYSPRT) SPLNBR(*LAST)");
+    assert_eq!((ids(&r.err), r.rc), (vec!["CPD0031", "CPF0006"], 255));
+    let r = run(
+        &dir,
+        None,
+        &format!("CRTMSGQ MSGQ({lib}/MQ) TEXT('golden')"),
+    );
+    assert_eq!((ids(&r.out), r.rc), (vec!["CPC9801"], 0), "{:?}", r.err);
+    let r = run(&dir, None, &format!("SNDMSG MSG('hello') TOMSGQ({lib}/MQ)"));
+    assert_eq!((r.out.len(), r.rc), (0, 0), "{:?}", r.out);
+    let r = run(&dir, None, &format!("DLTMSGQ MSGQ({lib}/MQ)"));
+    assert_eq!((ids(&r.out), r.rc), (vec!["CPC2191"], 0));
     assert_eq!(run(&dir, None, &format!("DLTLIB {lib}")).rc, 0);
 }
 

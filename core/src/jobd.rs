@@ -158,7 +158,7 @@ impl Job<'_> {
                 let (libs, name) = self.search(cmd.get("JOBD"));
                 let Some(d) = find(self.client, &libs, &name).await? else {
                     bail!(
-                        "CPF9801: Object {} in library *LIBL not found.",
+                        "CPF9801: Object {} is not in library *LIBL.",
                         name.to_ascii_uppercase()
                     );
                 };
@@ -240,7 +240,7 @@ impl Job<'_> {
             match find(self.client, &libs, &name).await? {
                 Some(d) => (d.library, d.name),
                 None => bail!(
-                    "CPF9801: Object {} in library {} not found.",
+                    "CPF9801: Object {} is not in library {}.",
                     name.to_ascii_uppercase(),
                     cmd.get("JOBD")
                         .split_once('/')

@@ -295,7 +295,7 @@ async fn module_information(
         }
     }
     let Some((mlib, r)) = found else {
-        bail!("CPF9801: Object {name} in library {lib} not found.");
+        bail!("CPF9801: Object {name} is not in library {lib}.");
     };
     authority::check(client, &caller.user, &mlib, &name, "*MODULE", Aut::Use).await?;
     let mut o = vec![0u8; 8];
@@ -353,12 +353,12 @@ async fn object_description(
     }
     let Some((olib, r)) = found else {
         if !lib.starts_with('*') && !crate::catalog::library_exists(client, &lib).await? {
-            bail!("CPF9810: Library {lib} not found.");
+            bail!("CPF9810: There is no library {lib}.");
         }
         match objtype.as_str() {
             "*PGM" => bail!("CPF9811: Program {name} in library {lib} not found."),
             "*FILE" => bail!("CPF9812: File {name} in library {lib} not found."),
-            _ => bail!("CPF9801: Object {name} in library {lib} not found."),
+            _ => bail!("CPF9801: Object {name} is not in library {lib}."),
         }
     };
     authority::check(client, &caller.user, &olib, &name, &objtype, Aut::Use).await?;
@@ -489,9 +489,9 @@ async fn change_object_description(
     }
     let Some(olib) = found else {
         if !lib.starts_with('*') && !crate::catalog::library_exists(client, &lib).await? {
-            bail!("CPF9810: Library {lib} not found.");
+            bail!("CPF9810: There is no library {lib}.");
         }
-        bail!("CPF9801: Object {name} in library {lib} not found.");
+        bail!("CPF9801: Object {name} is not in library {lib}.");
     };
     authority::check(client, &caller.user, &olib, &name, &objtype, Aut::Change).await?;
     let info = args.bytes(3);
@@ -579,7 +579,7 @@ async fn member_description(
     }
     let Some((flib, r)) = found else {
         if !lib.starts_with('*') && !crate::catalog::library_exists(client, &lib).await? {
-            bail!("CPF9810: Library {lib} not found.");
+            bail!("CPF9810: There is no library {lib}.");
         }
         bail!("CPF9812: File {file} in library {lib} not found.");
     };
@@ -885,7 +885,7 @@ async fn file_description(client: &Client, caller: &Caller, args: &mut dyn ApiAr
     }
     let Some((lib, r)) = found else {
         if !flib.starts_with('*') && !crate::catalog::library_exists(client, &flib).await? {
-            bail!("CPF9810: Library {flib} not found.");
+            bail!("CPF9810: There is no library {flib}.");
         }
         bail!("CPF9812: File {file} in library {flib} not found.");
     };
@@ -1130,7 +1130,7 @@ async fn job_description(client: &Client, caller: &Caller, args: &mut dyn ApiArg
         l => vec![l.to_string()],
     };
     let Some(d) = crate::jobd::find(client, &libs, &name).await? else {
-        bail!("CPF9801: Object {name} in library {lib} not found.");
+        bail!("CPF9801: Object {name} is not in library {lib}.");
     };
     authority::check(client, &caller.user, &d.library, &d.name, "*JOBD", Aut::Use).await?;
     let desc: String = client

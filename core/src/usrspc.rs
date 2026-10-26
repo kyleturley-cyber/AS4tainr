@@ -158,10 +158,10 @@ pub async fn find(client: &Client, name: &str, lib: &str, caller: &Caller) -> Re
         && !lib.is_empty()
         && !crate::catalog::library_exists(client, lib).await?
     {
-        bail!("CPF9810: Library {lib} not found.");
+        bail!("CPF9810: There is no library {lib}.");
     }
     bail!(
-        "CPF9801: Object {name} in library {} not found.",
+        "CPF9801: Object {name} is not in library {}.",
         if lib.is_empty() { "*LIBL" } else { lib }
     )
 }
@@ -179,7 +179,7 @@ async fn create(client: &Client, caller: &Caller, args: &mut dyn ApiArgs) -> Res
     let lib = validate_name("library", &lib)?;
     let name = validate_name("user space", &name)?;
     if !crate::catalog::library_exists(client, &lib).await? {
-        bail!("CPF9810: Library {lib} not found.");
+        bail!("CPF9810: There is no library {lib}.");
     }
     let extattr = text(args, 1);
     let size = args.num(2)?;
@@ -859,7 +859,7 @@ async fn list_objects(client: &Client, caller: &Caller, args: &mut dyn ApiArgs) 
             .collect(),
         l => {
             if !crate::catalog::library_exists(client, l).await? {
-                bail!("CPF9810: Library {l} not found.");
+                bail!("CPF9810: There is no library {l}.");
             }
             vec![l.to_string()]
         }
@@ -947,7 +947,7 @@ async fn list_fields(client: &Client, caller: &Caller, args: &mut dyn ApiArgs) -
     }
     let Some((lib, attr, ftext)) = found else {
         if !flib.starts_with('*') && !crate::catalog::library_exists(client, &flib).await? {
-            bail!("CPF9810: Library {flib} not found.");
+            bail!("CPF9810: There is no library {flib}.");
         }
         bail!("CPF9812: File {file} in library {flib} not found.");
     };

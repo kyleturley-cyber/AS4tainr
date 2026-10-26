@@ -93,7 +93,7 @@ pub async fn create(client: &Client, c: &Create<'_>) -> Result<()> {
     let lib = validate_name("library", c.library)?;
     let name = validate_name("data queue", c.name)?;
     if !crate::catalog::library_exists(client, &lib).await? {
-        bail!("CPF9810: Library {lib} not found.");
+        bail!("CPF9810: There is no library {lib}.");
     }
     let n = client
         .execute(
@@ -190,9 +190,9 @@ pub async fn find(client: &Client, lib: &str, name: &str, caller: &Caller) -> Re
         }
     }
     if !label.starts_with('*') && !crate::catalog::library_exists(client, &label).await? {
-        bail!("CPF9810: Library {label} not found.");
+        bail!("CPF9810: There is no library {label}.");
     }
-    bail!("CPF9801: Object {name} in library {label} not found.")
+    bail!("CPF9801: Object {name} is not in library {label}.")
 }
 
 /// Who calls a data queue API.

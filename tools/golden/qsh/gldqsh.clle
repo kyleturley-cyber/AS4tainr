@@ -19,6 +19,7 @@ PGM
   DCL &HI   *DEC (5 0)
   DCL &P    *INT 4
   DCL &DIGS *CHAR 16 VALUE('0123456789ABCDEF')
+  DCL &NUL  *CHAR 1 VALUE(X'00')
 
   /* A qualified name whose object part is a special value: not a    */
   /* comment.                                                         */
@@ -103,8 +104,8 @@ PGM
     RCVMSG MSGTYPE(*EXCP) MSGDTA(&D) MSGDTALEN(&DL) MSGID(&ID) RMV(*NO)
     CHGVAR &K 'esc4'
     CALLSUBR DATA
-    RCVMSG MSGTYPE(*ESCAPE) MSGDTA(&D) MSGDTALEN(&DL) MSGID(&ID)
-    CHGVAR &K 'esc4esc'
+    RCVMSG MSGTYPE(*EXCP) MSGDTA(&D) MSGDTALEN(&DL) MSGID(&ID)
+    CHGVAR &K 'esc4again'
     CALLSUBR DATA
   ENDDO
   QSH CMD('exit 4')
@@ -172,7 +173,7 @@ PGM
     CHGVAR &J 0
     DOFOR VAR(&I) FROM(1) TO(40)
       IF COND(&I *GT &DL) THEN(LEAVE)
-      CHGVAR &B2 (X'00' *CAT %SST(&D &I 1))
+      CHGVAR &B2 (&NUL *CAT %SST(&D &I 1))
       CHGVAR &BY %BIN(&B2)
       CHGVAR &HI (&BY / 16)
       CHGVAR &J (&J + 1)

@@ -243,6 +243,7 @@ pub fn analyze(source: &str, known: &dyn Fn(&str) -> bool, file_vars: &FileVars)
                 ),
             }),
         }
+        a.diags.extend(value_checks(*line, &bare, &st));
         for v in vars {
             uses.push((*line, v));
         }
@@ -624,6 +625,94 @@ fn code_lines(source: &str) -> Vec<usize> {
     out
 }
 
+/// RCVMSG's message types (CL reference, RCVMSG MSGTYPE).
+const RCVMSG_TYPES: &[&str] = &[
+    "*ANY", "*NEXT", "*PRV", "*FIRST", "*LAST", "*INFO", "*INQ", "*RPY", "*COPY", "*DIAG", "*COMP",
+    "*EXCP", "*RQS",
+];
+
+/// Checks of parameter values the compiler makes (observed with CRTBNDCL
+/// on PUB400, 2026-10-26, tools/golden/qsh.txt q_crt):
+/// - a special value a parameter does not take: CPD0084, severity 30
+///   (`RCVMSG MSGTYPE(*ESCAPE)`);
+/// - a hexadecimal constant as an operand of an expression: CPD0126,
+///   severity 30 (`CHGVAR &B2 (X'00' *CAT %SST(&D &I 1))`).
+fn value_checks(line: usize, cmd: &str, st: &crate::clpgm::Statement) -> Vec<Diag> {
+    let mut out = Vec::new();
+    for p in &st.params {
+        let kw = p.keyword.as_deref().unwrap_or("").to_ascii_uppercase();
+        let v = p.value.trim();
+        if cmd == "RCVMSG" && kw == "MSGTYPE" {
+            let u = v.to_ascii_uppercase();
+            if !u.starts_with('&') && !RCVMSG_TYPES.contains(&u.as_str()) {
+                out.push(Diag {
+                    line,
+                    id: "CPD0084".into(),
+                    sev: 30,
+                    text: format!("{} is not a value MSGTYPE takes.", quoted_value(v)),
+                });
+            }
+        }
+        if expression_with_hex(v) {
+            out.push(Diag {
+                line,
+                id: "CPD0126".into(),
+                sev: 30,
+                text: format!(
+                    "A hexadecimal constant cannot be an operand in {}.",
+                    if kw.is_empty() {
+                        "the expression".to_string()
+                    } else {
+                        kw.clone()
+                    }
+                ),
+            });
+        }
+    }
+    out
+}
+
+/// A value as the listing names it: a special value padded to 10.
+fn quoted_value(v: &str) -> String {
+    format!("'{v:<10}'")
+}
+
+/// An expression (an operator outside quotes) with an X'..' operand.
+fn expression_with_hex(v: &str) -> bool {
+    let cs: Vec<char> = v.chars().collect();
+    let (mut in_q, mut hex, mut op) = (false, false, false);
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if in_q {
+            if c == '\'' {
+                in_q = false;
+            }
+        } else if c == '\'' {
+            in_q = true;
+            let start = i > 0
+                && matches!(cs[i - 1], 'X' | 'x')
+                && (i == 1 || !(cs[i - 2].is_ascii_alphanumeric() || cs[i - 2] == '_'));
+            if start {
+                hex = true;
+            }
+        } else if c == '*' {
+            let w: String = cs[i + 1..]
+                .iter()
+                .take_while(|c| c.is_ascii_alphabetic())
+                .collect::<String>()
+                .to_ascii_uppercase();
+            if matches!(w.as_str(), "CAT" | "BCAT" | "TCAT") {
+                op = true;
+            }
+        } else if c == '|' {
+            op = true;
+        }
+        i += 1;
+    }
+    hex && op
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,5 +756,21 @@ mod tests {
             .map(|d| d.text.as_str())
             .collect();
         assert_eq!(d, ["Command MYCMD was not found in library OTHER."]);
+    }
+
+    /// RCVMSG MSGTYPE(*ESCAPE) is CPD0084 and a hexadecimal constant in
+    /// an expression CPD0126, both severity 30 (CRTBNDCL on PUB400,
+    /// 2026-10-26, tools/golden/qsh.txt q_crt); X'00' alone is a value.
+    #[test]
+    fn rcvmsg_msgtype_and_hex_in_expression() {
+        let src = "PGM\n  DCL &B *CHAR 2\n  DCL &D *CHAR 4\n  RCVMSG MSGTYPE(*ESCAPE)\n  CHGVAR &B (X'00' *CAT %SST(&D 1 1))\n  CHGVAR &B X'00'\n  RCVMSG MSGTYPE(*EXCP)\nENDPGM\n";
+        let a = analyze(src, &|c| c == "RCVMSG" || c == "CHGVAR", &|_| vec![]);
+        let ids: Vec<(usize, &str, u8)> = a
+            .diags
+            .iter()
+            .filter(|d| d.id != "CPD0791")
+            .map(|d| (d.line, d.id.as_str(), d.sev))
+            .collect();
+        assert_eq!(ids, [(4, "CPD0084", 30), (5, "CPD0126", 30)]);
     }
 }

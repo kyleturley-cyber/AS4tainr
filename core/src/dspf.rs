@@ -541,6 +541,37 @@ pub fn parse(name: &str, source: &str) -> Result<DisplayFile> {
 
         let pos = if row.is_empty() && col.is_empty() {
             None
+        } else if let Some(n) = col.strip_prefix('+') {
+            // +n (DDS for display files, Location: "the number of spaces
+            // to be left between the end of the previous field and the
+            // start of the field"; 1-99, not for the first field of a
+            // record). The space before the field is its attribute byte.
+            let n: u16 = n
+                .trim()
+                .parse()
+                .ok()
+                .filter(|n| (1..=99).contains(n))
+                .ok_or_else(|| anyhow::anyhow!("line {lineno}: bad position '{col}'"))?;
+            let rec = f.records.last();
+            let prev = match target {
+                Target::Field => rec
+                    .and_then(|r| r.fields.last())
+                    .and_then(|x| x.pos.map(|p| (p, field_width(x)))),
+                Target::Constant => rec
+                    .and_then(|r| r.constants.last())
+                    .map(|x| (x.pos, constant_width(x))),
+                _ => None,
+            };
+            let Some(((r, c), w)) = prev else {
+                bail!(
+                    "line {lineno}: a relative position (+n) needs a field before it in the record"
+                );
+            };
+            let start = c as u16 + w + n;
+            if start > max_c as u16 {
+                bail!("line {lineno}: location {r},{start} is outside a {max_r}x{max_c} display");
+            }
+            Some((r, start as u8))
         } else {
             let r: u8 = row
                 .parse()
@@ -800,6 +831,36 @@ fn check_subfiles(f: &DisplayFile) -> Result<()> {
 }
 
 // --------------------------------------------------------------- editing
+
+/// Width of a field on the screen (a numeric one as edited).
+fn field_width(f: &Field) -> u16 {
+    if f.is_numeric() {
+        display_width(f)
+    } else {
+        f.length
+    }
+}
+
+/// Width of a constant on the screen: DATE edited (EDTCDE(Y)) is 8, else
+/// 6; TIME 8; USER 10; SYSNAME 8.
+fn constant_width(c: &Constant) -> u16 {
+    match &c.text {
+        ConstText::Literal(t) => t.chars().count() as u16,
+        ConstText::Date => {
+            if c.keywords
+                .iter()
+                .any(|k| matches!(k.kw, Keyword::EdtCde(_)))
+            {
+                8
+            } else {
+                6
+            }
+        }
+        ConstText::Time => 8,
+        ConstText::User => 10,
+        ConstText::SysName => 8,
+    }
+}
 
 /// Width of a numeric field on the screen.
 pub fn display_width(f: &Field) -> u16 {
@@ -1455,6 +1516,31 @@ mod tests {
             .contains("outside a 24x80"));
     }
 
+    // DDS for display files, Location: +n in positions 42-44 leaves n
+    // spaces between the end of the previous field (or constant) and the
+    // start of this one, on the same line; not for a record's first
+    // field. The space before the field is its attribute byte, so the
+    // field starts n+1 columns after the previous one ends... here, at
+    // previous start + width + n (usrspcdsp.dspf of the IBMi-topics
+    // corpus: '...:' at 4,2 (25 wide) then $APINAME +1 at 4,28).
+    #[test]
+    fn relative_positions() {
+        let src = "     A          R REC
+     A                                  4  2'API name  . . . . . . . :'
+     A            $APINAME      10A  O    +1
+     A            $ENTLG         6Y 0O    +3EDTCDE(Z)
+     A            $NEXT          2A  O    +1
+";
+        let f = parse("rel", src).unwrap();
+        let r = f.record("REC").unwrap();
+        assert_eq!(r.fields[0].pos, Some((4, 28)));
+        assert_eq!(r.fields[1].pos, Some((4, 41)));
+        // EDTCDE(Z): 6 digits, no sign or point.
+        assert_eq!(r.fields[2].pos, Some((4, 48)));
+        let first = "     A          R REC\n     A            F1             2A  O    +1\n";
+        assert!(parse("rel", first).is_err());
+    }
+
     #[test]
     fn parses_the_sample_display_file() {
         let f = parse("custinqd", CUSTINQD).unwrap();
@@ -1660,7 +1746,10 @@ mod tests {
         assert_eq!(out.inputs, vec!["CODE", "AMT"]);
         let st = out.screen.to_stream();
         // Start of field orders (0x1D) with the digits-only shift.
-        let sf = st.windows(2).filter(|w| w[0] == 0x1D && w[1] == 0x45).count();
+        let sf = st
+            .windows(2)
+            .filter(|w| w[0] == 0x1D && w[1] == 0x45)
+            .count();
         assert_eq!(sf, 2, "{st:02X?}");
     }
 

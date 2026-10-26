@@ -31,6 +31,11 @@
 #   library; then its self-test suite
 #   ASSERTT made with RUCRTRPG and run with RUCALLTST: the test
 #   procedures that pass here, then the whole suite's result line.
+# - IBMi-topics (MarcoDeSenas, GPL-3.0): imported (a TOBi-like project:
+#   sources built from the IFS, relative INCLUDE SRCSTMF paths, commands
+#   with validity checkers that look for QCATRS on the call stack,
+#   RTNVAL parameters), then its SPLFDLT command, which lists the user's
+#   spooled files with QUSLSPL SPLF0300 in a user space and deletes them.
 #
 #   tools/legacy.sh
 #
@@ -51,6 +56,7 @@ clone https://github.com/RPGUnit/RPGUnit.git rpgunit
 clone https://github.com/richardschoen/QshOni.git qshoni
 clone https://github.com/IBM/ibmi-company_system.git cmpsys
 clone https://github.com/tools-400/irpgunit.git irpgunit
+clone https://github.com/MarcoDeSenas/IBMi-topics-thanks-to-pub400.git topics
 
 step() {
   echo "== $*"
@@ -191,3 +197,10 @@ irpg "RUCRTRPG TSTPGM(IRPGUNIT/ASSERTT) SRCFILE(IRPGUNIT/QUNITTEST) BNDDIR(IRPGU
 irpg "RUCALLTST TSTPGM(IRPGUNIT/ASSERTT) TSTPRC(TESTASSERTCLEAR TESTASSERTCOUNT TESTASSERTEQUAL_DATE TESTASSERTEQUAL_IND TESTASSERTEQUAL_INTEGER TESTASSERTEQUAL_STRING TESTASSERTEQUAL_TIME TESTASSERTEQUAL_TIMESTAMP TESTASSERTWITHFAILURE TESTASSERTWITHSUCCESS TESTBIGINTEGEREQUALITY TESTCLEARASSERTFAILEVENT TESTGETASSERTFAILEVT TESTGETLOGVALUE TESTGOODBYEISNOTHELLO TESTHELLOEQUALSHELLO TESTTOIND TESTTWOANDTWOEQUALSFOUR TESTTWOANDTWOISNOTEQUALTOFIVE)" |
   grep -E "^ *(Success|FAILURE|ERROR)\."
 irpg "RUCALLTST TSTPGM(IRPGUNIT/ASSERTT)" | grep -a -E "^ *(Success|FAILURE|ERROR)\."
+
+step "IBMi-topics (import, then SPLFDLT *LOGONLY and *BOTH in batch jobs)"
+"$bin" import "$work/topics" --lib TOPICS 2>/dev/null | tail -1
+"$bin" batch "DSPLIBL OUTPUT(*PRINT)" >/dev/null 2>&1
+topics() { "$bin" --libl TOPICS,QGPL --curlib TOPICS batch "$1" 2>&1 | grep -E "spool files|USP0|CPF1240"; }
+topics "SPLFDLT ACTION(*LOGONLY)"
+topics "SPLFDLT"

@@ -25,6 +25,15 @@ CREATE TABLE IF NOT EXISTS as4tainr.environment_variables (
     value  text,
     ccsid  integer NOT NULL DEFAULT 0
 );
+-- A copy of each job's variables (kept in the process) for SQL
+-- (QSYS2.ENVIRONMENT_VARIABLE_INFO), by job key.
+CREATE UNLOGGED TABLE IF NOT EXISTS as4tainr.job_environment_variables (
+    job    text NOT NULL,
+    name   text NOT NULL,
+    value  text,
+    ccsid  integer NOT NULL DEFAULT 0,
+    PRIMARY KEY (job, name)
+);
 "#;
 
 /// A variable's value (None: *NULL) and CCSID (0: the job's).
@@ -72,9 +81,34 @@ pub async fn job_vars(client: &Client, job: &str) -> Result<Vars> {
         return Ok(v.clone());
     }
     let sys = system_vars(client).await.unwrap_or_default();
-    let mut g = JOBS.lock().unwrap();
-    let m = g.get_or_insert_with(HashMap::new);
-    Ok(m.entry(job.to_string()).or_insert(sys).clone())
+    let vars = {
+        let mut g = JOBS.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        m.entry(job.to_string()).or_insert(sys).clone()
+    };
+    mirror(client, job).await;
+    Ok(vars)
+}
+
+/// The job's variables copied for SQL (as4tainr.job_environment_variables).
+async fn mirror(client: &Client, job: &str) {
+    let vars = JOBS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(job).cloned())
+        .unwrap_or_default();
+    let names: Vec<&str> = vars.keys().map(String::as_str).collect();
+    let values: Vec<Option<&str>> = vars.values().map(|v| v.value.as_deref()).collect();
+    let ccsids: Vec<i32> = vars.values().map(|v| v.ccsid).collect();
+    let _ = client
+        .execute(
+            "WITH gone AS (DELETE FROM as4tainr.job_environment_variables WHERE job = $1)
+             INSERT INTO as4tainr.job_environment_variables (job, name, value, ccsid)
+             SELECT $1, n, v, c FROM unnest($2::text[], $3::text[], $4::int[]) AS t(n, v, c)",
+            &[&job, &names, &values, &ccsids],
+        )
+        .await;
 }
 
 /// Change the job's variables (after `job_vars` made them).
@@ -135,7 +169,9 @@ pub async fn add(
                 }
                 v.insert(name.to_string(), var);
                 Ok(())
-            })
+            })?;
+            mirror(client, job).await;
+            Ok(())
         }
         Level::System => {
             let sql = if replace {
@@ -178,8 +214,10 @@ pub async fn change(
                 if let Some(c) = ccsid {
                     var.ccsid = c;
                 }
-                Ok(())
-            })
+                Ok::<(), anyhow::Error>(())
+            })?;
+            mirror(client, job).await;
+            Ok(())
         }
         Level::System => {
             let Some(old) = system_vars(client).await?.remove(name) else {
@@ -204,7 +242,9 @@ pub async fn remove(client: &Client, job: &str, level: Level, name: &str) -> Res
     let removed = match level {
         Level::Job => {
             job_vars(client, job).await?;
-            with_job(job, |v| v.remove(name).is_some())
+            let r = with_job(job, |v| v.remove(name).is_some());
+            mirror(client, job).await;
+            r
         }
         Level::System => {
             client

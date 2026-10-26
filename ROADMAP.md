@@ -203,6 +203,11 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] SQL: DECLARE GLOBAL TEMPORARY TABLE (QTEMP/SESSION), DEFAULT USER, ALTER TABLE with several alterations, Db2 implicit string/number casts
 - [x] Display files: keyboard shift D, usage P; CL: positional IF/ELSE commands
 - [x] Import: IBM-i-RPG-Free-CLP-Code (relative-path includes from the IFS, commands before programs)
+- [x] Import: IBMi-topics (MarcoDeSenas): TOBi projects fully in the IFS, CL INCLUDE SRCSTMF relative paths, NAME.srvpgm sources as EXPORT(*ALL) service programs; SPLFDLT runs end to end
+- [x] Commands: CMD statement VLDCKR/ALLOW/MAXPOS/TEXT, PARM RTNVAL(*YES), validity checker called by QCATRS; CL DCLPRCOPT binding, CALLPRC _MATPGMNM, CL programs listed by QWVRCSTK
+- [x] SQL: QSYS2.QCMDEXC scalar function in SQL PL, SYSTOOLS.LPRINTF, QSYS2.ENVIRONMENT_VARIABLE_INFO (ENV_VARS, also as RPG EXTNAME)
+- [x] QUSLSPL SPLF0300; DDS relative positions (+n); RPG LIKE of an outer field inside a qualified DS
+- [ ] System-period temporal tables (ROW BEGIN/END, TRANSACTION START ID, PERIOD SYSTEM_TIME, ADD VERSIONING, FOR SYSTEM_TIME queries)
 - [ ] DSPFD/DSPOBJD OUTPUT(*OUTFILE) with model files QAFDMBRL/QADSPOBJ (needs DSPFFD capture from PUB400)
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).

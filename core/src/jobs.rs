@@ -84,6 +84,17 @@ pub struct JobId {
     pub name: String,
 }
 
+impl JobId {
+    /// A qualified job name NUMBER/USER/NAME.
+    pub fn parse(text: &str) -> Option<JobId> {
+        let mut p = text.trim().splitn(3, '/');
+        let number = p.next()?.trim().parse().ok()?;
+        let user = p.next()?.trim().to_string();
+        let name = p.next()?.trim().to_string();
+        Some(JobId { number, user, name })
+    }
+}
+
 impl std::fmt::Display for JobId {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(out, "{:06}/{}/{}", self.number, self.user, self.name)
@@ -674,10 +685,10 @@ pub async fn msgq_key(client: &Client, libs: &[String], name: &str) -> Result<Op
             return Ok(Some(format!("{l}/{name}")));
         }
     }
-    if libs.iter().any(|l| l == "QUSRSYS" || l == "QSYS") {
-        if name == "QSYSOPR" || crate::users::get(client, &name).await?.is_some() {
-            return Ok(Some(name));
-        }
+    if libs.iter().any(|l| l == "QUSRSYS" || l == "QSYS")
+        && (name == "QSYSOPR" || crate::users::get(client, &name).await?.is_some())
+    {
+        return Ok(Some(name));
     }
     Ok(None)
 }

@@ -183,9 +183,9 @@ pub(crate) enum Tok {
     Punct(String),
 }
 
-/// NEXT VALUE FOR seq (NEXTVAL FOR) and PREVIOUS VALUE FOR seq (PREVVAL
-/// FOR) (Db2 for i SQL Reference, sequence reference): the sequence's
-/// next value, and the last one NEXT VALUE gave in this session.
+// NEXT VALUE FOR seq (NEXTVAL FOR) and PREVIOUS VALUE FOR seq (PREVVAL
+// FOR) (Db2 for i SQL Reference, sequence reference): the sequence's
+// next value, and the last one NEXT VALUE gave in this session.
 
 /// The special registers CURRENT DATE, CURRENT TIME and CURRENT TIMESTAMP
 /// as PostgreSQL computes them: the time the statement started.
@@ -1358,16 +1358,16 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
             }
             // QSYS2.JOB_NAME: the built-in global variable.
             Some("QSYS2")
-                if next_non_space(&toks, i + 1).is_some_and(
-                    |j| matches!(&toks[j], Tok::Punct(p) if p == "."),
-                ) && {
-                    let j = next_non_space(&toks, i + 1).unwrap_or(i);
-                    next_non_space(&toks, j + 1)
-                        .is_some_and(|k| word(&toks[k]).as_deref() == Some("JOB_NAME"))
-                        && !next_non_space(&toks, j + 1)
-                            .and_then(|k| next_non_space(&toks, k + 1))
-                            .is_some_and(|m| matches!(&toks[m], Tok::Punct(p) if p == "("))
-                } =>
+                if next_non_space(&toks, i + 1)
+                    .is_some_and(|j| matches!(&toks[j], Tok::Punct(p) if p == "."))
+                    && {
+                        let j = next_non_space(&toks, i + 1).unwrap_or(i);
+                        next_non_space(&toks, j + 1)
+                            .is_some_and(|k| word(&toks[k]).as_deref() == Some("JOB_NAME"))
+                            && !next_non_space(&toks, j + 1)
+                                .and_then(|k| next_non_space(&toks, k + 1))
+                                .is_some_and(|m| matches!(&toks[m], Tok::Punct(p) if p == "("))
+                    } =>
             {
                 let j = next_non_space(&toks, i + 1).unwrap_or(i);
                 let k = next_non_space(&toks, j + 1).unwrap_or(j);
@@ -1572,12 +1572,7 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
                         && c == next_non_space(&toks, call_open.unwrap() + 1).unwrap_or(0)
                     {
                         out.push(Tok::Word(
-                            if f == "CURDATE" {
-                                STMT_DATE
-                            } else {
-                                STMT_TIME
-                            }
-                            .into(),
+                            if f == "CURDATE" { STMT_DATE } else { STMT_TIME }.into(),
                         ));
                         i = c + 1;
                         continue;
@@ -1990,10 +1985,14 @@ pub(crate) fn context_sql(user: &str, curlib: Option<&str>, job: Option<&str>) -
 fn context_sql_in(user: &str, curlib: Option<&str>, job: Option<&str>, local: bool) -> String {
     let q = |s: &str| format!("'{}'", s.replace('\'', "''"));
     format!(
-        "SELECT set_config('as4tainr.user', {u}, {local}), set_config('as4tainr.curlib', {c}, {local}), set_config('as4tainr.job', {j}, {local})",
+        "SELECT set_config('as4tainr.user', {u}, {local}), set_config('as4tainr.curlib', {c}, {local}), set_config('as4tainr.job', {j}, {local}), set_config('as4tainr.job_key', {k}, {local})",
         u = q(user),
         c = q(curlib.unwrap_or("")),
-        j = q(job.unwrap_or(""))
+        j = q(job.unwrap_or("")),
+        // The key of the job's variables kept in this process (Job::job_key).
+        k = q(&job
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("PID{}", std::process::id())))
     )
 }
 
@@ -2142,11 +2141,8 @@ async fn run_in_transaction(
     text: &str,
     path: &[String],
 ) -> Result<Outcome> {
-    tx.batch_execute(&format!(
-        "SET LOCAL search_path TO {}",
-        joined_path(&path)
-    ))
-    .await?;
+    tx.batch_execute(&format!("SET LOCAL search_path TO {}", joined_path(path)))
+        .await?;
     let stmt = tx.prepare(text).await.map_err(|e| map_error(&e, text))?;
     let outcome = if t.kind == Kind::Query {
         let cols = stmt.columns();
@@ -2554,10 +2550,7 @@ impl Session {
         let sql_client = connect_as_sql_role(client, database_url).await?;
         let path: Vec<String> = libl.iter().map(|l| ident(l)).collect();
         sql_client
-            .batch_execute(&format!(
-                "SET search_path TO {}",
-                joined_path(&path)
-            ))
+            .batch_execute(&format!("SET search_path TO {}", joined_path(&path)))
             .await?;
         Ok(Session {
             context: None,

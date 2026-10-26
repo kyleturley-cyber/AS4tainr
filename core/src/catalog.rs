@@ -1356,6 +1356,15 @@ pub async fn resolve_record_file(client: &Client, libl: &[String], name: &str) -
                 file: crate::source::record_file(&n, rcdlen),
             });
         }
+        // A QSYS2 view of the IBM i services.
+        if lib == "QSYS2" {
+            if let Some(file) = crate::services::view_record(&n) {
+                return Ok(FileRef {
+                    library: lib.clone(),
+                    file,
+                });
+            }
+        }
     }
     resolve_file(client, libl, name).await
 }

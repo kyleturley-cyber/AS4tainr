@@ -353,6 +353,15 @@ fn define_option(cmd: &Command) -> String {
     }
 }
 
+/// INCDIR of CRTBNDCL/CRTCLMOD: the directories INCLUDE SRCSTMF searches
+/// after the source's own.
+fn cl_incdir(cmd: &Command) -> Vec<String> {
+    crate::cmd::raw_items_text(cmd.get("INCDIR"))
+        .into_iter()
+        .filter(|d| !d.is_empty() && !d.starts_with('*'))
+        .collect()
+}
+
 impl Job<'_> {
     /// The library list as searched: system part, current library, user
     /// part.
@@ -1466,9 +1475,14 @@ impl Job<'_> {
         let mut cl_listing = None;
         let mut m = m;
         if cl {
-            let src =
-                crate::source::expand_cl_includes(self.client, &self.library_list(), &m.source)
-                    .await?;
+            let src = crate::source::expand_cl_includes_from(
+                self.client,
+                &self.library_list(),
+                &m.source,
+                &m.stmf,
+                &cl_incdir(cmd),
+            )
+            .await?;
             cl_listing = Some(self.check_cl(cmd, &lib, &name, &m, &src, &libl).await?);
             m.source = src;
         } else {
@@ -2688,14 +2702,7 @@ impl Job<'_> {
             };
             let mut c = runtime::connect_db(&self.env.database_url).await?;
             crate::ile::store(
-                &mut c,
-                &lib,
-                &name,
-                "*MODULE",
-                "SQLRPGLE",
-                &text,
-                &m.source,
-                &options,
+                &mut c, &lib, &name, "*MODULE", "SQLRPGLE", &text, &m.source, &options,
             )
             .await?;
             crate::ile::set_source(self.client, &lib, &name, "*MODULE", &m).await?;
@@ -2855,15 +2862,91 @@ impl Job<'_> {
             }
             m.source.clone()
         } else {
-            let src =
-                crate::source::expand_cl_includes(self.client, &self.library_list(), &m.source)
-                    .await?;
+            let src = crate::source::expand_cl_includes_from(
+                self.client,
+                &self.library_list(),
+                &m.source,
+                &m.stmf,
+                &cl_incdir(cmd),
+            )
+            .await?;
             let mut libl = self.library_list();
             if !libl.contains(&lib) {
                 libl.insert(0, lib.clone());
             }
             let (shown, analysis) = self.check_cl(cmd, &lib, &name, &m, &src, &libl).await?;
             cl_listing = Some((shown, analysis));
+            // ILE CL: DFTACTGRP, ACTGRP, BNDDIR from the command, which
+            // DCLPRCOPT in the source overrides, and DCLPRCOPT's
+            // BNDSRVPGM (CL reference, DCLPRCOPT). A program not in the
+            // default activation group is bound to the procedures it
+            // calls (CALLPRC).
+            if cmd.def.name == "CRTBNDCL" {
+                let o = crate::clpgm::dclprcopt(&src);
+                let get = |k: &str| -> String {
+                    o.get(k)
+                        .map(|v| v.trim().to_ascii_uppercase())
+                        .unwrap_or_else(|| cmd.get(k).to_ascii_uppercase())
+                };
+                if get("DFTACTGRP") == "*NO" {
+                    let g = match get("ACTGRP").as_str() {
+                        "" | "*STGMDL" => "QILE".to_string(),
+                        g => g.to_string(),
+                    };
+                    options = format!("{options} DFTACTGRP(*NO) ACTGRP({g})")
+                        .trim()
+                        .to_string();
+                    let mut dirs: Vec<String> = cmd
+                        .list("BNDDIR")
+                        .into_iter()
+                        .filter(|d| !d.starts_with('*'))
+                        .collect();
+                    if let Some(v) = o.get("BNDDIR") {
+                        dirs.extend(
+                            crate::cmd::raw_items_text(v)
+                                .into_iter()
+                                .filter(|d| !d.starts_with('*'))
+                                .map(|d| d.to_ascii_uppercase()),
+                        );
+                    }
+                    // BNDSRVPGM((LIB/NAME *IMMED) ...) or (NAME).
+                    let srv: Vec<(String, String)> = o
+                        .get("BNDSRVPGM")
+                        .map(|v| crate::cmd::raw_items_text(v))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|x| !x.starts_with('*'))
+                        .map(|x| {
+                            let x = x.to_ascii_uppercase();
+                            match x.split_once('/') {
+                                Some((l, n)) => (l.to_string(), n.to_string()),
+                                None => ("*LIBL".to_string(), x),
+                            }
+                        })
+                        .collect();
+                    let entry = crate::ile::ModuleCopy {
+                        name: name.clone(),
+                        source: src.clone(),
+                        options: String::new(),
+                        attribute: "CLLE".to_string(),
+                    };
+                    let info = crate::ile::module_info(self.client, &libl, &entry).await?;
+                    // A procedure the binder cannot find (one of the
+                    // system's that as4tainr does not have, such as
+                    // getpwuid_r) leaves the program unbound, as before
+                    // ILE CL binding was done: its CALLPRC fails when it
+                    // runs (fidelity-gaps, DCLPRCOPT).
+                    if !info.imports.is_empty() {
+                        if let Ok((mut b, _)) =
+                            crate::ile::bind(self.client, &libl, vec![entry], &srv, &dirs).await
+                        {
+                            b.modules.retain(|x| x.name != name);
+                            b.actgrp = g.clone();
+                            binding = Some(b);
+                        }
+                    }
+                }
+            }
             src
         };
         let text = match cmd.get("TEXT") {
@@ -2954,12 +3037,15 @@ impl Job<'_> {
             match &lib {
                 Some(l) if l != "QSYS" && l != "*LIBL" => {
                     user_cmds.iter().any(|(ul, u)| ul == l && u == bare)
-                        || l == "*SYSTEM" && (crate::cl::find(bare).is_some() || crate::ibmcmds::is_ibm(bare))
+                        || l == "*SYSTEM"
+                            && (crate::cl::find(bare).is_some() || crate::ibmcmds::is_ibm(bare))
                 }
                 _ => {
                     crate::cl::find(bare).is_some()
                         || crate::ibmcmds::is_ibm(bare)
-                        || user_cmds.iter().any(|(ul, u)| u == bare && libl.contains(ul))
+                        || user_cmds
+                            .iter()
+                            .any(|(ul, u)| u == bare && libl.contains(ul))
                 }
             }
         };
@@ -3647,7 +3733,20 @@ impl Job<'_> {
         }
         let args = crate::cmd::call_args(crate::cmd::encode(d, line)?);
         if let Some(v) = &d.vldckr {
-            self.call_program_boxed(v, args.clone()).await?;
+            // The command analyzer (QSYS/QCATRS) calls the validity
+            // checker: its caller's call stack entry.
+            let job_key = self.job_key();
+            let analyzer =
+                crate::pgmmsg::listed_push(&job_key, ("QSYS", "QCATRS"), crate::ile::DEFAULT_GROUP);
+            let r = self.call_program_boxed(v, args.clone()).await;
+            crate::pgmmsg::listed_pop(&job_key, analyzer);
+            // Its messages come before the command's.
+            if let Outcome::Messages(mut first) = r? {
+                if let Outcome::Messages(m) = self.call_program_boxed(&d.pgm, args).await? {
+                    first.extend(m);
+                }
+                return Ok(Outcome::Messages(first));
+            }
         }
         self.call_program_boxed(&d.pgm, args).await
     }
@@ -3769,6 +3868,36 @@ impl Job<'_> {
             t => t.to_string(),
         };
         d.text = text.clone();
+        // The CMD statement's VLDCKR, MAXPOS, TEXT and ALLOW override
+        // CRTCMD's (CL reference, "Command Definition (CMD)").
+        let stmt = std::mem::take(&mut d.statement);
+        if let Some(v) = stmt.get("VLDCKR") {
+            d.vldckr = match v.to_ascii_uppercase().as_str() {
+                "*NONE" => None,
+                v => Some(qualified(v)),
+            };
+        }
+        if let Some(v) = stmt.get("MAXPOS") {
+            d.maxpos = v.parse().ok();
+        }
+        if let Some(v) = stmt.get("TEXT") {
+            d.text = match v.to_ascii_uppercase().as_str() {
+                "*BLANK" => String::new(),
+                "*SRCMBRTXT" => m.text.clone(),
+                "*CMDPMT" => d.prompt.clone(),
+                _ => crate::cmd::raw_text(v).unwrap_or_default(),
+            };
+        }
+        let allow = stmt
+            .get("ALLOW")
+            .map(String::as_str)
+            .unwrap_or_else(|| cmd.get("ALLOW"));
+        d.allow = allow
+            .split_whitespace()
+            .map(|x| x.trim_matches(['(', ')']).to_ascii_uppercase())
+            .filter(|x| !x.is_empty() && x != "*ALL")
+            .collect();
+        let text = d.text.clone();
         let mut c = runtime::connect_db(&self.env.database_url).await?;
         crate::cmd::create(&mut c, &d, &text, cmd.get("REPLACE") != "*NO").await?;
         authority::set_owner(self.client, &lib, &name, "*CMD", &self.user).await?;
@@ -5026,7 +5155,10 @@ impl Job<'_> {
         let lib = crate::qtemp::real(&lib.to_ascii_uppercase());
         let name = name.trim().to_ascii_uppercase();
         if !catalog::library_exists(self.client, &lib).await? {
-            bail!("CPF2110: Library {} not found.", crate::qtemp::logical(&lib));
+            bail!(
+                "CPF2110: Library {} not found.",
+                crate::qtemp::logical(&lib)
+            );
         }
         let text = match cmd.get("TEXT") {
             "*BLANK" => "",

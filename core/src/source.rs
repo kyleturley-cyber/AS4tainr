@@ -333,6 +333,20 @@ pub async fn find_stream_file(client: &Client, path: &str) -> Result<Option<(Str
     }))
 }
 
+/// A stream file's text by its path (the IFS root is not case-sensitive).
+async fn stream_file_text(client: &Client, path: &str) -> Result<Option<String>> {
+    let r = client
+        .query_opt(
+            "SELECT data, ccsid FROM as4tainr.ifs WHERE kind = 'F' AND path_key = lower($1)",
+            &[&path],
+        )
+        .await?;
+    Ok(r.map(|r| {
+        let data: Vec<u8> = r.get(0);
+        crate::ifs::codec::text(r.get(1), &data)
+    }))
+}
+
 /// The value of KEYWORD(...) in a command, quotes removed.
 fn keyword_value(text: &str, keyword: &str) -> Option<String> {
     let upper = text.to_ascii_uppercase();
@@ -346,6 +360,37 @@ fn keyword_value(text: &str, keyword: &str) -> Option<String> {
 /// the include's text replaces the statement before the program is
 /// checked, as the CL compiler does. Includes may include (10 levels).
 pub async fn expand_cl_includes(client: &Client, libs: &[String], source: &str) -> Result<String> {
+    expand_cl_includes_from(client, libs, source, "", &[]).await
+}
+
+/// A relative path from a directory: `.` and `..` resolved by name.
+pub fn join_relative(dir: &str, rel: &str) -> String {
+    let mut parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
+    for p in rel.split('/') {
+        match p {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            p => parts.push(p),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// `expand_cl_includes` for a source from the stream file `from` (or ""):
+/// a relative SRCSTMF path is looked for from the source's directory,
+/// then from each INCDIR directory (CL reference, INCLUDE SRCSTMF: "the
+/// path name is completed by pre-appending the searched including
+/// directory"; the source directory first, then INCDIR). The IFS root is
+/// not case-sensitive.
+pub async fn expand_cl_includes_from(
+    client: &Client,
+    libs: &[String],
+    source: &str,
+    from: &str,
+    incdir: &[String],
+) -> Result<String> {
     let mut text = source.to_string();
     for _ in 0..10 {
         let mut changed = false;
@@ -359,7 +404,25 @@ pub async fn expand_cl_includes(client: &Client, libs: &[String], source: &str) 
             }
             changed = true;
             if let Some(path) = keyword_value(t, "SRCSTMF") {
-                let Some((_, data)) = find_stream_file(client, &path).await? else {
+                let mut found = None;
+                if !path.starts_with('/') {
+                    let mut dirs: Vec<String> = Vec::new();
+                    if let Some((dir, _)) = from.rsplit_once('/') {
+                        dirs.push(dir.to_string());
+                    }
+                    dirs.extend(incdir.iter().cloned());
+                    for d in dirs {
+                        let full = join_relative(&d, &path);
+                        if let Some(f) = stream_file_text(client, &full).await? {
+                            found = Some(f);
+                            break;
+                        }
+                    }
+                }
+                if found.is_none() {
+                    found = find_stream_file(client, &path).await?.map(|x| x.1);
+                }
+                let Some(data) = found else {
                     bail!("INCLUDE: stream file {path} not found.");
                 };
                 out.push_str(&data);
@@ -560,6 +623,18 @@ pub async fn close_member(client: &Client, library: &str, file: &str, member: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // CL reference, INCLUDE SRCSTMF: a relative path is completed with
+    // the including directory (here by name: `..` goes up one).
+    #[test]
+    fn relative_include_paths() {
+        assert_eq!(
+            join_relative("/p/Tools/UserSpaces", "../../Common/Includes/inc.clle"),
+            "/p/Common/Includes/inc.clle"
+        );
+        assert_eq!(join_relative("/p/a", "./b/c"), "/p/a/b/c");
+        assert_eq!(join_relative("/", "../x"), "/x");
+    }
 
     #[test]
     fn source_types_from_extensions() {

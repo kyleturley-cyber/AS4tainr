@@ -909,6 +909,7 @@ impl Binder<'_> {
         let mut order: Vec<usize> = Vec::new();
         let mut later: Vec<usize> = Vec::new();
         let mut like: Vec<usize> = Vec::new();
+        let after_like: Vec<usize>;
         {
             let mut k = 0;
             while k < defs.len() {
@@ -992,6 +993,40 @@ impl Binder<'_> {
                 pending = wait;
             }
             order = placed;
+            // A data structure with a subfield LIKE a standalone field that
+            // is itself LIKE another (bound with the LIKE fields, below)
+            // comes after those fields; so do data structures that depend
+            // on it (iBMi-topics' QWc_JIDF0100: JobUser like(JobUser), the
+            // global JobUser like(UserProfile)).
+            let like_fields: Vec<String> = like
+                .iter()
+                .map(|&i| defs[i].name.to_ascii_uppercase())
+                .collect();
+            let mut moved: Vec<usize> = Vec::new();
+            loop {
+                let moved_names: Vec<String> = moved
+                    .iter()
+                    .map(|&i| defs[i].name.to_ascii_uppercase())
+                    .collect();
+                let more: Vec<usize> = order
+                    .iter()
+                    .copied()
+                    .filter(|&i| is_ds(i) && !moved.contains(&i))
+                    .filter(|&i| {
+                        ds_deps(i).iter().any(|d| {
+                            *d != defs[i].name.to_ascii_uppercase()
+                                && (like_fields.contains(d) || moved_names.contains(d))
+                        })
+                    })
+                    .collect();
+                if more.is_empty() {
+                    break;
+                }
+                moved.extend(more);
+            }
+            order.retain(|i| !moved.contains(i));
+            moved.sort();
+            after_like = moved;
         }
         // Fields LIKE another field (D specs, *LIKE DEFINE) come after the
         // fields they are like, which may be defined anywhere in the
@@ -1042,6 +1077,7 @@ impl Binder<'_> {
             order.extend(ready);
             like = wait;
         }
+        order.extend(after_like);
         order.extend(late_consts);
         order.extend(later);
         // Named constants of a literal value may be used before they are

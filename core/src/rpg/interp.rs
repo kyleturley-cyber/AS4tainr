@@ -2593,7 +2593,7 @@ impl<'a> Machine<'a> {
     /// (ILE RPG Reference, "Detailed RPG IV Object Program Cycle", step 3);
     /// written and unlocked when it ends with LR (steps 35-36).
     /// INZ(*USER): the job's user profile.
-    fn user_inz(&mut self) -> Result<()> {
+    pub(crate) fn user_inz(&mut self) -> Result<()> {
         let user = Value::str(&self.io.user);
         for f in &self.prog.user_inz {
             self.assign(
@@ -5439,7 +5439,16 @@ impl Machine<'_> {
                     bail!("QWVRCSTK of a job other than '*' is not supported");
                 }
                 crate::pgmmsg::stack_line(&self.io.job_key, self.line);
-                let bytes = cstk0100(&crate::pgmmsg::stack(&self.io.job_key));
+                if std::env::var_os("AS4TAINR_DEBUG_STACK").is_some() {
+                    eprintln!("QWVRCSTK for {}:", self.io.job_key);
+                    for e in crate::pgmmsg::stack_listed(&self.io.job_key) {
+                        eprintln!(
+                            "stack: {}/{} {} {} {}",
+                            e.lib, e.pgm, e.module, e.proc, e.actgrp
+                        );
+                    }
+                }
+                let bytes = cstk0100(&crate::pgmmsg::stack_listed(&self.io.job_key));
                 let n = (num(self, len)?.to_i128()?.max(0) as usize).min(self.rcv_room(rcv));
                 let mut out = bytes.clone();
                 // Bytes returned: what fits (whole entries only).
@@ -5447,9 +5456,10 @@ impl Machine<'_> {
                 out.truncate(fit);
                 out[0..4].copy_from_slice(&(fit as i32).to_be_bytes());
                 out[16..20].copy_from_slice(&(count as i32).to_be_bytes());
-                if fit < bytes.len() {
-                    out[28] = data::e("I")[0];
-                }
+                // A receiver too small for every entry leaves the
+                // information status blank: 'I' and 'N' are about the
+                // entries' contents (QWVRCSTK API, "Information status";
+                // "the API returns only the data that the area can hold").
                 let n = n.min(out.len());
                 self.bufs[rcv.buf][rcv.off..rcv.off + n].copy_from_slice(&out[..n]);
                 self.api_ok(rest.first());
@@ -6727,7 +6737,12 @@ impl<'a> Machine<'a> {
         if let Some((u, key, snap)) = reentry {
             let now = match u {
                 Some(u) => crate::ile::activation(&self.io.job_key, &self.io.actgrp, &u),
-                None => self.io.modules.lock().ok().and_then(|g| g.get(&key).cloned()),
+                None => self
+                    .io
+                    .modules
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.get(&key).cloned()),
             };
             if let Some(now) = now {
                 for (i, (old, new)) in snap.iter().zip(&now).enumerate() {
@@ -8073,7 +8088,7 @@ fn today_num(name: &str) -> i64 {
 /// The call stack in format CSTK0100 (Retrieve Call Stack API), the
 /// most recent entry first. Header: bytes returned and available, the
 /// number of entries, the offset to the first, the number returned,
-/// thread ID (8) and information status (' ' complete, 'I' incomplete).
+/// thread ID (8) and information status (' ': every entry complete).
 /// Each entry: its length, the displacement to and number of statement
 /// IDs, the displacement to and length of the procedure name, request
 /// level, program and library, MI instruction number, module and
@@ -8310,7 +8325,7 @@ fn lstm0100(
     // An impromptu message's text is kept with its message ID in front
     // ("CPF1234: text") when it has one.
     let text = crate::jobs::shown_text(&m.text);
-    let mut text = data::e(&text);
+    let mut text = data::e(text);
     text.truncate(max_len);
     for id in fields {
         let value: Vec<u8> = match id {
@@ -8346,10 +8361,9 @@ fn lstm0100(
 /// newest), maximum message and help lengths, offset to and number of
 /// the field identifiers to return, offset to and length of the call
 /// message queue name ('*': all) (Open List of Job Log Messages API).
-fn oljl_select(
-    job: &str,
-    s: &[u8],
-) -> Result<(Vec<crate::pgmmsg::QMsg>, Vec<i32>, (usize, usize))> {
+type OljlSelection = (Vec<crate::pgmmsg::QMsg>, Vec<i32>, (usize, usize));
+
+fn oljl_select(job: &str, s: &[u8]) -> Result<OljlSelection> {
     let txt = |a: usize, n: usize| -> String {
         s.get(a..a + n)
             .map(|b| data::a(b).trim().to_string())

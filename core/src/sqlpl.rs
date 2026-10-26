@@ -1484,9 +1484,100 @@ impl<'a, 'e> Run<'a, 'e> {
         }
     }
 
+    /// The QSYS2.QCMDEXC scalar function (IBM i services): its command
+    /// is run here and the call becomes its result, 1 when the command
+    /// ran and -1 when it failed. Each call in the statement runs once,
+    /// before the statement (not once per row).
+    fn expand_qcmdexc<'s>(&'s self, text: &'s str) -> BoxFut<'s, Result<String>> {
+        Box::pin(async move {
+            if !text.to_ascii_uppercase().contains("QCMDEXC") {
+                return Ok(text.to_string());
+            }
+            let toks = tokenize(text)?;
+            let significant = |from: usize, dir: isize| -> Option<usize> {
+                let mut j = from as isize + dir;
+                while j >= 0 && (j as usize) < toks.len() {
+                    if !matches!(toks[j as usize], Tok::Space(_)) {
+                        return Some(j as usize);
+                    }
+                    j += dir;
+                }
+                None
+            };
+            let first_word = toks.iter().find_map(|t| match t {
+                Tok::Word(w) => Some(w.to_ascii_uppercase()),
+                Tok::Space(_) => None,
+                _ => Some(String::new()),
+            });
+            if first_word.as_deref() == Some("CALL") {
+                return Ok(text.to_string());
+            }
+            let mut out: Vec<Tok> = Vec::new();
+            let mut i = 0;
+            while i < toks.len() {
+                let is_call = matches!(&toks[i], Tok::Word(w) if w.eq_ignore_ascii_case("QCMDEXC"))
+                    && significant(i, 1)
+                        .is_some_and(|j| matches!(&toks[j], Tok::Punct(p) if p == "("));
+                if !is_call {
+                    out.push(toks[i].clone());
+                    i += 1;
+                    continue;
+                }
+                // QSYS2.QCMDEXC: the qualifier goes with the call; another
+                // schema's QCMDEXC is not the service.
+                let dot =
+                    significant(i, -1).filter(|&j| matches!(&toks[j], Tok::Punct(p) if p == "."));
+                if let Some(d) = dot {
+                    let schema = significant(d, -1).and_then(|j| match &toks[j] {
+                        Tok::Word(w) => Some((j, w.to_ascii_uppercase())),
+                        _ => None,
+                    });
+                    match schema {
+                        Some((j, w)) if w == "QSYS2" => {
+                            let keep = out.len() - (i - j);
+                            out.truncate(keep);
+                        }
+                        _ => {
+                            out.push(toks[i].clone());
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+                let open = significant(i, 1).unwrap();
+                let mut depth = 0;
+                let mut close = None;
+                for (k, t) in toks.iter().enumerate().skip(open) {
+                    if let Tok::Punct(p) = t {
+                        if p == "(" {
+                            depth += 1;
+                        } else if p == ")" {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(k);
+                                break;
+                            }
+                        }
+                    }
+                }
+                let Some(close) = close else {
+                    bail!("SQL0104: QCMDEXC( has no closing parenthesis.");
+                };
+                let arg = render(&toks[open + 1..close]);
+                let arg = self.expand_qcmdexc(&arg).await?;
+                let cmd = self.value(&arg, None).await?.unwrap_or_default();
+                let ok = run_command(self.env, &cmd).await.is_ok();
+                out.push(Tok::Number(if ok { "1" } else { "-1" }.into()));
+                i = close + 1;
+            }
+            Ok(render(&out))
+        })
+    }
+
     /// An expression's value (cast to `ty` when given).
     async fn value(&self, expr: &str, ty: Option<&str>) -> Result<Option<String>> {
-        let e = expr.trim();
+        let expanded = self.expand_qcmdexc(expr).await?;
+        let e = expanded.trim();
         // A variable by itself, or NULL: no statement needed.
         if e.eq_ignore_ascii_case("NULL") {
             return Ok(None);
@@ -1511,7 +1602,7 @@ impl<'a, 'e> Run<'a, 'e> {
 
     /// A condition: true, or false/unknown.
     async fn truth(&self, cond: &str) -> Result<bool> {
-        let c = self.subst(cond)?;
+        let c = self.subst(&self.expand_qcmdexc(cond).await?)?;
         let (_, rows) = self
             .query(&format!(
                 "SELECT CASE WHEN ({c}) THEN 1 ELSE 0 END FROM SYSIBM.SYSDUMMY1"
@@ -2051,7 +2142,7 @@ impl<'a, 'e> Run<'a, 'e> {
             }
             "SELECT" | "VALUES" | "WITH" => {
                 if let Some((query, targets)) = split_into(text)? {
-                    let q = self.subst(&query)?;
+                    let q = self.subst(&self.expand_qcmdexc(&query).await?)?;
                     let (_, rows) = self.query(&q).await?;
                     if rows.len() > 1 {
                         bail!("SQL0811: The result of SELECT INTO has more than one row.");
@@ -2103,14 +2194,33 @@ impl<'a, 'e> Run<'a, 'e> {
         if self.depth >= MAX_DEPTH {
             bail!("SQL0901: Procedures call each other more than {MAX_DEPTH} levels deep.");
         }
-        let r = find(self.env.catalog, self.env.libl, name, "PROCEDURE")
-            .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "SQL0440: Procedure {name} with {} parameters not found.",
-                    args.len()
-                )
-            })?;
+        let found = find(self.env.catalog, self.env.libl, name, "PROCEDURE").await?;
+        if found.is_none() {
+            // An IBM i service that is a procedure (QSYS2.QCMDEXC,
+            // SYSTOOLS.LPRINTF...): its arguments with this routine's
+            // variables put in as values.
+            let mut lits = Vec::new();
+            for a in args {
+                let (kw, e) = match a.split_once("=>") {
+                    Some((k, e)) => (format!("{} => ", k.trim()), e),
+                    None => (String::new(), a.as_str()),
+                };
+                let v = self.value(e, None).await?;
+                lits.push(match v {
+                    Some(v) => format!("{kw}'{}'", v.replace('\'', "''")),
+                    None => format!("{kw}NULL"),
+                });
+            }
+            if let Some(r) = call_service(self.env, name, &lits).await {
+                return r.map(|_| ());
+            }
+        }
+        let r = found.ok_or_else(|| {
+            anyhow!(
+                "SQL0440: Procedure {name} with {} parameters not found.",
+                args.len()
+            )
+        })?;
         let mut values = Vec::new();
         for (p, a) in r.parms.iter().zip(args) {
             values.push(if p.mode == "OUT" {
@@ -2585,7 +2695,8 @@ async fn call_service(
 ) -> Option<Result<(Routine, CallResult)>> {
     let up = name.trim().to_ascii_uppercase().replace('/', ".");
     let base = match up.split_once('.') {
-        Some(("QSYS2", n)) => n.to_string(),
+        Some(("QSYS2", n)) if n != "LPRINTF" => n.to_string(),
+        Some(("SYSTOOLS", "LPRINTF")) => "LPRINTF".to_string(),
         Some(_) => return None,
         None => up,
     };
@@ -2598,9 +2709,36 @@ async fn call_service(
             "END_OF_LINE",
         ],
         "QCMDEXC" => &["COMMAND"],
+        // SYSTOOLS.LPRINTF (IBM i services): a line of text to the
+        // job log.
+        "LPRINTF" => &["FORMAT_STRING"],
         _ => return None,
     };
     Some(run_service(env, &base, params, args).await)
+}
+
+/// A CL command run for SQL (QCMDEXC) in a job like the SQL user's.
+async fn run_command(env: &Env<'_>, cmd: &str) -> Result<()> {
+    let environment = crate::commands::Environment {
+        database_url: env.database_url.to_string(),
+    };
+    let mut job = crate::commands::Job {
+        client: env.catalog,
+        env: &environment,
+        user: env.user.to_string(),
+        curlib: env.curlib.clone(),
+        libl: env
+            .libl
+            .iter()
+            .filter(|l| !crate::commands::SYSTEM_LIBRARY_LIST.contains(&l.as_str()))
+            .cloned()
+            .collect(),
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    Box::pin(job.run(cmd.trim())).await?;
+    Ok(())
 }
 
 async fn run_service(
@@ -2650,25 +2788,30 @@ async fn run_service(
     };
     if name == "QCMDEXC" {
         let cmd = get("COMMAND").ok_or_else(|| anyhow!("SQL0204: QCMDEXC needs a command."))?;
-        let environment = crate::commands::Environment {
-            database_url: env.database_url.to_string(),
+        run_command(env, &cmd).await?;
+    } else if name == "LPRINTF" {
+        // SYSTOOLS.LPRINTF: the text to the job log.
+        let text = get("FORMAT_STRING").unwrap_or_default();
+        let job = match env
+            .session
+            .exec(
+                env.catalog,
+                "SELECT current_setting('as4tainr.job', true) FROM SYSIBM.SYSDUMMY1",
+            )
+            .await?
+        {
+            Exec::Rows { rows, .. } => rows
+                .into_iter()
+                .next()
+                .and_then(|r| r.into_iter().next())
+                .flatten()
+                .unwrap_or_default(),
+            Exec::Count(..) => String::new(),
         };
-        let mut job = crate::commands::Job {
-            client: env.catalog,
-            env: &environment,
-            user: env.user.to_string(),
-            curlib: env.curlib.clone(),
-            libl: env
-                .libl
-                .iter()
-                .filter(|l| !crate::commands::SYSTEM_LIBRARY_LIST.contains(&l.as_str()))
-                .cloned()
-                .collect(),
-            display: None,
-            id: None,
-            calls: Default::default(),
-        };
-        Box::pin(job.run(cmd.trim())).await?;
+        match crate::jobs::JobId::parse(&job) {
+            Some(id) => crate::jobs::log(env.catalog, &id, "*INFO", text.trim_end()).await,
+            None => eprintln!("{}", text.trim_end()),
+        }
     } else {
         ifs_write(env, name, &get)?.await?;
     }

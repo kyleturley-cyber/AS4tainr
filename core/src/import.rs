@@ -250,7 +250,11 @@ fn read_rules(text: &str, out: &mut BTreeMap<String, (String, Vec<String>)>) {
         // A target's variable (`X.SRVPGM: private TEXT := ...`, as makei
         // reads them) is no rule: kept as `X.SRVPGM:TEXT`.
         if let Some((var, value)) = deps.split_once(":=") {
-            let var = var.split_whitespace().last().unwrap_or("").to_ascii_uppercase();
+            let var = var
+                .split_whitespace()
+                .last()
+                .unwrap_or("")
+                .to_ascii_uppercase();
             if !var.is_empty() {
                 out.insert(
                     format!("{}:{var}", target.trim().to_ascii_uppercase()),
@@ -274,10 +278,15 @@ fn read_rules(text: &str, out: &mut BTreeMap<String, (String, Vec<String>)>) {
         // or program's rule is kept, the module noted.
         let deps_list: Vec<String> = deps.split_whitespace().map(|d| d.to_string()).collect();
         if kind == "MODULE" {
-            out.insert(format!("{name}.MODULE"), ("MODULE".into(), deps_list.clone()));
+            out.insert(
+                format!("{name}.MODULE"),
+                ("MODULE".into(), deps_list.clone()),
+            );
         }
         if !matches!(kind.as_str(), "SRVPGM" | "PGM")
-            && out.get(&name).is_some_and(|r| r.0 == "SRVPGM" || r.0 == "PGM")
+            && out
+                .get(&name)
+                .is_some_and(|r| r.0 == "SRVPGM" || r.0 == "PGM")
         {
             continue;
         }
@@ -308,6 +317,53 @@ fn includes_relative_paths(path: &Path) -> bool {
         crate::rpg::parse::includes(&t)
             .iter()
             .any(|id| id.contains('/') && !id.starts_with('/') && !id.contains(','))
+    })
+}
+
+/// Every source file of a project (by its suffix), hidden folders left
+/// out: what a TOBi build finds in the IFS.
+fn project_sources(dir: &Path) -> Vec<std::path::PathBuf> {
+    const SUFFIXES: &[&str] = &[
+        "rpgle", "rpgleinc", "sqlrpgle", "rpg", "clle", "clleinc", "clp", "cmd", "sql", "dspf",
+        "prtf", "pf", "lf", "bnd", "bnddir", "cbl", "cblle", "sqlcblle", "c", "h", "rexx", "msgf",
+        "pnlgrp", "menu", "table", "view", "index", "sqlprc", "sqludf", "sqltrg", "sqlseq",
+        "srvpgm", "pgm", "module",
+    ];
+    let mut out = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            if p.is_dir() {
+                todo.push(p);
+            } else if name
+                .rsplit_once('.')
+                .is_some_and(|(_, x)| SUFFIXES.contains(&x.to_ascii_lowercase().as_str()))
+            {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A CL source with `INCLUDE SRCSTMF('a relative path')`.
+fn cl_includes_relative_paths(path: &Path) -> bool {
+    read_text(path).is_ok_and(|t| {
+        t.lines().any(|l| {
+            let u = l.trim_start().to_ascii_uppercase();
+            u.starts_with("INCLUDE ")
+                && u.split_once("SRCSTMF(")
+                    .is_some_and(|(_, r)| !r.trim_start().trim_start_matches('\'').starts_with('/'))
+        })
     })
 }
 
@@ -521,9 +577,13 @@ fn scan(dir: &Path) -> Result<Scan> {
             // Guide, "Search Path Within The IFS"), then a member.
             let sibling = if tobi && !id.contains(',') && !base.contains('.') {
                 m.path.parent().and_then(|d| {
-                    [base.clone(), format!("{base}.rpgleinc"), format!("{base}.rpgle")]
-                        .into_iter()
-                        .find(|n| dir_has(d, n))
+                    [
+                        base.clone(),
+                        format!("{base}.rpgleinc"),
+                        format!("{base}.rpgle"),
+                    ]
+                    .into_iter()
+                    .find(|n| dir_has(d, n))
                 })
             } else {
                 None
@@ -636,7 +696,12 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
     let ifs_root = format!("/{}", lib.to_ascii_lowercase());
     let incdir: String = tobi_include_path(dir)
         .iter()
-        .map(|d| format!(" '{ifs_root}/{}'", d.trim_start_matches("./").trim_end_matches('/')))
+        .map(|d| {
+            format!(
+                " '{ifs_root}/{}'",
+                d.trim_start_matches("./").trim_end_matches('/')
+            )
+        })
         .collect();
     let incdir = if incdir.is_empty() {
         String::new()
@@ -691,6 +756,14 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         files.iter().copied().collect::<Vec<_>>().join(", ")
     ));
 
+    // A TOBi project is built from the IFS: every source is there at its
+    // path in the project (includes name each other by relative paths).
+    if tobi {
+        for p in project_sources(dir) {
+            let path = format!("{ifs_root}/{}", rel_of(&p));
+            source::put_stream_file(job.client, &path, &read_text(&p)?).await?;
+        }
+    }
     // Include files go to the stream files, under /<library>/ (RPG
     // `/INCLUDE 'name.rpgleinc'` finds them by name).
     for (rel, path) in &includes {
@@ -924,7 +997,11 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
             match rules.get(&m.member) {
                 Some((kind, deps)) if kind == "SRVPGM" => deps
                     .iter()
-                    .filter_map(|d| d.to_ascii_uppercase().strip_suffix(".SRVPGM").map(String::from))
+                    .filter_map(|d| {
+                        d.to_ascii_uppercase()
+                            .strip_suffix(".SRVPGM")
+                            .map(String::from)
+                    })
                     .collect(),
                 _ => vec![],
             }
@@ -988,6 +1065,22 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         };
         step(job, &mut report, &m.member, &cmd).await;
     }
+    // A source named NAME.srvpgm.rpgle with no binder source of its name:
+    // a service program of its module exporting all its procedures.
+    for m in members.iter().filter(|m| {
+        m.objtype.as_deref() == Some("srvpgm")
+            && matches!(m.srctype.as_str(), "RPGLE" | "SQLRPGLE" | "CLLE")
+            && !members
+                .iter()
+                .any(|b| b.srctype == "BND" && b.member == m.member)
+            && !rules.contains_key(&m.member)
+    }) {
+        let cmd = format!(
+            "CRTSRVPGM SRVPGM({lib}/{0}) MODULE({lib}/{0}) EXPORT(*ALL)",
+            m.member
+        );
+        step(job, &mut report, &m.member, &cmd).await;
+    }
     // Programs bound from modules (TOBi `X.PGM: X.MODULE Y.SRVPGM`), with
     // the rule's TEXT and ACTGRP.
     for (name, (kind, deps)) in rules.iter() {
@@ -996,7 +1089,11 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         }
         let pick = |suffix: &str| -> Vec<String> {
             deps.iter()
-                .filter_map(|d| d.to_ascii_uppercase().strip_suffix(suffix).map(String::from))
+                .filter_map(|d| {
+                    d.to_ascii_uppercase()
+                        .strip_suffix(suffix)
+                        .map(String::from)
+                })
                 .map(|d| format!("{lib}/{d}"))
                 .collect()
         };
@@ -1084,7 +1181,13 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
             } else {
                 "PGM"
             };
-            let cmd = if matches!(t, "RPGLE" | "SQLRPGLE")
+            let cmd = if t == "CLLE" && (tobi || cl_includes_relative_paths(&m.path)) {
+                // From the IFS, where its INCLUDE SRCSTMF paths resolve
+                // from the source's directory.
+                let path = format!("{ifs_root}/{}", rel_of(&m.path));
+                source::put_stream_file(job.client, &path, &read_text(&m.path)?).await?;
+                format!("{command} {target}({lib}/{}) SRCSTMF('{path}')", m.member)
+            } else if matches!(t, "RPGLE" | "SQLRPGLE")
                 && (tobi || includes_relative_paths(&m.path))
             {
                 let path = format!("{ifs_root}/{}", rel_of(&m.path));
@@ -1327,10 +1430,12 @@ mod tests {
         );
         assert_eq!(
             r.get("REPL_PM"),
-            Some(&("SRVPGM".to_string(), vec!["REPL_PM.BND".to_string(), "REPL_PM.MODULE".to_string()]))
+            Some(&(
+                "SRVPGM".to_string(),
+                vec!["REPL_PM.BND".to_string(), "REPL_PM.MODULE".to_string()]
+            ))
         );
         assert_eq!(r.get("REPL_USR").map(|x| x.1.len()), Some(3));
         assert!(r.contains_key("REPL_PM.MODULE") && r.contains_key("REPL_USR.MODULE"));
     }
-
 }

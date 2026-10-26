@@ -1072,7 +1072,7 @@ async fn list_spooled_files(
 ) -> Result<()> {
     need(args, 6)?;
     let format = text(args, 1);
-    if format != "SPLF0100" {
+    if format != "SPLF0100" && format != "SPLF0300" {
         bail!("CPF3C21: Format name {format} is not valid.");
     }
     let user = match text(args, 2).as_str() {
@@ -1107,7 +1107,10 @@ async fn list_spooled_files(
     }
     let rows = client
         .query(
-            "SELECT id, job, user_name, outq, user_data FROM as4tainr.spooled_files
+            "SELECT id, job, user_name, outq, user_data, outq_lib, job_name, file, number,
+                    status, to_char(created, 'YYYY'), to_char(created, 'YYMMDD'),
+                    to_char(created, 'HH24MISS'), pages
+               FROM as4tainr.spooled_files
               WHERE ($1 = '*ALL' OR user_name = $1)
                 AND ($2 = '*ALL' OR outq = $2)
                 AND ($3 = '*ALL' OR user_data = $3)
@@ -1116,13 +1119,78 @@ async fn list_spooled_files(
             &[&user, &outq, &udata, &job],
         )
         .await?;
+    // SPLF0300 (List Spooled Files API, "SPLF0300 Format", 136 bytes):
+    // job name, user, number, file name and number, status (1 RDY, 2
+    // OPN, 3 CLO, 4 SAV, 5 WTR, 6 HLD, 7 MSGW, 8 PND, 9 PRT, 10 FIN, 11
+    // SND, 12 DFR), date (CYYMMDD) and time opened, schedule, system
+    // name, user data, form type, output queue and library, ASP, size
+    // and multiplier, total pages, copies left, priority, reserved,
+    // Internet print protocol job identifier.
+    if format == "SPLF0300" {
+        let system = crate::report::system_name();
+        let entries: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|r| {
+                let status: i32 = match r.get::<_, String>(9).as_str() {
+                    "RDY" => 1,
+                    "OPN" => 2,
+                    "CLO" => 3,
+                    "SAV" => 4,
+                    "WTR" => 5,
+                    "HLD" => 6,
+                    "MSGW" => 7,
+                    "PND" => 8,
+                    "PRT" => 9,
+                    "FIN" => 10,
+                    "SND" => 11,
+                    "DFR" => 12,
+                    _ => 1,
+                };
+                let year: i32 = r.get::<_, String>(10).parse().unwrap_or(2000);
+                let century = if year >= 2000 { "1" } else { "0" };
+                // job_name is the qualified job NUMBER/USER/NAME.
+                let qjob: String = r.get(6);
+                let mut parts = qjob.splitn(3, '/');
+                let _ = parts.next();
+                let juser = parts.next().unwrap_or("").to_string();
+                let jname = parts.next().unwrap_or("").to_string();
+                let mut en = field(&jname, 10);
+                en.extend(field(&juser, 10));
+                en.extend(field(&format!("{:06}", r.get::<_, i64>(1)), 6));
+                en.extend(field(&r.get::<_, String>(7), 10));
+                en.extend_from_slice(&r.get::<_, i32>(8).to_be_bytes());
+                en.extend_from_slice(&status.to_be_bytes());
+                en.extend(field(&format!("{century}{}", r.get::<_, String>(11)), 7));
+                en.extend(field(&r.get::<_, String>(12), 6));
+                en.extend(field("2", 1)); // schedule: *FILEEND
+                en.extend(field(&system, 10));
+                en.extend(field(&r.get::<_, String>(4), 10));
+                en.extend(field("*STD", 10));
+                en.extend(field(&r.get::<_, String>(3), 10));
+                en.extend(field(&r.get::<_, String>(5), 10));
+                en.extend_from_slice(&1i32.to_be_bytes()); // ASP
+                en.extend_from_slice(&4096i32.to_be_bytes()); // size
+                en.extend_from_slice(&1i32.to_be_bytes()); // multiplier
+                en.extend_from_slice(&r.get::<_, i32>(13).to_be_bytes());
+                en.extend_from_slice(&1i32.to_be_bytes()); // copies left
+                en.extend(field("5", 1)); // priority
+                en.extend(field("", 3));
+                en.extend_from_slice(&0i32.to_be_bytes());
+                en
+            })
+            .collect();
+        return list_spooled_write(
+            client, caller, args, &format, &user, &outq, &outqlib, &udata, entries, 136,
+        )
+        .await;
+    }
     let entries: Vec<Vec<u8>> = rows
         .iter()
         .map(|r| {
             let (ij, is) = crate::sysapi::internal_ids(r.get(1), r.get(0));
             let mut en = field(&r.get::<_, String>(2), 10);
             en.extend(field(&r.get::<_, String>(3), 10));
-            en.extend(field("QGPL", 10));
+            en.extend(field(&r.get::<_, String>(5), 10));
             en.extend(field("*STD", 10));
             en.extend(field(&r.get::<_, String>(4), 10));
             en.extend(ij);
@@ -1132,9 +1200,30 @@ async fn list_spooled_files(
             en
         })
         .collect();
+    list_spooled_write(
+        client, caller, args, &format, &user, &outq, &outqlib, &udata, entries, 88,
+    )
+    .await
+}
+
+/// QUSLSPL's list written to the user space: header (user, output
+/// queue, user space, job, dates) and the input parameter section.
+#[allow(clippy::too_many_arguments)]
+async fn list_spooled_write(
+    client: &Client,
+    caller: &Caller,
+    args: &mut dyn ApiArgs,
+    format: &str,
+    user: &str,
+    outq: &str,
+    outqlib: &str,
+    udata: &str,
+    entries: Vec<Vec<u8>>,
+    size: usize,
+) -> Result<()> {
     let (spc, spclib) = qualified(&args.bytes(0));
-    let mut header = field(&user, 10);
-    header.extend(field(&outq, 10));
+    let mut header = field(user, 10);
+    header.extend(field(outq, 10));
     header.extend(field(if outq == "*ALL" { "" } else { "QGPL" }, 10));
     header.extend(field(&spc, 10));
     header.extend(field(&spclib, 10));
@@ -1147,22 +1236,22 @@ async fn list_spooled_files(
     header.extend(field("", 8 + 7 + 6 + 7 + 6));
     let mut input = args.bytes(0);
     input.resize(20, 0x40);
-    input.extend(field(&format, 8));
-    input.extend(field(&user, 10));
-    input.extend(field(&outq, 10));
-    input.extend(field(&outqlib, 10));
+    input.extend(field(format, 8));
+    input.extend(field(user, 10));
+    input.extend(field(outq, 10));
+    input.extend(field(outqlib, 10));
     input.extend(field(&text(args, 4), 10));
-    input.extend(field(&udata, 10));
+    input.extend(field(udata, 10));
     write_list(
         client,
         caller,
         &args.bytes(0),
         "QUSLSPL",
-        &format,
+        format,
         &input,
         &header,
         &entries,
-        88,
+        size,
     )
     .await
 }

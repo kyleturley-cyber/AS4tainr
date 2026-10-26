@@ -126,6 +126,19 @@ Scott Lennon's examples of free-form RPG, CL, SQL and display files (github.com/
 
 What still fails and why (each would need something as4tainr does not have, or fails on IBM i too): service programs and programs whose binding directories the README has the user make by hand (CRTBNDDIR/ADDBNDDIRE are not in the repository); programs over the IBM sample file QIWS/QCUSTCDT; SQL functions over RPG procedures (LANGUAGE RPGLE external functions); DEMO_CL2 and DEMO_CL3, which read DSPFD's outfile through the model file QAFDMBRL; scripts for ACS Run SQL Scripts (a SELECT, which RUNSQLSTM refuses) or naming the author's library LENNONS1; DROP TABLE before the table exists (SQL0204, as on IBM i the first time).
 
+### IBMi-topics (MarcoDeSenas)
+
+Marco De Senas' IBM i tools written on PUB400 (github.com/MarcoDeSenas/IBMi-topics-thanks-to-pub400, GPL-3.0: cloned at test time only), laid out with an `iproj.json` and TOBi-style names (`envsav.pgm.clle`, `usrspc.srvpgm.rpgle`, `usp0101.msgid.sql`). On Oct 26, 2026 the import creates every object but two, and its SPLFDLT command runs end to end in a batch job (tools/legacy.sh): a validity checker that makes sure the command analyzer called it (QWVRCSTK through a service program, _MATPGMNM, a data area in QTEMP), user space commands with RTNVAL parameters, QUSLSPL SPLF0300 into a user space, DLTSPLF of each file, completion and escape messages from its own message file.
+
+What it found and as4tainr now does:
+
+- Import: every source of a TOBi project goes to the IFS at its path (include files named `.rpgle` and `.clle` too), CL programs whose INCLUDE SRCSTMF names a relative path are compiled from there (the path is completed with the source's directory, the IFS root is not case-sensitive), a `NAME.srvpgm.rpgle` without binder source becomes a service program exporting all (its installation notes: "Create RPG Module then Create Service Program with EXPORT(*ALL)");
+- Commands: the CMD statement's VLDCKR, ALLOW, MAXPOS and TEXT, PARM RTNVAL(*YES), the validity checker called by QSYS/QCATRS; CL: DCLPRCOPT (DFTACTGRP, ACTGRP, BNDSRVPGM, BNDDIR) binds the program, CALLPRC '_MATPGMNM', CL programs on the call stack, RCVMSG RMV(*YES) takes a message out of the job log lines; CPYTOARCF and CPYFRMARCF are IBM i commands to the CL compiler's check;
+- SQL: QSYS2.QCMDEXC as a scalar function in SQL procedures (its message scripts add each message description with ADDMSGD and fall back to CHGMSGD when that returns -1), SYSTOOLS.LPRINTF, QSYS2.ENVIRONMENT_VARIABLE_INFO (ENV_VARS, also as an RPG EXTNAME);
+- RPG: a subfield of a qualified data structure LIKE a standalone field that is itself LIKE another; a NOMAIN module's PSDS (*PROC: the module) set when CL calls into it; QWVRCSTK leaves the information status blank when the receiver is only the header; display files: relative positions (+n).
+
+What still fails: CMDGRP's script starts with `set schema = ?` (a parameter marker, for ACS's Run SQL Scripts; RUNSQLSTM cannot run it on IBM i either) and uses a system-period temporal table (GENERATED ALWAYS AS ROW BEGIN/END, PERIOD SYSTEM_TIME, ADD VERSIONING), which as4tainr does not have yet; so JOBLOGLST, which declares that file, is not created.
+
 ## Legacy applications, installed their own way
 
 `tools/legacy.sh` installs real IBM i applications the way their READMEs say, on an empty database, and reports what works. The repositories are cloned at test time and never added to as4tainr.

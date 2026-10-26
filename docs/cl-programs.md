@@ -47,7 +47,7 @@ The system's message files (QCPFMSG, QRNXMSG, QSQLMSG) have no descriptions here
 - `RCVMSG PGMQ(*EXT)`, `SENDER` (blank); inquiry messages and replies.
 - `CHGVAR` of a whole `DCLF` record (`RCDFMT` buffers), `OVRDSPF`, message subfiles.
 - Display commands (DSPLIB, WRKOBJ, ...) inside a CL program.
-- Pointers passed to programs and procedures, RTNVAL of commands made with CRTCMD.
+- Pointers passed to programs and procedures.
 - CRTBNDCL from a source physical file member (only from a file, with `as4tainr crtbndcl`).
 
 See [fidelity-gaps.md](fidelity-gaps.md).

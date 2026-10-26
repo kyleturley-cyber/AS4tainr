@@ -251,7 +251,7 @@ impl<'a> Machine<'a> {
     /// What the PSDS holds from the start of a call (ILE RPG Reference,
     /// "Program Status Data Structure"): *PROC, *PARMS, the program's
     /// library, the job, the dates, the program and module, the user.
-    pub(super) fn psds_start(&mut self) {
+    pub(crate) fn psds_start(&mut self) {
         let Some(ds) = self.prog.psds.clone() else {
             return;
         };

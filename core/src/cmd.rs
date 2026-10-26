@@ -68,6 +68,13 @@ pub struct Definition {
     /// REXCMDENV).
     #[serde(default)]
     pub rexx: Option<(String, String, String)>,
+    /// Where the command may run (ALLOW); empty = *ALL.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// CRTCMD parameters given on the CMD statement (VLDCKR, MAXPOS,
+    /// TEXT, ALLOW), applied over CRTCMD's.
+    #[serde(skip)]
+    pub statement: BTreeMap<String, String>,
 }
 
 /// The ELEM or QUAL statements under one label.
@@ -109,6 +116,10 @@ pub struct Parm {
     pub prompt: String,
     /// PMTCTL(*PMTRQS): shown when F9 asks for all parameters.
     pub pmtrqs: bool,
+    /// RTNVAL(*YES): the command processing program returns a value in
+    /// the CL variable given for this parameter.
+    #[serde(default)]
+    pub rtnval: bool,
 }
 
 impl Parm {
@@ -274,7 +285,22 @@ fn raw_items(raw: &str) -> Result<Vec<Item>> {
 }
 
 /// One text value of a definition keyword (quotes removed).
-fn raw_text(raw: &str) -> Result<String> {
+/// The values of a list as written (quotes removed).
+pub(crate) fn raw_items_text(raw: &str) -> Vec<String> {
+    fn flat(i: &Item, out: &mut Vec<String>) {
+        match i {
+            Item::Atom { text, .. } => out.push(text.clone()),
+            Item::List(v) => v.iter().for_each(|x| flat(x, out)),
+        }
+    }
+    let mut out = Vec::new();
+    for i in raw_items(raw).unwrap_or_default() {
+        flat(&i, &mut out);
+    }
+    out
+}
+
+pub(crate) fn raw_text(raw: &str) -> Result<String> {
     Ok(raw_items(raw)?
         .first()
         .map(|i| match i {
@@ -411,6 +437,7 @@ fn parse_parm(st: &crate::clpgm::Statement, order: &[&str]) -> Result<Parm> {
         dec,
         constant,
         rstd: yes("RSTD"),
+        rtnval: yes("RTNVAL"),
         dft: get("DFT").map(|d| d.trim().to_string()),
         values: raw_items(get("VALUES").unwrap_or(""))?
             .iter()
@@ -577,8 +604,26 @@ pub fn compile(library: &str, name: &str, pgm: &str, source: &str) -> Result<Def
                         "HLPID",
                         "TEXT",
                         "MAXPOS",
+                        "ALLOW",
+                        "MODE",
+                        "ALWLMTUSR",
+                        "THDSAFE",
+                        "MLTTHDACN",
+                        "VLDCKR",
+                        "PMTOVRPGM",
+                        "HLPSCHIDX",
+                        "CURLIB",
+                        "PRDLIB",
+                        "AUT",
                     ],
                 )?;
+                // CRTCMD values given on the CMD statement override those
+                // of the command (CL reference, "Command Definition (CMD)").
+                for k in ["VLDCKR", "MAXPOS", "TEXT", "ALLOW"] {
+                    if let Some(v) = p.get(k) {
+                        d.statement.insert(k.to_string(), v.trim().to_string());
+                    }
+                }
                 d.prompt = p
                     .get("PROMPT")
                     .map(|x| raw_text(x))
@@ -807,6 +852,32 @@ pub fn bind<'a>(d: &'a Definition, line: &str) -> Result<Vec<Bound<'a>>> {
         .iter()
         .enumerate()
         .map(|(i, p)| (p, vals.remove(&i)))
+        .collect())
+}
+
+/// The CL variables that RTNVAL(*YES) parameters name, by parameter
+/// (in the order the command processing program gets them), for the
+/// statement as written in a CL program (`&VAR` not substituted). CL
+/// reference, PARM RTNVAL: the value must be a CL variable, which the
+/// command processing program changes.
+pub fn rtnval_targets(d: &Definition, line: &str) -> Result<Vec<Option<String>>> {
+    if !d.parms.iter().any(|p| p.rtnval) {
+        return Ok(vec![]);
+    }
+    Ok(bind(d, line)?
+        .into_iter()
+        .map(|(p, v)| match (p.rtnval, v.as_deref()) {
+            (
+                true,
+                Some(
+                    [Item::Atom {
+                        text,
+                        quoted: false,
+                    }],
+                ),
+            ) if text.starts_with('&') => Some(text.to_ascii_uppercase()),
+            _ => None,
+        })
         .collect())
 }
 
@@ -1528,6 +1599,34 @@ pub fn prompt_def(d: &Definition) -> &'static crate::cl::CommandDef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // CL reference, "Command Definition (CMD)": the CMD statement takes
+    // CRTCMD's ALLOW, VLDCKR, MAXPOS, TEXT... (kept for CRTCMD to apply);
+    // PARM RTNVAL(*YES) marks a parameter whose CL variable gets a value
+    // back.
+    #[test]
+    fn cmd_statement_keywords_and_rtnval() {
+        let d = compile(
+            "L",
+            "C",
+            "*LIBL/P",
+            "CMD PROMPT('x') ALLOW(*BPGM *IPGM *BREXX) VLDCKR(CHK) MODE(*ALL) THDSAFE(*NO)
+PARM KWD(A) TYPE(*CHAR) LEN(3)
+PARM KWD(B) TYPE(*CHAR) LEN(5) RTNVAL(*YES)
+",
+        )
+        .unwrap();
+        assert_eq!(d.statement.get("VLDCKR").map(String::as_str), Some("CHK"));
+        assert_eq!(
+            d.statement.get("ALLOW").map(String::as_str),
+            Some("*BPGM *IPGM *BREXX")
+        );
+        assert!(!d.parms[0].rtnval && d.parms[1].rtnval);
+        assert_eq!(
+            rtnval_targets(&d, "C A(x) B(&OUT)").unwrap(),
+            [None, Some("&OUT".to_string())]
+        );
+    }
 
     // CL Programming, "Data passed to the command processing program":
     // a qualified name is its parts, object first; a simple list is a

@@ -4011,17 +4011,16 @@ pub const CPF0006: &str = "CPF0006: The command has errors and was not run.";
 /// The IBM i object types (IBM documentation, "External object types"):
 /// what an OBJTYPE parameter takes besides special values.
 pub const OBJECT_TYPES: &[&str] = &[
-    "*ALRTBL", "*AUTL", "*BNDDIR", "*CFGL", "*CHTFMT", "*CLD", "*CLS", "*CMD", "*CNNL",
-    "*COSD", "*CRG", "*CRQD", "*CSI", "*CSPMAP", "*CSPTBL", "*CTLD", "*DEVD", "*DOC",
-    "*DTAARA", "*DTADCT", "*DTAQ", "*EDTD", "*EXITRG", "*FCT", "*FILE", "*FLR", "*FNTRSC",
-    "*FNTTBL", "*FORMDF", "*FTR", "*GSS", "*IGCDCT", "*IGCSRT", "*IGCTBL", "*IMGCLG", "*IPXD",
-    "*JOBD", "*JOBQ", "*JOBSCD", "*JRN", "*JRNRCV", "*LIB", "*LIND", "*LOCALE", "*M36",
-    "*M36CFG", "*MEDDFN", "*MENU", "*MGTCOL", "*MODD", "*MODULE", "*MSGF", "*MSGQ",
-    "*NODGRP", "*NODL", "*NTBD", "*NWID", "*NWSCFG", "*NWSD", "*OUTQ", "*OVL", "*PAGDFN",
-    "*PAGSEG", "*PDFMAP", "*PDG", "*PGM", "*PNLGRP", "*PRDAVL", "*PRDDFN", "*PRDLOD",
-    "*PSFCFG", "*QMFORM", "*QMQRY", "*QRYDFN", "*RCT", "*S36", "*SBSD", "*SCHIDX", "*SPADCT",
-    "*SQLPKG", "*SQLUDT", "*SQLXSR", "*SRVPGM", "*SSND", "*SVRSTG", "*TBL", "*TIMZON",
-    "*USRIDX", "*USRPRF", "*USRQ", "*USRSPC", "*VLDL", "*WSCST",
+    "*ALRTBL", "*AUTL", "*BNDDIR", "*CFGL", "*CHTFMT", "*CLD", "*CLS", "*CMD", "*CNNL", "*COSD",
+    "*CRG", "*CRQD", "*CSI", "*CSPMAP", "*CSPTBL", "*CTLD", "*DEVD", "*DOC", "*DTAARA", "*DTADCT",
+    "*DTAQ", "*EDTD", "*EXITRG", "*FCT", "*FILE", "*FLR", "*FNTRSC", "*FNTTBL", "*FORMDF", "*FTR",
+    "*GSS", "*IGCDCT", "*IGCSRT", "*IGCTBL", "*IMGCLG", "*IPXD", "*JOBD", "*JOBQ", "*JOBSCD",
+    "*JRN", "*JRNRCV", "*LIB", "*LIND", "*LOCALE", "*M36", "*M36CFG", "*MEDDFN", "*MENU",
+    "*MGTCOL", "*MODD", "*MODULE", "*MSGF", "*MSGQ", "*NODGRP", "*NODL", "*NTBD", "*NWID",
+    "*NWSCFG", "*NWSD", "*OUTQ", "*OVL", "*PAGDFN", "*PAGSEG", "*PDFMAP", "*PDG", "*PGM",
+    "*PNLGRP", "*PRDAVL", "*PRDDFN", "*PRDLOD", "*PSFCFG", "*QMFORM", "*QMQRY", "*QRYDFN", "*RCT",
+    "*S36", "*SBSD", "*SCHIDX", "*SPADCT", "*SQLPKG", "*SQLUDT", "*SQLXSR", "*SRVPGM", "*SSND",
+    "*SVRSTG", "*TBL", "*TIMZON", "*USRIDX", "*USRPRF", "*USRQ", "*USRSPC", "*VLDL", "*WSCST",
 ];
 
 /// A value the command analyzer does not take: diagnostic CPD0084, then

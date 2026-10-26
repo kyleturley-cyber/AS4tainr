@@ -229,8 +229,9 @@ pub fn analyze(source: &str, known: &dyn Fn(&str) -> bool, file_vars: &FileVars)
                     }
                 }
             }
-            n if STATEMENTS.contains(&n) || crate::cl::CL_PROGRAM_ONLY.contains(&n) || known(&name) => {
-            }
+            n if STATEMENTS.contains(&n)
+                || crate::cl::CL_PROGRAM_ONLY.contains(&n)
+                || known(&name) => {}
             // A qualified command is looked for in its library.
             _ => a.diags.push(Diag {
                 line: *line,
@@ -659,8 +660,12 @@ mod tests {
     fn qualified_command_is_looked_for_in_its_library() {
         let src = "PGM\nAPPLIB/MYCMD\nOTHER/MYCMD\nENDPGM\n";
         let a = analyze(src, &|c| c == "APPLIB/MYCMD", &|_| vec![]);
-        let d: Vec<&str> = a.diags.iter().filter(|d| d.id == "CPD0030").map(|d| d.text.as_str()).collect();
+        let d: Vec<&str> = a
+            .diags
+            .iter()
+            .filter(|d| d.id == "CPD0030")
+            .map(|d| d.text.as_str())
+            .collect();
         assert_eq!(d, ["Command MYCMD was not found in library OTHER."]);
     }
-
 }

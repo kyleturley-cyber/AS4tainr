@@ -473,7 +473,9 @@ impl Machine<'_> {
                 Some(o) => {
                     let to = o.tofile.clone().unwrap_or_else(|| name.clone());
                     let (lib, file) = match to.split_once('/') {
-                        Some((l, f)) if l != "*LIBL" => (Some(crate::qtemp::real(l)), f.to_string()),
+                        Some((l, f)) if l != "*LIBL" => {
+                            (Some(crate::qtemp::real(l)), f.to_string())
+                        }
                         Some((_, f)) => (None, f.to_string()),
                         None => (None, to.clone()),
                     };

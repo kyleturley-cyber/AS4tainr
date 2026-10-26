@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 24";
+const VERSION: &str = "as4tainr services 25";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -1198,6 +1198,118 @@ END $as4tainr$;
 GRANT EXECUTE ON FUNCTION as4tainr_svc.try_jsonb(text) TO PUBLIC;
 "#;
 
+/// The record format of a QSYS2 view an RPG program names as an
+/// externally described file or data structure (EXTNAME(QSYS2/ENV_VARS)):
+/// its system column names and types.
+pub fn view_record(name: &str) -> Option<crate::dds::PhysicalFile> {
+    use crate::dds::{DataType, FieldDef, PhysicalFile};
+    let field = |n: &str, alias: &str, t: DataType, len: u32, varlen: bool, null: bool| FieldDef {
+        name: n.to_string(),
+        data_type: t,
+        length: len,
+        decimals: 0,
+        text: String::new(),
+        varlen,
+        null_capable: null,
+        default: None,
+        alias: Some(alias.to_string()),
+        identity: None,
+        double: false,
+        generated: None,
+    };
+    let fields = match name.to_ascii_uppercase().as_str() {
+        "ENV_VARS" | "ENVIRONMENT_VARIABLE_INFO" => vec![
+            field(
+                "VAR_TYPE",
+                "ENVIRONMENT_VARIABLE_TYPE",
+                DataType::Char,
+                6,
+                true,
+                false,
+            ),
+            field(
+                "VAR_NAME",
+                "ENVIRONMENT_VARIABLE_NAME",
+                DataType::Graphic,
+                128,
+                true,
+                false,
+            ),
+            field(
+                "VAR_VALUE",
+                "ENVIRONMENT_VARIABLE_VALUE",
+                DataType::Graphic,
+                1024,
+                true,
+                true,
+            ),
+            field(
+                "VAR_BNAME",
+                "ENVIRONMENT_VARIABLE_BINARY_NAME",
+                DataType::Hex,
+                128,
+                true,
+                false,
+            ),
+            field(
+                "VAR_BVALUE",
+                "ENVIRONMENT_VARIABLE_BINARY_VALUE",
+                DataType::Hex,
+                1024,
+                true,
+                true,
+            ),
+            field(
+                "VAR_CCSID",
+                "ENVIRONMENT_VARIABLE_CCSID",
+                DataType::Binary,
+                9,
+                false,
+                false,
+            ),
+        ],
+        _ => return None,
+    };
+    Some(PhysicalFile {
+        name: "ENV_VARS".into(),
+        format: "ENV_VARS".into(),
+        text: String::new(),
+        unique: false,
+        fields,
+        keys: vec![],
+        descending: vec![],
+        view: None,
+        source: None,
+    })
+}
+
+/// QSYS2.ENVIRONMENT_VARIABLE_INFO (IBM i services: ENVIRONMENT_VARIABLE_INFO
+/// view, system name ENV_VARS): the job's environment variables (JOB),
+/// then the system-level ones (SYSTEM). Columns and their system names
+/// from that page; the binary forms are the UTF-8 bytes here.
+const ENV_VARS: &str = r#"
+CREATE OR REPLACE VIEW qsys2.environment_variable_info AS
+SELECT CAST(t AS varchar(6)) COLLATE "C" AS environment_variable_type,
+       CAST(name AS varchar(128)) COLLATE "C" AS environment_variable_name,
+       CAST(value AS varchar(1024)) COLLATE "C" AS environment_variable_value,
+       convert_to(name, 'UTF8') AS environment_variable_binary_name,
+       convert_to(value, 'UTF8') AS environment_variable_binary_value,
+       CAST(CASE WHEN ccsid = 0 THEN 65535 ELSE ccsid END AS integer) AS environment_variable_ccsid
+FROM (SELECT 'JOB' AS t, 1 AS o, name, value, ccsid FROM as4tainr.job_environment_variables
+      WHERE job = current_setting('as4tainr.job_key', true)
+      UNION ALL
+      SELECT 'SYSTEM', 2, name, value, ccsid FROM as4tainr.environment_variables) v
+ORDER BY o, name;
+CREATE OR REPLACE VIEW qsys2.env_vars AS
+SELECT environment_variable_type AS var_type,
+       environment_variable_name AS var_name,
+       environment_variable_value AS var_value,
+       environment_variable_binary_name AS var_bname,
+       environment_variable_binary_value AS var_bvalue,
+       environment_variable_ccsid AS var_ccsid
+FROM qsys2.environment_variable_info;
+"#;
+
 /// The services added with this version: definitions and grants.
 fn work_services() -> String {
     format!(
@@ -1211,8 +1323,10 @@ fn work_services() -> String {
          {ROUTINE_VIEWS}
          {}
          {IFS_READ}
+         {ENV_VARS}
          GRANT SELECT ON qsys2.library_list_info, qsys2.user_info, qsys2.system_value_info,
-               qsys2.sysroutines, qsys2.sysparms TO {SQL_ROLE};",
+               qsys2.sysroutines, qsys2.sysparms, qsys2.environment_variable_info,
+               qsys2.env_vars TO {SQL_ROLE};",
         library_list_info(),
         user_info(),
         system_value_info(),

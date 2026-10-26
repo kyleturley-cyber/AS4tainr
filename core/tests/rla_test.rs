@@ -10447,6 +10447,21 @@ dcl-ds splf based(e) qualified;
   ijob char(16) pos(51);
   ispl char(16) pos(67);
 end-ds;
+dcl-ds s3 based(e) qualified;
+  jname char(10);
+  juser char(10);
+  jnbr char(6);
+  file char(10);
+  nbr int(10);
+  status int(10);
+  date char(7);
+  time char(6);
+  sched char(1);
+  sys char(10);
+  udata char(10);
+  form char(10);
+  outq char(10);
+end-ds;
 dcl-s err char(16) inz(x'00000010');
 dcl-s i int(10);
 QUSROBJD(objd : %size(objd) : 'OBJD0200' : 'QAPISRC   *LIBL' : '*FILE');
@@ -10472,6 +10487,13 @@ e = p + hdr.listoff;
 QUSRSPLA(spla : %size(spla) : 'SPLA0100' : '*INT' : splf.ijob : splf.ispl : '*INT' : -1);
 dsply (%trim(spla.file) + ' ' + %char(spla.nbr) + ' ' + %trim(spla.udata) + ' '
        + %trim(spla.status) + ' ' + %char(spla.pages));
+QUSLSPL('APISPC    {lib}' : 'SPLF0300' : '*CURRENT' : '*ALL' : '*ALL' : '*ALL' : err
+        : 'APITEST   QSECOFR   {nbr:06}');
+e = p + hdr.listoff;
+dsply ('splf0300 ' + %char(hdr.count) + ' ' + %char(hdr.entsize) + ' ' + %trim(s3.jname)
+       + ' ' + %trim(s3.juser) + ' ' + s3.jnbr + ' ' + %trim(s3.file) + ' ' + %char(s3.nbr)
+       + ' ' + %char(s3.status) + ' ' + %subst(s3.date:1:1) + ' ' + %trim(s3.udata)
+       + ' ' + %trim(s3.form));
 *inlr = *on;
 ",
         nbr = job.number
@@ -10489,6 +10511,12 @@ dsply (%trim(spla.file) + ' ' + %char(spla.nbr) + ' ' + %trim(spla.udata) + ' '
             "SRCDTA AB 13 80 0 0",
             "spooled 1 88",
             "QSYSPRT 1 MYDATA *READY 1",
+            // SPLF0300 (List Spooled Files API): 136-byte entries; status
+            // 1 is RDY; the date opened is CYYMMDD, century 1 for 20xx.
+            &format!(
+                "splf0300 1 136 APITEST QSECOFR {:06} QSYSPRT 1 1 1 MYDATA *STD",
+                job.number
+            ),
         ]
     );
 }
@@ -14203,7 +14231,9 @@ async fn call_back_into_running_bound_module_shares_globals() {
         id: None,
         calls: Default::default(),
     };
-    source::create_file(&client, &lib, "QRPGLESRC", "").await.unwrap();
+    source::create_file(&client, &lib, "QRPGLESRC", "")
+        .await
+        .unwrap();
     let put = |name: &str, text: &str| source::Member {
         library: lib.clone(),
         file: "QRPGLESRC".into(),
@@ -14249,7 +14279,11 @@ dcl-proc report export;
   setMode(9);
 end-proc;
 ";
-    for m in [put("CBMAIN3", main), put("FIRSTMOD", first), put("SECONDMOD", second)] {
+    for m in [
+        put("CBMAIN3", main),
+        put("FIRSTMOD", first),
+        put("SECONDMOD", second),
+    ] {
         source::put_member(&client, &m, false).await.unwrap();
     }
     for c in [
@@ -14572,9 +14606,11 @@ async fn compiled_program_follows_changed_file() {
         id: None,
         calls: Default::default(),
     };
-    job.run(&format!("RUNSQL SQL('create table {lib}.cachef (a char(5))') COMMIT(*NONE)"))
-        .await
-        .unwrap();
+    job.run(&format!(
+        "RUNSQL SQL('create table {lib}.cachef (a char(5))') COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
     let src = format!(
         "**free\ndcl-ds r extname('{lib}/CACHEF') end-ds;\ndsply %char(%size(r));\n*inlr = *on;\n"
     );
@@ -14598,9 +14634,11 @@ async fn compiled_program_follows_changed_file() {
     assert_eq!(r.messages, ["5"]);
     let r = run().await;
     assert_eq!(r.messages, ["5"]);
-    job.run(&format!("RUNSQL SQL('drop table {lib}.cachef') COMMIT(*NONE)"))
-        .await
-        .unwrap();
+    job.run(&format!(
+        "RUNSQL SQL('drop table {lib}.cachef') COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
     job.run(&format!(
         "RUNSQL SQL('create table {lib}.cachef (a char(5), b char(3))') COMMIT(*NONE)"
     ))
@@ -14742,7 +14780,6 @@ async fn embedded_sql_comments_are_not_rpg_literals() {
     assert!(text.contains("DSPLY") || text.contains("Dsply"), "{text}");
 }
 
-
 /// EVAL-CORR (ILE RPG Reference, EVAL-CORR): subfields of the same name
 /// are assigned (character to varying character, packed to zoned); a
 /// nested data structure subfield by subfield; arrays as many elements as
@@ -14847,22 +14884,24 @@ async fn sql_audit_columns_rename_alias_and_system_column_names() {
                 .await
                 .unwrap_or_else(|e| panic!("{sql}: {e:#}"))
             {
-                as4tainr_core::sql::Outcome::Rows { rows, .. } => rows
-                    .into_iter()
-                    .map(|r| r.join("|"))
-                    .collect::<Vec<_>>(),
+                as4tainr_core::sql::Outcome::Rows { rows, .. } => {
+                    rows.into_iter().map(|r| r.join("|")).collect::<Vec<_>>()
+                }
                 other => panic!("unexpected {other:?}"),
             }
         }
     };
     assert_eq!(
-        rows(format!("select itemnm, op, changed is not null from {lib}.audited_items")).await,
+        rows(format!(
+            "select itemnm, op, changed is not null from {lib}.audited_items"
+        ))
+        .await,
         ["PEN|I|TRUE"]
     );
     as4tainr_core::sql::run(
         &client,
         &url,
-        &[lib.clone()],
+        std::slice::from_ref(&lib),
         &format!("update {lib}.audt set item_name = 'INK'"),
     )
     .await
@@ -14884,27 +14923,32 @@ async fn sql_audit_columns_rename_alias_and_system_column_names() {
         as4tainr_core::sql::run(
             &client,
             &url,
-            &[lib.clone()],
+            std::slice::from_ref(&lib),
             &format!("insert into {lib}.genal (srcseq, srcdta) values (0, '{line}')"),
         )
         .await
         .unwrap();
     }
-    let m = as4tainr_core::source::find_member(&client, &[lib.clone()], "SRC", "GEN")
+    let m = as4tainr_core::source::find_member(&client, std::slice::from_ref(&lib), "SRC", "GEN")
         .await
         .unwrap();
     assert_eq!(m.source, "       dcl-s a int(10);\n       a = 1;");
     assert_eq!(
-        rows(format!("select srcseq, trim(srcdta) from {lib}.genal order by srcseq")).await,
+        rows(format!(
+            "select srcseq, trim(srcdta) from {lib}.genal order by srcseq"
+        ))
+        .await,
         ["1.00|dcl-s a int(10);", "2.00|a = 1;"]
     );
-    job.run(&format!("RUNSQL SQL('drop alias {lib}.genal') COMMIT(*NONE)"))
-        .await
-        .unwrap();
+    job.run(&format!(
+        "RUNSQL SQL('drop alias {lib}.genal') COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
     assert!(as4tainr_core::sql::run(
         &client,
         &url,
-        &[lib.clone()],
+        std::slice::from_ref(&lib),
         &format!("select * from {lib}.genal")
     )
     .await
@@ -14994,7 +15038,10 @@ end-proc;
     .unwrap_or_else(|e| panic!("{e:#}"));
     let r = job.run(&format!("CALL PGM({lib}/SQLOVR)")).await.unwrap();
     let text = format!("{r:?}");
-    assert!(text.contains("n=1") && text.contains("first note"), "{text}");
+    assert!(
+        text.contains("n=1") && text.contains("first note"),
+        "{text}"
+    );
 }
 
 /// SYSTOOLS.SPOOLED_FILE_DATA (Db2 for i services): the lines of a job's
@@ -15028,7 +15075,10 @@ async fn spooled_file_data_gives_the_lines() {
     let q = format!(
         "select ordinal_position, trim(spooled_data) from table(systools.spooled_file_data(job_name => '{job:06}/QSECOFR/SPLJOB', spooled_file_name => 'REPORT')) x"
     );
-    match as4tainr_core::sql::run(&client, &url, &[lib.clone()], &q).await.unwrap() {
+    match as4tainr_core::sql::run(&client, &url, std::slice::from_ref(&lib), &q)
+        .await
+        .unwrap()
+    {
         as4tainr_core::sql::Outcome::Rows { rows, .. } => assert_eq!(
             rows.into_iter().map(|r| r.join("|")).collect::<Vec<_>>(),
             ["1|first line", "2|second line"]
@@ -15036,7 +15086,10 @@ async fn spooled_file_data_gives_the_lines() {
         other => panic!("{other:?}"),
     }
     client
-        .execute("DELETE FROM as4tainr.spooled_files WHERE job = $1 AND job_name = 'SPLJOB'", &[&job])
+        .execute(
+            "DELETE FROM as4tainr.spooled_files WHERE job = $1 AND job_name = 'SPLJOB'",
+            &[&job],
+        )
         .await
         .unwrap();
 }
@@ -15080,12 +15133,19 @@ async fn declared_temporary_table_and_default_user() {
         .await
         .unwrap();
     assert!(
-        !lines.iter().any(|l| l.contains("SQL0") || l.contains("SQL1")),
+        !lines
+            .iter()
+            .any(|l| l.contains("SQL0") || l.contains("SQL1")),
         "{lines:?}"
     );
-    match as4tainr_core::sql::run(&client, &url, &[lib.clone()], &format!("select n, who from {lib}.dgtout"))
-        .await
-        .unwrap()
+    match as4tainr_core::sql::run(
+        &client,
+        &url,
+        std::slice::from_ref(&lib),
+        &format!("select n, who from {lib}.dgtout"),
+    )
+    .await
+    .unwrap()
     {
         as4tainr_core::sql::Outcome::Rows { rows, .. } => {
             assert_eq!(rows, [["5".to_string(), "QSECOFR   ".to_string()]])
@@ -15129,7 +15189,9 @@ async fn strings_compare_with_numbers_and_alter_table_alterations() {
         .await
         .unwrap();
     assert!(
-        !lines.iter().any(|l| l.contains("SQL0") || l.contains("SQL1")),
+        !lines
+            .iter()
+            .any(|l| l.contains("SQL0") || l.contains("SQL1")),
         "{lines:?}"
     );
     let rows = |sql: String| {
@@ -15141,10 +15203,9 @@ async fn strings_compare_with_numbers_and_alter_table_alterations() {
                 .await
                 .unwrap_or_else(|e| panic!("{sql}: {e:#}"))
             {
-                as4tainr_core::sql::Outcome::Rows { rows, .. } => rows
-                    .into_iter()
-                    .map(|r| r.join("|"))
-                    .collect::<Vec<_>>(),
+                as4tainr_core::sql::Outcome::Rows { rows, .. } => {
+                    rows.into_iter().map(|r| r.join("|")).collect::<Vec<_>>()
+                }
                 other => panic!("unexpected {other:?}"),
             }
         }
@@ -15157,12 +15218,391 @@ async fn strings_compare_with_numbers_and_alter_table_alterations() {
         ["10|Y|QSECOFR", "2|Y|QSECOFR"]
     );
     assert_eq!(
-        rows(format!("select '5' + 1, 2 * '3', 10 > '9', 10 > 9 from {lib}.cstm where id = 1")).await,
+        rows(format!(
+            "select '5' + 1, 2 * '3', 10 > '9', 10 > 9 from {lib}.cstm where id = 1"
+        ))
+        .await,
         ["6|6|TRUE|TRUE"]
     );
     // The library list the statement sees is the libraries only.
     assert_eq!(
         rows("select schema_name from qsys2.library_list_info".into()).await,
-        [lib.clone()]
+        std::slice::from_ref(&lib)
     );
+}
+
+/// A job running commands as QSECOFR with the library first.
+async fn run_in(client: &Client, url: &str, lib: &str, line: &str) -> anyhow::Result<Vec<String>> {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let env = Environment {
+        database_url: url.to_string(),
+    };
+    let mut job = Job {
+        client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.to_string()),
+        libl: vec![lib.to_string(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    match job.run(line).await? {
+        Outcome::Messages(m) => Ok(m),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// Commands as the IBMi-topics corpus (MarcoDeSenas, GPL-3.0) builds
+/// them. CL reference, "Command Definition (CMD)": VLDCKR, ALLOW and the
+/// other CRTCMD values on the CMD statement override CRTCMD's. PARM
+/// RTNVAL(*YES): the command processing program returns a value in the
+/// CL variable given. INCLUDE SRCSTMF: a relative path is completed with
+/// the source's directory. DCLPRCOPT DFTACTGRP(*NO) ACTGRP BNDSRVPGM:
+/// an ILE CL program bound to a service program it calls with CALLPRC.
+/// MI MATPGMNM: the bound program's library at offset 18 and name at 50.
+/// QWVRCSTK: the most recent entry first; a receiver too small for the
+/// entries leaves the information status blank. The validity checker's
+/// caller is the command analyzer QSYS/QCATRS (the corpus' validity
+/// checkers, written on PUB400, look for it one entry up).
+#[tokio::test]
+async fn command_statement_validity_checker_and_rtnval() {
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let dir = format!("/t/{}", lib.to_ascii_lowercase());
+    let put = |path: String, text: &'static str| {
+        let client = &client;
+        async move { source::put_stream_file(client, &path, text).await.unwrap() }
+    };
+    put(
+        format!("{dir}/common/includes/inc_decl.clle"),
+        "DCL VAR(&DATA) TYPE(*CHAR) LEN(80)\nDCL VAR(&STK) TYPE(*CHAR) LEN(40)\n",
+    )
+    .await;
+    // The service program: the program names on the call stack, most
+    // recent first, its own left out; and the information status after
+    // a call with a receiver only as long as the header.
+    put(
+        format!("{dir}/tools/stack.rpgle"),
+        "**free
+ctl-opt nomain;
+dcl-proc Callers export;
+  dcl-pi *n;
+    res char(40);
+  end-pi;
+  dcl-pr getStack extpgm('QWVRCSTK');
+    rcv char(65535) options(*varsize);
+    len int(10) const;
+    fmt char(8) const;
+    jid char(56) const;
+    jfmt char(8) const;
+    err char(16);
+  end-pr;
+  dcl-ds hdr qualified;
+    rtn int(10);
+    avl int(10);
+    ent int(10);
+    off int(10);
+    nret int(10);
+    thread char(8);
+    status char(1);
+  end-ds;
+  dcl-s buf char(4096);
+  dcl-s jid char(56);
+  dcl-s err char(16);
+  dcl-s i int(10);
+  dcl-s p pointer;
+  dcl-ds e qualified based(p);
+    len int(10) pos(1);
+    pgm char(10) pos(25);
+  end-ds;
+  %subst(jid:1:10) = '*';
+  %subst(jid:27:16) = *allx'00';
+  getStack(hdr:%size(hdr):'CSTK0100':jid:'JIDF0100':err);
+  res = 'S' + hdr.status + '|';
+  getStack(buf:%size(buf):'CSTK0100':jid:'JIDF0100':err);
+  hdr = buf;
+  p = %addr(buf) + hdr.off;
+  for i = 1 to hdr.nret;
+    if e.pgm <> 'STACK';
+      res = %trimr(res) + %trimr(e.pgm) + '/';
+    endif;
+    p += e.len;
+  endfor;
+end-proc;
+",
+    )
+    .await;
+    put(
+        format!("{dir}/tools/chk.clle"),
+        "PGM PARM(&IN &OUT)
+DCLPRCOPT DFTACTGRP(*NO) ACTGRP(TOPICS) BNDSRVPGM((STACK))
+DCL VAR(&IN) TYPE(*CHAR) LEN(10)
+DCL VAR(&OUT) TYPE(*CHAR) LEN(10)
+INCLUDE SRCSTMF('../Common/Includes/inc_decl.clle')
+CHGVAR VAR(%BIN(&DATA 1 4)) VALUE(80)
+CALLPRC PRC('_MATPGMNM') PARM((&DATA))
+SNDPGMMSG MSG('PGM' *BCAT %SST(&DATA 51 10) *TCAT '/' *CAT %SST(&DATA 19 10)) TOPGMQ(*EXT)
+CALLPRC PRC('CALLERS') PARM(&STK)
+SNDPGMMSG MSG(&STK) TOPGMQ(*EXT)
+ENDPGM
+",
+    )
+    .await;
+    put(
+        format!("{dir}/tools/cpp.clle"),
+        "PGM PARM(&IN &OUT)
+DCL VAR(&IN) TYPE(*CHAR) LEN(10)
+DCL VAR(&OUT) TYPE(*CHAR) LEN(10)
+CHGVAR VAR(&OUT) VALUE('got' *BCAT &IN)
+ENDPGM
+",
+    )
+    .await;
+    put(
+        format!("{dir}/tools/caller.clle"),
+        "PGM
+DCL VAR(&R) TYPE(*CHAR) LEN(10) VALUE('unchanged')
+TCMD IN(abc) OUT(&R)
+SNDPGMMSG MSG('R=' *CAT &R) TOPGMQ(*EXT)
+ENDPGM
+",
+    )
+    .await;
+    source::create_file(&client, &lib, "QCMDSRC", "")
+        .await
+        .unwrap();
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QCMDSRC".into(),
+            name: "TCMD".into(),
+            srctype: "CMD".into(),
+            source: "CMD PROMPT('Test') VLDCKR(CHK) ALLOW(*BPGM *IPGM) TEXT(*CMDPMT)
+PARM KWD(IN) TYPE(*CHAR) LEN(10) MIN(1)
+PARM KWD(OUT) TYPE(*CHAR) LEN(10) RTNVAL(*YES) MIN(1)
+"
+            .into(),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/STACK) SRCSTMF('{dir}/tools/stack.rpgle')"),
+        format!("CRTSRVPGM SRVPGM({lib}/STACK) MODULE({lib}/STACK) EXPORT(*ALL)"),
+        format!("CRTBNDCL PGM({lib}/CHK) SRCSTMF('{dir}/tools/chk.clle')"),
+        format!("CRTBNDCL PGM({lib}/CPP) SRCSTMF('{dir}/tools/cpp.clle')"),
+        format!("CRTCMD CMD({lib}/TCMD) PGM({lib}/CPP) SRCFILE({lib}/QCMDSRC) VLDCKR(*NONE)"),
+        format!("CRTBNDCL PGM({lib}/CALLER) SRCSTMF('{dir}/tools/caller.clle')"),
+    ] {
+        run_in(&client, &url, &lib, &c)
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e:#}"));
+    }
+    let def = as4tainr_core::cmd::find(&client, std::slice::from_ref(&lib), "TCMD")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(def.vldckr.as_deref(), Some("*LIBL/CHK"));
+    assert_eq!(def.allow, ["*BPGM", "*IPGM"]);
+    assert_eq!(def.text, "Test");
+    let m = run_in(&client, &url, &lib, &format!("CALL {lib}/CALLER"))
+        .await
+        .unwrap();
+    assert_eq!(
+        m,
+        [
+            format!("PGM CHK/{lib}"),
+            "S |CHK/QCATRS/CALLER/".to_string(),
+            // An unquoted value is in capitals.
+            "R=got ABC".to_string(),
+        ],
+        "{m:?}"
+    );
+}
+
+/// IBM i services the IBMi-topics corpus uses. QSYS2.QCMDEXC as a scalar
+/// function (rpgpgm.com, "QCMDEXC scalar function added to SQL", on the
+/// IBM i 7.4 TR4 service): 1 when the command ran, -1 when it failed.
+/// SYSTOOLS.LPRINTF: a procedure writing a line to the job log.
+/// QSYS2.ENVIRONMENT_VARIABLE_INFO (system name ENV_VARS; columns
+/// ENVIRONMENT_VARIABLE_TYPE VAR_TYPE, _NAME VAR_NAME, _VALUE VAR_VALUE,
+/// _CCSID VAR_CCSID...): the job's variables and the system's; an RPG
+/// data structure EXTNAME('QSYS2/ENV_VARS') has the system column names.
+#[tokio::test]
+async fn qcmdexc_function_lprintf_and_environment_variables_view() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let script = format!(
+        "create table {lib}.res (n int, rc int);
+         begin
+           declare cmd char(100);
+           declare issue int;
+           set cmd = 'CRTDTAARA DTAARA({lib}/TOPICS) TYPE(*CHAR) LEN(5)';
+           select qsys2.qcmdexc(cmd) into issue from sysibm.sysdummy1;
+           insert into {lib}.res values (1, issue);
+           select qsys2.qcmdexc(cmd) into issue from sysibm.sysdummy1;
+           insert into {lib}.res values (2, issue);
+           if qsys2.qcmdexc('CHGDTAARA DTAARA({lib}/TOPICS) VALUE(''abc'')') = 1 then
+             insert into {lib}.res values (3, 1);
+           end if;
+           call systools.lprintf('line for the job log');
+         end;"
+    );
+    let lines = job
+        .run_sql_script(&script, "test", 0, Some(lib.clone()), true)
+        .await
+        .unwrap();
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("SQL0") || l.contains("SQL1")),
+        "{lines:?}"
+    );
+    let rows = |sql: String| {
+        let client = &client;
+        let url = url.clone();
+        let lib = lib.clone();
+        async move {
+            match as4tainr_core::sql::run(client, &url, &[lib], &sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+            {
+                as4tainr_core::sql::Outcome::Rows { rows, .. } => {
+                    rows.into_iter().map(|r| r.join("|")).collect::<Vec<_>>()
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    };
+    // The second CRTDTAARA fails: the data area exists (CPF1023).
+    assert_eq!(
+        rows(format!("select n, rc from {lib}.res order by n")).await,
+        ["1|1", "2|-1", "3|1"]
+    );
+    let v: String = client
+        .query_one(
+            "SELECT value FROM as4tainr.data_areas WHERE library = $1 AND name = 'TOPICS'",
+            &[&lib],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(v.trim_end(), "abc");
+
+    // A job variable and a system variable.
+    let jv = format!("TOPICS_{lib}");
+    run_in(
+        &client,
+        &url,
+        &lib,
+        &format!("ADDENVVAR ENVVAR({jv}) VALUE('job value')"),
+    )
+    .await
+    .unwrap();
+    run_in(
+        &client,
+        &url,
+        &lib,
+        &format!("ADDENVVAR ENVVAR({jv}) VALUE('sys value') LEVEL(*SYS)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows(format!(
+            "select environment_variable_type, environment_variable_value
+               from qsys2.environment_variable_info
+              where environment_variable_name = '{jv}'"
+        ))
+        .await,
+        ["JOB|job value", "SYSTEM|sys value"]
+    );
+    assert_eq!(
+        rows(format!("select var_type, var_value from qsys2.env_vars where var_name = '{jv}' and var_type = 'SYSTEM'"))
+            .await,
+        ["SYSTEM|sys value"]
+    );
+    run_in(
+        &client,
+        &url,
+        &lib,
+        &format!("RMVENVVAR ENVVAR({jv}) LEVEL(*SYS)"),
+    )
+    .await
+    .unwrap();
+    run_in(&client, &url, &lib, &format!("RMVENVVAR ENVVAR({jv})"))
+        .await
+        .unwrap();
+    assert!(rows(format!(
+        "select 1 from qsys2.environment_variable_info where environment_variable_name = '{jv}'"
+    ))
+    .await
+    .is_empty());
+    // EXTNAME of the view: its system column names.
+    let src = "**free
+dcl-ds ev extname('QSYS2/ENV_VARS') qualified end-ds;
+ev.var_type = 'JOB';
+dsply %trim(ev.var_type);
+dsply %char(%size(ev.var_ccsid));
+*inlr = *on;
+";
+    as4tainr_core::source::put_stream_file(&client, &format!("/t/{lib}/ev.rpgle"), src)
+        .await
+        .unwrap();
+    run_in(
+        &client,
+        &url,
+        &lib,
+        &format!("CRTBNDRPG PGM({lib}/EV) SRCSTMF('/t/{lib}/ev.rpgle')"),
+    )
+    .await
+    .unwrap();
+    let m = run_in(&client, &url, &lib, &format!("CALL {lib}/EV"))
+        .await
+        .unwrap();
+    assert_eq!(m, ["DSPLY  JOB", "DSPLY  4"], "{m:?}");
+}
+
+/// ILE RPG Reference, QUALIFIED and LIKE: a qualified data structure's
+/// subfields are known only qualified, so a subfield LIKE(JobUser) names
+/// the standalone field JobUser even when it is itself declared LIKE
+/// another field (the IBMi-topics corpus' QWc_JIDF0100: JobUser
+/// like(JobUser), the global JobUser like(UserProfile)).
+#[tokio::test]
+async fn rpg_like_names_a_field_outside_the_qualified_ds() {
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = "**free
+dcl-s UserProfile char(10);
+dcl-s JobUser like(UserProfile);
+dcl-ds jidf qualified;
+  JobUser like(JobUser);
+  Rest char(2);
+end-ds;
+jidf.JobUser = 'ABCDEFGHIJKL';
+dsply jidf.JobUser;
+dsply %char(%size(jidf));
+*inlr = *on;
+";
+    let r = run_rpg(&url, &lib, "QSECOFR", "LIKEQ", src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["ABCDEFGHIJ", "12"]);
 }

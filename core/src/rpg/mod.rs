@@ -60,7 +60,11 @@ impl IncludePath {
         let names: Vec<String> = if base.contains('.') {
             vec![id.to_string()]
         } else {
-            vec![id.to_string(), format!("{id}.rpgleinc"), format!("{id}.rpgle")]
+            vec![
+                id.to_string(),
+                format!("{id}.rpgleinc"),
+                format!("{id}.rpgle"),
+            ]
         };
         let mut out = Vec::new();
         if id.starts_with('/') {
@@ -119,7 +123,9 @@ fn take_incpath(options: &str) -> (String, Option<IncludePath>) {
             path.dirs.push(v);
         } else if c == '*' {
             let w: String = std::iter::once(c)
-                .chain(std::iter::from_fn(|| chars.next_if(|c| c.is_ascii_alphanumeric())))
+                .chain(std::iter::from_fn(|| {
+                    chars.next_if(|c| c.is_ascii_alphanumeric())
+                }))
                 .collect();
             path.ifs_first = w.eq_ignore_ascii_case("*IFS");
         }
@@ -249,7 +255,11 @@ pub async fn load_includes(
         }
         if let Some(f) = find_include(client, libl, &id, p.as_ref()).await {
             let inner = nested_path(p.as_ref(), &f);
-            todo.extend(parse::includes(f.text()).into_iter().map(|i| (i, inner.clone())));
+            todo.extend(
+                parse::includes(f.text())
+                    .into_iter()
+                    .map(|i| (i, inner.clone())),
+            );
             out.insert(id, f.text().to_string());
         }
     }
@@ -397,7 +407,10 @@ pub async fn compile_ovr(
             .iter()
             .any(|id| id.starts_with('/') || id.contains('.') && !id.contains(','));
     let stamp = compile_stamp(client, uses_ifs).await;
-    let key = format!("{name}\u{1}{options}\u{1}{}\u{1}{ovr:?}\u{1}{source}", libl.join(","));
+    let key = format!(
+        "{name}\u{1}{options}\u{1}{}\u{1}{ovr:?}\u{1}{source}",
+        libl.join(",")
+    );
     if let Some(stamp) = &stamp {
         let cache = COMPILED.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((s, p)) = cache.get(&key) {
@@ -472,7 +485,10 @@ pub async fn compile_parts(
     // AS4TAINR_DUMP_SOURCE=dir: each source compiled is written there
     // (NAME.rpgle), to look at code programs generate and compile.
     if let Some(dir) = std::env::var_os("AS4TAINR_DUMP_SOURCE") {
-        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{name}.rpgle")), source);
+        let _ = std::fs::write(
+            std::path::Path::new(&dir).join(format!("{name}.rpgle")),
+            source,
+        );
     }
     let (options, incpath) = take_incpath(options);
     let includes = load_includes(client, libl, source, incpath.as_ref()).await;
@@ -890,6 +906,11 @@ pub async fn call_procedure(
         );
         if let Some(s) = crate::ile::activation(&job_key, &group, &unit) {
             m.set_storage(s);
+        } else {
+            // A module activated now: its INZ(*USER) and its PSDS, as for
+            // a bound call from RPG.
+            m.user_inz()?;
+            m.psds_start();
         }
         let globals = prog.globals.len();
         let (back, ret) = m.call_exported(&sym, args)?;

@@ -277,7 +277,10 @@ pub fn from_error(e: &anyhow::Error, id: &str) -> QMsg {
     let s = format!("{e:#}");
     // An RPG escape message (RNX) of an error written as its inquiry
     // message (RNQ) of the same number.
-    let alt = id.strip_prefix("RNX").map(|n| format!("RNQ{n}")).unwrap_or_else(|| id.to_string());
+    let alt = id
+        .strip_prefix("RNX")
+        .map(|n| format!("RNQ{n}"))
+        .unwrap_or_else(|| id.to_string());
     let line = s
         .lines()
         .find(|l| l.starts_with(id) || l.starts_with(&alt))
@@ -536,6 +539,66 @@ pub fn stack_push(
         })
     });
     id
+}
+
+/// Call stack entries kept for listing only (QWVRCSTK): CL programs and
+/// the command analyzer under a validity checker. Their messages go
+/// through the CL call stack (`Job.calls`), so the message functions
+/// above do not see them.
+static LISTED: std::sync::Mutex<Option<HashMap<String, Vec<Entry>>>> = std::sync::Mutex::new(None);
+
+/// A CL program (or QCATRS) starts: an entry for listings.
+pub fn listed_push(job: &str, (lib, pgm): (&str, &str), actgrp: &str) -> u64 {
+    let id = ENTRY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut g = LISTED.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(HashMap::new)
+        .entry(job.to_string())
+        .or_default()
+        .push(Entry {
+            id,
+            lib: lib.to_string(),
+            line: 0,
+            pgm: pgm.to_string(),
+            module: if lib == "QSYS" {
+                String::new()
+            } else {
+                pgm.to_string()
+            },
+            proc: if lib == "QSYS" {
+                String::new()
+            } else {
+                pgm.to_string()
+            },
+            actgrp: actgrp.to_string(),
+            queue: Vec::new(),
+        });
+    id
+}
+
+/// It ended.
+pub fn listed_pop(job: &str, id: u64) {
+    let mut g = LISTED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = g.as_mut().and_then(|m| m.get_mut(job)) {
+        if let Some(i) = s.iter().position(|e| e.id == id) {
+            s.truncate(i);
+        }
+    }
+}
+
+/// Every entry, innermost last: the procedures' and the listed ones in
+/// the order they started.
+pub fn stack_listed(job: &str) -> Vec<Entry> {
+    let mut all = stack(job);
+    if let Some(l) = LISTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(job))
+    {
+        all.extend(l.iter().cloned());
+    }
+    all.sort_by_key(|e| e.id);
+    all
 }
 
 /// A procedure ended: its entry (and any above it) and their queues go.

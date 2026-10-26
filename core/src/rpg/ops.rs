@@ -452,7 +452,9 @@ impl Machine<'_> {
         // The expression of a subfield of a data structure expression.
         let sub = |e: &Expr, d: &crate::rpg::program::DsInfo, name: &str| -> Expr {
             match e {
-                Expr::Name { parts, args } if !d.qualified && args.is_none() && parts.len() == 1 => {
+                Expr::Name { parts, args }
+                    if !d.qualified && args.is_none() && parts.len() == 1 =>
+                {
                     Expr::name(name)
                 }
                 Expr::Name { parts, args } => {
@@ -463,9 +465,16 @@ impl Machine<'_> {
                         idx[parts.len() - 1] = Some(Box::new(a.clone()));
                     }
                     if args.is_some() {
-                        Expr::Path { parts: p, idx, args: None }
+                        Expr::Path {
+                            parts: p,
+                            idx,
+                            args: None,
+                        }
                     } else {
-                        Expr::Name { parts: p, args: None }
+                        Expr::Name {
+                            parts: p,
+                            args: None,
+                        }
                     }
                 }
                 Expr::Path { parts, idx, args } => {
@@ -478,7 +487,11 @@ impl Machine<'_> {
                         }
                     }
                     i.push(None);
-                    Expr::Path { parts: p, idx: i, args: None }
+                    Expr::Path {
+                        parts: p,
+                        idx: i,
+                        args: None,
+                    }
                 }
                 other => other.clone(),
             }

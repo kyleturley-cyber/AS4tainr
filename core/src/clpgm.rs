@@ -1158,6 +1158,44 @@ enum Ins {
     RtnSubr(Option<Expr>),
 }
 
+/// MI built-ins a CL program may call with CALLPRC, done here.
+pub const MI_BUILTINS: &[&str] = &["_MATPGMNM"];
+
+/// DCLPRCOPT's values in a CL source (keyword → value as written).
+pub fn dclprcopt(source: &str) -> HashMap<String, String> {
+    let Ok(lines) = logical_lines(source) else {
+        return HashMap::new();
+    };
+    for (line, text) in lines {
+        if let Ok(st) = parse_statement(line, &text) {
+            if st.name == "DCLPRCOPT" {
+                return named(
+                    &st,
+                    &[
+                        "LOG",
+                        "ALWRTVSRC",
+                        "USRPRF",
+                        "AUT",
+                        "SRTSEQ",
+                        "LANGID",
+                        "TEXT",
+                        "DFTACTGRP",
+                        "ACTGRP",
+                        "STGMDL",
+                        "BNDSRVPGM",
+                        "BNDDIR",
+                        "SUBRSTACK",
+                        "DCLBNDDIR",
+                        "OPTIMIZE",
+                    ],
+                )
+                .unwrap_or_default();
+            }
+        }
+    }
+    HashMap::new()
+}
+
 #[derive(Debug, Clone)]
 pub struct Program {
     pub name: String,
@@ -1188,7 +1226,11 @@ impl Program {
                 if st.name == "CALLPRC" {
                     if let Ok(p) = named(st, &["PRC", "PARM", "RTNVAL"]) {
                         if let Some(prc) = p.get("PRC") {
-                            out.push(prc.trim().trim_matches('\'').to_ascii_uppercase());
+                            let prc = prc.trim().trim_matches('\'').to_ascii_uppercase();
+                            // MI built-ins are not imports.
+                            if !MI_BUILTINS.contains(&prc.as_str()) {
+                                out.push(prc);
+                            }
                         }
                     }
                 }
@@ -2553,7 +2595,16 @@ fn substitute_text(text: &str, vars: &HashMap<String, Var>) -> Result<String> {
 pub async fn run(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Result<Outcome> {
     // The program's own message queue, for as long as it runs.
     job.calls.enter();
+    // Its call stack entry (QWVRCSTK lists it).
+    let (lib, name) = pgm
+        .object
+        .split_once('/')
+        .map(|(l, n)| (l.to_string(), n.to_string()))
+        .unwrap_or_else(|| (String::new(), pgm.name.clone()));
+    let job_key = job.job_key();
+    let entry = crate::pgmmsg::listed_push(&job_key, (&lib, &name), &pgm.actgrp);
     let r = run_program(job, pgm, args).await;
+    crate::pgmmsg::listed_pop(&job_key, entry);
     job.calls.leave();
     if let Ok((_, values)) = &r {
         job.calls.returned = Some(values.clone());
@@ -2762,6 +2813,59 @@ fn param_values(pgm: &Program, vars: &HashMap<String, Var>) -> Vec<String> {
 }
 
 /// A parameter's value as the caller gets it back.
+/// Variables passed by reference get the values the called program left
+/// in them (a character parameter shorter than the variable changes only
+/// its first characters).
+fn write_back(
+    vars: &mut HashMap<String, Var>,
+    targets: &[Option<String>],
+    values: Vec<String>,
+) -> Result<()> {
+    for (t, v) in targets.iter().zip(values) {
+        let Some(name) = t else { continue };
+        let Some(var) = vars.get_mut(name) else {
+            continue;
+        };
+        let new = match var.ty {
+            VarType::Char => {
+                let old: Vec<char> = var.value.as_char()?.chars().collect();
+                let mut cs: Vec<char> = v.chars().collect();
+                if cs.len() < old.len() {
+                    cs.extend(&old[cs.len()..]);
+                }
+                Value::Char(cs.into_iter().collect())
+            }
+            VarType::Lgl => Value::Lgl(v.starts_with('1')),
+            VarType::Ptr => continue,
+            _ => match Decimal::from_str(v.trim()) {
+                Ok(d) => Value::Dec(d),
+                Err(_) => continue,
+            },
+        };
+        assign(name, var, new)?;
+    }
+    Ok(())
+}
+
+/// A statement as written: name and parameters (variables not
+/// substituted).
+fn statement_text(st: &Statement) -> String {
+    let mut out = st.name.clone();
+    for p in &st.params {
+        out.push(' ');
+        match &p.keyword {
+            Some(k) => {
+                out.push_str(k);
+                out.push('(');
+                out.push_str(&p.value);
+                out.push(')');
+            }
+            None => out.push_str(&p.value),
+        }
+    }
+    out
+}
+
 fn returned_text(v: &Var) -> String {
     match &v.value {
         Value::Dec(d) => dec_text(d),
@@ -3837,6 +3941,19 @@ async fn command(
             };
             let m = got.clone().unwrap_or_default();
             let found = got.is_some();
+            // A message removed from the program's queue leaves the job
+            // log too (the program's messages so far are what the job
+            // log shows of it).
+            if found && rmv != "*NO" && msgq == "*PGMQ" {
+                let full = if m.msgid.is_empty() {
+                    m.text.clone()
+                } else {
+                    format!("{}: {}", m.msgid, m.text)
+                };
+                if let Some(i) = msgs.iter().rposition(|x| *x == full || *x == m.text) {
+                    msgs.remove(i);
+                }
+            }
             let n = |x: usize| Value::Dec(Decimal::from(x as u64));
             let c = |s: &str| Value::Char(s.to_string());
             for (k, target) in &p {
@@ -4464,6 +4581,60 @@ async fn command(
                 .trim()
                 .trim_matches('\'')
                 .to_ascii_uppercase();
+            if prc == "_MATPGMNM" {
+                // The MI built-in Materialize Program Name: the bound
+                // program's library and name (MI instructions, MATPGMNM:
+                // bytes provided, bytes available, format 0, reserved;
+                // the context at offset 16 and the program at 48, each a
+                // type and subtype byte then a 30-character name). Types
+                // x'04' (context) and x'02' (program), subtype x'01'.
+                let arg = p
+                    .get("PARM")
+                    .map(|parm| split_params(parm))
+                    .transpose()?
+                    .and_then(|v| v.into_iter().next())
+                    .map(|t| {
+                        t.value
+                            .trim()
+                            .trim_start_matches('(')
+                            .trim_end_matches(')')
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .to_ascii_uppercase()
+                    })
+                    .unwrap_or_default();
+                let var = vars
+                    .get_mut(&arg)
+                    .ok_or_else(|| anyhow!("CPD0727: Variable {arg} is not declared."))?;
+                let mut b = to_bytes(var)?;
+                if b.len() < 16 {
+                    bail!("MCH3601: _MATPGMNM needs a receiver of at least 16 bytes.");
+                }
+                let provided = i32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+                if provided < 16 {
+                    bail!("MCH3803: _MATPGMNM: bytes provided {provided} is less than 16.");
+                }
+                let (lib, name) = pgm
+                    .object
+                    .split_once('/')
+                    .map(|(l, n)| (l.to_string(), n.to_string()))
+                    .unwrap_or_else(|| (String::new(), pgm.name.clone()));
+                let mut full = [0u8; 80];
+                full[4..8].copy_from_slice(&80i32.to_be_bytes());
+                full[16] = 0x04;
+                full[17] = 0x01;
+                let lib = crate::qtemp::logical(&lib);
+                full[18..48].copy_from_slice(&crate::rpg::data::e(&format!("{lib:<30}"))[..30]);
+                full[48] = 0x02;
+                full[49] = 0x01;
+                full[50..80].copy_from_slice(&crate::rpg::data::e(&format!("{name:<30}"))[..30]);
+                let end = (provided as usize).min(80).min(b.len());
+                b[4..end.max(4)].copy_from_slice(&full[4..end.max(4)]);
+                let v = from_bytes(var, &b)?;
+                var.value = v;
+                return Ok(None);
+            }
             let binding = pgm.binding.clone().ok_or_else(|| {
                 anyhow!("CPD5D02: Procedure {prc} is not bound to program {} (create it with CRTCLMOD and CRTPGM).", pgm.name)
             })?;
@@ -4585,29 +4756,7 @@ async fn command(
             // parameter shorter than the variable changes only its first
             // characters).
             if let Some(values) = job.calls.returned.take() {
-                for (t, v) in targets.iter().zip(values) {
-                    let Some(name) = t else { continue };
-                    let Some(var) = vars.get_mut(name) else {
-                        continue;
-                    };
-                    let new = match var.ty {
-                        VarType::Char => {
-                            let old: Vec<char> = var.value.as_char()?.chars().collect();
-                            let mut cs: Vec<char> = v.chars().collect();
-                            if cs.len() < old.len() {
-                                cs.extend(&old[cs.len()..]);
-                            }
-                            Value::Char(cs.into_iter().collect())
-                        }
-                        VarType::Lgl => Value::Lgl(v.starts_with('1')),
-                        VarType::Ptr => continue,
-                        _ => match Decimal::from_str(v.trim()) {
-                            Ok(d) => Value::Dec(d),
-                            Err(_) => continue,
-                        },
-                    };
-                    assign(name, var, new)?;
-                }
+                write_back(vars, &targets, values)?;
             }
             match o {
                 Outcome::Messages(m) => msgs.extend(m),
@@ -4620,11 +4769,24 @@ async fn command(
             let line = substitute(st, vars)?;
             job.calls.message_data = None;
             let queued_before: Vec<u32> = job.calls.current_queue().iter().map(|m| m.key).collect();
-            match job
+            // A command made with CRTCMD whose RTNVAL(*YES) parameters
+            // name CL variables: they get the values its processing
+            // program left in them.
+            let rtnval = match job.user_command(&line).await? {
+                Some(d) => crate::cmd::rtnval_targets(&d, &statement_text(st))?,
+                None => vec![],
+            };
+            job.calls.returned = None;
+            let outcome = job
                 .run_boxed(&line)
                 .await
-                .map_err(|e| analyzer_in_program(e, &st.name))?
-            {
+                .map_err(|e| analyzer_in_program(e, &st.name))?;
+            if rtnval.iter().any(Option::is_some) {
+                if let Some(values) = job.calls.returned.take() {
+                    write_back(vars, &rtnval, values)?;
+                }
+            }
+            match outcome {
                 Outcome::Messages(m) => {
                     // The command's messages go on the program's queue
                     // (completion messages, for RCVMSG); the last one
@@ -4725,6 +4887,18 @@ mod cvtdat_tests {
 
 #[cfg(test)]
 mod tests {
+    // CL reference, DCLPRCOPT: the program's create options in the
+    // source (DFTACTGRP, ACTGRP, BNDSRVPGM, BNDDIR...).
+    #[test]
+    fn dclprcopt_values() {
+        let o = super::dclprcopt(
+            "PGM\nDCLPRCOPT DFTACTGRP(*NO) ACTGRP(USRSPC) BNDSRVPGM((CALLSTACK))\nENDPGM\n",
+        );
+        assert_eq!(o.get("DFTACTGRP").map(String::as_str), Some("*NO"));
+        assert_eq!(o.get("ACTGRP").map(String::as_str), Some("USRSPC"));
+        assert_eq!(o.get("BNDSRVPGM").map(String::as_str), Some("(CALLSTACK)"));
+    }
+
     // CL reference: a qualified name's object part can be a special
     // value (`OBJ(LIB/*ALL)`, RSTOBJ SELECT `*ALL/*ALL`); `/*` after a
     // blank starts a comment.

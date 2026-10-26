@@ -16,7 +16,7 @@ QO:          QUAL       TYPE(*NAME) LEN(10) DFT(X)
              QUAL       TYPE(*NAME) LEN(10) DFT(*LIBL) SPCVAL((*LIBL))
 ```
 
-`CRTCMD CMD(MYLIB/HELLO) PGM(MYLIB/HELLOCPP) SRCFILE(MYLIB/QCMDSRC)` makes the command. `PGM` is the command processing program (CPP), a CL or RPG program; it need not exist yet. `VLDCKR` names a validity checking program, called first with the same parameters (an escape message from it stops the command). `DSPCMD` shows a command; `DLTCMD` deletes it.
+`CRTCMD CMD(MYLIB/HELLO) PGM(MYLIB/HELLOCPP) SRCFILE(MYLIB/QCMDSRC)` makes the command. `PGM` is the command processing program (CPP), a CL or RPG program; it need not exist yet. `VLDCKR` names a validity checking program, called first with the same parameters by the command analyzer (QSYS/QCATRS is its caller on the call stack; an escape message from it stops the command). The CMD statement may give `VLDCKR`, `ALLOW`, `MAXPOS` and `TEXT` too, and its values win over CRTCMD's. A parameter with `RTNVAL(*YES)` names a CL variable when the command runs in a CL program: the variable gets the value the CPP left in the parameter. `DSPCMD` shows a command; `DLTCMD` deletes it.
 
 ## Running it
 
@@ -42,4 +42,4 @@ The test `user_commands_crtcmd` makes the command above with a CL CPP and runs i
 
 ## Not yet
 
-See [fidelity-gaps.md](fidelity-gaps.md): DEP, PMTCTL, RTNVAL, PASSATR, PASSVAL, CHGCMD, CHGCMDDFT, message-file prompt text, REXX.
+See [fidelity-gaps.md](fidelity-gaps.md): DEP, PMTCTL, PASSATR, PASSVAL, CHGCMD, CHGCMDDFT, message-file prompt text, REXX.

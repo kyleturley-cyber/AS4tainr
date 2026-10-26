@@ -505,7 +505,11 @@ impl FieldDef {
             ),
             Some(FieldDefault::System) | None => format!(" DEFAULT {}", self.system_default()),
             Some(FieldDefault::User) => {
-                format!(" DEFAULT CAST({} AS {})", crate::sql::USER_SQL, self.sql_type())
+                format!(
+                    " DEFAULT CAST({} AS {})",
+                    crate::sql::USER_SQL,
+                    self.sql_type()
+                )
             }
         }
     }

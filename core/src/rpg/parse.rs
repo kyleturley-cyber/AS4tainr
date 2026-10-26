@@ -361,10 +361,18 @@ impl Lines<'_> {
                 } else {
                     // Embedded SQL keeps SQL's comments out.
                     let in_sql = if pending.trim().is_empty() {
-                        text.trim_start().to_ascii_uppercase().starts_with("EXEC SQL")
-                            || text.trim_start().to_ascii_uppercase().starts_with("EXEC\tSQL")
+                        text.trim_start()
+                            .to_ascii_uppercase()
+                            .starts_with("EXEC SQL")
+                            || text
+                                .trim_start()
+                                .to_ascii_uppercase()
+                                .starts_with("EXEC\tSQL")
                     } else {
-                        pending.trim_start().to_ascii_uppercase().starts_with("EXEC SQL")
+                        pending
+                            .trim_start()
+                            .to_ascii_uppercase()
+                            .starts_with("EXEC SQL")
                     };
                     let text = if in_sql || sql_block {
                         strip_sql_comments(&text, &mut sql_block)

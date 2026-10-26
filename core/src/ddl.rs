@@ -56,7 +56,10 @@ pub enum Ddl {
         member: Option<String>,
     },
     /// DROP ALIAS name.
-    DropAlias { name: Name, if_exists: bool },
+    DropAlias {
+        name: Name,
+        if_exists: bool,
+    },
     /// RENAME [TABLE] name TO new [FOR SYSTEM NAME sys] (Db2 for i SQL
     /// Reference, RENAME): the table's SQL name.
     Rename {
@@ -394,7 +397,11 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
                 _ => bail!("SQL0104: SET SCHEMA needs a schema name."),
             };
             // SESSION: the schema of declared temporary tables, QTEMP.
-            let schema = if schema == "SESSION" { "QTEMP".to_string() } else { schema };
+            let schema = if schema == "SESSION" {
+                "QTEMP".to_string()
+            } else {
+                schema
+            };
             Ddl::SetSchema(validate_name("library", &schema).map_err(sql0104)?)
         }
         "ALTER" => {
@@ -943,10 +950,7 @@ fn default_value(p: &mut P, f: &FieldDef) -> Result<FieldDefault> {
                 "USER" | "SESSION_USER" | "SYSTEM_USER" => {
                     p.i += 1;
                     if !matches!(f.data_type, DataType::Char) {
-                        bail!(
-                            "SQL0574: Default value {w} does not fit column {}.",
-                            f.name
-                        );
+                        bail!("SQL0574: Default value {w} does not fit column {}.", f.name);
                     }
                     FieldDefault::User
                 }
@@ -1088,7 +1092,16 @@ fn generated_spec(p: &mut P, f: &FieldDef) -> Result<GeneratedSpec> {
         false
     };
     if p.eat("FOR") {
-        for w in ["EACH", "ROW", "ON", "UPDATE", "AS", "ROW", "CHANGE", "TIMESTAMP"] {
+        for w in [
+            "EACH",
+            "ROW",
+            "ON",
+            "UPDATE",
+            "AS",
+            "ROW",
+            "CHANGE",
+            "TIMESTAMP",
+        ] {
             p.expect(w)?;
         }
         return Ok(GeneratedSpec::Column(Generated::RowChangeTimestamp));
@@ -2163,7 +2176,11 @@ pub(crate) fn alter_table_clauses(sql: &str) -> Vec<String> {
         }
         if w == "DROP" {
             if let Some(&s) = starts.last() {
-                let col = if words[s + 1].1 == "COLUMN" { s + 2 } else { s + 1 };
+                let col = if words[s + 1].1 == "COLUMN" {
+                    s + 2
+                } else {
+                    s + 1
+                };
                 if words[s].1 == "ALTER" && j == col + 1 {
                     continue;
                 }
@@ -3201,8 +3218,7 @@ async fn create_trigger_run(ctx: &mut Ctx<'_>, t: &Trigger) -> Result<String> {
     }
     let path: Vec<String> = libl.iter().map(|l| ident(l)).collect();
     let func = trigger_function(&tlib, &tname);
-    let fdef =
-        format!(
+    let fdef = format!(
         "CREATE OR REPLACE FUNCTION {func}() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER \
          SET search_path = {} AS ${tag}$ BEGIN\n{code}RETURN {result};\nEND ${tag}$",
         crate::sql::joined_path(&path)
@@ -3838,7 +3854,15 @@ pub async fn try_run(
     if parts.len() > 1 {
         let mut last = None;
         for part in &parts {
-            last = Box::pin(try_run(database_url, user, libl, curlib.clone(), schema, part)).await?;
+            last = Box::pin(try_run(
+                database_url,
+                user,
+                libl,
+                curlib.clone(),
+                schema,
+                part,
+            ))
+            .await?;
         }
         return Ok(last);
     }
@@ -3870,25 +3894,29 @@ pub async fn try_run(
 /// ON COMMIT, LOGGED and NOT LOGGED options change nothing here.
 fn declared_temporary_table(sql: &str) -> Option<String> {
     let words: Vec<&str> = sql.split_whitespace().collect();
-    let up: Vec<String> = words.iter().take(4).map(|w| w.to_ascii_uppercase()).collect();
+    let up: Vec<String> = words
+        .iter()
+        .take(4)
+        .map(|w| w.to_ascii_uppercase())
+        .collect();
     if up != ["DECLARE", "GLOBAL", "TEMPORARY", "TABLE"] {
         return None;
     }
     let mut rest = sql.trim().trim_end_matches(';').trim_end().to_string();
     // Past the four words.
     for _ in 0..4 {
-        rest = rest.trim_start().split_once(char::is_whitespace)?.1.to_string();
+        rest = rest
+            .trim_start()
+            .split_once(char::is_whitespace)?
+            .1
+            .to_string();
     }
     let rest = rest.trim_start();
     let (name, mut tail) = match rest.find(|c: char| c.is_whitespace() || c == '(') {
         Some(i) => (rest[..i].to_string(), rest[i..].to_string()),
         None => (rest.to_string(), String::new()),
     };
-    let name = name
-        .rsplit(['.', '/'])
-        .next()
-        .unwrap_or(&name)
-        .to_string();
+    let name = name.rsplit(['.', '/']).next().unwrap_or(&name).to_string();
     // The trailing options, last first.
     let mut replace = false;
     loop {
@@ -4764,7 +4792,10 @@ mod tests {
         );
         assert_eq!(
             alter_table_clauses("ALTER TABLE t ALTER COLUMN a DROP DEFAULT DROP COLUMN b"),
-            ["ALTER TABLE t ALTER COLUMN a DROP DEFAULT", "ALTER TABLE t DROP COLUMN b"]
+            [
+                "ALTER TABLE t ALTER COLUMN a DROP DEFAULT",
+                "ALTER TABLE t DROP COLUMN b"
+            ]
         );
         assert_eq!(
             alter_table_clauses("ALTER TABLE t ALTER a DROP NOT NULL"),

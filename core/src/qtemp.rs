@@ -157,12 +157,25 @@ async fn make(client: &Client, name: &str) -> Result<()> {
 
 async fn drop_library(client: &Client, name: &str) {
     let r = async {
-        client
+        // Another process's grants or catalog work can touch the same
+        // catalog rows ("tuple concurrently updated"): try again.
+        let mut tries = 0u64;
+        while let Err(e) = client
             .batch_execute(&format!(
                 "DROP SCHEMA IF EXISTS {} CASCADE",
                 crate::catalog::ident(name)
             ))
-            .await?;
+            .await
+        {
+            let concurrent = e
+                .as_db_error()
+                .is_some_and(|d| d.message().starts_with("tuple concurrently"));
+            tries += 1;
+            if !concurrent || tries >= 5 {
+                return Err(e.into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50 * tries)).await;
+        }
         // Its rows in every catalog table with a library (as DLTLIB).
         let tables = client
             .query(

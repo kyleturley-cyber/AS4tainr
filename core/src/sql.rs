@@ -96,15 +96,32 @@ pub async fn init(client: &Client) -> Result<()> {
         .batch_execute(&format!("ALTER ROLE {SQL_ROLE} PASSWORD '{password}'"))
         .await?;
     for lib in catalog::list_libraries(client).await? {
-        // Another job's QTEMP may be gone by now.
-        if let Err(e) = grant_library(client, &lib).await {
-            let gone = e
-                .downcast_ref::<tokio_postgres::Error>()
-                .and_then(|e| e.code())
-                == Some(&tokio_postgres::error::SqlState::INVALID_SCHEMA_NAME);
-            if !gone {
+        // Jobs' QTEMP libraries got their grants when they were made, and
+        // their jobs drop them at any moment: granting again would race
+        // with that DROP SCHEMA.
+        if lib.starts_with("#QP") || lib.starts_with("#QT") {
+            continue;
+        }
+        // Another process may drop a library or a table in it while the
+        // grants run (a job's QTEMP at its end, parallel jobs): a library
+        // that is gone is skipped, and a grant that met a table being
+        // dropped ("tuple concurrently deleted/updated") is tried again.
+        let mut tries = 0;
+        while let Err(e) = grant_library(client, &lib).await {
+            let db = e.downcast_ref::<tokio_postgres::Error>();
+            if db.and_then(|e| e.code())
+                == Some(&tokio_postgres::error::SqlState::INVALID_SCHEMA_NAME)
+            {
+                break;
+            }
+            let concurrent = db
+                .and_then(|e| e.as_db_error())
+                .is_some_and(|d| d.message().starts_with("tuple concurrently"));
+            tries += 1;
+            if !concurrent || tries >= 5 {
                 return Err(e);
             }
+            tokio::time::sleep(std::time::Duration::from_millis(50 * tries)).await;
         }
     }
     crate::services::init(client).await?;

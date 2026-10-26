@@ -11805,9 +11805,17 @@ async fn environment_variables_and_qshell_from_cl() {
         got["esc4"].starts_with("CPF9999 ") && got["esc4"].ends_with("D8E2C8F0F0F0F5"),
         "{got:?}"
     );
-    // ADDENVVAR's completion message is CPCA980 (its data, 12 bytes for
-    // GLDVAR on PUB400, is not given here yet).
-    assert!(got["addcomp"].starts_with("CPCA980 "), "{got:?}");
+    // The completion messages and their data: the name's length, then
+    // the name, in apostrophes for ADDENVVAR (also REPLACE(*YES)) and
+    // RMVENVVAR (PUB400 2026-10-26, tools/golden/qsh.txt q_out).
+    for (k, v) in [
+        ("addcomp", "CPCA980 12 000000087DC7D3C4E5C1D97D"),
+        ("chgcomp", "CPCA981 10 00000006C7D3C4E5C1D9"),
+        ("replcomp", "CPCA980 12 000000087DC7D3C4E5C1D97D"),
+        ("rmvcomp", "CPCA988 12 000000087DC7D3C4E5C1D97D"),
+    ] {
+        assert_eq!(got.get(k).map(String::as_str), Some(v), "{k}: {got:?}");
+    }
     // QIBM_QSH_CMD_OUTPUT=FILE=: the output in the stream file, which
     // CPYFRMSTMF (with STMFCODPAG, the old name of STMFCCSID) copies
     // into a program-described file, a record per line.

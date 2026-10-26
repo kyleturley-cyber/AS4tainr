@@ -111,6 +111,21 @@ pub fn output(setting: Option<&str>) -> Output {
     }
 }
 
+/// The message data of the environment variable commands' completion
+/// messages: the length of what follows (4-byte binary), then the name
+/// (EBCDIC), in apostrophes for CPCA980 and CPCA988.
+fn envvar_data(name: &str, quoted: bool) -> Vec<u8> {
+    let shown = if quoted {
+        format!("'{name}'")
+    } else {
+        name.to_string()
+    };
+    let text = crate::rpg::data::e(&shown);
+    let mut d = (text.len() as i32).to_be_bytes().to_vec();
+    d.extend(text);
+    d
+}
+
 impl Job<'_> {
     pub(crate) async fn qsh_command(&mut self, cmd: &Command) -> Result<Option<Outcome>> {
         Ok(Some(match cmd.def.name {
@@ -131,9 +146,11 @@ impl Job<'_> {
                     cmd.get("REPLACE").eq_ignore_ascii_case("*YES"),
                 )
                 .await?;
-                // CPCA980 (PUB400 2026-10-23, tools/golden/qsh.txt: the
-                // completion message after ADDENVVAR; its data not yet
-                // known byte for byte).
+                // CPCA980, also when REPLACE(*YES) replaced one; its data
+                // the name's length (4-byte binary) then the name in
+                // apostrophes (PUB400 2026-10-26, tools/golden/qsh.txt
+                // q_out addcomp, replcomp: 00000008 'GLDVAR').
+                self.calls.message_data = Some(envvar_data(&name, true));
                 Outcome::Messages(vec![format!(
                     "CPCA980: Environment variable {name} was added."
                 )])
@@ -155,13 +172,24 @@ impl Job<'_> {
                     ccsid(cmd.get("CCSID"))?,
                 )
                 .await?;
-                Outcome::Messages(vec![])
+                // CPCA981, its data the name without apostrophes (PUB400
+                // 2026-10-26, tools/golden/qsh.txt q_out chgcomp:
+                // 00000006 GLDVAR).
+                self.calls.message_data = Some(envvar_data(&name, false));
+                Outcome::Messages(vec![format!(
+                    "CPCA981: Environment variable {name} was changed."
+                )])
             }
             "RMVENVVAR" => {
                 let name = raw(cmd, "ENVVAR");
                 self.check_sys_level(cmd).await?;
                 envvar::remove(self.client, &self.job_key(), level(cmd), &name).await?;
-                Outcome::Messages(vec![])
+                // CPCA988, data as CPCA980's (PUB400 2026-10-26,
+                // tools/golden/qsh.txt q_out rmvcomp).
+                self.calls.message_data = Some(envvar_data(&name, true));
+                Outcome::Messages(vec![format!(
+                    "CPCA988: Environment variable {name} was removed."
+                )])
             }
             "WRKENVVAR" => {
                 let vars = match level(cmd) {

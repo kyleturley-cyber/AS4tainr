@@ -115,10 +115,19 @@ impl Job<'_> {
             }
         }
         let fields: Vec<String> = from.file.fields.iter().map(|f| f.name.clone()).collect();
-        let copied = format!(
-            "CPC2955: {} records were copied from member {from_name}.",
-            records.len()
-        );
+        // No records: CPC2957, to a file or *PRINT (PUB400 2026-10-27,
+        // verify5 z_cpysplf_2f, verify8 c8_cpyf_empty).
+        let copied = if records.is_empty() {
+            format!(
+                "CPC2957: No records were copied from file {from_name} in library {}.",
+                crate::qtemp::logical(&from.library)
+            )
+        } else {
+            format!(
+                "CPC2955: {} records were copied from member {from_name}.",
+                records.len()
+            )
+        };
         if to_q == "*PRINT" {
             let attr: Option<String> = self
                 .client
@@ -150,15 +159,6 @@ impl Job<'_> {
                 &images,
                 &crate::report::Stamp::now(),
             );
-            let copied = if records.is_empty() {
-                // CPC2957 (PUB400 2026-10-27, verify5 z_cpysplf_2f).
-                format!(
-                    "CPC2957: No records were copied from file {from_name} in library {}.",
-                    from.library
-                )
-            } else {
-                copied
-            };
             let mut all = vec![copied];
             all.extend(print);
             let rows: Vec<String> = images
@@ -412,8 +412,23 @@ pub fn print_listing(
             on_page = 2;
         }
         let mbr = if logical { "1" } else { "" };
-        let text = printable(img);
-        out.push(format!("{mbr:>5}{n:>12}  {text}").trim_end().to_string());
+        // A record longer than 100 bytes goes on in further lines of 100,
+        // starting in column 20 (PUB400 2026-10-27, verify8 c8_joblog7:
+        // 132-byte records).
+        let text: Vec<char> = printable(img).chars().collect();
+        let mut chunks = text.chunks(100);
+        let first: String = chunks.next().unwrap_or(&[]).iter().collect();
+        out.push(format!("{mbr:>5}{n:>12}  {first}").trim_end().to_string());
+        // Blank lines at the record's end are not printed (verify8
+        // c8_dbr_rows: a 372-byte QADSPDBR record on one line).
+        let mut rest: Vec<String> = chunks.map(|c| c.iter().collect()).collect();
+        while rest.last().is_some_and(|c| c.trim().is_empty()) {
+            rest.pop();
+        }
+        for c in &rest {
+            out.push(format!("{:19}{c}", "").trim_end().to_string());
+        }
+        on_page += rest.len();
         if hex {
             let nib = |f: fn(u8) -> u8| -> String {
                 img.iter()
@@ -532,6 +547,41 @@ mod tests {
                 "                   990004D",
             ]
         );
+    }
+
+    // A 132-byte record: 100 characters, then the rest from column 20
+    // (verify8 c8_joblog7).
+    #[test]
+    fn long_records_wrap() {
+        let line = format!("{:<100}{:<32}", "A".repeat(100), "27  18:10:40 UTC");
+        let l = print_listing(
+            "L",
+            "F",
+            "F",
+            "F",
+            132,
+            false,
+            false,
+            &[(1, crate::tn5250::ebcdic::encode(&line))],
+            &crate::report::Stamp::default(),
+        );
+        assert_eq!(l[5], format!("                1  {}", "A".repeat(100)));
+        assert_eq!(l[6], "                   27  18:10:40 UTC");
+        // A long record blank after its first 100 bytes is one line.
+        let short = format!("{:<372}", "PGLD6TB");
+        let l = print_listing(
+            "L",
+            "F",
+            "F",
+            "F",
+            372,
+            false,
+            false,
+            &[(1, crate::tn5250::ebcdic::encode(&short))],
+            &crate::report::Stamp::default(),
+        );
+        assert_eq!(l[5], "                1  PGLD6TB");
+        assert!(l[6].starts_with(" 1 records copied"), "{l:?}");
     }
 
     // A packed field's bytes print as blanks, characters as themselves

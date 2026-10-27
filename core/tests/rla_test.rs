@@ -16826,7 +16826,7 @@ async fn cpysplf_copies_lines() {
     )
     .await
     .unwrap();
-    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::commands::{Environment, Job, Outcome};
     let env = Environment {
         database_url: url.clone(),
     };
@@ -16860,7 +16860,12 @@ async fn cpysplf_copies_lines() {
         .unwrap()
         .get(0);
     let copy = |opt: &str| format!("CPYSPLF FILE({spl}) TOFILE({lib}/SPLCPY) SPLNBR(*LAST) {opt}");
-    job.run(&copy("")).await.unwrap();
+    // The completion message is CPF3485 (PUB400 2026-10-27, verify8
+    // c8_joblog7).
+    match job.run(&copy("")).await.unwrap() {
+        Outcome::Messages(m) => assert!(m[0].starts_with("CPF3485: "), "{m:?}"),
+        other => panic!("{other:?}"),
+    }
     let t = format!("{}.splcpy", lib.to_ascii_lowercase());
     let lines: Vec<String> = client
         .query(&format!("SELECT * FROM {t} ORDER BY rrn"), &[])
@@ -17068,4 +17073,167 @@ async fn crtpf_dds_listing_and_cpyf_print() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// DSPDBR and the DSPFD outfiles *BASATR, *MBR, *RCDFMT, *ACCPTH of an
+/// SQL table with an index and a view over it (PUB400 2026-10-27,
+/// tools/golden/verify8.txt c8_dbr_print, c8_dbr_out, c8_dbr_none,
+/// c8_dbr_missing, c8_bas, c8_mbr, c8_fmt, c8_acp and their values).
+#[tokio::test]
+async fn dspdbr_and_dspfd_outfiles() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    for s in [
+        format!("CREATE TABLE {lib}/GLD6TB (ID CHAR(10) NOT NULL, VAL CHAR(60) NOT NULL)"),
+        format!("CREATE INDEX {lib}/GLD7IX ON {lib}/GLD6TB (ID)"),
+        format!("CREATE VIEW {lib}/GLD7VW AS SELECT ID FROM {lib}/GLD6TB"),
+    ] {
+        job.run(&format!("RUNSQL SQL('{s}') COMMIT(*NONE)"))
+            .await
+            .unwrap();
+    }
+    job.run(&format!("CRTPF FILE({lib}/GLD6SP) RCDLEN(133)"))
+        .await
+        .unwrap();
+    let ids = |o: Outcome| match o {
+        Outcome::Messages(m) => m
+            .iter()
+            .map(|l| l.split(':').next().unwrap_or("").to_string())
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    // The printed report's dependents (c8_dbr_print).
+    match job
+        .run(&format!("DSPDBR FILE({lib}/GLD6TB) OUTPUT(*PRINT)"))
+        .await
+        .unwrap()
+    {
+        Outcome::Display(d) => {
+            assert!(
+                d.print
+                    .contains(&format!("       GLD7IX             {lib:<14}Data")),
+                "{:#?}",
+                d.print
+            );
+            assert!(d
+                .print
+                .iter()
+                .any(|l| l.ends_with(":                2")
+                    && l.contains("Number of dependent files")));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        ids(job
+            .run(&format!(
+                "DSPDBR FILE({lib}/GLD6TB) OUTPUT(*OUTFILE) OUTFILE({lib}/GLD7DBR)"
+            ))
+            .await
+            .unwrap()),
+        ["CPF9861", "CPF9862", "CPF3030"]
+    );
+    assert_eq!(
+        ids(job
+            .run(&format!(
+                "DSPDBR FILE({lib}/GLD6SP) OUTPUT(*OUTFILE) OUTFILE({lib}/GLD7DBR) OUTMBR(*FIRST *ADD)"
+            ))
+            .await
+            .unwrap()),
+        ["CPF3030"]
+    );
+    let rows: Vec<String> = client
+        .query(
+            &format!(
+                "SELECT rtrim(whrtyp)||'|'||rtrim(whrfi)||'|'||whno::text||'|'||rtrim(whrefi)||'|'||rtrim(whtype)||'|'||rtrim(whrmb)
+                   FROM {}.gld7dbr ORDER BY whrfi DESC, whrefi",
+                lib.to_ascii_lowercase()
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "P|GLD6TB|2|GLD7IX|D|*NONE",
+            "P|GLD6TB|2|GLD7VW|D|*NONE",
+            "P|GLD6SP|0|||*NONE"
+        ]
+    );
+    let e = job
+        .run(&format!("DSPDBR FILE({lib}/NOSUCH) OUTPUT(*PRINT)"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF3012"), "{e}");
+    for (ty, file, out) in [
+        ("*BASATR", "GLD6TB", "GLD7BAS"),
+        ("*MBR", "GLD6TB", "GLD7MBR"),
+        ("*RCDFMT", "GLD6TB", "GLD7FMT"),
+        ("*ACCPTH", "GLD7IX", "GLD7ACP"),
+    ] {
+        assert_eq!(
+            ids(job
+                .run(&format!(
+                    "DSPFD FILE({lib}/{file}) TYPE({ty}) OUTPUT(*OUTFILE) OUTFILE({lib}/{out})"
+                ))
+                .await
+                .unwrap()),
+            ["CPF9861", "CPF9862", "CPF3030"],
+            "{ty}"
+        );
+    }
+    let one = |sql: String| {
+        let client = &client;
+        async move {
+            let r = client.query_one(&sql, &[]).await.unwrap();
+            r.get::<_, String>(0)
+        }
+    };
+    let l = lib.to_ascii_lowercase();
+    assert_eq!(
+        one(format!(
+            "SELECT rtrim(atfile)||'|'||atftyp||'|'||rtrim(atfila)||'|'||atdtat||'|'||atwait::text||'|'||atwatr::text||'|'||ataccp||'|'||atsqlt FROM {l}.gld7bas"
+        ))
+        .await,
+        "GLD6TB|P|*PHY|D|30|60|A|T"
+    );
+    assert_eq!(
+        one(format!(
+            "SELECT rtrim(mbname)||'|'||mbecen||'|'||rtrim(mbedat)||'|'||mbmxrl::text||'|'||mbnrcd::text||'|'||mbres4 FROM {l}.gld7mbr"
+        ))
+        .await,
+        "GLD6TB|*|NONE|70|0|T"
+    );
+    assert_eq!(
+        one(format!(
+            "SELECT rtrim(rfname)||'|'||rffldn::text||'|'||rflen::text||'|'||rfpgrt::text FROM {l}.gld7fmt"
+        ))
+        .await,
+        "GLD6TB|2|70|-1"
+    );
+    assert_eq!(
+        one(format!(
+            "SELECT rtrim(apfile)||'|'||apftyp||'|'||apaccp||'|'||rtrim(apbof)||'|'||rtrim(apkeyf)||'|'||apkseq||'|'||apnkyf::text||'|'||apkeyn::text FROM {l}.gld7acp"
+        ))
+        .await,
+        "GLD7IX|L|K|GLD6TB|ID|A|1|1"
+    );
 }

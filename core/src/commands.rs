@@ -6267,7 +6267,9 @@ impl Job<'_> {
                 break;
             }
         }
+        let target_lib: String;
         if let Some(lib) = source_lib {
+            target_lib = lib.clone();
             let mbr = match cmd.get("TOMBR").to_ascii_uppercase().as_str() {
                 "" | "*FIRST" => name.clone(),
                 m => m.to_string(),
@@ -6313,6 +6315,7 @@ impl Job<'_> {
                 Aut::Change,
             )
             .await?;
+            target_lib = to.library.clone();
             let [field] = to.file.fields.as_slice() else {
                 bail!("CPF9898: File {name} has more than one field; CPYSPLF copies into a file of one character field here.");
             };
@@ -6333,11 +6336,12 @@ impl Job<'_> {
                 .collect();
             self.client.execute(sql.as_str(), &[&cut]).await?;
         }
+        // CPF3485, the completion message (PUB400 2026-10-27, verify8
+        // c8_joblog7: CPYSPLF of a job log into a RCDLEN(132) file).
         Ok(Outcome::Messages(vec![format!(
-            "{} records of spooled file {} number {} were copied to file {name}.",
+            "CPF3485: {} records were copied to file {name} in {}.",
             lines.len(),
-            f.file,
-            f.number
+            crate::qtemp::logical(&target_lib)
         )]))
     }
 

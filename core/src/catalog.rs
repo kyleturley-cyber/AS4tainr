@@ -1800,11 +1800,37 @@ pub async fn add_unique_constraint(
     Ok(())
 }
 
+/// The files built over a file (DSPDBR's dependents): logical files and
+/// SQL indexes (`logical_files`), and SQL views using it; by library and
+/// name.
+pub async fn dependent_files(
+    client: &Client,
+    library: &str,
+    name: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut over: Vec<(String, String)> = client
+        .query(
+            "SELECT library, name FROM as4tainr.logical_files WHERE pf_library=$1 AND pf_name=$2",
+            &[&library, &name],
+        )
+        .await?
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    for v in sql_views_over(client, library, name).await? {
+        if !over.contains(&v) {
+            over.push(v);
+        }
+    }
+    over.sort_by(|a, b| (&a.1, &a.0).cmp(&(&b.1, &b.0)));
+    Ok(over)
+}
+
 /// The SQL views (catalog files with a query) that use a file, found in
 /// PostgreSQL's dependencies; views of views are found too, also through
 /// the view that gives a table its SQL name.
 async fn sql_views_over(
-    tx: &tokio_postgres::Transaction<'_>,
+    tx: &impl tokio_postgres::GenericClient,
     library: &str,
     name: &str,
 ) -> Result<Vec<(String, String)>> {

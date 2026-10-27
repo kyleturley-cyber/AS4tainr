@@ -7,8 +7,9 @@
 //! (2026-10-26, tools/golden/verify1.txt v_ffd_objd, v_ffd_mbrl) and of
 //! QADSPFFD, QADSPDBR, QAFDBASI, QAFDMBR, QAFDPHY, QAFDACCP and QAFDRFMT
 //! (verify2.txt m_*); field texts and column headings are not copied
-//! (clean room). Only DSPOBJD and DSPFD TYPE(*MBRLIST) write records yet;
-//! the other models are there for programs that declare files LIKE them.
+//! (clean room). DSPOBJD, DSPFFD, DSPDBR (dbr.rs) and DSPFD (objdesc.rs,
+//! fdout.rs) write records; the models are also there for programs that
+//! declare files LIKE them.
 
 use anyhow::{bail, Result};
 use tokio_postgres::Client;

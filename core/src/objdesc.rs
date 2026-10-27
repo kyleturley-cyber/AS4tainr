@@ -13,6 +13,7 @@ impl Job<'_> {
         Ok(Some(match cmd.def.name {
             "DSPFD" => self.dspfd(cmd).await?,
             "DSPFFD" => self.dspffd(cmd).await?,
+            "DSPDBR" => self.dspdbr(cmd).await?,
             "CPYF" => self.cpyf(cmd).await?,
             _ => return Ok(None),
         }))
@@ -68,9 +69,15 @@ impl Job<'_> {
             if ty == "*ATR" && cmd.get("FILEATR").eq_ignore_ascii_case("*PF") {
                 return self.dspfd_phy_outfile(cmd, &lib, &name, &attr).await;
             }
+            if matches!(ty.as_str(), "*BASATR" | "*MBR" | "*RCDFMT" | "*ACCPTH") {
+                let (outfile, option) = outfile_option(cmd)?;
+                return self
+                    .dspfd_type_outfile(&ty, &outfile, &option, &lib, &name, &attr)
+                    .await;
+            }
             if ty != "*MBRLIST" {
                 return Err(crate::cl::value_error(&format!(
-                    "OUTPUT(*OUTFILE) is done for TYPE(*MBRLIST) and for TYPE(*ATR) FILEATR(*PF) only, not TYPE({ty}) here."
+                    "OUTPUT(*OUTFILE) is done for TYPE(*MBRLIST), *BASATR, *MBR, *RCDFMT, *ACCPTH and TYPE(*ATR) FILEATR(*PF) only, not TYPE({ty}) here."
                 )));
             }
             return self.dspfd_mbrlist_outfile(cmd, &lib, &name, &attr).await;

@@ -998,6 +998,14 @@ impl Job<'_> {
             .ok_or_else(|| anyhow::anyhow!("CPD0084: ERRLVL must be a number from 0 to 40."))?;
         // SRCSTMF, or SRCFILE and SRCMBR (one or the other).
         let stmf = cmd.get("SRCSTMF").to_string();
+        let mut input = crate::sqlstmlist::Input {
+            commit: cmd.get("COMMIT").to_ascii_uppercase(),
+            naming: cmd.get("NAMING").to_ascii_uppercase(),
+            errlvl,
+            dftrdbcol: cmd.get("DFTRDBCOL").to_ascii_uppercase(),
+            job_ccsid: "37".into(),
+            ..Default::default()
+        };
         let (source, what) = if !stmf.is_empty() {
             if !cmd.get("SRCFILE").is_empty() || !cmd.get("SRCMBR").is_empty() {
                 bail!("CPD0084: SRCSTMF cannot be given with SRCFILE or SRCMBR.");
@@ -1008,6 +1016,18 @@ impl Job<'_> {
             let text = crate::ifs::codec::text(ccsid, &bytes);
             // A byte order mark is not a statement.
             let text = text.trim_start_matches('\u{FEFF}').to_string();
+            let base = stmf.rsplit('/').next().unwrap_or(&stmf);
+            let base = base.split('.').next().unwrap_or(base);
+            input.name = base
+                .chars()
+                .take(10)
+                .collect::<String>()
+                .to_ascii_uppercase();
+            input.source = vec![("Source stream file".into(), stmf.clone())];
+            input.source_ccsid = ccsid.to_string();
+            input.changed = crate::ifs::stat(self.client, &stmf)
+                .await?
+                .map(|e| stamp_of_us(e.changed_us));
             (text, format!("stream file {stmf}"))
         } else {
             if cmd.get("SRCFILE").is_empty() || cmd.get("SRCMBR").is_empty() {
@@ -1015,16 +1035,42 @@ impl Job<'_> {
             }
             let m = self.source_member(cmd, "").await?;
             let what = format!("member {} in {}/{}", m.name, m.library, m.file);
+            input.name = m.name.clone();
+            input.source = vec![
+                (
+                    "Source file".into(),
+                    format!("{}/{}", crate::qtemp::logical(&m.library), m.file),
+                ),
+                ("Member".into(), m.name.clone()),
+            ];
+            input.source_ccsid = m.ccsid.to_string();
+            input.changed = m.changed_us.map(stamp_of_us);
             (m.source, what)
         };
+        input.lines = source.lines().map(str::to_string).collect();
         let schema = match cmd.get("DFTRDBCOL") {
             "*NONE" => None,
             s => Some(catalog::validate_name("library", s)?),
         };
-        let lines = self
-            .run_sql_script(&source, &what, errlvl, schema, true)
+        // COMMIT(*NONE) or *NC: no commitment control.
+        let no_commit = matches!(cmd.get("COMMIT"), "*NONE" | "*NC");
+        let run = self
+            .run_script(&source, &what, errlvl, schema, true, no_commit)
             .await?;
-        Ok(Outcome::Messages(lines))
+        // The listing (OUTPUT(*PRINT)); the statements' messages are in it
+        // rather than sent to the caller (PUB400 2026-10-26, verify2
+        // w_script, w_rb).
+        let printed = crate::sqlstmlist::listing(&input, &run.msgs, &crate::report::Stamp::now());
+        if !cmd.get("OUTPUT").eq_ignore_ascii_case("*NONE") {
+            let name = input.name.clone();
+            self.print_listing(&name, printed).await?;
+        }
+        if let Some(e) = run.failed {
+            return Err(e);
+        }
+        Ok(Outcome::Messages(
+            run.lines.last().cloned().into_iter().collect(),
+        ))
     }
 
     /// Run the statements of an SQL script (RUNSQLSTM). `schema`: the
@@ -1037,16 +1083,64 @@ impl Job<'_> {
         source: &str,
         what: &str,
         errlvl: u32,
-        mut schema: Option<String>,
+        schema: Option<String>,
         set_schema: bool,
     ) -> Result<Vec<String>> {
+        self.run_sql_script_commit(source, what, errlvl, schema, set_schema, false)
+            .await
+    }
+
+    /// `run_sql_script` with `no_commit`: the script runs without
+    /// commitment control (RUNSQLSTM COMMIT(*NONE) or *NC).
+    pub async fn run_sql_script_commit(
+        &mut self,
+        source: &str,
+        what: &str,
+        errlvl: u32,
+        schema: Option<String>,
+        set_schema: bool,
+        no_commit: bool,
+    ) -> Result<Vec<String>> {
+        let run = self
+            .run_script(source, what, errlvl, schema, set_schema, no_commit)
+            .await?;
+        match run.failed {
+            Some(e) => Err(e),
+            None => Ok(run.lines),
+        }
+    }
+
+    /// The statements of a script, run one after the other: a line for
+    /// each (and a summary), the listing's messages, and the error that
+    /// stopped the run (a statement that failed with a severity above
+    /// `errlvl`).
+    async fn run_script(
+        &mut self,
+        source: &str,
+        what: &str,
+        errlvl: u32,
+        mut schema: Option<String>,
+        set_schema: bool,
+        no_commit: bool,
+    ) -> Result<ScriptRun> {
         let mut lines = Vec::new();
+        let mut msgs: Vec<crate::sqlstmlist::Msg> = Vec::new();
+        let mut failed = None;
         let mut errors = 0;
-        let statements = crate::ddl::split_statements(source);
+        let placed = crate::ddl::split_statements_at(source);
+        let statements: Vec<String> = placed.iter().map(|p| p.0.clone()).collect();
         // INSERT, UPDATE and DELETE run on one SQL session, made again
         // after data definition (which can add libraries).
         let mut session: Option<(Vec<String>, crate::sql::Session)> = None;
         for (k, stmt) in statements.iter().enumerate() {
+            let (record, position) = (placed[k].1, placed[k].2);
+            let msg = |id: &str, severity: u32, text: &str| crate::sqlstmlist::Msg {
+                id: id.to_string(),
+                severity,
+                record,
+                position,
+                text: text.to_string(),
+            };
             if !set_schema
                 && matches!(
                     crate::ddl::parse(stmt),
@@ -1056,14 +1150,45 @@ impl Job<'_> {
                 lines.push(format!("Statement {}: SET SCHEMA skipped.", k + 1));
                 continue;
             }
-            // COMMIT [WORK]: each statement here is committed when it
-            // runs, so there is nothing left to commit (fidelity-gaps).
             let words: Vec<String> = stmt
                 .trim()
                 .trim_end_matches(';')
                 .split_whitespace()
                 .map(|w| w.to_ascii_uppercase())
                 .collect();
+            // Without commitment control (COMMIT(*NONE)), COMMIT, ROLLBACK
+            // and SAVEPOINT are not valid: SQL7007, severity 30, which
+            // stops the run at the default ERRLVL(10) (PUB400 2026-10-26,
+            // verify2 w_rb and w_script).
+            if no_commit
+                && matches!(
+                    words.first().map(String::as_str),
+                    Some("COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE")
+                )
+                && (words[0] != "RELEASE" || words.get(1).map(String::as_str) == Some("SAVEPOINT"))
+            {
+                let e = anyhow::anyhow!(
+                    "SQL7007: {} cannot be used when the statements run without commitment control.",
+                    words[0]
+                );
+                errors += 1;
+                lines.push(format!("Statement {}: {e:#}", k + 1));
+                msgs.push(msg(
+                    "SQL7007",
+                    30,
+                    crate::jobs::message_text(&format!("{e:#}")),
+                ));
+                if 30 > errlvl {
+                    failed = Some(anyhow::anyhow!(
+                        "SQL9010: RUNSQLSTM stopped at statement {} of {what}: {e:#}",
+                        k + 1
+                    ));
+                    break;
+                }
+                continue;
+            }
+            // COMMIT [WORK]: each statement here is committed when it
+            // runs, so there is nothing left to commit (fidelity-gaps).
             if matches!(
                 words
                     .iter()
@@ -1073,6 +1198,7 @@ impl Job<'_> {
                 ["COMMIT"] | ["COMMIT", "WORK"]
             ) {
                 lines.push(format!("Statement {}: COMMIT done.", k + 1));
+                msgs.push(msg("", 0, "COMMIT done."));
                 continue;
             }
             let libl = match &schema {
@@ -1149,16 +1275,27 @@ impl Job<'_> {
                 Err(e) => Err(e),
             };
             match r {
-                Ok(msg) => lines.push(format!("Statement {}: {msg}", k + 1)),
+                Ok(text) => {
+                    lines.push(format!("Statement {}: {text}", k + 1));
+                    msgs.push(listing_message(&words, &text, &msg));
+                }
                 Err(e) => {
                     errors += 1;
-                    lines.push(format!("Statement {}: {e:#}", k + 1));
+                    let full = format!("{e:#}");
+                    lines.push(format!("Statement {}: {full}", k + 1));
                     // SQL errors have severity 30.
+                    let last = full.lines().last().unwrap_or("").to_string();
+                    msgs.push(msg(
+                        crate::jobs::message_id(&last),
+                        30,
+                        crate::jobs::message_text(&last),
+                    ));
                     if 30 > errlvl {
-                        bail!(
-                            "SQL9010: RUNSQLSTM stopped at statement {} of {what}: {e:#}",
+                        failed = Some(anyhow::anyhow!(
+                            "SQL9010: RUNSQLSTM stopped at statement {} of {what}: {full}",
                             k + 1
-                        );
+                        ));
+                        break;
                     }
                 }
             }
@@ -1167,7 +1304,11 @@ impl Job<'_> {
             "{} statements run from {what}; {errors} with errors.",
             statements.len()
         ));
-        Ok(lines)
+        Ok(ScriptRun {
+            lines,
+            msgs,
+            failed,
+        })
     }
 
     /// Module copies named on CRTPGM/CRTSRVPGM MODULE (`*PGM`/`*SRVPGM`:
@@ -6272,10 +6413,12 @@ impl Job<'_> {
         groups: &[(String, Vec<catalog::ObjectEntry>)],
     ) -> Result<Outcome> {
         let outfile = cmd.get("OUTFILE").trim().to_string();
+        // PUB400 2026-10-26, verify2 o_objd_nofile: CPD9861.
         if outfile.is_empty() {
-            return Err(crate::cl::value_error(
-                "OUTPUT(*OUTFILE) needs OUTFILE, the file to receive the records.",
-            ));
+            bail!(
+                "CPD9861: OUTPUT(*OUTFILE) was given without OUTFILE, the file to receive the records.\n{}",
+                crate::cl::CPF0006
+            );
         }
         let option = cmd
             .list("OUTMBR")
@@ -6286,7 +6429,7 @@ impl Job<'_> {
             .client
             .query_one(
                 "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY'),
-                        to_char(now() AT TIME ZONE 'UTC', 'MMDDYY'),
+                        to_char(now() AT TIME ZONE 'UTC', 'YYMMDD'),
                         to_char(now() AT TIME ZONE 'UTC', 'HH24MISS')",
                 &[],
             )
@@ -6298,7 +6441,17 @@ impl Job<'_> {
             for o in objs {
                 let size = catalog::object_size(self.client, lib, &o.name, &o.objtype)
                     .await
-                    .unwrap_or(0);
+                    .unwrap_or(0)
+                    .max(0) as u64;
+                let journaled = o.objtype == "*FILE"
+                    && self
+                        .client
+                        .query_opt(
+                            "SELECT 1 FROM as4tainr.journaled_files WHERE library=$1 AND file=$2",
+                            &[lib, &o.name],
+                        )
+                        .await?
+                        .is_some();
                 let r = self
                     .client
                     .query_opt(
@@ -6325,7 +6478,7 @@ impl Job<'_> {
                 };
                 let mut rec: crate::outfile::Record = vec![
                     ("ODDCEN", crate::outfile::century(&ny)),
-                    ("ODDDAT", nd.clone()),
+                    ("ODDDAT", crate::outfile::job_date(&nd)),
                     ("ODDTIM", nt.clone()),
                     ("ODLBNM", crate::qtemp::logical(lib)),
                     ("ODOBNM", o.name.clone()),
@@ -6345,9 +6498,18 @@ impl Job<'_> {
                     ("ODCRTS", system.clone()),
                     ("ODASP", "1".into()),
                     ("ODUATR", g(13)),
-                    ("ODSIZU", size.to_string()),
-                    ("ODBPUN", "1".into()),
+                    // Sizes in units of 512 bytes, the bytes per unit a
+                    // data area's record shows (PUB400 2026-10-26, verify2
+                    // o_objd_vals: 16 units of 512 for 8192 bytes).
+                    ("ODSIZU", size.div_ceil(512).to_string()),
+                    ("ODBPUN", "512".into()),
                     ("ODDTL", "*BASIC".into()),
+                    // Allow change by API, and the system ASP for the
+                    // object and its library (o_objd_vals: 1, 1, 1).
+                    ("ODAAPI", "1".into()),
+                    ("ODASPL", "1".into()),
+                    ("ODLASN", "1".into()),
+                    ("ODJRST", if journaled { "1" } else { "0" }.into()),
                 ];
                 if !g(0).is_empty() {
                     rec.extend([
@@ -6369,8 +6531,9 @@ impl Job<'_> {
                 records.push(rec);
             }
         }
-        crate::outfile::write(self, &outfile, &option, &crate::outfile::QADSPOBJ, &records).await?;
-        Ok(Outcome::Messages(vec![]))
+        let w = crate::outfile::write(self, &outfile, &option, &crate::outfile::QADSPOBJ, &records)
+            .await?;
+        Ok(Outcome::Messages(w.messages))
     }
 
     /// CRTDTAQ (CL reference). TYPE(*DDM) is not done; MAXLEN 1-64512,
@@ -6848,6 +7011,42 @@ fn typed_parm(a: &str) -> String {
         }
         _ => value,
     }
+}
+
+/// A script's run (`Job::run_script`).
+struct ScriptRun {
+    lines: Vec<String>,
+    msgs: Vec<crate::sqlstmlist::Msg>,
+    failed: Option<anyhow::Error>,
+}
+
+/// The listing's message for a statement that ran: IBM's identifier for
+/// the kinds of statements a capture shows (PUB400 2026-10-26,
+/// tools/golden/verify2.txt w_script and w_rb: SQL790F for SET SCHEMA,
+/// SQL7905 with severity 20 for CREATE TABLE in a library without a
+/// journal, which as4tainr's libraries never have, SQL7988 for ALTER
+/// TABLE, SQL7956 for INSERT), none for the others.
+fn listing_message(
+    words: &[String],
+    text: &str,
+    msg: &dyn Fn(&str, u32, &str) -> crate::sqlstmlist::Msg,
+) -> crate::sqlstmlist::Msg {
+    let w: Vec<&str> = words.iter().map(String::as_str).collect();
+    match w.as_slice() {
+        ["SET", "SCHEMA", ..] | ["SET", "CURRENT", "SCHEMA", ..] => msg("SQL790F", 0, text),
+        ["CREATE", "TABLE", ..] | ["CREATE", "OR", "REPLACE", "TABLE", ..] => {
+            msg("SQL7905", 20, &format!("{text} It is not journaled."))
+        }
+        ["ALTER", "TABLE", ..] => msg("SQL7988", 0, text),
+        ["INSERT", ..] => msg("SQL7956", 0, text),
+        _ => msg("", 0, text),
+    }
+}
+
+/// A time in microseconds since 1970 (UTC) as a listing shows it.
+fn stamp_of_us(us: i64) -> crate::report::Stamp {
+    let ((y, m, d), (h, mi, sec), _) = crate::rpg::dates::from_epoch_us(us);
+    crate::report::Stamp::of((y, m, d), (h, mi, sec))
 }
 
 #[cfg(test)]

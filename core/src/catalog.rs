@@ -170,6 +170,9 @@ BEGIN
     ALTER TABLE as4tainr.file_fields ADD COLUMN IF NOT EXISTS hidden boolean NOT NULL DEFAULT false;
   END IF;
 END $$;
+-- The files with hidden columns are looked for before each SQL statement
+-- (temporal::expand_hidden).
+CREATE INDEX IF NOT EXISTS file_fields_hidden ON as4tainr.file_fields (library, file) WHERE hidden;
 -- SQL aliases (CREATE ALIAS): the view of that name is the alias.
 CREATE TABLE IF NOT EXISTS as4tainr.sql_aliases (
     library        text NOT NULL,

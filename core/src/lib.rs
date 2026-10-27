@@ -71,6 +71,7 @@ pub mod sqlfn;
 pub mod sqljson;
 pub mod sqljsonfn;
 pub mod sqlpl;
+pub mod sqlstmlist;
 pub mod sysapi;
 pub mod temporal;
 pub mod tn5250;

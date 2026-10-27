@@ -57,6 +57,14 @@ impl Job<'_> {
         authority::check(self.client, &self.user, &lib, &name, "*FILE", Aut::Use).await?;
         let ty = cmd.get("TYPE").to_ascii_uppercase();
         if cmd.get("OUTPUT").eq_ignore_ascii_case("*OUTFILE") {
+            // TYPE(*ATR) to an outfile is for one kind of file:
+            // FILEATR(*ALL) is CPD3006 (PUB400 2026-10-26, verify2 o_atr).
+            if ty == "*ATR" && cmd.get("FILEATR").eq_ignore_ascii_case("*ALL") {
+                bail!(
+                    "CPD3006: With TYPE(*ATR) and an outfile, FILEATR must name one kind of file, not *ALL.\n{}",
+                    crate::cl::CPF0006
+                );
+            }
             if ty != "*MBRLIST" {
                 return Err(crate::cl::value_error(&format!(
                     "OUTPUT(*OUTFILE) is done for TYPE(*MBRLIST) only, not TYPE({ty})."
@@ -375,8 +383,11 @@ impl Job<'_> {
                 ("MLSIZ2", size.to_string()),
             ]);
         }
-        crate::outfile::write(self, &outfile, &option, &crate::outfile::QAFDMBRL, &records).await?;
-        Ok(Outcome::Messages(vec![]))
+        let w = crate::outfile::write(self, &outfile, &option, &crate::outfile::QAFDMBRL, &records)
+            .await?;
+        let mut messages = w.messages.clone();
+        messages.push(crate::outfile::records_added(&w, records.len()));
+        Ok(Outcome::Messages(messages))
     }
 
     /// DSPFFD: a file's record format and its fields, in the layout of
@@ -408,8 +419,10 @@ impl Job<'_> {
                 break;
             }
         }
+        // DSPFFD's message for a file that is not there is CPF3012
+        // (PUB400 2026-10-26, verify2 o_atr_ffd).
         let Some((lib, row)) = found else {
-            bail!("CPF9812: File {name} in library {label} not found.");
+            bail!("CPF3012: There is no file {name} in library {label}.");
         };
         authority::check(self.client, &self.user, &lib, &name, "*FILE", Aut::Use).await?;
         let attr: String = row.get(0);

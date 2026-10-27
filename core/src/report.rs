@@ -44,6 +44,7 @@ pub fn at(fields: &[(usize, &str)]) -> String {
 
 /// The date and time a report shows: the job's date format and
 /// separators (system values QDATFMT, QDATSEP, QTIMSEP), from the clock.
+#[derive(Debug, Clone, Default)]
 pub struct Stamp {
     pub date: String,
     pub time: String,

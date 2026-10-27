@@ -414,6 +414,26 @@ pub async fn rewrite_system_time(client: &Client, libl: &[String], sql: &str) ->
                 .map(|f| f.alias.clone().unwrap_or_else(|| f.name.clone()))
                 .unwrap_or_else(|| n.to_string())
         };
+        // The times must not contain a column reference or a scalar
+        // fullselect (SQL Reference, table-reference, period-specification;
+        // PUB400 2026-10-26, verify2 w_asof: AS OF (SELECT MIN(...)) fails).
+        for v in [&t1, &t2] {
+            for t in crate::sql::tokenize(v)? {
+                let Tok::Word(w) = t else { continue };
+                let w = w.to_ascii_uppercase();
+                if w == "SELECT" {
+                    bail!("SQL0104: The time in FOR SYSTEM_TIME cannot be a fullselect.");
+                }
+                if file
+                    .file
+                    .fields
+                    .iter()
+                    .any(|f| f.name == w || f.alias.as_deref() == Some(w.as_str()))
+                {
+                    bail!("SQL0104: The time in FOR SYSTEM_TIME cannot name column {w}.");
+                }
+            }
+        }
         let (bc, ec) = (col(&b), col(&e));
         // A string is a timestamp in any of Db2's formats (TIMESTAMP()).
         let (t1, t2) = (format!("TIMESTAMP({t1})"), format!("TIMESTAMP({t2})"));
@@ -460,5 +480,387 @@ pub async fn rewrite_system_time(client: &Client, libl: &[String], sql: &str) ->
         k = j;
     }
     out.extend((copied..toks.len()).map(|i| text(&toks[i])));
+    Ok(out)
+}
+
+/// What a statement becomes before it is translated: `*` without the
+/// IMPLICITLY HIDDEN columns (`expand_hidden`), then FOR SYSTEM_TIME
+/// table references (`rewrite_system_time`).
+pub async fn rewrite(client: &Client, libl: &[String], sql: &str) -> Result<String> {
+    let sql = expand_hidden(client, libl, sql).await?;
+    let sql = long_timestamp_chars(client, libl, &sql).await?;
+    rewrite_system_time(client, libl, &sql).await
+}
+
+/// CHAR(column) of a TIMESTAMP(p) column with more than 6 fractional
+/// digits: all p digits (PUB400 2026-10-26, verify2 w_cur: CHAR of a
+/// TIMESTAMP(12) row end is 9999-12-30-00.00.00.000000000000).
+/// PostgreSQL keeps 6, so the rest are zeros. The column is found by
+/// name among the library list's files (one length for the name).
+async fn long_timestamp_chars(client: &Client, libl: &[String], sql: &str) -> Result<String> {
+    if !sql.to_ascii_uppercase().contains("CHAR") || libl.is_empty() {
+        return Ok(sql.to_string());
+    }
+    use crate::sql::Tok;
+    let rows = client
+        .query(
+            "SELECT upper(coalesce(alias, name)), min(length), max(length) FROM as4tainr.file_fields
+              WHERE library = ANY($1) AND data_type = 'Z' AND length > 26
+              GROUP BY 1",
+            &[&libl],
+        )
+        .await?;
+    if rows.is_empty() {
+        return Ok(sql.to_string());
+    }
+    let long: std::collections::HashMap<String, i32> = rows
+        .iter()
+        .filter(|r| r.get::<_, i32>(1) == r.get::<_, i32>(2))
+        .map(|r| (r.get::<_, String>(0), r.get::<_, i32>(1)))
+        .collect();
+    let toks = crate::sql::tokenize(sql)?;
+    let text = |t: &Tok| match t {
+        Tok::Space(s) | Tok::Word(s) | Tok::Number(s) | Tok::Punct(s) => s.clone(),
+        Tok::Str(s) => format!("'{}'", s.replace('\'', "''")),
+        Tok::Quoted(s) => format!("\"{}\"", s.replace('"', "\"\"")),
+    };
+    let sig: Vec<usize> = (0..toks.len())
+        .filter(|&i| !matches!(toks[i], Tok::Space(_)))
+        .collect();
+    let word = |k: usize| match sig.get(k).map(|&i| &toks[i]) {
+        Some(Tok::Word(w)) => w.to_ascii_uppercase(),
+        _ => String::new(),
+    };
+    let punct =
+        |k: usize, p: &str| matches!(sig.get(k).map(|&i| &toks[i]), Some(Tok::Punct(q)) if q == p);
+    let mut out = String::new();
+    let mut at = 0;
+    let mut k = 0;
+    while k < sig.len() {
+        // CHAR ( name ) or CHAR ( q . name ), not after a dot.
+        if word(k) == "CHAR" && punct(k + 1, "(") && !(k > 0 && punct(k - 1, ".")) {
+            let (name_at, close) = if punct(k + 3, ".") {
+                (k + 4, k + 5)
+            } else {
+                (k + 2, k + 3)
+            };
+            if punct(close, ")") {
+                if let Some(len) = long.get(&word(name_at)) {
+                    out.extend((at..sig[k]).map(|i| text(&toks[i])));
+                    let inner: String = (sig[k]..=sig[close]).map(|i| text(&toks[i])).collect();
+                    out.push_str(&format!("RPAD({inner}, {len}, '0')"));
+                    at = sig[close] + 1;
+                    k = close + 1;
+                    continue;
+                }
+            }
+        }
+        k += 1;
+    }
+    out.extend((at..toks.len()).map(|i| text(&toks[i])));
+    Ok(out)
+}
+
+/// Names (system and SQL) of the files that have IMPLICITLY HIDDEN
+/// columns.
+async fn hidden_names(client: &Client) -> Result<Vec<String>> {
+    let rows = client
+        .query(
+            "SELECT DISTINCT f.name, COALESCE(f.sql_name, '')
+               FROM as4tainr.file_fields ff
+               JOIN as4tainr.files f ON f.library = ff.library AND f.name = ff.file
+              WHERE ff.hidden",
+            &[],
+        )
+        .await?;
+    let mut out = Vec::new();
+    for r in rows {
+        let a: String = r.get(0);
+        let b: String = r.get(1);
+        out.push(a.to_ascii_uppercase());
+        if !b.is_empty() {
+            out.push(b.to_ascii_uppercase());
+        }
+    }
+    Ok(out)
+}
+
+/// Words that end a FROM clause (at its own level).
+const FROM_END: &[&str] = &[
+    "WHERE",
+    "GROUP",
+    "HAVING",
+    "ORDER",
+    "UNION",
+    "EXCEPT",
+    "INTERSECT",
+    "FETCH",
+    "LIMIT",
+    "OFFSET",
+    "WINDOW",
+    "OPTIMIZE",
+];
+
+/// Words that are not a correlation name after a table name.
+const NOT_CORRELATION: &[&str] = &[
+    "WHERE",
+    "GROUP",
+    "HAVING",
+    "ORDER",
+    "UNION",
+    "EXCEPT",
+    "INTERSECT",
+    "FETCH",
+    "LIMIT",
+    "OFFSET",
+    "WINDOW",
+    "OPTIMIZE",
+    "FOR",
+    "JOIN",
+    "INNER",
+    "LEFT",
+    "RIGHT",
+    "FULL",
+    "CROSS",
+    "EXCEPTION",
+    "ON",
+    "USING",
+    "WITH",
+];
+
+/// `*` and `name.*` in a select list, for tables with IMPLICITLY HIDDEN
+/// columns: the columns that are not hidden, by name (Db2 for i SQL
+/// Reference, CREATE TABLE, IMPLICITLY HIDDEN: "not visible in SQL
+/// statements unless referred to explicitly by name"; PUB400 2026-10-26,
+/// verify2 w_star: a table made from SELECT * has no hidden columns).
+/// Only select lists whose table references are tables or views by name
+/// are changed (a nested table expression or a common table expression
+/// keeps `*`: fidelity-gaps).
+pub async fn expand_hidden(client: &Client, libl: &[String], sql: &str) -> Result<String> {
+    if !sql.contains('*') {
+        return Ok(sql.to_string());
+    }
+    use crate::sql::Tok;
+    let names = hidden_names(client).await?;
+    if names.is_empty() {
+        return Ok(sql.to_string());
+    }
+    let toks = crate::sql::tokenize(sql)?;
+    if !toks.iter().any(|t| match t {
+        Tok::Word(w) => names.contains(&w.to_ascii_uppercase()),
+        Tok::Quoted(q) => names.contains(q),
+        _ => false,
+    }) {
+        return Ok(sql.to_string());
+    }
+    let text = |t: &Tok| match t {
+        Tok::Space(s) | Tok::Word(s) | Tok::Number(s) | Tok::Punct(s) => s.clone(),
+        Tok::Str(s) => format!("'{}'", s.replace('\'', "''")),
+        Tok::Quoted(s) => format!("\"{}\"", s.replace('"', "\"\"")),
+    };
+    let sig: Vec<usize> = (0..toks.len())
+        .filter(|&i| !matches!(toks[i], Tok::Space(_)))
+        .collect();
+    let n = sig.len();
+    let up = |k: usize| match toks.get(*sig.get(k).unwrap_or(&usize::MAX)) {
+        Some(Tok::Word(w)) => w.to_ascii_uppercase(),
+        _ => String::new(),
+    };
+    let punct = |k: usize, p: &str| matches!(sig.get(k).and_then(|&i| toks.get(i)), Some(Tok::Punct(q)) if q == p);
+    let name = |k: usize| match sig.get(k).and_then(|&i| toks.get(i)) {
+        Some(Tok::Word(w)) => Some(w.to_ascii_uppercase()),
+        Some(Tok::Quoted(q)) => Some(q.clone()),
+        _ => None,
+    };
+    // The parenthesis depth of each significant token.
+    let mut depth = vec![0i32; n];
+    let mut d = 0;
+    for (k, dk) in depth.iter_mut().enumerate() {
+        if punct(k, ")") {
+            d -= 1;
+        }
+        *dk = d;
+        if punct(k, "(") {
+            d += 1;
+        }
+    }
+    // (first, last significant token, replacement)
+    let mut repl: Vec<(usize, usize, String)> = Vec::new();
+    for k in 0..n {
+        if up(k) != "SELECT" {
+            continue;
+        }
+        let d = depth[k];
+        let mut f = k + 1;
+        while f < n && depth[f] >= d && !(depth[f] == d && up(f) == "FROM") {
+            f += 1;
+        }
+        if f >= n || depth[f] != d || up(f) != "FROM" {
+            continue;
+        }
+        // `*` and `q.*` items of the select list.
+        let item_start = |m: usize| {
+            m == k + 1
+                || punct(m - 1, ",")
+                || (matches!(up(m - 1).as_str(), "DISTINCT" | "ALL") && m - 1 == k + 1)
+        };
+        let mut stars: Vec<(usize, usize, Option<String>)> = Vec::new();
+        for (m, &dm) in depth.iter().enumerate().take(f).skip(k + 1) {
+            if dm != d || !punct(m, "*") || !(m + 1 == f || punct(m + 1, ",")) {
+                continue;
+            }
+            if item_start(m) {
+                stars.push((m, m, None));
+            } else if m >= k + 3 && punct(m - 1, ".") && item_start(m - 2) {
+                if let Some(q) = name(m - 2) {
+                    stars.push((m - 2, m, Some(q)));
+                }
+            }
+        }
+        if stars.is_empty() {
+            continue;
+        }
+        // The table references: (library, name, correlation name).
+        let mut refs: Vec<(Option<String>, String, Option<String>)> = Vec::new();
+        let mut known = true;
+        let mut m = f + 1;
+        'refs: while m < n && depth[m] >= d {
+            let Some(mut tname) = name(m).filter(|_| depth[m] == d) else {
+                known = false;
+                break;
+            };
+            m += 1;
+            let mut lib = None;
+            if (punct(m, ".") || punct(m, "/")) && name(m + 1).is_some() {
+                lib = Some(tname);
+                tname = name(m + 1).unwrap();
+                m += 2;
+            }
+            if punct(m, "(") {
+                // A table function.
+                known = false;
+                break;
+            }
+            let mut corr = None;
+            if up(m) == "FOR" && up(m + 1) == "SYSTEM_TIME" {
+                // A period specification: its correlation name, if any,
+                // is not looked for (an unqualified `*` still works).
+                m += 2;
+            } else if up(m) == "AS" {
+                corr = name(m + 1);
+                m += 2;
+            } else if let Some(c) = name(m) {
+                if !NOT_CORRELATION.contains(&c.as_str()) {
+                    corr = Some(c);
+                    m += 1;
+                }
+            }
+            refs.push((lib, tname, corr));
+            // On to the next table reference (a comma or JOIN), past ON
+            // conditions and period specifications.
+            while m < n && depth[m] >= d {
+                if depth[m] == d {
+                    if punct(m, ",") || up(m) == "JOIN" {
+                        m += 1;
+                        continue 'refs;
+                    }
+                    if FROM_END.contains(&up(m).as_str())
+                        || punct(m, ";")
+                        || (up(m) == "FOR" && up(m + 1) != "SYSTEM_TIME")
+                    {
+                        break 'refs;
+                    }
+                }
+                m += 1;
+            }
+        }
+        if refs.is_empty() {
+            continue;
+        }
+        // The columns of each reference (None: not a file by name, e.g.
+        // a common table expression).
+        let mut cols: Vec<Option<(Vec<String>, bool)>> = Vec::new();
+        for (lib, tname, _) in &refs {
+            let q = match lib {
+                Some(l) => format!("{l}/{tname}"),
+                None => tname.clone(),
+            };
+            cols.push(
+                crate::catalog::resolve_sql_file(client, libl, &q)
+                    .await
+                    .ok()
+                    .map(|f| {
+                        let hidden = f.file.fields.iter().any(|x| x.hidden);
+                        let c = f
+                            .file
+                            .fields
+                            .iter()
+                            .filter(|x| !x.hidden)
+                            .map(|x| x.alias.clone().unwrap_or_else(|| x.name.clone()))
+                            .collect();
+                        (c, hidden)
+                    }),
+            );
+        }
+        let exposed = |r: &(Option<String>, String, Option<String>)| {
+            r.2.clone().unwrap_or_else(|| r.1.clone())
+        };
+        for (first, last, q) in stars {
+            let s = match q {
+                None => {
+                    if !known || cols.iter().any(|c| c.is_none()) {
+                        continue;
+                    }
+                    if !cols.iter().any(|c| c.as_ref().unwrap().1) {
+                        continue;
+                    }
+                    if refs.len() == 1 {
+                        cols[0].as_ref().unwrap().0.join(", ")
+                    } else {
+                        refs.iter()
+                            .zip(&cols)
+                            .flat_map(|(r, c)| {
+                                let e = exposed(r);
+                                c.as_ref()
+                                    .unwrap()
+                                    .0
+                                    .iter()
+                                    .map(move |x| format!("{e}.{x}"))
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                }
+                Some(q) => {
+                    let Some((r, Some((c, true)))) =
+                        refs.iter().zip(&cols).find(|(r, _)| exposed(r) == q)
+                    else {
+                        continue;
+                    };
+                    let e = exposed(r);
+                    c.iter()
+                        .map(|x| format!("{e}.{x}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            };
+            if !s.is_empty() {
+                repl.push((first, last, s));
+            }
+        }
+    }
+    if repl.is_empty() {
+        return Ok(sql.to_string());
+    }
+    repl.sort_by_key(|r| r.0);
+    let mut out = String::new();
+    let mut at = 0;
+    for (first, last, s) in repl {
+        out.extend((at..sig[first]).map(|i| text(&toks[i])));
+        out.push_str(&s);
+        at = sig[last] + 1;
+    }
+    out.extend((at..toks.len()).map(|i| text(&toks[i])));
     Ok(out)
 }

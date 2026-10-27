@@ -70,12 +70,12 @@ run() {
 step "Northwind database"
 "$bin" put "$work/nwdb/create-northwind-schema.sql" /home/northwind/create.sql
 "$bin" put "$work/nwdb/insert-data-northwind-db2.sql" /home/northwind/insert.sql
-run "RUNSQLSTM SRCSTMF('/home/northwind/create.sql') COMMIT(*NONE) NAMING(*SQL) ERRLVL(30)" | tail -1
-run "RUNSQLSTM SRCSTMF('/home/northwind/insert.sql') COMMIT(*NONE) NAMING(*SQL) ERRLVL(30)" | tail -1
+"$bin" system -s "RUNSQLSTM SRCSTMF('/home/northwind/create.sql') COMMIT(*NONE) NAMING(*SQL) ERRLVL(30)" | tail -1
+"$bin" system -s "RUNSQLSTM SRCSTMF('/home/northwind/insert.sql') COMMIT(*NONE) NAMING(*SQL) ERRLVL(30)" | tail -1
 
 step "Northwind application (README: Install)"
 "$bin" put "$work/nwapp" /home/me/northwind-ibmi
-run "RUNSQLSTM SRCSTMF('/home/me/northwind-ibmi/qsqlsrc/nwidrst.sql') COMMIT(*NONE)" | tail -1
+"$bin" system -s "RUNSQLSTM SRCSTMF('/home/me/northwind-ibmi/qsqlsrc/nwidrst.sql') COMMIT(*NONE)" | tail -1
 run "CRTLIB NWAPP"
 run "CRTSRCPF NWAPP/QCLLESRC RCDLEN(92)"
 run "CPYFRMSTMF FROMSTMF('/home/me/northwind-ibmi/qcllesrc/nwbuild.clle') TOMBR('/QSYS.LIB/NWAPP.LIB/QCLLESRC.FILE/NWBUILD.MBR') MBROPT(*REPLACE)"
@@ -101,7 +101,7 @@ done
 # view ORDAUDJV shows the same change.
 "$bin" --libl COM022LIB system "CALL COM022LIB/SETUPJRN" | tail -1
 "$bin" --libl COM022LIB system "CALL COM022LIB/ADDTRG" | tail -1
-"$bin" --libl COM022LIB system "RUNSQLSTM SRCFILE(COM022LIB/QSQLSRC) SRCMBR(ORDAUDJV) COMMIT(*NONE)" | tail -1
+"$bin" --libl COM022LIB system -s "RUNSQLSTM SRCFILE(COM022LIB/QSQLSRC) SRCMBR(ORDAUDJV) COMMIT(*NONE)" | tail -1
 "$bin" --libl COM022LIB sql "UPDATE ORDHDR SET STATUS = STATUS WHERE ORDNO = 10001"
 "$bin" --libl COM022LIB sql "SELECT ORDNO, ACTION FROM ORDAUD"
 "$bin" --libl COM022LIB sql "SELECT ORDNO, ACTION, AUDSRC FROM ORDAUDJV"
@@ -151,7 +151,7 @@ step "Company System (makefile: BIN_LIB=CMPSYS)"
   cd "$work/cmpsys" || exit 1
   export AS4TAINR_CURLIB=CMPSYS AS4TAINR_LIBL=CMPSYS,QGPL,QTEMP
   b="$(cd "$OLDPWD" && cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
-  s() { "$b" system "$1" 2>&1 | grep -E "^(CPF|CPD|RNS9310|SQL[0-9])|created in|with errors" | grep -v "^ "; }
+  s() { "$b" system -s "$1" 2>&1 | grep -E "^(CPF|CPD|RNS9310|SQL[0-9])|created in|with errors" | grep -v "^ "; }
   s "CRTLIB LIB(CMPSYS)"
   s "RUNSQLSTM SRCSTMF('qsqlsrc/employee.table') COMMIT(*NONE)"
   s "RUNSQLSTM SRCSTMF('qsqlsrc/department.table') COMMIT(*NONE)"

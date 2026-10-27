@@ -258,6 +258,9 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("Name, *NONE")
             .keyword_only(),
+            p("OUTPUT", Kind::Name, false, Some("*PRINT"), "Listing output")
+                .ch("*PRINT, *NONE")
+                .keyword_only(),
         ],
     },
     CommandDef {
@@ -1851,6 +1854,9 @@ pub static COMMANDS: &[CommandDef] = &[
             p("OUTFILE", Kind::Qualified, false, None, "File to receive output").ch("Name"),
             p("OUTMBR", Kind::List, false, Some("*FIRST *REPLACE"), "Output member options")
                 .ch("*FIRST, *REPLACE, *ADD"),
+            p("FILEATR", Kind::Name, false, Some("*ALL"), "File attributes")
+                .ch("*ALL, *PF, *LF, *DSPF, *PRTF, *SAVF, *DDMF, *TAPF, *DKTF, *ICFF")
+                .keyword_only(),
         ],
     },
     CommandDef {

@@ -3267,7 +3267,16 @@ async fn create_trigger_run(ctx: &mut Ctx<'_>, t: &Trigger) -> Result<String> {
                     let f = catalog::resolve_sql_file(ctx.client, &libl, &name)
                         .await
                         .map_err(|_| anyhow!("SQL0204: {name} not found."))?;
-                    let cols: Vec<String> = f.file.fields.iter().map(|fd| fd.column()).collect();
+                    // IMPLICITLY HIDDEN columns are left out (PUB400 2026-10-26,
+        // verify2 w_ins_nocols: five values for a table of eight columns,
+        // three hidden).
+        let cols: Vec<String> = f
+            .file
+            .fields
+            .iter()
+            .filter(|fd| !fd.hidden)
+            .map(|fd| fd.column())
+            .collect();
                     text.insert_str(*at, &format!(" ({})", cols.join(", ")));
                 }
                 code.push_str(text.trim().trim_end_matches(';'));
@@ -4173,14 +4182,39 @@ fn declared_temporary_table(sql: &str) -> Option<String> {
 /// quoted names and comments (`--` to the end of the line, `/* */`).
 /// Comments are left out; empty statements are skipped.
 pub fn split_statements(script: &str) -> Vec<String> {
+    split_statements_at(script)
+        .into_iter()
+        .map(|(s, _, _)| s)
+        .collect()
+}
+
+/// `split_statements` with where each statement starts: the line and
+/// column (from 1) of its first character that is not a blank, a
+/// comment before it included (RUNSQLSTM's listing gives a statement
+/// the record of the comment lines before it: PUB400 2026-10-26,
+/// verify2 w_rb, record 1 for an INSERT on line 2 after a comment).
+pub fn split_statements_at(script: &str) -> Vec<(String, usize, usize)> {
     let cs: Vec<char> = script.chars().collect();
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut i = 0;
     let mut blocks = 0i32;
     let mut cases = 0i32;
+    let mut start: Option<usize> = None;
+    let place = |at: usize| -> (usize, usize) {
+        let line = cs[..at].iter().filter(|c| **c == '\n').count() + 1;
+        let bol = cs[..at]
+            .iter()
+            .rposition(|c| *c == '\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        (line, at - bol + 1)
+    };
     while i < cs.len() {
         let c = cs[i];
+        if start.is_none() && !c.is_whitespace() && !(c == ';' && blocks == 0) {
+            start = Some(i);
+        }
         if c == '-' && cs.get(i + 1) == Some(&'-') {
             while i < cs.len() && cs[i] != '\n' {
                 i += 1;
@@ -4256,16 +4290,19 @@ pub fn split_statements(script: &str) -> Vec<String> {
         }
         if c == ';' && blocks == 0 {
             if !cur.trim().is_empty() {
-                out.push(cur.trim().to_string());
+                let (l, col) = place(start.unwrap_or(i));
+                out.push((cur.trim().to_string(), l, col));
             }
             cur.clear();
+            start = None;
         } else {
             cur.push(c);
         }
         i += 1;
     }
     if !cur.trim().is_empty() {
-        out.push(cur.trim().to_string());
+        let (l, col) = place(start.unwrap_or(0));
+        out.push((cur.trim().to_string(), l, col));
     }
     out
 }
@@ -5029,6 +5066,20 @@ fn title(kind: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    // RUNSQLSTM's listing gives a statement the record and position of
+    // its first character, a comment before it included (PUB400
+    // 2026-10-26, tools/golden/verify2.txt w_rb: records 1 and 3 for an
+    // INSERT after a comment on line 1, and a ROLLBACK on line 3).
+    #[test]
+    fn statements_with_their_places() {
+        let s = "-- note\ninsert into t values (1);\nrollback;\n  commit;";
+        let p = split_statements_at(s);
+        let at: Vec<(usize, usize)> = p.iter().map(|x| (x.1, x.2)).collect();
+        assert_eq!(at, [(1, 1), (3, 1), (4, 3)]);
+        assert_eq!(p[1].0, "rollback");
+    }
+
     use super::*;
 
     #[test]

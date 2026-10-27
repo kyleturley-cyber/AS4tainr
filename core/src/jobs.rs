@@ -266,6 +266,15 @@ pub fn message_id(text: &str) -> &str {
     }
 }
 
+/// A message's text without the message ID before it.
+pub fn message_text(text: &str) -> &str {
+    if message_id(text).is_empty() {
+        text
+    } else {
+        text[8..].trim_start()
+    }
+}
+
 /// The escape message's ID in an error's text: the messages of a failed
 /// command are its diagnostics, one per line, then the escape message
 /// (e.g. "CPD0030: ...\nCPF0006: ..."), so the last line with an ID.

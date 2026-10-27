@@ -204,6 +204,8 @@ def main():
     subprocess.run([bin_, "system", "CRTLIB LIB(%s)" % a.lib], env=env, capture_output=True)
     subprocess.run([bin_, "system", "MKDIR DIR('/home/%s')" % a.home], env=env, capture_output=True)
     env["AS4TAINR_LIBL"] = "%s,%s" % (a.lib, env["AS4TAINR_LIBL"])
+    # The capture's library is the user's current library there too.
+    env["AS4TAINR_CURLIB"] = a.lib
 
     report = []
     counts = {"same": 0, "different": 0, "missing": 0, "clean-room": 0}

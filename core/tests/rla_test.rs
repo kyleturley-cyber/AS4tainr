@@ -9796,9 +9796,12 @@ async fn screens_round4_reports_and_pdm() {
     assert_ne!(o.status, 0, "{o:?}");
     let o = sys!(format!("DLTF FILE({lib}/SCR4SRC)"));
     assert_eq!(o.status, 0, "{o:?}");
+    // DSPFFD of a file that is not there: CPF3012 (PUB400 2026-10-26,
+    // tools/golden/verify2.txt o_atr_ffd; this test expected CPF9812,
+    // which no capture showed).
     let o = sys!(format!("DSPFFD FILE({lib}/SCR4SRC)"));
     assert!(
-        o.stderr.join("\n").contains("CPF9812") || o.stdout.join("\n").contains("CPF9812"),
+        o.stderr.join("\n").contains("CPF3012") || o.stdout.join("\n").contains("CPF3012"),
         "{o:?}"
     );
 }
@@ -15806,12 +15809,26 @@ async fn dspobjd_and_dspfd_outfiles() {
         ]
     };
     assert_eq!(got, [row("A1", "CLLE", "first"), row("B2", "RPGLE", "")]);
-    // Only TYPE(*MBRLIST) goes to an output file here.
+    // TYPE(*ATR) to an outfile with FILEATR(*ALL), the default: CPD3006
+    // (PUB400 2026-10-26, tools/golden/verify2.txt o_atr).
     let e = run_in(
         &client,
         &url,
         &lib,
         &format!("DSPFD FILE({lib}/QOSRC) TYPE(*ATR) OUTPUT(*OUTFILE) OUTFILE({lib}/ATRS)"),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(e.starts_with("CPD3006"), "{e}");
+    // Only TYPE(*MBRLIST) goes to an output file here.
+    let e = run_in(
+        &client,
+        &url,
+        &lib,
+        &format!(
+            "DSPFD FILE({lib}/QOSRC) TYPE(*ATR) FILEATR(*PF) OUTPUT(*OUTFILE) OUTFILE({lib}/ATRS)"
+        ),
     )
     .await
     .unwrap_err()
@@ -15901,9 +15918,11 @@ async fn system_period_temporal_tables() {
         "insert into {lib}.tgrp (grp, seq, cmd) values('G1', 1, 'DSPLIBL')"
     ))
     .await;
+    // CHAR of the TIMESTAMP(12) row end has 12 fractional digits (PUB400
+    // 2026-10-26, tools/golden/verify2.txt w_cur).
     assert_eq!(
         rows(format!("select audit_oper, char(sys_end) from {lib}.tgrp")).await,
-        ["I|9999-12-30-00.00.00.000000"]
+        ["I|9999-12-30-00.00.00.000000000000"]
     );
     let first = rows(format!("select char(sys_start) from {lib}.tgrp")).await;
     change(format!("update {lib}.tgrp set cmd = 'WRKACTJOB'")).await;
@@ -15990,4 +16009,303 @@ async fn system_period_temporal_tables() {
         .unwrap()
         .get(0);
     assert_eq!(left, 0);
+}
+
+/// What PUB400 showed for the verify2 round (IBM i 7.5, 2026-10-26,
+/// tools/golden/verify2.txt): RUNSQLSTM COMMIT(*NONE) refuses COMMIT and
+/// ROLLBACK with SQL7007 (severity 30), stops there and fails with
+/// SQL9010, and its listing shows each statement's message and record
+/// (w_rb: SQL7956 for the INSERT at record 1, SQL7007 at record 3; the
+/// summary 2 total, 1 info, 1 severe); IMPLICITLY HIDDEN columns are left
+/// out of an INSERT without columns (w_ins_nocols: five values for eight
+/// columns, three hidden; w_ins_nocols3: three values fail) and of
+/// SELECT * (w_star: a table made from it has five columns); FOR
+/// SYSTEM_TIME takes no scalar fullselect (w_asof) and needs a temporal
+/// table (w_notemporal); DSPOBJD and DSPFD OUTPUT(*OUTFILE) send CPF9861
+/// and CPF9862 when they make the file, DSPFD also CPF3030 each time,
+/// DSPOBJD without OUTFILE is CPD9861 (o_objd, o_objd_again, o_mbrl,
+/// o_mbrl_pf, o_objd_nofile); a DSPOBJD record's bytes per unit is 512,
+/// the ASP numbers 1 and change by API allowed (o_objd_vals); the other
+/// model files' field counts and record lengths are DSPFFD's (m_*).
+#[tokio::test]
+async fn verify2_runsqlstm_hidden_columns_and_outfiles() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    job.run(&format!(
+        "RUNSQL SQL('CREATE TABLE {lib}/GLDTO (SEQ INTEGER GENERATED ALWAYS AS IDENTITY, ID CHAR(10), VAL VARCHAR(1000))') COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
+    source::create_file(&client, &lib, "QSQLSRC", "")
+        .await
+        .unwrap();
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QSQLSRC".into(),
+            name: "GLDRB".into(),
+            srctype: "SQL".into(),
+            text: String::new(),
+            source: format!(
+                "-- COMMIT and ROLLBACK with COMMIT(*NONE).\ninsert into {lib}.GLDTO (ID, VAL) values ('RB1', 'before rollback');\nrollback;\ninsert into {lib}.GLDTO (ID, VAL) values ('RB2', 'after rollback');\ncommit;\n"
+            ),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    let e = job
+        .run(&format!(
+            "RUNSQLSTM SRCFILE({lib}/QSQLSRC) SRCMBR(GLDRB) COMMIT(*NONE)"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("SQL9010") && e.contains("SQL7007"), "{e}");
+    let ids = as4tainr_core::sql::run(
+        &client,
+        &url,
+        std::slice::from_ref(&lib),
+        &format!("SELECT RTRIM(ID) FROM {lib}.GLDTO ORDER BY SEQ"),
+    )
+    .await
+    .unwrap();
+    let as4tainr_core::sql::Outcome::Rows { rows, .. } = ids else {
+        panic!("{ids:?}")
+    };
+    assert_eq!(rows, [["RB1".to_string()]]);
+    let l = &job.calls.printed;
+    assert!(
+        l.iter()
+            .any(|x| x.starts_with("SQL7956   0       1  Position 1 ")),
+        "{l:#?}"
+    );
+    assert!(
+        l.iter()
+            .any(|x| x.starts_with("SQL7007  30       3  Position 1 ")),
+        "{l:#?}"
+    );
+    assert!(
+        l.iter()
+            .any(|x| x == "      2        1         0          0        1         0"),
+        "{l:#?}"
+    );
+    assert!(l
+        .iter()
+        .any(|x| x == "30 level severity errors found in source"));
+    // The same script under commitment control (COMMIT(*CHG), the
+    // default) is not refused for ROLLBACK by SQL7007.
+    let e = job
+        .run(&format!("RUNSQLSTM SRCFILE({lib}/QSQLSRC) SRCMBR(GLDRB)"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!e.contains("SQL7007"), "{e}");
+
+    // A temporal table with hidden columns, as gldtmp.sql makes it.
+    let script = format!(
+        "set schema = {lib};
+         create table GLDTMP (GRP char(10) not null, SEQ int not null, CMD varchar(100) not null,
+           AUDIT_USER varchar(128) generated always as (SESSION_USER),
+           AUDIT_OPER char(1) generated always as (data change operation),
+           SYS_START timestamp(12) not null generated always as row begin,
+           SYS_END timestamp(12) not null generated always as row end,
+           TS_ID timestamp(12) not null generated always as transaction start id,
+           period system_time (SYS_START, SYS_END));
+         create table GLDTMP_HST like GLDTMP;
+         alter table GLDTMP add versioning use history table GLDTMP_HST on delete add extra row;
+         alter table GLDTMP
+           alter column SYS_START set implicitly hidden
+           alter column SYS_END set implicitly hidden
+           alter column TS_ID set implicitly hidden;"
+    );
+    let lines = job
+        .run_sql_script(&script, "test", 0, Some(lib.clone()), true)
+        .await
+        .unwrap();
+    assert!(!lines.iter().any(|l| l.contains(": SQL")), "{lines:?}");
+    let sql = |s: String| {
+        let client = &client;
+        let url = url.clone();
+        let lib = lib.clone();
+        async move { as4tainr_core::sql::run(client, &url, &[lib], &s).await }
+    };
+    sql(format!(
+        "INSERT INTO {lib}.GLDTMP VALUES('G2', 1, 'DSPJOB', DEFAULT, DEFAULT)"
+    ))
+    .await
+    .unwrap();
+    assert!(sql(format!(
+        "INSERT INTO {lib}.GLDTMP VALUES('G3', 1, 'WRKSPLF')"
+    ))
+    .await
+    .is_err());
+    match sql(format!("SELECT * FROM {lib}.GLDTMP")).await.unwrap() {
+        as4tainr_core::sql::Outcome::Rows { columns, .. } => {
+            assert_eq!(columns, ["GRP", "SEQ", "CMD", "AUDIT_USER", "AUDIT_OPER"])
+        }
+        other => panic!("{other:?}"),
+    }
+    // Named, a hidden column is there.
+    match sql(format!("SELECT T.*, CHAR(SYS_END) FROM {lib}.GLDTMP T"))
+        .await
+        .unwrap()
+    {
+        as4tainr_core::sql::Outcome::Rows { columns, rows, .. } => {
+            assert_eq!(columns.len(), 6, "{columns:?}");
+            assert_eq!(rows[0][5], "9999-12-30-00.00.00.000000000000");
+        }
+        other => panic!("{other:?}"),
+    }
+    job.run(&format!(
+        "RUNSQL SQL('CREATE TABLE {lib}/GLDTSTAR AS (SELECT * FROM {lib}/GLDTMP) WITH NO DATA') COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
+    let n: i64 = client
+        .query_one(
+            "SELECT count(*) FROM as4tainr.file_fields WHERE library = $1 AND file = 'GLDTSTAR'",
+            &[&lib],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 5);
+    let e = sql(format!(
+        "SELECT CMD FROM {lib}.GLDTMP FOR SYSTEM_TIME AS OF (SELECT MIN(SYS_START) FROM {lib}.GLDTMP_HST)"
+    ))
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("fullselect"), "{e}");
+    assert!(sql(format!(
+        "SELECT VAL FROM {lib}.GLDTO FOR SYSTEM_TIME AS OF CURRENT TIMESTAMP"
+    ))
+    .await
+    .is_err());
+    // FROM ... TO with constants still works (w_fromto: the current row).
+    match sql(format!(
+        "SELECT COUNT(*) FROM {lib}.GLDTMP FOR SYSTEM_TIME FROM '2000-01-01-00.00.00' TO '9999-12-30-00.00.00' T"
+    ))
+    .await
+    .unwrap()
+    {
+        as4tainr_core::sql::Outcome::Rows { rows, .. } => assert_eq!(rows, [["1".to_string()]]),
+        other => panic!("{other:?}"),
+    }
+
+    // Output files: the messages.
+    job.run(&format!(
+        "CRTDTAARA DTAARA({lib}/GLDODA) TYPE(*CHAR) LEN(10) TEXT('outfile golden')"
+    ))
+    .await
+    .unwrap();
+    let ids = |o: Outcome| -> Vec<String> {
+        match o {
+            Outcome::Messages(m) => m
+                .iter()
+                .map(|x| as4tainr_core::jobs::message_id(x).to_string())
+                .collect(),
+            other => panic!("{other:?}"),
+        }
+    };
+    let objd = format!(
+        "DSPOBJD OBJ({lib}/GLDODA) OBJTYPE(*DTAARA) OUTPUT(*OUTFILE) OUTFILE({lib}/GLDOBJ)"
+    );
+    assert_eq!(ids(job.run(&objd).await.unwrap()), ["CPF9861", "CPF9862"]);
+    assert!(ids(job.run(&objd).await.unwrap()).is_empty());
+    let e = job
+        .run(&format!(
+            "DSPOBJD OBJ({lib}/GLDODA) OBJTYPE(*DTAARA) OUTPUT(*OUTFILE)"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPD9861") && e.contains("CPF0006"), "{e}");
+    let r = client
+        .query_one(
+            &format!(
+                "SELECT odbpun::text, odaapi, odaspl::text, odlasn::text FROM {}.gldobj",
+                lib.to_ascii_lowercase()
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let got: Vec<String> = (0..4).map(|i| r.get(i)).collect();
+    assert_eq!(got, ["512", "1", "1", "1"]);
+    source::create_file(&client, &lib, "GLDWSRC", "")
+        .await
+        .unwrap();
+    for m in ["A1", "B2"] {
+        job.run(&format!(
+            "ADDPFM FILE({lib}/GLDWSRC) MBR({m}) SRCTYPE(CLLE)"
+        ))
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        ids(job
+            .run(&format!(
+                "DSPFD FILE({lib}/GLDWSRC) TYPE(*MBRLIST) OUTPUT(*OUTFILE) OUTFILE({lib}/GLDMBR)"
+            ))
+            .await
+            .unwrap()),
+        ["CPF9861", "CPF9862", "CPF3030"]
+    );
+    match job
+        .run(&format!(
+            "DSPFD FILE({lib}/GLDTO) TYPE(*MBRLIST) OUTPUT(*OUTFILE) OUTFILE({lib}/GLDMBR) OUTMBR(*FIRST *ADD)"
+        ))
+        .await
+        .unwrap()
+    {
+        Outcome::Messages(m) => {
+            assert_eq!(m.len(), 1, "{m:?}");
+            assert!(m[0].starts_with("CPF3030: 1 records"), "{m:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // The models made at catalog initialization.
+    for (file, fields, len) in [
+        ("QADSPFFD", 102i64, 1066i64),
+        ("QADSPDBR", 16, 372),
+        ("QAFDBASI", 48, 199),
+        ("QAFDMBR", 155, 906),
+        ("QAFDPHY", 98, 3992),
+        ("QAFDACCP", 33, 130),
+        ("QAFDRFMT", 53, 290),
+    ] {
+        let r = client
+            .query_one(
+                "SELECT count(*), coalesce(sum(CASE WHEN data_type = 'P' THEN length / 2 + 1
+                                                    WHEN varlen THEN length + 2 ELSE length END), 0)::bigint
+                   FROM as4tainr.file_fields WHERE library = 'QSYS' AND file = $1",
+                &[&file],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (r.get::<_, i64>(0), r.get::<_, i64>(1)),
+            (fields, len),
+            "{file}"
+        );
+    }
 }

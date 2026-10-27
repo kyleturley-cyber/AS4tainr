@@ -2094,7 +2094,7 @@ pub async fn run_as(
         }));
     }
     let libraries = catalog::list_libraries(client).await?;
-    let sql = &crate::temporal::rewrite_system_time(client, libl, sql).await?;
+    let sql = &crate::temporal::rewrite(client, libl, sql).await?;
     let t = translate(sql, &|n| libraries.iter().any(|l| l == n))?;
     let mut text = system_column_names(client, libl, &t.sql).await?;
     if let Some((target, at)) = &t.insert_needs_columns {
@@ -2110,7 +2110,16 @@ pub async fn run_as(
         let f = catalog::resolve_sql_file(client, libl, &name)
             .await
             .map_err(|_| anyhow!("SQL0204: {name} not found."))?;
-        let cols: Vec<String> = f.file.fields.iter().map(|fd| fd.column()).collect();
+        // IMPLICITLY HIDDEN columns are left out (PUB400 2026-10-26,
+        // verify2 w_ins_nocols: five values for a table of eight columns,
+        // three hidden).
+        let cols: Vec<String> = f
+            .file
+            .fields
+            .iter()
+            .filter(|fd| !fd.hidden)
+            .map(|fd| fd.column())
+            .collect();
         text.insert_str(*at, &format!(" ({})", cols.join(", ")));
     }
     let path: Vec<String> = libl.iter().map(|l| ident(l)).collect();
@@ -2616,7 +2625,7 @@ impl Session {
     /// Run one statement (host variables already in it as literals).
     /// `catalog_client` reads file descriptions (INSERT without columns).
     pub async fn exec(&self, catalog_client: &Client, sql: &str) -> Result<Exec> {
-        let sql = &crate::temporal::rewrite_system_time(catalog_client, &self.libl, sql).await?;
+        let sql = &crate::temporal::rewrite(catalog_client, &self.libl, sql).await?;
         let t = translate(sql, &|n| self.libraries.iter().any(|l| l == n))?;
         let mut text = system_column_names(catalog_client, &self.libl, &t.sql).await?;
         if let Some((target, at)) = &t.insert_needs_columns {
@@ -2631,7 +2640,16 @@ impl Session {
             let f = catalog::resolve_sql_file(catalog_client, &self.libl, &name)
                 .await
                 .map_err(|_| anyhow!("SQL0204: {name} not found."))?;
-            let cols: Vec<String> = f.file.fields.iter().map(|fd| fd.column()).collect();
+            // IMPLICITLY HIDDEN columns are left out (PUB400 2026-10-26,
+            // verify2 w_ins_nocols: five values for a table of eight columns,
+            // three hidden).
+            let cols: Vec<String> = f
+                .file
+                .fields
+                .iter()
+                .filter(|fd| !fd.hidden)
+                .map(|fd| fd.column())
+                .collect();
             text.insert_str(*at, &format!(" ({})", cols.join(", ")));
         }
         // Under commitment control: on the definition's session, inside a
@@ -2811,6 +2829,7 @@ pub async fn create_view(
     check_option: bool,
 ) -> Result<()> {
     let libraries = catalog::list_libraries(client).await?;
+    let query = &crate::temporal::rewrite(client, libl, query).await?;
     let t = translate(query, &|n| libraries.iter().any(|l| l == n))?;
     if t.kind != Kind::Query {
         bail!("SQL0104: a view is defined by a query (SELECT).");
@@ -2944,6 +2963,7 @@ pub(crate) async fn query_fields(
     query: &str,
 ) -> Result<Vec<crate::dds::FieldDef>> {
     let libraries = catalog::list_libraries(client).await?;
+    let query = &crate::temporal::rewrite(client, libl, query).await?;
     let t = translate(query, &|n| libraries.iter().any(|l| l == n))?;
     if t.kind != Kind::Query {
         bail!("SQL0104: a query (SELECT) is expected after AS.");

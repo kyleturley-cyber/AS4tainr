@@ -55,7 +55,12 @@ pub fn listing(input: &Input, msgs: &[Msg], stamp: &Stamp) -> Vec<String> {
             format!("PAGE {page:>5}")
         };
         crate::report::at(&[
-            (1, "5770SS1 V7R5M0 220415"),
+            // The product line names as4tainr (report.rs), in IBM's
+            // columns: product and release, one blank, the level.
+            (
+                1,
+                &format!("{} {}", crate::report::PRODUCT, crate::report::LEVEL),
+            ),
             (37, "Run SQL Statements"),
             (68, &input.name),
             (103, &format!("{} {}", stamp.date, stamp.time)),
@@ -236,9 +241,10 @@ mod tests {
             text: "x".into(),
         }];
         let l = listing(&input, &msgs, &stamp);
+        // IBM's columns; the product line is as4tainr's (report.rs).
         assert_eq!(
             l[0],
-            "5770SS1 V7R5M0 220415               Run SQL Statements             GLDRB                              26-10-26 23:45:35   PAGE   1"
+            "AS4T001 V0R1M0 261021               Run SQL Statements             GLDRB                              26-10-26 23:45:35   PAGE   1"
         );
         assert_eq!(
             l[1],
@@ -249,7 +255,7 @@ mod tests {
         assert!(l.contains(&"  Minimum divide scale....0".to_string()));
         assert!(l.contains(&"  resolution..............*DFT".to_string()));
         let p2 = l.iter().position(|x| x.ends_with("PAGE     2")).unwrap();
-        assert!(l[p2].starts_with("5770SS1 V7R5M0 220415               Run SQL Statements"));
+        assert!(l[p2].starts_with("AS4T001 V0R1M0 261021               Run SQL Statements"));
         assert_eq!(l[p2 + 2], "      1 rollback;");
         // A record over 80 characters goes on with the same number
         // (w_script record 17).

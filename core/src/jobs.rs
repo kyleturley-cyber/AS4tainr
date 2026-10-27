@@ -491,7 +491,9 @@ pub async fn find(client: &Client, spec: &JobSpec) -> Result<JobInfo> {
         _ => spec.name.clone(),
     };
     match rows.len() {
-        0 => bail!("Job {shown} not found."),
+        // CPF3342 (PUB400 2026-10-26, tools/golden/spool-job.txt j_joblog:
+        // CPYSPLF of a job that is gone).
+        0 => bail!("CPF3342: There is no job {shown}."),
         1 => Ok(job_row(&rows[0])),
         _ if spec.number.is_some() => Ok(job_row(&rows[0])),
         n => bail!("{n} jobs are named {shown}; give the job number as well (number/user/name)."),

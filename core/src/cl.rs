@@ -1554,6 +1554,28 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "CPYSPLF",
+        description: "Copy Spooled File",
+        params: &[
+            p("FILE", Kind::Name, true, None, "Spooled file").ch("Name"),
+            p("TOFILE", Kind::Qualified, true, None, "To data base file").ch("Name"),
+            p("JOB", Kind::Text, false, Some("*"), "Job name").ch("*, number/user/name"),
+            p(
+                "SPLNBR",
+                Kind::Text,
+                false,
+                Some("*ONLY"),
+                "Spooled file number",
+            )
+            .ch("1-999999, *ONLY, *LAST"),
+            p("TOMBR", Kind::Name, false, Some("*FIRST"), "To member").ch("Name, *FIRST"),
+            p("MBROPT", Kind::Name, false, Some("*REPLACE"), "Replace or add records")
+                .ch("*REPLACE, *ADD"),
+            p("CTLCHAR", Kind::Name, false, Some("*NONE"), "Control character")
+                .ch("*NONE, *FCFC"),
+        ],
+    },
+    CommandDef {
         name: "DLTSPLF",
         description: "Delete Spooled File",
         params: &[
@@ -4150,8 +4172,8 @@ pub static GROUPS: &[Group] = &[
         item: "Spooled file commands",
         title: "Spooled File Commands",
         commands: &[
-            "WRKSPLF", "DSPSPLF", "DLTSPLF", "HLDSPLF", "RLSSPLF", "CHGSPLFA", "WRKSPLFA",
-            "WRKOUTQ", "CRTOUTQ", "DLTOUTQ", "CLROUTQ", "HLDOUTQ", "RLSOUTQ",
+            "WRKSPLF", "DSPSPLF", "DLTSPLF", "CPYSPLF", "HLDSPLF", "RLSSPLF", "CHGSPLFA",
+            "WRKSPLFA", "WRKOUTQ", "CRTOUTQ", "DLTOUTQ", "CLROUTQ", "HLDOUTQ", "RLSOUTQ",
         ],
     },
     Group {

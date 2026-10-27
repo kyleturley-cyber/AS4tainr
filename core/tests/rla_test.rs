@@ -16804,3 +16804,94 @@ insert into {sch}.NOSUCHTBL values (1);
     );
     job.run(&format!("DLTLIB LIB({sch})")).await.unwrap();
 }
+
+/// CPYSPLF (CL reference, Copy Spooled File): the spooled file's lines as
+/// records of a physical file of one field (CRTPF RCDLEN), replaced or
+/// added (MBROPT); CTLCHAR(*FCFC) puts the first-character forms control
+/// before each line ('1' starts a page). A job that is not there is
+/// CPF3342 (PUB400 2026-10-26, tools/golden/spool-job.txt j_joblog).
+#[tokio::test]
+async fn cpysplf_copies_lines() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let id = as4tainr_core::jobs::start_interactive(
+        &client,
+        &format!("P{}", &lib[1..]),
+        "QSECOFR",
+        None,
+        std::slice::from_ref(&lib),
+    )
+    .await
+    .unwrap();
+    use as4tainr_core::commands::{Environment, Job};
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: Some(id),
+        calls: Default::default(),
+    };
+    job.run(&format!("CRTPF FILE({lib}/SPLCPY) RCDLEN(132)"))
+        .await
+        .unwrap();
+    // A spooled file of the job: two pages.
+    let printed: Vec<String> = ["first SPLCPY line", "second line", "\x0c", "page two"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    as4tainr_core::spool::print_report(&client, job.id.as_ref().unwrap(), "GLDSPL", "", &printed)
+        .await
+        .unwrap();
+    let spl: String = client
+        .query_one(
+            "SELECT file FROM as4tainr.spooled_files WHERE job = $1 ORDER BY id DESC LIMIT 1",
+            &[&job.id.as_ref().unwrap().number],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let copy = |opt: &str| format!("CPYSPLF FILE({spl}) TOFILE({lib}/SPLCPY) SPLNBR(*LAST) {opt}");
+    job.run(&copy("")).await.unwrap();
+    let t = format!("{}.splcpy", lib.to_ascii_lowercase());
+    let lines: Vec<String> = client
+        .query(&format!("SELECT * FROM {t} ORDER BY rrn"), &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<_, String>(1))
+        .collect();
+    assert!(lines.len() > 3, "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("SPLCPY")), "{lines:?}");
+    // *ADD with *FCFC: the same lines again, each after its control
+    // character, the first a '1'.
+    job.run(&copy("MBROPT(*ADD) CTLCHAR(*FCFC)")).await.unwrap();
+    let n: i64 = client
+        .query_one(&format!("SELECT count(*) FROM {t}"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(n as usize, 2 * lines.len());
+    let first: String = client
+        .query_one(
+            &format!("SELECT * FROM {t} ORDER BY rrn OFFSET $1 LIMIT 1"),
+            &[&(lines.len() as i64)],
+        )
+        .await
+        .unwrap()
+        .get(1);
+    assert!(first.starts_with('1'), "{first:?}");
+    let e = job
+        .run(&format!(
+            "CPYSPLF FILE({spl}) TOFILE({lib}/SPLCPY) JOB(999999/QSECOFR/NOSUCH)"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF3342"), "{e}");
+}

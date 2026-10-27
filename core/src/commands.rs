@@ -665,6 +665,7 @@ impl Job<'_> {
             "WRKSPLF" => self.wrksplf(&cmd).await,
             "DSPSPLF" => self.dspsplf(&cmd).await,
             "DLTSPLF" => self.dltsplf(&cmd).await,
+            "CPYSPLF" => self.cpysplf(&cmd).await,
             other => bail!("CPD0030: Command {other} is not implemented yet."),
         }
     }
@@ -4204,6 +4205,48 @@ impl Job<'_> {
             t => t.to_string(),
         };
         d.text = text.clone();
+        // The listing's messages (PUB400 2026-10-26, verify1 v_crtcmd and
+        // qsh q_crtcmd): CPD079A, severity 10, for each CRTCMD parameter
+        // the CMD statement gives, in the reverse of CRTCMD's order;
+        // CPD0250, severity 20, for an optional *CHAR parameter without
+        // DFT.
+        let lines: Vec<String> = m.source.lines().map(str::to_string).collect();
+        let stmts = crate::cmdlist::statements(&lines);
+        let mut msgs = Vec::new();
+        if let Some(c) = stmts.iter().find(|s| s.command == "CMD") {
+            for kw in crate::cmdlist::OVERRIDABLE.iter().rev() {
+                if crate::cmdlist::gives(&c.text, kw) {
+                    msgs.push(crate::cmdlist::Msg {
+                        id: "CPD079A".into(),
+                        sev: 10,
+                        seq: crate::cmdlist::seq(c.first),
+                        text: format!("The CMD statement's {kw} replaces CRTCMD's value."),
+                        inline: true,
+                    });
+                }
+            }
+        }
+        for (s, p) in stmts
+            .iter()
+            .filter(|s| s.command == "PARM")
+            .zip(d.parms.iter())
+        {
+            if p.ty.eq_ignore_ascii_case("*CHAR")
+                && p.min == 0
+                && p.dft.is_none()
+                && p.constant.is_none()
+            {
+                msgs.push(crate::cmdlist::Msg {
+                    id: "CPD0250".into(),
+                    sev: 20,
+                    seq: crate::cmdlist::seq(s.first),
+                    text: format!("{} has no DFT: blanks are its default.", p.kwd),
+                    inline: false,
+                });
+            }
+        }
+        let crtcmd_vldckr = cmd.get("VLDCKR").to_ascii_uppercase();
+        let crtcmd_allow = cmd.get("ALLOW").to_ascii_uppercase();
         // The CMD statement's VLDCKR, MAXPOS, TEXT and ALLOW override
         // CRTCMD's (CL reference, "Command Definition (CMD)").
         let stmt = std::mem::take(&mut d.statement);
@@ -4238,9 +4281,53 @@ impl Job<'_> {
         crate::cmd::create(&mut c, &d, &text, cmd.get("REPLACE") != "*NO").await?;
         authority::set_owner(self.client, &lib, &name, "*CMD", &self.user).await?;
         // CPC0202 (PUB400 2026-10-23, tools/golden/qsh.txt q_crtcmd).
-        Ok(Outcome::Messages(vec![format!(
-            "CPC0202: Command {name} is now in library {lib}."
-        )]))
+        let done = format!("Command {name} is now in library {lib}.");
+        // The listing (cmdlist.rs): CRTCMD's own values on the first page.
+        let split = |q: &str| match q.split_once('/') {
+            Some((l, n)) => (l.to_string(), n.to_string()),
+            None => ("*LIBL".to_string(), q.to_string()),
+        };
+        let input = crate::cmdlist::Input {
+            name: name.clone(),
+            library: lib.clone(),
+            pgm: split(&pgm),
+            srcfile: (m.library.clone(), m.file.clone()),
+            member: m.name.clone(),
+            changed: m.changed_us.map(stamp_of_us),
+            vldckr: if crtcmd_vldckr.is_empty() {
+                "*NONE".into()
+            } else {
+                crtcmd_vldckr
+            },
+            mode: vec!["*PROD".into(), "*DEBUG".into(), "*SERVICE".into()],
+            allow: match crtcmd_allow.as_str() {
+                "" | "*ALL" => crate::cmdlist::ALL_ENVIRONMENTS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                a => a
+                    .split_whitespace()
+                    .map(|x| x.trim_matches(['(', ')']).to_string())
+                    .collect(),
+            },
+            maxpos: match cmd.get("MAXPOS") {
+                "" => "*NOMAX".into(),
+                v => v.to_ascii_uppercase(),
+            },
+            text: match cmd.get("TEXT") {
+                "*SRCMBRTXT" => m.text.clone(),
+                "*BLANK" | "" => String::new(),
+                t => t.to_string(),
+            },
+            replace: match cmd.get("REPLACE") {
+                "" => "*YES".into(),
+                v => v.to_ascii_uppercase(),
+            },
+            lines,
+        };
+        let printed = crate::cmdlist::listing(&input, &msgs, &done, &crate::report::Stamp::now());
+        self.print_listing(&name, printed).await?;
+        Ok(Outcome::Messages(vec![format!("CPC0202: {done}")]))
     }
 
     async fn dltcmd(&mut self, cmd: &Command) -> Result<Outcome> {
@@ -5952,7 +6039,7 @@ impl Job<'_> {
         }
         let job = self.job_named(cmd.get("JOB")).await?;
         let number = match cmd.get("SPLNBR") {
-            "*LAST" | "" => None,
+            "*LAST" | "*ONLY" | "" => None,
             n => Some(
                 n.parse::<i32>()
                     .map_err(|_| anyhow!("SPLNBR({n}) is not a number."))?,
@@ -5976,6 +6063,110 @@ impl Job<'_> {
             spool: Some(Box::new(view)),
             ..Default::default()
         }))
+    }
+
+    /// CPYSPLF (CL reference): the spooled file's lines as records of a
+    /// physical file with one character field (CRTPF RCDLEN) or of a
+    /// source member; MBROPT *REPLACE or *ADD; CTLCHAR(*FCFC) puts the
+    /// first-character forms control in front ('1' for a page's first
+    /// line, blank for the others). The lines are as the pages print,
+    /// blank lines included (fidelity-gaps).
+    async fn cpysplf(&mut self, cmd: &Command) -> Result<Outcome> {
+        let f = self.spooled_file(cmd).await?;
+        let pages = crate::spool::pages(self.client, f.id).await?;
+        let fcfc = cmd.get("CTLCHAR").eq_ignore_ascii_case("*FCFC");
+        let mut lines = Vec::new();
+        for page in &pages {
+            for (k, l) in page.iter().enumerate() {
+                lines.push(if fcfc {
+                    format!("{}{l}", if k == 0 { '1' } else { ' ' })
+                } else {
+                    l.clone()
+                });
+            }
+        }
+        let (libs, name) = self.search(cmd.get("TOFILE"));
+        let name = name.to_ascii_uppercase();
+        let add = cmd.get("MBROPT").eq_ignore_ascii_case("*ADD");
+        let mut source_lib = None;
+        for l in &libs {
+            if crate::source::is_source_file(self.client, l, &name).await? {
+                source_lib = Some(l.clone());
+                break;
+            }
+        }
+        if let Some(lib) = source_lib {
+            let mbr = match cmd.get("TOMBR").to_ascii_uppercase().as_str() {
+                "" | "*FIRST" => name.clone(),
+                m => m.to_string(),
+            };
+            let old =
+                crate::source::find_member(self.client, std::slice::from_ref(&lib), &name, &mbr)
+                    .await
+                    .ok();
+            let mut text = match (&old, add) {
+                (Some(o), true) if !o.source.is_empty() => format!("{}\n", o.source),
+                _ => String::new(),
+            };
+            text.push_str(&lines.join("\n"));
+            crate::source::put_member(
+                self.client,
+                &crate::source::Member {
+                    library: lib.clone(),
+                    file: name.clone(),
+                    name: mbr,
+                    srctype: old.as_ref().map(|o| o.srctype.clone()).unwrap_or_default(),
+                    text: old.as_ref().map(|o| o.text.clone()).unwrap_or_default(),
+                    source: text,
+                    ..Default::default()
+                },
+                true,
+            )
+            .await?;
+        } else {
+            let to = catalog::resolve_file(self.client, &libs, &name)
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "CPF9812: There is no file {name} to copy spooled file {} into.",
+                        f.file
+                    )
+                })?;
+            authority::check(
+                self.client,
+                &self.user,
+                &to.library,
+                &name,
+                "*FILE",
+                Aut::Change,
+            )
+            .await?;
+            let [field] = to.file.fields.as_slice() else {
+                bail!("CPF9898: File {name} has more than one field; CPYSPLF copies into a file of one character field here.");
+            };
+            let table = to.table();
+            if !add {
+                self.client
+                    .batch_execute(&format!("DELETE FROM {table}"))
+                    .await?;
+            }
+            let width = field.length as usize;
+            let sql = format!(
+                "INSERT INTO {table} ({}) SELECT rpad(l, {width}) FROM unnest($1::text[]) WITH ORDINALITY AS t(l, n) ORDER BY n",
+                field.column()
+            );
+            let cut: Vec<String> = lines
+                .iter()
+                .map(|l| l.chars().take(width).collect())
+                .collect();
+            self.client.execute(sql.as_str(), &[&cut]).await?;
+        }
+        Ok(Outcome::Messages(vec![format!(
+            "{} records of spooled file {} number {} were copied to file {name}.",
+            lines.len(),
+            f.file,
+            f.number
+        )]))
     }
 
     async fn dltsplf(&mut self, cmd: &Command) -> Result<Outcome> {

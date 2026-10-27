@@ -22,6 +22,7 @@ Each spooled file belongs to the job that made it and to that job's user. It is 
 | `WRKSPLF` | Your spooled files: file, user, output queue, user data, status, pages. Options 3 hold, 4 delete, 5 display, 6 release and 8 attributes (WRKSPLFA), at IBM i's columns; F11 shows each file's job, F5 refreshes |
 | `DSPSPLF FILE(QSYSPRT) JOB(number/user/name) SPLNBR(n)` | Shows the pages as printed in IBM i's viewer: the page and line of the first line shown, a Control field (T top, B bottom, +n/-n lines, Pn page n, Wn/W+n/W-n columns), a Find field (Enter or F16 looks for the next line with the text), 16 lines of 78 columns; F19/F20 move 78 columns |
 | `DLTSPLF FILE(...) JOB(...) SPLNBR(...)` | Deletes a spooled file |
+| `CPYSPLF FILE(...) TOFILE(...) TOMBR(...) MBROPT(*REPLACE\|*ADD) CTLCHAR(*NONE\|*FCFC)` | Copies a spooled file's lines into a file of one character field or a source member (docs/fidelity-gaps.md, CPYSPLF) |
 | `HLDSPLF`, `RLSSPLF` (FILE, JOB, SPLNBR) | Holds a ready file (status HLD) and releases it (RDY again) |
 | `CHGSPLFA FILE(...) OUTQ(lib/name) USRDTA(...)` | Moves a spooled file to another output queue, changes its user data (the other attributes are accepted and not kept) |
 | `CRTOUTQ OUTQ(lib/name)`, `DLTOUTQ`, `CLROUTQ`, `HLDOUTQ`, `RLSOUTQ` | Output queues: created (SEQ, DSPDTA, OPRCTL, TEXT kept), deleted when empty, cleared of their ready and held files, held (CPF3426 when already held) and released; CPF3357 when a queue is not found |
@@ -102,7 +103,7 @@ QGYOLSPL (format OSPL0300, filter OSPF0100) lists spooled files and keeps the li
 
 - **Formats and editing:** data formats `P`/`B`/`L`/`R` in O specs, the overflow indicators `OA`-`OG`; in DDS, fonts, CPI/LPI, BOX, LINE and barcodes are accepted and not printed.
 - **Printer settings:** `PRTCTL`; of OVRPRTF only `SPLFNAME`, `USRDTA`, `PAGESIZE` and `OVRFLW` are used.
-- **Output queues and writers:** `CPYSPLF`, writers (`STRPRTWTR`; a held output queue holds nothing back here, as there are no writers), remote output queues, the data queue of an output queue, `WRKSPLF`'s options 1 (send), 2 (change), 7 (messages) and 9 (printing status), and printing to a real printer or to PDF.
+- **Output queues and writers:** writers (`STRPRTWTR`; a held output queue holds nothing back here, as there are no writers), remote output queues, the data queue of an output queue, `WRKSPLF`'s options 1 (send), 2 (change), 7 (messages) and 9 (printing status), and printing to a real printer or to PDF.
 - **Unedited negative numbers** print with a trailing `-`. IBM i shows the sign in the last digit's zone.
 
 A compiler listing (CRTBNDCL, CRTBNDRPG... in an interactive or batch job) is a spooled file named after the program, with a spooled file page for each listing page: a new page starts at each page heading line (as on IBM i 7.5, where a CL listing of three pages is a spooled file of three pages in WRKSPLF).

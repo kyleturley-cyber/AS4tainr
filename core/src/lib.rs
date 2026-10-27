@@ -22,6 +22,7 @@ pub mod cl;
 pub mod cllist;
 pub mod clpgm;
 pub mod cmd;
+pub mod cmdlist;
 pub mod cmtctl;
 pub mod collate;
 pub mod commands;

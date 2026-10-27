@@ -1,0 +1,18 @@
+# Golden: what the older captures disagree on. Does `system` show the
+# DDS listing of a CRTPF or CRTLF that works (messages.txt f_crtlf did,
+# a later f_crtpf did not), and of one that fails (f_crtpf_dup did)?
+# A DDS error's listing (message IDs and severities).
+# CPYSPLF: its completion message, CTLCHAR(*FCFC), a to-file of two fields.
+# Capture with: golden.ps1 -List tools\golden\verify5.txt -Files tools\golden\verify5
+z_cleanup|!for f in GLD5LF GLD5PF GLD5BAD GLD5SRC; do system -q "DLTF FILE(AS4TRAINR1/$f)"; done; echo cleaned
+z_src|!system -q "CRTSRCPF FILE(AS4TRAINR1/GLD5SRC) RCDLEN(92)"; for m in gld5pf gld5lf gld5bad; do u=$(echo $m | tr a-z A-Z); system -q "ADDPFM FILE(AS4TRAINR1/GLD5SRC) MBR($u) SRCTYPE(PF)"; done; system -q "CHGPFM FILE(AS4TRAINR1/GLD5SRC) MBR(GLD5LF) SRCTYPE(LF)"; for f in gld5pf.pf gld5lf.lf gld5bad.pf; do m=$(echo ${f%.*} | tr a-z A-Z); system "CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/$f') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD5SRC.FILE/$m.MBR') MBROPT(*REPLACE)"; done
+z_crtpf|CRTPF FILE(AS4TRAINR1/GLD5PF) SRCFILE(AS4TRAINR1/GLD5SRC)
+z_crtpf_dup|CRTPF FILE(AS4TRAINR1/GLD5PF) SRCFILE(AS4TRAINR1/GLD5SRC)
+z_crtlf|CRTLF FILE(AS4TRAINR1/GLD5LF) SRCFILE(AS4TRAINR1/GLD5SRC)
+z_crtpf_bad|CRTPF FILE(AS4TRAINR1/GLD5BAD) SRCFILE(AS4TRAINR1/GLD5SRC)
+z_crtpf_nosrc|CRTPF FILE(AS4TRAINR1/GLD5PF) SRCFILE(AS4TRAINR1/GLD5SRC) OPTION(*NOSRC *NOLIST)
+# CPYSPLF in one job: a DSPFFD report copied as is, with *FCFC, and into a file of two fields
+z_cpysplf|!system -q "DLTF FILE(QTEMP/GLD5SP)"; system "CRTPF FILE(QTEMP/GLD5SP) RCDLEN(133)" >/dev/null; system "DSPFFD FILE(AS4TRAINR1/GLD5PF) OUTPUT(*PRINT)" >/dev/null; system "CPYSPLF FILE(QPDSPFFD) TOFILE(QTEMP/GLD5SP) SPLNBR(*LAST)"; system "CPYSPLF FILE(QPDSPFFD) TOFILE(QTEMP/GLD5SP) SPLNBR(*LAST) MBROPT(*ADD) CTLCHAR(*FCFC)"; system "CPYF FROMFILE(QTEMP/GLD5SP) TOFILE(*PRINT)"
+z_cpysplf_2f|!system "DSPFFD FILE(AS4TRAINR1/GLD5PF) OUTPUT(*PRINT)" >/dev/null; system "CPYSPLF FILE(QPDSPFFD) TOFILE(AS4TRAINR1/GLD5PF) SPLNBR(*LAST)"; system "CPYF FROMFILE(AS4TRAINR1/GLD5PF) TOFILE(*PRINT) OUTFMT(*HEX)"
+z_cpysplf_none|!system "DSPFFD FILE(AS4TRAINR1/GLD5PF) OUTPUT(*PRINT)" >/dev/null; system "CPYSPLF FILE(QPDSPFFD) TOFILE(AS4TRAINR1/GLD5NO) SPLNBR(*LAST)"
+z_end|!for f in GLD5LF GLD5PF GLD5BAD GLD5SRC; do system -q "DLTF FILE(AS4TRAINR1/$f)"; done; echo cleaned

@@ -1,0 +1,16 @@
+# Golden: CPYSPLF in one job. Under `system` a program's spooled files
+# are its print job's (spool s_dump, verify5 z_cpysplf), so the program
+# runs in batch and logs each CPYSPLF's message (ID and text) in GLD6LOG:
+# its completion message, CTLCHAR(*FCFC), a to-file of two fields.
+# Capture with: golden.ps1 -List tools\golden\verify6.txt -Files tools\golden\verify6
+c6_cleanup|!system -q "DLTPGM PGM(AS4TRAINR1/GLD6SPL)"; for f in GLD6TB GLD6SP GLD6LOG; do system -q "DLTF FILE(AS4TRAINR1/$f)"; done; echo cleaned
+c6_tag|!setccsid 819 /home/AS4TRAINR/gld/gld6spl.clle; ls /home/AS4TRAINR/gld/gld6spl.clle
+c6_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD6TB (ID CHAR(10) NOT NULL, VAL CHAR(60) NOT NULL)') COMMIT(*NONE)
+c6_log|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD6LOG (L VARCHAR(300) NOT NULL)') COMMIT(*NONE)
+c6_sp|CRTPF FILE(AS4TRAINR1/GLD6SP) RCDLEN(133)
+c6_crt|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD6SPL) SRCSTMF('/home/AS4TRAINR/gld/gld6spl.clle')"
+c6_sbm|!system "SBMJOB CMD(CALL PGM(AS4TRAINR1/GLD6SPL)) JOB(GLD6SPL)" >/dev/null; sleep 20; echo submitted
+c6_msgs|CPYF FROMFILE(AS4TRAINR1/GLD6LOG) TOFILE(*PRINT)
+c6_lines|CPYF FROMFILE(AS4TRAINR1/GLD6SP) TOFILE(*PRINT)
+c6_two|CPYF FROMFILE(AS4TRAINR1/GLD6TB) TOFILE(*PRINT)
+c6_end|!system -q "DLTPGM PGM(AS4TRAINR1/GLD6SPL)"; for f in GLD6TB GLD6SP GLD6LOG; do system -q "DLTF FILE(AS4TRAINR1/$f)"; done; echo cleaned

@@ -29,6 +29,7 @@ pub mod commands;
 pub mod cpyf;
 pub mod ddl;
 pub mod dds;
+pub mod ddslist;
 pub mod dspf;
 pub mod dtaara;
 pub mod dtaq;

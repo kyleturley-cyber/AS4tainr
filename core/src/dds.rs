@@ -1003,7 +1003,17 @@ pub fn parse_pf(file_name: &str, source: &str) -> Result<PhysicalFile> {
                         DataType::Char
                     }
                 } else {
-                    DataType::from_code(&type_txt).with_context(|| format!("line {lineno}"))?
+                    DataType::from_code(&type_txt).map_err(|e| {
+                        // CPD7419, severity 30, at the data type's position
+                        // (PUB400 2026-10-27, verify5 z_crtpf_bad).
+                        anyhow::Error::new(crate::ddslist::DdsError(crate::ddslist::Msg {
+                            id: Some("CPD7419".into()),
+                            sev: 30,
+                            line: lineno,
+                            pos: 35,
+                            text: e.to_string(),
+                        }))
+                    })?
                 };
                 let decimals = decimals.unwrap_or(0);
                 if data_type.is_numeric() && (length == 0 || length > 63 || decimals > length) {

@@ -7,7 +7,7 @@ Printed output on IBM i does not go straight to a printer. It becomes a **spoole
 | Source | Spooled file | User data |
 | --- | --- | --- |
 | An RPG program printing through a program-described printer file (O specs, `EXCEPT`) | the printer file's name, e.g. `QSYSPRT`, or OVRPRTF `SPLFNAME` | the program name, or OVRPRTF `USRDTA` |
-| A display command (`DSPPFM`, `DSPLIB`, `WRKOBJ`, ...) run in a batch job | `QSYSPRT` | the command name |
+| A display command (`DSPPFM`, `DSPLIB`, `WRKOBJ`, ...) run in a batch job or a CL program of a job | `QSYSPRT`; `QPDSPFFD` for DSPFFD and `QPDSPFD` for DSPFD (their printer files; the others' own printer files are not used yet, docs/fidelity-gaps.md) | the command name |
 | `DSPJOBLOG OUTPUT(*PRINT)`, `SIGNOFF LOG(*LIST)` | `QPJOBLOG` | the job name |
 | A batch job that ends abnormally | `QPJOBLOG` | the job name |
 

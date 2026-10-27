@@ -1937,6 +1937,9 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("Name"),
             p("SRCMBR", Kind::Name, false, Some("*FILE"), "Source member").ch("Name, *FILE"),
+            // The DDS listing's *NOSRC and *NOLIST (ddslist.rs).
+            p("OPTION", Kind::List, false, Some("*SRC *LIST"), "Source listing options")
+                .keyword_only(),
         ],
     },
     CommandDef {
@@ -4038,6 +4041,11 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*NONE, *NOCHK, *MAP, *DROP")
             .keyword_only(),
+            // TOFILE(*PRINT)'s form: *HEX is printed as *CHAR here
+            // (docs/fidelity-gaps.md).
+            p("OUTFMT", Kind::Name, false, Some("*CHAR"), "Print format")
+                .ch("*CHAR, *HEX")
+                .keyword_only(),
         ],
     },
 ];

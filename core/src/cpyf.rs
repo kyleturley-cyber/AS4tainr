@@ -97,7 +97,9 @@ impl Job<'_> {
         .await?;
         let to_q = cmd.get("TOFILE").to_ascii_uppercase();
         let mut records = Vec::new();
+        let mut rrns: Vec<i64> = Vec::new();
         if let Some(r) = source_records {
+            rrns = (1..=r.len() as i64).collect();
             records = r;
         } else {
             let mut reader = rla::OpenFile::new(from.clone());
@@ -107,6 +109,7 @@ impl Job<'_> {
                     break;
                 }
                 if let Some(rec) = r.record {
+                    rrns.push(r.rrn.unwrap_or(rrns.len() as i64 + 1));
                     records.push(rec);
                 }
             }
@@ -117,49 +120,49 @@ impl Job<'_> {
             records.len()
         );
         if to_q == "*PRINT" {
-            let widths: Vec<usize> = from
-                .file
-                .fields
-                .iter()
-                .map(|f| {
-                    records
-                        .iter()
-                        .map(|r| r.get(&f.name).map(|v| v.chars().count()).unwrap_or(0))
-                        .max()
-                        .unwrap_or(0)
-                        .max(f.name.len())
-                })
-                .collect();
-            let line = |vals: Vec<String>| -> String {
-                vals.iter()
-                    .zip(&widths)
-                    .map(|(v, w)| format!("{v:<w$}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    .trim_end()
-                    .to_string()
+            let attr: Option<String> = self
+                .client
+                .query_opt(
+                    "SELECT attribute FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+                    &[&from.library, &from_name],
+                )
+                .await?
+                .map(|r| r.get(0));
+            let logical = attr.as_deref().is_some_and(|a| a.starts_with("LF"));
+            let member = match cmd.get("FROMMBR").to_ascii_uppercase().as_str() {
+                "" | "*FIRST" | "*ALL" => from_name.clone(),
+                m => m.to_string(),
             };
-            let rows: Vec<String> = records
+            let images: Vec<(i64, String)> = records
                 .iter()
-                .map(|r| {
-                    line(
-                        fields
-                            .iter()
-                            .map(|f| r.get(f).cloned().unwrap_or_default())
-                            .collect(),
-                    )
-                })
+                .zip(&rrns)
+                .map(|(r, n)| (*n, printable(&record_image(&from.file, r))))
                 .collect();
-            // Printed: the completion message, then the records (observed
-            // on IBM i 7.5: CPC2955 first, then the listing).
-            let heading = line(fields.clone());
-            let mut print = vec![
-                copied,
-                format!("Copy File {}/{from_name}", from.library),
-                format!("Record format: {}", from.file.format),
-                heading.clone(),
-            ];
-            print.extend(rows.iter().cloned());
+            let print = print_listing(
+                &from.library,
+                &from_name,
+                &member,
+                &from.file.format,
+                record_length(&from.file),
+                logical,
+                &images,
+                &crate::report::Stamp::now(),
+            );
+            let copied = if records.is_empty() {
+                // CPC2957 (PUB400 2026-10-27, verify5 z_cpysplf_2f).
+                format!(
+                    "CPC2957: No records were copied from file {from_name} in library {}.",
+                    from.library
+                )
+            } else {
+                copied
+            };
+            let mut all = vec![copied];
+            all.extend(print);
+            let rows: Vec<String> = images
+                .iter()
+                .map(|(_, l)| l.trim_end().to_string())
+                .collect();
             return Ok(Outcome::Display(ListDisplay {
                 title: format!("Copy File {}/{from_name}", from.library),
                 info: vec![
@@ -167,9 +170,9 @@ impl Job<'_> {
                     ("Record format".into(), from.file.format.clone()),
                     ("Records copied".into(), records.len().to_string()),
                 ],
-                heading,
+                heading: String::new(),
                 rows,
-                print,
+                print: all,
                 ..Default::default()
             }));
         }
@@ -288,5 +291,201 @@ impl Job<'_> {
         }
         infos.push(copied);
         Ok(Outcome::Messages(infos))
+    }
+}
+
+/// A record's bytes in its record format (EBCDIC characters, zoned,
+/// packed and binary numbers), as a program or CPYF sees the buffer.
+pub fn record_image(f: &crate::dds::PhysicalFile, rec: &rla::Record) -> Vec<u8> {
+    use crate::rpg::data::{self, Fit, Value};
+    let mut img = Vec::new();
+    for fd in &f.fields {
+        let Some(t) = crate::rpg::program::program_type(fd, true, false) else {
+            continue;
+        };
+        let mut b = vec![data::BLANK; t.size()];
+        if let Some(text) = rec.get(&fd.name) {
+            let v = if t.is_numeric() {
+                crate::rpg::dec::Dec::parse(text.trim())
+                    .map(Value::Num)
+                    .ok()
+            } else {
+                Some(Value::str(text))
+            };
+            if let Some(v) = v {
+                let _ = data::store(&t, &v, &mut b, Fit::Truncate { half_adjust: false }, false);
+            }
+        }
+        img.extend(b);
+    }
+    img
+}
+
+/// The record length of a record format (the bytes of its fields).
+pub fn record_length(f: &crate::dds::PhysicalFile) -> usize {
+    f.fields
+        .iter()
+        .filter_map(|x| crate::rpg::program::program_type(x, true, false))
+        .map(|t| t.size())
+        .sum()
+}
+
+/// A record image as CPYF OUTFMT(*CHAR) prints it: its EBCDIC characters,
+/// the bytes that are not printable characters (below X'40', X'FF') as
+/// blanks (PUB400 2026-10-22, files-and-programs f_cpyf_print: a packed
+/// key printed as blanks).
+pub fn printable(img: &[u8]) -> String {
+    img.iter()
+        .map(|&b| {
+            if b < 0x40 || b == 0xFF {
+                ' '
+            } else {
+                crate::tn5250::ebcdic::decode(&[b])
+                    .chars()
+                    .next()
+                    .unwrap_or(' ')
+            }
+        })
+        .collect()
+}
+
+/// CPYF TOFILE(*PRINT)'s listing in IBM i 7.5's layout (PUB400
+/// 2026-10-22 files-and-programs f_cpyf_print, rpg-sql v_print,
+/// 2026-10-27 verify5 z_cpysplf_2f): a page header, the from-file, its
+/// member, record format and record length, the to-file; a ruler; each
+/// record's number (with the member number for a logical file) and its
+/// characters; the count line and the end line. 30 lines a page, the
+/// header and ruler repeated (v_print). The product line is as4tainr's.
+#[allow(clippy::too_many_arguments)]
+pub fn print_listing(
+    lib: &str,
+    file: &str,
+    member: &str,
+    format: &str,
+    reclen: usize,
+    logical: bool,
+    images: &[(i64, String)],
+    stamp: &crate::report::Stamp,
+) -> Vec<String> {
+    const PAGE: usize = 30;
+    let qualified = format!("{lib}/{file}");
+    let header = |page: usize| {
+        format!(
+            " {}  {}{:9}COPY FILE{:>34}  {member:<10}{:11}{} {}  Page{:>10}",
+            crate::report::PRODUCT,
+            crate::report::LEVEL,
+            "",
+            qualified,
+            "",
+            stamp.date,
+            stamp.time,
+            page
+        )
+    };
+    let ruler = format!(
+        " {}    RCDNBR  *...+... 1 ...+... 2 ...+... 3 ...+... 4 ...+... 5 ...+... 6 ...+... 7 ...+... 8 ...+... 9 ...+... 0",
+        if logical { "MBRNBR" } else { "      " }
+    );
+    let mut out = vec![
+        header(1),
+        format!(
+            " From file . . . . . :  {qualified:<26}Member  . . :  {member:<20}Record format . . . . . :  {format}"
+        ),
+        format!(" Record length . . . :  {reclen}"),
+        " To file . . . . . . :  *PRINT".to_string(),
+        ruler.clone(),
+    ];
+    let mut page = 1;
+    let mut on_page = out.len();
+    for (n, text) in images {
+        if on_page == PAGE {
+            page += 1;
+            out.push(header(page));
+            out.push(ruler.clone());
+            on_page = 2;
+        }
+        let mbr = if logical { "1" } else { "" };
+        out.push(format!("{mbr:>5}{n:>12}  {text}").trim_end().to_string());
+        on_page += 1;
+    }
+    out.push(format!(
+        " {} records copied to member or label *N in file QSYSPRT in library QSYS. 0 records excluded.",
+        images.len()
+    ));
+    out.push(format!(
+        "{:29}* * * * *   E N D   O F   C O M P U T E R   P R I N T O U T   * * * * *",
+        ""
+    ));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Expected lines: PUB400 (IBM i 7.5) 2026-10-22, files-and-programs
+    // f_cpyf_print (a keyed logical file over CODE 5P 0, NAME 20A; the
+    // product line is as4tainr's) and rpg-sql v_print (30 lines a page).
+    #[test]
+    fn print_layout() {
+        let stamp = crate::report::Stamp {
+            date: "26-10-22".into(),
+            time: "01:29:12".into(),
+            zone: String::new(),
+        };
+        let img = |s: &str| format!("   {s:<20}");
+        let l = print_listing(
+            "AS4TRAINR1",
+            "GOLDLF",
+            "GOLDLF",
+            "GOLDR",
+            23,
+            true,
+            &[(2, img("Alpha")), (1, img("Beta"))],
+            &stamp,
+        );
+        assert_eq!(
+            l[0],
+            format!(
+                " {}  {}         COPY FILE                 AS4TRAINR1/GOLDLF  GOLDLF               26-10-22 01:29:12  Page         1",
+                crate::report::PRODUCT,
+                crate::report::LEVEL
+            )
+        );
+        assert_eq!(l[1], " From file . . . . . :  AS4TRAINR1/GOLDLF         Member  . . :  GOLDLF              Record format . . . . . :  GOLDR");
+        assert_eq!(l[2], " Record length . . . :  23");
+        assert_eq!(l[3], " To file . . . . . . :  *PRINT");
+        assert_eq!(l[4], " MBRNBR    RCDNBR  *...+... 1 ...+... 2 ...+... 3 ...+... 4 ...+... 5 ...+... 6 ...+... 7 ...+... 8 ...+... 9 ...+... 0");
+        assert_eq!(l[5], "    1           2     Alpha");
+        assert_eq!(l[7], " 2 records copied to member or label *N in file QSYSPRT in library QSYS. 0 records excluded.");
+        assert_eq!(l[8], "                             * * * * *   E N D   O F   C O M P U T E R   P R I N T O U T   * * * * *");
+        let many: Vec<(i64, String)> = (1..=30).map(|n| (n, "x".to_string())).collect();
+        let l = print_listing("L", "F", "F", "F", 1, false, &many, &stamp);
+        // Page 1: header, 3 lines, ruler, 25 records; page 2: header,
+        // ruler, the next records (v_print).
+        assert_eq!(l[4], "           RCDNBR  *...+... 1 ...+... 2 ...+... 3 ...+... 4 ...+... 5 ...+... 6 ...+... 7 ...+... 8 ...+... 9 ...+... 0");
+        assert_eq!(l[5], "                1  x");
+        assert_eq!(l[29], "               25  x");
+        assert!(l[30].ends_with("Page         2"));
+        assert_eq!(l[32], "               26  x");
+    }
+
+    // A packed field's bytes print as blanks, characters as themselves
+    // (f_cpyf_print: CODE 5P 0 then NAME).
+    #[test]
+    fn packed_bytes_print_as_blanks() {
+        let pf = crate::dds::parse_pf(
+            "GOLDPF",
+            "     A          R GOLDR\n     A            CODE           5P 0\n     A            NAME          20A\n",
+        )
+        .unwrap();
+        let rec = rla::Record::from([
+            ("CODE".to_string(), "2".to_string()),
+            ("NAME".to_string(), "Alpha".to_string()),
+        ]);
+        let img = record_image(&pf, &rec);
+        assert_eq!(img.len(), 23);
+        assert_eq!(printable(&img).trim_end(), "   Alpha");
+        assert_eq!(record_length(&pf), 23);
     }
 }

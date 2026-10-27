@@ -2960,13 +2960,39 @@ impl Job<'_> {
         let mut c = runtime::connect_db(&self.env.database_url).await?;
         let msg = match cmd.def.name {
             "CRTPF" => {
-                let mut pf = crate::dds::parse_pf(&name, &m.source)?;
+                let mut pf = match crate::dds::parse_pf(&name, &m.source) {
+                    Ok(pf) => pf,
+                    Err(e) if !rcdlen => {
+                        return Err(self.dds_failed(cmd, &m, &lib, &name, true, e).await);
+                    }
+                    Err(e) => return Err(e),
+                };
                 match cmd.get("TEXT") {
                     "" | "*SRCMBRTXT" => {}
                     "*BLANK" => pf.text = String::new(),
                     t => pf.text = t.to_string(),
                 }
-                catalog::create_physical_file(&mut c, &lib, &pf).await?;
+                if let Err(e) = catalog::create_physical_file(&mut c, &lib, &pf).await {
+                    if !rcdlen {
+                        self.dds_listing(cmd, &m, &lib, &name, true, &[], &finals_of(&e), false)
+                            .await?;
+                    }
+                    return Err(e);
+                }
+                if !rcdlen {
+                    let done = format!("File {name} was created in library {lib}.");
+                    self.dds_listing(
+                        cmd,
+                        &m,
+                        &lib,
+                        &name,
+                        true,
+                        &[],
+                        &[("CPC7301".into(), 0, done)],
+                        true,
+                    )
+                    .await?;
+                }
                 if rcdlen {
                     self.client
                         .execute(
@@ -2988,8 +3014,32 @@ impl Job<'_> {
                 };
             }
             "CRTLF" => {
-                let lf = crate::dds::parse_lf(&name, &m.source)?;
-                catalog::create_logical_file(&mut c, &self.library_list(), &lib, &lf).await?;
+                let lf = match crate::dds::parse_lf(&name, &m.source) {
+                    Ok(lf) => lf,
+                    Err(e) => return Err(self.dds_failed(cmd, &m, &lib, &name, false, e).await),
+                };
+                if let Err(e) =
+                    catalog::create_logical_file(&mut c, &self.library_list(), &lib, &lf).await
+                {
+                    self.dds_listing(cmd, &m, &lib, &name, false, &[], &finals_of(&e), false)
+                        .await?;
+                    return Err(e);
+                }
+                let done = format!(
+                    "File {name} was created in library {lib} over {}.",
+                    lf.based_on
+                );
+                self.dds_listing(
+                    cmd,
+                    &m,
+                    &lib,
+                    &name,
+                    false,
+                    &[],
+                    &[("CPC7301".into(), 0, done)],
+                    true,
+                )
+                .await?;
                 // CPC7301 and CPC7305, as for a physical file (observed on
                 // IBM i 7.5).
                 authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
@@ -3012,6 +3062,128 @@ impl Job<'_> {
         };
         authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
         Ok(Outcome::Messages(vec![msg]))
+    }
+
+    /// CRTPF's and CRTLF's DDS listing (ddslist.rs), printed as IBM i 7.5
+    /// prints it for a file created, one that exists already and DDS with
+    /// errors (PUB400 2026-10-27, verify5 z_crtpf, z_crtpf_dup, z_crtlf,
+    /// z_crtpf_bad).
+    #[allow(clippy::too_many_arguments)]
+    async fn dds_listing(
+        &mut self,
+        cmd: &Command,
+        m: &crate::source::Member,
+        lib: &str,
+        name: &str,
+        physical: bool,
+        msgs: &[crate::ddslist::Msg],
+        finals: &[(String, u32, String)],
+        created: bool,
+    ) -> Result<()> {
+        let given: Vec<String> = cmd
+            .list("OPTION")
+            .iter()
+            .flat_map(|v| {
+                v.split_whitespace()
+                    .map(|x| x.to_ascii_uppercase())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let has = |a: &[&str]| given.iter().any(|g| a.contains(&g.as_str()));
+        let options = vec![
+            if has(&["*NOSRC", "*NOSOURCE"]) {
+                "*NOSOURCE"
+            } else {
+                "*SOURCE"
+            }
+            .to_string(),
+            if has(&["*NOLIST"]) {
+                "*NOLIST"
+            } else {
+                "*LIST"
+            }
+            .to_string(),
+            if has(&["*SECLVL"]) {
+                "*SECLVL"
+            } else {
+                "*NOSECLVL"
+            }
+            .to_string(),
+            if has(&["*EVENTF"]) {
+                "*EVENTF"
+            } else {
+                "*NOEVENTF"
+            }
+            .to_string(),
+        ];
+        let text = match cmd.get("TEXT") {
+            "" | "*SRCMBRTXT" => m.text.clone(),
+            "*BLANK" => String::new(),
+            t => t.to_string(),
+        };
+        let input = crate::ddslist::Input {
+            name: name.to_string(),
+            library: lib.to_string(),
+            attribute: if physical { "Physical" } else { "Logical" }.into(),
+            srcfile: (m.library.clone(), m.file.clone()),
+            member: m.name.clone(),
+            changed: m.changed_us.map(stamp_of_us),
+            options,
+            genlvl: "20".into(),
+            flag: "00".into(),
+            filetype: "*DATA".into(),
+            aut: "*LIBCRTAUT".into(),
+            replace: "*NO".into(),
+            text,
+            lines: m.source.lines().map(str::to_string).collect(),
+            physical,
+        };
+        let printed =
+            crate::ddslist::listing(&input, msgs, finals, created, &crate::report::Stamp::now());
+        if !printed.is_empty() {
+            self.print_listing(name, printed).await?;
+        }
+        Ok(())
+    }
+
+    /// DDS with an error: the listing with its message, then CPF7311 and
+    /// CPF7302 (PUB400 2026-10-27, verify5 z_crtpf_bad; the DDS message is
+    /// only in the listing there, as4tainr also puts it in CPF7311's text).
+    async fn dds_failed(
+        &mut self,
+        cmd: &Command,
+        m: &crate::source::Member,
+        lib: &str,
+        name: &str,
+        physical: bool,
+        e: anyhow::Error,
+    ) -> anyhow::Error {
+        let msg = crate::ddslist::message_of(&e);
+        let not = format!("File {name} was not created in library {lib}.");
+        if let Err(p) = self
+            .dds_listing(
+                cmd,
+                m,
+                lib,
+                name,
+                physical,
+                std::slice::from_ref(&msg),
+                &[("CPF7302".into(), 40, not.clone())],
+                false,
+            )
+            .await
+        {
+            return p;
+        }
+        let at = if msg.line > 0 {
+            format!(" (line {}: {})", msg.line, msg.text)
+        } else {
+            format!(" ({})", msg.text)
+        };
+        anyhow!(
+            "CPF7311: The DDS has errors of severity {} above the generation level 20{at}.\nCPF7302: {not}",
+            msg.sev
+        )
     }
 
     /// CRTBNDCL, CRTCLPGM, CRTBNDRPG, CRTSQLRPGI from a source member: the
@@ -7392,6 +7564,20 @@ fn listing_message(
 }
 
 /// A time in microseconds since 1970 (UTC) as a listing shows it.
+/// The messages of a failed create, for a listing's summary: each
+/// `ID: text` line, severity 40 (verify5 z_crtpf_dup: CPF5813 and CPF7302
+/// both 40).
+fn finals_of(e: &anyhow::Error) -> Vec<(String, u32, String)> {
+    format!("{e:#}")
+        .lines()
+        .filter_map(|l| {
+            let (id, text) = l.split_once(": ")?;
+            (id.len() == 7 && id.chars().all(|c| c.is_ascii_alphanumeric()))
+                .then(|| (id.to_string(), 40, text.to_string()))
+        })
+        .collect()
+}
+
 fn stamp_of_us(us: i64) -> crate::report::Stamp {
     let ((y, m, d), (h, mi, sec), _) = crate::rpg::dates::from_epoch_us(us);
     crate::report::Stamp::of((y, m, d), (h, mi, sec))

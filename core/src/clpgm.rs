@@ -4867,7 +4867,12 @@ async fn command(
                 // program's DSPOBJD OUTPUT(*PRINT)).
                 Outcome::Display(d) if !d.print.is_empty() => {
                     if let Some(id) = job.id.clone() {
-                        crate::spool::print_lines(job.client, &id, "QSYSPRT", &st.name, &d.print)
+                        // The command's own printer file when it has one
+                        // (DSPFFD QPDSPFFD, DSPFD QPDSPFD; PUB400
+                        // 2026-10-27, verify5 z_cpysplf: CPYSPLF
+                        // FILE(QPDSPFFD)), else QSYSPRT.
+                        let file = d.spool.as_ref().map_or("QSYSPRT", |v| v.file.as_str());
+                        crate::spool::print_lines(job.client, &id, file, &st.name, &d.print)
                             .await?;
                     } else {
                         job.calls.printed.extend(d.print.iter().cloned());

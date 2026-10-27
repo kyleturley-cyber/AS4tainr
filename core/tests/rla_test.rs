@@ -16457,7 +16457,10 @@ async fn verify2_runsqlstm_hidden_columns_and_outfiles() {
     ))
     .await
     .unwrap();
-    // CPYF of a source member (verify3 x_src: printed, no error).
+    // CPYF of a source member (verify3 x_src: printed, no error). A1 has
+    // no records here, so the completion message is CPC2957 (PUB400
+    // 2026-10-27, verify5 z_cpysplf_2f: no records copied); x_src's member
+    // had records (CPC2955).
     match job
         .run(&format!(
             "CPYF FROMFILE({lib}/GLDWSRC) TOFILE(*PRINT) FROMMBR(A1)"
@@ -16465,7 +16468,7 @@ async fn verify2_runsqlstm_hidden_columns_and_outfiles() {
         .await
         .unwrap()
     {
-        Outcome::Display(d) => assert!(d.print[0].starts_with("CPC2955"), "{:?}", d.print),
+        Outcome::Display(d) => assert!(d.print[0].starts_with("CPC2957"), "{:?}", d.print),
         other => panic!("{other:?}"),
     }
     assert_eq!(
@@ -16894,4 +16897,175 @@ async fn cpysplf_copies_lines() {
         .unwrap_err()
         .to_string();
     assert!(e.starts_with("CPF3342"), "{e}");
+}
+
+/// CRTPF's DDS listing and its DDS errors, CPYF TOFILE(*PRINT) of an
+/// empty file (PUB400 2026-10-27, tools/golden/verify5.txt): a file
+/// created prints the listing with its expanded source (z_crtpf); a data
+/// type that is not valid is CPD7419 at its position in the listing,
+/// and the command ends with CPF7311 then CPF7302 (z_crtpf_bad); a file
+/// that exists prints the listing too, ending CPF5813 and CPF7302
+/// (z_crtpf_dup); copying no records is CPC2957 (z_cpysplf_2f).
+#[tokio::test]
+async fn crtpf_dds_listing_and_cpyf_print() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let id = as4tainr_core::jobs::start_interactive(
+        &client,
+        &format!("D{}", &lib[1..]),
+        "QSECOFR",
+        None,
+        std::slice::from_ref(&lib),
+    )
+    .await
+    .unwrap();
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: Some(id),
+        calls: Default::default(),
+    };
+    job.run(&format!("CRTSRCPF FILE({lib}/GLD5SRC) RCDLEN(92)"))
+        .await
+        .unwrap();
+    for (m, src) in [
+        (
+            "GLD5PF",
+            "     A          R GLD5R\n     A            CODE           5P 0\n     A            NAME          20A\n     A          K CODE\n",
+        ),
+        ("GLD5BAD", "     A          R GLD5R\n     A            CODE           5X 0\n"),
+    ] {
+        as4tainr_core::source::put_member(
+            &client,
+            &as4tainr_core::source::Member {
+                library: lib.clone(),
+                file: "GLD5SRC".into(),
+                name: m.into(),
+                srctype: "PF".into(),
+                text: String::new(),
+                source: src.into(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .unwrap();
+    }
+    let ids = |o: Outcome| match o {
+        Outcome::Messages(m) => m
+            .iter()
+            .map(|l| l.split(':').next().unwrap_or("").to_string())
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    job.calls.printed.clear();
+    let o = job
+        .run(&format!("CRTPF FILE({lib}/GLD5PF) SRCFILE({lib}/GLD5SRC)"))
+        .await
+        .unwrap();
+    assert_eq!(ids(o), ["CPC7301", "CPC7305"]);
+    let p = std::mem::take(&mut job.calls.printed);
+    assert!(p.iter().any(|l| l.trim() == "Expanded Source"), "{p:#?}");
+    assert!(
+        p.contains(&"    300                    NAME          20A  B      COLHDG('NAME')                          20            4       4".to_string()),
+        "{p:#?}"
+    );
+    let e = job
+        .run(&format!("CRTPF FILE({lib}/GLD5PF) SRCFILE({lib}/GLD5SRC)"))
+        .await
+        .unwrap_err()
+        .to_string();
+    let got: Vec<&str> = e.lines().map(|l| &l[..7]).collect();
+    assert_eq!(got, ["CPF5813", "CPF7302"]);
+    let p = std::mem::take(&mut job.calls.printed);
+    assert!(p.iter().any(|l| l.trim() == "Messages"), "{p:#?}");
+    assert!(
+        p.iter().any(|l| l.starts_with("* CPF5813      40")),
+        "{p:#?}"
+    );
+    let e = job
+        .run(&format!("CRTPF FILE({lib}/GLD5BAD) SRCFILE({lib}/GLD5SRC)"))
+        .await
+        .unwrap_err()
+        .to_string();
+    let got: Vec<&str> = e.lines().map(|l| &l[..7]).collect();
+    assert_eq!(got, ["CPF7311", "CPF7302"]);
+    let p = std::mem::take(&mut job.calls.printed);
+    assert!(
+        p.contains(&"*                                  CPD7419-*".to_string()),
+        "{p:#?}"
+    );
+    assert!(
+        p.iter()
+            .any(|l| l.starts_with("* CPD7419      30        1")),
+        "{p:#?}"
+    );
+    // OPTION(*NOSRC *NOLIST): nothing printed (z_crtpf_nosrc).
+    let _ = job
+        .run(&format!(
+            "CRTPF FILE({lib}/GLD5PF) SRCFILE({lib}/GLD5SRC) OPTION(*NOSRC *NOLIST)"
+        ))
+        .await;
+    assert!(job.calls.printed.is_empty(), "{:#?}", job.calls.printed);
+    // DSPFFD's report in a CL program is spooled file QPDSPFFD, its
+    // printer file (verify5 z_cpysplf: CPYSPLF FILE(QPDSPFFD) of a DSPFFD
+    // OUTPUT(*PRINT)), which CPYSPLF copies.
+    job.run(&format!("CRTPF FILE({lib}/GLD5SP) RCDLEN(133)"))
+        .await
+        .unwrap();
+    job.run(&format!("CRTSRCPF FILE({lib}/QCLSRC)"))
+        .await
+        .unwrap();
+    as4tainr_core::source::put_member(
+        &client,
+        &as4tainr_core::source::Member {
+            library: lib.clone(),
+            file: "QCLSRC".into(),
+            name: "GLD5CL".into(),
+            srctype: "CLLE".into(),
+            text: String::new(),
+            source: format!(
+                "PGM\n  DSPFFD FILE({lib}/GLD5PF) OUTPUT(*PRINT)\n  CPYSPLF FILE(QPDSPFFD) TOFILE({lib}/GLD5SP) SPLNBR(*LAST)\nENDPGM\n"
+            ),
+            ..Default::default()
+        },
+        true,
+    )
+    .await
+    .unwrap();
+    job.run(&format!("CRTBNDCL PGM({lib}/GLD5CL) SRCFILE({lib}/QCLSRC)"))
+        .await
+        .unwrap();
+    job.run(&format!("CALL PGM({lib}/GLD5CL)")).await.unwrap();
+    let n: i64 = client
+        .query_one(
+            &format!("SELECT count(*) FROM {}.gld5sp", lib.to_ascii_lowercase()),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(n > 10, "{n}");
+    match job
+        .run(&format!("CPYF FROMFILE({lib}/GLD5PF) TOFILE(*PRINT)"))
+        .await
+        .unwrap()
+    {
+        Outcome::Display(d) => {
+            assert!(d.print[0].starts_with("CPC2957"), "{:?}", d.print);
+            assert!(d
+                .print
+                .iter()
+                .any(|l| l.starts_with(" 0 records copied to member or label *N in file QSYSPRT")));
+        }
+        other => panic!("{other:?}"),
+    }
 }

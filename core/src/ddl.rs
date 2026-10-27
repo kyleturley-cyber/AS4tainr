@@ -2730,6 +2730,10 @@ fn name_of(parts: &[String]) -> Result<Name> {
 }
 
 /// What a statement runs with.
+/// What a CREATE TABLE message adds when the table is journaled to the
+/// library's QSQJRN (RUNSQLSTM's listing tells SQL7950 from SQL7905 by it).
+pub const JOURNALED: &str = "It is journaled to QSQJRN.";
+
 pub struct Ctx<'a> {
     pub client: &'a mut Client,
     pub user: &'a str,
@@ -3516,6 +3520,9 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
             }
             catalog::create_library(ctx.client, lib, "").await?;
             authority::set_owner(ctx.client, "QSYS", lib, "*LIB", ctx.user).await?;
+            // The schema's journal QSQJRN, which its tables are journaled
+            // to (journal::create_schema_journal).
+            crate::journal::create_schema_journal(ctx.client, lib, ctx.user).await?;
             Ok(format!("Schema {lib} created."))
         }
         Ddl::Grant {
@@ -3740,10 +3747,17 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
                     }
                 }
             }
-            Ok(if sys == name.name {
+            let journaled =
+                crate::journal::journal_sql_table(ctx.client, &lib, &sys, ctx.user).await?;
+            let made = if sys == name.name {
                 format!("Table {sys} created in {lib}.")
             } else {
                 format!("Table {} created in {lib} (system name {sys}).", name.name)
+            };
+            Ok(if journaled {
+                format!("{made} {JOURNALED}")
+            } else {
+                made
             })
         }
         Ddl::CreateIndex {

@@ -29,8 +29,11 @@ CREATE TABLE IF NOT EXISTS as4tainr.temporal_tables (
 -- Arguments: history table (quoted, qualified), its schema and name, the
 -- row begin and row end columns, Y for the extra row, then (column, what
 -- it holds) pairs for the auditing columns.
+-- UPDATE and DELETE need the table and its history table journaled
+-- (SQL7008 naming the one that is not, history table first: PUB400
+-- 2026-10-27, tools/golden/verify3.txt x_errors; SQLSTATE 55019).
 CREATE OR REPLACE FUNCTION as4tainr.versioning() RETURNS trigger
-LANGUAGE plpgsql AS $f$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
 DECLARE
   hist text := TG_ARGV[0];
   bcol text := TG_ARGV[3];
@@ -41,6 +44,16 @@ DECLARE
   i int;
   v text;
 BEGIN
+  IF NOT EXISTS (SELECT 1 FROM as4tainr.journaled_files
+                  WHERE library = upper(TG_ARGV[1]) AND file = upper(TG_ARGV[2])) THEN
+    RAISE EXCEPTION '% in % is not journaled: a versioned table and its history table must be.',
+      upper(TG_ARGV[2]), upper(TG_ARGV[1]) USING ERRCODE = '55019';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM as4tainr.journaled_files
+                  WHERE library = upper(TG_TABLE_SCHEMA) AND file = upper(TG_TABLE_NAME)) THEN
+    RAISE EXCEPTION '% in % is not journaled: a versioned table and its history table must be.',
+      upper(TG_TABLE_NAME), upper(TG_TABLE_SCHEMA) USING ERRCODE = '55019';
+  END IF;
   SELECT string_agg(quote_ident(column_name), ', ' ORDER BY ordinal_position) INTO cols
     FROM information_schema.columns
    WHERE table_schema = TG_ARGV[1] AND table_name = TG_ARGV[2] AND column_name <> 'rrn';

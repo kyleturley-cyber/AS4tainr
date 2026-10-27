@@ -673,6 +673,130 @@ pub fn next_receiver_name(name: &str) -> String {
     }
 }
 
+/// Journaling of a physical file starts (STRJRNPF, and a table SQL
+/// makes in a library with a journal QSQJRN): the file is noted, its
+/// trigger writes record entries, F JM is journaled.
+pub(crate) async fn start_journaling(
+    client: &Client,
+    (jlib, jname): (&str, &str),
+    images: &str,
+    omit: &str,
+    (lib, file): (&str, &str),
+    who: (&str, &str),
+) -> Result<()> {
+    client
+        .execute(
+            "INSERT INTO as4tainr.journaled_files (library, file, journal_lib, journal, images, omtjrne)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[&lib, &file, &jlib, &jname, &images, &omit],
+        )
+        .await?;
+    let q = |s: &str| crate::dds::quote(s);
+    client
+        .batch_execute(&format!(
+            "CREATE TRIGGER \"as4tainr~journal\" AFTER INSERT OR UPDATE OR DELETE ON {}.{}
+             FOR EACH ROW EXECUTE FUNCTION as4tainr_svc.journal_trigger({}, {}, {}, {}, {})",
+            ident(lib),
+            ident(file),
+            q(jlib),
+            q(jname),
+            q(images),
+            q(lib),
+            q(file)
+        ))
+        .await?;
+    entry(
+        client,
+        jlib,
+        jname,
+        "F",
+        "JM",
+        Some(member_object(lib, file)),
+        Some("*QDDS"),
+        who,
+    )
+    .await
+}
+
+/// CREATE SCHEMA's journal: receiver QSQJRN0001 and journal QSQJRN in
+/// the schema, the receiver attached (Db2 for i SQL Reference, CREATE
+/// SCHEMA: "A journal QSQJRN and journal receiver QSQJRN0001 is created
+/// in the schema").
+pub(crate) async fn create_schema_journal(client: &Client, lib: &str, owner: &str) -> Result<()> {
+    let (rname, jname) = ("QSQJRN0001", "QSQJRN");
+    client
+        .execute(
+            "INSERT INTO as4tainr.objects (library, name, objtype, text) VALUES ($1, $2, '*JRNRCV', '')",
+            &[&lib, &rname],
+        )
+        .await?;
+    client
+        .execute(
+            "INSERT INTO as4tainr.journal_receivers (library, name, text) VALUES ($1, $2, '')",
+            &[&lib, &rname],
+        )
+        .await?;
+    crate::authority::set_owner(client, lib, rname, "*JRNRCV", owner).await?;
+    client
+        .execute(
+            "INSERT INTO as4tainr.objects (library, name, objtype, text) VALUES ($1, $2, '*JRN', '')",
+            &[&lib, &jname],
+        )
+        .await?;
+    let jid: i32 = client
+        .query_one(
+            "INSERT INTO as4tainr.journals (library, name, receiver_lib, receiver, text)
+             VALUES ($1, $2, $1, $3, '') RETURNING jid",
+            &[&lib, &jname, &rname],
+        )
+        .await?
+        .get(0);
+    client
+        .batch_execute(&format!("CREATE SEQUENCE IF NOT EXISTS {}", seq_name(jid)))
+        .await?;
+    client
+        .execute(
+            "UPDATE as4tainr.journal_receivers SET journal_lib=$1, journal=$2, attached=clock_timestamp()
+              WHERE library=$1 AND name=$3",
+            &[&lib, &jname, &rname],
+        )
+        .await?;
+    crate::authority::set_owner(client, lib, jname, "*JRN", owner).await?;
+    Ok(())
+}
+
+/// A table SQL made: journaled to QSQJRN when the library has a journal
+/// of that name, with IMAGES(*BOTH) and OMTJRNE(*OPNCLO) (PUB400
+/// 2026-10-27, tools/golden/verify4.txt y_to_jrn, y_t4_jrn). Whether it
+/// was.
+pub(crate) async fn journal_sql_table(
+    client: &Client,
+    lib: &str,
+    file: &str,
+    user: &str,
+) -> Result<bool> {
+    let there = client
+        .query_opt(
+            "SELECT 1 FROM as4tainr.journals WHERE library=$1 AND name='QSQJRN'",
+            &[&lib],
+        )
+        .await?
+        .is_some();
+    if !there || journal_of(client, lib, file).await?.is_some() {
+        return Ok(false);
+    }
+    start_journaling(
+        client,
+        (lib, "QSQJRN"),
+        "*BOTH",
+        "*OPNCLO",
+        (lib, file),
+        ("", user),
+    )
+    .await?;
+    Ok(true)
+}
+
 /// Write a journal entry from as4tainr (F JM, F EJ, J PR...) for a job
 /// (its name "number/user/name") and user.
 #[allow(clippy::too_many_arguments)]
@@ -1117,36 +1241,13 @@ impl Job<'_> {
             if journal_of(self.client, lib, file).await?.is_some() {
                 continue;
             }
-            self.client
-                .execute(
-                    "INSERT INTO as4tainr.journaled_files (library, file, journal_lib, journal, images, omtjrne)
-                     VALUES ($1, $2, $3, $4, $5, $6)",
-                    &[lib, file, &jlib, &jname, &images, &omit],
-                )
-                .await?;
-            let q = |s: &str| crate::dds::quote(s);
-            self.client
-                .batch_execute(&format!(
-                    "CREATE TRIGGER \"as4tainr~journal\" AFTER INSERT OR UPDATE OR DELETE ON {}.{}
-                     FOR EACH ROW EXECUTE FUNCTION as4tainr_svc.journal_trigger({}, {}, {}, {}, {})",
-                    ident(lib),
-                    ident(file),
-                    q(&jlib),
-                    q(&jname),
-                    q(images),
-                    q(lib),
-                    q(file)
-                ))
-                .await?;
             let job = self.job_name();
-            entry(
+            start_journaling(
                 self.client,
-                &jlib,
-                &jname,
-                "F",
-                "JM",
-                Some(member_object(lib, file)),
-                Some("*QDDS"),
+                (&jlib, &jname),
+                images,
+                omit,
+                (lib, file),
                 (&job, &self.user),
             )
             .await?;

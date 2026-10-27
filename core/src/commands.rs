@@ -1114,6 +1114,10 @@ impl Job<'_> {
         commit: ScriptCommit,
     ) -> Result<ScriptRun> {
         let no_commit = commit == ScriptCommit::NoCommit;
+        // Tables, indexes and views the unit of work made: a ROLLBACK
+        // takes them back too (PUB400 2026-10-27, tools/golden/verify4.txt
+        // y_rb4 and y_t5: the CREATE TABLE before the ROLLBACK is gone).
+        let mut created: Vec<(&'static str, String, String)> = Vec::new();
         // The script's unit of work, under a commit level.
         let unit = match &commit {
             ScriptCommit::Level(l) => Some(
@@ -1208,6 +1212,11 @@ impl Job<'_> {
                     } else {
                         d.rollback().await
                     };
+                    if commit {
+                        created.clear();
+                    } else {
+                        self.undo_created(&mut created).await;
+                    }
                     match r {
                         Ok(()) => {
                             let (id, text) = if commit {
@@ -1325,6 +1334,27 @@ impl Job<'_> {
             };
             match r {
                 Ok(text) => {
+                    if unit.is_some() {
+                        use crate::ddl::Ddl;
+                        let made = match crate::ddl::parse(stmt) {
+                            Ok(Some(
+                                Ddl::CreateTable { name, .. }
+                                | Ddl::CreateTableLike { name, .. }
+                                | Ddl::CreateTableAs { name, .. },
+                            )) => Some(("TABLE", name)),
+                            Ok(Some(Ddl::CreateIndex { name, .. })) => Some(("INDEX", name)),
+                            Ok(Some(Ddl::CreateView { name, .. })) => Some(("VIEW", name)),
+                            _ => None,
+                        };
+                        if let Some((kind, n)) = made {
+                            let lib = n
+                                .lib
+                                .clone()
+                                .or_else(|| schema.clone())
+                                .unwrap_or_else(|| self.current_library());
+                            created.push((kind, lib, n.name.clone()));
+                        }
+                    }
                     lines.push(format!("Statement {}: {text}", k + 1));
                     msgs.push(listing_message(&words, &text, &msg));
                 }
@@ -1354,7 +1384,17 @@ impl Job<'_> {
         // back when an error stopped it (CL reference, RUNSQLSTM ERRLVL).
         if let Some(d) = &unit {
             if failed.is_some() {
+                // SQL7961 with no record (verify4 y_rb4: the insert
+                // before the error is gone).
                 d.rollback().await?;
+                self.undo_created(&mut created).await;
+                msgs.push(crate::sqlstmlist::Msg {
+                    id: "SQL7961".into(),
+                    severity: 0,
+                    record: 0,
+                    position: 0,
+                    text: "The changes were rolled back.".into(),
+                });
             } else {
                 d.commit().await?;
                 msgs.push(crate::sqlstmlist::Msg {
@@ -1375,6 +1415,24 @@ impl Job<'_> {
             msgs,
             failed,
         })
+    }
+
+    /// A ROLLBACK of a script's unit of work: the objects it made are
+    /// dropped again, newest first (as4tainr runs data definition outside
+    /// the transaction, so this is how it is taken back).
+    async fn undo_created(&mut self, created: &mut Vec<(&'static str, String, String)>) {
+        while let Some((kind, lib, name)) = created.pop() {
+            let mut none = None;
+            let _ = crate::ddl::try_run(
+                &self.env.database_url,
+                &self.user,
+                &self.library_list(),
+                Some(self.current_library()),
+                &mut none,
+                &format!("DROP {kind} {lib}.{name}"),
+            )
+            .await;
+        }
     }
 
     /// Module copies named on CRTPGM/CRTSRVPGM MODULE (`*PGM`/`*SRVPGM`:
@@ -7105,7 +7163,9 @@ struct ScriptRun {
 /// journal, which as4tainr's libraries never have, SQL7988 for ALTER
 /// TABLE, SQL7956 for INSERT; 2026-10-27, verify3.txt x_ok: SQL7957 for
 /// UPDATE, SQL0100 for a change of no rows, SQL7951 for CREATE VIEW,
-/// SQL7953 for DROP), none for the others (DELETE of rows included).
+/// SQL7953 for DROP; verify4.txt y_ids: SQL7955 for DELETE, SQL7950 for
+/// CREATE TABLE journaled to QSQJRN, SQL7954 for CREATE INDEX, SQL7965
+/// for LABEL ON and COMMENT ON), none for the others.
 fn listing_message(
     words: &[String],
     text: &str,
@@ -7114,9 +7174,18 @@ fn listing_message(
     let w: Vec<&str> = words.iter().map(String::as_str).collect();
     match w.as_slice() {
         ["SET", "SCHEMA", ..] | ["SET", "CURRENT", "SCHEMA", ..] => msg("SQL790F", 0, text),
+        // Journaled to the library's QSQJRN: SQL7950 (verify4 y_ids);
+        // else SQL7905, severity 20.
+        ["CREATE", "TABLE", ..] | ["CREATE", "OR", "REPLACE", "TABLE", ..]
+            if text.ends_with(crate::ddl::JOURNALED) =>
+        {
+            msg("SQL7950", 0, text)
+        }
         ["CREATE", "TABLE", ..] | ["CREATE", "OR", "REPLACE", "TABLE", ..] => {
             msg("SQL7905", 20, &format!("{text} It is not journaled."))
         }
+        ["CREATE", "INDEX", ..] | ["CREATE", "UNIQUE", "INDEX", ..] => msg("SQL7954", 0, text),
+        ["LABEL", "ON", ..] | ["COMMENT", "ON", ..] => msg("SQL7965", 0, text),
         ["ALTER", "TABLE", ..] => msg("SQL7988", 0, text),
         // A change that found no rows: SQL0100 (verify3 x_ok, x_errors).
         ["INSERT" | "UPDATE" | "DELETE", ..] if text.starts_with("0 rows") => {
@@ -7124,6 +7193,7 @@ fn listing_message(
         }
         ["INSERT", ..] => msg("SQL7956", 0, text),
         ["UPDATE", ..] => msg("SQL7957", 0, text),
+        ["DELETE", ..] => msg("SQL7955", 0, text),
         ["CREATE", "VIEW", ..] | ["CREATE", "OR", "REPLACE", "VIEW", ..] => msg("SQL7951", 0, text),
         ["DROP", ..] => msg("SQL7953", 0, text),
         _ => msg("", 0, text),

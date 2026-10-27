@@ -726,8 +726,10 @@ impl Job<'_> {
     /// its level identifier, then the field's names, buffer positions and
     /// length, digits and decimal positions, data type, text, CCSID,
     /// null capability, variable length, alternative name, identity and
-    /// IMPLICITLY HIDDEN. Values as the printed report gives them; dates
-    /// with a century digit. Fields as4tainr keeps no value for are blank
+    /// IMPLICITLY HIDDEN. Values as the printed report gives them and as
+    /// captured (verify4.txt y_ffd_vals: 1261027, P, 1, the record length,
+    /// SEQ at 1 in 4 bytes with 9 digits, type B, usage B, SQL type T,
+    /// identity Y); dates with a century digit. Fields as4tainr keeps no value for are blank
     /// or zero (fidelity-gaps).
     async fn dspffd_outfile(
         &mut self,
@@ -837,8 +839,27 @@ impl Job<'_> {
                 ("WHALI2", alias),
                 ("WHSYSN", system.clone()),
                 ("WHSQLT", sqlt.to_string()),
-                ("WHCSID", if character { ccsid.clone() } else { "0".into() }),
-                ("WHVARL", if x.varlen { "Y" } else { "N" }.to_string()),
+                // Not character: CCSID 65535 and WHVARL blank (PUB400
+                // 2026-10-27, verify4.txt y_ffd_vals: an INTEGER column).
+                (
+                    "WHCSID",
+                    if character {
+                        ccsid.clone()
+                    } else {
+                        "65535".into()
+                    },
+                ),
+                (
+                    "WHVARL",
+                    if !character {
+                        " "
+                    } else if x.varlen {
+                        "Y"
+                    } else {
+                        "N"
+                    }
+                    .to_string(),
+                ),
                 ("WHNULL", if x.null_capable { "Y" } else { "N" }.to_string()),
                 (
                     "WHIDC",
@@ -850,7 +871,10 @@ impl Job<'_> {
         }
         let w = crate::outfile::write(self, &outfile, &option, &crate::outfile::QADSPFFD, &records)
             .await?;
-        Ok(Outcome::Messages(w.messages))
+        // CPF3030 each time (verify4 y_ffd, y_ffd_again).
+        let mut messages = w.messages.clone();
+        messages.push(crate::outfile::records_added(&w, records.len()));
+        Ok(Outcome::Messages(messages))
     }
 }
 

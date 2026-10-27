@@ -85,3 +85,7 @@ If the program ends in error (an escape message, QMHSNDPM `*ESCAPE`), the operat
 The COM order management application (`tools/legacy.sh`) uses both: its ORDTRG trigger program writes an audit row for every order change, and its ORDAUDJV view shows the same audit from the journal.
 
 See [fidelity-gaps.md](fidelity-gaps.md) for what is not done.
+
+## SQL tables and QSQJRN
+
+CREATE SCHEMA makes the journal QSQJRN and its receiver QSQJRN0001 in the schema (Db2 for i SQL Reference, CREATE SCHEMA). A table made by SQL (CREATE TABLE, also AS and LIKE) in a library that has a journal named QSQJRN is journaled to it right away, with IMAGES(*BOTH) and OMTJRNE(*OPNCLO), as PUB400 showed (2026-10-27, tools/golden/verify4.txt y_to_jrn); RUNSQLSTM's listing then gives SQL7950 instead of SQL7905. UPDATE and DELETE of a system-period temporal table need the table and its history table journaled (SQL7008).

@@ -822,7 +822,71 @@ fn decimal_division(toks: Vec<Tok>) -> Vec<Tok> {
     toks
 }
 
+/// A searched WHEN of a CASE expression takes no EXISTS predicate
+/// (SQL0104 at EXISTS) and no IN with a fullselect (SQL0115): PUB400
+/// 2026-10-27, tools/golden/verify3.txt x_errors (a select list) and
+/// verify4.txt y_ids (a VALUES list, an UPDATE's SET, CASE WHEN 1 IN
+/// (SELECT ...)); EXISTS in a WHERE clause is fine (y_ids).
+fn check_case_conditions(toks: &[Tok]) -> Result<()> {
+    if !toks
+        .iter()
+        .any(|t| matches!(t, Tok::Word(w) if w.eq_ignore_ascii_case("CASE")))
+    {
+        return Ok(());
+    }
+    let sig: Vec<&Tok> = toks
+        .iter()
+        .filter(|t| !matches!(t, Tok::Space(_)))
+        .collect();
+    let up = |t: &Tok| match t {
+        Tok::Word(w) => w.to_ascii_uppercase(),
+        _ => String::new(),
+    };
+    let punct = |t: Option<&&Tok>, p: &str| matches!(t, Some(Tok::Punct(q)) if q == p);
+    // The CASE expressions open around a token: (paren depth, in a WHEN
+    // condition).
+    let mut cases: Vec<(i32, bool)> = Vec::new();
+    let mut depth = 0i32;
+    for (k, t) in sig.iter().enumerate() {
+        if punct(Some(t), "(") {
+            depth += 1;
+            continue;
+        }
+        if punct(Some(t), ")") {
+            depth -= 1;
+            continue;
+        }
+        let w = up(t);
+        match w.as_str() {
+            "CASE" => cases.push((depth, false)),
+            "END" if cases.last().is_some_and(|c| c.0 == depth) => {
+                cases.pop();
+            }
+            "WHEN" if cases.last().is_some_and(|c| c.0 == depth) => {
+                cases.last_mut().unwrap().1 = true;
+            }
+            "THEN" | "ELSE" if cases.last().is_some_and(|c| c.0 == depth) => {
+                cases.last_mut().unwrap().1 = false;
+            }
+            "EXISTS" if cases.last().is_some_and(|c| c.1 && c.0 == depth) => {
+                bail!("SQL0104: EXISTS is not valid in the condition of a CASE WHEN.");
+            }
+            "IN" if cases.last().is_some_and(|c| c.1 && c.0 == depth)
+                && punct(sig.get(k + 1), "(")
+                && sig.get(k + 2).is_some_and(|t| up(t) == "SELECT") =>
+            {
+                bail!(
+                    "SQL0115: IN with a fullselect is not valid in the condition of a CASE WHEN."
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Translated> {
+    check_case_conditions(&tokenize(sql.trim())?)?;
     let mut toks = listagg(decimal_division(sequence_values(
         crate::sqljsonfn::rewrite(crate::sqljson::rewrite(tokenize(sql.trim())?)?)?,
         is_library,
@@ -1928,6 +1992,9 @@ pub(crate) fn map_error(e: &tokio_postgres::Error, sql: &str) -> anyhow::Error {
             anyhow!("SQL0117: The INSERT gives a different number of values than it has columns.")
         }
         "42601" => anyhow!("SQL0104: Statement not valid: {msg}."),
+        // A file not valid for the operation (as4tainr's temporal
+        // versioning: a table that is not journaled): SQL7008.
+        "55019" => anyhow!("SQL7008: {msg}"),
         "23505" => anyhow!("SQL0803: Duplicate key value: the record was not written."),
         "23514" => match constraint_name(db) {
             Some((c, l)) => {
@@ -2475,6 +2542,32 @@ mod tests {
             "select * from t"
         );
         assert_eq!(tr("select 'it''s' from t;").sql, "select 'it''s' from t");
+    }
+
+    // CASE WHEN takes no EXISTS and no IN (fullselect); WHERE EXISTS is
+    // fine (PUB400 2026-10-27, verify3 x_errors, verify4 y_ids).
+    #[test]
+    fn case_conditions_without_subquery_predicates() {
+        let err = |s: &str| translate(s, &|_| false).unwrap_err().to_string();
+        assert!(
+            err("select case when exists (select 1 from t) then 1 else 0 end from u")
+                .starts_with("SQL0104")
+        );
+        assert!(
+            err("update t set v = case when exists (select 1 from u) then 'Y' end")
+                .starts_with("SQL0104")
+        );
+        assert!(
+            err("select case when 1 in (select 1 from t) then 'IN' end from u")
+                .starts_with("SQL0115")
+        );
+        assert!(translate("select 1 from t where exists (select 1 from u)", &|_| false).is_ok());
+        assert!(translate("select case when a in (1, 2) then 1 end from t", &|_| false).is_ok());
+        assert!(translate(
+            "select case when a = 1 then (select 1 from u where exists (select 1 from v)) end from t",
+            &|_| false
+        )
+        .is_ok());
     }
 
     #[test]

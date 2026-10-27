@@ -15963,6 +15963,15 @@ async fn system_period_temporal_tables() {
         id: None,
         calls: Default::default(),
     };
+    // A journal QSQJRN in the library: the tables SQL makes are journaled
+    // to it (PUB400 2026-10-27, tools/golden/verify4.txt y_to_jrn), which
+    // UPDATE and DELETE of a versioned table need (verify3 x_errors).
+    for c in [
+        format!("CRTJRNRCV JRNRCV({lib}/QSQJRN0001)"),
+        format!("CRTJRN JRN({lib}/QSQJRN) JRNRCV({lib}/QSQJRN0001)"),
+    ] {
+        job.run(&c).await.unwrap();
+    }
     let script = format!(
         "set schema = {lib};
          create table TGRP (
@@ -16353,6 +16362,21 @@ async fn verify2_runsqlstm_hidden_columns_and_outfiles() {
     // A delete's extra row (begin = end) is in no period: FROM ... TO
     // counts the version that was deleted, not its extra row (verify3
     // x_asof: 2 for an insert, an update and a delete).
+    // Not journaled: UPDATE and DELETE of the versioned table are SQL7008
+    // naming the history table (PUB400 2026-10-27, verify3 x_errors);
+    // journaled, they work (verify3 x_upd, x_del).
+    let e = sql(format!("DELETE FROM {lib}.GLDTMP"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("SQL7008") && e.contains("GLDTMP_HST"), "{e}");
+    for c in [
+        format!("CRTJRNRCV JRNRCV({lib}/GLDRCV)"),
+        format!("CRTJRN JRN({lib}/GLDJRN) JRNRCV({lib}/GLDRCV)"),
+        format!("STRJRNPF FILE({lib}/GLDTMP {lib}/GLDTMP_HST) JRN({lib}/GLDJRN) IMAGES(*BOTH)"),
+    ] {
+        job.run(&c).await.unwrap();
+    }
     sql(format!("DELETE FROM {lib}.GLDTMP")).await.unwrap();
     match sql(format!(
         "SELECT COUNT(*) FROM {lib}.GLDTMP FOR SYSTEM_TIME FROM '2000-01-01-00.00.00' TO '9999-12-30-00.00.00' T"
@@ -16572,7 +16596,8 @@ async fn dspffd_outfile() {
                 .iter()
                 .map(|x| as4tainr_core::jobs::message_id(x))
                 .collect();
-            assert_eq!(ids, ["CPF9861", "CPF9862"]);
+            // CPF3030 too (PUB400 2026-10-27, verify4.txt y_ffd).
+            assert_eq!(ids, ["CPF9861", "CPF9862", "CPF3030"]);
         }
         other => panic!("{other:?}"),
     }
@@ -16580,7 +16605,8 @@ async fn dspffd_outfile() {
         .query(
             &format!(
                 "SELECT rtrim(whflde) || '|' || whfobo::text || '|' || whfldb::text || '|' || whfldd::text
-                        || '|' || whfldp::text || '|' || whfldt || '|' || whvarl || '|' || whnull
+                        || '|' || whfldp::text || '|' || whfldt || '|' || coalesce(nullif(whvarl, ' '), '_')
+                        || '|' || whnull
                         || '|' || whhdncol || '|' || whfldn::text || '|' || rtrim(whname)
                    FROM {}.ffd ORDER BY whfobo",
                 lib.to_ascii_lowercase()
@@ -16594,7 +16620,8 @@ async fn dspffd_outfile() {
         got[..5],
         [
             "GRP|1|10|0|0|A|N|N|0|8|GLDTMP",
-            "SEQ|11|4|9|0|B|N|N|0|8|GLDTMP",
+            // Not character: WHVARL blank, shown as _ (verify4 y_ffd_vals).
+            "SEQ|11|4|9|0|B|_|N|0|8|GLDTMP",
             "CMD|15|102|0|0|A|Y|N|0|8|GLDTMP",
             "AUDIT_USER|117|130|0|0|A|Y|Y|0|8|GLDTMP",
             "AUDIT_OPER|247|1|0|0|A|N|Y|0|8|GLDTMP",
@@ -16604,4 +16631,176 @@ async fn dspffd_outfile() {
         got[7].starts_with("TS_ID|") && got[7].contains("|1|8|"),
         "{got:?}"
     );
+    // A non-character field's CCSID: 65535 (verify4 y_ffd_vals).
+    let c: String = client
+        .query_one(
+            &format!(
+                "SELECT whcsid::text FROM {}.ffd WHERE whflde = 'SEQ'",
+                lib.to_ascii_lowercase()
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(c, "65535");
+}
+
+/// CREATE SCHEMA makes journal QSQJRN and receiver QSQJRN0001 in the
+/// schema (Db2 for i SQL Reference, CREATE SCHEMA), and a table SQL makes
+/// in a library with QSQJRN is journaled to it with IMAGES(*BOTH) and
+/// OMTJRNE(*OPNCLO) (PUB400 2026-10-27, tools/golden/verify4.txt
+/// y_to_jrn). RUNSQLSTM's listing then gives CREATE TABLE SQL7950, and
+/// SQL7955 for DELETE, SQL7954 for CREATE INDEX, SQL7965 for LABEL ON and
+/// COMMENT ON (y_ids); an error that stops a script under COMMIT(*CHG)
+/// rolls its changes back, SQL7961 with no record (y_rb4), and a ROLLBACK
+/// takes back a table the script made (y_t5).
+#[tokio::test]
+async fn schema_journal_and_listing_ids() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let sch = format!("S{}", &lib[1..]);
+    job.run(&format!("RUNSQL SQL('CREATE SCHEMA {sch}') COMMIT(*NONE)"))
+        .await
+        .unwrap();
+    for (name, ty) in [("QSQJRN", "*JRN"), ("QSQJRN0001", "*JRNRCV")] {
+        assert!(
+            catalog::object_exists(&client, std::slice::from_ref(&sch), name, ty)
+                .await
+                .unwrap(),
+            "{name}"
+        );
+    }
+    source::create_file(&client, &lib, "QSQLSRC", "")
+        .await
+        .unwrap();
+    let put = |name: &str, text: String| source::Member {
+        library: lib.clone(),
+        file: "QSQLSRC".into(),
+        name: name.into(),
+        srctype: "SQL".into(),
+        text: String::new(),
+        source: text,
+        ..Default::default()
+    };
+    source::put_member(
+        &client,
+        &put(
+            "IDS",
+            format!(
+                "create table {sch}.T4 (K int not null primary key, V char(10));
+insert into {sch}.T4 values (1, 'a');
+delete from {sch}.T4 where K = 1;
+create index {sch}.T4I on {sch}.T4 (V);
+label on table {sch}.T4 is 'golden 4';
+"
+            ),
+        ),
+        false,
+    )
+    .await
+    .unwrap();
+    job.run(&format!(
+        "RUNSQLSTM SRCFILE({lib}/QSQLSRC) SRCMBR(IDS) COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
+    let l = job.calls.printed.clone();
+    for (id, rec) in [
+        ("SQL7950", 1),
+        ("SQL7956", 2),
+        ("SQL7955", 3),
+        ("SQL7954", 4),
+        ("SQL7965", 5),
+    ] {
+        assert!(
+            l.iter()
+                .any(|x| x.starts_with(&format!("{id}   0 {rec:>7}  Position 1 "))),
+            "{id}: {l:#?}"
+        );
+    }
+    let j = client
+        .query_one(
+            "SELECT journal, images, omtjrne FROM as4tainr.journaled_files WHERE library = $1 AND file = 'T4'",
+            &[&sch],
+        )
+        .await
+        .unwrap();
+    let got: Vec<String> = (0..3).map(|i| j.get(i)).collect();
+    assert_eq!(got, ["QSQJRN", "*BOTH", "*OPNCLO"]);
+    // COMMIT(*CHG): the error stops the script and its insert is rolled
+    // back.
+    source::put_member(
+        &client,
+        &put(
+            "RB4",
+            format!(
+                "insert into {sch}.T4 values (2, 'b');
+insert into {sch}.NOSUCHTBL values (1);
+"
+            ),
+        ),
+        false,
+    )
+    .await
+    .unwrap();
+    let e = job
+        .run(&format!("RUNSQLSTM SRCFILE({lib}/QSQLSRC) SRCMBR(RB4)"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("SQL9010"), "{e}");
+    assert!(
+        job.calls
+            .printed
+            .iter()
+            .any(|x| x.starts_with("SQL7961   0          ")),
+        "{:#?}",
+        job.calls.printed
+    );
+    let n: i64 = client
+        .query_one(
+            &format!("SELECT count(*) FROM {}.t4", sch.to_ascii_lowercase()),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 0);
+    // A ROLLBACK takes back a CREATE TABLE of the unit of work too
+    // (verify4 y_rb4, y_t5: CPF9801 for the table afterwards).
+    source::put_member(
+        &client,
+        &put(
+            "RB5",
+            format!("create table {sch}.T5 (K int);\nrollback;\n"),
+        ),
+        false,
+    )
+    .await
+    .unwrap();
+    job.run(&format!("RUNSQLSTM SRCFILE({lib}/QSQLSRC) SRCMBR(RB5)"))
+        .await
+        .unwrap();
+    assert!(
+        !catalog::object_exists(&client, std::slice::from_ref(&sch), "T5", "*FILE")
+            .await
+            .unwrap()
+    );
+    job.run(&format!("DLTLIB LIB({sch})")).await.unwrap();
 }

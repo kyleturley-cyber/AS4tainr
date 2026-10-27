@@ -215,6 +215,7 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] PUB400 verify2: RUNSQLSTM listing in IBM layout and SQL7007 for COMMIT/ROLLBACK with COMMIT(*NONE); IMPLICITLY HIDDEN columns left out of SELECT * and INSERT without columns; outfile messages (CPF9861/CPF9862/CPF3030, CPD9861, CPD3006); seven more model files (QADSPFFD, QADSPDBR, QAFDBASI, QAFDMBR, QAFDPHY, QAFDACCP, QAFDRFMT)
 - [x] PUB400 verify3: RUNSQLSTM under commitment control (COMMIT/ROLLBACK, commit at the end), listing IDs, no completion message; SQ20524/SQ20525/SQL0117; DSPFD *ATR FILEATR(*PF) outfile (QAFDPHY); source member usage data; CPYF of a source member
 - [x] DSPFFD OUTPUT(*OUTFILE) (QADSPFFD); test isolation for jobs without an id
+- [x] PUB400 verify4: CREATE SCHEMA makes QSQJRN, SQL tables journaled to it; SQL7008 for UPDATE/DELETE of unjournaled versioned tables; CASE WHEN EXISTS/IN (fullselect) refused; RUNSQLSTM rollback takes back created tables, more listing IDs
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).
 - [x] Journals and trigger programs: COM's SETUPJRN, ORDAUDJV (QSYS2.DISPLAY_JOURNAL) and ORDTRG (ADDPFTRG) run (docs/journals.md).

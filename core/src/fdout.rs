@@ -31,6 +31,8 @@ pub struct FileInfo {
     pub created: (String, String, String),
     pub changed: (String, String, String),
     pub records: i64,
+    /// Deleted records (record numbers no longer used).
+    pub deleted: i64,
     pub journal: Option<(String, String, String)>,
     pub system: String,
 }
@@ -60,13 +62,32 @@ fn reclen(f: &FileInfo) -> u32 {
     f.file.fields.iter().map(|x| x.buffer_bytes()).sum()
 }
 
+/// The SQL file type: T table, I index, V view; '0' for a file not made
+/// by SQL (verify9 d9_bas_vals1, d9_blf_vals1).
 fn sql_code(f: &FileInfo) -> &'static str {
+    if f.file.view.is_some() {
+        return "V";
+    }
     match f.sql_type.as_str() {
         "TABLE" => "T",
-        "VIEW" => "V",
         "INDEX" => "I",
-        _ => " ",
+        _ => "0",
     }
+}
+
+fn sql_made(f: &FileInfo) -> bool {
+    sql_code(f) != "0"
+}
+
+/// The bytes of the key fields (MBMXKL; verify9 d9_mbr_vals: 3 for a
+/// 5,0 packed key).
+fn key_bytes(f: &FileInfo) -> u32 {
+    f.file
+        .keys
+        .iter()
+        .filter_map(|k| f.file.fields.iter().find(|x| &x.name == k))
+        .map(|x| x.buffer_bytes())
+        .sum()
 }
 
 /// QAFDBASI (c8_bas_vals1).
@@ -100,7 +121,8 @@ pub fn basatr(f: &FileInfo) -> Vec<Record> {
     vec![r]
 }
 
-/// QAFDMBR (c8_mbr_vals1-3): the member, named like the file.
+/// QAFDMBR (c8_mbr_vals1-3 for an SQL table, verify9 d9_mbr_vals1-3 for
+/// a keyed DDS file): the member, named like the file.
 pub fn member(f: &FileInfo) -> Vec<Record> {
     let mut r = head(
         [
@@ -137,12 +159,22 @@ pub fn member(f: &FileInfo) -> Vec<Record> {
         ("MBMAXM", "1".into()),
         ("MBMXRL", reclen(f).to_string()),
         ("MBJRNL", if f.journal.is_some() { "Y" } else { "N" }.into()),
-        ("MBRCDC", "4294967288".into()),
+        // SIZE: *NOMAX for an SQL table, the DDS default 10000 1000 3
+        // (record capacity 13000) for a DDS file.
+        ("MBSIZ", if sql_made(f) { "0" } else { "10000" }.into()),
+        ("MBSIZI", if sql_made(f) { "0" } else { "1000" }.into()),
+        ("MBSIZM", if sql_made(f) { "0" } else { "3" }.into()),
+        (
+            "MBRCDC",
+            if sql_made(f) { "4294967288" } else { "13000" }.into(),
+        ),
         ("MBNRCD", f.records.to_string()),
+        ("MBNDTR", f.deleted.to_string()),
         ("MBALLO", "N".into()),
         ("MBCONT", "N".into()),
         ("MBRSHR", "N".into()),
-        ("MBDSSZ", "12288".into()),
+        ("MBDSSZ", if sql_made(f) { "12288" } else { "8192" }.into()),
+        ("MBDSZ2", if sql_made(f) { "12288" } else { "8192" }.into()),
         ("MBCHGC", f.changed.0.clone()),
         ("MBCHGD", f.changed.1.clone()),
         ("MBCHGT", f.changed.2.clone()),
@@ -150,9 +182,33 @@ pub fn member(f: &FileInfo) -> Vec<Record> {
         ("MBALWT", "Y".into()),
         ("MBALUP", "Y".into()),
         ("MBALDT", "Y".into()),
-        ("MBDSZ2", "12288".into()),
-        ("MBAPBL", "1".into()),
+        // Usage: the last change, used once (both captures: 1, today, 1).
+        ("MBUCEN", f.changed.0.clone()),
+        ("MBUDAT", f.changed.1.clone()),
+        ("MBUCNT", "1".into()),
+        ("MBAPBL", if keyed(f) { "2" } else { "1" }.into()),
+        ("MBINTR", "0".into()),
+        ("MBRBCK", "0".into()),
     ]);
+    if keyed(f) {
+        // A keyed access path (d9_mbr_vals): maintenance immediate,
+        // recovery and force *NO, the key's bytes, its size (90112 as
+        // captured), an entry and a key value per record.
+        let k = key_bytes(f).to_string();
+        r.extend([
+            ("MBMANT", "I".to_string()),
+            ("MBRECV", "N".into()),
+            ("MBFKAP", "N".into()),
+            ("MBMXKL", k.clone()),
+            ("MBMXK2", k),
+            ("MBINDX", "Y".into()),
+            ("MBACPJ", "N".into()),
+            ("MBISIZ", "90112".into()),
+            ("MBISZ2", "90112".into()),
+            ("MBIXNT", f.records.to_string()),
+            ("MBUKV1", f.records.to_string()),
+        ]);
+    }
     if let Some((j, l, images)) = &f.journal {
         r.extend([
             ("MBJRNM", j.clone()),
@@ -187,31 +243,36 @@ pub fn rcdfmt(f: &FileInfo) -> Vec<Record> {
     vec![r]
 }
 
-/// QAFDACCP (c8_acp_vals1): a record per key field, numbered from 1;
-/// a file in arrival sequence has one record without a key.
+/// QAFDACCP (c8_acp_vals1 for an SQL index; verify9 d9_acp_vals1 for
+/// a keyed DDS physical file, a DDS logical file and a table in arrival
+/// sequence): a record per key field, numbered from 1, or one without a
+/// key; the based-on file only for a logical file.
 pub fn accpth(f: &FileInfo) -> Vec<Record> {
     let base = |r: &mut Record| {
         r.extend([
-            ("APMANT", "I".to_string()),
-            ("APUNIQ", if f.file.unique { "Y" } else { "N" }.into()),
-            ("APKEYO", "N".into()),
-            ("APSELO", if f.select_omit { "Y" } else { "N" }.into()),
+            ("APSELO", if f.select_omit { "Y" } else { "N" }.to_string()),
             ("APACCP", if keyed(f) { "K" } else { "A" }.into()),
-            ("APNSCO", "1".into()),
             ("APJOIN", "N".into()),
-            ("APACPJ", "N".into()),
-            ("APNSC2", "1".into()),
-        ]);
-        let (bl, bf) = f
-            .based_on
-            .clone()
-            .unwrap_or_else(|| (f.library.clone(), f.name.clone()));
-        r.extend([
-            ("APBOF", bf.clone()),
-            ("APBOL", crate::qtemp::logical(&bl)),
-            ("APBOLF", f.file.format.clone()),
             ("APNKYF", f.file.keys.len().to_string()),
         ]);
+        if keyed(f) {
+            r.extend([
+                ("APMANT", "I".to_string()),
+                ("APUNIQ", if f.file.unique { "Y" } else { "N" }.into()),
+                ("APKEYO", "N".into()),
+                ("APACPJ", "N".into()),
+            ]);
+        }
+        match &f.based_on {
+            Some((bl, bf)) => r.extend([
+                ("APNSCO", "1".to_string()),
+                ("APNSC2", "1".into()),
+                ("APBOF", bf.clone()),
+                ("APBOL", crate::qtemp::logical(bl)),
+                ("APBOLF", f.file.format.clone()),
+            ]),
+            None => r.extend([("APNSCO", "0".to_string()), ("APNSC2", "0".into())]),
+        }
     };
     let names = [
         "APRCEN", "APRDAT", "APRTIM", "APFILE", "APLIB", "APFTYP", "APFILA", "APFATR", "APSYSN",
@@ -240,7 +301,22 @@ pub fn accpth(f: &FileInfo) -> Vec<Record> {
                     }
                     .to_string(),
                 ),
-                ("APKSIN", "N".into()),
+                // A numeric key is signed (S; d9_acp_vals1), a character
+                // key N.
+                (
+                    "APKSIN",
+                    if f.file
+                        .fields
+                        .iter()
+                        .find(|x| &x.name == k)
+                        .is_some_and(|x| x.data_type.is_numeric())
+                    {
+                        "S"
+                    } else {
+                        "N"
+                    }
+                    .into(),
+                ),
                 ("APKZD", "N".into()),
                 ("APKASQ", "N".into()),
                 ("APKEYN", (i + 1).to_string()),
@@ -302,14 +378,20 @@ impl Job<'_> {
                 &[&lib, &name],
             )
             .await?;
-        let records: i64 = if source {
-            0
+        let (records, deleted): (i64, i64) = if source {
+            (0, 0)
         } else {
             self.client
-                .query_one(&format!("SELECT count(*) FROM {}", fr.table()), &[])
+                .query_one(
+                    &format!(
+                        "SELECT count(*), coalesce(max(rrn), 0) - count(*) FROM {}",
+                        fr.table()
+                    ),
+                    &[],
+                )
                 .await
-                .map(|r| r.get(0))
-                .unwrap_or(0)
+                .map(|r| (r.get(0), r.get(1)))
+                .unwrap_or((0, 0))
         };
         let journal = self
             .client
@@ -347,6 +429,7 @@ impl Job<'_> {
             created,
             changed,
             records,
+            deleted,
             journal,
             system: crate::report::system_name().chars().take(8).collect(),
         })
@@ -402,6 +485,7 @@ mod tests {
             created: ("1".into(), "261027".into(), "202716".into()),
             changed: ("1".into(), "261027".into(), "202716".into()),
             records: 0,
+            deleted: 0,
             journal: None,
             system: "PUB400".into(),
         }
@@ -470,6 +554,84 @@ mod tests {
             ("RFTOTF", "1"),
         ] {
             assert_eq!(get(r, k), v, "{k}");
+        }
+    }
+
+    // Expected values: PUB400 2026-10-27, verify9 d9_bas_vals1,
+    // d9_mbr_vals1-3, d9_acp_vals1: a DDS physical file keyed on CODE
+    // 5P 0 with two records (one more deleted), and an SQL table in
+    // arrival sequence.
+    #[test]
+    fn dds_values() {
+        let mut f = info();
+        f.name = "GLD9PF".into();
+        f.sql_type = String::new();
+        f.file = crate::dds::parse_pf(
+            "GLD9PF",
+            "     A          R GLD9R\n     A            CODE           5P 0\n     A            NAME          20A\n     A          K CODE\n",
+        )
+        .unwrap();
+        f.records = 2;
+        f.deleted = 1;
+        assert_eq!(get(&basatr(&f)[0], "ATSQLT"), "0");
+        assert_eq!(get(&basatr(&f)[0], "ATACCP"), "K");
+        let m = &member(&f)[0];
+        for (k, v) in [
+            ("MBRES4", "0"),
+            ("MBMANT", "I"),
+            ("MBRECV", "N"),
+            ("MBFKAP", "N"),
+            ("MBMXKL", "3"),
+            ("MBSIZ", "10000"),
+            ("MBSIZI", "1000"),
+            ("MBSIZM", "3"),
+            ("MBRCDC", "13000"),
+            ("MBNRCD", "2"),
+            ("MBNDTR", "1"),
+            ("MBDSSZ", "8192"),
+            ("MBISIZ", "90112"),
+            ("MBIXNT", "2"),
+            ("MBACPJ", "N"),
+            ("MBUCNT", "1"),
+            ("MBINDX", "Y"),
+            ("MBDSZ2", "8192"),
+            ("MBMXK2", "3"),
+            ("MBAPBL", "2"),
+            ("MBISZ2", "90112"),
+            ("MBUKV1", "2"),
+            ("MBINTR", "0"),
+            ("MBRBCK", "0"),
+        ] {
+            assert_eq!(get(m, k), v, "{k}");
+        }
+        let a = &accpth(&f)[0];
+        for (k, v) in [
+            ("APMANT", "I"),
+            ("APNSCO", "0"),
+            ("APBOF", ""),
+            ("APBOLF", ""),
+            ("APKEYF", "CODE"),
+            ("APKSIN", "S"),
+            ("APACPJ", "N"),
+            ("APNSC2", "0"),
+        ] {
+            assert_eq!(get(a, k), v, "{k}");
+        }
+        let t = info();
+        let a = &accpth(&t)[0];
+        for (k, v) in [
+            ("APMANT", ""),
+            ("APUNIQ", ""),
+            ("APKEYO", ""),
+            ("APACCP", "A"),
+            ("APNSCO", "0"),
+            ("APNKYF", "0"),
+            ("APKEYN", ""),
+            ("APJOIN", "N"),
+            ("APACPJ", ""),
+            ("APNSC2", "0"),
+        ] {
+            assert_eq!(get(a, k), v, "{k}");
         }
     }
 

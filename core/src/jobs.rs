@@ -840,12 +840,9 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
             } else {
                 d.print.clone()
             };
-            // The command's own printer file when it has one (DSPFFD
-            // QPDSPFFD, DSPFD QPDSPFD), else QSYSPRT.
-            let file = match &d.spool {
-                Some(v) if !d.print.is_empty() => v.file.as_str(),
-                _ => "QSYSPRT",
-            };
+            // The command's own printer file (report.rs printer_file;
+            // verify9 d9_prt_rows).
+            let file = crate::report::printer_file(first.as_str());
             crate::spool::print_lines(&client, &id, file, first.as_str(), &lines).await?;
             if let Some(m) = &d.print_msg {
                 log(&client, &id, "*COMP", m).await;

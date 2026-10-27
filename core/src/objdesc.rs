@@ -53,7 +53,7 @@ impl Job<'_> {
             }
         }
         let Some((lib, attr, text, created)) = found else {
-            bail!("CPF9812: File {name} in library {label} not found.");
+            bail!("CPF9812: There is no file {name} in library {label}.");
         };
         authority::check(self.client, &self.user, &lib, &name, "*FILE", Aut::Use).await?;
         let ty = cmd.get("TYPE").to_ascii_uppercase();
@@ -589,7 +589,7 @@ impl Job<'_> {
         use crate::dds::DataType;
         let (format, fields, external) = record_format(self.client, &lib, &name, &attr)
             .await
-            .map_err(|_| anyhow::anyhow!("CPF9812: File {name} in library {label} not found."))?;
+            .map_err(|_| anyhow::anyhow!("CPF9812: There is no file {name} in library {label}."))?;
         if cmd.get("OUTPUT").eq_ignore_ascii_case("*OUTFILE") {
             return self
                 .dspffd_outfile(cmd, &lib, &name, &attr, &format, &fields)

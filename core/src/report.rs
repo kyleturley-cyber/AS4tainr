@@ -150,8 +150,47 @@ pub const END_SYSVAL: &str =
 pub const END_OBJD: &str =
     "                                        * * * * *   E N D   O F   L I S T I N G   * * * * *";
 
+/// The printer file a display command prints its report with, as its
+/// spooled file's name (PUB400 2026-10-27, tools/golden/verify9.txt
+/// d9_prt_rows, `system -k` of each command): QSYSPRT for the others.
+pub fn printer_file(command: &str) -> &'static str {
+    match command.to_ascii_uppercase().as_str() {
+        "DSPOBJD" => "QPRTOBJD",
+        "DSPFD" => "QPDSPFD",
+        "DSPFFD" => "QPDSPFFD",
+        "DSPDBR" => "QPDSPDBR",
+        "DSPLIBL" => "QPRTLIBL",
+        "DSPMSGD" => "QPMSGD",
+        "DSPJOB" => "QPDSPJOB",
+        "DSPLIB" => "QPDSPLIB",
+        "DSPUSRPRF" => "QPUSRPRF",
+        _ => "QSYSPRT",
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    // PUB400 2026-10-27, verify9 d9_prt_rows: the spooled files `system
+    // -k` kept for each command, newest first.
+    #[test]
+    fn printer_files() {
+        for (c, f) in [
+            ("DSPOBJD", "QPRTOBJD"),
+            ("DSPFD", "QPDSPFD"),
+            ("DSPFFD", "QPDSPFFD"),
+            ("DSPDBR", "QPDSPDBR"),
+            ("DSPLIBL", "QPRTLIBL"),
+            ("DSPSYSVAL", "QSYSPRT"),
+            ("DSPMSGD", "QPMSGD"),
+            ("DSPJOB", "QPDSPJOB"),
+            ("DSPLIB", "QPDSPLIB"),
+            ("CPYF", "QSYSPRT"),
+            ("DSPUSRPRF", "QPUSRPRF"),
+        ] {
+            assert_eq!(super::printer_file(c), f, "{c}");
+        }
+    }
+
     use super::*;
 
     // Expected lines: PUB400 (IBM i 7.5) output of `system "DSPLIBL"`,

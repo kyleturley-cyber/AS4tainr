@@ -742,7 +742,7 @@ impl Job<'_> {
             }
         }
         let lib = q.split_once('/').map(|x| x.0).unwrap_or("*LIBL");
-        bail!("CPF9812: File {name} in library {lib} not found.");
+        bail!("CPF9812: There is no file {name} in library {lib}.");
     }
 
     /// ADDPFTRG FILE TRGTIME TRGEVENT PGM [RPLTRG] [TRG] [TRGLIB]

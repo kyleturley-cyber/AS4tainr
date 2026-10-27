@@ -126,7 +126,7 @@ impl Job<'_> {
             }
         }
         let lib = q.split_once('/').map(|(l, _)| l).unwrap_or("*LIBL");
-        bail!("CPF9812: File {name} in library {lib} not found.")
+        bail!("CPF9812: There is no file {name} in library {lib}.")
     }
 
     /// ADDPFM: add a member to a source file. A member that is there

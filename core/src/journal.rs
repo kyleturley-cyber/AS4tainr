@@ -1205,7 +1205,7 @@ impl Job<'_> {
                     bail!("CPF9898: File {name} is not a physical file.");
                 }
                 let lib = it.split_once('/').map(|x| x.0).unwrap_or("*LIBL");
-                bail!("CPF9812: File {name} in library {lib} not found.");
+                bail!("CPF9812: There is no file {name} in library {lib}.");
             }
         }
         Ok(out)

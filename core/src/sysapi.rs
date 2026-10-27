@@ -357,7 +357,7 @@ async fn object_description(
         }
         match objtype.as_str() {
             "*PGM" => bail!("CPF9811: Program {name} in library {lib} not found."),
-            "*FILE" => bail!("CPF9812: File {name} in library {lib} not found."),
+            "*FILE" => bail!("CPF9812: There is no file {name} in library {lib}."),
             _ => bail!("CPF9801: Object {name} is not in library {lib}."),
         }
     };
@@ -581,7 +581,7 @@ async fn member_description(
         if !lib.starts_with('*') && !crate::catalog::library_exists(client, &lib).await? {
             bail!("CPF9810: There is no library {lib}.");
         }
-        bail!("CPF9812: File {file} in library {lib} not found.");
+        bail!("CPF9812: There is no file {file} in library {lib}.");
     };
     authority::check(client, &caller.user, &flib, &file, "*FILE", Aut::Use).await?;
     let attr: String = r.get(0);
@@ -887,7 +887,7 @@ async fn file_description(client: &Client, caller: &Caller, args: &mut dyn ApiAr
         if !flib.starts_with('*') && !crate::catalog::library_exists(client, &flib).await? {
             bail!("CPF9810: There is no library {flib}.");
         }
-        bail!("CPF9812: File {file} in library {flib} not found.");
+        bail!("CPF9812: There is no file {file} in library {flib}.");
     };
     authority::check(client, &caller.user, &lib, &file, "*FILE", Aut::Use).await?;
     let attr: String = r.get(0);

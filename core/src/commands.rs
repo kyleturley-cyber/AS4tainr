@@ -2475,7 +2475,7 @@ impl Job<'_> {
                     }
                 }
                 found.ok_or_else(|| {
-                    anyhow::anyhow!("CPF9812: File {file} in library *LIBL not found.")
+                    anyhow::anyhow!("CPF9812: There is no file {file} in library *LIBL.")
                 })?
             }
             "*CURLIB" => self.current_library(),
@@ -2499,7 +2499,7 @@ impl Job<'_> {
         } else if !catalog::object_exists(self.client, std::slice::from_ref(&lib), &file, "*FILE")
             .await?
         {
-            bail!("CPF9812: File {file} in library {lib} not found.");
+            bail!("CPF9812: There is no file {file} in library {lib}.");
         }
         Ok(Outcome::Messages(vec![format!(
             "CPC3201: Member {mbr} of file {file} in library {lib} was changed."
@@ -2555,7 +2555,7 @@ impl Job<'_> {
         }
         let Some(lib) = found else {
             bail!(
-                "CPF9812: File {name} in library {} not found.",
+                "CPF9812: There is no file {name} in library {}.",
                 cmd.get("FILE")
                     .split_once('/')
                     .map(|x| x.0)
@@ -4001,7 +4001,7 @@ impl Job<'_> {
             let tl = tl.to_ascii_uppercase();
             let tf = tf.to_ascii_uppercase();
             if !crate::source::is_source_file(self.client, &tl, &tf).await? {
-                bail!("CPF9812: File {tf} in library {tl} not found.");
+                bail!("CPF9812: There is no file {tf} in library {tl}.");
             }
             Some((tl, tf))
         };
@@ -6316,25 +6316,52 @@ impl Job<'_> {
             )
             .await?;
             target_lib = to.library.clone();
-            let [field] = to.file.fields.as_slice() else {
-                bail!("CPF9898: File {name} has more than one field; CPYSPLF copies into a file of one character field here.");
-            };
+            // The lines go into the record as its bytes, whatever its
+            // fields (PUB400 2026-10-27, verify9 d9_spl_two, d9_spl_short:
+            // two character fields, one short field); data cut off at the
+            // record length is CPF3370, once; bytes a numeric field cannot
+            // take end the copy with CPF9846 after CPF3485 for the records
+            // copied (d9_spl_fk).
+            let reclen = crate::cpyf::record_length(&to.file);
             let table = to.table();
             if !add {
                 self.client
                     .batch_execute(&format!("DELETE FROM {table}"))
                     .await?;
             }
-            let width = field.length as usize;
-            let sql = format!(
-                "INSERT INTO {table} ({}) SELECT rpad(l, {width}) FROM unnest($1::text[]) WITH ORDINALITY AS t(l, n) ORDER BY n",
-                field.column()
-            );
-            let cut: Vec<String> = lines
-                .iter()
-                .map(|l| l.chars().take(width).collect())
-                .collect();
-            self.client.execute(sql.as_str(), &[&cut]).await?;
+            let shown = crate::qtemp::logical(&to.library);
+            let mut diags = Vec::new();
+            if lines.iter().any(|l| l.trim_end().chars().count() > reclen) {
+                diags.push(format!(
+                    "CPF3370: Not all of the data fitted into the records of file {name} in {shown}."
+                ));
+            }
+            let mut writer = crate::rla::OpenFile::new(to.clone());
+            for (done, l) in lines.iter().enumerate() {
+                let mut img = crate::tn5250::ebcdic::encode(&format!("{l:<reclen$}"));
+                img.truncate(reclen);
+                let rec = match crate::cpyf::image_record(&to.file, &img) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        diags.push(format!(
+                            "CPF3485: {done} records were copied to file {name} in {shown}."
+                        ));
+                        diags.push(format!(
+                            "CPF9846: Record {} of file {name} in library {shown} could not be written: its data does not fit the fields.",
+                            done + 1
+                        ));
+                        bail!("{}", diags.join("\n"));
+                    }
+                };
+                writer.write(self.client, &rec).await?;
+            }
+            if !diags.is_empty() {
+                diags.push(format!(
+                    "CPF3485: {} records were copied to file {name} in {shown}.",
+                    lines.len()
+                ));
+                return Ok(Outcome::Messages(diags));
+            }
         }
         // CPF3485, the completion message (PUB400 2026-10-27, verify8
         // c8_joblog7: CPYSPLF of a job log into a RCDLEN(132) file).

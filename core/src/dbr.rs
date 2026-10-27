@@ -12,12 +12,14 @@ use crate::cl::Command;
 use crate::commands::{Job, ListDisplay, Outcome};
 use anyhow::{bail, Result};
 
-/// One dependent file: name, library, dependency ("D": data).
+/// One dependent file: name, library, dependency ("D": data, "C": a
+/// referential constraint, with its library and name).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dependent {
     pub name: String,
     pub library: String,
     pub kind: &'static str,
+    pub constraint: Option<(String, String)>,
 }
 
 /// What the report shows about the file.
@@ -77,15 +79,26 @@ pub fn report(input: &Input, stamp: &crate::report::Stamp) -> Vec<String> {
             line(6, "Number of dependent files", "", ""),
             input.dependents.len()
         ),
-        " Files Dependent On Specified File".to_string(),
-        "   Dependent File         Library       Dependency   JREF    Constraint".to_string(),
     ];
+    // No dependents: the report ends with the count (verify9 d9_dbr_lf,
+    // d9_dbr_none).
+    if input.dependents.is_empty() {
+        return out;
+    }
+    out.push(" Files Dependent On Specified File".to_string());
+    out.push("   Dependent File         Library       Dependency   JREF    Constraint".to_string());
     for d in &input.dependents {
         let kind = match d.kind {
             "D" => "Data",
+            "C" => "Constraint",
             k => k,
         };
-        out.push(format!("{:7}{:<19}{:<14}{kind}", "", d.name, d.library));
+        // A constraint's name in column 62 (verify9 d9_dbr_fk).
+        let line = match &d.constraint {
+            Some((_, c)) => format!("{:7}{:<19}{:<14}{kind:<21}{c}", "", d.name, d.library),
+            None => format!("{:7}{:<19}{:<14}{kind}", "", d.name, d.library),
+        };
+        out.push(line);
     }
     out
 }
@@ -109,6 +122,16 @@ pub fn records(input: &Input, now: &str, system: &str) -> Vec<crate::outfile::Re
             ("WHJDIL", "0".into()),
             ("WHJREF", "0".into()),
             ("WHSYSN", system.to_string()),
+            (
+                "WHCTLN",
+                d.and_then(|d| d.constraint.as_ref().map(|c| c.0.clone()))
+                    .unwrap_or_default(),
+            ),
+            (
+                "WHCSTN",
+                d.and_then(|d| d.constraint.as_ref().map(|c| c.1.clone()))
+                    .unwrap_or_default(),
+            ),
         ]
     };
     if input.dependents.is_empty() {
@@ -154,15 +177,27 @@ impl Job<'_> {
             bail!("CPF3012: There is no file {name} in library {shown}.");
         };
         authority::check(self.client, &self.user, &lib, &name, "*FILE", Aut::Use).await?;
-        let dependents = crate::catalog::dependent_files(self.client, &lib, &name)
-            .await?
-            .into_iter()
-            .map(|(l, n)| Dependent {
-                name: n,
+        let mut dependents: Vec<Dependent> =
+            crate::catalog::dependent_files(self.client, &lib, &name)
+                .await?
+                .into_iter()
+                .map(|(l, n)| Dependent {
+                    name: n,
+                    library: crate::qtemp::logical(&l),
+                    kind: "D",
+                    constraint: None,
+                })
+                .collect();
+        // Foreign keys whose parent is this file: dependency C with the
+        // constraint (verify9 d9_dbr_fk, d9_dbr_vals1).
+        for (l, f, c) in crate::catalog::foreign_keys_to(self.client, &lib, &name).await? {
+            dependents.push(Dependent {
+                name: f,
                 library: crate::qtemp::logical(&l),
-                kind: "D",
-            })
-            .collect();
+                kind: "C",
+                constraint: Some((crate::qtemp::logical(&l), c)),
+            });
+        }
         let output = match cmd.get("OUTPUT").to_ascii_uppercase().as_str() {
             "" => "*".to_string(),
             o => o.to_string(),
@@ -230,11 +265,13 @@ mod tests {
                     name: "GLD7IX".into(),
                     library: "AS4TRAINR1".into(),
                     kind: "D",
+                    constraint: None,
                 },
                 Dependent {
                     name: "GLD7VW".into(),
                     library: "AS4TRAINR1".into(),
                     kind: "D",
+                    constraint: None,
                 },
             ],
         }
@@ -278,6 +315,40 @@ mod tests {
             "       GLD7VW             AS4TRAINR1    Data",
         ];
         assert_eq!(&l[1..], want);
+    }
+
+    // verify9 d9_dbr_fk: a foreign key; d9_dbr_none: no dependents.
+    #[test]
+    fn constraint_and_no_dependents() {
+        let stamp = crate::report::Stamp::default();
+        let mut i = input();
+        i.dependents = vec![Dependent {
+            name: "GLD9C".into(),
+            library: "AS4TRAINR1".into(),
+            kind: "C",
+            constraint: Some(("AS4TRAINR1".into(), "GLD9FK".into())),
+        }];
+        let l = report(&i, &stamp);
+        assert_eq!(
+            l.last().unwrap(),
+            "       GLD9C              AS4TRAINR1    Constraint           GLD9FK"
+        );
+        let r = records(&i, "1261027210501", "PUB400");
+        let get = |k: &str| {
+            r[0].iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(get("WHTYPE"), "C");
+        assert_eq!(get("WHCTLN"), "AS4TRAINR1");
+        assert_eq!(get("WHCSTN"), "GLD9FK");
+        i.dependents.clear();
+        let l = report(&i, &stamp);
+        assert_eq!(
+            l.last().unwrap(),
+            "     Number of dependent files . . . . . . . . :                0"
+        );
     }
 
     // c8_dbr_vals1: two dependents, then a file with none (one record).

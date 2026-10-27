@@ -1800,6 +1800,30 @@ pub async fn add_unique_constraint(
     Ok(())
 }
 
+/// The foreign keys whose parent is a file (DSPDBR's constraint
+/// dependents): the dependent file's library and name and the
+/// constraint's name.
+pub async fn foreign_keys_to(
+    client: &Client,
+    library: &str,
+    name: &str,
+) -> Result<Vec<(String, String, String)>> {
+    Ok(client
+        .query(
+            "SELECT c.library, c.file, c.name FROM as4tainr.constraints c
+               JOIN pg_namespace ns ON ns.nspname = lower(c.library)
+               JOIN pg_constraint pc ON pc.connamespace = ns.oid AND pc.conname = lower(c.file || '_' || c.name)
+              WHERE c.kind = 'FOREIGN KEY'
+                AND pc.confrelid = to_regclass(format('%I.%I', lower($1::text), lower($2::text)))
+              ORDER BY c.file, c.library, c.name",
+            &[&library, &name],
+        )
+        .await?
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect())
+}
+
 /// The files built over a file (DSPDBR's dependents): logical files and
 /// SQL indexes (`logical_files`), and SQL views using it; by library and
 /// name.

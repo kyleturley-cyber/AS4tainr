@@ -11497,11 +11497,13 @@ end-proc;
     };
     let stk = format!("inner {:010}", line_of("// @STK") * 100);
     let div = format!("DIVIDE {}", line_of("// @DIV") * 100);
+    // In the test's own job (its call stack and message queues), not
+    // the process-wide ones other tests use at the same time.
     let r = rpg::call(
         &url,
         vec![lib.clone()],
         "QSECOFR".into(),
-        None,
+        job.id.as_ref().map(|i| i.to_string()),
         None,
         None,
         "RUNITF".into(),
@@ -16902,6 +16904,56 @@ async fn cpysplf_copies_lines() {
         .unwrap_err()
         .to_string();
     assert!(e.starts_with("CPF3342"), "{e}");
+    // Into a file of two character fields: the line's bytes fill the
+    // record, cut at its length with CPF3370 (PUB400 2026-10-27, verify9
+    // d9_spl_two); a zoned field the text cannot go into ends the copy
+    // with CPF3485 for what was copied, then CPF9846 (d9_spl_fk).
+    for s in [
+        format!("CREATE TABLE {lib}/SPLTW (A CHAR(5) NOT NULL, B CHAR(10) NOT NULL)"),
+        format!("CREATE TABLE {lib}/SPLZN (N NUMERIC(5, 0) NOT NULL)"),
+    ] {
+        job.run(&format!("RUNSQL SQL('{s}') COMMIT(*NONE)"))
+            .await
+            .unwrap();
+    }
+    let m = match job
+        .run(&format!(
+            "CPYSPLF FILE({spl}) TOFILE({lib}/SPLTW) SPLNBR(*LAST)"
+        ))
+        .await
+        .unwrap()
+    {
+        Outcome::Messages(m) => m,
+        other => panic!("{other:?}"),
+    };
+    let ids: Vec<&str> = m.iter().map(|l| &l[..7]).collect();
+    assert_eq!(ids, ["CPF3370", "CPF3485"], "{m:?}");
+    let (a, b): (String, String) = {
+        let r = client
+            .query_one(
+                &format!(
+                    "SELECT a, b FROM {}.spltw ORDER BY rrn LIMIT 1",
+                    lib.to_ascii_lowercase()
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        (r.get(0), r.get(1))
+    };
+    assert_eq!(
+        format!("{a}{b}"),
+        format!("{:<15}", &lines[0][..15.min(lines[0].len())])
+    );
+    let e = job
+        .run(&format!(
+            "CPYSPLF FILE({spl}) TOFILE({lib}/SPLZN) SPLNBR(*LAST)"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    let ids: Vec<&str> = e.lines().map(|l| &l[..7]).collect();
+    assert_eq!(ids, ["CPF3370", "CPF3485", "CPF9846"], "{e}");
 }
 
 /// CRTPF's DDS listing and its DDS errors, CPYF TOFILE(*PRINT) of an

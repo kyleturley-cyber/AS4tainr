@@ -233,7 +233,7 @@ pub async fn find_member(
             changed_us: r.get(3),
         });
     }
-    bail!("CPF9812: File {file} in library *LIBL not found.");
+    bail!("CPF9812: There is no file {file} in library *LIBL.");
 }
 
 /// The members of a source file: (member, type, text), by name.

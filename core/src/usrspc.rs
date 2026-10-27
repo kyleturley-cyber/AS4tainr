@@ -760,7 +760,7 @@ async fn list_members(client: &Client, caller: &Caller, args: &mut dyn ApiArgs) 
         }
     }
     let Some((lib, r)) = found else {
-        bail!("CPF9812: File {file} in library {flib} not found.");
+        bail!("CPF9812: There is no file {file} in library {flib}.");
     };
     authority::check(client, &caller.user, &lib, &file, "*FILE", Aut::Use).await?;
     let pattern = text(args, 3);
@@ -949,7 +949,7 @@ async fn list_fields(client: &Client, caller: &Caller, args: &mut dyn ApiArgs) -
         if !flib.starts_with('*') && !crate::catalog::library_exists(client, &flib).await? {
             bail!("CPF9810: There is no library {flib}.");
         }
-        bail!("CPF9812: File {file} in library {flib} not found.");
+        bail!("CPF9812: There is no file {file} in library {flib}.");
     };
     authority::check(client, &caller.user, &lib, &file, "*FILE", Aut::Use).await?;
     let (fmt, fields, _) = crate::objdesc::record_format(client, &lib, &file, &attr)

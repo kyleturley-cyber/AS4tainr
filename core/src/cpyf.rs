@@ -323,6 +323,57 @@ pub fn record_image(f: &crate::dds::PhysicalFile, rec: &rla::Record) -> Vec<u8> 
     img
 }
 
+/// A record image back into a record's field values (the inverse of
+/// `record_image`); bytes that are not valid for a numeric field are an
+/// error.
+pub fn image_record(f: &crate::dds::PhysicalFile, img: &[u8]) -> Result<rla::Record> {
+    use crate::rpg::data::{self, Value};
+    let mut rec = rla::Record::new();
+    let mut off = 0;
+    for fd in &f.fields {
+        let Some(t) = crate::rpg::program::program_type(fd, true, false) else {
+            continue;
+        };
+        let size = t.size();
+        let Some(b) = img.get(off..off + size) else {
+            break;
+        };
+        // Decimal data must be valid: zoned digits F0-F9 (the last one's
+        // zone the sign, A-F), packed digit nibbles 0-9 and a sign A-F.
+        let digit = |n: u8| n <= 9;
+        let sign = |n: u8| n >= 0xA;
+        let valid = match t {
+            data::DType::Zoned(..) => b.iter().enumerate().all(|(i, &x)| {
+                digit(x & 0x0F)
+                    && (if i + 1 == b.len() {
+                        sign(x >> 4)
+                    } else {
+                        x >> 4 == 0xF
+                    })
+            }),
+            data::DType::Packed(..) => b.iter().enumerate().all(|(i, &x)| {
+                digit(x >> 4)
+                    && (if i + 1 == b.len() {
+                        sign(x & 0x0F)
+                    } else {
+                        digit(x & 0x0F)
+                    })
+            }),
+            _ => true,
+        };
+        if !valid {
+            anyhow::bail!("field {} has data that is not a valid number", fd.name);
+        }
+        let text = match data::load(&t, b)? {
+            Value::Num(d) => d.rescale(fd.decimals as u8, false)?.to_string(),
+            other => data::a(&other.chars()?),
+        };
+        rec.insert(fd.name.clone(), text);
+        off += size;
+    }
+    Ok(rec)
+}
+
 /// The record length of a record format (the bytes of its fields).
 pub fn record_length(f: &crate::dds::PhysicalFile) -> usize {
     f.fields

@@ -4354,7 +4354,7 @@ async fn command(
                 }
             }
             let Some((lib, r)) = found else {
-                bail!("CPF9812: File {fname} in library {label} not found.");
+                bail!("CPF9812: There is no file {fname} in library {label}.");
             };
             let attr: String = r.get(0);
             let cent = |y: i32| if y >= 2000 { 1 } else { 0 };
@@ -4867,11 +4867,9 @@ async fn command(
                 // program's DSPOBJD OUTPUT(*PRINT)).
                 Outcome::Display(d) if !d.print.is_empty() => {
                     if let Some(id) = job.id.clone() {
-                        // The command's own printer file when it has one
-                        // (DSPFFD QPDSPFFD, DSPFD QPDSPFD; PUB400
-                        // 2026-10-27, verify5 z_cpysplf: CPYSPLF
-                        // FILE(QPDSPFFD)), else QSYSPRT.
-                        let file = d.spool.as_ref().map_or("QSYSPRT", |v| v.file.as_str());
+                        // The command's own printer file (report.rs
+                        // printer_file; verify9 d9_prt_rows).
+                        let file = crate::report::printer_file(&st.name);
                         crate::spool::print_lines(job.client, &id, file, &st.name, &d.print)
                             .await?;
                     } else {

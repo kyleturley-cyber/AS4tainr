@@ -310,10 +310,14 @@ impl Mirror {
             .into_iter()
             .find(|p| Path::new(p).exists())?;
         let mut script = String::from("exec 2>&1\n");
+        // A top-level directory the container does not have is made
+        // first; where it cannot be (as4tainr not running as root: the
+        // namespace's root cannot write in the container's /), the
+        // command does not see that IFS directory (docs/qshell.md).
         for n in &tops {
             let src = self.root.join(n);
             script.push_str(&format!(
-                "mkdir -p {t} 2>/dev/null; {mount} --bind {s} {t} || exit 126\n",
+                "mkdir -p {t} 2>/dev/null; if [ -d {t} ]; then {mount} --bind {s} {t} || exit 126; fi\n",
                 t = sh_quote(&format!("/{n}")),
                 s = sh_quote(&src.to_string_lossy()),
             ));

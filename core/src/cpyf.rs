@@ -133,11 +133,12 @@ impl Job<'_> {
                 "" | "*FIRST" | "*ALL" => from_name.clone(),
                 m => m.to_string(),
             };
-            let images: Vec<(i64, String)> = records
+            let images: Vec<(i64, Vec<u8>)> = records
                 .iter()
                 .zip(&rrns)
-                .map(|(r, n)| (*n, printable(&record_image(&from.file, r))))
+                .map(|(r, n)| (*n, record_image(&from.file, r)))
                 .collect();
+            let hex = cmd.get("OUTFMT").eq_ignore_ascii_case("*HEX");
             let print = print_listing(
                 &from.library,
                 &from_name,
@@ -145,6 +146,7 @@ impl Job<'_> {
                 &from.file.format,
                 record_length(&from.file),
                 logical,
+                hex,
                 &images,
                 &crate::report::Stamp::now(),
             );
@@ -161,7 +163,7 @@ impl Job<'_> {
             all.extend(print);
             let rows: Vec<String> = images
                 .iter()
-                .map(|(_, l)| l.trim_end().to_string())
+                .map(|(_, l)| printable(l).trim_end().to_string())
                 .collect();
             return Ok(Outcome::Display(ListDisplay {
                 title: format!("Copy File {}/{from_name}", from.library),
@@ -356,6 +358,9 @@ pub fn printable(img: &[u8]) -> String {
 /// record's number (with the member number for a logical file) and its
 /// characters; the count line and the end line. 30 lines a page, the
 /// header and ruler repeated (v_print). The product line is as4tainr's.
+/// OUTFMT(*HEX): under each record's characters, a line of each byte's
+/// zone (high) digit and a line of its low digit (PUB400 2026-10-27,
+/// verify7 c7_hex).
 #[allow(clippy::too_many_arguments)]
 pub fn print_listing(
     lib: &str,
@@ -364,7 +369,8 @@ pub fn print_listing(
     format: &str,
     reclen: usize,
     logical: bool,
-    images: &[(i64, String)],
+    hex: bool,
+    images: &[(i64, Vec<u8>)],
     stamp: &crate::report::Stamp,
 ) -> Vec<String> {
     const PAGE: usize = 30;
@@ -397,16 +403,28 @@ pub fn print_listing(
     ];
     let mut page = 1;
     let mut on_page = out.len();
-    for (n, text) in images {
-        if on_page == PAGE {
+    let need = if hex { 3 } else { 1 };
+    for (n, img) in images {
+        if on_page + need > PAGE {
             page += 1;
             out.push(header(page));
             out.push(ruler.clone());
             on_page = 2;
         }
         let mbr = if logical { "1" } else { "" };
+        let text = printable(img);
         out.push(format!("{mbr:>5}{n:>12}  {text}").trim_end().to_string());
-        on_page += 1;
+        if hex {
+            let nib = |f: fn(u8) -> u8| -> String {
+                img.iter()
+                    .map(|&b| char::from_digit(f(b) as u32, 16).unwrap_or('0'))
+                    .collect::<String>()
+                    .to_ascii_uppercase()
+            };
+            out.push(format!("{:19}{}", "", nib(|b| b >> 4)));
+            out.push(format!("{:19}{}", "", nib(|b| b & 0x0F)));
+        }
+        on_page += need;
     }
     out.push(format!(
         " {} records copied to member or label *N in file QSYSPRT in library QSYS. 0 records excluded.",
@@ -433,7 +451,7 @@ mod tests {
             time: "01:29:12".into(),
             zone: String::new(),
         };
-        let img = |s: &str| format!("   {s:<20}");
+        let img = |s: &str| crate::tn5250::ebcdic::encode(&format!("   {s:<20}"));
         let l = print_listing(
             "AS4TRAINR1",
             "GOLDLF",
@@ -441,6 +459,7 @@ mod tests {
             "GOLDR",
             23,
             true,
+            false,
             &[(2, img("Alpha")), (1, img("Beta"))],
             &stamp,
         );
@@ -459,8 +478,10 @@ mod tests {
         assert_eq!(l[5], "    1           2     Alpha");
         assert_eq!(l[7], " 2 records copied to member or label *N in file QSYSPRT in library QSYS. 0 records excluded.");
         assert_eq!(l[8], "                             * * * * *   E N D   O F   C O M P U T E R   P R I N T O U T   * * * * *");
-        let many: Vec<(i64, String)> = (1..=30).map(|n| (n, "x".to_string())).collect();
-        let l = print_listing("L", "F", "F", "F", 1, false, &many, &stamp);
+        let many: Vec<(i64, Vec<u8>)> = (1..=30)
+            .map(|n| (n, crate::tn5250::ebcdic::encode("x")))
+            .collect();
+        let l = print_listing("L", "F", "F", "F", 1, false, false, &many, &stamp);
         // Page 1: header, 3 lines, ruler, 25 records; page 2: header,
         // ruler, the next records (v_print).
         assert_eq!(l[4], "           RCDNBR  *...+... 1 ...+... 2 ...+... 3 ...+... 4 ...+... 5 ...+... 6 ...+... 7 ...+... 8 ...+... 9 ...+... 0");
@@ -468,6 +489,49 @@ mod tests {
         assert_eq!(l[29], "               25  x");
         assert!(l[30].ends_with("Page         2"));
         assert_eq!(l[32], "               26  x");
+    }
+
+    // OUTFMT(*HEX): PUB400 2026-10-27, verify7 c7_hex (ID CHAR(4), N
+    // DECIMAL(5,0): 'AB', 123 and 'Z9', -45).
+    #[test]
+    fn hex_lines() {
+        let pf = crate::dds::parse_pf(
+            "GLD7HX",
+            "     A          R GLD7HX\n     A            ID             4A\n     A            N              5P 0\n",
+        )
+        .unwrap();
+        let rec = |id: &str, n: &str| {
+            rla::Record::from([
+                ("ID".to_string(), id.to_string()),
+                ("N".to_string(), n.to_string()),
+            ])
+        };
+        let stamp = crate::report::Stamp::default();
+        let l = print_listing(
+            "AS4TRAINR1",
+            "GLD7HX",
+            "GLD7HX",
+            "GLD7HX",
+            7,
+            false,
+            true,
+            &[
+                (1, record_image(&pf, &rec("AB", "123"))),
+                (2, record_image(&pf, &rec("Z9", "-45"))),
+            ],
+            &stamp,
+        );
+        assert_eq!(
+            &l[5..11],
+            [
+                "                1  AB",
+                "                   CC44013",
+                "                   120002F",
+                "                2  Z9    )",
+                "                   EF44005",
+                "                   990004D",
+            ]
+        );
     }
 
     // A packed field's bytes print as blanks, characters as themselves

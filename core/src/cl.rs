@@ -4041,8 +4041,8 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*NONE, *NOCHK, *MAP, *DROP")
             .keyword_only(),
-            // TOFILE(*PRINT)'s form: *HEX is printed as *CHAR here
-            // (docs/fidelity-gaps.md).
+            // TOFILE(*PRINT)'s form: *HEX adds each record's zone and
+            // digit lines (cpyf.rs print_listing).
             p("OUTFMT", Kind::Name, false, Some("*CHAR"), "Print format")
                 .ch("*CHAR, *HEX")
                 .keyword_only(),

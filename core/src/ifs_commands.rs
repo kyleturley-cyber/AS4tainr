@@ -224,6 +224,7 @@ impl Job<'_> {
                 let to = cmd.get("TOSTMF");
                 let libs = [lib.clone()];
                 let m = crate::source::find_member(self.client, &libs, &file, &mbr).await?;
+                crate::source::note_used(self.client, &m.library, &m.file, &m.name).await;
                 let eol = if cmd.get("ENDLINFMT").eq_ignore_ascii_case("*FIXED") {
                     ""
                 } else {
@@ -340,6 +341,7 @@ impl Job<'_> {
                     ..Default::default()
                 };
                 crate::source::put_member(self.client, &m, true).await?;
+                crate::source::note_used(self.client, &lib, &file, &mbr).await;
                 msg(format!(
                     "CPCA081: Stream file {from} was copied to member {mbr}."
                 ))

@@ -1922,6 +1922,11 @@ pub(crate) fn map_error(e: &tokio_postgres::Error, sql: &str) -> anyhow::Error {
                     .trim_end_matches(" does not exist")
             )
         ),
+        // A VALUES list longer or shorter than the INSERT's columns:
+        // SQL0117 (PUB400 2026-10-27, tools/golden/verify3.txt x_errors).
+        "42601" if msg.starts_with("INSERT has more") => {
+            anyhow!("SQL0117: The INSERT gives a different number of values than it has columns.")
+        }
         "42601" => anyhow!("SQL0104: Statement not valid: {msg}."),
         "23505" => anyhow!("SQL0803: Duplicate key value: the record was not written."),
         "23514" => match constraint_name(db) {

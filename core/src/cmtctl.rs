@@ -184,6 +184,27 @@ pub async fn start(
     Ok(d)
 }
 
+/// A definition of its own for one piece of work (RUNSQLSTM with a
+/// commit level): not the job's or an activation group's, so COMMIT and
+/// ROLLBACK statements of the script end only its unit of work.
+pub async fn private(
+    catalog: &Client,
+    database_url: &str,
+    job: Option<&str>,
+    lcklvl: &str,
+) -> Result<Arc<Definition>> {
+    let client = crate::sql::connect_as_sql_role(catalog, database_url).await?;
+    crate::runtime::job_session(&client, job, crate::runtime::default_record_wait()).await?;
+    let d = Arc::new(Definition {
+        lcklvl: lcklvl.to_string(),
+        scope: "*ACTGRP".into(),
+        client,
+        changes: AtomicU64::new(0),
+    });
+    d.begin().await?;
+    Ok(d)
+}
+
 /// ENDCMTCTL: the definition ends; pending changes are rolled back and
 /// their number returned. CPF8350 when there is no definition.
 pub async fn end(job: &str, actgrp: &str) -> Result<u64> {

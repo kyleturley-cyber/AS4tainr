@@ -65,9 +65,12 @@ impl Job<'_> {
                     crate::cl::CPF0006
                 );
             }
+            if ty == "*ATR" && cmd.get("FILEATR").eq_ignore_ascii_case("*PF") {
+                return self.dspfd_phy_outfile(cmd, &lib, &name, &attr).await;
+            }
             if ty != "*MBRLIST" {
                 return Err(crate::cl::value_error(&format!(
-                    "OUTPUT(*OUTFILE) is done for TYPE(*MBRLIST) only, not TYPE({ty})."
+                    "OUTPUT(*OUTFILE) is done for TYPE(*MBRLIST) and for TYPE(*ATR) FILEATR(*PF) only, not TYPE({ty}) here."
                 )));
             }
             return self.dspfd_mbrlist_outfile(cmd, &lib, &name, &attr).await;
@@ -276,17 +279,7 @@ impl Job<'_> {
         name: &str,
         attr: &str,
     ) -> Result<Outcome> {
-        let outfile = cmd.get("OUTFILE").trim().to_string();
-        if outfile.is_empty() {
-            return Err(crate::cl::value_error(
-                "OUTPUT(*OUTFILE) needs OUTFILE, the file to receive the records.",
-            ));
-        }
-        let option = cmd
-            .list("OUTMBR")
-            .get(1)
-            .cloned()
-            .unwrap_or_else(|| "*REPLACE".into());
+        let (outfile, option) = outfile_option(cmd)?;
         let logical = attr == "LF";
         let source = crate::source::is_source_file(self.client, lib, name).await?;
         let size = catalog::object_size(self.client, lib, name, "*FILE")
@@ -298,21 +291,43 @@ impl Job<'_> {
                        FROM (SELECT CAST($1::text AS timestamptz) AS t) x";
         let now = self.client.query_one(stamp, &[&"now"]).await?;
         let (ny, nd, nt): (String, String, String) = (now.get(0), now.get(1), now.get(2));
-        // (member, source type, text, records, created, changed)
-        type Member = (String, String, String, i64, String, String);
+        // (member, source type, text, records, created, changed, last
+        // used, days used)
+        type Member = (
+            String,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            Option<String>,
+            i32,
+        );
         let members: Vec<Member> = if source {
             self.client
                 .query(
                     "SELECT member, srctype, text,
                             CASE WHEN source = '' THEN 0
                                  ELSE array_length(string_to_array(rtrim(source, E'\n'), E'\n'), 1) END::bigint,
-                            coalesce(added, now())::text, coalesce(changed, added, now())::text
+                            coalesce(added, now())::text, coalesce(changed, added, now())::text,
+                            last_used::text, days_used
                        FROM as4tainr.source_members WHERE library=$1 AND file=$2 ORDER BY member",
                     &[&lib, &name],
                 )
                 .await?
                 .iter()
-                .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5)))
+                .map(|r| {
+                    (
+                        r.get(0),
+                        r.get(1),
+                        r.get(2),
+                        r.get(3),
+                        r.get(4),
+                        r.get(5),
+                        r.get(6),
+                        r.get(7),
+                    )
+                })
                 .collect()
         } else if attr == "PF" || logical {
             let o = self
@@ -343,6 +358,8 @@ impl Job<'_> {
                 rows,
                 o.get(1),
                 o.get(2),
+                None,
+                0,
             )]
         } else {
             return Err(crate::cl::value_error(&format!(
@@ -351,11 +368,17 @@ impl Job<'_> {
         };
         let system: String = crate::report::system_name().chars().take(8).collect();
         let mut records = Vec::new();
-        for (m, srctype, text, nrec, created, changed) in &members {
+        for (m, srctype, text, nrec, created, changed, used, days) in &members {
             let c = self.client.query_one(stamp, &[created]).await?;
             let h = self.client.query_one(stamp, &[changed]).await?;
             let (cy, cd): (String, String) = (c.get(0), c.get(1));
             let (hy, hd, ht): (String, String, String) = (h.get(0), h.get(1), h.get(2));
+            let mut usage: crate::outfile::Record = vec![("MLUCNT", days.to_string())];
+            if let Some(u) = used {
+                let u = self.client.query_one(stamp, &[u]).await?;
+                usage.push(("MLUCEN", crate::outfile::century(&u.get::<_, String>(0))));
+                usage.push(("MLUDAT", u.get(1)));
+            }
             records.push(vec![
                 ("MLRCEN", crate::outfile::century(&ny)),
                 ("MLRDAT", nd.clone()),
@@ -382,8 +405,129 @@ impl Job<'_> {
                 ("MLSEU2", srctype.clone()),
                 ("MLSIZ2", size.to_string()),
             ]);
+            records.last_mut().unwrap().extend(usage);
         }
         let w = crate::outfile::write(self, &outfile, &option, &crate::outfile::QAFDMBRL, &records)
+            .await?;
+        let mut messages = w.messages.clone();
+        messages.push(crate::outfile::records_added(&w, records.len()));
+        Ok(Outcome::Messages(messages))
+    }
+
+    /// DSPFD TYPE(*ATR) FILEATR(*PF) OUTPUT(*OUTFILE): a record for the
+    /// physical file in the format of QSYS/QAFDPHY (QWHFDPHY; outfile.rs).
+    /// The values as captured for an SQL table (PUB400 2026-10-27,
+    /// tools/golden/verify3.txt x_fd_phyvals: *PHY, D, 1 format, 1
+    /// member, MAXMBRS 1, SIZE 0, the record length, journaled Y with the
+    /// journal, its library and B for *BOTH, SQL type T) and the
+    /// messages (x_fd_phy: CPF9861, CPF9862, CPF3030); dates YYMMDD with a
+    /// century (the model's field descriptions). Fields as4tainr has no
+    /// value for are blank or zero (fidelity-gaps).
+    async fn dspfd_phy_outfile(
+        &mut self,
+        cmd: &Command,
+        lib: &str,
+        name: &str,
+        attr: &str,
+    ) -> Result<Outcome> {
+        let (outfile, option) = outfile_option(cmd)?;
+        if !attr.starts_with("PF") {
+            return Err(crate::cl::value_error(&format!(
+                "File {name} in library {lib} is not a physical file: FILEATR(*PF) lists physical files."
+            )));
+        }
+        let source = crate::source::is_source_file(self.client, lib, name).await?;
+        let reclen: u32 = if source {
+            crate::source::record_length(self.client, lib, name).await?
+        } else {
+            let fr = catalog::resolve_file(self.client, &[lib.to_string()], name).await?;
+            fr.file.fields.iter().map(|f| f.buffer_bytes()).sum()
+        };
+        let stamp =
+            "SELECT to_char(t AT TIME ZONE 'UTC', 'YYYY'), to_char(t AT TIME ZONE 'UTC', 'YYMMDD'),
+                            to_char(t AT TIME ZONE 'UTC', 'HH24MISS')
+                       FROM (SELECT CAST($1::text AS timestamptz) AS t) x";
+        let now = self.client.query_one(stamp, &[&"now"]).await?;
+        let o = self
+            .client
+            .query_one(
+                "SELECT o.text, o.created::text, coalesce(f.sql_type, '')
+                   FROM as4tainr.objects o
+                   LEFT JOIN as4tainr.files f ON f.library = o.library AND f.name = o.name
+                  WHERE o.library=$1 AND o.name=$2 AND o.objtype='*FILE'",
+                &[&lib, &name],
+            )
+            .await?;
+        let (text, created, sql_type): (String, String, String) = (o.get(0), o.get(1), o.get(2));
+        let c = self.client.query_one(stamp, &[&created]).await?;
+        let members: i64 = if source {
+            self.client
+                .query_one(
+                    "SELECT count(*) FROM as4tainr.source_members WHERE library=$1 AND file=$2",
+                    &[&lib, &name],
+                )
+                .await?
+                .get(0)
+        } else {
+            1
+        };
+        let journal = self
+            .client
+            .query_opt(
+                "SELECT journal, journal_lib, images FROM as4tainr.journaled_files
+                  WHERE library=$1 AND file=$2",
+                &[&lib, &name],
+            )
+            .await?;
+        let table = sql_type == "TABLE";
+        let mut rec: crate::outfile::Record = vec![
+            ("PHRCEN", crate::outfile::century(&now.get::<_, String>(0))),
+            ("PHRDAT", now.get(1)),
+            ("PHRTIM", now.get(2)),
+            ("PHFILE", name.to_string()),
+            ("PHLIB", crate::qtemp::logical(lib)),
+            ("PHFTYP", "P".into()),
+            ("PHFILA", "*PHY".into()),
+            ("PHFATR", "PF".into()),
+            (
+                "PHSYSN",
+                crate::report::system_name().chars().take(8).collect(),
+            ),
+            ("PHASP", "1".into()),
+            ("PHDTAT", if source { "S" } else { "D" }.into()),
+            ("PHTXT", text),
+            ("PHNOFM", "1".into()),
+            ("PHFCCN", crate::outfile::century(&c.get::<_, String>(0))),
+            ("PHFCDT", c.get(1)),
+            ("PHFCTM", c.get(2)),
+            ("PHFLS", "Y".into()),
+            ("PHNOMB", members.to_string()),
+            ("PHMAXM", "1".into()),
+            // SIZE: *NOMAX (0) for an SQL table; the DDS default 10000
+            // otherwise, as the printed *ATR report shows.
+            ("PHSIZ", if table { "0" } else { "10000" }.into()),
+            ("PHMXRL", reclen.to_string()),
+            ("PHJRNL", if journal.is_some() { "Y" } else { "N" }.into()),
+            ("PHSQLT", if table { "T" } else { " " }.into()),
+        ];
+        if let Some(j) = &journal {
+            let images: String = j.get(2);
+            rec.extend([
+                ("PHJRNM", j.get::<_, String>(0)),
+                ("PHJRLB", j.get::<_, String>(1)),
+                (
+                    "PHJRIM",
+                    if images.eq_ignore_ascii_case("*BOTH") {
+                        "B"
+                    } else {
+                        "A"
+                    }
+                    .to_string(),
+                ),
+            ]);
+        }
+        let records = vec![rec];
+        let w = crate::outfile::write(self, &outfile, &option, &crate::outfile::QAFDPHY, &records)
             .await?;
         let mut messages = w.messages.clone();
         messages.push(crate::outfile::records_added(&w, records.len()));
@@ -439,6 +583,11 @@ impl Job<'_> {
         let (format, fields, external) = record_format(self.client, &lib, &name, &attr)
             .await
             .map_err(|_| anyhow::anyhow!("CPF9812: File {name} in library {label} not found."))?;
+        if cmd.get("OUTPUT").eq_ignore_ascii_case("*OUTFILE") {
+            return self
+                .dspffd_outfile(cmd, &lib, &name, &attr, &format, &fields)
+                .await;
+        }
         // Source files' fields have no column headings.
         let heading = attr != "PF-SRC";
         // A character field's CCSID: the system's (QCCSID), or the job's
@@ -569,6 +718,142 @@ impl Job<'_> {
     }
 }
 
+impl Job<'_> {
+    /// DSPFFD OUTPUT(*OUTFILE): a record per field in the format of
+    /// QSYS/QADSPFFD (QWHDRFFD; outfile.rs, from the PUB400 DSPFFD capture
+    /// 2026-10-26, tools/golden/verify2.txt m_ffd, whose field
+    /// descriptions say what each holds): the file, the record format and
+    /// its level identifier, then the field's names, buffer positions and
+    /// length, digits and decimal positions, data type, text, CCSID,
+    /// null capability, variable length, alternative name, identity and
+    /// IMPLICITLY HIDDEN. Values as the printed report gives them; dates
+    /// with a century digit. Fields as4tainr keeps no value for are blank
+    /// or zero (fidelity-gaps).
+    async fn dspffd_outfile(
+        &mut self,
+        cmd: &Command,
+        lib: &str,
+        name: &str,
+        attr: &str,
+        format: &str,
+        fields: &[crate::dds::FieldDef],
+    ) -> Result<Outcome> {
+        let (outfile, option) = outfile_option(cmd)?;
+        let stamp =
+            "SELECT to_char(t AT TIME ZONE 'UTC', 'YYYY'), to_char(t AT TIME ZONE 'UTC', 'YYMMDD'),
+                            to_char(t AT TIME ZONE 'UTC', 'HH24MISS')
+                       FROM (SELECT CAST($1::text AS timestamptz) AS t) x";
+        let now = self.client.query_one(stamp, &[&"now"]).await?;
+        let o = self
+            .client
+            .query_one(
+                "SELECT o.created::text, coalesce(f.sql_type, '')
+                   FROM as4tainr.objects o
+                   LEFT JOIN as4tainr.files f ON f.library = o.library AND f.name = o.name
+                  WHERE o.library=$1 AND o.name=$2 AND o.objtype='*FILE'",
+                &[&lib, &name],
+            )
+            .await?;
+        let (created, sql_type): (String, String) = (o.get(0), o.get(1));
+        let c = self.client.query_one(stamp, &[&created]).await?;
+        let crtd = format!(
+            "{}{}",
+            crate::outfile::century(&c.get::<_, String>(0)),
+            c.get::<_, String>(1)
+        );
+        let dttm = format!(
+            "{}{}{}",
+            crate::outfile::century(&now.get::<_, String>(0)),
+            now.get::<_, String>(1),
+            now.get::<_, String>(2)
+        );
+        let ccsid = crate::clpgm::system_value_text("QCCSID")
+            .map(|v| match v {
+                Ok(s) => s,
+                Err(n) => n.to_string(),
+            })
+            .filter(|v| v.trim() != "65535")
+            .unwrap_or_else(|| "37".into());
+        let reclen: u32 = fields.iter().map(|f| f.buffer_bytes()).sum();
+        let level = level_id(format, fields);
+        let system: String = crate::report::system_name().chars().take(8).collect();
+        let sqlt = match sql_type.as_str() {
+            "TABLE" => "T",
+            "INDEX" => "I",
+            _ => " ",
+        };
+        let mut records = Vec::new();
+        let mut pos = 1u32;
+        for x in fields {
+            use crate::dds::DataType;
+            let size = x.buffer_bytes();
+            let numeric = x.data_type.is_numeric() && x.data_type != DataType::Float;
+            let character = matches!(x.data_type, DataType::Char);
+            let alias = x.alias.clone().unwrap_or_default();
+            records.push(vec![
+                ("WHFILE", name.to_string()),
+                ("WHLIB", crate::qtemp::logical(lib)),
+                ("WHCRTD", crtd.clone()),
+                (
+                    "WHFTYP",
+                    if attr.starts_with("LF") { "L" } else { "P" }.to_string(),
+                ),
+                ("WHCNT", "1".to_string()),
+                ("WHDTTM", dttm.clone()),
+                ("WHNAME", format.to_string()),
+                ("WHSEQ", level.clone()),
+                ("WHFLDN", fields.len().to_string()),
+                ("WHRLEN", reclen.to_string()),
+                ("WHFLDI", x.name.clone()),
+                ("WHFLDE", x.name.clone()),
+                ("WHFOBO", pos.to_string()),
+                ("WHIBO", pos.to_string()),
+                ("WHFLDB", size.to_string()),
+                (
+                    "WHFLDD",
+                    if numeric {
+                        x.length.to_string()
+                    } else {
+                        "0".into()
+                    },
+                ),
+                (
+                    "WHFLDP",
+                    if numeric {
+                        x.decimals.to_string()
+                    } else {
+                        "0".into()
+                    },
+                ),
+                ("WHFTXT", x.text.clone()),
+                ("WHFLDT", x.data_type.code().chars().take(1).collect()),
+                ("WHFIOB", "B".to_string()),
+                ("WHNFLD", fields.len().to_string()),
+                (
+                    "WHALTY",
+                    if alias.is_empty() { "N" } else { "Y" }.to_string(),
+                ),
+                ("WHALIS", alias.clone()),
+                ("WHALI2", alias),
+                ("WHSYSN", system.clone()),
+                ("WHSQLT", sqlt.to_string()),
+                ("WHCSID", if character { ccsid.clone() } else { "0".into() }),
+                ("WHVARL", if x.varlen { "Y" } else { "N" }.to_string()),
+                ("WHNULL", if x.null_capable { "Y" } else { "N" }.to_string()),
+                (
+                    "WHIDC",
+                    if x.identity.is_some() { "Y" } else { "N" }.to_string(),
+                ),
+                ("WHHDNCOL", if x.hidden { "1" } else { "0" }.to_string()),
+            ]);
+            pos += size;
+        }
+        let w = crate::outfile::write(self, &outfile, &option, &crate::outfile::QADSPFFD, &records)
+            .await?;
+        Ok(Outcome::Messages(w.messages))
+    }
+}
+
 /// A file's record format: its name, its fields, and whether the file
 /// is externally described. A source file's record is a sequence number,
 /// a date and the data (CRTSRCPF RCDLEN).
@@ -636,4 +921,23 @@ pub fn level_id(format: &str, fields: &[crate::dds::FieldDef]) -> String {
         ));
     }
     format!("{:013X}", h & 0xF_FFFF_FFFF_FFFF)
+}
+
+/// OUTFILE and OUTMBR's member option of a DSPFD to an outfile; no
+/// OUTFILE is CPD9861 (PUB400 2026-10-27, tools/golden/verify3.txt
+/// x_fd_nofile).
+fn outfile_option(cmd: &Command) -> Result<(String, String)> {
+    let outfile = cmd.get("OUTFILE").trim().to_string();
+    if outfile.is_empty() {
+        bail!(
+            "CPD9861: OUTPUT(*OUTFILE) was given without OUTFILE, the file to receive the records.\n{}",
+            crate::cl::CPF0006
+        );
+    }
+    let option = cmd
+        .list("OUTMBR")
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "*REPLACE".into());
+    Ok((outfile, option))
 }

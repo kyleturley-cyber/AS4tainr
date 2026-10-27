@@ -191,10 +191,11 @@ pub async fn add_versioning(
     Ok(())
 }
 
-/// DROP VERSIONING: the history table stays, no longer written.
+/// DROP VERSIONING: the history table stays, no longer written. A table
+/// that is not versioned: SQ20525 (PUB400 2026-10-27, verify3 x_errors).
 pub async fn drop_versioning(client: &Client, lib: &str, file: &str) -> Result<()> {
     if period(client, lib, file).await?.and_then(|p| p.2).is_none() {
-        bail!("SQL0084: Table {file} in {lib} is not versioned.");
+        bail!("SQ20525: Table {file} in {lib} is not versioned.");
     }
     let table = format!("{}.{}", ident(lib), ident(file));
     client
@@ -403,7 +404,7 @@ pub async fn rewrite_system_time(client: &Client, libl: &[String], sql: &str) ->
             .map_err(|_| anyhow::anyhow!("SQL0204: {name} not found."))?;
         let Some((b, e, history)) = period(client, &file.library, &file.file.name).await? else {
             bail!(
-                "SQL0084: {name} is not a system-period temporal table: FOR SYSTEM_TIME needs one."
+                "SQ20524: {name} is not a system-period temporal table: FOR SYSTEM_TIME needs one."
             );
         };
         let col = |n: &str| {
@@ -416,13 +417,15 @@ pub async fn rewrite_system_time(client: &Client, libl: &[String], sql: &str) ->
         };
         // The times must not contain a column reference or a scalar
         // fullselect (SQL Reference, table-reference, period-specification;
-        // PUB400 2026-10-26, verify2 w_asof: AS OF (SELECT MIN(...)) fails).
+        // PUB400 2026-10-26, verify2 w_asof: AS OF (SELECT MIN(...)) fails;
+        // verify3 x_errors: SQ20524 for both, and for a table that is not
+        // temporal).
         for v in [&t1, &t2] {
             for t in crate::sql::tokenize(v)? {
                 let Tok::Word(w) = t else { continue };
                 let w = w.to_ascii_uppercase();
                 if w == "SELECT" {
-                    bail!("SQL0104: The time in FOR SYSTEM_TIME cannot be a fullselect.");
+                    bail!("SQ20524: The time in FOR SYSTEM_TIME cannot be a fullselect.");
                 }
                 if file
                     .file
@@ -430,17 +433,20 @@ pub async fn rewrite_system_time(client: &Client, libl: &[String], sql: &str) ->
                     .iter()
                     .any(|f| f.name == w || f.alias.as_deref() == Some(w.as_str()))
                 {
-                    bail!("SQL0104: The time in FOR SYSTEM_TIME cannot name column {w}.");
+                    bail!("SQ20524: The time in FOR SYSTEM_TIME cannot name column {w}.");
                 }
             }
         }
         let (bc, ec) = (col(&b), col(&e));
         // A string is a timestamp in any of Db2's formats (TIMESTAMP()).
         let (t1, t2) = (format!("TIMESTAMP({t1})"), format!("TIMESTAMP({t2})"));
+        // A version whose period is empty (the extra row of a delete,
+        // begin = end) is in no period (PUB400 2026-10-27, verify3
+        // x_asof: FROM 2000 TO 9999 counts 2 of the 3 history rows).
         let cond = match kind.as_str() {
             "AS" => format!("{bc} <= {t1} AND {ec} > {t1}"),
-            "FROM" => format!("{bc} < {t2} AND {ec} > {t1}"),
-            _ => format!("{bc} <= {t2} AND {ec} > {t1}"),
+            "FROM" => format!("{bc} < {t2} AND {ec} > {t1} AND {bc} < {ec}"),
+            _ => format!("{bc} <= {t2} AND {ec} > {t1} AND {bc} < {ec}"),
         };
         let cols: Vec<String> = file
             .file

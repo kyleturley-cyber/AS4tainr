@@ -3974,7 +3974,10 @@ pub static COMMANDS: &[CommandDef] = &[
         description: "Display File Field Description",
         params: &[
             p("FILE", Kind::Qualified, true, None, "File").ch("Name"),
-            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT, *OUTFILE"),
+            p("OUTFILE", Kind::Qualified, false, None, "File to receive output").ch("Name"),
+            p("OUTMBR", Kind::List, false, Some("*FIRST *REPLACE"), "Output member options")
+                .ch("*FIRST, *REPLACE, *ADD"),
         ],
     },
     CommandDef {

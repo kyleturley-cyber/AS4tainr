@@ -256,8 +256,13 @@ pub async fn set_function(client: &Client, id: &JobId, function: &str, activity:
 pub fn message_id(text: &str) -> &str {
     match text.split_once(':') {
         Some((id, _))
+            // A letter, two letters or digits (SQL messages like SQ20524:
+            // PUB400 2026-10-27, verify3 x_errors), four hexadecimal digits.
             if id.len() == 7
-                && id[..3].chars().all(|c| c.is_ascii_uppercase())
+                && id.as_bytes()[0].is_ascii_uppercase()
+                && id[1..3]
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
                 && id[3..].chars().all(|c| c.is_ascii_hexdigit()) =>
         {
             id

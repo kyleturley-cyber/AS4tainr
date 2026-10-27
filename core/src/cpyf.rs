@@ -23,13 +23,69 @@ impl Job<'_> {
         let from_q = cmd.get("FROMFILE").to_ascii_uppercase();
         let (libs, from_name) = self.search(&from_q);
         let from_label = from_q.split_once('/').map(|x| x.0).unwrap_or("*LIBL");
-        let from = catalog::resolve_file(self.client, &libs, &from_name)
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "CPF2802: From-file {from_name} in library {from_label} does not exist.\nCPF2817: The copy was not done."
-                )
-            })?;
+        // A source file: its member's records, SRCSEQ, SRCDAT and SRCDTA
+        // (PUB400 2026-10-27, tools/golden/verify3.txt x_src: CPYF of a
+        // source member to *PRINT).
+        let mut source_lib = None;
+        for l in &libs {
+            if crate::source::is_source_file(self.client, l, &from_name).await? {
+                source_lib = Some(l.clone());
+                break;
+            }
+        }
+        let mut source_records: Option<Vec<rla::Record>> = None;
+        let from = if let Some(l) = source_lib {
+            let mbr = match cmd.get("FROMMBR").to_ascii_uppercase().as_str() {
+                "" | "*FIRST" => self
+                    .client
+                    .query_opt(
+                        "SELECT member FROM as4tainr.source_members WHERE library=$1 AND file=$2
+                          ORDER BY added, member LIMIT 1",
+                        &[&l, &from_name],
+                    )
+                    .await?
+                    .map(|r| r.get::<_, String>(0))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "CPF4102: File {from_name} in library {l} has no members.\nCPF2817: The copy was not done."
+                        )
+                    })?,
+                m => m.to_string(),
+            };
+            let m =
+                crate::source::find_member(self.client, std::slice::from_ref(&l), &from_name, &mbr)
+                    .await?;
+            // Reading a member is a use of it (source::note_used).
+            crate::source::note_used(self.client, &l, &from_name, &mbr).await;
+            let rcdlen = crate::source::record_length(self.client, &l, &from_name).await?;
+            let pf = crate::source::record_file(&from_name, rcdlen);
+            let width = pf.fields[2].length as usize;
+            source_records = Some(
+                m.source
+                    .lines()
+                    .enumerate()
+                    .map(|(i, line)| {
+                        rla::Record::from([
+                            ("SRCSEQ".to_string(), format!("{}.00", (i + 1) % 10000)),
+                            ("SRCDAT".to_string(), "0".to_string()),
+                            ("SRCDTA".to_string(), line.chars().take(width).collect()),
+                        ])
+                    })
+                    .collect(),
+            );
+            catalog::FileRef {
+                library: l,
+                file: pf,
+            }
+        } else {
+            catalog::resolve_file(self.client, &libs, &from_name)
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "CPF2802: From-file {from_name} in library {from_label} does not exist.\nCPF2817: The copy was not done."
+                    )
+                })?
+        };
         crate::authority::check(
             self.client,
             &self.user,
@@ -40,15 +96,19 @@ impl Job<'_> {
         )
         .await?;
         let to_q = cmd.get("TOFILE").to_ascii_uppercase();
-        let mut reader = rla::OpenFile::new(from.clone());
         let mut records = Vec::new();
-        loop {
-            let r = reader.read(self.client).await?;
-            if r.eof {
-                break;
-            }
-            if let Some(rec) = r.record {
-                records.push(rec);
+        if let Some(r) = source_records {
+            records = r;
+        } else {
+            let mut reader = rla::OpenFile::new(from.clone());
+            loop {
+                let r = reader.read(self.client).await?;
+                if r.eof {
+                    break;
+                }
+                if let Some(rec) = r.record {
+                    records.push(rec);
+                }
             }
         }
         let fields: Vec<String> = from.file.fields.iter().map(|f| f.name.clone()).collect();

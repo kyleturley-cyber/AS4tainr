@@ -4793,9 +4793,17 @@ async fn sql_tables_indexes_and_runsqlstm() {
     let as4tainr_core::commands::Outcome::Messages(m) = out else {
         panic!("{out:?}")
     };
-    assert_eq!(
-        m.last().unwrap(),
-        &format!("3 statements run from member DROPS in {lib}/QSQLSRC; 2 with errors.")
+    // No completion message; the listing reports the errors (PUB400
+    // 2026-10-27, tools/golden/verify3.txt x_errors: ERRLVL(30) with
+    // severity 30 errors ends normally and sends nothing).
+    assert!(m.is_empty(), "{m:?}");
+    assert!(
+        job.calls
+            .printed
+            .iter()
+            .any(|l| l == "30 level severity errors found in source"),
+        "{:?}",
+        job.calls.printed
     );
     assert!(
         catalog::object_exists(&client, std::slice::from_ref(&lib), "AFTER", "*FILE")
@@ -11233,6 +11241,17 @@ async fn rpg_features_found_by_rpgunit() {
     let env = Environment {
         database_url: url.clone(),
     };
+    // A job of its own: jobs without one share the process's program
+    // message queues, which other tests running at the same time use.
+    let id = as4tainr_core::jobs::start_interactive(
+        &client,
+        &format!("R{}", &lib[1..]),
+        "QSECOFR",
+        None,
+        std::slice::from_ref(&lib),
+    )
+    .await
+    .unwrap();
     let mut job = Job {
         client: &client,
         env: &env,
@@ -11240,7 +11259,7 @@ async fn rpg_features_found_by_rpgunit() {
         curlib: Some(lib.clone()),
         libl: vec![lib.clone()],
         display: None,
-        id: None,
+        id: Some(id),
         calls: Default::default(),
     };
     // OVRPRTF's parameters left out are not overridden (CL reference,
@@ -13782,6 +13801,17 @@ async fn message_to_caller_two_entries_up() {
     let env = Environment {
         database_url: url.clone(),
     };
+    // A job of its own: jobs without one share the process's call stack,
+    // which other tests running at the same time add to.
+    let id = as4tainr_core::jobs::start_interactive(
+        &client,
+        &format!("M{}", &lib[1..]),
+        "QSECOFR",
+        None,
+        std::slice::from_ref(&lib),
+    )
+    .await
+    .unwrap();
     let mut job = Job {
         client: &client,
         env: &env,
@@ -13789,7 +13819,7 @@ async fn message_to_caller_two_entries_up() {
         curlib: Some(lib.clone()),
         libl: vec![lib.clone()],
         display: None,
-        id: None,
+        id: Some(id),
         calls: Default::default(),
     };
     source::create_file(&client, &lib, "QRPGLESRC", "")
@@ -15257,6 +15287,42 @@ async fn strings_compare_with_numbers_and_alter_table_alterations() {
 }
 
 /// A job running commands as QSECOFR with the library first.
+/// `run_in` in an interactive job of its own (its own job key, so its
+/// call stack and messages are not shared with other tests' jobs).
+async fn run_in_own_job(
+    client: &Client,
+    url: &str,
+    lib: &str,
+    line: &str,
+) -> anyhow::Result<Vec<String>> {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let env = Environment {
+        database_url: url.to_string(),
+    };
+    let id = as4tainr_core::jobs::start_interactive(
+        client,
+        &format!("J{}", &lib[1..]),
+        "QSECOFR",
+        None,
+        &[lib.to_string(), "QGPL".into()],
+    )
+    .await?;
+    let mut job = Job {
+        client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.to_string()),
+        libl: vec![lib.to_string(), "QGPL".into()],
+        display: None,
+        id: Some(id),
+        calls: Default::default(),
+    };
+    match job.run(line).await? {
+        Outcome::Messages(m) => Ok(m),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
 async fn run_in(client: &Client, url: &str, lib: &str, line: &str) -> anyhow::Result<Vec<String>> {
     use as4tainr_core::commands::{Environment, Job, Outcome};
     let env = Environment {
@@ -15444,7 +15510,9 @@ PARM KWD(OUT) TYPE(*CHAR) LEN(10) RTNVAL(*YES) MIN(1)
         .unwrap_err()
         .to_string();
     assert!(e.starts_with("CPD0031") && e.contains("CPF0006"), "{e}");
-    let m = run_in(&client, &url, &lib, &format!("CALL {lib}/CALLER"))
+    // In a job of its own: jobs without one share the process's call
+    // stack, which other tests running at the same time add to.
+    let m = run_in_own_job(&client, &url, &lib, &format!("CALL {lib}/CALLER"))
         .await
         .unwrap();
     assert_eq!(
@@ -15821,13 +15889,43 @@ async fn dspobjd_and_dspfd_outfiles() {
     .unwrap_err()
     .to_string();
     assert!(e.starts_with("CPD3006"), "{e}");
-    // Only TYPE(*MBRLIST) goes to an output file here.
-    let e = run_in(
+    // FILEATR(*PF): a QAFDPHY record (PUB400 2026-10-27,
+    // tools/golden/verify3.txt x_fd_phy: CPF9861, CPF9862, CPF3030; a
+    // source file's PHDTAT is S, the model's field description).
+    let m = run_in(
         &client,
         &url,
         &lib,
         &format!(
             "DSPFD FILE({lib}/QOSRC) TYPE(*ATR) FILEATR(*PF) OUTPUT(*OUTFILE) OUTFILE({lib}/ATRS)"
+        ),
+    )
+    .await
+    .unwrap();
+    let ids: Vec<&str> = m
+        .iter()
+        .map(|x| as4tainr_core::jobs::message_id(x))
+        .collect();
+    assert_eq!(ids, ["CPF9861", "CPF9862", "CPF3030"]);
+    let r = client
+        .query_one(
+            &format!(
+                "SELECT rtrim(phfile), phfila, phdtat, phnomb::text, phjrnl FROM {}.atrs",
+                lib.to_ascii_lowercase()
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let got: Vec<String> = (0..5).map(|i| r.get(i)).collect();
+    assert_eq!(got, ["QOSRC", "*PHY", "S", "2", "N"]);
+    // Other kinds of files do not go to an output file here.
+    let e = run_in(
+        &client,
+        &url,
+        &lib,
+        &format!(
+            "DSPFD FILE({lib}/QOSRC) TYPE(*ATR) FILEATR(*LF) OUTPUT(*OUTFILE) OUTFILE({lib}/ATRS)"
         ),
     )
     .await
@@ -16111,13 +16209,48 @@ async fn verify2_runsqlstm_hidden_columns_and_outfiles() {
         .iter()
         .any(|x| x == "30 level severity errors found in source"));
     // The same script under commitment control (COMMIT(*CHG), the
-    // default) is not refused for ROLLBACK by SQL7007.
-    let e = job
-        .run(&format!("RUNSQLSTM SRCFILE({lib}/QSQLSRC) SRCMBR(GLDRB)"))
+    // default): ROLLBACK takes back the INSERT before it, COMMIT keeps
+    // the one after, and the end commits (PUB400 2026-10-27,
+    // tools/golden/verify3.txt x_cmt: SQL7961, SQL7960, then SQL7960
+    // with no record; CMT1 gone, CMT2 and CMT3 kept).
+    job.run(&format!("RUNSQLSTM SRCFILE({lib}/QSQLSRC) SRCMBR(GLDRB)"))
         .await
-        .unwrap_err()
-        .to_string();
-    assert!(!e.contains("SQL7007"), "{e}");
+        .unwrap();
+    let ids = as4tainr_core::sql::run(
+        &client,
+        &url,
+        std::slice::from_ref(&lib),
+        &format!("SELECT RTRIM(ID) FROM {lib}.GLDTO ORDER BY SEQ"),
+    )
+    .await
+    .unwrap();
+    let as4tainr_core::sql::Outcome::Rows { rows, .. } = ids else {
+        panic!("{ids:?}")
+    };
+    assert_eq!(rows, [["RB1".to_string()], ["RB2".to_string()]]);
+    let l = &job.calls.printed;
+    assert!(
+        l.iter()
+            .any(|x| x.starts_with("SQL7961   0       3  Position 1 ")),
+        "{l:#?}"
+    );
+    assert!(
+        l.iter()
+            .any(|x| x.starts_with("SQL7960   0       5  Position 1 ")),
+        "{l:#?}"
+    );
+    assert!(
+        l.iter().any(|x| x.starts_with("SQL7960   0          ")),
+        "{l:#?}"
+    );
+    assert!(l
+        .iter()
+        .any(|x| x == "00 level severity errors found in source"));
+    job.run(&format!(
+        "RUNSQL SQL('DELETE FROM {lib}/GLDTO') COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
 
     // A temporal table with hidden columns, as gldtmp.sql makes it.
     let script = format!(
@@ -16152,11 +16285,14 @@ async fn verify2_runsqlstm_hidden_columns_and_outfiles() {
     ))
     .await
     .unwrap();
-    assert!(sql(format!(
+    // verify3 x_errors: SQL0117.
+    let e = sql(format!(
         "INSERT INTO {lib}.GLDTMP VALUES('G3', 1, 'WRKSPLF')"
     ))
     .await
-    .is_err());
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("SQL0117"), "{e}");
     match sql(format!("SELECT * FROM {lib}.GLDTMP")).await.unwrap() {
         as4tainr_core::sql::Outcome::Rows { columns, .. } => {
             assert_eq!(columns, ["GRP", "SEQ", "CMD", "AUDIT_USER", "AUDIT_OPER"])
@@ -16194,12 +16330,16 @@ async fn verify2_runsqlstm_hidden_columns_and_outfiles() {
     .await
     .unwrap_err()
     .to_string();
-    assert!(e.contains("fullselect"), "{e}");
-    assert!(sql(format!(
-        "SELECT VAL FROM {lib}.GLDTO FOR SYSTEM_TIME AS OF CURRENT TIMESTAMP"
-    ))
-    .await
-    .is_err());
+    // verify3 x_errors: SQ20524 for a fullselect, a column and a table
+    // that is not temporal.
+    assert!(e.contains("SQ20524") && e.contains("fullselect"), "{e}");
+    for q in [
+        format!("SELECT CMD FROM {lib}.GLDTMP FOR SYSTEM_TIME AS OF SYS_START"),
+        format!("SELECT VAL FROM {lib}.GLDTO FOR SYSTEM_TIME AS OF CURRENT TIMESTAMP"),
+    ] {
+        let e = sql(q).await.unwrap_err().to_string();
+        assert!(e.contains("SQ20524"), "{e}");
+    }
     // FROM ... TO with constants still works (w_fromto: the current row).
     match sql(format!(
         "SELECT COUNT(*) FROM {lib}.GLDTMP FOR SYSTEM_TIME FROM '2000-01-01-00.00.00' TO '9999-12-30-00.00.00' T"
@@ -16210,6 +16350,24 @@ async fn verify2_runsqlstm_hidden_columns_and_outfiles() {
         as4tainr_core::sql::Outcome::Rows { rows, .. } => assert_eq!(rows, [["1".to_string()]]),
         other => panic!("{other:?}"),
     }
+    // A delete's extra row (begin = end) is in no period: FROM ... TO
+    // counts the version that was deleted, not its extra row (verify3
+    // x_asof: 2 for an insert, an update and a delete).
+    sql(format!("DELETE FROM {lib}.GLDTMP")).await.unwrap();
+    match sql(format!(
+        "SELECT COUNT(*) FROM {lib}.GLDTMP FOR SYSTEM_TIME FROM '2000-01-01-00.00.00' TO '9999-12-30-00.00.00' T"
+    ))
+    .await
+    .unwrap()
+    {
+        as4tainr_core::sql::Outcome::Rows { rows, .. } => assert_eq!(rows, [["1".to_string()]]),
+        other => panic!("{other:?}"),
+    }
+    // DROP VERSIONING of a table that is not versioned: SQ20525.
+    let drop = format!("RUNSQL SQL('ALTER TABLE {lib}/GLDTMP DROP VERSIONING') COMMIT(*NONE)");
+    job.run(&drop).await.unwrap();
+    let e = job.run(&drop).await.unwrap_err().to_string();
+    assert!(e.contains("SQ20525"), "{e}");
 
     // Output files: the messages.
     job.run(&format!(
@@ -16261,6 +16419,31 @@ async fn verify2_runsqlstm_hidden_columns_and_outfiles() {
         .await
         .unwrap();
     }
+    // A1 used (copied to a stream file and back), B2 never: the usage
+    // fields (verify3 x_mbrl_vals: 1, today, 1 for the member used; blank,
+    // blank, 0 for the other).
+    let stmf = format!("/tmp/{lib}-a1.txt");
+    job.run(&format!(
+        "CPYTOSTMF FROMMBR('/QSYS.LIB/{lib}.LIB/GLDWSRC.FILE/A1.MBR') TOSTMF('{stmf}')"
+    ))
+    .await
+    .unwrap();
+    job.run(&format!(
+        "CPYFRMSTMF FROMSTMF('{stmf}') TOMBR('/QSYS.LIB/{lib}.LIB/GLDWSRC.FILE/A1.MBR') MBROPT(*REPLACE)"
+    ))
+    .await
+    .unwrap();
+    // CPYF of a source member (verify3 x_src: printed, no error).
+    match job
+        .run(&format!(
+            "CPYF FROMFILE({lib}/GLDWSRC) TOFILE(*PRINT) FROMMBR(A1)"
+        ))
+        .await
+        .unwrap()
+    {
+        Outcome::Display(d) => assert!(d.print[0].starts_with("CPC2955"), "{:?}", d.print),
+        other => panic!("{other:?}"),
+    }
     assert_eq!(
         ids(job
             .run(&format!(
@@ -16269,6 +16452,32 @@ async fn verify2_runsqlstm_hidden_columns_and_outfiles() {
             .await
             .unwrap()),
         ["CPF9861", "CPF9862", "CPF3030"]
+    );
+    let today: String = client
+        .query_one("SELECT to_char(now() AT TIME ZONE 'UTC', 'YYMMDD')", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let rows = client
+        .query(
+            &format!(
+                "SELECT rtrim(mlname), mlucen, mludat, mlucnt::text FROM {}.gldmbr ORDER BY mlname",
+                lib.to_ascii_lowercase()
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let got: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| (0..4).map(|i| r.get(i)).collect())
+        .collect();
+    assert_eq!(
+        got,
+        [
+            vec!["A1".to_string(), "1".into(), today.clone(), "1".into()],
+            vec!["B2".to_string(), " ".into(), "      ".into(), "0".into()]
+        ]
     );
     match job
         .run(&format!(
@@ -16308,4 +16517,91 @@ async fn verify2_runsqlstm_hidden_columns_and_outfiles() {
             "{file}"
         );
     }
+}
+
+/// DSPFFD OUTPUT(*OUTFILE): a QADSPFFD record per field (the model's
+/// field descriptions: PUB400 2026-10-26, tools/golden/verify2.txt
+/// m_ffd). The values are the printed report's for the same table
+/// (verify2 w_hist_ffd, DSPFFD of a table made like gldtmp.sql's: GRP
+/// CHAR 10 at 1, SEQ BINARY 9 0 in 4 bytes at 11, CMD a VARCHAR(100) in
+/// 102 bytes at 15, AUDIT_USER 130 at 117 and AUDIT_OPER 1 at 247, the
+/// auditing columns null-capable); IMPLICITLY HIDDEN columns have
+/// WHHDNCOL 1. The file is made with CPF9861 and CPF9862 (outfile.rs).
+#[tokio::test]
+async fn dspffd_outfile() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let script = format!(
+        "create table {lib}.GLDTMP (GRP char(10) not null, SEQ int not null, CMD varchar(100) not null,
+           AUDIT_USER varchar(128) generated always as (SESSION_USER),
+           AUDIT_OPER char(1) generated always as (data change operation),
+           SYS_START timestamp(12) not null generated always as row begin,
+           SYS_END timestamp(12) not null generated always as row end,
+           TS_ID timestamp(12) not null generated always as transaction start id,
+           period system_time (SYS_START, SYS_END));
+         alter table {lib}.GLDTMP alter column TS_ID set implicitly hidden;"
+    );
+    let lines = job
+        .run_sql_script(&script, "test", 0, Some(lib.clone()), true)
+        .await
+        .unwrap();
+    assert!(!lines.iter().any(|l| l.contains(": SQL")), "{lines:?}");
+    match job
+        .run(&format!(
+            "DSPFFD FILE({lib}/GLDTMP) OUTPUT(*OUTFILE) OUTFILE({lib}/FFD)"
+        ))
+        .await
+        .unwrap()
+    {
+        Outcome::Messages(m) => {
+            let ids: Vec<&str> = m
+                .iter()
+                .map(|x| as4tainr_core::jobs::message_id(x))
+                .collect();
+            assert_eq!(ids, ["CPF9861", "CPF9862"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    let rows = client
+        .query(
+            &format!(
+                "SELECT rtrim(whflde) || '|' || whfobo::text || '|' || whfldb::text || '|' || whfldd::text
+                        || '|' || whfldp::text || '|' || whfldt || '|' || whvarl || '|' || whnull
+                        || '|' || whhdncol || '|' || whfldn::text || '|' || rtrim(whname)
+                   FROM {}.ffd ORDER BY whfobo",
+                lib.to_ascii_lowercase()
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let got: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(
+        got[..5],
+        [
+            "GRP|1|10|0|0|A|N|N|0|8|GLDTMP",
+            "SEQ|11|4|9|0|B|N|N|0|8|GLDTMP",
+            "CMD|15|102|0|0|A|Y|N|0|8|GLDTMP",
+            "AUDIT_USER|117|130|0|0|A|Y|Y|0|8|GLDTMP",
+            "AUDIT_OPER|247|1|0|0|A|N|Y|0|8|GLDTMP",
+        ]
+    );
+    assert!(
+        got[7].starts_with("TS_ID|") && got[7].contains("|1|8|"),
+        "{got:?}"
+    );
 }

@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS as4tainr.source_members (
 );
 -- When a member was added: *FIRST is the member added first.
 ALTER TABLE as4tainr.source_members ADD COLUMN IF NOT EXISTS added timestamptz NOT NULL DEFAULT now();
+-- Usage data: when the member was last used and on how many days.
+ALTER TABLE as4tainr.source_members ADD COLUMN IF NOT EXISTS last_used timestamptz;
+ALTER TABLE as4tainr.source_members ADD COLUMN IF NOT EXISTS days_used integer NOT NULL DEFAULT 0;
 -- Stream files (a small IFS): include files that source refers to by
 -- path, such as RPG `/INCLUDE 'header.rpgleinc'`.
 CREATE TABLE IF NOT EXISTS as4tainr.stream_files (
@@ -496,6 +499,25 @@ pub fn record_file(name: &str, rcdlen: u32) -> crate::dds::PhysicalFile {
 /// the first one added (*FIRST). Its lines become the records of the
 /// table LIB.FILE (sequence numbers 1.00, 2.00...; date 0). The member's
 /// name.
+/// A member was used (opened to read or write it): its last-used date,
+/// and one more day in its days-used count when it was not used today
+/// yet (DSPFD TYPE(*MBRLIST) MLUDAT and MLUCNT: PUB400 2026-10-27,
+/// tools/golden/verify3.txt x_mbrl_vals: a member written by CPYFRMSTMF
+/// and read by CPYF the same day, 1; a member never opened, blank and 0).
+pub async fn note_used(client: &Client, library: &str, file: &str, member: &str) {
+    let _ = client
+        .execute(
+            "UPDATE as4tainr.source_members
+                SET days_used = days_used + CASE WHEN last_used IS NULL
+                      OR (last_used AT TIME ZONE 'UTC')::date <> (now() AT TIME ZONE 'UTC')::date
+                    THEN 1 ELSE 0 END,
+                    last_used = now()
+              WHERE library = $1 AND file = $2 AND member = $3",
+            &[&library, &file, &member],
+        )
+        .await;
+}
+
 pub async fn open_member(
     client: &Client,
     library: &str,
@@ -528,6 +550,7 @@ pub async fn open_member(
                 "CPF9815: Member {member} of file {file} in library {library} does not exist."
             )
         })?;
+    note_used(client, library, file, &member).await;
     let rcdlen = record_length(client, library, file).await?;
     let pf = record_file(file, rcdlen);
     let table = format!(

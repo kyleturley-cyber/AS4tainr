@@ -44,7 +44,7 @@ import subprocess
 import sys
 import tempfile
 
-MSG = re.compile(r"^([A-Z]{3}[0-9A-F]{4}): ?(.*)$")
+MSG = re.compile(r"^([A-Z][A-Z0-9]{2}[0-9A-F]{4}): ?(.*)$")
 # Lines a capture system adds to every printed page (PUB400's own footer).
 FOOTER = re.compile(r"^\s*-=\*.*\*=-\s*$")
 
@@ -140,7 +140,7 @@ def audit(golden, src):
             m = MSG.match(line.strip())
             if m and len(skeleton(m.group(2))) > 8:
                 ibm.setdefault((m.group(1), skeleton(m.group(2))), f[:-4])
-    lit = re.compile(r'"([A-Z]{3}[0-9A-F]{4}): ((?:[^"\\]|\\.)*)"')
+    lit = re.compile(r'"([A-Z][A-Z0-9]{2}[0-9A-F]{4}): ((?:[^"\\]|\\.)*)"')
     found = 0
     for root, _, files in os.walk(src):
         for f in sorted(files):

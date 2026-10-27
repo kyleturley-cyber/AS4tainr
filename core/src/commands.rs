@@ -1052,10 +1052,14 @@ impl Job<'_> {
             "*NONE" => None,
             s => Some(catalog::validate_name("library", s)?),
         };
-        // COMMIT(*NONE) or *NC: no commitment control.
-        let no_commit = matches!(cmd.get("COMMIT"), "*NONE" | "*NC");
+        // COMMIT(*NONE) or *NC: no commitment control; else the script's
+        // changes are a unit of work of its own.
+        let commit = match cmd.get("COMMIT").to_ascii_uppercase().as_str() {
+            "*NONE" | "*NC" => ScriptCommit::NoCommit,
+            level => ScriptCommit::Level(level.to_string()),
+        };
         let run = self
-            .run_script(&source, &what, errlvl, schema, true, no_commit)
+            .run_script(&source, &what, errlvl, schema, true, commit)
             .await?;
         // The listing (OUTPUT(*PRINT)); the statements' messages are in it
         // rather than sent to the caller (PUB400 2026-10-26, verify2
@@ -1068,9 +1072,10 @@ impl Job<'_> {
         if let Some(e) = run.failed {
             return Err(e);
         }
-        Ok(Outcome::Messages(
-            run.lines.last().cloned().into_iter().collect(),
-        ))
+        // No completion message: `system` shows only the listing (PUB400
+        // 2026-10-27, tools/golden/verify3.txt x_ok, and x_errors with
+        // ERRLVL(30)).
+        Ok(Outcome::Messages(vec![]))
     }
 
     /// Run the statements of an SQL script (RUNSQLSTM). `schema`: the
@@ -1086,23 +1091,8 @@ impl Job<'_> {
         schema: Option<String>,
         set_schema: bool,
     ) -> Result<Vec<String>> {
-        self.run_sql_script_commit(source, what, errlvl, schema, set_schema, false)
-            .await
-    }
-
-    /// `run_sql_script` with `no_commit`: the script runs without
-    /// commitment control (RUNSQLSTM COMMIT(*NONE) or *NC).
-    pub async fn run_sql_script_commit(
-        &mut self,
-        source: &str,
-        what: &str,
-        errlvl: u32,
-        schema: Option<String>,
-        set_schema: bool,
-        no_commit: bool,
-    ) -> Result<Vec<String>> {
         let run = self
-            .run_script(source, what, errlvl, schema, set_schema, no_commit)
+            .run_script(source, what, errlvl, schema, set_schema, ScriptCommit::Auto)
             .await?;
         match run.failed {
             Some(e) => Err(e),
@@ -1121,8 +1111,22 @@ impl Job<'_> {
         errlvl: u32,
         mut schema: Option<String>,
         set_schema: bool,
-        no_commit: bool,
+        commit: ScriptCommit,
     ) -> Result<ScriptRun> {
+        let no_commit = commit == ScriptCommit::NoCommit;
+        // The script's unit of work, under a commit level.
+        let unit = match &commit {
+            ScriptCommit::Level(l) => Some(
+                crate::cmtctl::private(
+                    self.client,
+                    &self.env.database_url,
+                    self.id.as_ref().map(|i| i.to_string()).as_deref(),
+                    l,
+                )
+                .await?,
+            ),
+            _ => None,
+        };
         let mut lines = Vec::new();
         let mut msgs: Vec<crate::sqlstmlist::Msg> = Vec::new();
         let mut failed = None;
@@ -1187,6 +1191,38 @@ impl Job<'_> {
                 }
                 continue;
             }
+            // COMMIT and ROLLBACK under the script's commit level: its
+            // unit of work (PUB400 2026-10-27, verify3 x_cmt: SQL7961, the
+            // row before the ROLLBACK gone; SQL7960).
+            let bare = |w: &str| {
+                matches!(
+                    words.iter().map(String::as_str).collect::<Vec<_>>().as_slice(),
+                    [x] | [x, "WORK"] if *x == w
+                )
+            };
+            if let Some(d) = &unit {
+                if bare("COMMIT") || bare("ROLLBACK") {
+                    let commit = bare("COMMIT");
+                    let r = if commit {
+                        d.commit().await
+                    } else {
+                        d.rollback().await
+                    };
+                    match r {
+                        Ok(()) => {
+                            let (id, text) = if commit {
+                                ("SQL7960", "The changes were committed.")
+                            } else {
+                                ("SQL7961", "The changes were rolled back.")
+                            };
+                            lines.push(format!("Statement {}: {text}", k + 1));
+                            msgs.push(msg(id, 0, text));
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
             // COMMIT [WORK]: each statement here is committed when it
             // runs, so there is nothing left to commit (fidelity-gaps).
             if matches!(
@@ -1229,12 +1265,25 @@ impl Job<'_> {
                         ))
                     } else if plain && t.is_ok() {
                         if session.as_ref().map(|(l, _)| l != &libl).unwrap_or(true) {
-                            let mut s = crate::sql::Session::open(
-                                self.client,
-                                &self.env.database_url,
-                                &libl,
-                            )
-                            .await?;
+                            let mut s = match &unit {
+                                Some(d) => {
+                                    crate::sql::Session::open_in(
+                                        self.client,
+                                        &self.env.database_url,
+                                        &libl,
+                                        d.clone(),
+                                    )
+                                    .await?
+                                }
+                                None => {
+                                    crate::sql::Session::open(
+                                        self.client,
+                                        &self.env.database_url,
+                                        &libl,
+                                    )
+                                    .await?
+                                }
+                            };
                             s.set_context(
                                 &self.user,
                                 Some(self.current_library()),
@@ -1298,6 +1347,23 @@ impl Job<'_> {
                         break;
                     }
                 }
+            }
+        }
+        // The end of a script under a commit level: its changes are
+        // committed (SQL7960 with no record: verify3 x_cmt), or rolled
+        // back when an error stopped it (CL reference, RUNSQLSTM ERRLVL).
+        if let Some(d) = &unit {
+            if failed.is_some() {
+                d.rollback().await?;
+            } else {
+                d.commit().await?;
+                msgs.push(crate::sqlstmlist::Msg {
+                    id: "SQL7960".into(),
+                    severity: 0,
+                    record: 0,
+                    position: 0,
+                    text: "The changes were committed.".into(),
+                });
             }
         }
         lines.push(format!(
@@ -7013,6 +7079,18 @@ fn typed_parm(a: &str) -> String {
     }
 }
 
+/// How a script's statements are committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScriptCommit {
+    /// Each statement when it runs; COMMIT does nothing (`as4tainr
+    /// import`, `run_sql_script`).
+    Auto,
+    /// COMMIT(*NONE) or *NC: COMMIT and ROLLBACK are SQL7007.
+    NoCommit,
+    /// A commit level: a unit of work of the script's own.
+    Level(String),
+}
+
 /// A script's run (`Job::run_script`).
 struct ScriptRun {
     lines: Vec<String>,
@@ -7025,7 +7103,9 @@ struct ScriptRun {
 /// tools/golden/verify2.txt w_script and w_rb: SQL790F for SET SCHEMA,
 /// SQL7905 with severity 20 for CREATE TABLE in a library without a
 /// journal, which as4tainr's libraries never have, SQL7988 for ALTER
-/// TABLE, SQL7956 for INSERT), none for the others.
+/// TABLE, SQL7956 for INSERT; 2026-10-27, verify3.txt x_ok: SQL7957 for
+/// UPDATE, SQL0100 for a change of no rows, SQL7951 for CREATE VIEW,
+/// SQL7953 for DROP), none for the others (DELETE of rows included).
 fn listing_message(
     words: &[String],
     text: &str,
@@ -7038,7 +7118,14 @@ fn listing_message(
             msg("SQL7905", 20, &format!("{text} It is not journaled."))
         }
         ["ALTER", "TABLE", ..] => msg("SQL7988", 0, text),
+        // A change that found no rows: SQL0100 (verify3 x_ok, x_errors).
+        ["INSERT" | "UPDATE" | "DELETE", ..] if text.starts_with("0 rows") => {
+            msg("SQL0100", 0, text)
+        }
         ["INSERT", ..] => msg("SQL7956", 0, text),
+        ["UPDATE", ..] => msg("SQL7957", 0, text),
+        ["CREATE", "VIEW", ..] | ["CREATE", "OR", "REPLACE", "VIEW", ..] => msg("SQL7951", 0, text),
+        ["DROP", ..] => msg("SQL7953", 0, text),
         _ => msg("", 0, text),
     }
 }

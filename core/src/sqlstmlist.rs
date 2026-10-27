@@ -127,7 +127,11 @@ pub fn listing(input: &Input, msgs: &[Msg], stamp: &Stamp) -> Vec<String> {
     // The messages: the text from column 22, wrapped at word boundaries.
     let mut messages = vec!["MSG ID  SEV  RECORD  TEXT".to_string()];
     for m in msgs {
-        let text = format!("Position {} {}", m.position, m.text);
+        let text = if m.record == 0 {
+            m.text.clone()
+        } else {
+            format!("Position {} {}", m.position, m.text)
+        };
         let mut rows: Vec<String> = Vec::new();
         let mut cur = String::new();
         for w in text.split_whitespace() {
@@ -144,10 +148,14 @@ pub fn listing(input: &Input, msgs: &[Msg], stamp: &Stamp) -> Vec<String> {
         }
         for (k, r) in rows.iter().enumerate() {
             if k == 0 {
-                messages.push(format!(
-                    "{:<7} {:>3} {:>7}  {r}",
-                    m.id, m.severity, m.record
-                ));
+                // A message of no statement (the commit at the end) has
+                // no record (verify3 x_cmt).
+                let record = if m.record == 0 {
+                    String::new()
+                } else {
+                    m.record.to_string()
+                };
+                messages.push(format!("{:<7} {:>3} {:>7}  {r}", m.id, m.severity, record));
             } else {
                 messages.push(format!("{:21}{r}", ""));
             }
@@ -169,10 +177,9 @@ pub fn listing(input: &Input, msgs: &[Msg], stamp: &Stamp) -> Vec<String> {
         count(30, 39),
         count(40, 99)
     ));
+    // Also with no errors: "00 level ..." (verify3 x_ok).
     let worst = msgs.iter().map(|m| m.severity).max().unwrap_or(0);
-    if worst > 0 {
-        messages.push(format!("{worst} level severity errors found in source"));
-    }
+    messages.push(format!("{worst:02} level severity errors found in source"));
     messages.push(format!(
         "{:32}* * * * *  E N D  O F  L I S T I N G  * * * * *",
         ""
@@ -294,5 +301,27 @@ mod tests {
             "SQL7988   0      15  Position 1 Table GLDTMP in AS4TRAINR1 was altered as"
         );
         assert_eq!(l[i + 1], "                     asked.");
+    }
+
+    // A script without errors still has the severity line, "00 level";
+    // the commit at the end of a script under commitment control has no
+    // record and no position (PUB400 2026-10-27, tools/golden/verify3.txt
+    // x_ok and x_cmt).
+    #[test]
+    fn no_errors_and_the_final_commit() {
+        let stamp = Stamp::default();
+        let msgs = vec![Msg {
+            id: "SQL7960".into(),
+            severity: 0,
+            record: 0,
+            position: 0,
+            text: "Done.".into(),
+        }];
+        let l = listing(&Input::default(), &msgs, &stamp);
+        assert!(
+            l.contains(&"SQL7960   0          Done.".to_string()),
+            "{l:#?}"
+        );
+        assert!(l.contains(&"00 level severity errors found in source".to_string()));
     }
 }

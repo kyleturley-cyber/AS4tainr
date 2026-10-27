@@ -25,7 +25,7 @@ import subprocess
 import sys
 
 BIN = os.environ.get("AS4TAINR_BIN", "target/debug/as4tainr")
-MSG = re.compile(r"^(2> )?([A-Z]{3}[0-9A-F]{4}): ")
+MSG = re.compile(r"^(2> )?([A-Z][A-Z0-9]{2}[0-9A-F]{4}): ")
 STAMP = re.compile(r"\d\d[-/.,]\d\d[-/.,]\d\d\s+\d\d[:.]\d\d[:.]\d\d( [A-Z]{3})?")
 
 

@@ -533,8 +533,10 @@ with Tn5250(HOST) as t:
           "WRKOBJ with a generic name lists the matching objects", t)
     t.fkey(3); t.wait_for("Command Entry")
     command(t, "dsppfm custmast", "Display Physical File Member")
-    check("Bluebird Supply" in t.line(8) and "CUSNAM" in t.line(7),
-          "DSPPFM shows the records in arrival order under the field names", t)
+    # IBM i 7.5's DSPPFM (PUB400 screens5 08_dsppfm): a ruler on line 6,
+    # the records' bytes from line 7, in arrival order.
+    check("Bluebird Supply" in t.line(7) and t.line(6).strip().startswith("*...+....1"),
+          "DSPPFM shows the records in arrival order under a ruler", t)
     t.fkey(3); t.wait_for("Command Entry")
 
     command(t, "signoff", "Sign On")

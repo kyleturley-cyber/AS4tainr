@@ -17365,3 +17365,45 @@ async fn cpyf_nochk_copies_record_bytes() {
         [0x00, 0x00, 0x1F]
     );
 }
+
+/// DSPPFM of a data member shows its records as bytes (PUB400
+/// 2026-10-27, tools/golden/screens5.txt 08_dsppfm, 09_dsppfm_f10: CODE
+/// DEC(5,0) 1 is X'00001F', then NAME's characters).
+#[tokio::test]
+async fn dsppfm_shows_record_bytes() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    for s in [
+        format!("CREATE TABLE {lib}/SCR5PF (CODE DEC(5, 0) NOT NULL, NAME CHAR(20) NOT NULL)"),
+        format!("INSERT INTO {lib}/SCR5PF VALUES(1, ''Alpha''), (-23, ''Beta'')"),
+    ] {
+        job.run(&format!("RUNSQL SQL('{s}') COMMIT(*NONE)"))
+            .await
+            .unwrap();
+    }
+    let Outcome::Display(d) = job.run(&format!("DSPPFM {lib}/SCR5PF")).await.unwrap() else {
+        panic!()
+    };
+    let m = d.member.expect("a member view");
+    assert_eq!(m.reclen, 23);
+    assert_eq!(m.records[0].1[..4], [0x00, 0x00, 0x1F, 0xC1]);
+    assert_eq!(m.records[1].1[..4], [0x00, 0x02, 0x3D, 0xC2]);
+    // The three packed bytes print blank (the screen shows the record
+    // from column 2).
+    assert_eq!(d.rows[0], "   Alpha");
+    assert_eq!(d.heading, "*...+....1....+....2...");
+}

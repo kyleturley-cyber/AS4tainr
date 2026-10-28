@@ -496,6 +496,7 @@ impl Job<'_> {
             ibm: None,
             print_msg: None,
             spool: None,
+            member: None,
         }))
     }
 }

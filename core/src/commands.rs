@@ -67,6 +67,9 @@ pub struct ListDisplay {
     /// Shown in the Display Spooled File viewer instead (DSPSPLF; DSPFD
     /// and DSPFFD on a display, whose report IBM i shows there).
     pub spool: Option<Box<SpoolView>>,
+    /// Shown as DSPPFM shows a data member, its records as bytes
+    /// (pfmview.rs).
+    pub member: Option<Box<crate::pfmview::MemberView>>,
 }
 
 /// What the Display Spooled File viewer shows: the file's name and its
@@ -846,6 +849,7 @@ impl Job<'_> {
             }),
             print_msg: None,
             spool: None,
+            member: None,
         }))
     }
 
@@ -5374,62 +5378,35 @@ impl Job<'_> {
         )
         .await?;
         let recs = catalog::member_records(self.client, &f, DSPPFM_MAX_RECORDS + 1).await?;
-        let widths: Vec<usize> = f
-            .file
-            .fields
-            .iter()
-            .map(|fd| {
-                let w = if fd.data_type.is_numeric() {
-                    // digits, decimal point, sign
-                    fd.length as usize + usize::from(fd.decimals > 0) + 1
-                } else if fd.varlen {
-                    // Variable length: as wide as the longest value shown.
-                    0
-                } else {
-                    fd.length as usize
-                };
-                w.max(fd.name.len())
-            })
-            .collect();
-        let widths: Vec<usize> = widths
-            .iter()
-            .enumerate()
-            .map(|(i, w)| {
-                if f.file.fields[i].varlen {
-                    recs.iter()
-                        .take(DSPPFM_MAX_RECORDS as usize)
-                        .map(|(_, v)| v.get(i).map(|x| x.chars().count()).unwrap_or(0))
-                        .max()
-                        .unwrap_or(0)
-                        .max(*w)
-                } else {
-                    *w
-                }
-            })
-            .collect();
-        // Numbers (and their headings) are right-aligned, text left-aligned.
-        let line = |vals: &[String], numeric_right: bool| -> String {
-            vals.iter()
-                .zip(&widths)
-                .zip(&f.file.fields)
-                .map(|((v, w), fd)| {
-                    if numeric_right && fd.data_type.is_numeric() {
-                        format!("{v:>w$}")
-                    } else {
-                        format!("{v:<w$}")
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-                .trim_end()
-                .to_string()
-        };
-        let names: Vec<String> = f.file.fields.iter().map(|fd| fd.name.clone()).collect();
-        let truncated = recs.len() as i64 > DSPPFM_MAX_RECORDS;
-        let rows: Vec<String> = recs
+        // The records as their bytes (pfmview.rs; PUB400 2026-10-27,
+        // screens5 08_dsppfm): what a 5250 display and a printed DSPPFM
+        // show.
+        let reclen = crate::cpyf::record_length(&f.file);
+        let images: Vec<(i64, Vec<u8>)> = recs
             .iter()
             .take(DSPPFM_MAX_RECORDS as usize)
-            .map(|(_, v)| line(v, true))
+            .map(|(rrn, vals)| {
+                let rec: crate::rla::Record = f
+                    .file
+                    .fields
+                    .iter()
+                    .zip(vals)
+                    .map(|(fd, v)| (fd.name.clone(), v.clone()))
+                    .collect();
+                (*rrn, crate::cpyf::record_image(&f.file, &rec))
+            })
+            .collect();
+        let member_view = crate::pfmview::MemberView {
+            file: f.file.name.clone(),
+            library: crate::qtemp::logical(&f.library),
+            member: f.file.name.clone(),
+            reclen,
+            records: images.clone(),
+        };
+        let truncated = recs.len() as i64 > DSPPFM_MAX_RECORDS;
+        let rows: Vec<String> = images
+            .iter()
+            .map(|(_, b)| crate::cpyf::printable(b).trim_end().to_string())
             .collect();
         let mut info = vec![
             ("File".to_string(), f.file.name.clone()),
@@ -5442,11 +5419,14 @@ impl Job<'_> {
                 format!("only the first {DSPPFM_MAX_RECORDS} records are shown"),
             ));
         }
+        // Printed and listed: the record bytes as characters under a
+        // ruler of the record length.
         Ok(Outcome::Display(ListDisplay {
             title: "Display Physical File Member".into(),
             info,
-            heading: line(&names, true),
+            heading: crate::pfmview::ruler(1, reclen.max(1)),
             rows,
+            member: Some(Box::new(member_view)),
             ..Default::default()
         }))
     }
@@ -5591,6 +5571,7 @@ impl Job<'_> {
             }),
             print_msg: None,
             spool: None,
+            member: None,
         }))
     }
 
@@ -5638,6 +5619,7 @@ impl Job<'_> {
             }),
             print_msg: None,
             spool: None,
+            member: None,
         }))
     }
 
@@ -6193,6 +6175,7 @@ impl Job<'_> {
             }),
             print_msg: None,
             spool: None,
+            member: None,
         }))
     }
 

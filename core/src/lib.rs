@@ -52,6 +52,7 @@ pub mod outq;
 pub mod ovr;
 pub mod pase_system;
 pub mod pdm;
+pub mod pfmview;
 pub mod pftrg;
 pub mod pgmmsg;
 pub mod prtf;

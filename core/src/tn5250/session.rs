@@ -1891,6 +1891,9 @@ async fn list_display(
     if let Some(v) = &d.spool {
         return spool_display(term, v, first_message).await;
     }
+    if let Some(m) = &d.member {
+        return member_display(term, m, first_message).await;
+    }
     if let Some(l) = &d.ibm {
         return ibm_list_display(term, d, l, system, first_message).await;
     }
@@ -2095,6 +2098,153 @@ fn spool_control(v: &str) -> Option<SpoolControl> {
             } else {
                 signed(&v).map(SpoolControl::Lines)
             }
+        }
+    }
+}
+
+/// DSPPFM's display of a data member (pfmview.rs: IBM i 7.5's layout,
+/// PUB400 screens5): Enter or F12 goes back, F3 exits, Page Up/Down move
+/// by 15 lines' worth of records, F19/F20 by 78 columns (20 bytes in
+/// hexadecimal), F10 switches hexadecimal on and off and F11 switches
+/// between characters with hexadecimal beside them and below them; the
+/// Control field takes T, B, +n, -n (records) and a record number, W+n,
+/// W-n and Wn (columns); Find looks for text from the next record.
+async fn member_display(
+    term: &mut Term,
+    v: &crate::pfmview::MemberView,
+    first_message: &str,
+) -> Result<ListResult> {
+    use crate::pfmview::{screen, shift, Mode, ROWS};
+    let n = v.records.len();
+    let mut top = 0usize;
+    let mut left = 0usize;
+    let mut mode = Mode::Char;
+    let mut message = first_message.to_string();
+    let mut find = String::new();
+    loop {
+        let rows = screen(v, top, left, mode);
+        let mut s = Screen::new();
+        for (i, r) in rows.iter().enumerate() {
+            let text: String = r.chars().skip(1).collect();
+            if text.trim().is_empty() {
+                continue;
+            }
+            match i {
+                0 => centered(&mut s, 1, text.trim()),
+                22 => keys(&mut s, 23, &text),
+                _ => {
+                    s.put(i as u8 + 1, 2, &text);
+                }
+            }
+        }
+        s.field("CTL", 4, 23, 11, FieldKind::Upper, "");
+        s.field("FIND", 5, 23, 40, FieldKind::Text, &find);
+        s.cursor_at(4, 23);
+        s.message(&message);
+        message.clear();
+        let inp = term.show(&s).await?;
+        let mut control = String::new();
+        for (name, val) in &inp.values {
+            match name.as_str() {
+                "CTL" => control = val.trim().to_string(),
+                "FIND" => find = val.trim_end().to_string(),
+                _ => {}
+            }
+        }
+        let per_page = if mode == Mode::Vertical {
+            ROWS / 4 + 1
+        } else {
+            ROWS
+        };
+        let search = |from: usize, find: &str| -> Option<usize> {
+            let want = find.trim().to_ascii_uppercase();
+            (from..n).find(|&i| {
+                crate::cpyf::printable(&v.records[i].1)
+                    .to_ascii_uppercase()
+                    .contains(&want)
+            })
+        };
+        let step = shift(mode);
+        match inp.aid {
+            Aid::F(3) => return Ok(ListResult::Exit),
+            Aid::F(12) => return Ok(ListResult::Back),
+            Aid::F(10) => {
+                mode = if mode == Mode::Char {
+                    Mode::Hex
+                } else {
+                    Mode::Char
+                };
+            }
+            Aid::F(11) => {
+                mode = if mode == Mode::Vertical {
+                    Mode::Hex
+                } else {
+                    Mode::Vertical
+                };
+            }
+            Aid::F(19) => {
+                if left == 0 {
+                    message = "Already at the left edge.".into();
+                } else {
+                    left = left.saturating_sub(step);
+                }
+            }
+            Aid::F(20) => {
+                if left + step < v.reclen {
+                    left += step;
+                } else {
+                    message = "Already at the right edge.".into();
+                }
+            }
+            Aid::RollUp => {
+                if top + per_page < n {
+                    top += per_page;
+                } else {
+                    message = "Already at the bottom of the member.".into();
+                }
+            }
+            Aid::RollDown => {
+                if top == 0 {
+                    message = "Already at the top of the member.".into();
+                } else {
+                    top = top.saturating_sub(per_page);
+                }
+            }
+            Aid::Enter => {
+                if control.is_empty() && find.trim().is_empty() {
+                    return Ok(ListResult::Back);
+                }
+                if !control.is_empty() {
+                    match spool_control(&control) {
+                        Some(SpoolControl::Top) => top = 0,
+                        Some(SpoolControl::Bottom) => top = n.saturating_sub(per_page),
+                        Some(SpoolControl::Lines(d)) => {
+                            top = (top as i64 + d).clamp(0, n.saturating_sub(1) as i64) as usize
+                        }
+                        Some(SpoolControl::ColumnBy(d)) => {
+                            left = (left as i64 + d).clamp(0, v.reclen.saturating_sub(1) as i64)
+                                as usize
+                        }
+                        Some(SpoolControl::Column(c)) => left = c.clamp(1, v.reclen.max(1)) - 1,
+                        // A number: that record.
+                        _ => match control.parse::<i64>() {
+                            Ok(r) => match v.records.iter().position(|x| x.0 >= r) {
+                                Some(i) => top = i,
+                                None => {
+                                    message = format!("Record {r} is past the end of the member.")
+                                }
+                            },
+                            Err(_) => message = format!("Control value {control} not valid."),
+                        },
+                    }
+                } else {
+                    match search(top + 1, &find) {
+                        Some(i) => top = i,
+                        None => message = "String not found.".into(),
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }

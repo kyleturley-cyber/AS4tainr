@@ -1,0 +1,13 @@
+# Golden: XML-SAX's events one kind at a time (verify14 stopped at a
+# CDATA section with exception 24): references in content and in an
+# attribute, CDATA, a processing instruction, the XML declaration with
+# encoding and standalone, DOCTYPE, an unknown entity and a document that
+# is not well formed, each document under MONITOR, records unblocked.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify15.txt -Files tools\golden\verify15
+v15_cleanup|!system -q "DLTPGM PGM(AS4TRAINR1/GLD15X)"; system -q "DLTF FILE(AS4TRAINR1/GLD15OUT)"; echo cleaned
+v15_tag|!setccsid 819 /home/AS4TRAINR/gld/gld15x.rpgle; ls /home/AS4TRAINR/gld | grep gld15
+v15_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD15OUT (ID CHAR(10) NOT NULL, VAL CHAR(200) NOT NULL)') COMMIT(*NONE)
+v15_rpgx|!system "CRTBNDRPG PGM(AS4TRAINR1/GLD15X) SRCSTMF('/home/AS4TRAINR/gld/gld15x.rpgle')" | grep -E "RNF[0-9]|RNS9" | head -40
+v15_callx|!system "CALL PGM(AS4TRAINR1/GLD15X)"
+v15_rows|CPYF FROMFILE(AS4TRAINR1/GLD15OUT) TOFILE(*PRINT)
+v15_end|!system -q "DLTPGM PGM(AS4TRAINR1/GLD15X)"; system -q "DLTF FILE(AS4TRAINR1/GLD15OUT)"; echo cleaned

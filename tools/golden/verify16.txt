@@ -1,0 +1,13 @@
+# Golden: CDATA sections in XML-SAX (verify14 and verify15 stopped at
+# "<![" with exception 24 on PUB400): the bytes '[' and ']' compiled to,
+# documents with CCSID 37's and CCSID 273's bracket bytes and with
+# literals; an unknown entity in an attribute value.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify16.txt -Files tools\golden\verify16
+w16_cleanup|!system -q "DLTPGM PGM(AS4TRAINR1/GLD16X)"; system -q "DLTF FILE(AS4TRAINR1/GLD16OUT)"; echo cleaned
+w16_tag|!setccsid 819 /home/AS4TRAINR/gld/gld16x.rpgle; ls /home/AS4TRAINR/gld | grep gld16
+w16_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD16OUT (ID CHAR(10) NOT NULL, VAL CHAR(200) NOT NULL)') COMMIT(*NONE)
+w16_rpgx|!system "CRTBNDRPG PGM(AS4TRAINR1/GLD16X) SRCSTMF('/home/AS4TRAINR/gld/gld16x.rpgle')" | grep -E "RNF[0-9]|RNS9" | head -40
+w16_callx|!system "CALL PGM(AS4TRAINR1/GLD16X)"
+w16_rows|CPYF FROMFILE(AS4TRAINR1/GLD16OUT) TOFILE(*PRINT)
+w16_ccsid|!system "DSPJOB OUTPUT(*PRINT) OPTION(*DFNA)" | grep -i -E "ccsid|coded"
+w16_end|!system -q "DLTPGM PGM(AS4TRAINR1/GLD16X)"; system -q "DLTF FILE(AS4TRAINR1/GLD16OUT)"; echo cleaned

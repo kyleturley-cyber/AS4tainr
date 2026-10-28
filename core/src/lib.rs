@@ -32,6 +32,7 @@ pub mod ddl;
 pub mod dds;
 pub mod ddslist;
 pub mod dspf;
+pub mod dspjob;
 pub mod dtaara;
 pub mod dtaq;
 pub mod envvar;

@@ -34,6 +34,7 @@ Batch programs run without a display: `EXFMT` in a batch job fails, as it does o
 | Command | What it does |
 | --- | --- |
 | `SBMJOB CMD(...) JOB(...) JOBQ(QBATCH) CURLIB(...) INLLIBL(...)` | Submits a batch job |
+| `DSPJOB` | The job's definition, status and run attributes and its call stack (OPTION `*DFNA`, `*STSA`, `*RUNA`, `*PGMSTK`; `*SELECT` and `*ALL` give all four), printed in IBM i 7.5's layout with OUTPUT(*PRINT) (spooled file QPDSPJOB; under PASE `system` written out), or listed on the display |
 | `WRKACTJOB` | Active jobs by subsystem, with what each is doing: `CMD-WRKACTJOB`, `PGM-ORDENT`, status `RUN`, `DSPW` (waiting at the display) or `LCKW` (waiting for a record lock, see [record-locks.md](record-locks.md)). Option 5 shows the job log, and F5 refreshes |
 | `WRKSBMJOB` | Jobs you submitted: `JOBQ` (waiting), `ACTIVE`, `OUTQ` (ended). Option 4 ends a job that has not started, option 5 shows its log, F5 refreshes |
 | `DSPJOBLOG JOB(*)` or `JOB(number/user/name)` | A job's log: the commands it ran (`>`) and the messages they sent |

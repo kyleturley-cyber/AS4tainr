@@ -3106,7 +3106,7 @@ async fn run_program(
                             // queue, for RCVMSG MSGTYPE(*EXCP).
                             let m = job.calls.escape.take().unwrap_or_else(|| {
                                 let mut m = crate::pgmmsg::from_error(&e, &original);
-                                m.sender = crate::pgmmsg::command_program(&st.name);
+                                m.sender = crate::pgmmsg::command_program(&st.name, &m.msgid);
                                 m
                             });
                             job.calls.put(m, false);
@@ -3506,6 +3506,8 @@ pub(crate) const SYSTEM_VALUE_NAMES: &[&str] = &[
     "QCCSID",
     "QUTCOFFSET",
     "QTIMZON",
+    "QPRTDEV",
+    "QPRTTXT",
     "QSECURITY",
     "QSYSLIBL",
     "QUSRLIBL",
@@ -3539,6 +3541,8 @@ pub(crate) fn system_value_description(name: &str) -> Option<&'static str> {
         "QCCSID" => "Coded character set of the system",
         "QUTCOFFSET" => "Hours and minutes from UTC",
         "QTIMZON" => "Time zone description",
+        "QPRTDEV" => "Printer device of the system",
+        "QPRTTXT" => "Text printed at the bottom of each page",
         "QSECURITY" => "Security level",
         "QSYSLIBL" => "System part of the library list",
         "QUSRLIBL" => "User part of the library list",
@@ -3601,6 +3605,10 @@ fn system_value(name: &str) -> Result<Value> {
         "QCCSID" => Value::Dec(Decimal::from(65535)),
         "QUTCOFFSET" => c("+0000".into()),
         "QTIMZON" => c("Q0000UTC".into()),
+        // As shipped: the system printer PRT01, no print text (IBM i
+        // system values documentation).
+        "QPRTDEV" => c("PRT01".into()),
+        "QPRTTXT" => c(String::new()),
         "QSECURITY" => c("40".into()),
         "QSYSLIBL" => c(list(crate::commands::SYSTEM_LIBRARY_LIST, 150)),
         "QUSRLIBL" => c(list(crate::commands::USER_LIBRARY_LIST, 250)),
@@ -4851,10 +4859,11 @@ async fn command(
                         if sent.iter().any(|s| s == bare || s == t) {
                             continue;
                         }
-                        let (id, text) = match t.split_once(": ") {
+                        let (id, text): (String, String) = match t.split_once(": ") {
                             Some((i, x)) if is_msgid(i) => (i.to_string(), x.to_string()),
                             _ => (String::new(), t.clone()),
                         };
+                        let sender_id = id.clone();
                         job.calls.put(
                             crate::pgmmsg::QMsg {
                                 msgf: if id.is_empty() {
@@ -4875,7 +4884,7 @@ async fn command(
                                 } else {
                                     Vec::new()
                                 },
-                                sender: crate::pgmmsg::command_program(&st.name),
+                                sender: crate::pgmmsg::command_program(&st.name, &sender_id),
                                 ..Default::default()
                             },
                             false,

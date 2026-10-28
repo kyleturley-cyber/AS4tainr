@@ -802,7 +802,9 @@ impl<'a> Machine<'a> {
                     m
                 }
             };
-            crate::pgmmsg::stack_send(&self.io.job_key, id, m);
+            if let Some(k) = crate::pgmmsg::stack_send(&self.io.job_key, id, m) {
+                self.logged.push(k);
+            }
         }
         code
     }

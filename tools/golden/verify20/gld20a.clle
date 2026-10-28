@@ -1,0 +1,6 @@
+/* Golden (tools/golden/verify20.txt): the printed job log of a job  */
+/* whose CL program calls an RPG program that calls another.         */
+PGM
+  CALL       PGM(AS4TRAINR1/GLD20P)
+  DSPJOBLOG  OUTPUT(*PRINT)
+ENDPGM

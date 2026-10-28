@@ -1,0 +1,15 @@
+# Golden: messages an RPG program called by another sends to '*' counter
+# 1 and *PGMBDY counter 1, and a DSPLY, in the printed job log
+# (verify19 b19_joblog had the outermost program's); DSPJOB's other
+# printed sections (*ALL, for their order, *LIBL, *ACTGRP).
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify20.txt -Files tools\golden\verify20
+e20_cleanup|!for p in GLD20A GLD20P GLD20Q; do system -q "DLTPGM PGM(AS4TRAINR1/$p)"; done; echo cleaned
+e20_tag|!setccsid 819 /home/AS4TRAINR/gld/gld20a.clle /home/AS4TRAINR/gld/gld20p.rpgle /home/AS4TRAINR/gld/gld20q.rpgle; ls /home/AS4TRAINR/gld | grep gld20
+e20_rpgq|!system -s "CRTBNDRPG PGM(AS4TRAINR1/GLD20Q) SRCSTMF('/home/AS4TRAINR/gld/gld20q.rpgle')"
+e20_rpgp|!system -s "CRTBNDRPG PGM(AS4TRAINR1/GLD20P) SRCSTMF('/home/AS4TRAINR/gld/gld20p.rpgle')"
+e20_cla|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD20A) SRCSTMF('/home/AS4TRAINR/gld/gld20a.clle')"
+e20_joblog|!system "CALL PGM(AS4TRAINR1/GLD20A)"
+e20_all|DSPJOB OUTPUT(*PRINT) OPTION(*ALL)
+e20_libl|DSPJOB OUTPUT(*PRINT) OPTION(*LIBL)
+e20_actgrp|DSPJOB OUTPUT(*PRINT) OPTION(*ACTGRP)
+e20_end|!for p in GLD20A GLD20P GLD20Q; do system -q "DLTPGM PGM(AS4TRAINR1/$p)"; done; echo cleaned

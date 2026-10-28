@@ -142,6 +142,12 @@ impl CallStack {
         self.frames.last().map(frame_end)
     }
 
+    /// Messages a program sent with the message APIs (a called RPG
+    /// program's), into this job's log.
+    pub fn log_from_program(&mut self, msgs: Vec<QMsg>) {
+        self.log.extend(msgs);
+    }
+
     /// The messages of the job log that are still there, oldest first.
     pub fn logged(&self) -> &[QMsg] {
         &self.log
@@ -158,13 +164,16 @@ impl CallStack {
     }
 }
 
+/// A CL program as a sender or receiver; its statement number is its
+/// source line times 100 (PUB400 2026-10-28, tools/golden/verify17.txt
+/// x17_joblog: the SNDPGMMSG on line 7 is statement 700).
 fn frame_end(f: &Frame) -> Sender {
     Sender {
         pgm: f.pgm.clone(),
         lib: f.lib.clone(),
         module: if f.ile { f.pgm.clone() } else { String::new() },
         proc: if f.ile { f.pgm.clone() } else { String::new() },
-        line: f.line,
+        line: f.line * 100,
         inst: String::new(),
     }
 }
@@ -182,18 +191,24 @@ pub fn command_caller() -> Sender {
     }
 }
 
-/// The program that sends a command's messages (its command processing
-/// program), with the instruction, as PUB400's job logs show them
-/// (2026-10-28): CHKOBJ's escape from QLICKOBJ 025B (verify17
-/// x17_joblog), CRTDTAARA's completion message from QWCCCRVC 0095 and
-/// DLTDTAARA's escape from QLIDLOBJ 0772 (verify18 y18_joblog), all in
-/// QSYS. Other commands' are not known here: `*N`
-/// (docs/fidelity-gaps.md).
-pub fn command_program(command: &str) -> Sender {
-    let (pgm, lib, inst) = match command.to_ascii_uppercase().as_str() {
-        "CHKOBJ" => ("QLICKOBJ", "QSYS", "025B"),
-        "CRTDTAARA" => ("QWCCCRVC", "QSYS", "0095"),
-        "DLTDTAARA" => ("QLIDLOBJ", "QSYS", "0772"),
+/// The program that sends a command's message (its command processing
+/// program, or the one it calls), with the instruction, as PUB400's job
+/// logs show them (2026-10-28, all in QSYS): CHKOBJ's escape CPF9801
+/// from QLICKOBJ 025B (verify17 x17_joblog); CRTDTAARA's CPC0904 from
+/// QWCCCRVC 0095, DLTDTAARA's and DLTF's messages from QLIDLOBJ 0772
+/// (verify18 y18_joblog, verify19 b19_joblog); CRTPF's CPC7301 from QDDCPF
+/// 054C and its CPC7305 from QDDCPFM 005B, CLRPFM's CPC3101 from
+/// QDBCLRPF 03AE, ADDLIBLE's CPC2196 from QLICUSRL 0114 (b19_joblog).
+/// Others are not known here: `*N` (docs/fidelity-gaps.md).
+pub fn command_program(command: &str, msgid: &str) -> Sender {
+    let (pgm, lib, inst) = match (command.to_ascii_uppercase().as_str(), msgid) {
+        ("CHKOBJ", _) => ("QLICKOBJ", "QSYS", "025B"),
+        ("CRTDTAARA", _) => ("QWCCCRVC", "QSYS", "0095"),
+        ("DLTDTAARA" | "DLTF", _) => ("QLIDLOBJ", "QSYS", "0772"),
+        ("CRTPF", "CPC7301") => ("QDDCPF", "QSYS", "054C"),
+        ("CRTPF", "CPC7305") => ("QDDCPFM", "QSYS", "005B"),
+        ("CLRPFM", "CPC3101") => ("QDBCLRPF", "QSYS", "03AE"),
+        ("ADDLIBLE", "CPC2196") => ("QLICUSRL", "QSYS", "0114"),
         _ => ("*N", "", "*N"),
     };
     Sender {
@@ -883,6 +898,54 @@ pub fn stack_target(job: &str, entry: &str, counter: usize) -> Option<u64> {
     })
 }
 
+/// When the entry a message API names (as [`stack_target`]) is one
+/// below the outermost RPG entry: that entry, a program's main
+/// procedure, whose caller is its program entry procedure (see
+/// [`pep_send`]).
+pub fn stack_pep(job: &str, entry: &str, counter: usize) -> Option<Entry> {
+    with_stack(job, |s| {
+        let top = s.len().checked_sub(1)?;
+        let base = match entry.trim().to_ascii_uppercase().as_str() {
+            "*" | "" => top,
+            "*PGMBDY" => {
+                let pgm = &s[top].pgm;
+                let mut i = top;
+                while i > 0 && s[i - 1].pgm == *pgm {
+                    i -= 1;
+                }
+                i
+            }
+            _ => return None,
+        };
+        (counter == base + 1).then(|| s[0].clone())
+    })
+}
+
+/// A message sent to the program entry procedure of `main`'s program
+/// (`_QRNP_PEP_` and the program's name, an ILE RPG program's, with no
+/// statement: PUB400 2026-10-28, tools/golden/verify19.txt b19_joblog):
+/// it is only in the job log; its key.
+pub fn pep_send(job: &str, main: &Entry, mut m: QMsg) -> u32 {
+    let key = NAMED_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    m.key = key;
+    stamp(&mut m);
+    m.receiver = Sender {
+        pgm: main.pgm.clone(),
+        lib: crate::qtemp::logical(&main.lib),
+        module: main.module.clone(),
+        proc: format!("_QRNP_PEP_{}", main.pgm),
+        line: 0,
+        inst: String::new(),
+    };
+    if let Ok(mut g) = JOBLOG.lock() {
+        g.get_or_insert_with(HashMap::new)
+            .entry(job.to_string())
+            .or_default()
+            .push(m);
+    }
+    key
+}
+
 /// Put a message on an entry's queue; its key.
 pub fn stack_send(job: &str, id: u64, mut m: QMsg) -> Option<u32> {
     let key = NAMED_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -908,7 +971,13 @@ pub fn stack_send(job: &str, id: u64, mut m: QMsg) -> Option<u32> {
             lib: crate::qtemp::logical(&s[i].lib),
             module: s[i].module.clone(),
             proc: s[i].proc.clone(),
-            line: s[i].line,
+            // The running procedure is at the statement that sends
+            // (b19_joblog: GLD19P to itself, statement 21 both).
+            line: if i + 1 == s.len() && m.sender.line > 0 {
+                m.sender.line
+            } else {
+                s[i].line
+            },
             inst: String::new(),
         };
         // The job log's copy names the receiver too.
@@ -1059,7 +1128,9 @@ pub struct Sender {
     pub lib: String,
     pub module: String,
     pub proc: String,
-    /// The source line of the statement that sent it (0: not known).
+    /// The statement that sent it (0: not known): an RPG program's
+    /// source line, a CL program's line times 100 (as job logs number
+    /// them: PUB400 2026-10-28, tools/golden/verify19.txt b19_joblog).
     pub line: usize,
     /// The instruction a system program sent it from (the job log's INST
     /// column); blank: `*STMT` for an ILE procedure, else not known.

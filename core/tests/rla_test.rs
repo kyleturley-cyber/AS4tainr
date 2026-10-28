@@ -18197,3 +18197,161 @@ async fn verify18_removed_messages_leave_the_job_log() {
         ]
     );
 }
+
+/// An RPG program's QMHSNDPM messages in a `system` job's printed job
+/// log, and DSPJOB's printed report (PUB400 2026-10-28,
+/// tools/golden/verify19.txt b19_joblog, b19_dfna, b19_stsa, b19_runa,
+/// b19_pgmstk, the same sources): GLD19P's message to itself has its
+/// statement (the source line, 21) on both ends; those to '*' counter 1
+/// go to its program entry procedure _QRNP_PEP_GLD19P (statement *N), not
+/// to the CL caller; CRTPF's CPC7301 and CPC7305 come from QDDCPF
+/// (054C) and QDDCPFM (005B), CLRPFM's from QDBCLRPF (03AE), DLTF's
+/// from QLIDLOBJ (0772). DSPJOB's sections have their titles and
+/// attribute lines where PUB400 prints them, a `system` job's call stack
+/// starts with QP0ZSPWT, and no message is sent.
+#[tokio::test]
+async fn verify19_rpg_messages_and_dspjob() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::pase_system;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let dir = format!("/tmp/{lib}");
+    let _ = as4tainr_core::ifs::mkdir_all(&client, &dir, "QSECOFR").await;
+    for (f, text) in [
+        (
+            "gld19a.clle",
+            include_str!("../../tools/golden/verify19/gld19a.clle"),
+        ),
+        (
+            "gld19p.rpgle",
+            include_str!("../../tools/golden/verify19/gld19p.rpgle"),
+        ),
+    ] {
+        as4tainr_core::ifs::write_file(
+            &client,
+            &format!("{dir}/{f}"),
+            text.replace("AS4TRAINR1", &lib).as_bytes(),
+            819,
+            0o644,
+            "QSECOFR",
+        )
+        .await
+        .unwrap();
+    }
+    for c in [
+        format!("CRTBNDRPG PGM({lib}/GLD19P) SRCSTMF('{dir}/gld19p.rpgle')"),
+        format!("CRTBNDCL PGM({lib}/GLD19A) SRCSTMF('{dir}/gld19a.clle')"),
+    ] {
+        let o = pase_system::run(&mut job, &[c]).await;
+        assert_eq!(o.status, 0, "{o:?}");
+    }
+    job.calls = Default::default();
+    let o = pase_system::run(&mut job, &[format!("CALL PGM({lib}/GLD19A)")]).await;
+    assert_eq!(o.status, 0, "{o:?}");
+    // Nothing reaches `system` but the job log (b19_joblog).
+    assert!(o.stdout[0].contains("Display Job Log"), "{o:?}");
+    let log = &o.stdout;
+    let col = |l: &str, a: usize, b: usize| {
+        l.get(a - 1..b.min(l.len()))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let firsts: Vec<[String; 4]> = log
+        .iter()
+        .filter(|l| !l.starts_with(' ') && !l.starts_with("MSGID"))
+        .map(|l| {
+            [
+                col(l, 1, 11),
+                col(l, 68, 80),
+                col(l, 93, 101),
+                col(l, 102, 113),
+            ]
+        })
+        .take(8)
+        .collect();
+    let row = |a: &str, b: &str, c: &str, d: &str| [a, b, c, d].map(str::to_string);
+    assert_eq!(
+        firsts,
+        [
+            row("CPF1124", "QWTPIIPP", "04DC", "*EXT"),
+            row("*NONE", "GLD19P", "*STMT", "GLD19P"),
+            row("*NONE", "GLD19P", "*STMT", "GLD19P"),
+            row("*NONE", "GLD19P", "*STMT", "GLD19P"),
+            row("*NONE", "GLD19A", "*STMT", "GLD19A"),
+            row("CPC7301", "QDDCPF", "054C", "GLD19A"),
+            row("CPC7305", "QDDCPFM", "005B", "GLD19A"),
+            row("CPC3101", "QDBCLRPF", "03AE", "GLD19A"),
+        ],
+        "{o:?}"
+    );
+    let details: Vec<String> = log
+        .iter()
+        .skip_while(|l| !l.ends_with("GLD19P info to self") && !l.contains("Statement"))
+        .filter(|l| {
+            l.trim_start().starts_with("Statement") || l.trim_start().starts_with("To procedure")
+        })
+        .take(6)
+        .map(|l| l.trim().rsplit(' ').next().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        details,
+        ["21", "GLD19P", "21", "23", "_QRNP_PEP_GLD19P", "*N"],
+        "{o:?}"
+    );
+    assert!(log
+        .iter()
+        .any(|l| l.contains("QLIDLOBJ     QSYS        0772")));
+
+    // DSPJOB OUTPUT(*PRINT) of a `system` job.
+    job.calls = Default::default();
+    let o = pase_system::run(&mut job, &["DSPJOB OUTPUT(*PRINT) OPTION(*DFNA)".into()]).await;
+    assert_eq!(o.status, 0, "{o:?}");
+    let p = &o.stdout;
+    assert!(
+        p[0].starts_with(" AS4T001 V0R1M0 261021                      Display Job"),
+        "{o:?}"
+    );
+    assert_eq!(p[2].trim(), "Job Definition Attributes");
+    assert_eq!(
+        p[3],
+        "   Job description  . . . . . . . . . . . . . . :   JOBD         QDFTSVR"
+    );
+    assert!(p.last().unwrap().contains("E N D  O F  L I S T I N G"));
+    let o = pase_system::run(&mut job, &["DSPJOB OUTPUT(*PRINT) OPTION(*STSA)".into()]).await;
+    assert_eq!(o.stdout[2].trim(), "Job Status Attributes");
+    assert_eq!(
+        o.stdout[3],
+        "   Status of job  . . . . . . . . . . . . . . . :   ACTIVE"
+    );
+    let o = pase_system::run(&mut job, &["DSPJOB OUTPUT(*PRINT) OPTION(*RUNA)".into()]).await;
+    assert_eq!(
+        o.stdout[3],
+        "   Run priority  . . . . . . . . . . . . . . . . . . . . :   RUNPTY       50"
+    );
+    let o = pase_system::run(&mut job, &["DSPJOB OUTPUT(*PRINT) OPTION(*PGMSTK)".into()]).await;
+    let pgms: Vec<String> = o
+        .stdout
+        .iter()
+        .filter(|l| l.starts_with("      Q"))
+        .map(|l| l[6..17].trim().to_string())
+        .collect();
+    assert_eq!(
+        pgms,
+        ["QP0ZSPWT", "QP0ZPCPN", "QP0ZPCPN", "QP2CMD", "QP2CMD", "QP2USER2", "QCMDEXC"],
+        "{o:?}"
+    );
+}

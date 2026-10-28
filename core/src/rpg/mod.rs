@@ -589,6 +589,9 @@ pub struct ClContext {
 /// abnormally.
 pub struct CallResult {
     pub messages: Vec<String>,
+    /// The messages the program sent with the message APIs that are still
+    /// in the job log, oldest first (for a `system` job's printed log).
+    pub logged: Vec<crate::pgmmsg::QMsg>,
     /// Printer output of a call without a job (otherwise it is in the
     /// job's spooled files).
     pub printed: Vec<String>,
@@ -795,6 +798,10 @@ async fn call_any(
         };
         Ok((
             CallResult {
+                logged: crate::pgmmsg::job_log(&m.io_job_key())
+                    .into_iter()
+                    .filter(|q| m.logged.contains(&q.key))
+                    .collect(),
                 messages: std::mem::take(&mut m.messages),
                 printed: std::mem::take(&mut m.printed),
                 error: r.err(),

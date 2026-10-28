@@ -648,6 +648,7 @@ impl Job<'_> {
             "WRKACTJOB" => self.wrkactjob().await,
             "WRKSBMJOB" => self.wrksbmjob().await,
             "DSPJOBLOG" => self.dspjoblog(&cmd).await,
+            "DSPJOB" => self.dspjob(&cmd).await,
             "ENDJOB" => self.endjob(&cmd).await,
             "SNDMSG" => self.sndmsg(&cmd).await,
             "DSPMSG" => self.dspmsg(&cmd).await,
@@ -5807,10 +5808,8 @@ impl Job<'_> {
             },
             module: s.module.clone(),
             proc: s.proc.clone(),
-            // An ILE CL statement's number is its source line times 100
-            // (x17_joblog: the SNDPGMMSG on line 7 is statement 700).
             stmt: if s.line > 0 {
-                (s.line * 100).to_string()
+                s.line.to_string()
             } else {
                 "*N".into()
             },
@@ -5841,6 +5840,154 @@ impl Job<'_> {
             &crate::report::Stamp::now(),
             &crate::report::system_name(),
         )
+    }
+
+    /// DSPJOB: the job's definition, status and run attributes and its
+    /// call stack in IBM i 7.5's printed layout (crate::dspjob), printed
+    /// (OUTPUT(*PRINT), `system`) or shown as a list. OPTION *DFNA,
+    /// *STSA, *RUNA, *PGMSTK, or *SELECT/*ALL for the four.
+    async fn dspjob(&mut self, cmd: &Command) -> Result<Outcome> {
+        use crate::dspjob::{Facts, StackEntry};
+        let option = cmd.get("OPTION").trim().to_ascii_uppercase();
+        let this = matches!(cmd.get("JOB").trim(), "*" | "");
+        let ((y, mo, d), (h, mi, s), _) = crate::pgmmsg::job_started();
+        let st = crate::report::Stamp::of((y, mo, d), (h, mi, s));
+        let mut f = if this && self.id.is_none() {
+            // `system`'s own job (PUB400 2026-10-28,
+            // tools/golden/verify19.txt b19_dfna, b19_stsa).
+            Facts {
+                name: "QP0ZSPWT".into(),
+                user: "QUSER".into(),
+                number: format!("{:06}", std::process::id() % 1_000_000),
+                system_job: true,
+                jobd: "QDFTSVR".into(),
+                jobd_lib: "QGPL".into(),
+                current_user: self.user.clone(),
+                subsystem: "QUSRWRK".into(),
+                entered: (st.date.clone(), st.time.clone()),
+                started: (st.date.clone(), st.time.clone()),
+                stack: crate::dspjob::system_job_base(),
+                ..Default::default()
+            }
+        } else {
+            let job = self.job_named(cmd.get("JOB")).await?;
+            let d = crate::jobd::find(self.client, &["QGPL".to_string()], "QDFTJOBD").await?;
+            let other = match &d {
+                Some(d) => crate::jobd::other_attributes(self.client, d).await?,
+                None => String::new(),
+            };
+            // The catalog's entered time is MM/DD/YY HH:MM:SS.
+            let e = &job.entered;
+            let n = |r: std::ops::Range<usize>| -> u32 {
+                e.get(r).and_then(|v| v.parse().ok()).unwrap_or(0)
+            };
+            let es = crate::report::Stamp::of(
+                (2000 + n(6..8) as i32, n(0..2), n(3..5)),
+                (n(9..11), n(12..14), n(15..17)),
+            );
+            let batch = job.job_type.starts_with('B');
+            Facts {
+                name: job.id.name.clone(),
+                user: job.id.user.clone(),
+                number: format!("{:06}", job.id.number),
+                job_type: if batch { "B" } else { "I" }.into(),
+                jobd: "QDFTJOBD".into(),
+                jobd_lib: "QGPL".into(),
+                jobd_other: other,
+                jobq: if batch {
+                    job.jobq.clone()
+                } else {
+                    String::new()
+                },
+                jobq_lib: if batch { "QGPL".into() } else { String::new() },
+                current_user: job.id.user.clone(),
+                subsystem: job.subsystem.clone(),
+                entered: (es.date.clone(), es.time.clone()),
+                started: (es.date.clone(), es.time.clone()),
+                ..Default::default()
+            }
+        };
+        // The call stack as this process keeps it (QWVRCSTK's entries).
+        let mut groups: Vec<String> = Vec::new();
+        let mut last_ile = String::new();
+        for e in crate::pgmmsg::stack_listed(&self.job_key()) {
+            if f.system_job && e.lib == "QSYS" && e.pgm == "QP2USER2" {
+                continue;
+            }
+            if e.lib == "QSYS" && e.pgm == "QCMDEXC" {
+                f.stack.push(crate::dspjob::qcmdexc_entry());
+                continue;
+            }
+            // Activation group numbers: the default one's is 2 (the
+            // user state default group, b19_pgmstk); named groups are
+            // numbered from 3 as they appear (docs/fidelity-gaps.md).
+            let number = if e.actgrp == crate::ile::DEFAULT_GROUP || e.actgrp.is_empty() {
+                2
+            } else {
+                match groups.iter().position(|g| *g == e.actgrp) {
+                    Some(i) => i as u64 + 3,
+                    None => {
+                        groups.push(e.actgrp.clone());
+                        groups.len() as u64 + 2
+                    }
+                }
+            };
+            let actgrp = if e.actgrp.is_empty() {
+                crate::ile::DEFAULT_GROUP.to_string()
+            } else {
+                e.actgrp.clone()
+            };
+            let ile = !e.module.is_empty();
+            let boundary = ile && last_ile != actgrp;
+            if ile {
+                last_ile = actgrp.clone();
+            }
+            f.stack.push(StackEntry {
+                pgm: e.pgm.clone(),
+                lib: crate::qtemp::logical(&e.lib),
+                stmt: if e.line > 0 {
+                    e.line.to_string()
+                } else {
+                    String::new()
+                },
+                actgrp,
+                actgrp_number: number,
+                module: e.module.clone(),
+                // CRTBNDRPG and CRTBNDCL make the module in QTEMP.
+                module_lib: if ile { "QTEMP".into() } else { String::new() },
+                control_boundary: boundary,
+                procedure: e.proc.clone(),
+                ..Default::default()
+            });
+        }
+        let sections = match option.as_str() {
+            "*DFNA" => vec![crate::dspjob::definition(&f)],
+            "*STSA" => vec![crate::dspjob::status(&f)],
+            "*RUNA" => vec![crate::dspjob::run(&f)],
+            "*PGMSTK" => vec![crate::dspjob::stack(&f)],
+            "*SELECT" | "*ALL" | "" => vec![
+                crate::dspjob::status(&f),
+                crate::dspjob::definition(&f),
+                crate::dspjob::run(&f),
+                crate::dspjob::stack(&f),
+            ],
+            other => {
+                bail!("DSPJOB OPTION({other}) is not supported yet (*DFNA, *STSA, *RUNA, *PGMSTK).")
+            }
+        };
+        let rows: Vec<String> = sections.iter().flatten().cloned().collect();
+        let print = crate::dspjob::print(&f, &sections, &crate::report::Stamp::now());
+        if self.id.is_none() && cmd.get("OUTPUT") == "*PRINT" {
+            // `system` writes the report out; no message (b19_dfna).
+            self.calls.printed.extend(print);
+            return Ok(Outcome::Messages(vec![]));
+        }
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display Job".into(),
+            print,
+            rows,
+            ..Default::default()
+        }))
     }
 
     async fn endjob(&mut self, cmd: &Command) -> Result<Outcome> {
@@ -7534,6 +7681,8 @@ impl Job<'_> {
         // as the command's printed output (PASE `system` writes a
         // program's spooled output to standard output).
         self.calls.printed.extend(r.printed.iter().cloned());
+        // Its messages for this job's job log.
+        self.calls.log_from_program(r.logged.clone());
         if let Some(e) = r.error {
             msgs.push(format!("{e:#}"));
             msgs.push(format!("Program {pgm} ended abnormally."));

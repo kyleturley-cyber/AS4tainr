@@ -320,6 +320,9 @@ pub struct Machine<'a> {
     io: Io<'a>,
     /// DSPLY output, in order.
     pub messages: Vec<String>,
+    /// The keys of the messages this program (and those it called) sent
+    /// with the message APIs, for its job's printed job log.
+    pub logged: Vec<u32>,
     /// The entry parameters' values when the program ended (`run`).
     pub returned: Vec<String>,
     /// The remainder of the last DIV, for MVR.
@@ -520,6 +523,7 @@ impl<'a> Machine<'a> {
             last: Status::default(),
             io,
             messages: Vec::new(),
+            logged: Vec::new(),
             returned: Vec::new(),
             remainder: Dec::ZERO,
             ws: Workstation::new(),
@@ -4273,6 +4277,11 @@ impl<'a> Machine<'a> {
     }
 
     /// The sender of a message this code sends: its call stack entry.
+    /// The job's key (process state: call stack, job log).
+    pub(super) fn io_job_key(&self) -> String {
+        self.io.job_key.clone()
+    }
+
     pub(super) fn sender(&self) -> crate::pgmmsg::Sender {
         let s = crate::pgmmsg::stack(&self.io.job_key);
         match s.last() {
@@ -4869,6 +4878,7 @@ impl Machine<'_> {
                 if let Some(id) = stacked {
                     let key =
                         crate::pgmmsg::stack_send(&self.io.job_key, id, msg.clone()).unwrap_or(0);
+                    self.logged.push(key);
                     // The program's queue by name too (message subfiles,
                     // SFLPGMQ).
                     if let Some(q) = queue.clone().filter(|q| q != "*EXT") {
@@ -4885,6 +4895,19 @@ impl Machine<'_> {
                     }
                     self.api_ok(rest.get(1));
                     return Ok(true);
+                }
+                // The caller of the outermost RPG program's main procedure
+                // is the program entry procedure: the message goes on its
+                // queue, which no CL caller receives from, and is in the
+                // job log (PUB400 2026-10-28, tools/golden/verify19.txt
+                // b19_joblog: '*' counter 1 from GLD19P's main procedure to
+                // _QRNP_PEP_GLD19P).
+                if !entry_text.trim().eq_ignore_ascii_case("*EXT") {
+                    if let Some(main) = crate::pgmmsg::stack_pep(&self.io.job_key, &entry_text, up)
+                    {
+                        let key = crate::pgmmsg::pep_send(&self.io.job_key, &main, msg.clone());
+                        self.logged.push(key);
+                    }
                 }
                 // *EXT, or a caller above the RPG programs (a command
                 // line, a CL program): the message goes to the job log.
@@ -5677,7 +5700,9 @@ impl Machine<'_> {
                         },
                         ..Default::default()
                     };
-                    crate::pgmmsg::stack_send(&self.io.job_key, id, q);
+                    if let Some(k) = crate::pgmmsg::stack_send(&self.io.job_key, id, q) {
+                        self.logged.push(k);
+                    }
                 }
                 self.job_log(m);
             }
@@ -6788,6 +6813,7 @@ impl<'a> Machine<'a> {
         self.share_in();
         self.messages.append(&mut m.messages);
         self.printed.append(&mut m.printed);
+        self.logged.append(&mut m.logged);
         let kept: Vec<Vec<u8>> = m.bufs.own[..globals].to_vec();
         // Printed lines go to the spooled file now; the file stays open.
         let names: Vec<String> = m.printers.keys().cloned().collect();
@@ -7288,6 +7314,8 @@ impl<'a> Machine<'a> {
             let r = m.run_bytes(&mut parms);
             self.messages.append(&mut m.messages);
             self.printed.append(&mut m.printed);
+            self.logged.append(&mut m.logged);
+            self.logged.append(&mut m.logged);
             r
         };
         rt.block_on(crate::pftrg::set_program(data, &back.0, &back.1));
@@ -7476,6 +7504,8 @@ impl<'a> Machine<'a> {
             let r = m.run_bytes(&mut parms);
             self.messages.append(&mut m.messages);
             self.printed.append(&mut m.printed);
+            self.logged.append(&mut m.logged);
+            self.logged.append(&mut m.logged);
             r
         };
         r.map_err(|e| anyhow!("{e:#}\nProgram {name} ended abnormally."))?;

@@ -1425,6 +1425,18 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[],
     },
     CommandDef {
+        name: "DSPJOB",
+        description: "Display Job",
+        params: &[
+            p("JOB", Kind::Text, false, Some("*"), "Job name").ch("*, number/user/name"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+            p("OPTION", Kind::Name, false, Some("*SELECT"), "Option")
+                .ch("*SELECT, *ALL, *DFNA, *STSA, *RUNA, *PGMSTK"),
+            p("DUPJOBOPT", Kind::Name, false, Some("*SELECT"), "Duplicate job option")
+                .ch("*SELECT, *MSG"),
+        ],
+    },
+    CommandDef {
         name: "DSPJOBLOG",
         description: "Display Job Log",
         params: &[
@@ -4174,6 +4186,7 @@ pub static GROUPS: &[Group] = &[
             "DSPJOBD",
             "WRKACTJOB",
             "WRKSBMJOB",
+            "DSPJOB",
             "DSPJOBLOG",
             "ENDJOB",
             "SNDMSG",

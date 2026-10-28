@@ -1,0 +1,13 @@
+# Golden: the printed job log (DSPJOBLOG OUTPUT(*PRINT)) in IBM i 7.5's
+# layout, for as4tainr to print it: a `system` command's own job log, and
+# that of a job whose CL programs send *INFO, *DIAG, *COMP (CPF9898 to
+# the caller) and *ESCAPE messages, monitor CPF9801 and a called
+# program's escape, and receive some of them (RMV(*NO), RMV(*YES)).
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify17.txt -Files tools\golden\verify17
+x17_cleanup|!for p in GLD17A GLD17B; do system -q "DLTPGM PGM(AS4TRAINR1/$p)"; done; echo cleaned
+x17_tag|!setccsid 819 /home/AS4TRAINR/gld/gld17a.clle /home/AS4TRAINR/gld/gld17b.clle; ls /home/AS4TRAINR/gld | grep gld17
+x17_cla|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD17A) SRCSTMF('/home/AS4TRAINR/gld/gld17a.clle')"
+x17_clb|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD17B) SRCSTMF('/home/AS4TRAINR/gld/gld17b.clle')"
+x17_own|!system "DSPJOBLOG OUTPUT(*PRINT)"
+x17_joblog|!system "CALL PGM(AS4TRAINR1/GLD17A)"
+x17_end|!for p in GLD17A GLD17B; do system -q "DLTPGM PGM(AS4TRAINR1/$p)"; done; echo cleaned

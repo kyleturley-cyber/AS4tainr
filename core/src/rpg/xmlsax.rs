@@ -22,9 +22,12 @@
 //! *XML_EXCEPTION 15; verify15.txt v15_rows: *XML_ATTR_UCS2_REF 1,
 //! *XML_ATTR_PREDEF_REF 3, *XML_UCS2_REF 7, *XML_PREDEF_REF 8,
 //! *XML_DOCTYPE_DECL 9, *XML_PI_TARGET 16, *XML_PI_DATA 17,
-//! *XML_STANDALONE_DECL 18, *XML_UNKNOWN_REF 24); as4tainr's own numbers
-//! for the CDATA events and an unknown reference in an attribute
-//! (docs/fidelity-gaps.md). An event without a string (the start and end
+//! *XML_STANDALONE_DECL 18, *XML_UNKNOWN_REF 24; verify16.txt w16_rows:
+//! *XML_END_CDATA 11, *XML_START_CDATA 19, *XML_UNKNOWN_ATTR_REF 23).
+//! The parser reads the document in the job's CCSID: on PUB400 (CCSID
+//! 273) a CDATA section written with CCSID 37's brackets X'BA' X'BB' was
+//! exception 24 and one with 273's X'63' X'FC' parsed (w16_rows D1, D2);
+//! as4tainr's jobs are CCSID 37. An event without a string (the start and end
 //! of the document, the end of the attributes) has length -1 (u14_rows:
 //! "20 -1", "26 -1", "12 -1"). A character reference passes the
 //! character in UCS-2 (two bytes, v15_rows "7 2"). An attribute value is
@@ -52,21 +55,20 @@ const EVENTS: &[(&str, i64)] = &[
     ("*XML_PREDEF_REF", 8),
     ("*XML_DOCTYPE_DECL", 9),
     ("*XML_ENCODING_DECL", 10),
+    ("*XML_END_CDATA", 11),
     ("*XML_END_DOCUMENT", 12),
     ("*XML_END_ELEMENT", 13),
     ("*XML_EXCEPTION", 15),
     ("*XML_PI_TARGET", 16),
     ("*XML_PI_DATA", 17),
     ("*XML_STANDALONE_DECL", 18),
+    ("*XML_START_CDATA", 19),
     ("*XML_START_DOCUMENT", 20),
     ("*XML_START_ELEMENT", 21),
+    ("*XML_UNKNOWN_ATTR_REF", 23),
     ("*XML_UNKNOWN_REF", 24),
     ("*XML_VERSION_INFO", 25),
     ("*XML_END_ATTR", 26),
-    // as4tainr's numbers.
-    ("*XML_UNKNOWN_ATTR_REF", 47),
-    ("*XML_START_CDATA", 50),
-    ("*XML_END_CDATA", 51),
 ];
 
 /// The number of an *XML_xxx special word.
@@ -148,10 +150,26 @@ pub(super) fn events(text: &str) -> Vec<Event> {
                 ev.push((code("*XML_EXCEPTION"), upto.clone(), 5));
                 ev.push((code("*XML_EXCEPTION"), upto, 300));
             } else {
-                // The document up to where it went wrong (its length is
+                // The events before where it went wrong, then the
+                // exception with the document up to there (its length is
                 // what the handler gets: the string pointer is *NULL).
+                // Markup after "<!" that is no comment, CDATA section or
+                // DOCTYPE is exception 24 after the two characters
+                // (w16_rows D1: "21 a", then "15 5 24" for "<a><!" and a
+                // bracket byte the job's CCSID does not have); other
+                // errors as4tainr's ID 1.
                 let at = offset_of(src, e.pos()).min(src.len());
-                ev.push((code("*XML_EXCEPTION"), src[..at].to_string(), 1));
+                let rest = &src[at..];
+                let bad_decl = rest.starts_with("<!")
+                    && !["<!--", "<![CDATA[", "<!DOCTYPE"]
+                        .iter()
+                        .any(|p| rest.starts_with(p));
+                ev.extend(prefix_events(&src[..at]));
+                if bad_decl {
+                    ev.push((code("*XML_EXCEPTION"), src[..at + 2].to_string(), 24));
+                } else {
+                    ev.push((code("*XML_EXCEPTION"), src[..at].to_string(), 1));
+                }
             }
             return ev;
         }
@@ -263,7 +281,16 @@ fn prefix_events(prefix: &str) -> Vec<Event> {
         rest = rest.get(end + 1..).unwrap_or("");
     }
     let closed: String = open.iter().rev().map(|n| format!("</{n}>")).collect();
-    let mut ev = events(&format!("{prefix}{closed}"));
+    let whole = format!("{prefix}{closed}");
+    // Only a start that parses (no recursion into another error).
+    let opts = roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..Default::default()
+    };
+    if open.is_empty() || roxmltree::Document::parse_with_options(&whole, opts).is_err() {
+        return Vec::new();
+    }
+    let mut ev = events(&whole);
     // Not the closings added, nor the end of the document.
     ev.pop();
     for _ in 0..open.len() {
@@ -662,6 +689,32 @@ mod tests {
             [20, 21, 24, 13, 12]
         );
         assert_eq!(d7[2].1, "x");
+        // verify16 w16_rows D2, D4: CDATA 19 and 11 around its characters,
+        // an unknown entity in an attribute 23.
+        let c = nums("<a><![CDATA[d]]></a>");
+        assert!(c.contains(&(19, "<![CDATA[".into(), 0)) && c.contains(&(11, "]]>".into(), 0)));
+        let u = nums("<a x=\"1&y;2\"/>");
+        assert!(u.contains(&(23, "y".into(), 0)), "{u:?}");
+        // w16_rows D1 (seen from the other side: a bracket byte the job's
+        // CCSID does not have): "<a>", then exception 24 with 5 bytes.
+        let b = nums("<a><!\u{c4}CDATA\u{c4}d]]></a>");
+        let codes: Vec<(i64, i64, usize)> = b.iter().map(|e| (e.0, e.2, e.1.len())).collect();
+        assert_eq!(codes, [(20, 0, 0), (21, 0, 1), (15, 24, 5)]);
+        // Documents that go wrong anywhere end in one exception or two.
+        for bad in [
+            "",
+            "<",
+            "<a",
+            "&",
+            "x",
+            "<a><!",
+            "<a></b>",
+            "<a><b><c></a>",
+            "<a>&#;</a>",
+        ] {
+            let ev = nums(bad);
+            assert_eq!(ev.last().map(|e| e.0), Some(15), "{bad}: {ev:?}");
+        }
         // D8: an end tag that does not match: the starts before it, then
         // exceptions 5 and 300, each with the 10 bytes read.
         let d8 = nums("<a><b></a>");

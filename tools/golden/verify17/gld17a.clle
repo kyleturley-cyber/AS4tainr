@@ -1,0 +1,21 @@
+/* Golden (tools/golden/verify17.txt): the printed job log of a job  */
+/* whose CL programs send, receive and monitor messages of several   */
+/* types, printed by DSPJOBLOG OUTPUT(*PRINT) at the end.            */
+PGM
+  DCL        VAR(&M) TYPE(*CHAR) LEN(80)
+  DCL        VAR(&ID) TYPE(*CHAR) LEN(7)
+  SNDPGMMSG  MSG('GLD17 info to self') TOPGMQ(*SAME)
+  SNDPGMMSG  MSG('GLD17 diag to self') TOPGMQ(*SAME) MSGTYPE(*DIAG)
+  SNDPGMMSG  MSGID(CPF9898) MSGF(QCPFMSG) MSGDTA('GLD17 comp to caller') +
+               TOPGMQ(*PRV) MSGTYPE(*COMP)
+  CHKOBJ     OBJ(AS4TRAINR1/GLD17NONE) OBJTYPE(*FILE)
+  MONMSG     MSGID(CPF9801) EXEC(DO)
+    RCVMSG     MSGTYPE(*EXCP) MSGID(&ID) RMV(*NO)
+  ENDDO
+  CALL       PGM(AS4TRAINR1/GLD17B)
+  MONMSG     MSGID(CPF9898) EXEC(DO)
+    RCVMSG     MSGTYPE(*EXCP) MSG(&M) RMV(*YES)
+  ENDDO
+  SNDPGMMSG  MSG('GLD17 last') TOPGMQ(*SAME)
+  DSPJOBLOG  OUTPUT(*PRINT)
+ENDPGM

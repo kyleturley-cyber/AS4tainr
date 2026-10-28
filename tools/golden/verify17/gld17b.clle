@@ -1,0 +1,7 @@
+/* Golden (tools/golden/verify17.txt): a called program that sends an */
+/* informational message to its caller and ends with an escape.      */
+PGM
+  SNDPGMMSG  MSG('GLD17B info to caller') TOPGMQ(*PRV)
+  SNDPGMMSG  MSGID(CPF9898) MSGF(QCPFMSG) MSGDTA('GLD17B escape') +
+               TOPGMQ(*PRV) MSGTYPE(*ESCAPE)
+ENDPGM

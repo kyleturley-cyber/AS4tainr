@@ -18071,3 +18071,129 @@ async fn verify17_printed_job_log() {
     assert!(o.stdout[4].starts_with("CPF1124"), "{o:?}");
     assert!(o.stdout[5].trim_start().starts_with("Message . . . . :"));
 }
+
+/// Which messages the printed job log keeps (PUB400 2026-10-28,
+/// tools/golden/verify18.txt y18_joblog, the same source and message
+/// file): every message removed from its queue leaves it, completion
+/// messages too (GLD18A's own, received or removed by key, and
+/// CRTDTAARA's received with RMV(*YES)); CRTDTAARA's completion message
+/// comes from QWCCCRVC (0095), DLTDTAARA's escape CPF2105 (severity 40,
+/// monitored, left on the queue) from QLIDLOBJ (0772); a second-level
+/// text runs on from column 38 without its format controls; a long text
+/// is cut at blanks by column 115.
+#[tokio::test]
+async fn verify18_removed_messages_leave_the_job_log() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::pase_system;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let dir = format!("/tmp/{lib}");
+    let _ = as4tainr_core::ifs::mkdir_all(&client, &dir, "QSECOFR").await;
+    as4tainr_core::ifs::write_file(
+        &client,
+        &format!("{dir}/gld18a.clle"),
+        include_str!("../../tools/golden/verify18/gld18a.clle")
+            .replace("AS4TRAINR1", &lib)
+            .as_bytes(),
+        819,
+        0o644,
+        "QSECOFR",
+    )
+    .await
+    .unwrap();
+    for c in [
+        format!("CRTMSGF MSGF({lib}/GLD18M)"),
+        format!("ADDMSGD MSGID(GLD1801) MSGF({lib}/GLD18M) MSG('GLD18 own message &1') SECLVL('&N Cause . . . . . :   GLD18 own cause text. &N Recovery  . . . :   GLD18 own recovery text.') SEV(30) FMT((*CHAR 3))"),
+        format!("CRTBNDCL PGM({lib}/GLD18A) SRCSTMF('{dir}/gld18a.clle')"),
+    ] {
+        let o = pase_system::run(&mut job, &[c]).await;
+        assert_eq!(o.status, 0, "{o:?}");
+    }
+    job.calls = Default::default();
+    let o = pase_system::run(&mut job, &[format!("CALL PGM({lib}/GLD18A)")]).await;
+    assert_eq!(o.status, 0, "{o:?}");
+    let log = &o.stdout;
+    let col = |l: &str, a: usize, b: usize| {
+        l.get(a - 1..b.min(l.len()))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let firsts: Vec<[String; 6]> = log
+        .iter()
+        .filter(|l| !l.starts_with(' ') && !l.starts_with("MSGID"))
+        .map(|l| {
+            [
+                col(l, 1, 11),
+                col(l, 12, 35),
+                col(l, 36, 40),
+                col(l, 68, 80),
+                col(l, 93, 101),
+                col(l, 102, 113),
+            ]
+        })
+        .collect();
+    let row = |a: &str, b: &str, c: &str, d: &str, e: &str, f: &str| {
+        [a, b, c, d, e, f].map(str::to_string)
+    };
+    assert_eq!(
+        firsts,
+        [
+            row("CPF1124", "Information", "00", "QWTPIIPP", "04DC", "*EXT"),
+            row("CPC0904", "Completion", "00", "QWCCCRVC", "0095", "GLD18A"),
+            row("CPF2105", "Escape", "40", "QLIDLOBJ", "0772", "GLD18A"),
+            row("GLD1801", "Diagnostic", "30", "GLD18A", "*STMT", "GLD18A"),
+            row("*NONE", "Information", "", "GLD18A", "*STMT", "GLD18A"),
+            row("*NONE", "Completion", "", "GLD18A", "*STMT", "GLD18A"),
+        ],
+        "{o:?}"
+    );
+    let at = log
+        .iter()
+        .position(|l| l.ends_with("Message . . . . :   GLD18 own message ABC"))
+        .unwrap_or_else(|| panic!("{o:?}"));
+    let pad = |n: usize, t: &str| format!("{}{t}", " ".repeat(n));
+    assert_eq!(
+        log[at + 1],
+        pad(
+            37,
+            "Cause . . . . . :   GLD18 own cause text. Recovery  . . . :   GLD18 own"
+        )
+    );
+    assert_eq!(log[at + 2], pad(39, "recovery text."));
+    let at = log
+        .iter()
+        .position(|l| l.contains("Message . . . . :   GLD18 long:"))
+        .unwrap();
+    assert_eq!(
+        log[at..at + 4],
+        [
+            pad(
+                37,
+                "Message . . . . :   GLD18 long: one two three four five six seven eight nine"
+            ),
+            pad(
+                39,
+                "ten eleven twelve thirteen fourteen fifteen.  After two blanks sixteen"
+            ),
+            pad(
+                39,
+                "seventeen eighteen nineteen twenty twenty-one twenty-two twenty-three"
+            ),
+            pad(39, "twenty-four end."),
+        ]
+    );
+}

@@ -89,7 +89,7 @@ pub struct CallStack {
     frames: Vec<Frame>,
     /// Every message put on a queue, oldest first: the job log's (one
     /// whose program ended stays, PUB400 2026-10-28,
-    /// tools/golden/verify17.txt x17_joblog; removed ones: `unlog`).
+    /// tools/golden/verify17.txt x17_joblog; removed ones leave: `unlog`).
     log: Vec<QMsg>,
 }
 
@@ -147,17 +147,14 @@ impl CallStack {
         &self.log
     }
 
-    /// Messages removed from their queue leave the job log, but for
-    /// completion messages, which stay: on PUB400 (2026-10-28) impromptu
-    /// messages a program removed (verify12 n12_keys, verify13
-    /// t13_joblog) and the escape message a called program sent, taken
-    /// with RCVMSG RMV(*YES) (verify17 x17_joblog), were not in the
-    /// printed job log, but CRTDTAARA's completion message received with
-    /// RMV(*YES) was still listed by JOBLOG_INFO (2026-10-26, verify1
-    /// v_out). Which rule IBM i follows is to be checked (fidelity gaps).
+    /// Messages removed from their queue leave the job log, whatever
+    /// their type (PUB400 2026-10-28: impromptu messages a program removed,
+    /// verify12 n12_keys and verify13 t13_joblog; a called program's
+    /// escape taken with RCVMSG RMV(*YES), verify17 x17_joblog; completion
+    /// messages, its own and CRTDTAARA's, taken with RCVMSG RMV(*YES) or
+    /// RMVMSG, verify18 y18_joblog).
     fn unlog(&mut self, keys: &[u32]) {
-        self.log
-            .retain(|m| !keys.contains(&m.key) || m.ty == "*COMP");
+        self.log.retain(|m| !keys.contains(&m.key));
     }
 }
 
@@ -186,13 +183,17 @@ pub fn command_caller() -> Sender {
 }
 
 /// The program that sends a command's messages (its command processing
-/// program): CHKOBJ's is QLICKOBJ in QSYS, its escape messages sent from
-/// instruction 025B (PUB400 2026-10-28, tools/golden/verify17.txt
-/// x17_joblog). Other commands' are not known here: `*N`
+/// program), with the instruction, as PUB400's job logs show them
+/// (2026-10-28): CHKOBJ's escape from QLICKOBJ 025B (verify17
+/// x17_joblog), CRTDTAARA's completion message from QWCCCRVC 0095 and
+/// DLTDTAARA's escape from QLIDLOBJ 0772 (verify18 y18_joblog), all in
+/// QSYS. Other commands' are not known here: `*N`
 /// (docs/fidelity-gaps.md).
 pub fn command_program(command: &str) -> Sender {
     let (pgm, lib, inst) = match command.to_ascii_uppercase().as_str() {
         "CHKOBJ" => ("QLICKOBJ", "QSYS", "025B"),
+        "CRTDTAARA" => ("QWCCCRVC", "QSYS", "0095"),
+        "DLTDTAARA" => ("QLIDLOBJ", "QSYS", "0772"),
         _ => ("*N", "", "*N"),
     };
     Sender {
@@ -205,11 +206,11 @@ pub fn command_program(command: &str) -> Sender {
 
 /// The severity of a system message whose description is not here: as
 /// captured (PUB400 2026-10-28, tools/golden/verify17.txt x17_joblog:
-/// CPF9898 and CPF9801 40, CPF1124 00); others 00
-/// (docs/fidelity-gaps.md).
+/// CPF9898 and CPF9801 40, CPF1124 00; verify18 y18_joblog: CPF2105 40,
+/// CPC0904 00); others 00 (docs/fidelity-gaps.md).
 pub fn system_severity(id: &str) -> i32 {
     match id {
-        "CPF9898" | "CPF9801" => 40,
+        "CPF9898" | "CPF9801" | "CPF2105" => 40,
         _ => 0,
     }
 }

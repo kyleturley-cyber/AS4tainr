@@ -1,0 +1,15 @@
+# Golden: an RPG program's QMHSNDPM messages and more commands' sending
+# programs in the printed job log (verify18 y18_joblog), and DSPJOB's
+# printed report (not implemented here yet: CPD0030) of a `system` job,
+# four of its options.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify19.txt -Files tools\golden\verify19
+b19_cleanup|!for p in GLD19A GLD19P; do system -q "DLTPGM PGM(AS4TRAINR1/$p)"; done; echo cleaned
+b19_tag|!setccsid 819 /home/AS4TRAINR/gld/gld19a.clle /home/AS4TRAINR/gld/gld19p.rpgle; ls /home/AS4TRAINR/gld | grep gld19
+b19_rpg|!system -s "CRTBNDRPG PGM(AS4TRAINR1/GLD19P) SRCSTMF('/home/AS4TRAINR/gld/gld19p.rpgle')"
+b19_cla|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD19A) SRCSTMF('/home/AS4TRAINR/gld/gld19a.clle')"
+b19_joblog|!system "CALL PGM(AS4TRAINR1/GLD19A)"
+b19_dfna|DSPJOB OUTPUT(*PRINT) OPTION(*DFNA)
+b19_stsa|DSPJOB OUTPUT(*PRINT) OPTION(*STSA)
+b19_runa|DSPJOB OUTPUT(*PRINT) OPTION(*RUNA)
+b19_pgmstk|DSPJOB OUTPUT(*PRINT) OPTION(*PGMSTK)
+b19_end|!for p in GLD19A GLD19P; do system -q "DLTPGM PGM(AS4TRAINR1/$p)"; done; echo cleaned

@@ -1,0 +1,16 @@
+/* Golden (tools/golden/verify19.txt): the printed job log of a job  */
+/* whose CL program calls an RPG program that sends messages, and    */
+/* runs commands whose messages show their sending programs.         */
+PGM
+  CALL       PGM(AS4TRAINR1/GLD19P)
+  SNDPGMMSG  MSG('GLD19A after call') TOPGMQ(*SAME)
+  CRTPF      FILE(QTEMP/GLD19F) RCDLEN(10)
+  CLRPFM     FILE(QTEMP/GLD19F)
+  DLTF       FILE(QTEMP/GLD19F)
+  CRTDTAARA  DTAARA(QTEMP/GLD19D) TYPE(*CHAR) LEN(10)
+  CHGDTAARA  DTAARA(QTEMP/GLD19D) VALUE('x')
+  DLTDTAARA  DTAARA(QTEMP/GLD19D)
+  ADDLIBLE   LIB(AS4TRAINR1)
+  MONMSG     MSGID(CPF2103)
+  DSPJOBLOG  OUTPUT(*PRINT)
+ENDPGM

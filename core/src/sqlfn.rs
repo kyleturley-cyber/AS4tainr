@@ -322,15 +322,19 @@ LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, pg_temp AS $as4tainr$
 // functions (IBM i 7.5).
 const MORE: &str = r#"
 -- A source member's records, for an alias or an override naming it
--- (SRCSEQ numbers the lines 1.00, 2.00..., SRCDAT 0, SRCDTA the line).
+-- (SRCSEQ and SRCDAT as kept, source.rs seqdat; else the lines numbered
+-- 1.00, 2.00... with SRCDAT 0; SRCDTA the line).
 CREATE OR REPLACE FUNCTION as4tainr_svc.source_lines(lib text, fil text, mbr text)
 RETURNS TABLE (srcseq numeric(6,2), srcdat numeric(6,0), srcdta varchar(32754))
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $as4tainr$
 BEGIN
   RETURN QUERY
-  SELECT CAST(l.n AS numeric(6,2)), CAST(0 AS numeric(6,0)), CAST(l.t AS varchar(32754))
+  SELECT CAST(coalesce(CAST(substr(q.v, 1, 6) AS numeric) / 100, l.n) AS numeric(6,2)),
+         CAST(coalesce(CAST(substr(q.v, 7, 6) AS numeric), 0) AS numeric(6,0)),
+         CAST(l.t AS varchar(32754))
     FROM as4tainr.source_members m,
-         LATERAL regexp_split_to_table(m.source, E'\n') WITH ORDINALITY AS l(t, n)
+         LATERAL regexp_split_to_table(regexp_replace(m.source, E'\n$', ''), E'\n') WITH ORDINALITY AS l(t, n),
+         LATERAL (SELECT (string_to_array(m.seqdat, E'\n'))[CAST(l.n AS int)] AS v) q
    WHERE m.library = lib AND m.file = fil AND m.member = mbr AND m.source <> '';
 END $as4tainr$;
 -- QSYS2.JOB_NAME (Db2 for i SQL Reference, built-in global variables):

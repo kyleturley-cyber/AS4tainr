@@ -43,6 +43,10 @@ ALTER TABLE as4tainr.source_members ADD COLUMN IF NOT EXISTS added timestamptz N
 -- Usage data: when the member was last used and on how many days.
 ALTER TABLE as4tainr.source_members ADD COLUMN IF NOT EXISTS last_used timestamptz;
 ALTER TABLE as4tainr.source_members ADD COLUMN IF NOT EXISTS days_used integer NOT NULL DEFAULT 0;
+-- Each line's SRCSEQ and SRCDAT as twelve digits (ssssssdddddd), the
+-- lines' separated by newlines; null: the lines are numbered 1.00,
+-- 2.00... with date 0 ([`line_meta`]).
+ALTER TABLE as4tainr.source_members ADD COLUMN IF NOT EXISTS seqdat text;
 -- Stream files (a small IFS): include files that source refers to by
 -- path, such as RPG `/INCLUDE 'header.rpgleinc'`.
 CREATE TABLE IF NOT EXISTS as4tainr.stream_files (
@@ -175,7 +179,8 @@ pub async fn put_member(client: &Client, m: &Member, replace: bool) -> Result<()
     let sql = if replace {
         "INSERT INTO as4tainr.source_members VALUES ($1,$2,$3,$4,$5,$6, now())
          ON CONFLICT (library, file, member) DO UPDATE
-         SET srctype=EXCLUDED.srctype, text=EXCLUDED.text, source=EXCLUDED.source, changed=now()"
+         SET srctype=EXCLUDED.srctype, text=EXCLUDED.text, source=EXCLUDED.source, changed=now(),
+             seqdat=CASE WHEN source_members.source = EXCLUDED.source THEN source_members.seqdat END"
     } else {
         "INSERT INTO as4tainr.source_members VALUES ($1,$2,$3,$4,$5,$6, now()) ON CONFLICT DO NOTHING"
     };
@@ -453,6 +458,60 @@ pub async fn expand_cl_includes_from(
     bail!("INCLUDE: includes nested more than 10 deep.");
 }
 
+/// A member's lines as records: (SRCSEQ, SRCDAT, SRCDTA), the numbers
+/// as decimal text ("2.50", "261027"). `seqdat` is the member's kept
+/// SRCSEQ and SRCDAT (twelve digits a line); lines it has none for are
+/// numbered 1.00, 2.00... with date 0, as CPYFRMSTMF numbers them.
+pub fn line_records(source: &str, seqdat: Option<&str>) -> Vec<(String, String, String)> {
+    let meta: Vec<&str> = seqdat.map(|m| m.split('\n').collect()).unwrap_or_default();
+    source
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            let (seq, dat) = match meta.get(i) {
+                Some(m) if m.len() == 12 && m.bytes().all(|b| b.is_ascii_digit()) => (
+                    format!("{}.{}", m[..4].parse::<u32>().unwrap_or(0), &m[4..6]),
+                    m[6..].parse::<u32>().unwrap_or(0).to_string(),
+                ),
+                _ => (format!("{}.00", (i + 1) % 10000), "0".to_string()),
+            };
+            (seq, dat, line.to_string())
+        })
+        .collect()
+}
+
+/// SRCSEQ and SRCDAT (decimal text) as the twelve digits kept for a line.
+pub fn line_meta(seq: &str, dat: &str) -> String {
+    let seq = seq.trim().trim_start_matches(['-', '+']);
+    let (int, frac) = seq.split_once('.').unwrap_or((seq, ""));
+    let digits = |s: &str| -> u64 {
+        s.bytes()
+            .filter(u8::is_ascii_digit)
+            .fold(0u64, |n, b| (n * 10 + u64::from(b - b'0')) % 1_000_000_000)
+    };
+    let frac2: String = frac.chars().chain("00".chars()).take(2).collect();
+    let s = (digits(int) % 10_000) * 100 + digits(&frac2);
+    let d = dat.trim().trim_start_matches(['-', '+']);
+    let d = digits(d.split_once('.').map(|x| x.0).unwrap_or(d)) % 1_000_000;
+    format!("{s:06}{d:06}")
+}
+
+/// A member's kept SRCSEQ and SRCDAT (see [`line_records`]).
+pub async fn member_seqdat(
+    client: &Client,
+    library: &str,
+    file: &str,
+    member: &str,
+) -> Result<Option<String>> {
+    Ok(client
+        .query_opt(
+            "SELECT seqdat FROM as4tainr.source_members WHERE library=$1 AND file=$2 AND member=$3",
+            &[&library, &file, &member],
+        )
+        .await?
+        .and_then(|r| r.get(0)))
+}
+
 /// A source file as a database file: its record format (named as the
 /// file) SRCSEQ, SRCDAT, SRCDTA.
 pub fn record_file(name: &str, rcdlen: u32) -> crate::dds::PhysicalFile {
@@ -497,8 +556,8 @@ pub fn record_file(name: &str, rcdlen: u32) -> crate::dds::PhysicalFile {
 
 /// Open a member of a source file for record-level access: `member`, or
 /// the first one added (*FIRST). Its lines become the records of the
-/// table LIB.FILE (sequence numbers 1.00, 2.00...; date 0). The member's
-/// name.
+/// table LIB.FILE (with the SRCSEQ and SRCDAT kept for them, else
+/// sequence numbers 1.00, 2.00... and date 0). The member's name.
 /// A member was used (opened to read or write it): its last-used date,
 /// and one more day in its days-used count when it was not used today
 /// yet (DSPFD TYPE(*MBRLIST) MLUDAT and MLUCNT: PUB400 2026-10-27,
@@ -538,13 +597,13 @@ pub async fn open_member(
                 anyhow::anyhow!("CPF4102: File {file} in library {library} has no members.")
             })?,
     };
-    let text: String = client
+    let (text, seqdat): (String, Option<String>) = client
         .query_opt(
-            "SELECT source FROM as4tainr.source_members WHERE library=$1 AND file=$2 AND member=$3",
+            "SELECT source, seqdat FROM as4tainr.source_members WHERE library=$1 AND file=$2 AND member=$3",
             &[&library, &file, &member],
         )
         .await?
-        .map(|r| r.get(0))
+        .map(|r| (r.get(0), r.get(1)))
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "CPF9815: Member {member} of file {file} in library {library} does not exist."
@@ -580,26 +639,24 @@ pub async fn open_member(
         ))
         .await?;
     let width = pf.fields[2].length as usize;
-    let lines: Vec<String> = if text.is_empty() {
-        vec![]
-    } else {
-        text.lines()
-            .map(|l| l.chars().take(width).collect::<String>())
-            .collect()
-    };
-    let seqs: Vec<String> = (1..=lines.len())
-        .map(|n| format!("{}.00", n % 10000))
+    let recs = line_records(&text, seqdat.as_deref());
+    let seqs: Vec<&str> = recs.iter().map(|r| r.0.as_str()).collect();
+    let dats: Vec<&str> = recs.iter().map(|r| r.1.as_str()).collect();
+    let lines: Vec<String> = recs
+        .iter()
+        .map(|r| r.2.chars().take(width).collect())
         .collect();
     client
         .execute(
             &format!(
-                "INSERT INTO {table} ({}, {}, {}) SELECT s::numeric, 0, rpad(d, {width})
-                   FROM unnest($1::text[], $2::text[]) AS t(s, d)",
+                "INSERT INTO {table} ({}, {}, {}) SELECT s::numeric, a::numeric, rpad(d, {width})
+                   FROM unnest($1::text[], $2::text[], $3::text[]) WITH ORDINALITY AS t(s, a, d, n)
+                  ORDER BY n",
                 pf.fields[0].column(),
                 pf.fields[1].column(),
                 pf.fields[2].column()
             ),
-            &[&seqs, &lines],
+            &[&seqs, &dats, &lines],
         )
         .await?;
     Ok(member)
@@ -617,8 +674,10 @@ pub async fn close_member(client: &Client, library: &str, file: &str, member: &s
     let rows = client
         .query(
             &format!(
-                "SELECT rtrim({}) FROM {table} ORDER BY rrn",
-                pf.fields[2].column()
+                "SELECT rtrim({}), {}::text, {}::text FROM {table} ORDER BY rrn",
+                pf.fields[2].column(),
+                pf.fields[0].column(),
+                pf.fields[1].column()
             ),
             &[],
         )
@@ -631,11 +690,22 @@ pub async fn close_member(client: &Client, library: &str, file: &str, member: &s
     if !text.is_empty() {
         text.push('\n');
     }
+    // The records' SRCSEQ and SRCDAT are kept (none when they are the
+    // numbering a member without them gets).
+    let meta: Vec<String> = rows
+        .iter()
+        .map(|r| line_meta(&r.get::<_, String>(1), &r.get::<_, String>(2)))
+        .collect();
+    let numbered = meta
+        .iter()
+        .enumerate()
+        .all(|(i, m)| *m == line_meta(&format!("{}.00", (i + 1) % 10000), "0"));
+    let seqdat = (!numbered).then(|| meta.join("\n"));
     client
         .execute(
-            "UPDATE as4tainr.source_members SET source=$4, changed=now()
+            "UPDATE as4tainr.source_members SET source=$4, seqdat=$5, changed=now()
              WHERE library=$1 AND file=$2 AND member=$3",
-            &[&library, &file, &member, &text],
+            &[&library, &file, &member, &text, &seqdat],
         )
         .await?;
     client
@@ -658,6 +728,23 @@ mod tests {
         );
         assert_eq!(join_relative("/p/a", "./b/c"), "/p/a/b/c");
         assert_eq!(join_relative("/", "../x"), "/x");
+    }
+
+    // SRCSEQ ZONED(6,2) and SRCDAT ZONED(6,0) kept for each line
+    // (PUB400 2026-10-28, tools/golden/screens6.txt 07_dsppfm: the
+    // records inserted with 1.00/261027 and 2.50/0 show as 000100261027
+    // and 000250000000).
+    #[test]
+    fn sequence_numbers_and_dates() {
+        assert_eq!(line_meta("1.00", "261027"), "000100261027");
+        assert_eq!(line_meta("2.5", "0"), "000250000000");
+        assert_eq!(line_meta("9999.99", "991231"), "999999991231");
+        let r = line_records("a\nb\nc\n", Some("000100261027\n000250000000"));
+        assert_eq!(r[0], ("1.00".into(), "261027".into(), "a".into()));
+        assert_eq!(r[1], ("2.50".into(), "0".into(), "b".into()));
+        // A line with none kept: its line number.
+        assert_eq!(r[2], ("3.00".into(), "0".into(), "c".into()));
+        assert_eq!(line_records("x", None)[0].0, "1.00");
     }
 
     #[test]

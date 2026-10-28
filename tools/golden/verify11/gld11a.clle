@@ -1,0 +1,14 @@
+/* Golden (tools/golden/verify11.txt): message keys across call     */
+/* stack entries and RCVMSG RMV(*YES) in the job log. Results go    */
+/* into AS4TRAINR1/GLD11OUT with RUNSQL.                            */
+PGM
+  DCL        VAR(&K) TYPE(*CHAR) LEN(4)
+  DCL        VAR(&K2) TYPE(*CHAR) LEN(4)
+  DCL        VAR(&M) TYPE(*CHAR) LEN(80)
+  SNDPGMMSG  MSG('GLD11 key test') TOPGMQ(*SAME) KEYVAR(&K)
+  CALL       PGM(AS4TRAINR1/GLD11B) PARM(&K)
+  SNDPGMMSG  MSG('GLD11 removed') TOPGMQ(*SAME) KEYVAR(&K2)
+  RCVMSG     MSGKEY(&K2) RMV(*YES) MSG(&M)
+  SNDPGMMSG  MSG('GLD11 kept') TOPGMQ(*SAME)
+  RCVMSG     MSGTYPE(*LAST) RMV(*NO) MSG(&M)
+ENDPGM

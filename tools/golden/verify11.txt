@@ -1,0 +1,18 @@
+# Golden: older open questions. A job description's defaults (CRTJOBD,
+# DSPJOBD, QWDRJOBD JOBD0100 as hexadecimal); QUSRJOBI JOBI0400 of a job
+# (hexadecimal); the PSDS after a MONITORed %SUBST error; XML-SAX's
+# event numbers; RCVMSG by a message key in another call stack entry
+# (*SAME, *PRV); the job log after RCVMSG RMV(*YES).
+# Capture with: golden.ps1 -List tools\golden\verify11.txt -Files tools\golden\verify11
+k_cleanup|!for p in GLD11 GLD11A GLD11B; do system -q "DLTPGM PGM(AS4TRAINR1/$p)"; done; system -q "DLTF FILE(AS4TRAINR1/GLD11OUT)"; system -q "DLTJOBD JOBD(AS4TRAINR1/GLD11JD)"; echo cleaned
+k_tag|!setccsid 819 /home/AS4TRAINR/gld/gld11.rpgle /home/AS4TRAINR/gld/gld11a.clle /home/AS4TRAINR/gld/gld11b.clle; ls /home/AS4TRAINR/gld | grep gld11
+k_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD11OUT (ID CHAR(10) NOT NULL, VAL CHAR(200) NOT NULL)') COMMIT(*NONE)
+k_jobd|CRTJOBD JOBD(AS4TRAINR1/GLD11JD)
+k_dspjobd|DSPJOBD JOBD(AS4TRAINR1/GLD11JD) OUTPUT(*PRINT)
+k_rpg|!system -s "CRTBNDRPG PGM(AS4TRAINR1/GLD11) SRCSTMF('/home/AS4TRAINR/gld/gld11.rpgle')"
+k_cla|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD11A) SRCSTMF('/home/AS4TRAINR/gld/gld11a.clle')"
+k_clb|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD11B) SRCSTMF('/home/AS4TRAINR/gld/gld11b.clle')"
+k_call|CALL PGM(AS4TRAINR1/GLD11)
+k_keys|!system "CALL PGM(AS4TRAINR1/GLD11A)"; system "DSPJOBLOG OUTPUT(*PRINT)" | grep -E "GLD11|CPF24" | head -20
+k_rows|CPYF FROMFILE(AS4TRAINR1/GLD11OUT) TOFILE(*PRINT)
+k_end|!for p in GLD11 GLD11A GLD11B; do system -q "DLTPGM PGM(AS4TRAINR1/$p)"; done; system -q "DLTF FILE(AS4TRAINR1/GLD11OUT)"; system -q "DLTJOBD JOBD(AS4TRAINR1/GLD11JD)"; echo cleaned

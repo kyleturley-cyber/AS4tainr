@@ -36,6 +36,9 @@ pub const COLS: usize = 78;
 /// Bytes of a hexadecimal line.
 pub const HEX_BYTES: usize = 20;
 
+/// The note a member without records shows (its place as on IBM i).
+pub const NO_RECORDS: &str = "(The member has no records)";
+
 /// How far F19 and F20 move in a mode.
 pub fn shift(mode: Mode) -> usize {
     match mode {
@@ -69,6 +72,23 @@ pub fn ruler(from: usize, to: usize) -> String {
 pub fn screen(v: &MemberView, top: usize, left: usize, mode: Mode) -> Vec<String> {
     let mut rows = vec![String::new(); 24];
     rows[0] = format!("{:26}Display Physical File Member", "");
+    // A member with no records: no record number, Control or Find, a
+    // ruler of 78 columns whatever the record length, a note in
+    // parentheses from column 4 of line 8 (as4tainr's own words: the
+    // text is IBM's), and F3 and F12 only (PUB400 2026-10-28,
+    // tools/golden/screens6.txt 12_dsppfm_empty).
+    if v.records.is_empty() {
+        rows[1] = format!(
+            " File . . . . . . :   {:<20}Library  . . . . :   {}",
+            v.file, v.library
+        );
+        rows[2] = format!(" Member . . . . . :   {}", v.member);
+        rows[5] = format!(" {}", ruler(1, COLS));
+        rows[7] = format!("   {NO_RECORDS}");
+        rows[21] = format!("{:73}Bottom", "");
+        rows[22] = " F3=Exit   F12=Cancel".to_string();
+        return rows.iter().map(|r| r.trim_end().to_string()).collect();
+    }
     let rec_no = v.records.get(top).map(|r| r.0).unwrap_or(0);
     rows[1] = format!(
         " File . . . . . . :   {:<20}Library  . . . . :   {}",
@@ -238,6 +258,97 @@ mod tests {
         assert_eq!(s[10], "    Beta");
         assert_eq!(s[11], " 003C8A84444444444444444");
         assert_eq!(s[12], " 02D25310000000000000000");
+    }
+
+    // screens6 12_dsppfm_empty: a table of one CHAR(5) column, no rows.
+    #[test]
+    fn empty_member() {
+        let v = MemberView {
+            file: "SCR6E".into(),
+            library: "AS4TRAINR1".into(),
+            member: "SCR6E".into(),
+            reclen: 5,
+            records: vec![],
+        };
+        let s = screen(&v, 0, 0, Mode::Char);
+        assert_eq!(
+            s[1],
+            " File . . . . . . :   SCR6E               Library  . . . . :   AS4TRAINR1"
+        );
+        assert_eq!(s[2], " Member . . . . . :   SCR6E");
+        assert_eq!(s[3], "");
+        assert_eq!(s[4], "");
+        assert_eq!(
+            s[5],
+            " *...+....1....+....2....+....3....+....4....+....5....+....6....+....7....+..."
+        );
+        assert_eq!(s[6], "");
+        assert_eq!(s[7], format!("   {NO_RECORDS}"));
+        assert_eq!(s[8], "");
+        assert_eq!(
+            s[21],
+            "                                                                         Bottom"
+        );
+        assert_eq!(s[22], " F3=Exit   F12=Cancel");
+    }
+
+    // screens6 07_dsppfm, 08_dsppfm_f10, 09_dsppfm_f11: a source member
+    // of record length 92 (SRCSEQ ZONED(6,2), SRCDAT ZONED(6,0), SRCDTA
+    // CHAR(80)) with records 1.00/261027 'line one' and 2.50/0
+    // '  line two'.
+    #[test]
+    fn source_member() {
+        let rec = |s: &str| crate::tn5250::ebcdic::encode(&format!("{s:<92}"));
+        let v = MemberView {
+            file: "SCR6SRC".into(),
+            library: "AS4TRAINR1".into(),
+            member: "M1".into(),
+            reclen: 92,
+            records: vec![
+                (1, rec("000100261027line one")),
+                (2, rec("000250000000  line two")),
+            ],
+        };
+        let s = screen(&v, 0, 0, Mode::Char);
+        assert_eq!(
+            s[2],
+            " Member . . . . . :   M1                  Record . . . . . :   1"
+        );
+        assert_eq!(
+            s[5],
+            " *...+....1....+....2....+....3....+....4....+....5....+....6....+....7....+..."
+        );
+        assert_eq!(s[6], " 000100261027line one");
+        assert_eq!(s[7], " 000250000000  line two");
+        assert_eq!(s[8], "                           ****** END OF DATA ******");
+        let s = screen(&v, 0, 0, Mode::Hex);
+        assert_eq!(
+            s[6],
+            " F0F0F0F1 F0F0F2F6 F1F0F2F7 93899585 40969585   *000100261027line one*"
+        );
+        assert_eq!(
+            s[7],
+            " F0F0F0F2 F5F0F0F0 F0F0F0F0 40409389 958540A3   *000250000000  line t*"
+        );
+        let s = screen(&v, 0, 0, Mode::Vertical);
+        assert_eq!(s[6], " 000100261027line one");
+        assert_eq!(
+            s[7],
+            " FFFFFFFFFFFF989849984444444444444444444444444444444444444444444444444444444444"
+        );
+        assert_eq!(
+            s[8],
+            " 000100261027395506550000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(s[9], "");
+        assert_eq!(
+            s[11],
+            " FFFFFFFFFFFF4498984AA944444444444444444444444444444444444444444444444444444444"
+        );
+        assert_eq!(
+            s[14],
+            "                           ****** END OF DATA ******"
+        );
     }
 
     // 12_dsppfm_wide, 13_dsppfm_wide_f20, 14_dsppfm_wide_f10: a 160-byte

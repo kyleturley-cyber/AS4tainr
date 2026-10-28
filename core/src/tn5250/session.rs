@@ -2137,9 +2137,13 @@ async fn member_display(
                 }
             }
         }
-        s.field("CTL", 4, 23, 11, FieldKind::Upper, "");
-        s.field("FIND", 5, 23, 40, FieldKind::Text, &find);
-        s.cursor_at(4, 23);
+        // A member with no records has no Control and Find fields
+        // (screens6 12_dsppfm_empty).
+        if n > 0 {
+            s.field("CTL", 4, 23, 11, FieldKind::Upper, "");
+            s.field("FIND", 5, 23, 40, FieldKind::Text, &find);
+            s.cursor_at(4, 23);
+        }
         s.message(&message);
         message.clear();
         let inp = term.show(&s).await?;

@@ -1,0 +1,22 @@
+# 5250 screens of PUB400 (IBM i 7.5), round 6: DSPPFM of a source member
+# (SRCSEQ ZONED(6,2), SRCDAT ZONED(6,0), SRCDTA), F10, F11; and of a
+# member with no records.
+# Objects: source file SCR6SRC and table SCR6E in AS4TRAINR1 (created and deleted here).
+# Run: screens.ps1 -List tools\golden\screens6.txt -Out target\ibmi\screens6
+01_signon|{USER}{TAB}{PASSWORD}{ENTER}
+02_after_signon|{ENTER}
+03_cmd_entry|call qcmd{ERASEEOF}{ENTER}
+04_srcpf|crtsrcpf as4trainr1/scr6src rcdlen(92){ERASEEOF}{ENTER}
+05_addpfm|addpfm as4trainr1/scr6src mbr(m1) srctype(txt){ERASEEOF}{ENTER}
+06_rows|runsql sql('insert into as4trainr1/scr6src values(1.00, 261027, ''line one''), (2.50, 0, ''  line two'')') commit(*none){ERASEEOF}{ENTER}
+07_dsppfm|dsppfm as4trainr1/scr6src m1{ERASEEOF}{ENTER}
+08_dsppfm_f10|{F10}
+09_dsppfm_f11|{F11}
+10_dsppfm_exit|{F3}
+11_empty|runsql sql('create table as4trainr1/scr6e (a char(5) not null)') commit(*none){ERASEEOF}{ENTER}
+12_dsppfm_empty|dsppfm as4trainr1/scr6e{ERASEEOF}{ENTER}
+13_dsppfm_empty_exit|{F3}
+14_dltf|dltf as4trainr1/scr6src{ERASEEOF}{ENTER}
+15_dltf_e|dltf as4trainr1/scr6e{ERASEEOF}{ENTER}
+16_exit_cmd_entry|{F3}
+17_signoff|signoff{ERASEEOF}{ENTER}

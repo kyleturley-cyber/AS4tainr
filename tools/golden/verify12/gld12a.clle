@@ -1,0 +1,17 @@
+/* Golden (tools/golden/verify12.txt): message keys across call     */
+/* stack entries, RCVMSG RMV(*YES), and the job log of the same job  */
+/* (DSPJOBLOG OUTPUT(*PRINT) at the end). Results go into            */
+/* AS4TRAINR1/GLD12OUT with RUNSQL.                                  */
+PGM
+  DCL        VAR(&K) TYPE(*CHAR) LEN(4)
+  DCL        VAR(&K2) TYPE(*CHAR) LEN(4)
+  DCL        VAR(&M) TYPE(*CHAR) LEN(80)
+  SNDPGMMSG  MSG('GLD12 key test') TOPGMQ(*SAME) KEYVAR(&K)
+  CALL       PGM(AS4TRAINR1/GLD12B) PARM(&K)
+  SNDPGMMSG  MSG('GLD12 removed') TOPGMQ(*SAME) KEYVAR(&K2)
+  RCVMSG     MSGKEY(&K2) RMV(*YES) MSG(&M)
+  SNDPGMMSG  MSG('GLD12 kept') TOPGMQ(*SAME)
+  RCVMSG     MSGTYPE(*LAST) RMV(*NO) MSG(&M)
+  SNDPGMMSG  MSG('GLD12 to caller') TOPGMQ(*PRV)
+  DSPJOBLOG  OUTPUT(*PRINT)
+ENDPGM

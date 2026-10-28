@@ -1,0 +1,31 @@
+# Golden: verify11's open questions again, in smaller pieces. The ILE RPG
+# compile listings' messages (verify11's GLD11 failed with severity 30
+# and no listing); the PSDS after a MONITORed %SUBST error; XML-SAX's
+# event numbers; QUSRJOBI JOBI0400 and QWDRJOBD JOBD0100 of QGPL/QDFTJOBD
+# (hexadecimal); DSPJOBD of QDFTJOBD; RCVMSG and RMVMSG by a message key
+# in another call stack entry and the job log of that job (DSPJOBLOG in
+# GLD12A); SRCSEQ and SRCDAT inserted through an alias over a source
+# member, printed with CPYF; SQL naming the source file itself.
+# Capture with: golden.ps1 -List tools\golden\verify12.txt -Files tools\golden\verify12
+n12_cleanup|!for p in GLD12P GLD12X GLD12J GLD12A GLD12B; do system -q "DLTPGM PGM(AS4TRAINR1/$p)"; done; system -q "DLTF FILE(AS4TRAINR1/GLD12OUT)"; system -q "DLTF FILE(AS4TRAINR1/GLD12SRC)"; echo cleaned
+n12_tag|!setccsid 819 /home/AS4TRAINR/gld/gld12p.rpgle /home/AS4TRAINR/gld/gld12x.rpgle /home/AS4TRAINR/gld/gld12j.rpgle /home/AS4TRAINR/gld/gld12a.clle /home/AS4TRAINR/gld/gld12b.clle; ls /home/AS4TRAINR/gld | grep gld12
+n12_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD12OUT (ID CHAR(10) NOT NULL, VAL CHAR(200) NOT NULL)') COMMIT(*NONE)
+n12_rpgp|!system "CRTBNDRPG PGM(AS4TRAINR1/GLD12P) SRCSTMF('/home/AS4TRAINR/gld/gld12p.rpgle')" | grep -E "RNF[0-9]|RNS9" | head -40
+n12_rpgx|!system "CRTBNDRPG PGM(AS4TRAINR1/GLD12X) SRCSTMF('/home/AS4TRAINR/gld/gld12x.rpgle')" | grep -E "RNF[0-9]|RNS9" | head -40
+n12_rpgj|!system "CRTBNDRPG PGM(AS4TRAINR1/GLD12J) SRCSTMF('/home/AS4TRAINR/gld/gld12j.rpgle')" | grep -E "RNF[0-9]|RNS9" | head -40
+n12_cla|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD12A) SRCSTMF('/home/AS4TRAINR/gld/gld12a.clle')"
+n12_clb|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD12B) SRCSTMF('/home/AS4TRAINR/gld/gld12b.clle')"
+n12_callp|CALL PGM(AS4TRAINR1/GLD12P)
+n12_callx|CALL PGM(AS4TRAINR1/GLD12X)
+n12_callj|CALL PGM(AS4TRAINR1/GLD12J)
+n12_keys|!system "CALL PGM(AS4TRAINR1/GLD12A)" | grep -E "GLD12|CPF24|CPF19|CPC|CPD" | head -40
+n12_rows|CPYF FROMFILE(AS4TRAINR1/GLD12OUT) TOFILE(*PRINT)
+n12_dspjobd|DSPJOBD JOBD(QGPL/QDFTJOBD) OUTPUT(*PRINT)
+n12_src|CRTSRCPF FILE(AS4TRAINR1/GLD12SRC) RCDLEN(92) MBR(M1)
+n12_alias|RUNSQL SQL('CREATE ALIAS AS4TRAINR1/GLD12AL FOR AS4TRAINR1/GLD12SRC (M1)') COMMIT(*NONE)
+n12_ins|RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD12AL (SRCSEQ, SRCDAT, SRCDTA) VALUES(1.00, 261028, ''one''), (2.50, 0, ''two'')') COMMIT(*NONE)
+n12_ins_nocols|RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD12AL VALUES(3.00, 261029, ''three'')') COMMIT(*NONE)
+n12_ins_file|RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD12SRC VALUES(4.00, 261030, ''four'')') COMMIT(*NONE)
+n12_src_print|CPYF FROMFILE(AS4TRAINR1/GLD12SRC) TOFILE(*PRINT) FROMMBR(M1)
+n12_src_hex|CPYF FROMFILE(AS4TRAINR1/GLD12SRC) TOFILE(*PRINT) FROMMBR(M1) OUTFMT(*HEX)
+n12_end|!for p in GLD12P GLD12X GLD12J GLD12A GLD12B; do system -q "DLTPGM PGM(AS4TRAINR1/$p)"; done; system -q "RUNSQL SQL('DROP ALIAS AS4TRAINR1/GLD12AL') COMMIT(*NONE)"; system -q "DLTF FILE(AS4TRAINR1/GLD12OUT)"; system -q "DLTF FILE(AS4TRAINR1/GLD12SRC)"; echo cleaned

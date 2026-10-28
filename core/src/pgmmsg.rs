@@ -159,7 +159,19 @@ impl CallStack {
         key: Option<u32>,
         rmv: &str,
     ) -> Option<QMsg> {
-        let n = self.stack.len().checked_sub(1 + up)?;
+        let mut n = self.stack.len().checked_sub(1 + up)?;
+        // A message key names one message in the job: RCVMSG finds it
+        // whichever call stack entry's queue it is on (PUB400 2026-10-28,
+        // tools/golden/verify11.txt k_rows: a key from the caller found
+        // with PGMQ(*SAME) and with PGMQ(*PRV *)).
+        if let Some(k) = key {
+            if !self.stack[n].iter().any(|m| m.key == k) {
+                n = (0..self.stack.len())
+                    .rev()
+                    .find(|&i| self.stack[i].iter().any(|m| m.key == k))
+                    .unwrap_or(n);
+            }
+        }
         let q = self.stack.get_mut(n)?;
         let i = select(q, msgtype, key)?;
         let exception = matches!(q[i].ty.as_str(), "*ESCAPE" | "*NOTIFY");
@@ -948,5 +960,30 @@ mod tests {
         assert_eq!(select(&q, "*ANY", Some(99)), None);
         assert_eq!(parse_key(&key_text(1234)), Some(1234));
         assert_eq!(rtntype("*ESCAPE"), "15");
+    }
+
+    // PUB400 2026-10-28, tools/golden/verify11.txt k_rows: GLD11A sends
+    // 'GLD11 key test' to its own queue and passes the key to GLD11B,
+    // whose RCVMSG PGMQ(*SAME) MSGKEY(&K) RMV(*NO) and RCVMSG
+    // PGMQ(*PRV *) MSGKEY(&K) RMV(*NO) both receive it (K01, K02).
+    #[test]
+    fn key_from_another_call_stack_entry() {
+        let mut c = CallStack::default();
+        c.enter();
+        let k = c.put(
+            QMsg {
+                text: "GLD11 key test".into(),
+                ty: "*INFO".into(),
+                ..Default::default()
+            },
+            false,
+        );
+        c.enter();
+        let same = c.receive_from(0, "*ANY", Some(k), "*NO").unwrap();
+        assert_eq!(same.text, "GLD11 key test");
+        let prv = c.receive_from(1, "*ANY", Some(k), "*NO").unwrap();
+        assert_eq!(prv.text, "GLD11 key test");
+        // A key no queue has: nothing.
+        assert!(c.receive_from(0, "*ANY", Some(k + 99), "*NO").is_none());
     }
 }

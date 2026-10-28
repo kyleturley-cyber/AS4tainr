@@ -4192,7 +4192,11 @@ async fn import_an_application() {
     let Outcome::Display(d) = job.run("DSPPFM QDDSSRC MBR(CONTACT)").await.unwrap() else {
         panic!()
     };
-    assert!(d.rows[0].starts_with("   1.00 "), "{:?}", d.rows);
+    // The records as bytes: SRCSEQ 1.00 and SRCDAT 0 as zoned digits,
+    // then the line (PUB400 2026-10-28, tools/golden/screens6.txt
+    // 07_dsppfm; this test expected the line number "   1.00 " before
+    // the line, a layout of as4tainr's own).
+    assert!(d.rows[0].starts_with("000100000000"), "{:?}", d.rows);
     assert!(d.rows.iter().any(|r| r.contains("K CTID")));
 
     // A field named like a PostgreSQL system column (CTID) works in SQL.
@@ -12808,6 +12812,13 @@ async fn job_descriptions() {
             .unwrap()
             .is_none()
     );
+    // DSPJOBD of a job description that is not there: CPF1623 (PUB400
+    // 2026-10-28, tools/golden/verify11.txt k_dspjobd).
+    let e = cl_cmd(&mut job, format!("DSPJOBD JOBD({lib}/TESTJD)"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains(": CPF1623:"), "{e}");
 }
 
 #[tokio::test]
@@ -14990,12 +15001,13 @@ async fn sql_audit_columns_rename_alias_and_system_column_names() {
         .await
         .unwrap();
     assert_eq!(m.source, "       dcl-s a int(10);\n       a = 1;");
+    // The records keep the SRCSEQ inserted (PUB400 2026-10-28,
+    // tools/golden/screens6.txt 07_dsppfm: inserted 1.00 and 2.50 show
+    // as 000100 and 000250; this test expected the lines renumbered
+    // 1.00, 2.00, which as4tainr did before it kept them).
     assert_eq!(
-        rows(format!(
-            "select srcseq, trim(srcdta) from {lib}.genal order by srcseq"
-        ))
-        .await,
-        ["1.00|dcl-s a int(10);", "2.00|a = 1;"]
+        rows(format!("select srcseq, trim(srcdta) from {lib}.genal")).await,
+        ["0.00|dcl-s a int(10);", "0.00|a = 1;"]
     );
     job.run(&format!(
         "RUNSQL SQL('drop alias {lib}.genal') COMMIT(*NONE)"
@@ -17406,4 +17418,108 @@ async fn dsppfm_shows_record_bytes() {
     // from column 2).
     assert_eq!(d.rows[0], "   Alpha");
     assert_eq!(d.heading, "*...+....1....+....2...");
+}
+
+/// A source member keeps each record's SRCSEQ and SRCDAT, and DSPPFM
+/// shows its records as bytes like a data member's (PUB400 2026-10-28,
+/// tools/golden/screens6.txt 06_rows, 07_dsppfm: records inserted with
+/// RUNSQL as 1.00/261027 'line one' and 2.50/0 '  line two' show as
+/// "000100261027line one" and "000250000000  line two" under a ruler of
+/// 78 of the 92 columns). A member with no records shows none (the
+/// screen's note: pfmview.rs).
+#[tokio::test]
+async fn source_member_keeps_sequence_numbers_and_dates() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    for c in [
+        format!("CRTSRCPF {lib}/SCR6SRC RCDLEN(92)"),
+        format!("ADDPFM {lib}/SCR6SRC MBR(M1) SRCTYPE(TXT)"),
+        // IBM i's SQL names the source file itself (its first member);
+        // here an alias names the member (docs/fidelity-gaps.md).
+        format!("RUNSQL SQL('CREATE ALIAS {lib}.SCR6A FOR {lib}.SCR6SRC (M1)') COMMIT(*NONE)"),
+    ] {
+        job.run(&c).await.unwrap_or_else(|e| panic!("{c}: {e:#}"));
+    }
+    as4tainr_core::sql::run(
+        &client,
+        &url,
+        std::slice::from_ref(&lib),
+        &format!("INSERT INTO {lib}.SCR6A (SRCSEQ, SRCDAT, SRCDTA) VALUES(1.00, 261027, 'line one'), (2.50, 0, '  line two')"),
+    )
+    .await
+    .unwrap();
+    let Outcome::Display(d) = job.run(&format!("DSPPFM {lib}/SCR6SRC M1")).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(d.rows, ["000100261027line one", "000250000000  line two"]);
+    let m = d.member.expect("a member view");
+    assert_eq!(m.reclen, 92);
+    assert_eq!(m.member, "M1");
+    let s = as4tainr_core::pfmview::screen(&m, 0, 0, as4tainr_core::pfmview::Mode::Char);
+    assert_eq!(s[6], " 000100261027line one");
+    // SQL reads them back as kept.
+    let rows = client
+        .query(
+            "SELECT srcseq::text, srcdat::text, rtrim(srcdta)
+               FROM as4tainr_svc.source_lines($1, 'SCR6SRC', 'M1')",
+            &[&lib],
+        )
+        .await
+        .unwrap();
+    let got: Vec<(String, String, String)> = rows
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (
+                "1.00".to_string(),
+                "261027".to_string(),
+                "line one".to_string()
+            ),
+            (
+                "2.50".to_string(),
+                "0".to_string(),
+                "  line two".to_string()
+            )
+        ]
+    );
+    // CPYF to another member copies them.
+    job.run(&format!("ADDPFM {lib}/SCR6SRC MBR(M2)"))
+        .await
+        .unwrap();
+    let o = job
+        .run(&format!(
+            "CPYF FROMFILE({lib}/SCR6SRC) TOFILE(*PRINT) FROMMBR(M1)"
+        ))
+        .await;
+    let text = format!("{o:?}");
+    assert!(text.contains("000250000000  line two"), "{text}");
+    // An empty table: the member view has no records.
+    job.run(&format!(
+        "RUNSQL SQL('CREATE TABLE {lib}/SCR6E (A CHAR(5) NOT NULL)') COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
+    let Outcome::Display(d) = job.run(&format!("DSPPFM {lib}/SCR6E")).await.unwrap() else {
+        panic!()
+    };
+    let m = d.member.expect("a member view");
+    let s = as4tainr_core::pfmview::screen(&m, 0, 0, as4tainr_core::pfmview::Mode::Char);
+    assert_eq!(s[7], format!("   {}", as4tainr_core::pfmview::NO_RECORDS));
 }

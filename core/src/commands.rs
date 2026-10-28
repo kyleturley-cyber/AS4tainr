@@ -5343,6 +5343,29 @@ impl Job<'_> {
                     &member,
                 )
                 .await?;
+                // The member's records as their bytes, as a data
+                // member's: SRCSEQ ZONED(6,2), SRCDAT ZONED(6,0), SRCDTA
+                // (PUB400 2026-10-28, tools/golden/screens6.txt 07_dsppfm,
+                // 08_dsppfm_f10, 09_dsppfm_f11).
+                let seqdat = crate::source::member_seqdat(self.client, l, &file, &m.name).await?;
+                let rcdlen = crate::source::record_length(self.client, l, &file).await?;
+                let pf = crate::source::record_file(&file, rcdlen);
+                let width = pf.fields[2].length as usize;
+                let images: Vec<(i64, Vec<u8>)> =
+                    crate::source::line_records(&m.source, seqdat.as_deref())
+                        .into_iter()
+                        .take(DSPPFM_MAX_RECORDS as usize)
+                        .enumerate()
+                        .map(|(i, (seq, dat, line))| {
+                            let rec = crate::rla::Record::from([
+                                ("SRCSEQ".to_string(), seq),
+                                ("SRCDAT".to_string(), dat),
+                                ("SRCDTA".to_string(), line.chars().take(width).collect()),
+                            ]);
+                            (i as i64 + 1, crate::cpyf::record_image(&pf, &rec))
+                        })
+                        .collect();
+                let reclen = crate::cpyf::record_length(&pf);
                 return Ok(Outcome::Display(ListDisplay {
                     title: "Display Physical File Member".into(),
                     info: vec![
@@ -5351,13 +5374,18 @@ impl Job<'_> {
                         ("Member".into(), m.name.clone()),
                         ("Type".into(), m.srctype.clone()),
                     ],
-                    heading: "SEQNBR  *...+... 1 ...+... 2 ...+... 3 ...+... 4 ...+... 5 ...+... 6 ...+... 7".into(),
-                    rows: m
-                        .source
-                        .lines()
-                        .enumerate()
-                        .map(|(i, line)| format!("{:>4}.00 {}", i + 1, line))
+                    heading: crate::pfmview::ruler(1, reclen.max(1)),
+                    rows: images
+                        .iter()
+                        .map(|(_, b)| crate::cpyf::printable(b).trim_end().to_string())
                         .collect(),
+                    member: Some(Box::new(crate::pfmview::MemberView {
+                        file: file.clone(),
+                        library: crate::qtemp::logical(l),
+                        member: m.name.clone(),
+                        reclen,
+                        records: images,
+                    })),
                     ..Default::default()
                 }));
             }

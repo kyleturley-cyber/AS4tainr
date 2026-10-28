@@ -651,7 +651,10 @@ with Tn5250(HOST) as t:
           "DSPFD lists a source file's members, types and texts", t)
     t.fkey(3); t.wait_for("Command Entry")
     command(t, "dsppfm contacts/qrpglesrc mbr(contcnt)", "Display Physical File Member")
-    check("1.00" in t.text() and "CONTCNT" in t.text(), "DSPPFM shows a source member's lines", t)
+    # The records as bytes, SRCSEQ and SRCDAT as zoned digits (PUB400
+    # screens6 07_dsppfm): line 1 numbered 1.00 with date 0.
+    check(t.line(7).lstrip().startswith("000100000000") and "CONTCNT" in t.text(),
+          "DSPPFM shows a source member's records (SRCSEQ, SRCDAT, SRCDTA)", t)
     t.fkey(3); t.wait_for("Command Entry")
     command(t, "crtbndrpg contacts/contcnt", "Program CONTCNT was created in library CONTACTS")
     check(True, "CRTBNDRPG creates a program from QRPGLESRC (SRCMBR(*PGM))", t)

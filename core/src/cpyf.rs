@@ -60,14 +60,14 @@ impl Job<'_> {
             let rcdlen = crate::source::record_length(self.client, &l, &from_name).await?;
             let pf = crate::source::record_file(&from_name, rcdlen);
             let width = pf.fields[2].length as usize;
+            let seqdat = crate::source::member_seqdat(self.client, &l, &from_name, &mbr).await?;
             source_records = Some(
-                m.source
-                    .lines()
-                    .enumerate()
-                    .map(|(i, line)| {
+                crate::source::line_records(&m.source, seqdat.as_deref())
+                    .into_iter()
+                    .map(|(seq, dat, line)| {
                         rla::Record::from([
-                            ("SRCSEQ".to_string(), format!("{}.00", (i + 1) % 10000)),
-                            ("SRCDAT".to_string(), "0".to_string()),
+                            ("SRCSEQ".to_string(), seq),
+                            ("SRCDAT".to_string(), dat),
                             ("SRCDTA".to_string(), line.chars().take(width).collect()),
                         ])
                     })

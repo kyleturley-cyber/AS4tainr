@@ -1064,7 +1064,7 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
         .src
         .map(|s| s.ctdata.iter().map(|(_, l)| l.len()).sum())
         .unwrap_or(0);
-    let specs = total_records - comments - not_specs - ctdata;
+    let specs = total_records.saturating_sub(comments + not_specs + ctdata);
     let sum = |t: &str, v: usize| {
         let l = crate::commands::dsp_label(t, 30);
         at(&[(5, &l), (39, &format!("{v:>8}"))])

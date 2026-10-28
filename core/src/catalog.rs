@@ -185,10 +185,22 @@ CREATE TABLE IF NOT EXISTS as4tainr.sql_aliases (
 -- INSERT through such an alias: a record added at the member's end.
 CREATE OR REPLACE FUNCTION as4tainr.source_alias_insert() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+DECLARE
+  -- The record's SRCSEQ and SRCDAT as twelve digits (source.rs, seqdat).
+  meta text := lpad(CAST(CAST(abs(round(coalesce(NEW.srcseq, 0) * 100)) AS bigint) % 1000000 AS text), 6, '0')
+            || lpad(CAST(CAST(abs(coalesce(NEW.srcdat, 0)) AS bigint) % 1000000 AS text), 6, '0');
 BEGIN
+  -- The member's lines without the newline that ends the last.
   UPDATE as4tainr.source_members
      SET source = CASE WHEN source = '' THEN rtrim(coalesce(NEW.srcdta, ''))
-                       ELSE source || E'\n' || rtrim(coalesce(NEW.srcdta, '')) END,
+                       ELSE regexp_replace(source, E'\n$', '') || E'\n' || rtrim(coalesce(NEW.srcdta, '')) END,
+         seqdat = CASE WHEN source = '' THEN meta
+                       ELSE coalesce(seqdat,
+                              (SELECT string_agg(lpad(CAST((l.n * 100) % 1000000 AS text), 6, '0') || '000000',
+                                                 E'\n' ORDER BY l.n)
+                                 FROM regexp_split_to_table(regexp_replace(source, E'\n$', ''), E'\n')
+                                      WITH ORDINALITY AS l(t, n)))
+                            || E'\n' || meta END,
          changed = now()
    WHERE library = TG_ARGV[0] AND file = TG_ARGV[1] AND member = TG_ARGV[2];
   IF NOT FOUND THEN

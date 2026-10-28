@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS as4tainr.job_descriptions (
     other   text NOT NULL DEFAULT '',
     PRIMARY KEY (library, name)
 );
+-- QGPL/QDFTJOBD, the job description IBM i ships, with CRTJOBD's
+-- defaults (SBMJOB JOBD(*USRPRF) uses them for profiles naming it).
+INSERT INTO as4tainr.job_descriptions (library, name) VALUES ('QGPL', 'QDFTJOBD')
+ON CONFLICT DO NOTHING;
 "#;
 
 /// A job description as SBMJOB uses it.
@@ -156,9 +160,11 @@ impl Job<'_> {
             }
             "DSPJOBD" => {
                 let (libs, name) = self.search(cmd.get("JOBD"));
+                // A job description that is not there: CPF1623 alone
+                // (PUB400 2026-10-28, tools/golden/verify11.txt k_dspjobd).
                 let Some(d) = find(self.client, &libs, &name).await? else {
                     bail!(
-                        "CPF9801: Object {} is not in library *LIBL.",
+                        "CPF1623: Job description {} cannot be shown.",
                         name.to_ascii_uppercase()
                     );
                 };

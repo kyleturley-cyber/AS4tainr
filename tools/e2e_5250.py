@@ -290,14 +290,29 @@ with Tn5250(HOST) as t:
     t.wait_for("next order number")
     check("The next order number is 1005." in t.text(),
           "F3 ends ORDENT; ORDENTC reads the data area with RTVDTAARA", t)
+    # DSPPFM shows the records as bytes, packed fields as their bytes
+    # (PUB400 screens5 08_dsppfm), so the item names are checked there and
+    # the packed price and quantities with STRSQL. This step expected
+    # DSPPFM to show "189.00", "4960" and "7900", which IBM i's DSPPFM
+    # does not for packed fields.
     command(t, "dsppfm ordlin", "Display Physical File Member")
     screen = t.text()
-    check("PUMP-200" in screen and "189.00" in screen and "NUT-M8" in screen,
-          "the order lines are in ORDLIN", t)
+    check("PUMP-200" in screen and "NUT-M8" in screen, "the order lines are in ORDLIN", t)
     t.fkey(3); t.wait_for("Command Entry")
-    command(t, "dsppfm itemmast", "Display Physical File Member")
-    check("4960" in t.text() and "7900" in t.text(), "the quantities were taken off ITMQOH", t)
-    t.fkey(3); t.wait_for("Command Entry")
+
+    def sql_rows(query):
+        command(t, "strsql", "Enter SQL Statements")
+        t.type(query); t.enter()
+        t.wait_for("Display Data")
+        text = t.text()
+        t.fkey(3); t.wait_for("Enter SQL Statements")
+        t.fkey(3); t.wait_for("Command Entry")
+        return text
+
+    rows = sql_rows("select item, price from qgpl/ordlin where item = 'PUMP-200'")
+    check("PUMP-200" in rows and "189.00" in rows, "ORDLIN has the PUMP-200 line at 189.00", t)
+    rows = sql_rows("select item, itmqoh from qgpl/itemmast where itmqoh in (4960, 7900)")
+    check("4960" in rows and "7900" in rows, "the quantities were taken off ITMQOH", t)
     command(t, "dspdtaara ordnxt", "Display Data Area")
     check("*DEC" in t.text() and "1005" in t.text() and "Next order number" in t.text(),
           "DSPDTAARA shows the data area", t)

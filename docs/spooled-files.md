@@ -13,6 +13,8 @@ Printed output on IBM i does not go straight to a printer. It becomes a **spoole
 
 A batch job's job log is kept only when the job ends abnormally. That is what the shipped job description `QDFTJOBD` does with `LOG(4 0 *NOLIST)`.
 
+A printed job log has IBM i 7.5's layout (`core/src/joblog.rs`): a four-line header on each page of 56 lines ("Display Job Log" for `DSPJOBLOG OUTPUT(*PRINT)`, "Job Log" at the end of a job), then a line per message (ID or `*NONE`, type, severity, date, time with microseconds, sending and receiving program, library and instruction) and its details (sending user, ILE modules, procedures and statements, the text). Under PASE `system` (no job of the catalog) `DSPJOBLOG OUTPUT(*PRINT)` prints the job's own log, as `system` shows it: a QP0ZSPWT job of user QUSER whose CL programs' messages are listed with their senders and receivers. What differs from IBM i is in docs/fidelity-gaps.md.
+
 Each spooled file belongs to the job that made it and to that job's user. It is numbered within the job (1, 2, ...), goes to the output queue of the user's profile (CRTUSRPRF and CHGUSRPRF `OUTQ`; `*WRKSTN`, the default, is `QGPL/QPRINT`, which is there from the start), and has status `RDY` once it is complete, `HLD` while held.
 
 ## Commands

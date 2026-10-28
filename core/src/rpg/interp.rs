@@ -4282,6 +4282,7 @@ impl<'a> Machine<'a> {
                 module: e.module.clone(),
                 proc: e.proc.clone(),
                 line: self.line,
+                inst: String::new(),
             },
             None => crate::pgmmsg::Sender {
                 pgm: self.stack_pgm(),
@@ -4289,6 +4290,7 @@ impl<'a> Machine<'a> {
                 module: self.prog.name.clone(),
                 proc: self.prog.name.clone(),
                 line: self.line,
+                inst: String::new(),
             },
         }
     }

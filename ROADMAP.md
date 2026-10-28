@@ -232,6 +232,7 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] SQL on source files (first member), DSPJOBD's report, RNF3546 for a data structure named as its LIKEREC format, RMVMSG/RCVMSG keys across the call stack with CPF2410 (PUB400 verify12)
 - [x] QUSRJOBI JOBI0400 and QWDRJOBD JOBD0100 as IBM i 7.5 returns them, RNF3546 marked in the listing's source, SQL UPDATE/DELETE on source files (PUB400 verify13)
 - [x] XML-SAX event numbers, strings and lengths as IBM i 7.5 passes them (PUB400 verify14, verify15)
+- [x] Printed job log in IBM i 7.5's layout (QPJOBLOG: DSPJOBLOG OUTPUT(*PRINT), end of job), a `system` job's own job log with senders, receivers and statements (verify17)
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).
 - [x] Journals and trigger programs: COM's SETUPJRN, ORDAUDJV (QSYS2.DISPLAY_JOURNAL) and ORDTRG (ADDPFTRG) run (docs/journals.md).

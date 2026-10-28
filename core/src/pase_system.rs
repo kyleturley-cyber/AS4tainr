@@ -41,6 +41,8 @@ struct Options {
 /// Run `system` with its arguments (options, then the command; words
 /// after the options are joined with blanks).
 pub async fn run(job: &mut Job<'_>, args: &[String]) -> Output {
+    // The job starts (its job log's first message).
+    crate::pgmmsg::job_started();
     let mut opts = Options::default();
     let mut rest = args;
     while let Some(a) = rest.first() {

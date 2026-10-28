@@ -882,8 +882,8 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
     if !normal {
         // QDFTJOBD's LOG(4 0 *NOLIST): the job log is kept as a spooled
         // file only when the job ends abnormally.
-        let lines = crate::spool::job_log_lines(&client, &id).await?;
-        crate::spool::print_lines(&client, &id, "QPJOBLOG", &id.name, &lines).await?;
+        let lines = crate::spool::job_log_lines(&client, &id, crate::joblog::Title::Ended).await?;
+        crate::spool::print_report(&client, &id, "QPJOBLOG", &id.name, &lines).await?;
     }
     end(&client, &id, normal).await?;
     if !info.submitted_by.is_empty() {

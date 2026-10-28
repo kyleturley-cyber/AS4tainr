@@ -655,8 +655,13 @@ impl Job<'_> {
                 // LOG(*LIST): the job log is kept as a spooled file.
                 if cmd.get("LOG") == "*LIST" {
                     if let Some(id) = &self.id {
-                        let lines = crate::spool::job_log_lines(self.client, id).await?;
-                        crate::spool::print_lines(self.client, id, "QPJOBLOG", &id.name, &lines)
+                        let lines = crate::spool::job_log_lines(
+                            self.client,
+                            id,
+                            crate::joblog::Title::Ended,
+                        )
+                        .await?;
+                        crate::spool::print_report(self.client, id, "QPJOBLOG", &id.name, &lines)
                             .await?;
                     }
                 }
@@ -5671,14 +5676,25 @@ impl Job<'_> {
     }
 
     async fn dspjoblog(&mut self, cmd: &Command) -> Result<Outcome> {
+        let this = matches!(cmd.get("JOB").trim(), "*" | "");
+        if this && self.id.is_none() && cmd.get("OUTPUT") == "*PRINT" {
+            // `system`'s own job: its job log printed (QPJOBLOG), which
+            // `system` writes out; no message (PUB400 2026-10-28,
+            // tools/golden/verify17.txt x17_own).
+            let lines = self.system_job_log();
+            self.calls.printed.extend(lines);
+            return Ok(Outcome::Messages(vec![]));
+        }
         let job = self.job_named(cmd.get("JOB")).await?;
         if cmd.get("OUTPUT") == "*PRINT" {
             let me = self
                 .id
                 .clone()
                 .ok_or_else(|| anyhow!("OUTPUT(*PRINT) needs a job to own the spooled file."))?;
-            let lines = crate::spool::job_log_lines(self.client, &job.id).await?;
-            crate::spool::print_lines(self.client, &me, "QPJOBLOG", &job.id.name, &lines).await?;
+            let lines =
+                crate::spool::job_log_lines(self.client, &job.id, crate::joblog::Title::Display)
+                    .await?;
+            crate::spool::print_report(self.client, &me, "QPJOBLOG", &job.id.name, &lines).await?;
             return Ok(Outcome::Messages(vec![format!(
                 "Job log of {} printed to spooled file QPJOBLOG.",
                 job.id
@@ -5737,6 +5753,94 @@ impl Job<'_> {
             }),
             ..Default::default()
         }))
+    }
+
+    /// The printed job log of a job that is not as4tainr's (`system`,
+    /// `as4tainr call`): as on IBM i, where `system` runs in a QP0ZSPWT
+    /// job of user QUSER with job description QGPL/QDFTSVR (PUB400
+    /// 2026-10-28, tools/golden/verify17.txt x17_own; the number here is
+    /// the process's). The job started message CPF1124 first, then the
+    /// messages its programs sent that are still on their queues
+    /// (crate::joblog).
+    fn system_job_log(&self) -> Vec<String> {
+        use crate::joblog::{date_text, time_text, End, Entry};
+        let number = format!("{:06}", std::process::id() % 1_000_000);
+        let ((y, mo, d), (h, mi, sec), us) = crate::pgmmsg::job_started();
+        let started = crate::report::Stamp::of((y, mo, d), (h, mi, sec));
+        let hms = format!("{h:02}{mi:02}{sec:02}");
+        let mut entries = vec![Entry {
+            msgid: "CPF1124".into(),
+            ty: "*INFO".into(),
+            date: started.date.clone(),
+            time: time_text(&hms, &format!("{us:06}")),
+            user: "QUSER".into(),
+            from: End {
+                pgm: "QWTPIIPP".into(),
+                lib: "QSYS".into(),
+                inst: "04DC".into(),
+                ..Default::default()
+            },
+            to: End {
+                pgm: "*EXT".into(),
+                inst: "*N".into(),
+                ..Default::default()
+            },
+            text: format!(
+                "Job {number}/QUSER/QP0ZSPWT began running in subsystem QUSRWRK in QSYS on {} at {}; it came into the system on {} at {}.",
+                started.date, started.time, started.date, started.time
+            ),
+            ..Default::default()
+        }];
+        // What the CL programs put on their queues (the message APIs'
+        // job log, crate::pgmmsg::job_log, is the process's, not this
+        // job's: not here, docs/fidelity-gaps.md).
+        let logged = self.calls.logged();
+        let end = |s: &crate::pgmmsg::Sender| End {
+            pgm: s.pgm.clone(),
+            lib: s.lib.clone(),
+            inst: if !s.inst.is_empty() {
+                s.inst.clone()
+            } else if !s.module.is_empty() {
+                "*STMT".into()
+            } else {
+                "*N".into()
+            },
+            module: s.module.clone(),
+            proc: s.proc.clone(),
+            // An ILE CL statement's number is its source line times 100
+            // (x17_joblog: the SNDPGMMSG on line 7 is statement 700).
+            stmt: if s.line > 0 {
+                (s.line * 100).to_string()
+            } else {
+                "*N".into()
+            },
+        };
+        entries.extend(logged.iter().map(|m| Entry {
+            msgid: m.msgid.clone(),
+            ty: m.ty.clone(),
+            sev: m.sev,
+            date: date_text(&m.sent.0),
+            time: time_text(&m.sent.1, &m.usec),
+            user: self.user.clone(),
+            from: end(&m.sender),
+            to: end(&m.receiver),
+            text: m.text.clone(),
+            seclvl: m.seclvl.clone(),
+        }));
+        let job = crate::joblog::Job {
+            name: "QP0ZSPWT".into(),
+            user: "QUSER".into(),
+            number,
+            jobd: "QDFTSVR".into(),
+            jobd_lib: "QGPL".into(),
+        };
+        crate::joblog::print(
+            &job,
+            crate::joblog::Title::Display,
+            &entries,
+            &crate::report::Stamp::now(),
+            &crate::report::system_name(),
+        )
     }
 
     async fn endjob(&mut self, cmd: &Command) -> Result<Outcome> {

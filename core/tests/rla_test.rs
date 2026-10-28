@@ -3738,11 +3738,24 @@ async fn spooled_files() {
         .await
         .is_err());
 
-    // DSPJOBLOG OUTPUT(*PRINT).
+    // DSPJOBLOG OUTPUT(*PRINT): IBM i's layout, "Display Job Log" at
+    // column 47 (PUB400 2026-10-28, tools/golden/verify17.txt x17_own).
     job.run("DSPJOBLOG OUTPUT(*PRINT)").await.unwrap();
-    assert!(spool::find(&client, "QPJOBLOG", id.number, None)
-        .await
-        .is_ok());
+    let printed = spool::pages(
+        &client,
+        spool::find(&client, "QPJOBLOG", id.number, None)
+            .await
+            .unwrap()
+            .id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        printed[0][0].find("Display Job Log"),
+        Some(46),
+        "{printed:?}"
+    );
+    assert!(printed[0][3].starts_with("MSGID      TYPE"), "{printed:?}");
 
     // Batch: a display command prints QSYSPRT; an abnormal end keeps QPJOBLOG.
     let run_batch = |cmd: String| {
@@ -3806,6 +3819,17 @@ async fn spooled_files() {
     // DLTDTAARA of a data area that is not there: CPF2105 (PUB400, IBM i
     // 7.5, `system "DLTDTAARA ..."` twice, 2026-10-21).
     assert!(log[0].iter().any(|l| l.contains("CPF2105")), "{log:?}");
+    // A job log printed at the end of a job: "Job Log" at column 50, the
+    // request after a minus sign (PUB400 2026-10-27,
+    // tools/golden/verify8.txt c8_joblog7).
+    assert_eq!(log[0][0].find("Job Log"), Some(49), "{log:?}");
+    assert!(log[0][1].contains(":   SPLTEST "), "{log:?}");
+    assert!(
+        log[0]
+            .iter()
+            .any(|l| l.ends_with("Message . . . . :  -DLTDTAARA NOPE")),
+        "{log:?}"
+    );
     let Outcome::Display(d) = job.run("WRKSPLF").await.unwrap() else {
         panic!()
     };
@@ -17640,8 +17664,7 @@ async fn verify12_message_keys_likerec_and_crtsrcpf() {
     }
     let dir = format!("/tmp/{lib}");
     let _ = as4tainr_core::ifs::mkdir_all(&client, &dir, "QSECOFR").await;
-    // The capture's sources, in this test's library; GLD12A without its
-    // DSPJOBLOG (a `system` job's job log is not printed here: gap).
+    // The capture's sources, in this test's library.
     for (f, text) in [
         (
             "gld12a.clle",
@@ -17656,9 +17679,7 @@ async fn verify12_message_keys_likerec_and_crtsrcpf() {
             include_str!("../../tools/golden/verify12/gld12p.rpgle"),
         ),
     ] {
-        let text = text
-            .replace("AS4TRAINR1", &lib)
-            .replace("  DSPJOBLOG  OUTPUT(*PRINT)\n", "");
+        let text = text.replace("AS4TRAINR1", &lib);
         as4tainr_core::ifs::write_file(
             &client,
             &format!("{dir}/{f}"),
@@ -17683,6 +17704,30 @@ async fn verify12_message_keys_likerec_and_crtsrcpf() {
     }
     let o = sys!(format!("CALL PGM({lib}/GLD12A)"));
     assert_eq!(o.status, 0, "{o:?}");
+    // Its job log: of GLD12's messages, the one kept and the one to the
+    // caller (QCMDEXC) (PUB400 2026-10-28, tools/golden/verify12.txt
+    // n12_keys).
+    let gld: Vec<(String, String)> = o
+        .stdout
+        .iter()
+        .filter(|l| l.starts_with("*NONE"))
+        .map(|l| (l[67..79].trim().to_string(), l[101..113].trim().to_string()))
+        .collect();
+    assert_eq!(
+        gld,
+        [
+            ("GLD12A".to_string(), "GLD12A".to_string()),
+            ("GLD12A".into(), "QCMDEXC".into())
+        ],
+        "{o:?}"
+    );
+    let texts: Vec<&str> = o
+        .stdout
+        .iter()
+        .filter_map(|l| l.trim().strip_prefix("Message . . . . :   "))
+        .filter(|t| t.starts_with("GLD12"))
+        .collect();
+    assert_eq!(texts, ["GLD12 kept", "GLD12 to caller"]);
     let rows = client
         .query(
             &format!(
@@ -17814,4 +17859,215 @@ async fn sql_update_and_delete_on_a_source_file() {
             .unwrap_or_else(|e| panic!("{st}: {e:#}"));
     }
     assert_eq!(lines().await, ["3.00/261029/three", "5.00/0/five"]);
+}
+
+/// The printed job log of a `system` job whose CL programs send, receive
+/// and monitor messages (PUB400 2026-10-28, tools/golden/verify17.txt
+/// x17_joblog, the same sources): the CPF9898 completion message GLD17A
+/// sent its caller is on standard output first; the job log has the job
+/// started message CPF1124, then the messages in the order sent, without
+/// the escape message GLD17B sent and RCVMSG RMV(*YES) took, with the
+/// CPF9801 escape RCVMSG RMV(*NO) kept; ILE senders and receivers with
+/// their module, procedure and statement (source line times 100), system
+/// programs (QLICKOBJ, QCMDEXC) with an instruction number instead.
+#[tokio::test]
+async fn verify17_printed_job_log() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::pase_system;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let dir = format!("/tmp/{lib}");
+    let _ = as4tainr_core::ifs::mkdir_all(&client, &dir, "QSECOFR").await;
+    for (f, text) in [
+        (
+            "gld17a.clle",
+            include_str!("../../tools/golden/verify17/gld17a.clle"),
+        ),
+        (
+            "gld17b.clle",
+            include_str!("../../tools/golden/verify17/gld17b.clle"),
+        ),
+    ] {
+        as4tainr_core::ifs::write_file(
+            &client,
+            &format!("{dir}/{f}"),
+            text.replace("AS4TRAINR1", &lib).as_bytes(),
+            819,
+            0o644,
+            "QSECOFR",
+        )
+        .await
+        .unwrap();
+    }
+    for p in ["GLD17B", "GLD17A"] {
+        let o = pase_system::run(
+            &mut job,
+            &[format!(
+                "CRTBNDCL PGM({lib}/{p}) SRCSTMF('{dir}/{}.clle')",
+                p.to_ascii_lowercase()
+            )],
+        )
+        .await;
+        assert_eq!(o.status, 0, "{o:?}");
+    }
+    let o = pase_system::run(&mut job, &[format!("CALL PGM({lib}/GLD17A)")]).await;
+    assert_eq!(o.status, 0, "{o:?}");
+    assert_eq!(o.stdout[0], "CPF9898: GLD17 comp to caller.", "{o:?}");
+    let log = &o.stdout[1..];
+    assert!(log[0].contains("Display Job Log"), "{o:?}");
+    assert!(log[1].contains(":   QP0ZSPWT        User  . . . . . . :   QUSER"));
+    assert!(log[2].ends_with(":   QDFTSVR         Library . . . . . :   QGPL"));
+    // Each entry's line as columns: ID, type, severity, from program,
+    // library, instruction, to program, library, instruction.
+    let cols = |l: &str| -> Vec<String> {
+        let at = |a: usize, b: usize| {
+            l.get(a - 1..b.min(l.len()))
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        vec![
+            at(1, 11),
+            at(12, 35),
+            at(36, 40),
+            at(68, 80),
+            at(81, 92),
+            at(93, 101),
+            at(102, 113),
+            at(114, 125),
+            at(126, 132),
+        ]
+    };
+    let firsts: Vec<Vec<String>> = log
+        .iter()
+        .filter(|l| !l.starts_with(' ') && !l.starts_with("MSGID"))
+        .map(|l| cols(l))
+        .collect();
+    let l = lib.as_str();
+    let want: Vec<Vec<&str>> = vec![
+        vec![
+            "CPF1124",
+            "Information",
+            "00",
+            "QWTPIIPP",
+            "QSYS",
+            "04DC",
+            "*EXT",
+            "",
+            "*N",
+        ],
+        vec![
+            "*NONE",
+            "Information",
+            "",
+            "GLD17A",
+            l,
+            "*STMT",
+            "GLD17A",
+            l,
+            "*STMT",
+        ],
+        vec![
+            "*NONE",
+            "Diagnostic",
+            "",
+            "GLD17A",
+            l,
+            "*STMT",
+            "GLD17A",
+            l,
+            "*STMT",
+        ],
+        vec![
+            "CPF9898",
+            "Completion",
+            "40",
+            "GLD17A",
+            l,
+            "*STMT",
+            "QCMDEXC",
+            "QSYS",
+            "012F",
+        ],
+        vec![
+            "CPF9801", "Escape", "40", "QLICKOBJ", "QSYS", "025B", "GLD17A", l, "*STMT",
+        ],
+        vec![
+            "*NONE",
+            "Information",
+            "",
+            "GLD17B",
+            l,
+            "*STMT",
+            "GLD17A",
+            l,
+            "*STMT",
+        ],
+        vec![
+            "*NONE",
+            "Information",
+            "",
+            "GLD17A",
+            l,
+            "*STMT",
+            "GLD17A",
+            l,
+            "*STMT",
+        ],
+    ];
+    assert_eq!(firsts, want, "{o:?}");
+    let stmts: Vec<&str> = log
+        .iter()
+        .filter(|l| l.trim_start().starts_with("Statement"))
+        .map(|l| l.trim().rsplit(' ').next().unwrap())
+        .collect();
+    assert_eq!(
+        stmts,
+        ["700", "700", "800", "800", "900", "1100", "400", "1500", "1900", "1900"],
+        "{o:?}"
+    );
+    let texts: Vec<&str> = log
+        .iter()
+        .filter_map(|l| l.trim().strip_prefix("Message . . . . :   "))
+        .skip(1)
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "GLD17 info to self",
+            "GLD17 diag to self",
+            "GLD17 comp to caller.",
+            &format!("Object GLD17NONE was not found in library {lib}."),
+            "GLD17B info to caller",
+            "GLD17 last",
+        ]
+    );
+    // The sending user (the job's is QUSER) on each entry but CPF1124.
+    let users = log
+        .iter()
+        .filter(|l| l.trim_start().starts_with("From user"))
+        .count();
+    assert_eq!(users, 6);
+
+    // A `system` command's own job log (a job of its own): only CPF1124,
+    // and no message (x17_own).
+    job.calls = Default::default();
+    let o = pase_system::run(&mut job, &["DSPJOBLOG OUTPUT(*PRINT)".into()]).await;
+    assert_eq!(o.status, 0, "{o:?}");
+    assert!(o.stdout[0].contains("Display Job Log"), "{o:?}");
+    assert!(o.stdout[4].starts_with("CPF1124"), "{o:?}");
+    assert!(o.stdout[5].trim_start().starts_with("Message . . . . :"));
 }

@@ -1,0 +1,15 @@
+# Golden: the printed job log again (verify17 x17_joblog): which removed
+# messages leave it (an impromptu completion message RCVMSG RMV(*YES)
+# took, a predefined informational one, a completion message RMVMSG
+# removed by key, CRTDTAARA's completion message RCVMSG RMV(*YES) took),
+# which programs send CRTDTAARA's and DLTDTAARA's messages, how a message
+# with a second-level text (a message file of our own) and a long text
+# print.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify18.txt -Files tools\golden\verify18
+y18_cleanup|!system -q "DLTPGM PGM(AS4TRAINR1/GLD18A)"; system -q "DLTMSGF MSGF(AS4TRAINR1/GLD18M)"; echo cleaned
+y18_tag|!setccsid 819 /home/AS4TRAINR/gld/gld18a.clle; ls /home/AS4TRAINR/gld | grep gld18
+y18_msgf|CRTMSGF MSGF(AS4TRAINR1/GLD18M)
+y18_msgd|ADDMSGD MSGID(GLD1801) MSGF(AS4TRAINR1/GLD18M) MSG('GLD18 own message &1') SECLVL('&N Cause . . . . . :   GLD18 own cause text. &N Recovery  . . . :   GLD18 own recovery text.') SEV(30) FMT((*CHAR 3))
+y18_cla|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD18A) SRCSTMF('/home/AS4TRAINR/gld/gld18a.clle')"
+y18_joblog|!system "CALL PGM(AS4TRAINR1/GLD18A)"
+y18_end|!system -q "DLTPGM PGM(AS4TRAINR1/GLD18A)"; system -q "DLTMSGF MSGF(AS4TRAINR1/GLD18M)"; echo cleaned

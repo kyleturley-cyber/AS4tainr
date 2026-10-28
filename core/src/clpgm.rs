@@ -2597,14 +2597,14 @@ fn substitute_text(text: &str, vars: &HashMap<String, Var>) -> Result<String> {
 /// Run a CL program in a job, with CALL's parameter values. Returns the
 /// messages it sent (and those of the commands it ran).
 pub async fn run(job: &mut Job<'_>, pgm: &Program, args: &[String]) -> Result<Outcome> {
-    // The program's own message queue, for as long as it runs.
-    job.calls.enter();
     // Its call stack entry (QWVRCSTK lists it).
     let (lib, name) = pgm
         .object
         .split_once('/')
         .map(|(l, n)| (l.to_string(), n.to_string()))
         .unwrap_or_else(|| (String::new(), pgm.name.clone()));
+    // The program's own message queue, for as long as it runs.
+    job.calls.enter_program(&lib, &name, pgm.pep);
     let job_key = job.job_key();
     // An ILE CL program is two entries, as on IBM i: the program entry
     // procedure, then the program's own procedure (QWVRCSTK on PUB400,
@@ -3054,6 +3054,7 @@ async fn run_program(
             Ins::Cmd { st, monitors } => {
                 job.calls.escape = None;
                 job.calls.escape_to_caller = false;
+                job.calls.set_line(st.line);
                 let result = command(job, pgm, st, &mut vars, &mut msgs, &mut io).await;
                 match result {
                     Ok(Some(o)) => return Ok((o, param_values(pgm, &vars))),
@@ -3103,11 +3104,11 @@ async fn run_program(
                         if monitored {
                             // The handled exception goes on the program's
                             // queue, for RCVMSG MSGTYPE(*EXCP).
-                            let m = job
-                                .calls
-                                .escape
-                                .take()
-                                .unwrap_or_else(|| crate::pgmmsg::from_error(&e, &original));
+                            let m = job.calls.escape.take().unwrap_or_else(|| {
+                                let mut m = crate::pgmmsg::from_error(&e, &original);
+                                m.sender = crate::pgmmsg::command_program(&st.name);
+                                m
+                            });
                             job.calls.put(m, false);
                             // A function check is an exception of its own,
                             // the one RCVMSG MSGTYPE(*EXCP) gets; its data
@@ -3768,6 +3769,12 @@ async fn command(
                         m.sev = 40;
                     }
                     job.calls.escape_to_caller = to != "*SAME";
+                    // Sent now, by this program (the job log shows it
+                    // when the caller gets it).
+                    crate::pgmmsg::stamp(&mut m);
+                    if let Some(s) = job.calls.current() {
+                        m.sender = s;
+                    }
                     job.calls.escape = Some(m);
                     bail!(line)
                 }
@@ -3783,7 +3790,15 @@ async fn command(
                     0
                 }
                 ("*INFO" | "*COMP" | "*DIAG" | "*NOTIFY", _) => {
-                    msgs.push(m.text.clone());
+                    // A predefined message reaches the caller with its
+                    // identifier (PUB400 2026-10-28, tools/golden/
+                    // verify17.txt x17_joblog: "CPF9898: ..." from
+                    // `system`).
+                    msgs.push(if m.msgid.is_empty() {
+                        m.text.clone()
+                    } else {
+                        format!("{}: {}", m.msgid, m.text)
+                    });
                     job.calls.put(m, true)
                 }
                 (other, _) => bail!("line {}: MSGTYPE({other}) is not supported", st.line),
@@ -4860,6 +4875,7 @@ async fn command(
                                 } else {
                                     Vec::new()
                                 },
+                                sender: crate::pgmmsg::command_program(&st.name),
                                 ..Default::default()
                             },
                             false,

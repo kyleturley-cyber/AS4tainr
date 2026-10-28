@@ -354,18 +354,68 @@ pub async fn delete(client: &Client, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// A job log as printed lines (QPJOBLOG).
-pub async fn job_log_lines(client: &Client, job: &JobId) -> Result<Vec<String>> {
-    let mut out = vec![
-        format!("Job Log   Job: {}", job),
-        String::new(),
-        format!("{:<9} {:<8} {:<7} Message", "Time", "Type", "ID"),
-    ];
-    for e in crate::jobs::job_log(client, job.number).await? {
-        out.push(format!(
-            "{:<9} {:<8} {:<7} {}",
-            e.sent, e.kind, e.msgid, e.text
-        ));
-    }
-    Ok(out)
+/// A job log of the catalog as printed lines (QPJOBLOG), in IBM i's
+/// layout (crate::joblog). What the catalog keeps of a message is its
+/// type, ID, text and time: the sending and receiving programs are not
+/// known (`*N`, and `*EXT`), and the job description is QGPL/QDFTJOBD,
+/// the one jobs get here (docs/fidelity-gaps.md).
+pub async fn job_log_lines(
+    client: &Client,
+    job: &JobId,
+    title: crate::joblog::Title,
+) -> Result<Vec<String>> {
+    use crate::joblog::{date_text, time_text, End, Entry};
+    let rows = client
+        .query(
+            "SELECT '1' || to_char(sent, 'YYMMDD'), to_char(sent, 'HH24MISS'), to_char(sent, 'US'),
+                    msgid, kind, text
+             FROM as4tainr.job_log WHERE job = $1 ORDER BY seq",
+            &[&job.number],
+        )
+        .await?;
+    let entries: Vec<Entry> = rows
+        .iter()
+        .map(|r| {
+            let msgid: String = r.get(3);
+            let kind: String = r.get(4);
+            let text: String = r.get(5);
+            let text = match text.split_once(": ") {
+                Some((id, t)) if !msgid.is_empty() && id == msgid => t.to_string(),
+                _ => text,
+            };
+            Entry {
+                sev: crate::pgmmsg::system_severity(&msgid),
+                msgid,
+                ty: format!("*{}", kind.trim_start_matches('*')),
+                date: date_text(&r.get::<_, String>(0)),
+                time: time_text(&r.get::<_, String>(1), &r.get::<_, String>(2)),
+                from: End {
+                    pgm: "*N".into(),
+                    inst: "*N".into(),
+                    ..Default::default()
+                },
+                to: End {
+                    pgm: "*EXT".into(),
+                    inst: "*N".into(),
+                    ..Default::default()
+                },
+                text,
+                ..Default::default()
+            }
+        })
+        .collect();
+    let header = crate::joblog::Job {
+        name: job.name.clone(),
+        user: job.user.clone(),
+        number: format!("{:06}", job.number),
+        jobd: "QDFTJOBD".into(),
+        jobd_lib: "QGPL".into(),
+    };
+    Ok(crate::joblog::print(
+        &header,
+        title,
+        &entries,
+        &crate::report::Stamp::now(),
+        &crate::report::system_name(),
+    ))
 }

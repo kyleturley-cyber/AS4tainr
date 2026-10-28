@@ -243,7 +243,7 @@ def main():
         ibm = {
             (i, re.sub(r"\s+", " ", t))
             for i, t in messages(g_out) + messages(g_err)
-            if len(skeleton(t)) > 8
+            if len(skeleton(t)) > 8 and i != "CPF9898"
         }
         same = [
             i

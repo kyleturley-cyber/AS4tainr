@@ -85,12 +85,40 @@ pub struct CallStack {
     /// does not show them (PUB400 2026-10-26, tools/golden/verify1.txt
     /// v_call, qsh.txt q_call).
     pub own_queue: Vec<String>,
+    /// The CL programs running (with `stack`): name and source line.
+    frames: Vec<Frame>,
+    /// Every message put on a queue, oldest first: the job log's (one
+    /// whose program ended stays, PUB400 2026-10-28,
+    /// tools/golden/verify17.txt x17_joblog; removed ones: `unlog`).
+    log: Vec<QMsg>,
+}
+
+/// A CL program on the call stack.
+#[derive(Debug, Clone, Default)]
+struct Frame {
+    lib: String,
+    pgm: String,
+    /// ILE (CRTBNDCL): its module and procedure have its name.
+    ile: bool,
+    /// The statement running (source line).
+    line: usize,
 }
 
 impl CallStack {
     /// A program starts: its queue.
     pub fn enter(&mut self) {
+        self.enter_program("", "", false);
+    }
+
+    /// A CL program `lib/pgm` starts (`ile`: made by CRTBNDCL).
+    pub fn enter_program(&mut self, lib: &str, pgm: &str, ile: bool) {
         self.stack.push(Vec::new());
+        self.frames.push(Frame {
+            lib: crate::qtemp::logical(lib),
+            pgm: pgm.to_string(),
+            ile,
+            line: 0,
+        });
     }
 
     /// A program ends: its queue and the overrides it made go with it.
@@ -99,8 +127,114 @@ impl CallStack {
         self.overrides
             .retain(|o| o.level < level || o.actgrp.is_some());
         self.stack.pop();
+        self.frames.pop();
     }
 
+    /// The running program is at a statement (its source line).
+    pub fn set_line(&mut self, line: usize) {
+        if let Some(f) = self.frames.last_mut() {
+            f.line = line;
+        }
+    }
+
+    /// The running CL program as a message's sender (or receiver).
+    pub fn current(&self) -> Option<Sender> {
+        self.frames.last().map(frame_end)
+    }
+
+    /// The messages of the job log that are still there, oldest first.
+    pub fn logged(&self) -> &[QMsg] {
+        &self.log
+    }
+
+    /// Messages removed from their queue leave the job log, but for
+    /// completion messages, which stay: on PUB400 (2026-10-28) impromptu
+    /// messages a program removed (verify12 n12_keys, verify13
+    /// t13_joblog) and the escape message a called program sent, taken
+    /// with RCVMSG RMV(*YES) (verify17 x17_joblog), were not in the
+    /// printed job log, but CRTDTAARA's completion message received with
+    /// RMV(*YES) was still listed by JOBLOG_INFO (2026-10-26, verify1
+    /// v_out). Which rule IBM i follows is to be checked (fidelity gaps).
+    fn unlog(&mut self, keys: &[u32]) {
+        self.log
+            .retain(|m| !keys.contains(&m.key) || m.ty == "*COMP");
+    }
+}
+
+fn frame_end(f: &Frame) -> Sender {
+    Sender {
+        pgm: f.pgm.clone(),
+        lib: f.lib.clone(),
+        module: if f.ile { f.pgm.clone() } else { String::new() },
+        proc: if f.ile { f.pgm.clone() } else { String::new() },
+        line: f.line,
+        inst: String::new(),
+    }
+}
+
+/// The program below a job's first CL program, which gets what that one
+/// sends to its caller: QCMDEXC (QSYS, instruction 012F), the program
+/// `system` runs the command with (PUB400 2026-10-28,
+/// tools/golden/verify17.txt x17_joblog and verify13.txt t13_joblog).
+pub fn command_caller() -> Sender {
+    Sender {
+        pgm: "QCMDEXC".into(),
+        lib: "QSYS".into(),
+        inst: "012F".into(),
+        ..Default::default()
+    }
+}
+
+/// The program that sends a command's messages (its command processing
+/// program): CHKOBJ's is QLICKOBJ in QSYS, its escape messages sent from
+/// instruction 025B (PUB400 2026-10-28, tools/golden/verify17.txt
+/// x17_joblog). Other commands' are not known here: `*N`
+/// (docs/fidelity-gaps.md).
+pub fn command_program(command: &str) -> Sender {
+    let (pgm, lib, inst) = match command.to_ascii_uppercase().as_str() {
+        "CHKOBJ" => ("QLICKOBJ", "QSYS", "025B"),
+        _ => ("*N", "", "*N"),
+    };
+    Sender {
+        pgm: pgm.into(),
+        lib: lib.into(),
+        inst: inst.into(),
+        ..Default::default()
+    }
+}
+
+/// The severity of a system message whose description is not here: as
+/// captured (PUB400 2026-10-28, tools/golden/verify17.txt x17_joblog:
+/// CPF9898 and CPF9801 40, CPF1124 00); others 00
+/// (docs/fidelity-gaps.md).
+pub fn system_severity(id: &str) -> i32 {
+    match id {
+        "CPF9898" | "CPF9801" => 40,
+        _ => 0,
+    }
+}
+
+/// When a message was sent: CYYMMDD, HHMMSS and microseconds, now (if
+/// not set yet).
+pub fn stamp(m: &mut QMsg) {
+    if m.sent.0.is_empty() {
+        let ((y, mo, d), (h, mi, sec), us) = crate::rpg::dates::now();
+        m.sent = (
+            format!("{}{:02}{mo:02}{d:02}", u8::from(y >= 2000), y % 100),
+            format!("{h:02}{mi:02}{sec:02}"),
+        );
+        m.usec = format!("{us:06}");
+    }
+}
+
+/// When the job started (the process, for `system`): the first time
+/// this is asked.
+pub fn job_started() -> crate::rpg::dates::Ts {
+    static STARTED: std::sync::OnceLock<crate::rpg::dates::Ts> = std::sync::OnceLock::new();
+    *STARTED.get_or_init(crate::rpg::dates::now)
+}
+
+impl CallStack {
     /// The current call level: 0 on the command line, 1 in a CL program
     /// called from it, and so on.
     pub fn level(&self) -> usize {
@@ -118,6 +252,7 @@ impl CallStack {
     pub fn put(&mut self, mut m: QMsg, caller: bool) -> u32 {
         let k = self.key();
         m.key = k;
+        stamp(&mut m);
         if !m.msgid.is_empty() && !m.text.is_empty() {
             self.texts.insert(m.msgid.clone(), m.text.clone());
         }
@@ -127,6 +262,21 @@ impl CallStack {
         } else {
             n.checked_sub(1)
         };
+        // Sent by the running program unless the sender is known (a
+        // called program's escape, a command's message); received by the
+        // program whose queue it goes on (or the command's caller).
+        if m.sender.pgm.is_empty() {
+            if let Some(s) = self.current() {
+                m.sender = s;
+            }
+        }
+        if n > 0 {
+            m.receiver = at
+                .and_then(|i| self.frames.get(i))
+                .map(frame_end)
+                .unwrap_or_else(command_caller);
+            self.log.push(m.clone());
+        }
         if let Some(q) = at.and_then(|i| self.stack.get_mut(i)) {
             q.push(m);
         }
@@ -181,7 +331,9 @@ impl CallStack {
             _ => true,
         };
         if remove {
-            Some(q.remove(i))
+            let m = q.remove(i);
+            self.unlog(&[m.key]);
+            Some(m)
         } else {
             q[i].old = true;
             Some(q[i].clone())
@@ -200,17 +352,24 @@ impl CallStack {
         let Some(q) = self.stack.get_mut(n) else {
             return;
         };
-        match clear {
-            "*OLD" => q.retain(|m| !m.old),
-            "*NEW" => q.retain(|m| m.old),
-            "*ALL" | "*KEEPUNANS" => q.clear(),
-            _ => {
-                if let Some(k) = key {
-                    // By key: the message wherever it is on the call
-                    // stack, as RCVMSG finds it (PUB400 2026-10-28,
-                    // tools/golden/verify12.txt n12_rows: GLD12B removed
-                    // its caller's message by key, and the caller's own
-                    // RCVMSG of that key then failed with CPF2410).
+        let gone: Vec<u32> = match clear {
+            "*OLD" | "*NEW" | "*ALL" | "*KEEPUNANS" => {
+                let (gone, keep): (Vec<QMsg>, Vec<QMsg>) =
+                    std::mem::take(q).into_iter().partition(|m| match clear {
+                        "*OLD" => m.old,
+                        "*NEW" => !m.old,
+                        _ => true,
+                    });
+                *q = keep;
+                gone.iter().map(|m| m.key).collect()
+            }
+            _ => match key {
+                // By key: the message wherever it is on the call stack,
+                // as RCVMSG finds it (PUB400 2026-10-28,
+                // tools/golden/verify12.txt n12_rows: GLD12B removed its
+                // caller's message by key, and the caller's own RCVMSG of
+                // that key then failed with CPF2410).
+                Some(k) => {
                     if q.iter().any(|m| m.key == k) {
                         q.retain(|m| m.key != k);
                     } else {
@@ -218,9 +377,12 @@ impl CallStack {
                             q.retain(|m| m.key != k);
                         }
                     }
+                    vec![k]
                 }
-            }
-        }
+                None => vec![],
+            },
+        };
+        self.unlog(&gone);
     }
 
     /// Whether a program message queue on the call stack has the message
@@ -333,7 +495,7 @@ pub fn from_error(e: &anyhow::Error, id: &str) -> QMsg {
         msgflib: "QSYS".into(),
         sndmsgflib: "*LIBL".into(),
         text,
-        sev: if id == "CPF9898" { 40 } else { 0 },
+        sev: system_severity(id),
         ty: "*ESCAPE".into(),
         ..Default::default()
     }
@@ -407,7 +569,7 @@ pub async fn describe(
                 _ if !given.is_empty() => given,
                 _ => format!("Message {msgid} from {name}."),
             };
-            m.sev = if msgid == "CPF9898" { 40 } else { 0 };
+            m.sev = system_severity(&msgid);
         }
         None => bail!("CPF2407: There is no message file {name} in library {lib}."),
     }
@@ -724,14 +886,7 @@ pub fn stack_target(job: &str, entry: &str, counter: usize) -> Option<u64> {
 pub fn stack_send(job: &str, id: u64, mut m: QMsg) -> Option<u32> {
     let key = NAMED_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     m.key = key;
-    if m.sent.0.is_empty() {
-        let ((y, mo, d), (h, mi, sec), us) = crate::rpg::dates::now();
-        m.sent = (
-            format!("{}{:02}{mo:02}{d:02}", u8::from(y >= 2000), y % 100),
-            format!("{h:02}{mi:02}{sec:02}"),
-        );
-        m.usec = format!("{us:06}");
-    }
+    stamp(&mut m);
     // Messages on call message queues are in the job log too.
     if let Ok(mut g) = JOBLOG.lock() {
         g.get_or_insert_with(HashMap::new)
@@ -753,6 +908,7 @@ pub fn stack_send(job: &str, id: u64, mut m: QMsg) -> Option<u32> {
             module: s[i].module.clone(),
             proc: s[i].proc.clone(),
             line: s[i].line,
+            inst: String::new(),
         };
         // The job log's copy names the receiver too.
         if let Ok(mut g) = JOBLOG.lock() {
@@ -904,6 +1060,9 @@ pub struct Sender {
     pub proc: String,
     /// The source line of the statement that sent it (0: not known).
     pub line: usize,
+    /// The instruction a system program sent it from (the job log's INST
+    /// column); blank: `*STMT` for an ILE procedure, else not known.
+    pub inst: String,
 }
 
 impl std::fmt::Display for Escape {

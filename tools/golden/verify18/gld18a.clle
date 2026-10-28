@@ -1,0 +1,31 @@
+/* Golden (tools/golden/verify18.txt): which removed messages leave  */
+/* the printed job log (impromptu and predefined, completion and     */
+/* other types, RCVMSG RMV(*YES) and RMVMSG), the senders of         */
+/* commands' messages, a message with a second-level text, and a     */
+/* long text, printed by DSPJOBLOG OUTPUT(*PRINT) at the end.         */
+PGM
+  DCL        VAR(&M) TYPE(*CHAR) LEN(80)
+  DCL        VAR(&K) TYPE(*CHAR) LEN(4)
+  SNDPGMMSG  MSG('GLD18 comp removed') TOPGMQ(*SAME) MSGTYPE(*COMP)
+  RCVMSG     MSGTYPE(*COMP) RMV(*YES) MSG(&M)
+  SNDPGMMSG  MSGID(CPF9898) MSGF(QCPFMSG) MSGDTA('GLD18 info id removed') +
+               TOPGMQ(*SAME)
+  RCVMSG     MSGTYPE(*INFO) RMV(*YES) MSG(&M)
+  SNDPGMMSG  MSG('GLD18 comp rmvmsg') TOPGMQ(*SAME) MSGTYPE(*COMP) +
+               KEYVAR(&K)
+  RMVMSG     MSGKEY(&K) CLEAR(*BYKEY)
+  CRTDTAARA  DTAARA(QTEMP/GLD18R) TYPE(*CHAR) TEXT('removed')
+  RCVMSG     MSGTYPE(*COMP) RMV(*YES) MSG(&M)
+  CRTDTAARA  DTAARA(QTEMP/GLD18K) TYPE(*CHAR) TEXT('kept')
+  DLTDTAARA  DTAARA(QTEMP/GLD18NONE)
+  MONMSG     MSGID(CPF2105)
+  SNDPGMMSG  MSGID(GLD1801) MSGF(AS4TRAINR1/GLD18M) MSGDTA('ABC') +
+               TOPGMQ(*SAME) MSGTYPE(*DIAG)
+  SNDPGMMSG  MSG('GLD18 long: one two three four five six seven eight +
+               nine ten eleven twelve thirteen fourteen fifteen.  After +
+               two blanks sixteen seventeen eighteen nineteen twenty +
+               twenty-one twenty-two twenty-three twenty-four end.') +
+               TOPGMQ(*SAME)
+  SNDPGMMSG  MSG('GLD18 comp kept') TOPGMQ(*SAME) MSGTYPE(*COMP)
+  DSPJOBLOG  OUTPUT(*PRINT)
+ENDPGM

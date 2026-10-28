@@ -789,20 +789,34 @@ impl<'a> Machine<'a> {
         // The exception message goes to the call message queue of the
         // procedure that handled it (QMHRCVPM *EXCP finds it there).
         if let Some(id) = crate::pgmmsg::stack_target(&self.io.job_key, "*", 0) {
-            let m = match err.downcast_ref::<crate::pgmmsg::Escape>() {
-                Some(e) => e.0.clone(),
+            let (m, logged) = match err.downcast_ref::<crate::pgmmsg::Escape>() {
+                // In the job log already where it was sent (an entry
+                // procedure): not again.
+                Some(e) => (e.0.clone(), e.0.key != 0),
                 None => {
                     let msgid = message_id(err);
                     let mut m = crate::pgmmsg::from_error(err, &msgid);
                     m.data = super::data::e(&m.text);
                     // Sent by the procedure where it happened.
-                    m.sender = origin(err)
+                    let at = origin(err)
                         .map(|a| a.sender)
                         .unwrap_or_else(|| self.sender());
-                    m
+                    // The job log shows an RPG run-time error sent by the
+                    // run time (QRNXIE) to the procedure, at the statement
+                    // where it happened (PUB400 2026-10-28,
+                    // tools/golden/verify21.txt h21_joblog); QMHRCVPM still
+                    // gives the procedure as its sender (docs/fidelity-gaps.md).
+                    m.receiver.line = at.line;
+                    if msgid.starts_with("RNX") {
+                        m.logged_sender = Some(crate::pgmmsg::rpg_runtime_sender());
+                    }
+                    m.sender = at;
+                    (m, false)
                 }
             };
-            if let Some(k) = crate::pgmmsg::stack_send(&self.io.job_key, id, m) {
+            if logged {
+                crate::pgmmsg::stack_send_unlogged(&self.io.job_key, id, m);
+            } else if let Some(k) = crate::pgmmsg::stack_send(&self.io.job_key, id, m) {
                 self.logged.push(k);
             }
         }

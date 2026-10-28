@@ -397,9 +397,13 @@ fn pase_shell_job() {
     // DLTSPLF of JOB(*) does not find it (CPF3303), and its lines go to
     // standard output (PUB400 2026-10-26, tools/golden/spool.txt s_dump:
     // GLDSPD lists GLDSPL under QPRTJOB, its DLTSPLF ends with CPF3303).
+    // The program DSPLYs the exception ID with this test's library name:
+    // under `system` a DSPLY goes to QSYSOPR, not to standard output
+    // (PUB400 2026-10-28, tools/golden/verify21.txt h21_dsply), so the
+    // test reads it from there.
     std::fs::write(
         dir.join("prt.rpgle"),
-        "**free\nctl-opt dftactgrp(*no);\ndcl-f qsysprt printer(80) usropn;\ndcl-ds line len(80) end-ds;\ndcl-pr qcmdexc extpgm('QCMDEXC');\n  c char(200) const;\n  l packed(15:5) const;\nend-pr;\ndcl-ds psds psds;\n  excid char(7) pos(40);\nend-ds;\nopen qsysprt;\nline = 'PRINTED';\nwrite qsysprt line;\nclose qsysprt;\nmonitor;\n  qcmdexc('DLTSPLF FILE(QSYSPRT) SPLNBR(*LAST)' : 35);\n  dsply 'deleted';\non-error;\n  dsply excid;\nendmon;\nreturn;\n",
+        format!("**free\nctl-opt dftactgrp(*no);\ndcl-f qsysprt printer(80) usropn;\ndcl-ds line len(80) end-ds;\ndcl-pr qcmdexc extpgm('QCMDEXC');\n  c char(200) const;\n  l packed(15:5) const;\nend-pr;\ndcl-ds psds psds;\n  excid char(7) pos(40);\nend-ds;\nopen qsysprt;\nline = 'PRINTED';\nwrite qsysprt line;\nclose qsysprt;\nmonitor;\n  qcmdexc('DLTSPLF FILE(QSYSPRT) SPLNBR(*LAST)' : 35);\n  dsply '{lib} deleted';\non-error;\n  dsply ('{lib} ' + excid);\nendmon;\nreturn;\n"),
     )
     .unwrap();
     let put = Command::new(env!("CARGO_BIN_EXE_as4tainr"))
@@ -417,10 +421,17 @@ fn pase_shell_job() {
     assert_eq!(r.rc, 0, "{:?} {:?}", r.out, r.err);
     let r = run(&dir, Some(&lib), &format!("CALL {lib}/PRT"));
     assert!(
-        r.out.iter().any(|l| l.contains("CPF3303")),
+        !r.out.iter().any(|l| l.starts_with("DSPLY")),
         "{:?} {:?}",
         r.out,
         r.err
+    );
+    let m = run(&dir, None, "DSPMSG MSGQ(QSYSOPR)");
+    assert!(
+        m.out.iter().any(|l| l.trim() == format!("{lib} CPF3303")),
+        "{:?} {:?}",
+        m.out,
+        m.err
     );
     assert!(r.out.iter().any(|l| l == "PRINTED"), "{:?}", r.out);
     // DSPSPLF does not run under `system` (CPD0031 then CPF0006: the

@@ -5821,7 +5821,7 @@ impl Job<'_> {
             date: date_text(&m.sent.0),
             time: time_text(&m.sent.1, &m.usec),
             user: self.user.clone(),
-            from: end(&m.sender),
+            from: end(m.logged_sender.as_ref().unwrap_or(&m.sender)),
             to: end(&m.receiver),
             text: m.text.clone(),
             seclvl: m.seclvl.clone(),
@@ -5909,6 +5909,7 @@ impl Job<'_> {
         };
         // The call stack as this process keeps it (QWVRCSTK's entries).
         let mut groups: Vec<String> = Vec::new();
+        let mut in_use: Vec<String> = Vec::new();
         let mut last_ile = String::new();
         for e in crate::pgmmsg::stack_listed(&self.job_key()) {
             if f.system_job && e.lib == "QSYS" && e.pgm == "QP2USER2" {
@@ -5937,6 +5938,7 @@ impl Job<'_> {
             } else {
                 e.actgrp.clone()
             };
+            in_use.push(actgrp.clone());
             let ile = !e.module.is_empty();
             let boundary = ile && last_ile != actgrp;
             if ile {
@@ -5960,19 +5962,57 @@ impl Job<'_> {
                 ..Default::default()
             });
         }
+        // The library list, and the activation groups: the two default
+        // ones (b19_pgmstk: QCMDEXC's 1, the user programs' 2), then the
+        // named ones on the call stack and those with service programs.
+        for (lib, kind) in self.library_list_entries() {
+            let text = catalog::library_text(self.client, &lib)
+                .await
+                .unwrap_or_default();
+            f.libl.push((lib, kind.to_string(), text));
+        }
+        // The job's environment variables; CCSID 0 is the job's (37 here).
+        for (name, v) in crate::envvar::job_vars(self.client, &self.job_key())
+            .await
+            .unwrap_or_default()
+        {
+            let ccsid = if v.ccsid == 0 { 37 } else { v.ccsid };
+            f.envvars.push((name, v.value, ccsid));
+        }
+        for g in crate::ile::job_groups(&self.job_key()) {
+            if !groups.contains(&g) {
+                groups.push(g);
+            }
+        }
+        f.groups = vec![
+            (crate::ile::DEFAULT_GROUP.to_string(), 1, true),
+            (crate::ile::DEFAULT_GROUP.to_string(), 2, true),
+        ];
+        for (i, g) in groups.iter().enumerate() {
+            f.groups.push((g.clone(), i as u64 + 3, in_use.contains(g)));
+        }
         let sections = match option.as_str() {
             "*DFNA" => vec![crate::dspjob::definition(&f)],
+            "*LIBL" => vec![crate::dspjob::library_list(&f)],
+            "*ACTGRP" => vec![crate::dspjob::activation_groups(&f)],
+            "*ENVVAR" => vec![crate::dspjob::environment_variables(&f)],
             "*STSA" => vec![crate::dspjob::status(&f)],
             "*RUNA" => vec![crate::dspjob::run(&f)],
             "*PGMSTK" => vec![crate::dspjob::stack(&f)],
+            // In the order IBM i prints them (PUB400 2026-10-28,
+            // tools/golden/verify20.txt e20_all), the sections not done
+            // here left out.
             "*SELECT" | "*ALL" | "" => vec![
                 crate::dspjob::status(&f),
                 crate::dspjob::definition(&f),
                 crate::dspjob::run(&f),
                 crate::dspjob::stack(&f),
+                crate::dspjob::library_list(&f),
+                crate::dspjob::activation_groups(&f),
+                crate::dspjob::environment_variables(&f),
             ],
             other => {
-                bail!("DSPJOB OPTION({other}) is not supported yet (*DFNA, *STSA, *RUNA, *PGMSTK).")
+                bail!("DSPJOB OPTION({other}) is not supported yet (*DFNA, *STSA, *RUNA, *PGMSTK, *LIBL, *ACTGRP, *ENVVAR).")
             }
         };
         let rows: Vec<String> = sections.iter().flatten().cloned().collect();

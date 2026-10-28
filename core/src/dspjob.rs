@@ -48,6 +48,12 @@ pub struct Facts {
     pub entered: (String, String),
     pub started: (String, String),
     pub stack: Vec<StackEntry>,
+    /// The library list: name, type (SYS, PRD, CUR, USR) and text.
+    pub libl: Vec<(String, String, String)>,
+    /// The activation groups: name, number, in use (on the call stack).
+    pub groups: Vec<(String, u64, bool)>,
+    /// The job's environment variables: name, value (None: *NULL), CCSID.
+    pub envvars: Vec<(String, Option<String>, i32)>,
 }
 
 /// One call stack entry (*PGMSTK), innermost last.
@@ -416,6 +422,85 @@ pub fn stack(f: &Facts) -> Vec<String> {
     out
 }
 
+/// *LIBL: the library list (PUB400 2026-10-28, tools/golden/verify20.txt
+/// e20_libl: the title at column 43, "ASP" over "Device" at 27, library
+/// at 4, type at 16, text at 39).
+pub fn library_list(f: &Facts) -> Vec<String> {
+    let mut out = vec![
+        at(&[(43, "Job Library List")]),
+        at(&[(27, "ASP")]),
+        at(&[(4, "Library"), (16, "Type"), (27, "Device"), (39, "Text")]),
+    ];
+    for (lib, ty, text) in &f.libl {
+        out.push(at(&[(4, lib), (16, ty), (39, text)]));
+    }
+    out
+}
+
+/// *ACTGRP: the activation groups (e20_actgrp: the title at column 45,
+/// name at 2, number at 17, in use at 39, program and library at 55 and
+/// 68). The two default activation groups first; then the named ones
+/// (the program that made one is not kept here).
+pub fn activation_groups(f: &Facts) -> Vec<String> {
+    let mut out = vec![
+        at(&[(45, "Job Activation Groups")]),
+        at(&[(2, "-------Activation Group--------")]),
+        at(&[
+            (2, "Name"),
+            (17, "Number"),
+            (36, "In Use Indicator"),
+            (55, "Program"),
+            (68, "Library"),
+        ]),
+    ];
+    for (name, n, used) in &f.groups {
+        let number = format!("{n:016}");
+        out.push(at(&[
+            (2, name),
+            (17, &number),
+            (39, if *used { "Y" } else { "N" }),
+        ]));
+    }
+    out
+}
+
+/// *ENVVAR: the job's environment variables (PUB400 2026-10-28,
+/// tools/golden/verify21.txt h21_envvar: the title at column 39, name at
+/// 2, the value in quotes at 42, at most 77 characters a line, the rest
+/// on lines of their own in quotes, the CCSID right-aligned to column
+/// 128).
+pub fn environment_variables(f: &Facts) -> Vec<String> {
+    let mut out = vec![
+        at(&[(39, "Environment variables")]),
+        at(&[(2, "Name"), (42, "Value"), (124, "CCSID")]),
+    ];
+    for (name, value, ccsid) in &f.envvars {
+        let ccsid = format!("{ccsid:>5}");
+        let parts: Vec<String> = match value {
+            None => vec!["*NULL".to_string()],
+            Some(v) => {
+                let chars: Vec<char> = v.chars().collect();
+                if chars.is_empty() {
+                    vec!["''".to_string()]
+                } else {
+                    chars
+                        .chunks(77)
+                        .map(|c| format!("'{}'", c.iter().collect::<String>()))
+                        .collect()
+                }
+            }
+        };
+        for (i, p) in parts.iter().enumerate() {
+            if i == 0 {
+                out.push(at(&[(2, name), (42, p), (124, &ccsid)]));
+            } else {
+                out.push(at(&[(42, p)]));
+            }
+        }
+    }
+    out
+}
+
 /// The report: the sections asked for, in pages of [`PAGE_LINES`] lines
 /// with the header on each, then the end-of-listing line.
 pub fn print(f: &Facts, sections: &[Vec<String>], stamp: &Stamp) -> Vec<String> {
@@ -561,6 +646,47 @@ mod tests {
             "   Run priority  . . . . . . . . . . . . . . . . . . . . :   RUNPTY       50"
         );
         assert_eq!(cols(&r[6]), [6, 75]);
+    }
+
+    // *LIBL's and *ACTGRP's lines (verify20 e20_libl, e20_actgrp).
+    #[test]
+    fn library_list_and_groups() {
+        let mut f = facts();
+        f.libl = vec![("QSYS".into(), "SYS".into(), "System Library".into())];
+        f.groups = vec![("*DFTACTGRP".into(), 1, true)];
+        let l = library_list(&f);
+        assert_eq!(cols(&l[0]), [43]);
+        assert_eq!(l[2], "   Library     Type       Device      Text");
+        assert_eq!(l[3], "   QSYS        SYS                    System Library");
+        let a = activation_groups(&f);
+        assert_eq!(cols(&a[0]), [45]);
+        assert_eq!(
+            a[2],
+            " Name           Number             In Use Indicator   Program      Library"
+        );
+        assert_eq!(a[3], " *DFTACTGRP     0000000000000001      Y");
+    }
+
+    // *ENVVAR's lines (verify21 h21_envvar: PASE_NLSPATH's 105-character
+    // value in two quoted pieces, 77 characters in the first).
+    #[test]
+    fn environment_variable_lines() {
+        let mut f = facts();
+        let long = "/usr/lib/nls/msg/%L/%N:/usr/lib/nls/msg/%L/%N.cat:/usr/lib/nls/msg/EN_US/%N:/usr/lib/nls/msg/EN_US/%N.cat";
+        f.envvars = vec![
+            ("PASE_USRGRP_LIMITED".into(), Some("N".into()), 273),
+            ("PASE_NLSPATH".into(), Some(long.into()), 273),
+        ];
+        let l = environment_variables(&f);
+        assert_eq!(cols(&l[0]), [39]);
+        assert_eq!(cols(&l[1]), [2, 42, 124]);
+        assert_eq!(cols(&l[2]), [2, 42, 126]);
+        assert_eq!(l[2].len(), 128);
+        assert_eq!(l[3].len(), 128);
+        assert_eq!(
+            l[4],
+            format!("{}'usr/lib/nls/msg/EN_US/%N.cat'", " ".repeat(41))
+        );
     }
 
     // The call stack's lines (b19_pgmstk: QP2USER2 and QCMDEXC).

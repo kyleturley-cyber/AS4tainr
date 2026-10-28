@@ -4039,6 +4039,8 @@ impl<'a> Machine<'a> {
             &main,
             &self.io.actgrp,
         );
+        // Below it, the program's entry procedure (for the message APIs).
+        crate::pgmmsg::stack_mark_pep(&self.io.job_key, id);
         let r = self.run_bytes_inner(parms);
         crate::pgmmsg::stack_pop(&self.io.job_key, id);
         r
@@ -4863,6 +4865,17 @@ impl Machine<'_> {
                     }
                     let entry_text = text(self, entry);
                     let up = num(self, counter)?.to_i128()?.max(0) as usize;
+                    // Sent to a program entry procedure: the job log shows
+                    // it there, once (PUB400 2026-10-28,
+                    // tools/golden/verify21.txt h21_joblog: GLD21Q's
+                    // CPF9898 to _QRNP_PEP_GLD21Q, which GLD21A's MONMSG
+                    // took); the caller still gets it.
+                    if let Some(crate::pgmmsg::Target::Pep(main)) =
+                        crate::pgmmsg::stack_target_pep(&self.io.job_key, &entry_text, up)
+                    {
+                        m.key = crate::pgmmsg::pep_send(&self.io.job_key, &main, m.clone());
+                        self.logged.push(m.key);
+                    }
                     let target = crate::pgmmsg::stack_target(&self.io.job_key, &entry_text, up);
                     return Err(anyhow::Error::new(crate::pgmmsg::Escape(m, target)));
                 }
@@ -4870,10 +4883,15 @@ impl Machine<'_> {
                 // counter), when it is an RPG procedure's.
                 let entry_text = text(self, entry);
                 let up = num(self, counter)?.to_i128()?.max(0) as usize;
-                let stacked = if entry_text.trim().eq_ignore_ascii_case("*EXT") {
+                let target = if entry_text.trim().eq_ignore_ascii_case("*EXT") {
                     None
                 } else {
-                    crate::pgmmsg::stack_target(&self.io.job_key, &entry_text, up)
+                    crate::pgmmsg::stack_target_pep(&self.io.job_key, &entry_text, up)
+                };
+                let (stacked, pep) = match target {
+                    Some(crate::pgmmsg::Target::Entry(id)) => (Some(id), None),
+                    Some(crate::pgmmsg::Target::Pep(main)) => (None, Some(main)),
+                    None => (None, None),
                 };
                 if let Some(id) = stacked {
                     let key =
@@ -4896,18 +4914,14 @@ impl Machine<'_> {
                     self.api_ok(rest.get(1));
                     return Ok(true);
                 }
-                // The caller of the outermost RPG program's main procedure
-                // is the program entry procedure: the message goes on its
-                // queue, which no CL caller receives from, and is in the
-                // job log (PUB400 2026-10-28, tools/golden/verify19.txt
-                // b19_joblog: '*' counter 1 from GLD19P's main procedure to
-                // _QRNP_PEP_GLD19P).
-                if !entry_text.trim().eq_ignore_ascii_case("*EXT") {
-                    if let Some(main) = crate::pgmmsg::stack_pep(&self.io.job_key, &entry_text, up)
-                    {
-                        let key = crate::pgmmsg::pep_send(&self.io.job_key, &main, msg.clone());
-                        self.logged.push(key);
-                    }
+                // A program entry procedure: the message goes on its
+                // queue, which the job log shows (PUB400 2026-10-28,
+                // tools/golden/verify19.txt b19_joblog, verify20.txt
+                // e20_joblog: '*' counter 1 from a main procedure goes to
+                // _QRNP_PEP_ and the program's name).
+                if let Some(main) = pep {
+                    let key = crate::pgmmsg::pep_send(&self.io.job_key, &main, msg.clone());
+                    self.logged.push(key);
                 }
                 // *EXT, or a caller above the RPG programs (a command
                 // line, a CL program): the message goes to the job log.

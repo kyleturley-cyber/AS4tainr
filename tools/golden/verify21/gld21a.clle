@@ -1,0 +1,13 @@
+/* Golden (tools/golden/verify21.txt): what a CL program gets from   */
+/* an RPG program that sends an escape to its own entry procedure,   */
+/* and the job log with an RPG run-time error MONITOR took.          */
+PGM
+  DCL        VAR(&ID) TYPE(*CHAR) LEN(7)
+  CALL       PGM(AS4TRAINR1/GLD21Q)
+  MONMSG     MSGID(CPF0000 CEE0000 RNX0000 MCH0000) EXEC(DO)
+    RCVMSG     MSGTYPE(*EXCP) MSGID(&ID) RMV(*NO)
+    SNDPGMMSG  MSG('GLD21 caught ' *CAT &ID) TOPGMQ(*SAME)
+  ENDDO
+  CALL       PGM(AS4TRAINR1/GLD21M)
+  DSPJOBLOG  OUTPUT(*PRINT)
+ENDPGM

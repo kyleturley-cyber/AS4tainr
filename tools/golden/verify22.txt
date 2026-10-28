@@ -1,0 +1,14 @@
+# Golden: a `system` job's job log as QSYS2.JOBLOG_INFO('*') shows it to
+# the job itself (as4tainr lists no rows there: fidelity-gaps "JOBLOG_INFO
+# with no job"): the same messages as verify21's printed job log
+# (h21_joblog), with programs, modules, procedures and instructions.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify22.txt -Files tools\golden\verify22
+u22_cleanup|!for p in GLD22A GLD22Q GLD22M; do system -q "DLTPGM PGM(AS4TRAINR1/$p)"; done; system -q "DLTF FILE(AS4TRAINR1/GLD22OUT)"; echo cleaned
+u22_tag|!setccsid 819 /home/AS4TRAINR/gld/gld22a.clle /home/AS4TRAINR/gld/gld22q.rpgle /home/AS4TRAINR/gld/gld22m.rpgle; ls /home/AS4TRAINR/gld | grep gld22
+u22_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD22OUT (N INT, ID CHAR(7), TY CHAR(13), SEV INT, FP CHAR(10), FL CHAR(10), FM CHAR(10), FPR VARCHAR(40), FI CHAR(8), TP CHAR(10), TL CHAR(10), TM CHAR(10), TPR VARCHAR(40), TI CHAR(8), FU CHAR(10), TX VARCHAR(60))') COMMIT(*NONE)
+u22_rpgq|!system -s "CRTBNDRPG PGM(AS4TRAINR1/GLD22Q) SRCSTMF('/home/AS4TRAINR/gld/gld22q.rpgle')"
+u22_rpgm|!system -s "CRTBNDRPG PGM(AS4TRAINR1/GLD22M) SRCSTMF('/home/AS4TRAINR/gld/gld22m.rpgle')"
+u22_cla|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD22A) SRCSTMF('/home/AS4TRAINR/gld/gld22a.clle')"
+u22_call|!system "CALL PGM(AS4TRAINR1/GLD22A)"
+u22_rows|CPYF FROMFILE(AS4TRAINR1/GLD22OUT) TOFILE(*PRINT)
+u22_end|!for p in GLD22A GLD22Q GLD22M; do system -q "DLTPGM PGM(AS4TRAINR1/$p)"; done; system -q "DLTF FILE(AS4TRAINR1/GLD22OUT)"; echo cleaned

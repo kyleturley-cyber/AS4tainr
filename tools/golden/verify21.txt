@@ -1,0 +1,15 @@
+# Golden: an RPG program's escape message to its own entry procedure
+# ('*' counter 1) as its CL caller sees it, an RPG run-time error MONITOR
+# took, in the printed job log; a DSPLY under `system`; DSPJOB's
+# environment variables (*ENVVAR).
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify21.txt -Files tools\golden\verify21
+h21_cleanup|!for p in GLD21A GLD21Q GLD21M GLD21D; do system -q "DLTPGM PGM(AS4TRAINR1/$p)"; done; echo cleaned
+h21_tag|!setccsid 819 /home/AS4TRAINR/gld/gld21a.clle /home/AS4TRAINR/gld/gld21q.rpgle /home/AS4TRAINR/gld/gld21m.rpgle /home/AS4TRAINR/gld/gld21d.rpgle; ls /home/AS4TRAINR/gld | grep gld21
+h21_rpgq|!system -s "CRTBNDRPG PGM(AS4TRAINR1/GLD21Q) SRCSTMF('/home/AS4TRAINR/gld/gld21q.rpgle')"
+h21_rpgm|!system -s "CRTBNDRPG PGM(AS4TRAINR1/GLD21M) SRCSTMF('/home/AS4TRAINR/gld/gld21m.rpgle')"
+h21_rpgd|!system -s "CRTBNDRPG PGM(AS4TRAINR1/GLD21D) SRCSTMF('/home/AS4TRAINR/gld/gld21d.rpgle')"
+h21_cla|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD21A) SRCSTMF('/home/AS4TRAINR/gld/gld21a.clle')"
+h21_joblog|!system "CALL PGM(AS4TRAINR1/GLD21A)"
+h21_dsply|!system "CALL PGM(AS4TRAINR1/GLD21D)"
+h21_envvar|DSPJOB OUTPUT(*PRINT) OPTION(*ENVVAR)
+h21_end|!for p in GLD21A GLD21Q GLD21M GLD21D; do system -q "DLTPGM PGM(AS4TRAINR1/$p)"; done; echo cleaned

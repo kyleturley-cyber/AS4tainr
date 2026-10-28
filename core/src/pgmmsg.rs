@@ -46,6 +46,10 @@ pub struct QMsg {
     pub sent: (String, String),
     /// And the microseconds (6 digits).
     pub usec: String,
+    /// The sender the job log shows when it is not `sender` (an RPG
+    /// run-time error: the run time's QRNXIE, while the message APIs give
+    /// programs the procedure where it happened).
+    pub logged_sender: Option<Sender>,
 }
 
 #[derive(Debug, Default)]
@@ -87,6 +91,9 @@ pub struct CallStack {
     pub own_queue: Vec<String>,
     /// The CL programs running (with `stack`): name and source line.
     frames: Vec<Frame>,
+    /// The escape message a called program's job log entries ended with
+    /// (`log_from_program`), until the next message is put.
+    logged_escape: Option<String>,
     /// Every message put on a queue, oldest first: the job log's (one
     /// whose program ended stays, PUB400 2026-10-28,
     /// tools/golden/verify17.txt x17_joblog; removed ones leave: `unlog`).
@@ -143,8 +150,16 @@ impl CallStack {
     }
 
     /// Messages a program sent with the message APIs (a called RPG
-    /// program's), into this job's log.
+    /// program's), into this job's log. An escape message among them is
+    /// the one the caller gets: not logged a second time when the caller
+    /// takes it (h21_joblog: GLD21Q's CPF9898 once, to its entry
+    /// procedure, though GLD21A's MONMSG took it).
     pub fn log_from_program(&mut self, msgs: Vec<QMsg>) {
+        self.logged_escape = msgs
+            .iter()
+            .rev()
+            .find(|m| m.ty == "*ESCAPE")
+            .map(|m| m.msgid.clone());
         self.log.extend(msgs);
     }
 
@@ -222,11 +237,29 @@ pub fn command_program(command: &str, msgid: &str) -> Sender {
 /// The severity of a system message whose description is not here: as
 /// captured (PUB400 2026-10-28, tools/golden/verify17.txt x17_joblog:
 /// CPF9898 and CPF9801 40, CPF1124 00; verify18 y18_joblog: CPF2105 40,
-/// CPC0904 00); others 00 (docs/fidelity-gaps.md).
+/// CPC0904 00; verify21 h21_joblog: RNX0100 50); others 00
+/// (docs/fidelity-gaps.md).
 pub fn system_severity(id: &str) -> i32 {
     match id {
         "CPF9898" | "CPF9801" | "CPF2105" => 40,
+        // An RPG run-time error (h21_joblog: RNX0100).
+        "RNX0100" => 50,
         _ => 0,
+    }
+}
+
+/// Who sends an RPG run-time error's escape message: the RPG run time's
+/// QRNXIE in QSYS, module QRNXMSG, procedure SignalException, statement
+/// 22, as PUB400's job log showed it (2026-10-28,
+/// tools/golden/verify21.txt h21_joblog: RNX0100 after %SUBST).
+pub fn rpg_runtime_sender() -> Sender {
+    Sender {
+        pgm: "QRNXIE".into(),
+        lib: "QSYS".into(),
+        module: "QRNXMSG".into(),
+        proc: "SignalException".into(),
+        line: 22,
+        inst: "*STMT".into(),
     }
 }
 
@@ -286,7 +319,9 @@ impl CallStack {
                 m.sender = s;
             }
         }
-        if n > 0 {
+        let logged = m.ty == "*ESCAPE" && self.logged_escape.take().is_some_and(|id| id == m.msgid);
+        self.logged_escape = None;
+        if n > 0 && !logged {
             m.receiver = at
                 .and_then(|i| self.frames.get(i))
                 .map(frame_end)
@@ -666,6 +701,9 @@ pub struct Entry {
     /// The source line the procedure is running (where it called the
     /// next entry); 0 when not known.
     pub line: usize,
+    /// A program's main procedure, with the program entry procedure
+    /// below it ([`Target`]).
+    pub pep: bool,
 }
 
 /// The job log as the list APIs see it (QGYOLJBL): every message sent
@@ -749,6 +787,7 @@ pub fn stack_push(
             proc: proc.to_string(),
             actgrp: actgrp.to_string(),
             queue: Vec::new(),
+            pep: false,
         })
     });
     id
@@ -784,6 +823,7 @@ pub fn listed_push(job: &str, (lib, pgm): (&str, &str), actgrp: &str) -> u64 {
             },
             actgrp: actgrp.to_string(),
             queue: Vec::new(),
+            pep: false,
         });
     id
 }
@@ -898,26 +938,81 @@ pub fn stack_target(job: &str, entry: &str, counter: usize) -> Option<u64> {
     })
 }
 
-/// When the entry a message API names (as [`stack_target`]) is one
-/// below the outermost RPG entry: that entry, a program's main
-/// procedure, whose caller is its program entry procedure (see
-/// [`pep_send`]).
-pub fn stack_pep(job: &str, entry: &str, counter: usize) -> Option<Entry> {
+/// Where a message API's message goes, counting the program entry
+/// procedure each RPG program has below its main procedure, as IBM i
+/// does (PUB400 2026-10-28, tools/golden/verify19.txt b19_joblog and
+/// verify20.txt e20_joblog: '*' counter 1 from a program's main
+/// procedure goes to `_QRNP_PEP_` and its name, also when an RPG program
+/// called it; *PGMBDY is that entry procedure, so *PGMBDY counter 1 is
+/// the caller's procedure).
+#[derive(Debug, Clone)]
+pub enum Target {
+    Entry(u64),
+    /// The entry procedure of the program whose main procedure this is.
+    Pep(Entry),
+}
+
+/// [`Target`] of an entry and counter (as [`stack_target`] names
+/// them); None: above the outermost RPG entry.
+pub fn stack_target_pep(job: &str, entry: &str, counter: usize) -> Option<Target> {
     with_stack(job, |s| {
+        // The entries with the entry procedures, outermost first.
+        let mut v: Vec<Target> = Vec::new();
+        let mut at = Vec::new();
+        for e in s.iter() {
+            if e.pep {
+                v.push(Target::Pep(e.clone()));
+            }
+            at.push(v.len());
+            v.push(Target::Entry(e.id));
+        }
         let top = s.len().checked_sub(1)?;
-        let base = match entry.trim().to_ascii_uppercase().as_str() {
-            "*" | "" => top,
+        let e = entry.trim().to_ascii_uppercase();
+        let base = match e.as_str() {
+            "*" | "" => at[top],
             "*PGMBDY" => {
                 let pgm = &s[top].pgm;
                 let mut i = top;
-                while i > 0 && s[i - 1].pgm == *pgm {
+                while i > 0 && s[i - 1].pgm == *pgm && !s[i].pep {
                     i -= 1;
                 }
-                i
+                if s[i].pep {
+                    at[i] - 1
+                } else {
+                    at[i]
+                }
             }
-            _ => return None,
+            "*CTLBDY" => {
+                let g = &s[top].actgrp;
+                let mut i = top;
+                while i > 0 && s[i - 1].actgrp == *g {
+                    i -= 1;
+                }
+                // The oldest entry of the activation group: the entry
+                // procedure of its first program, which is in it too.
+                if s[i].pep {
+                    at[i] - 1
+                } else {
+                    at[i]
+                }
+            }
+            name => {
+                at[s.iter().rposition(|x| {
+                    x.proc.eq_ignore_ascii_case(name) || x.pgm.eq_ignore_ascii_case(name)
+                })?]
+            }
         };
-        (counter == base + 1).then(|| s[0].clone())
+        base.checked_sub(counter).map(|i| v[i].clone())
+    })
+}
+
+/// An RPG program's main procedure: its program entry procedure is
+/// below it (see [`Target`]).
+pub fn stack_mark_pep(job: &str, id: u64) {
+    with_stack(job, |s| {
+        if let Some(e) = s.iter_mut().find(|e| e.id == id) {
+            e.pep = true;
+        }
     })
 }
 
@@ -947,12 +1042,24 @@ pub fn pep_send(job: &str, main: &Entry, mut m: QMsg) -> u32 {
 }
 
 /// Put a message on an entry's queue; its key.
-pub fn stack_send(job: &str, id: u64, mut m: QMsg) -> Option<u32> {
+pub fn stack_send(job: &str, id: u64, m: QMsg) -> Option<u32> {
+    stack_send_logged(job, id, m, true)
+}
+
+/// Put a message that is in the job log already (an escape message the
+/// job log shows where it was sent, PUB400 2026-10-28,
+/// tools/golden/verify21.txt h21_joblog) on an entry's queue.
+pub fn stack_send_unlogged(job: &str, id: u64, m: QMsg) -> Option<u32> {
+    stack_send_logged(job, id, m, false)
+}
+
+fn stack_send_logged(job: &str, id: u64, mut m: QMsg, log: bool) -> Option<u32> {
     let key = NAMED_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     m.key = key;
     stamp(&mut m);
     // Messages on call message queues are in the job log too.
-    if let Ok(mut g) = JOBLOG.lock() {
+    if !log {
+    } else if let Ok(mut g) = JOBLOG.lock() {
         g.get_or_insert_with(HashMap::new)
             .entry(job.to_string())
             .or_default()
@@ -973,7 +1080,9 @@ pub fn stack_send(job: &str, id: u64, mut m: QMsg) -> Option<u32> {
             proc: s[i].proc.clone(),
             // The running procedure is at the statement that sends
             // (b19_joblog: GLD19P to itself, statement 21 both).
-            line: if i + 1 == s.len() && m.sender.line > 0 {
+            line: if m.receiver.line > 0 {
+                m.receiver.line
+            } else if i + 1 == s.len() && m.sender.line > 0 {
                 m.sender.line
             } else {
                 s[i].line
@@ -1237,5 +1346,45 @@ mod tests {
         // program removes the caller's message; the key is then gone.
         c.remove_from(0, "*BYKEY", Some(k));
         assert!(!c.has_key(k));
+    }
+
+    // An RPG program GLD20P calls GLD20Q (PUB400 2026-10-28,
+    // tools/golden/verify20.txt e20_joblog): from GLD20Q's main
+    // procedure '*' counter 1 is GLD20Q's entry procedure, *PGMBDY
+    // counter 1 is GLD20P's main procedure. *CTLBDY is the entry procedure
+    // of the activation group's first program, so counter 1 is above it
+    // (none here): RPGUnit's sndCompMsg sends its completion message so,
+    // and its self-test passes on IBM i.
+    #[test]
+    fn entry_procedures() {
+        let job = "TEST-PEP";
+        let p = stack_push(job, ("LIB", "GLD20P"), "GLD20P", "GLD20P", "QILE");
+        stack_mark_pep(job, p);
+        let q = stack_push(job, ("LIB", "GLD20Q"), "GLD20Q", "GLD20Q", "QILE");
+        stack_mark_pep(job, q);
+        let pep_of = |t: Option<Target>| match t {
+            Some(Target::Pep(e)) => Some(e.pgm),
+            _ => None,
+        };
+        let entry = |t: Option<Target>| match t {
+            Some(Target::Entry(id)) => Some(id),
+            _ => None,
+        };
+        assert_eq!(
+            pep_of(stack_target_pep(job, "*", 1)).as_deref(),
+            Some("GLD20Q")
+        );
+        assert_eq!(entry(stack_target_pep(job, "*", 0)), Some(q));
+        assert_eq!(entry(stack_target_pep(job, "*PGMBDY", 1)), Some(p));
+        assert_eq!(
+            pep_of(stack_target_pep(job, "*", 3)).as_deref(),
+            Some("GLD20P")
+        );
+        assert_eq!(
+            pep_of(stack_target_pep(job, "*CTLBDY", 0)).as_deref(),
+            Some("GLD20P")
+        );
+        assert!(stack_target_pep(job, "*CTLBDY", 1).is_none());
+        stack_pop(job, p);
     }
 }

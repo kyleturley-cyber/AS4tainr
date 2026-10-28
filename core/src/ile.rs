@@ -594,6 +594,25 @@ pub fn activation_owner(job: &str, group: &str, unit: &str) -> u32 {
         .or_insert_with(crate::rpg::mem::new_owner)
 }
 
+/// The named activation groups a job has service programs active in.
+pub fn job_groups(job: &str) -> Vec<String> {
+    let mut out: Vec<String> = ACTIVATIONS
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref().map(|m| {
+                m.keys()
+                    .filter(|(j, g, _)| j == job && g != DEFAULT_GROUP)
+                    .map(|(_, g, _)| g.clone())
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Keep a module's storage in its activation group.
 pub fn keep_activation(job: &str, group: &str, unit: &str, storage: Vec<Vec<u8>>) {
     if let Ok(mut g) = ACTIVATIONS.lock() {

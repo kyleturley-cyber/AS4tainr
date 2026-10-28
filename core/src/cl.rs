@@ -1431,7 +1431,7 @@ pub static COMMANDS: &[CommandDef] = &[
             p("JOB", Kind::Text, false, Some("*"), "Job name").ch("*, number/user/name"),
             p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
             p("OPTION", Kind::Name, false, Some("*SELECT"), "Option")
-                .ch("*SELECT, *ALL, *DFNA, *STSA, *RUNA, *PGMSTK"),
+                .ch("*SELECT, *ALL, *DFNA, *STSA, *RUNA, *PGMSTK, *LIBL, *ACTGRP, *ENVVAR"),
             p("DUPJOBOPT", Kind::Name, false, Some("*SELECT"), "Duplicate job option")
                 .ch("*SELECT, *MSG"),
         ],

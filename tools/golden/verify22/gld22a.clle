@@ -1,0 +1,27 @@
+/* Golden (tools/golden/verify22.txt): the job log of a `system` job */
+/* as QSYS2.JOBLOG_INFO('*') lists it to the job itself: programs,   */
+/* modules, procedures, instructions, severity and type of each      */
+/* message, written into AS4TRAINR1/GLD22OUT.                        */
+PGM
+  DCL        VAR(&ID) TYPE(*CHAR) LEN(7)
+  CALL       PGM(AS4TRAINR1/GLD22Q)
+  MONMSG     MSGID(CPF0000 CEE0000 RNX0000 MCH0000) EXEC(DO)
+    RCVMSG     MSGTYPE(*EXCP) MSGID(&ID) RMV(*NO)
+    SNDPGMMSG  MSG('GLD22 caught ' *CAT &ID) TOPGMQ(*SAME)
+  ENDDO
+  CALL       PGM(AS4TRAINR1/GLD22M)
+  SNDPGMMSG  MSGID(CPF9898) MSGF(QCPFMSG) MSGDTA('GLD22 to caller') +
+               TOPGMQ(*PRV) MSGTYPE(*INFO)
+  RUNSQL     SQL('INSERT INTO AS4TRAINR1/GLD22OUT SELECT +
+               ORDINAL_POSITION, COALESCE(MESSAGE_ID, ''*NONE''), +
+               CAST(MESSAGE_TYPE AS CHAR(13)), SEVERITY, +
+               CAST(FROM_PROGRAM AS CHAR(10)), CAST(FROM_LIBRARY AS +
+               CHAR(10)), CAST(FROM_MODULE AS CHAR(10)), +
+               CAST(FROM_PROCEDURE AS VARCHAR(40)), +
+               CAST(FROM_INSTRUCTION AS CHAR(8)), CAST(TO_PROGRAM AS +
+               CHAR(10)), CAST(TO_LIBRARY AS CHAR(10)), CAST(TO_MODULE +
+               AS CHAR(10)), CAST(TO_PROCEDURE AS VARCHAR(40)), +
+               CAST(TO_INSTRUCTION AS CHAR(8)), CAST(FROM_USER AS +
+               CHAR(10)), CAST(MESSAGE_TEXT AS VARCHAR(60)) FROM +
+               TABLE(QSYS2.JOBLOG_INFO(''*'')) X') COMMIT(*NONE)
+ENDPGM

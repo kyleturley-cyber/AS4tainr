@@ -142,6 +142,36 @@ pub async fn run(job: &mut Job<'_>, args: &[String]) -> Output {
         ),
         other => other,
     });
+    // A program's DSPLY lines do not reach `system`'s output: the job is
+    // not interactive, so they go to the system operator's message queue
+    // (PUB400 2026-10-28, tools/golden/verify21.txt h21_dsply: nothing on
+    // standard output; verify20 e20_joblog: nor in the job log; QSYSOPR
+    // from the DSPLY operation's description for jobs that are not
+    // interactive).
+    let mut displayed: Vec<String> = Vec::new();
+    let mut take_dsply = |lines: Vec<String>| -> Vec<String> {
+        lines
+            .into_iter()
+            .filter(|l| match l.strip_prefix("DSPLY  ") {
+                Some(t) => {
+                    displayed.push(t.to_string());
+                    false
+                }
+                None => true,
+            })
+            .collect()
+    };
+    let result = match result {
+        Ok(Outcome::Messages(m)) => Ok(Outcome::Messages(take_dsply(m))),
+        Err(e) => {
+            let lines = take_dsply(format!("{e:#}").lines().map(str::to_string).collect());
+            Err(anyhow::anyhow!(lines.join("\n")))
+        }
+        other => other,
+    };
+    for t in &displayed {
+        let _ = crate::jobs::send_message(job.client, "QSYSOPR", &job.user, "", "*INFO", t).await;
+    }
     match result {
         Ok(Outcome::Messages(m)) if !opts.quiet => {
             out.stdout.extend(m.iter().map(|l| msg(l)));

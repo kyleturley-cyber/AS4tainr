@@ -18122,6 +18122,11 @@ async fn verify18_removed_messages_leave_the_job_log() {
         let o = pase_system::run(&mut job, &[c]).await;
         assert_eq!(o.status, 0, "{o:?}");
     }
+    // The process's QTEMP may still have them from an earlier run of
+    // this test with the same process ID.
+    for d in ["GLD18R", "GLD18K"] {
+        let _ = pase_system::run(&mut job, &[format!("DLTDTAARA DTAARA(QTEMP/{d})")]).await;
+    }
     job.calls = Default::default();
     let o = pase_system::run(&mut job, &[format!("CALL PGM({lib}/GLD18A)")]).await;
     assert_eq!(o.status, 0, "{o:?}");
@@ -18354,4 +18359,262 @@ async fn verify19_rpg_messages_and_dspjob() {
         ["QP0ZSPWT", "QP0ZPCPN", "QP0ZPCPN", "QP2CMD", "QP2CMD", "QP2USER2", "QCMDEXC"],
         "{o:?}"
     );
+}
+
+/// Messages from an RPG program another RPG program called (PUB400
+/// 2026-10-28, tools/golden/verify20.txt e20_joblog, the same sources):
+/// '*' counter 1 from GLD20Q's main procedure goes to its own program
+/// entry procedure _QRNP_PEP_GLD20Q (statement *N), *PGMBDY counter 1 to
+/// its caller GLD20P at the statement that called it (6). DSPJOB *LIBL,
+/// *ACTGRP and *ALL's order of sections (e20_libl, e20_actgrp, e20_all).
+#[tokio::test]
+async fn verify20_called_rpg_program_messages_and_dspjob() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::pase_system;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let dir = format!("/tmp/{lib}");
+    let _ = as4tainr_core::ifs::mkdir_all(&client, &dir, "QSECOFR").await;
+    for (f, text) in [
+        (
+            "gld20a.clle",
+            include_str!("../../tools/golden/verify20/gld20a.clle"),
+        ),
+        (
+            "gld20p.rpgle",
+            include_str!("../../tools/golden/verify20/gld20p.rpgle"),
+        ),
+        (
+            "gld20q.rpgle",
+            include_str!("../../tools/golden/verify20/gld20q.rpgle"),
+        ),
+    ] {
+        as4tainr_core::ifs::write_file(
+            &client,
+            &format!("{dir}/{f}"),
+            text.replace("AS4TRAINR1", &lib).as_bytes(),
+            819,
+            0o644,
+            "QSECOFR",
+        )
+        .await
+        .unwrap();
+    }
+    for c in [
+        format!("CRTBNDRPG PGM({lib}/GLD20Q) SRCSTMF('{dir}/gld20q.rpgle')"),
+        format!("CRTBNDRPG PGM({lib}/GLD20P) SRCSTMF('{dir}/gld20p.rpgle')"),
+        format!("CRTBNDCL PGM({lib}/GLD20A) SRCSTMF('{dir}/gld20a.clle')"),
+    ] {
+        let o = pase_system::run(&mut job, &[c]).await;
+        assert_eq!(o.status, 0, "{o:?}");
+    }
+    job.calls = Default::default();
+    let o = pase_system::run(&mut job, &[format!("CALL PGM({lib}/GLD20A)")]).await;
+    assert_eq!(o.status, 0, "{o:?}");
+    let detail = |k: &str| -> Vec<String> {
+        o.stdout
+            .iter()
+            .filter(|l| l.trim_start().starts_with(k))
+            .map(|l| l.trim().rsplit(' ').next().unwrap().to_string())
+            .collect()
+    };
+    let to: Vec<String> = o
+        .stdout
+        .iter()
+        .filter(|l| l.starts_with("*NONE"))
+        .map(|l| l[101..113].trim().to_string())
+        .collect();
+    assert_eq!(to, ["GLD20Q", "GLD20P"], "{o:?}");
+    assert_eq!(detail("To procedure"), ["_QRNP_PEP_GLD20Q", "GLD20P"]);
+    assert_eq!(detail("Statement"), ["21", "*N", "23", "6"], "{o:?}");
+
+    job.calls = Default::default();
+    let o = pase_system::run(&mut job, &["DSPJOB OUTPUT(*PRINT) OPTION(*LIBL)".into()]).await;
+    assert_eq!(o.status, 0, "{o:?}");
+    assert_eq!(o.stdout[2].trim(), "Job Library List");
+    assert_eq!(o.stdout[4], "   Library     Type       Device      Text");
+    assert!(o.stdout[5].starts_with("   QSYS        SYS "), "{o:?}");
+    let o = pase_system::run(&mut job, &["DSPJOB OUTPUT(*PRINT) OPTION(*ACTGRP)".into()]).await;
+    assert_eq!(
+        o.stdout[5], " *DFTACTGRP     0000000000000001      Y",
+        "{o:?}"
+    );
+    assert_eq!(o.stdout[6], " *DFTACTGRP     0000000000000002      Y");
+    let o = pase_system::run(&mut job, &["DSPJOB OUTPUT(*PRINT) OPTION(*ALL)".into()]).await;
+    let titles: Vec<&str> = o
+        .stdout
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| l.starts_with("Job ") && !l.contains(':'))
+        .collect();
+    assert_eq!(
+        titles,
+        [
+            "Job Status Attributes",
+            "Job Definition Attributes",
+            "Job Run Attributes",
+            "Job Call Stack",
+            "Job Library List",
+            "Job Activation Groups"
+        ],
+        "{o:?}"
+    );
+}
+
+/// An RPG program's escape message to its own entry procedure, a
+/// run-time error MONITOR took, DSPLY and environment variables in a
+/// `system` job (PUB400 2026-10-28, tools/golden/verify21.txt
+/// h21_joblog, h21_dsply, h21_envvar, the same sources): GLD21Q's CPF9898
+/// is in the job log once, to _QRNP_PEP_GLD21Q, and GLD21A's MONMSG gets
+/// it as CPF9898; GLD21M's RNX0100 (severity 50) is sent by QRNXIE
+/// (QRNXMSG, SignalException, statement 22) to GLD21M at statement 9;
+/// GLD21D's DSPLY line is not in `system`'s output; DSPJOB *ENVVAR lists
+/// a variable with its value in quotes at column 42.
+#[tokio::test]
+async fn verify21_escape_to_entry_procedure_rnx_and_dsply() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::pase_system;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let dir = format!("/tmp/{lib}");
+    let _ = as4tainr_core::ifs::mkdir_all(&client, &dir, "QSECOFR").await;
+    for (f, text) in [
+        (
+            "gld21a.clle",
+            include_str!("../../tools/golden/verify21/gld21a.clle"),
+        ),
+        (
+            "gld21q.rpgle",
+            include_str!("../../tools/golden/verify21/gld21q.rpgle"),
+        ),
+        (
+            "gld21m.rpgle",
+            include_str!("../../tools/golden/verify21/gld21m.rpgle"),
+        ),
+        (
+            "gld21d.rpgle",
+            include_str!("../../tools/golden/verify21/gld21d.rpgle"),
+        ),
+    ] {
+        as4tainr_core::ifs::write_file(
+            &client,
+            &format!("{dir}/{f}"),
+            text.replace("AS4TRAINR1", &lib).as_bytes(),
+            819,
+            0o644,
+            "QSECOFR",
+        )
+        .await
+        .unwrap();
+    }
+    for c in [
+        format!("CRTBNDRPG PGM({lib}/GLD21Q) SRCSTMF('{dir}/gld21q.rpgle')"),
+        format!("CRTBNDRPG PGM({lib}/GLD21M) SRCSTMF('{dir}/gld21m.rpgle')"),
+        format!("CRTBNDRPG PGM({lib}/GLD21D) SRCSTMF('{dir}/gld21d.rpgle')"),
+        format!("CRTBNDCL PGM({lib}/GLD21A) SRCSTMF('{dir}/gld21a.clle')"),
+    ] {
+        let o = pase_system::run(&mut job, &[c]).await;
+        assert_eq!(o.status, 0, "{o:?}");
+    }
+    job.calls = Default::default();
+    let o = pase_system::run(&mut job, &[format!("CALL PGM({lib}/GLD21A)")]).await;
+    assert_eq!(o.status, 0, "{o:?}");
+    let col = |l: &str, a: usize, b: usize| {
+        l.get(a - 1..b.min(l.len()))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let firsts: Vec<[String; 5]> = o
+        .stdout
+        .iter()
+        .filter(|l| !l.starts_with(' ') && !l.starts_with("MSGID"))
+        .map(|l| {
+            [
+                col(l, 1, 11),
+                col(l, 36, 40),
+                col(l, 68, 80),
+                col(l, 93, 101),
+                col(l, 102, 113),
+            ]
+        })
+        .collect();
+    let row = |a: &str, b: &str, c: &str, d: &str, e: &str| [a, b, c, d, e].map(str::to_string);
+    assert_eq!(
+        firsts,
+        [
+            row("CPF1124", "00", "QWTPIIPP", "04DC", "*EXT"),
+            row("CPF9898", "40", "GLD21Q", "*STMT", "GLD21Q"),
+            row("*NONE", "", "GLD21A", "*STMT", "GLD21A"),
+            row("RNX0100", "50", "QRNXIE", "*STMT", "GLD21M"),
+        ],
+        "{o:?}"
+    );
+    let detail = |k: &str| -> Vec<String> {
+        o.stdout
+            .iter()
+            .filter(|l| l.trim_start().starts_with(k))
+            .map(|l| l.trim().rsplit(' ').next().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        detail("To procedure"),
+        ["_QRNP_PEP_GLD21Q", "GLD21A", "GLD21M"]
+    );
+    assert_eq!(
+        detail("From procedure"),
+        ["GLD21Q", "GLD21A", "SignalException"]
+    );
+    assert_eq!(detail("Statement"), ["21", "*N", "900", "900", "22", "9"]);
+    assert!(o
+        .stdout
+        .iter()
+        .any(|l| l.ends_with("Message . . . . :   GLD21 caught CPF9898")));
+
+    job.calls = Default::default();
+    let o = pase_system::run(&mut job, &[format!("CALL PGM({lib}/GLD21D)")]).await;
+    assert_eq!(o.status, 0, "{o:?}");
+    assert!(o.stdout.is_empty(), "{o:?}");
+
+    let o = pase_system::run(
+        &mut job,
+        &["ADDENVVAR ENVVAR(GLD21ENV) VALUE('x21') REPLACE(*YES)".into()],
+    )
+    .await;
+    assert_eq!(o.status, 0, "{o:?}");
+    let o = pase_system::run(&mut job, &["DSPJOB OUTPUT(*PRINT) OPTION(*ENVVAR)".into()]).await;
+    assert_eq!(o.stdout[2].trim(), "Environment variables", "{o:?}");
+    let line = o
+        .stdout
+        .iter()
+        .find(|l| l.starts_with(" GLD21ENV "))
+        .unwrap_or_else(|| panic!("{o:?}"));
+    assert_eq!(&line[41..46], "'x21'");
+    assert_eq!(line.len(), 128);
 }

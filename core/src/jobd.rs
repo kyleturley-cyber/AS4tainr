@@ -29,10 +29,18 @@ CREATE TABLE IF NOT EXISTS as4tainr.job_descriptions (
     other   text NOT NULL DEFAULT '',
     PRIMARY KEY (library, name)
 );
--- QGPL/QDFTJOBD, the job description IBM i ships, with CRTJOBD's
--- defaults (SBMJOB JOBD(*USRPRF) uses them for profiles naming it).
-INSERT INTO as4tainr.job_descriptions (library, name) VALUES ('QGPL', 'QDFTJOBD')
-ON CONFLICT DO NOTHING;
+-- QGPL/QDFTJOBD, the job description IBM i ships: its values that are
+-- not CRTJOBD's defaults as DSPJOBD shows them on IBM i 7.5 (PUB400
+-- 2026-10-28, tools/golden/verify12.txt n12_dspjobd).
+INSERT INTO as4tainr.job_descriptions (library, name, other)
+VALUES ('QGPL', 'QDFTJOBD', 'RTGDTA(QCMDI)' || E'\n' || 'INQMSGRPY(*SYSRPYL)' || E'\n'
+                            || 'LOG(4 20 *SECLVL)' || E'\n' || 'LOGCLPGM(*YES)')
+ON CONFLICT (library, name) DO UPDATE SET other = EXCLUDED.other
+ WHERE job_descriptions.other = '';
+INSERT INTO as4tainr.objects (library, name, objtype, attribute, text)
+SELECT 'QGPL', 'QDFTJOBD', '*JOBD', '', 'Default job description'
+ WHERE NOT EXISTS (SELECT 1 FROM as4tainr.objects
+                    WHERE library = 'QGPL' AND name = 'QDFTJOBD' AND objtype = '*JOBD');
 "#;
 
 /// A job description as SBMJOB uses it.
@@ -72,6 +80,132 @@ pub async fn find(client: &Client, libs: &[String], name: &str) -> Result<Option
         }
     }
     Ok(None)
+}
+
+/// A job description's attributes in DSPJOBD's report, IBM i 7.5's
+/// layout (PUB400 2026-10-28, tools/golden/verify12.txt n12_dspjobd:
+/// labels from column 2 with leaders to column 49, the colon at 51, the
+/// value at 55; the initial library list in three columns). Values not
+/// given when it was made are CRTJOBD's defaults (IBM i CL reference,
+/// CRTJOBD). The initial library list's sequence numbers were not
+/// captured: 10, 20... as DSPLIBL numbers.
+pub fn report_lines(d: &JobDescription, other: &str, text: &str) -> Vec<String> {
+    use crate::report::at;
+    let given = |k: &str| -> Option<String> {
+        other.lines().find_map(|l| {
+            l.strip_prefix(k)
+                .and_then(|r| r.strip_prefix('('))
+                .and_then(|r| r.strip_suffix(')'))
+                .map(|v| v.trim().to_string())
+        })
+    };
+    let val = |k: &str, dft: &str| given(k).unwrap_or_else(|| dft.to_string());
+    let line = |label: &str, v: &str| {
+        format!("{}   {v}", crate::commands::dsp_label(label, 48))
+            .trim_end()
+            .to_string()
+    };
+    let sub = |label: &str, v: &str| {
+        format!("{}     {v}", crate::commands::dsp_label(label, 48))
+            .trim_end()
+            .to_string()
+    };
+    let split = |q: &str| -> (String, String) {
+        match q.split_once('/') {
+            Some((l, n)) => (n.to_string(), l.to_string()),
+            None => (q.to_string(), String::new()),
+        }
+    };
+    let (jobq, jobq_lib) = split(&d.jobq);
+    let jobq_lib = if jobq_lib.is_empty() {
+        "*LIBL".to_string()
+    } else {
+        jobq_lib
+    };
+    let (outq, outq_lib) = split(&val("OUTQ", "*USRPRF"));
+    let log = val("LOG", "4 0 *NOLIST");
+    let mut log = log.split_whitespace().map(str::to_string);
+    let (level, sev, logtext) = (
+        log.next().unwrap_or_else(|| "4".into()),
+        log.next().unwrap_or_else(|| "0".into()),
+        log.next().unwrap_or_else(|| "*NOLIST".into()),
+    );
+    let mut out = vec![
+        at(&[
+            (2, "Job description:"),
+            (21, &d.name),
+            (36, "Library:"),
+            (47, &d.library),
+        ]),
+        line(" User profile", &d.user),
+        line(" CL syntax check", &val("SYNTAX", "*NOCHK")),
+        line(" Hold on job queue", &val("HOLD", "*NO")),
+        line(" End severity", &val("ENDSEV", "30")),
+        line(" Job date", &val("DATE", "*SYSVAL")),
+        line(" Job switches", &val("SWS", "00000000")),
+        line(" Inquiry message reply", &val("INQMSGRPY", "*RQD")),
+        line(" Job priority (on job queue)", &val("JOBPTY", "5")),
+        line(" Job queue", &jobq),
+        sub("   Library", &jobq_lib),
+        line(" Output priority (on output queue)", &val("OUTPTY", "5")),
+        line(" Printer device", &val("PRTDEV", "*USRPRF")),
+        line(" Output queue", &outq),
+        sub("   Library", &outq_lib),
+        " Message logging:".to_string(),
+        line("   Level", &level),
+        line("   Severity", &sev),
+        line("   Text", &logtext),
+        line(" Log CL program commands", &val("LOGCLPGM", "*NO")),
+        line(" Job log output", &val("LOGOUTPUT", "*SYSVAL")),
+        line(" Accounting code", &val("ACGCDE", "*USRPRF")),
+        line(" Print text", &val("PRTTXT", "*SYSVAL")),
+        line(" Routing data", &val("RTGDTA", "QCMDB")),
+        line(" Request data", &d.rqsdta),
+        line(" DDM conversation", &val("DDMCNV", "*KEEP")),
+        line(" Device recovery action", "*SYSVAL"),
+        line(" Time slice end pool", "*SYSVAL"),
+        line(
+            " Job message queue maximum size",
+            &val("JOBMSGQMX", "*SYSVAL"),
+        ),
+        line(
+            " Job message queue full action",
+            &val("JOBMSGQFL", "*SYSVAL"),
+        ),
+        line(" Allow multiple threads", &val("ALWMLTTHD", "*NO")),
+        line(" Initial ASP group", &val("INLASPGRP", "*NONE")),
+        line(" Spooled file action", &val("SPLFACN", "*SYSVAL")),
+        line(" Workload group", "*SBSD"),
+        line(" Text", text),
+        at(&[(56, "Initial library list:")]),
+        at(&[(2, "Sequence"), (46, "Sequence"), (90, "Sequence")]),
+        at(&[
+            (3, "number"),
+            (12, "Library"),
+            (47, "number"),
+            (56, "Library"),
+            (91, "number"),
+            (100, "Library"),
+        ]),
+    ];
+    match &d.inllibl {
+        None => out.push(at(&[(12, "*SYSVAL")])),
+        Some(libs) => {
+            for row in libs.chunks(3).enumerate() {
+                let (r, chunk) = row;
+                let mut f: Vec<(usize, String)> = Vec::new();
+                for (c, l) in chunk.iter().enumerate() {
+                    let n = (r * 3 + c + 1) * 10;
+                    let base = 1 + c * 44;
+                    f.push((base + 7 - n.to_string().len(), n.to_string()));
+                    f.push((base + 11, l.clone()));
+                }
+                let refs: Vec<(usize, &str)> = f.iter().map(|(c, t)| (*c, t.as_str())).collect();
+                out.push(at(&refs));
+            }
+        }
+    }
+    out
 }
 
 /// The values of a list parameter as one blank-separated text.
@@ -176,24 +310,29 @@ impl Job<'_> {
                     )
                     .await?
                     .get(0);
-                let mut rows = vec![
-                    format!("Job description  . . . . . :   {}", d.name),
-                    format!("  Library  . . . . . . . . :     {}", d.library),
-                    format!("User profile . . . . . . . :   {}", d.user),
-                    format!("Job queue  . . . . . . . . :   {}", d.jobq),
-                    format!(
-                        "Initial library list . . . :   {}",
-                        d.inllibl
-                            .as_ref()
-                            .map(|l| l.join(" "))
-                            .unwrap_or_else(|| "*SYSVAL".into())
-                    ),
-                    format!("Request data . . . . . . . :   {}", d.rqsdta),
-                ];
-                rows.extend(other.lines().map(str::to_string));
+                let text: String = self
+                    .client
+                    .query_opt(
+                        "SELECT text FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype='*JOBD'",
+                        &[&d.library, &d.name],
+                    )
+                    .await?
+                    .map(|r| r.get(0))
+                    .unwrap_or_default();
+                let rows = report_lines(&d, &other, &text);
+                let [h1, h2] = crate::report::header_b(
+                    45,
+                    "Job Description Information",
+                    &crate::report::system_name(),
+                    &crate::report::Stamp::now(),
+                    1,
+                );
+                let mut print = vec![h1, h2];
+                print.extend(rows.iter().cloned());
+                print.push(crate::report::END_SYSVAL.into());
                 Outcome::Display(ListDisplay {
                     title: "Display Job Description".into(),
-                    print: rows.clone(),
+                    print,
                     rows,
                     ..Default::default()
                 })
@@ -348,5 +487,68 @@ impl Job<'_> {
         Ok(Outcome::Messages(vec![format!(
             "Job description {name} created in library {lib}."
         )]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // PUB400 2026-10-28, tools/golden/verify12.txt n12_dspjobd: DSPJOBD
+    // QGPL/QDFTJOBD OUTPUT(*PRINT), the lines after the page header.
+    #[test]
+    fn qdftjobd_report() {
+        let d = JobDescription {
+            library: "QGPL".into(),
+            name: "QDFTJOBD".into(),
+            jobq: "QGPL/QBATCH".into(),
+            inllibl: None,
+            user: "*RQD".into(),
+            rqsdta: "*NONE".into(),
+        };
+        let other = "RTGDTA(QCMDI)\nINQMSGRPY(*SYSRPYL)\nLOG(4 20 *SECLVL)\nLOGCLPGM(*YES)";
+        let got = report_lines(&d, other, "Default job description");
+        let want = [
+            " Job description:   QDFTJOBD       Library:   QGPL",
+            " User profile . . . . . . . . . . . . . . . . . . :   *RQD",
+            " CL syntax check  . . . . . . . . . . . . . . . . :   *NOCHK",
+            " Hold on job queue  . . . . . . . . . . . . . . . :   *NO",
+            " End severity . . . . . . . . . . . . . . . . . . :   30",
+            " Job date . . . . . . . . . . . . . . . . . . . . :   *SYSVAL",
+            " Job switches . . . . . . . . . . . . . . . . . . :   00000000",
+            " Inquiry message reply  . . . . . . . . . . . . . :   *SYSRPYL",
+            " Job priority (on job queue)  . . . . . . . . . . :   5",
+            " Job queue  . . . . . . . . . . . . . . . . . . . :   QBATCH",
+            "   Library  . . . . . . . . . . . . . . . . . . . :     QGPL",
+            " Output priority (on output queue)  . . . . . . . :   5",
+            " Printer device . . . . . . . . . . . . . . . . . :   *USRPRF",
+            " Output queue . . . . . . . . . . . . . . . . . . :   *USRPRF",
+            "   Library  . . . . . . . . . . . . . . . . . . . :",
+            " Message logging:",
+            "   Level  . . . . . . . . . . . . . . . . . . . . :   4",
+            "   Severity . . . . . . . . . . . . . . . . . . . :   20",
+            "   Text . . . . . . . . . . . . . . . . . . . . . :   *SECLVL",
+            " Log CL program commands  . . . . . . . . . . . . :   *YES",
+            " Job log output . . . . . . . . . . . . . . . . . :   *SYSVAL",
+            " Accounting code  . . . . . . . . . . . . . . . . :   *USRPRF",
+            " Print text . . . . . . . . . . . . . . . . . . . :   *SYSVAL",
+            " Routing data . . . . . . . . . . . . . . . . . . :   QCMDI",
+            " Request data . . . . . . . . . . . . . . . . . . :   *NONE",
+            " DDM conversation . . . . . . . . . . . . . . . . :   *KEEP",
+            " Device recovery action . . . . . . . . . . . . . :   *SYSVAL",
+            " Time slice end pool  . . . . . . . . . . . . . . :   *SYSVAL",
+            " Job message queue maximum size . . . . . . . . . :   *SYSVAL",
+            " Job message queue full action  . . . . . . . . . :   *SYSVAL",
+            " Allow multiple threads . . . . . . . . . . . . . :   *NO",
+            " Initial ASP group  . . . . . . . . . . . . . . . :   *NONE",
+            " Spooled file action  . . . . . . . . . . . . . . :   *SYSVAL",
+            " Workload group . . . . . . . . . . . . . . . . . :   *SBSD",
+            " Text . . . . . . . . . . . . . . . . . . . . . . :   Default job description",
+            "                                                       Initial library list:",
+            " Sequence                                    Sequence                                    Sequence",
+            "  number   Library                            number   Library                            number   Library",
+            "           *SYSVAL",
+        ];
+        assert_eq!(got, want);
     }
 }

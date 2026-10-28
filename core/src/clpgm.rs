@@ -3907,6 +3907,14 @@ async fn command(
                 }
             };
             let rmv = up("RMV", "*YES");
+            // A key no program message queue has: CPF2410 (PUB400
+            // 2026-10-28, tools/golden/verify12.txt n12_rows K03: RCVMSG
+            // of a key whose message RMVMSG had removed).
+            if let (Some(k), "*PGMQ") = (key, msgq.as_str()) {
+                if !job.calls.has_key(k) {
+                    bail!("CPF2410: No message with this key is in the program message queue.");
+                }
+            }
             let got = if msgq == "*PGMQ" {
                 job.calls.receive_from(levels, &msgtype, key, &rmv)
             } else {

@@ -6,7 +6,13 @@
 
 /// The functions, as SQL for the services batch.
 pub fn sql() -> String {
-    format!("{FUNCTIONS}\n{MORE}\n{}\n{}", grants(), implicit_casts())
+    format!(
+        "{FUNCTIONS}\n{MORE}\n{}\n{}\n{}",
+        // INSERT into a source file SQL names (source.rs sql_sources).
+        crate::source::insert_function("as4tainr_svc.source_insert"),
+        grants(),
+        implicit_casts()
+    )
 }
 
 /// Implicit casting between strings and numbers (Db2 for i SQL Reference,
@@ -68,6 +74,7 @@ fn grants() -> String {
     let sigs = [
         "job_name()",
         "source_lines(text, text, text)",
+        "source_insert()",
         "char(numeric)",
         "char(smallint)",
         "char(integer)",

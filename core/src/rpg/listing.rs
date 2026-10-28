@@ -1046,7 +1046,11 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
         at(&[(27, "M e s s a g e   S u m m a r y")]),
         " Msg id  Sv Number Message text".into(),
     ];
-    for (id, (sev, n, text)) in &by_id {
+    // By severity, then message ID (verify12 n12_rpgp: 00 RNF7031,
+    // RNF7066, RNF7086; 20 RNF3546; 30 RNF7030, RNF7260, RNF7503).
+    let mut summary: Vec<_> = by_id.iter().collect();
+    summary.sort_by_key(|(id, (sev, _, _))| (*sev, (*id).clone()));
+    for (id, (sev, n, text)) in summary {
         let head = format!("*{id:<7} {sev:02} {n:>6} ");
         msgs.extend(wrapped(&head, text, 19, 82));
     }
@@ -1280,6 +1284,21 @@ fn with_def(mut r: Vec<(usize, char)>, def: Option<usize>) -> Vec<(usize, char)>
             r.push((d, 'D'));
             r.sort_by_key(|x| x.0);
         }
+        // The name again on its own definition (`dcl-ds psds psds`, a
+        // file's RENAME(file: format)) is not a reference (PUB400
+        // 2026-10-28, tools/golden/verify12.txt n12_rpgp: "PSDS DS(46)
+        // 8D" and "GLD12OUT DISK 6D", both RNF7031).
+        let mut seen = false;
+        r.retain(|x| {
+            if x.0 != d {
+                return true;
+            }
+            if x.1 == 'D' && !seen {
+                seen = true;
+                return true;
+            }
+            x.1 != ' '
+        });
     }
     r
 }
@@ -1331,10 +1350,26 @@ fn cross_reference(
         let d = Some(lno(f.decl.line));
         let r = with_def(get(&f.decl.name), d);
         let l = ref_lines(&r);
+        // A file neither named nor read or written through a record
+        // format: RNF7031 (verify12 n12_rpgp: "*RNF7031 GLD12OUT DISK
+        // 6D", its only WRITE not valid, RNF7066).
+        let formats_unused = input
+            .diags
+            .iter()
+            .any(|x| x.id == "RNF7066" && x.line == f.decl.line);
+        let prefix = if formats_unused && r.iter().all(|x| x.1 == 'D') {
+            *unreferenced += 1;
+            "*RNF7031"
+        } else {
+            ""
+        };
         out.push(
             format!(
                 "{:<45}{}",
-                at(&[(10, &f.decl.name), (28, &f.decl.device)]),
+                format!(
+                    "{prefix}{}",
+                    &at(&[(10, &f.decl.name), (28, &f.decl.device)])[prefix.len()..]
+                ),
                 l.first().cloned().unwrap_or_default()
             )
             .trim_end()

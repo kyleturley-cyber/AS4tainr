@@ -1,0 +1,34 @@
+# Golden: verify12's programs again with the data structure renamed (it
+# was named as its record format: RNF3546), so the PSDS after a MONITORed
+# %SUBST error, XML-SAX's events, QUSRJOBI JOBI0400 and QWDRJOBD JOBD0100
+# of QGPL/QDFTJOBD come out; the whole ILE RPG listing of the RNF3546
+# source (where the message shows in the source section); the whole
+# printed job log of a CL program's job (DSPJOBLOG OUTPUT(*PRINT) in
+# GLD13A); RCVMSG of a key RMV(*YES) took away, and of a blank key; the
+# job descriptions in QGPL and DSPJOBD of QGPL/QBATCH (an initial library
+# list, if it has one); SQL UPDATE and DELETE on a source file.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify13.txt -Files tools\golden\verify13
+t13_cleanup|!for p in GLD13P GLD13X GLD13J GLD13E GLD13A GLD13B GLD13C; do system -q "DLTPGM PGM(AS4TRAINR1/$p)"; done; system -q "DLTF FILE(AS4TRAINR1/GLD13OUT)"; system -q "DLTF FILE(AS4TRAINR1/GLD13SRC)"; echo cleaned
+t13_tag|!setccsid 819 /home/AS4TRAINR/gld/gld13p.rpgle /home/AS4TRAINR/gld/gld13x.rpgle /home/AS4TRAINR/gld/gld13j.rpgle /home/AS4TRAINR/gld/gld13e.rpgle /home/AS4TRAINR/gld/gld13a.clle /home/AS4TRAINR/gld/gld13b.clle /home/AS4TRAINR/gld/gld13c.clle; ls /home/AS4TRAINR/gld | grep gld13
+t13_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD13OUT (ID CHAR(10) NOT NULL, VAL CHAR(200) NOT NULL)') COMMIT(*NONE)
+t13_rpge|!system "CRTBNDRPG PGM(AS4TRAINR1/GLD13E) SRCSTMF('/home/AS4TRAINR/gld/gld13e.rpgle')"
+t13_rpgp|!system "CRTBNDRPG PGM(AS4TRAINR1/GLD13P) SRCSTMF('/home/AS4TRAINR/gld/gld13p.rpgle')" | grep -E "RNF[0-9]|RNS9" | head -40
+t13_rpgx|!system "CRTBNDRPG PGM(AS4TRAINR1/GLD13X) SRCSTMF('/home/AS4TRAINR/gld/gld13x.rpgle')" | grep -E "RNF[0-9]|RNS9" | head -40
+t13_rpgj|!system "CRTBNDRPG PGM(AS4TRAINR1/GLD13J) SRCSTMF('/home/AS4TRAINR/gld/gld13j.rpgle')" | grep -E "RNF[0-9]|RNS9" | head -40
+t13_cla|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD13A) SRCSTMF('/home/AS4TRAINR/gld/gld13a.clle')"
+t13_clb|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD13B) SRCSTMF('/home/AS4TRAINR/gld/gld13b.clle')"
+t13_clc|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD13C) SRCSTMF('/home/AS4TRAINR/gld/gld13c.clle')"
+t13_callp|CALL PGM(AS4TRAINR1/GLD13P)
+t13_callx|CALL PGM(AS4TRAINR1/GLD13X)
+t13_callj|CALL PGM(AS4TRAINR1/GLD13J)
+t13_callc|CALL PGM(AS4TRAINR1/GLD13C)
+t13_joblog|!system "CALL PGM(AS4TRAINR1/GLD13A)"
+t13_rows|CPYF FROMFILE(AS4TRAINR1/GLD13OUT) TOFILE(*PRINT)
+t13_jobds|DSPOBJD OBJ(QGPL/*ALL) OBJTYPE(*JOBD) OUTPUT(*PRINT)
+t13_qbatch|DSPJOBD JOBD(QGPL/QBATCH) OUTPUT(*PRINT)
+t13_src|CRTSRCPF FILE(AS4TRAINR1/GLD13SRC) RCDLEN(92) MBR(M1)
+t13_ins|RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD13SRC VALUES(1.00, 261029, ''one''), (2.00, 261029, ''two''), (3.00, 261029, ''three'')') COMMIT(*NONE)
+t13_upd|RUNSQL SQL('UPDATE AS4TRAINR1/GLD13SRC SET SRCDTA = ''TWO'', SRCDAT = 261030 WHERE SRCSEQ = 2') COMMIT(*NONE)
+t13_del|RUNSQL SQL('DELETE FROM AS4TRAINR1/GLD13SRC WHERE SRCSEQ = 1') COMMIT(*NONE)
+t13_src_print|CPYF FROMFILE(AS4TRAINR1/GLD13SRC) TOFILE(*PRINT) FROMMBR(M1)
+t13_end|!for p in GLD13P GLD13X GLD13J GLD13E GLD13A GLD13B GLD13C; do system -q "DLTPGM PGM(AS4TRAINR1/$p)"; done; system -q "DLTF FILE(AS4TRAINR1/GLD13OUT)"; system -q "DLTF FILE(AS4TRAINR1/GLD13SRC)"; echo cleaned

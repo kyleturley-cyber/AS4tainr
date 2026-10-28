@@ -3268,19 +3268,7 @@ async fn create_trigger_run(ctx: &mut Ctx<'_>, t: &Trigger) -> Result<String> {
                 let mut text = tr.sql.clone();
                 if let Some((target, at)) = &tr.insert_needs_columns {
                     let name = target.replace('"', "").replace('.', "/").to_ascii_uppercase();
-                    let f = catalog::resolve_sql_file(ctx.client, &libl, &name)
-                        .await
-                        .map_err(|_| anyhow!("SQL0204: {name} not found."))?;
-                    // IMPLICITLY HIDDEN columns are left out (PUB400 2026-10-26,
-        // verify2 w_ins_nocols: five values for a table of eight columns,
-        // three hidden).
-        let cols: Vec<String> = f
-            .file
-            .fields
-            .iter()
-            .filter(|fd| !fd.hidden)
-            .map(|fd| fd.column())
-            .collect();
+                    let cols = crate::sql::insert_columns(ctx.client, &libl, &name).await?;
                     text.insert_str(*at, &format!(" ({})", cols.join(", ")));
                 }
                 code.push_str(text.trim().trim_end_matches(';'));

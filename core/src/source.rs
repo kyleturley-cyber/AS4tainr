@@ -458,6 +458,234 @@ pub async fn expand_cl_includes_from(
     bail!("INCLUDE: includes nested more than 10 deep.");
 }
 
+/// The trigger function that adds a record at the end of a source member
+/// for an INSERT through a view of the member (an alias, or SQL naming
+/// the source file): the trigger's arguments are the library, file and
+/// member; the record's SRCSEQ and SRCDAT are kept (`seqdat`).
+pub fn insert_function(name: &str) -> String {
+    format!(
+        r#"CREATE OR REPLACE FUNCTION {name}() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+DECLARE
+  -- The record's SRCSEQ and SRCDAT as twelve digits (seqdat).
+  meta text := lpad(CAST(CAST(abs(round(coalesce(NEW.srcseq, 0) * 100)) AS bigint) % 1000000 AS text), 6, '0')
+            || lpad(CAST(CAST(abs(coalesce(NEW.srcdat, 0)) AS bigint) % 1000000 AS text), 6, '0');
+BEGIN
+  -- The member's lines without the newline that ends the last.
+  UPDATE as4tainr.source_members
+     SET source = CASE WHEN source = '' THEN rtrim(coalesce(NEW.srcdta, ''))
+                       ELSE regexp_replace(source, E'\n$', '') || E'\n' || rtrim(coalesce(NEW.srcdta, '')) END,
+         seqdat = CASE WHEN source = '' THEN meta
+                       ELSE coalesce(seqdat,
+                              (SELECT string_agg(lpad(CAST((l.n * 100) % 1000000 AS text), 6, '0') || '000000',
+                                                 E'\n' ORDER BY l.n)
+                                 FROM regexp_split_to_table(regexp_replace(source, E'\n$', ''), E'\n')
+                                      WITH ORDINALITY AS l(t, n)))
+                            || E'\n' || meta END,
+         changed = now()
+   WHERE library = TG_ARGV[0] AND file = TG_ARGV[1] AND member = TG_ARGV[2];
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Member % of file % in library % not found.', TG_ARGV[2], TG_ARGV[1], TG_ARGV[0]
+      USING ERRCODE = '42704';
+  END IF;
+  RETURN NEW;
+END $f$;
+"#
+    )
+}
+
+/// A source file an SQL statement names: Db2 for i reads and adds to its
+/// first member (PUB400 2026-10-28, tools/golden/verify12.txt
+/// n12_ins_file: INSERT INTO the source file added record 4 to M1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqlSource {
+    /// Where the statement names it qualified (`"lib"."file"`,
+    /// `lib.file`): byte ranges replaced by the view. A bare name is
+    /// left as it is: the temporary view of that name is found first.
+    pub spans: Vec<(usize, usize)>,
+    /// The temporary view put in its place.
+    pub view: String,
+    pub library: String,
+    pub file: String,
+    pub member: String,
+}
+
+/// The source files a translated SQL statement names, qualified
+/// (`"lib"."file"`) or after FROM, JOIN, INTO, UPDATE or TABLE and
+/// found first through the library list, with the views that stand for
+/// them ([`sql_source_views`]). Text in quotes is not looked at.
+pub async fn sql_sources(client: &Client, libl: &[String], sql: &str) -> Result<Vec<SqlSource>> {
+    // Tokens outside string literals: quoted names keep their quotes.
+    let b = sql.as_bytes();
+    let mut toks: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' {
+            i += 1;
+            while i < b.len() && b[i] != b'\'' {
+                i += 1;
+            }
+            i += 1;
+        } else if c == b'"' {
+            let st = i;
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                i += 1;
+            }
+            i += 1;
+            toks.push((st, i.min(b.len())));
+        } else if c.is_ascii_alphanumeric() || b"_#@$".contains(&c) {
+            let st = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b"_#@$".contains(&b[i])) {
+                i += 1;
+            }
+            toks.push((st, i));
+        } else {
+            if c == b'.' {
+                toks.push((i, i + 1));
+            }
+            i += 1;
+        }
+    }
+    let word = |k: usize| sql[toks[k].0..toks[k].1].to_string();
+    let unq = |w: &str| w.trim_matches('"').to_ascii_uppercase();
+    let adjacent = |k: usize| {
+        k + 2 < toks.len()
+            && word(k + 1) == "."
+            && toks[k].1 == toks[k + 1].0
+            && toks[k + 1].1 == toks[k + 2].0
+            && word(k + 2) != "."
+    };
+    // (span, library if qualified, file).
+    type Candidate = (Option<(usize, usize)>, Option<String>, String);
+    let mut cands: Vec<Candidate> = Vec::new();
+    for k in 0..toks.len() {
+        let w = word(k);
+        if w == "." || (k > 0 && word(k - 1) == "." && toks[k - 1].1 == toks[k].0) {
+            continue;
+        }
+        if adjacent(k) {
+            // Three parts (a column of lib.file) are not a table.
+            if k + 4 < toks.len() && word(k + 3) == "." && toks[k + 2].1 == toks[k + 3].0 {
+                continue;
+            }
+            cands.push((
+                Some((toks[k].0, toks[k + 2].1)),
+                Some(unq(&w)),
+                unq(&word(k + 2)),
+            ));
+        } else if k > 0
+            && !w.starts_with('"')
+            && matches!(
+                word(k - 1).to_ascii_uppercase().as_str(),
+                "FROM" | "JOIN" | "INTO" | "UPDATE" | "TABLE"
+            )
+        {
+            cands.push((None, None, w.to_ascii_uppercase()));
+        }
+    }
+    let mut out: Vec<SqlSource> = Vec::new();
+    if cands.is_empty() {
+        return Ok(out);
+    }
+    // The files of those names in the libraries concerned, in one query
+    // (this runs before every SQL statement).
+    let names: Vec<String> = cands.iter().map(|c| c.2.clone()).collect();
+    let mut libs_all: Vec<String> = libl.to_vec();
+    libs_all.extend(cands.iter().filter_map(|c| c.1.clone()));
+    let files: Vec<(String, String, String)> = client
+        .query(
+            "SELECT library, name, attribute FROM as4tainr.objects
+              WHERE objtype = '*FILE' AND name = ANY($1) AND library = ANY($2)",
+            &[&names, &libs_all],
+        )
+        .await?
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    if !files.iter().any(|f| f.2 == "PF-SRC") {
+        return Ok(out);
+    }
+    for (span, lib, file) in cands {
+        let libs = match &lib {
+            Some(l) => vec![l.clone()],
+            None => libl.to_vec(),
+        };
+        // The first library with a file of that name decides.
+        let found = libs
+            .iter()
+            .find_map(|l| files.iter().find(|f| &f.0 == l && f.1 == file))
+            .filter(|f| f.2 == "PF-SRC")
+            .map(|f| f.0.clone());
+        let Some(l) = found else { continue };
+        let view = match lib {
+            Some(_) => format!("as4src_{l}_{file}").to_ascii_lowercase(),
+            None => file.to_ascii_lowercase(),
+        };
+        if let Some(o) = out.iter_mut().find(|o| o.view == view) {
+            o.spans.extend(span);
+            continue;
+        }
+        let member: String = client
+            .query_opt(
+                "SELECT member FROM as4tainr.source_members WHERE library=$1 AND file=$2
+                  ORDER BY added, member LIMIT 1",
+                &[&l, &file],
+            )
+            .await?
+            .map(|r| r.get(0))
+            .unwrap_or_default();
+        out.push(SqlSource {
+            spans: span.into_iter().collect(),
+            view,
+            library: l,
+            file,
+            member,
+        });
+    }
+    Ok(out)
+}
+
+/// Make the temporary views (on the connection that runs the statement)
+/// for the source files a statement names, and put them in its text: the
+/// member's records SRCSEQ, SRCDAT, SRCDTA; an INSERT adds a record at
+/// the member's end.
+pub async fn sql_source_views(
+    sql_client: &Client,
+    sources: &[SqlSource],
+    text: &str,
+) -> Result<String> {
+    let q = |v: &str| format!("'{}'", v.replace('\'', "''"));
+    let mut text = text.to_string();
+    let mut spans: Vec<(usize, usize, String)> = Vec::new();
+    for s in sources {
+        let view = format!("pg_temp.{}", crate::catalog::ident(&s.view));
+        sql_client
+            .batch_execute(&format!(
+                "DROP VIEW IF EXISTS {view};
+                 CREATE TEMP VIEW {} AS SELECT srcseq, srcdat, srcdta
+                   FROM as4tainr_svc.source_lines({}, {}, {});
+                 CREATE TRIGGER as4tainr_source INSTEAD OF INSERT ON {view}
+                   FOR EACH ROW EXECUTE FUNCTION as4tainr_svc.source_insert({}, {}, {})",
+                crate::catalog::ident(&s.view),
+                q(&s.library),
+                q(&s.file),
+                q(&s.member),
+                q(&s.library),
+                q(&s.file),
+                q(&s.member)
+            ))
+            .await?;
+        spans.extend(s.spans.iter().map(|&(a, b)| (a, b, view.clone())));
+    }
+    spans.sort_by_key(|x| std::cmp::Reverse(x.0));
+    for (a, b, v) in spans {
+        text.replace_range(a..b, &v);
+    }
+    Ok(text)
+}
+
 /// A member's lines as records: (SRCSEQ, SRCDAT, SRCDTA), the numbers
 /// as decimal text ("2.50", "261027"). `seqdat` is the member's kept
 /// SRCSEQ and SRCDAT (twelve digits a line); lines it has none for are

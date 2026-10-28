@@ -2523,23 +2523,29 @@ impl Job<'_> {
             "*FILE" => Some(name.clone()),
             m => Some(m.to_ascii_uppercase()),
         };
+        let mut msgs = vec![format!(
+            "CPC7301: File {name} was created in library {lib}."
+        )];
         if let Some(m) = mbr {
             crate::source::put_member(
                 self.client,
                 &crate::source::Member {
                     library: lib.clone(),
                     file: name.clone(),
-                    name: m,
+                    name: m.clone(),
                     ccsid: 37,
                     ..Default::default()
                 },
                 false,
             )
             .await?;
+            // The member added: CPC7305 after CPC7301 (PUB400 2026-10-28,
+            // tools/golden/verify12.txt n12_src).
+            msgs.push(format!(
+                "CPC7305: Member {m} was added to file {name} in library {lib}."
+            ));
         }
-        Ok(Outcome::Messages(vec![format!(
-            "CPC7301: File {name} was created in library {lib}."
-        )]))
+        Ok(Outcome::Messages(msgs))
     }
 
     /// DSPFD TYPE(*ATR) of a database physical file: its printed report

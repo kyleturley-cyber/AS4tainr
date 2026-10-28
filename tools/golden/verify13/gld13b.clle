@@ -1,0 +1,32 @@
+/* Golden (tools/golden/verify13.txt): GLD13A's message key used in */
+/* this program's queue (*SAME), RMVMSG by that key from here, then */
+/* RCVMSG of the key in the caller's queue (*PRV).                   */
+PGM        PARM(&K)
+  DCL        VAR(&K) TYPE(*CHAR) LEN(4)
+  DCL        VAR(&M) TYPE(*CHAR) LEN(80)
+  DCL        VAR(&ID) TYPE(*CHAR) LEN(7)
+  DCL        VAR(&S) TYPE(*CHAR) LEN(200)
+  RCVMSG     PGMQ(*SAME) MSGKEY(&K) RMV(*NO) MSG(&M)
+  MONMSG     MSGID(CPF0000) EXEC(DO)
+    RCVMSG     MSGTYPE(*EXCP) MSGID(&ID)
+    CHGVAR     VAR(&M) VALUE('EXCP ' *CAT &ID)
+  ENDDO
+  CHGVAR     VAR(&S) VALUE('INSERT INTO AS4TRAINR1/GLD13OUT VALUES(''K01'', ''' *CAT %TRIM(&M) *CAT ''')')
+  RUNSQL     SQL(&S) COMMIT(*NONE)
+  CHGVAR     VAR(&M) VALUE('removed')
+  RMVMSG     PGMQ(*SAME) MSGKEY(&K)
+  MONMSG     MSGID(CPF0000) EXEC(DO)
+    RCVMSG     MSGTYPE(*EXCP) MSGID(&ID)
+    CHGVAR     VAR(&M) VALUE('EXCP ' *CAT &ID)
+  ENDDO
+  CHGVAR     VAR(&S) VALUE('INSERT INTO AS4TRAINR1/GLD13OUT VALUES(''K02'', ''' *CAT %TRIM(&M) *CAT ''')')
+  RUNSQL     SQL(&S) COMMIT(*NONE)
+  CHGVAR     VAR(&M) VALUE(' ')
+  RCVMSG     PGMQ(*PRV *) MSGKEY(&K) RMV(*NO) MSG(&M)
+  MONMSG     MSGID(CPF0000) EXEC(DO)
+    RCVMSG     MSGTYPE(*EXCP) MSGID(&ID)
+    CHGVAR     VAR(&M) VALUE('EXCP ' *CAT &ID)
+  ENDDO
+  CHGVAR     VAR(&S) VALUE('INSERT INTO AS4TRAINR1/GLD13OUT VALUES(''K03'', ''' *CAT %TRIM(&M) *CAT ''')')
+  RUNSQL     SQL(&S) COMMIT(*NONE)
+ENDPGM

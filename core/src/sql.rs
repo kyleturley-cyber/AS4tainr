@@ -641,6 +641,51 @@ pub enum Kind {
     Delete,
 }
 
+/// The column list an INSERT without one gets: the file's fields in
+/// order, IMPLICITLY HIDDEN columns left out (PUB400 2026-10-26, verify2
+/// w_ins_nocols: five values for a table of eight columns, three
+/// hidden); for an alias over a source file member, SRCSEQ, SRCDAT and
+/// SRCDTA (PUB400 2026-10-28, verify12 n12_ins_nocols).
+pub async fn insert_columns(client: &Client, libl: &[String], name: &str) -> Result<Vec<String>> {
+    if let Ok(f) = catalog::resolve_sql_file(client, libl, name).await {
+        return Ok(f
+            .file
+            .fields
+            .iter()
+            .filter(|fd| !fd.hidden)
+            .map(|fd| fd.column())
+            .collect());
+    }
+    let (libs, file) = match name.split_once('/') {
+        Some((l, f)) => (vec![l.to_string()], f.to_string()),
+        None => (libl.to_vec(), name.to_string()),
+    };
+    for l in &libs {
+        let alias = client
+            .query_opt(
+                "SELECT 1 FROM as4tainr.sql_aliases a JOIN as4tainr.objects o
+                    ON o.library = a.target_library AND o.name = a.target_file
+                   AND o.objtype = '*FILE' AND o.attribute = 'PF-SRC'
+                 WHERE a.library = $1 AND a.name = $2",
+                &[l, &file],
+            )
+            .await?;
+        // A source file named itself (its first member: verify12
+        // n12_ins_file).
+        let source = client
+            .query_opt(
+                "SELECT 1 FROM as4tainr.objects WHERE library = $1 AND name = $2
+                    AND objtype = '*FILE' AND attribute = 'PF-SRC'",
+                &[l, &file],
+            )
+            .await?;
+        if alias.is_some() || source.is_some() {
+            return Ok(vec!["srcseq".into(), "srcdat".into(), "srcdta".into()]);
+        }
+    }
+    bail!("SQL0204: {name} not found.")
+}
+
 /// A statement translated to PostgreSQL.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Translated {
@@ -2179,19 +2224,7 @@ pub async fn run_as(
         } else {
             target.to_ascii_uppercase()
         };
-        let f = catalog::resolve_sql_file(client, libl, &name)
-            .await
-            .map_err(|_| anyhow!("SQL0204: {name} not found."))?;
-        // IMPLICITLY HIDDEN columns are left out (PUB400 2026-10-26,
-        // verify2 w_ins_nocols: five values for a table of eight columns,
-        // three hidden).
-        let cols: Vec<String> = f
-            .file
-            .fields
-            .iter()
-            .filter(|fd| !fd.hidden)
-            .map(|fd| fd.column())
-            .collect();
+        let cols = insert_columns(client, libl, &name).await?;
         text.insert_str(*at, &format!(" ({})", cols.join(", ")));
     }
     let path: Vec<String> = libl.iter().map(|l| ident(l)).collect();
@@ -2199,6 +2232,9 @@ pub async fn run_as(
     // its own as the SQL role.
     let sql_client = std::sync::Arc::new(connect_as_sql_role(client, database_url).await?);
     sql_client.batch_execute(&context).await?;
+    // Source files the statement names: views of their first members.
+    let sources = crate::source::sql_sources(client, libl, &text).await?;
+    let text = crate::source::sql_source_views(&sql_client, &sources, &text).await?;
     sql_client.batch_execute("BEGIN").await?;
     // Trigger programs (ADDPFTRG) for the changes, in this transaction; one
     // that fails ends the statement in SQL0443.
@@ -2735,20 +2771,17 @@ impl Session {
             } else {
                 target.to_ascii_uppercase()
             };
-            let f = catalog::resolve_sql_file(catalog_client, &self.libl, &name)
-                .await
-                .map_err(|_| anyhow!("SQL0204: {name} not found."))?;
-            // IMPLICITLY HIDDEN columns are left out (PUB400 2026-10-26,
-            // verify2 w_ins_nocols: five values for a table of eight columns,
-            // three hidden).
-            let cols: Vec<String> = f
-                .file
-                .fields
-                .iter()
-                .filter(|fd| !fd.hidden)
-                .map(|fd| fd.column())
-                .collect();
+            let cols = insert_columns(catalog_client, &self.libl, &name).await?;
             text.insert_str(*at, &format!(" ({})", cols.join(", ")));
+        }
+        // Source files the statement names: views of their first members.
+        let sources = crate::source::sql_sources(catalog_client, &self.libl, &text).await?;
+        if !sources.is_empty() {
+            let on: &Client = match &self.cmt {
+                Some(d) => &d.client,
+                None => &self.client,
+            };
+            text = crate::source::sql_source_views(on, &sources, &text).await?;
         }
         // Under commitment control: on the definition's session, inside a
         // savepoint, so that a statement that fails takes back only its

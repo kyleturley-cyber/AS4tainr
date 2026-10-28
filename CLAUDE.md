@@ -101,6 +101,7 @@ AS4TAINR_BIN=target/debug/as4tainr scripts/demo.sh
 TN5250=/path/to/tn5250 python3 tools/e2e_5250.py 127.0.0.1:2323   # against a running `as4tainr tn5250`
 python3 tools/e2e_web.py http://127.0.0.1:5250   # browser terminal in Chromium (pip install playwright), with --web-listen 127.0.0.1:5250
 TN5250=/path/to/tn5250 AS4TAINR_BIN=target/debug/as4tainr python3 tools/gate3_5250.py 127.0.0.1:2323   # then the Phase 3 gate
+python3 tools/e2e_5250_web.py tools/e2e_5250.py 127.0.0.1:2323   # the same tests (and gate3) through the browser terminal, without the tn5250 client
 ```
 
 ## Conventions

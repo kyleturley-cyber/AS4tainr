@@ -7,7 +7,13 @@
 //! - RNF7416 (30): EVAL assigns a numeric value to a character target, or
 //!   a character value to a numeric one;
 //! - RNF7086 (00): RPG blocks the records of a file (the conditions of
-//!   the BLOCK keyword's description).
+//!   the BLOCK keyword's description);
+//! - RNF3546 (20): LIKEREC names the data structure itself (a data
+//!   structure named as the record format), with what follows from it:
+//!   its subfields are not defined (RNF7030, RNF7503), it cannot be the
+//!   result of a file operation (RNF7260), and the record format is then
+//!   not used (RNF7066, 00) (PUB400 2026-10-28, tools/golden/verify12.txt
+//!   n12_rpgp, n12_rpgx, n12_rpgj: `dcl-ds outr likerec(OUTR: *output)`).
 //!
 //! The texts are as4tainr's own.
 
@@ -54,6 +60,11 @@ struct Walker<'a> {
     prog: &'a Program,
     proc: Option<&'a super::program::ProcInfo>,
     out: Checked,
+    /// Data structures whose LIKEREC names themselves (RNF3546) in the
+    /// scope being checked: they have no subfields.
+    bad_ds: Vec<String>,
+    /// Record formats a file operation with such a data structure named.
+    invalid_io: Vec<String>,
 }
 
 impl Walker<'_> {
@@ -81,6 +92,12 @@ impl Walker<'_> {
     fn expr(&mut self, line: usize, e: &Expr) -> bool {
         let mut bad = false;
         match e {
+            Expr::Name { parts, .. } | Expr::Path { parts, .. }
+                if parts.len() > 1 && self.bad_ds.contains(&parts[0].to_ascii_uppercase()) =>
+            {
+                self.undefined(line, &parts[1].to_ascii_uppercase());
+                bad = true;
+            }
             Expr::Name { parts, args } => {
                 let name = parts.join(".");
                 if !self.defined(&name) && !self.defined(&parts[0]) {
@@ -196,7 +213,17 @@ impl Walker<'_> {
     fn stmt(&mut self, l: usize, s: &Stmt) {
         match s {
             Stmt::Eval { target, value, .. } => {
-                self.expr(l, target);
+                // A subfield of a data structure without subfields
+                // (RNF3546) as the target: RNF7503 too (verify12
+                // n12_rpgp: `outr.ID = id;` RNF7030 and RNF7503).
+                if self.expr(l, target) && self.bad_target(target) {
+                    self.out.diags.push(Diag {
+                        line: l,
+                        id: "RNF7503".into(),
+                        sev: 30,
+                        text: "The expression has an operand that is not defined.".into(),
+                    });
+                }
                 self.value(l, value);
                 if let (Some(t), Some(v)) = (self.class_of(target), self.class_of(value)) {
                     if t != v {
@@ -218,9 +245,24 @@ impl Walker<'_> {
                     self.opt(l, &p.value);
                 }
             }
-            Stmt::File { key, .. } => {
+            Stmt::File { key, ds, file, .. } => {
                 for k in key.iter().flatten() {
                     self.value(l, k);
+                }
+                // The result data structure is one without subfields
+                // (RNF3546): not valid (verify12 n12_rpgp: `write OUTR
+                // outr;` RNF7260).
+                if ds
+                    .as_ref()
+                    .is_some_and(|d| self.bad_ds.contains(&d.to_ascii_uppercase()))
+                {
+                    self.out.diags.push(Diag {
+                        line: l,
+                        id: "RNF7260".into(),
+                        sev: 30,
+                        text: "The data structure in the result field cannot be used with this operation.".into(),
+                    });
+                    self.invalid_io.push(file.to_ascii_uppercase());
                 }
             }
             Stmt::Dsply { message, response } => {
@@ -235,6 +277,13 @@ impl Walker<'_> {
             }
             _ => {}
         }
+    }
+
+    /// Whether an EVAL target is a subfield of a data structure without
+    /// subfields (RNF3546).
+    fn bad_target(&self, e: &Expr) -> bool {
+        matches!(e, Expr::Name { parts, .. } | Expr::Path { parts, .. }
+            if parts.len() > 1 && self.bad_ds.contains(&parts[0].to_ascii_uppercase()))
     }
 
     /// Whether a value is numeric (Some(true)) or character (Some(false)),
@@ -285,19 +334,94 @@ pub fn check(src: &Source, prog: &Program) -> Checked {
         prog,
         proc: None,
         out: Checked::default(),
+        bad_ds: Vec::new(),
+        invalid_io: Vec::new(),
     };
+    let global_bad = self_likerec(&src.defs, &mut w.out.diags);
+    w.bad_ds = global_bad.clone();
     for c in &src.calcs {
         w.calc(c);
     }
     for p in &src.procs {
         w.proc = prog.procs.get(&p.name.to_ascii_uppercase());
+        let local = self_likerec(&p.defs, &mut w.out.diags);
+        // A local definition of the name hides the global one.
+        w.bad_ds = global_bad
+            .iter()
+            .filter(|g| !p.defs.iter().any(|d| d.name.eq_ignore_ascii_case(g)))
+            .cloned()
+            .chain(local)
+            .collect();
         for c in &p.calcs {
             w.calc(c);
+        }
+    }
+    // A record format whose only file operations were not valid: not
+    // used (RNF7066, verify12 n12_rpgp).
+    let mut used: Vec<String> = Vec::new();
+    let mut note = |calcs: &[CalcLine]| {
+        for c in calcs {
+            if let Line::Stmt(Stmt::File { file, ds, .. }) = &c.what {
+                let bad = ds.as_ref().is_some_and(|d| {
+                    d.eq_ignore_ascii_case(file)
+                        && w.invalid_io.contains(&file.to_ascii_uppercase())
+                });
+                if !bad {
+                    used.push(file.to_ascii_uppercase());
+                }
+            }
+        }
+    };
+    note(&src.calcs);
+    for p in &src.procs {
+        note(&p.calcs);
+    }
+    for f in &prog.files {
+        let fmt = f.format.to_ascii_uppercase();
+        if w.invalid_io.contains(&fmt)
+            && !used.contains(&fmt)
+            && !used.contains(&f.decl.name.to_ascii_uppercase())
+        {
+            w.out.diags.push(Diag {
+                line: f.decl.line,
+                id: "RNF7066".into(),
+                sev: 0,
+                text: format!("Record format {fmt} is not read or written."),
+            });
         }
     }
     let mut out = w.out;
     out.diags.extend(blocking(src));
     out.diags.sort_by_key(|d| d.line);
+    out
+}
+
+/// RNF3546 for each data structure among `defs` whose LIKEREC names the
+/// data structure itself; their names.
+fn self_likerec(defs: &[super::ast::Def], diags: &mut Vec<Diag>) -> Vec<String> {
+    let mut out = Vec::new();
+    for d in defs {
+        if d.kind != super::ast::DefKind::Ds {
+            continue;
+        }
+        let Some(k) = keyword(&d.keywords, "LIKEREC") else {
+            continue;
+        };
+        let fmt = k
+            .args
+            .first()
+            .map(|a| a.trim().to_ascii_uppercase())
+            .unwrap_or_default();
+        if fmt == d.name.to_ascii_uppercase() {
+            diags.push(Diag {
+                line: d.line,
+                id: "RNF3546".into(),
+                sev: 20,
+                text: format!("LIKEREC({fmt}) does not name a record format here."),
+            });
+            out.push(fmt);
+        }
+    }
     out
 }
 

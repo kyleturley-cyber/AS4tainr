@@ -12794,7 +12794,12 @@ async fn job_descriptions() {
         .await
         .unwrap()
         .join("\n");
-    assert!(shown.contains(&format!("{lib} QGPL")), "{shown}");
+    // The initial library list in DSPJOBD's three columns (IBM i 7.5's
+    // layout, PUB400 2026-10-28 verify12 n12_dspjobd; this test looked
+    // for "LIB QGPL" on one line, a layout of as4tainr's own).
+    // Sequence numbers 10, 20 (not captured; as DSPLIBL numbers them).
+    let want = as4tainr_core::report::at(&[(6, "10"), (12, &lib), (50, "20"), (56, "QGPL")]);
+    assert!(shown.contains(&want), "{shown}");
     let r = cl_cmd(
         &mut job,
         format!("SBMJOB CMD(DSPLIBL) JOBD({lib}/TESTJD) INLLIBL(*JOBD)"),
@@ -17471,11 +17476,33 @@ async fn source_member_keeps_sequence_numbers_and_dates() {
     assert_eq!(m.member, "M1");
     let s = as4tainr_core::pfmview::screen(&m, 0, 0, as4tainr_core::pfmview::Mode::Char);
     assert_eq!(s[6], " 000100261027line one");
+    // An INSERT without a column list through the alias, and into the
+    // source file itself (its first member), with system and SQL naming
+    // (PUB400 2026-10-28, tools/golden/verify12.txt n12_ins_nocols,
+    // n12_ins_file: records 3 and 4 printed by CPYF as 000300261029three
+    // and 000400261030four).
+    for st in [
+        format!("INSERT INTO {lib}.SCR6A VALUES(3.00, 261029, 'three')"),
+        format!("INSERT INTO {lib}/SCR6SRC VALUES(4.00, 261030, 'four')"),
+    ] {
+        as4tainr_core::sql::run(&client, &url, std::slice::from_ref(&lib), &st)
+            .await
+            .unwrap_or_else(|e| panic!("{st}: {e:#}"));
+    }
+    let n = client
+        .query_one(
+            "SELECT count(*) FROM as4tainr_svc.source_lines($1, 'SCR6SRC', 'M1') WHERE srcseq > 2.5",
+            &[&lib],
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0);
+    assert_eq!(n, 2);
     // SQL reads them back as kept.
     let rows = client
         .query(
             "SELECT srcseq::text, srcdat::text, rtrim(srcdta)
-               FROM as4tainr_svc.source_lines($1, 'SCR6SRC', 'M1')",
+               FROM as4tainr_svc.source_lines($1, 'SCR6SRC', 'M1') WHERE srcseq < 3",
             &[&lib],
         )
         .await
@@ -17522,4 +17549,147 @@ async fn source_member_keeps_sequence_numbers_and_dates() {
     let m = d.member.expect("a member view");
     let s = as4tainr_core::pfmview::screen(&m, 0, 0, as4tainr_core::pfmview::Mode::Char);
     assert_eq!(s[7], format!("   {}", as4tainr_core::pfmview::NO_RECORDS));
+}
+
+/// verify12's programs (PUB400 2026-10-28, tools/golden/verify12.txt):
+/// - RCVMSG and RMVMSG by a message key from another call stack entry
+///   (n12_rows: K01 the caller's message received with PGMQ(*SAME), K02
+///   RMVMSG by that key removed it, K03 RCVMSG PGMQ(*PRV *) of the key
+///   then ends in CPF2410);
+/// - ILE RPG: a data structure named as the record format its LIKEREC
+///   names (n12_rpgp: RNF3546 20, RNF7030 30 twice, RNF7503 30 twice,
+///   RNF7260 30, RNF7066 00, the file and the PSDS RNF7031; the message
+///   summary by severity then ID; RNS9308 and RNS9310);
+/// - CRTSRCPF MBR: CPC7301 then CPC7305 (n12_src).
+#[tokio::test]
+async fn verify12_message_keys_likerec_and_crtsrcpf() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::pase_system;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let ids = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .filter_map(|l| l.split_once(':').map(|x| x.0.to_string()))
+            .filter(|i| i.len() == 7)
+            .collect()
+    };
+    macro_rules! sys {
+        ($c:expr) => {
+            pase_system::run(&mut job, &[$c.to_string()]).await
+        };
+    }
+    let dir = format!("/tmp/{lib}");
+    let _ = as4tainr_core::ifs::mkdir_all(&client, &dir, "QSECOFR").await;
+    // The capture's sources, in this test's library; GLD12A without its
+    // DSPJOBLOG (a `system` job's job log is not printed here: gap).
+    for (f, text) in [
+        (
+            "gld12a.clle",
+            include_str!("../../tools/golden/verify12/gld12a.clle"),
+        ),
+        (
+            "gld12b.clle",
+            include_str!("../../tools/golden/verify12/gld12b.clle"),
+        ),
+        (
+            "gld12p.rpgle",
+            include_str!("../../tools/golden/verify12/gld12p.rpgle"),
+        ),
+    ] {
+        let text = text
+            .replace("AS4TRAINR1", &lib)
+            .replace("  DSPJOBLOG  OUTPUT(*PRINT)\n", "");
+        as4tainr_core::ifs::write_file(
+            &client,
+            &format!("{dir}/{f}"),
+            text.as_bytes(),
+            819,
+            0o644,
+            "QSECOFR",
+        )
+        .await
+        .unwrap();
+    }
+    let o = sys!(format!(
+        "RUNSQL SQL('CREATE TABLE {lib}/GLD12OUT (ID CHAR(10) NOT NULL, VAL CHAR(200) NOT NULL)') COMMIT(*NONE)"
+    ));
+    assert_eq!(o.status, 0, "{o:?}");
+    for p in ["GLD12B", "GLD12A"] {
+        let o = sys!(format!(
+            "CRTBNDCL PGM({lib}/{p}) SRCSTMF('{dir}/{}.clle')",
+            p.to_ascii_lowercase()
+        ));
+        assert_eq!(o.status, 0, "{o:?}");
+    }
+    let o = sys!(format!("CALL PGM({lib}/GLD12A)"));
+    assert_eq!(o.status, 0, "{o:?}");
+    let rows = client
+        .query(
+            &format!(
+                "SELECT rtrim(id), rtrim(val) FROM {}.{} ORDER BY rrn",
+                as4tainr_core::catalog::ident(&lib),
+                as4tainr_core::catalog::ident("GLD12OUT")
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let got: Vec<(String, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(
+        got,
+        [
+            ("K01".to_string(), "GLD12 key test".to_string()),
+            ("K02".into(), "removed".into()),
+            ("K03".into(), "EXCP CPF2410".into()),
+        ]
+    );
+
+    let o = sys!(format!(
+        "CRTBNDRPG PGM({lib}/GLD12P) SRCSTMF('{dir}/gld12p.rpgle')"
+    ));
+    assert_eq!(o.status, 255, "{o:?}");
+    assert_eq!(ids(&o.stderr), ["RNS9308", "RNS9310"]);
+    let msg = |head: &str| o.stdout.iter().filter(|l| l.starts_with(head)).count();
+    for (head, n) in [
+        ("*RNF3546 20", 2), // the message and its summary line
+        ("*RNF7030 30", 3),
+        ("*RNF7503 30", 3),
+        ("*RNF7260 30", 2),
+        ("*RNF7066 00", 2),
+        ("*RNF7031 GLD12OUT          DISK", 1),
+        ("*RNF7031 PSDS              DS(46)", 1),
+        ("*RNF7031 00      2", 1),
+    ] {
+        assert_eq!(msg(head), n, "{head}: {o:?}");
+    }
+    let summary: Vec<&str> = o
+        .stdout
+        .iter()
+        .skip_while(|l| !l.contains("M e s s a g e   S u m m a r y"))
+        .take_while(|l| !l.contains("E N D   O F   M E S S A G E"))
+        .filter(|l| l.starts_with("*RNF"))
+        .map(|l| &l[1..8])
+        .collect();
+    assert_eq!(
+        summary,
+        ["RNF7031", "RNF7066", "RNF7086", "RNF3546", "RNF7030", "RNF7260", "RNF7503"],
+        "{o:?}"
+    );
+
+    let o = sys!(format!("CRTSRCPF FILE({lib}/GLD12SRC) RCDLEN(92) MBR(M1)"));
+    assert_eq!(ids(&o.stdout), ["CPC7301", "CPC7305"], "{o:?}");
 }

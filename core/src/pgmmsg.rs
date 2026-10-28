@@ -206,10 +206,27 @@ impl CallStack {
             "*ALL" | "*KEEPUNANS" => q.clear(),
             _ => {
                 if let Some(k) = key {
-                    q.retain(|m| m.key != k);
+                    // By key: the message wherever it is on the call
+                    // stack, as RCVMSG finds it (PUB400 2026-10-28,
+                    // tools/golden/verify12.txt n12_rows: GLD12B removed
+                    // its caller's message by key, and the caller's own
+                    // RCVMSG of that key then failed with CPF2410).
+                    if q.iter().any(|m| m.key == k) {
+                        q.retain(|m| m.key != k);
+                    } else {
+                        for q in self.stack.iter_mut() {
+                            q.retain(|m| m.key != k);
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /// Whether a program message queue on the call stack has the message
+    /// with this key.
+    pub fn has_key(&self, k: u32) -> bool {
+        self.stack.iter().any(|q| q.iter().any(|m| m.key == k))
     }
 }
 
@@ -985,5 +1002,9 @@ mod tests {
         assert_eq!(prv.text, "GLD11 key test");
         // A key no queue has: nothing.
         assert!(c.receive_from(0, "*ANY", Some(k + 99), "*NO").is_none());
+        // verify12 n12_rows: RMVMSG PGMQ(*SAME) MSGKEY in the called
+        // program removes the caller's message; the key is then gone.
+        c.remove_from(0, "*BYKEY", Some(k));
+        assert!(!c.has_key(k));
     }
 }

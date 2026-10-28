@@ -1,0 +1,30 @@
+/* Golden (tools/golden/verify13.txt): RCVMSG of a key whose message */
+/* RMV(*YES) took away, and of a key given as blanks. Results go    */
+/* into AS4TRAINR1/GLD13OUT with RUNSQL.                             */
+PGM
+  DCL        VAR(&K) TYPE(*CHAR) LEN(4)
+  DCL        VAR(&M) TYPE(*CHAR) LEN(80)
+  DCL        VAR(&ID) TYPE(*CHAR) LEN(7)
+  DCL        VAR(&S) TYPE(*CHAR) LEN(200)
+  SNDPGMMSG  MSG('GLD13 twice') TOPGMQ(*SAME) KEYVAR(&K)
+  RCVMSG     MSGKEY(&K) RMV(*YES) MSG(&M)
+  CHGVAR     VAR(&S) VALUE('INSERT INTO AS4TRAINR1/GLD13OUT VALUES(''C01'', ''' *CAT %TRIM(&M) *CAT ''')')
+  RUNSQL     SQL(&S) COMMIT(*NONE)
+  CHGVAR     VAR(&M) VALUE(' ')
+  RCVMSG     MSGKEY(&K) RMV(*NO) MSG(&M)
+  MONMSG     MSGID(CPF0000) EXEC(DO)
+    RCVMSG     MSGTYPE(*EXCP) MSGID(&ID)
+    CHGVAR     VAR(&M) VALUE('EXCP ' *CAT &ID)
+  ENDDO
+  CHGVAR     VAR(&S) VALUE('INSERT INTO AS4TRAINR1/GLD13OUT VALUES(''C02'', ''' *CAT %TRIM(&M) *CAT ''')')
+  RUNSQL     SQL(&S) COMMIT(*NONE)
+  CHGVAR     VAR(&M) VALUE(' ')
+  CHGVAR     VAR(&K) VALUE(' ')
+  RCVMSG     MSGKEY(&K) RMV(*NO) MSG(&M)
+  MONMSG     MSGID(CPF0000) EXEC(DO)
+    RCVMSG     MSGTYPE(*EXCP) MSGID(&ID)
+    CHGVAR     VAR(&M) VALUE('EXCP ' *CAT &ID)
+  ENDDO
+  CHGVAR     VAR(&S) VALUE('INSERT INTO AS4TRAINR1/GLD13OUT VALUES(''C03'', ''' *CAT %TRIM(&M) *CAT ''')')
+  RUNSQL     SQL(&S) COMMIT(*NONE)
+ENDPGM

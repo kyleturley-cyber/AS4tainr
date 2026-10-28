@@ -89,16 +89,32 @@ pub async fn find(client: &Client, libs: &[String], name: &str) -> Result<Option
 /// given when it was made are CRTJOBD's defaults (IBM i CL reference,
 /// CRTJOBD). The initial library list's sequence numbers were not
 /// captured: 10, 20... as DSPLIBL numbers.
+/// An attribute kept as given when the job description was made or
+/// changed (`KEY(value)` lines), or None (CRTJOBD's default applies).
+pub fn given(other: &str, k: &str) -> Option<String> {
+    other.lines().find_map(|l| {
+        l.strip_prefix(k)
+            .and_then(|r| r.strip_prefix('('))
+            .and_then(|r| r.strip_suffix(')'))
+            .map(|v| v.trim().to_string())
+    })
+}
+
+/// The kept attributes of a job description (`given`).
+pub async fn other_attributes(client: &Client, d: &JobDescription) -> Result<String> {
+    Ok(client
+        .query_opt(
+            "SELECT other FROM as4tainr.job_descriptions WHERE library=$1 AND name=$2",
+            &[&d.library, &d.name],
+        )
+        .await?
+        .map(|r| r.get(0))
+        .unwrap_or_default())
+}
+
 pub fn report_lines(d: &JobDescription, other: &str, text: &str) -> Vec<String> {
     use crate::report::at;
-    let given = |k: &str| -> Option<String> {
-        other.lines().find_map(|l| {
-            l.strip_prefix(k)
-                .and_then(|r| r.strip_prefix('('))
-                .and_then(|r| r.strip_suffix(')'))
-                .map(|v| v.trim().to_string())
-        })
-    };
+    let given = |k: &str| given(other, k);
     let val = |k: &str, dft: &str| given(k).unwrap_or_else(|| dft.to_string());
     let line = |label: &str, v: &str| {
         format!("{}   {v}", crate::commands::dsp_label(label, 48))

@@ -822,6 +822,39 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
                     )
                 };
                 lines_out.push(s.trim_end().to_string());
+                // Messages that point at a place on the line: a marker
+                // line, then the message with the marker's letter
+                // (PUB400 2026-10-28, tools/golden/verify13.txt
+                // t13_rpge: "======>" and "aaaa" under LIKEREC's argument,
+                // "*RNF3546 20 a      000031  ...").
+                let marked: Vec<&super::check::Diag> = input
+                    .diags
+                    .iter()
+                    .filter(|d| d.line == *n && d.at.is_some())
+                    .collect();
+                if !marked.is_empty() {
+                    let mut m = String::from("======>");
+                    for (k, d) in marked.iter().enumerate() {
+                        let (col, len) = d.at.unwrap_or_default();
+                        let letter = (b'a' + (k % 26) as u8) as char;
+                        while m.chars().count() < 7 + col {
+                            m.push(' ');
+                        }
+                        m.extend(std::iter::repeat_n(letter, len.max(1)));
+                    }
+                    lines_out.push(m);
+                    for (k, d) in marked.iter().enumerate() {
+                        let letter = ((b'a' + (k % 26) as u8) as char).to_string();
+                        let head = format!(
+                            "*{:<7} {:02} {:<6} {:<6}  ",
+                            d.id,
+                            d.sev,
+                            letter,
+                            seq_of(*n)
+                        );
+                        lines_out.extend(wrapped(&head, &d.text, 27, 86));
+                    }
+                }
             }
             Row::Copy(k, line, ordinal) => {
                 listing_no += 1;
@@ -895,7 +928,7 @@ pub fn listing(input: &Input, stamp: &Stamp) -> Vec<String> {
         )]),
         " Msg id  Sv Number Seq     Message text".to_string(),
     ];
-    for d in input.diags {
+    for d in input.diags.iter().filter(|d| d.at.is_none()) {
         let (n, seq) = if d.line >= COPY_LINES {
             (
                 lno(d.line).to_string(),

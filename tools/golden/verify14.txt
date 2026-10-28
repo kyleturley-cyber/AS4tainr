@@ -1,0 +1,12 @@
+# Golden: XML-SAX's events again (verify13's GLD13X did not end within
+# 120 seconds on PUB400 and its blocked records were lost): two
+# documents, each under MONITOR, records written unblocked, at most 40
+# events a document; the job log of that job printed after it.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify14.txt -Files tools\golden\verify14
+u14_cleanup|!system -q "DLTPGM PGM(AS4TRAINR1/GLD14X)"; system -q "DLTF FILE(AS4TRAINR1/GLD14OUT)"; echo cleaned
+u14_tag|!setccsid 819 /home/AS4TRAINR/gld/gld14x.rpgle; ls /home/AS4TRAINR/gld | grep gld14
+u14_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD14OUT (ID CHAR(10) NOT NULL, VAL CHAR(200) NOT NULL)') COMMIT(*NONE)
+u14_rpgx|!system "CRTBNDRPG PGM(AS4TRAINR1/GLD14X) SRCSTMF('/home/AS4TRAINR/gld/gld14x.rpgle')" | grep -E "RNF[0-9]|RNS9" | head -40
+u14_callx|!system "CALL PGM(AS4TRAINR1/GLD14X)"
+u14_rows|CPYF FROMFILE(AS4TRAINR1/GLD14OUT) TOFILE(*PRINT)
+u14_end|!system -q "DLTPGM PGM(AS4TRAINR1/GLD14X)"; system -q "DLTF FILE(AS4TRAINR1/GLD14OUT)"; echo cleaned

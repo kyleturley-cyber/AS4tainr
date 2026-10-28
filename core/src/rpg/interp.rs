@@ -1478,9 +1478,22 @@ impl<'a> Machine<'a> {
             "EDITC" => {
                 let v = arg(self, 0)?.num()?;
                 let code = a(&arg(self, 1)?.chars()?);
-                let (digits, decs) = match args.first().and_then(|x| self.type_of(x)) {
-                    Some(t) if t.is_numeric() => t.precision(),
-                    _ => (v.int_digits() + v.scale() as u32, v.scale() as u32),
+                // The value's length and decimals: a variable's, or an
+                // expression's (%EDITC(%DEC(i: 4: 0): 'X') is four digits:
+                // PUB400 2026-10-28, tools/golden/verify13.txt t13_rows
+                // "J0001").
+                let (digits, decs) = match args.first() {
+                    Some(x @ (Expr::Bif(..) | Expr::Bin(..) | Expr::Unary(..))) => {
+                        match self.num_precision(x) {
+                            Some(p) => p,
+                            None => (v.int_digits() + v.scale() as u32, v.scale() as u32),
+                        }
+                    }
+                    Some(x) => match self.type_of(x) {
+                        Some(t) if t.is_numeric() => t.precision(),
+                        _ => (v.int_digits() + v.scale() as u32, v.scale() as u32),
+                    },
+                    None => (v.int_digits() + v.scale() as u32, v.scale() as u32),
                 };
                 let mut out = edit_code(&v, digits, decs, code.chars().next().unwrap_or('Z'));
                 // The third argument (ILE RPG Reference, %EDITC): *ASTFILL

@@ -3666,7 +3666,7 @@ impl Job<'_> {
             crate::rpg::compile_parts(self.client, libl, name, &m.source, options, &[]).await;
         let mut checked = crate::rpg::check::Checked::default();
         if let (Some(src), Ok(prog)) = (&parsed, &compiled) {
-            checked = crate::rpg::check::check(src, prog);
+            checked = crate::rpg::check::check(src, prog, &m.source);
         }
         if let Err(e) = &compiled {
             checked.diags.push(crate::rpg::check::Diag {
@@ -3674,6 +3674,7 @@ impl Job<'_> {
                 id: crate::jobs::message_id(&format!("{e:#}")).to_string(),
                 sev: 30,
                 text: format!("{e:#}"),
+                at: None,
             });
         }
         let max = checked.diags.iter().map(|d| d.sev).max().unwrap_or(0);

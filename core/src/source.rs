@@ -494,6 +494,71 @@ END $f$;
     )
 }
 
+/// The trigger function for UPDATE and DELETE of a source member's
+/// records through a view of them with their relative record numbers
+/// (`rrn`): the line is changed or taken out (with its SRCSEQ and SRCDAT,
+/// `seqdat`). Records deleted earlier in the same statement are counted
+/// so that later ones still find their lines (PUB400 2026-10-28,
+/// tools/golden/verify13.txt t13_upd, t13_del: UPDATE ... WHERE SRCSEQ
+/// = 2 and DELETE ... WHERE SRCSEQ = 1 on the source file).
+pub fn change_function(name: &str) -> String {
+    format!(
+        r#"CREATE OR REPLACE FUNCTION {name}() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+DECLARE
+  src text;
+  meta text;
+  lines text[];
+  metas text[];
+  n int;
+  i int;
+  stmt text := CAST(statement_timestamp() AS text) || '|' || TG_ARGV[0] || '/' || TG_ARGV[1] || '/' || TG_ARGV[2];
+  done text := coalesce(current_setting('as4tainr.srcdel', true), '');
+  gone int[] := '{{}}';
+BEGIN
+  SELECT source, seqdat INTO src, meta FROM as4tainr.source_members
+   WHERE library = TG_ARGV[0] AND file = TG_ARGV[1] AND member = TG_ARGV[2] FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Member % of file % in library % not found.', TG_ARGV[2], TG_ARGV[1], TG_ARGV[0]
+      USING ERRCODE = '42704';
+  END IF;
+  src := regexp_replace(src, E'\n$', '');
+  lines := CASE WHEN src = '' THEN '{{}}'::text[] ELSE string_to_array(src, E'\n') END;
+  metas := coalesce(string_to_array(meta, E'\n'), '{{}}'::text[]);
+  FOR i IN 1 .. coalesce(array_length(lines, 1), 0) LOOP
+    IF i > coalesce(array_length(metas, 1), 0) OR length(metas[i]) <> 12 THEN
+      metas[i] := lpad(CAST((i * 100) % 1000000 AS text), 6, '0') || '000000';
+    END IF;
+  END LOOP;
+  IF split_part(done, '#', 1) = stmt AND split_part(done, '#', 2) <> '' THEN
+    gone := string_to_array(split_part(done, '#', 2), ',')::int[];
+  END IF;
+  n := OLD.rrn - (SELECT count(*) FROM unnest(gone) g WHERE g < OLD.rrn);
+  IF n < 1 OR n > coalesce(array_length(lines, 1), 0) THEN
+    RETURN NULL;
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    lines := lines[1 : n - 1] || lines[n + 1 :];
+    metas := metas[1 : n - 1] || metas[n + 1 :];
+    gone := gone || CAST(OLD.rrn AS int);
+    PERFORM set_config('as4tainr.srcdel', stmt || '#' || array_to_string(gone, ','), true);
+  ELSE
+    lines[n] := rtrim(coalesce(NEW.srcdta, ''));
+    metas[n] := lpad(CAST(CAST(abs(round(coalesce(NEW.srcseq, 0) * 100)) AS bigint) % 1000000 AS text), 6, '0')
+             || lpad(CAST(CAST(abs(coalesce(NEW.srcdat, 0)) AS bigint) % 1000000 AS text), 6, '0');
+  END IF;
+  UPDATE as4tainr.source_members
+     SET source = array_to_string(lines, E'\n'),
+         seqdat = CASE WHEN coalesce(array_length(lines, 1), 0) = 0 THEN NULL
+                       ELSE array_to_string(metas[1 : array_length(lines, 1)], E'\n') END,
+         changed = now()
+   WHERE library = TG_ARGV[0] AND file = TG_ARGV[1] AND member = TG_ARGV[2];
+  RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END $f$;
+"#
+    )
+}
+
 /// A source file an SQL statement names: Db2 for i reads and adds to its
 /// first member (PUB400 2026-10-28, tools/golden/verify12.txt
 /// n12_ins_file: INSERT INTO the source file added record 4 to M1).
@@ -649,8 +714,10 @@ pub async fn sql_sources(client: &Client, libl: &[String], sql: &str) -> Result<
 
 /// Make the temporary views (on the connection that runs the statement)
 /// for the source files a statement names, and put them in its text: the
-/// member's records SRCSEQ, SRCDAT, SRCDTA; an INSERT adds a record at
-/// the member's end.
+/// member's records SRCSEQ, SRCDAT, SRCDTA (and their relative record
+/// numbers, RRN, which SELECT * leaves out as for any file); an INSERT
+/// adds a record at the member's end, UPDATE and DELETE change and take
+/// out records ([`change_function`]).
 pub async fn sql_source_views(
     sql_client: &Client,
     sources: &[SqlSource],
@@ -664,17 +731,14 @@ pub async fn sql_source_views(
         sql_client
             .batch_execute(&format!(
                 "DROP VIEW IF EXISTS {view};
-                 CREATE TEMP VIEW {} AS SELECT srcseq, srcdat, srcdta
-                   FROM as4tainr_svc.source_lines({}, {}, {});
+                 CREATE TEMP VIEW {} AS SELECT rrn, srcseq, srcdat, srcdta
+                   FROM as4tainr_svc.source_records({a});
                  CREATE TRIGGER as4tainr_source INSTEAD OF INSERT ON {view}
-                   FOR EACH ROW EXECUTE FUNCTION as4tainr_svc.source_insert({}, {}, {})",
+                   FOR EACH ROW EXECUTE FUNCTION as4tainr_svc.source_insert({a});
+                 CREATE TRIGGER as4tainr_source_change INSTEAD OF UPDATE OR DELETE ON {view}
+                   FOR EACH ROW EXECUTE FUNCTION as4tainr_svc.source_change({a})",
                 crate::catalog::ident(&s.view),
-                q(&s.library),
-                q(&s.file),
-                q(&s.member),
-                q(&s.library),
-                q(&s.file),
-                q(&s.member)
+                a = format!("{}, {}, {}", q(&s.library), q(&s.file), q(&s.member)),
             ))
             .await?;
         spans.extend(s.spans.iter().map(|&(a, b)| (a, b, view.clone())));

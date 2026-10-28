@@ -1059,13 +1059,16 @@ fn job_information(caller: &Caller, args: &mut dyn ApiArgs) -> Result<()> {
             o.extend(field("QDFTJOBD", 10));
             o.extend(field("QGPL", 10));
             o.extend(field("", 24)); // unit of work ID
-            o.extend(field("", 8)); // mode
+                                     // PUB400 2026-10-28, tools/golden/verify13.txt t13_rows J:
+                                     // the values below marked "t13" are those IBM i 7.5 gave a
+                                     // job there.
+            o.extend(field("*BLANK", 8)); // mode (t13)
             o.extend(field("*RQD", 10)); // inquiry message reply
             o.extend(field("*NO", 10)); // log CL programs
             o.extend(field("*NORMAL", 10)); // break message handling
             o.extend(field("*NORMAL", 10)); // status message handling
-            o.extend(field("", 13)); // device recovery action
-            o.extend(field("", 10)); // DDM conversation handling
+            o.extend(field("*MSG", 13)); // device recovery action (t13)
+            o.extend(field("*KEEP", 10)); // DDM conversation handling (t13)
             o.extend(field("/", 1)); // date separator
             o.extend(field("*MDY", 4)); // date format
             o.extend(field("", 30)); // print text
@@ -1073,8 +1076,8 @@ fn job_information(caller: &Caller, args: &mut dyn ApiArgs) -> Result<()> {
             o.extend(field("", 20)); // submitter's message queue
             o.extend(field(":", 1)); // time separator
             o.extend_from_slice(&bin4(65535)); // coded character set ID
-            o.extend(field("", 8)); // date and time scheduled
-            o.extend(field("", 10)); // print key format
+            o.extend(vec![0u8; 8]); // date and time scheduled: none (t13)
+            o.extend(field("*PRTHDR", 10)); // print key format (t13)
             o.extend(field("*HEX", 10)); // sort sequence
             o.extend(field("", 10));
             o.extend(field("ENU", 3)); // language ID
@@ -1082,28 +1085,33 @@ fn job_information(caller: &Caller, args: &mut dyn ApiArgs) -> Result<()> {
             o.extend(field("", 1)); // completion status
             o.extend(field("0", 1)); // signed-on job
             o.extend(field("00000000", 8)); // job switches
-            o.extend(field("", 10)); // message queue full action
-            o.extend(field("", 1));
-            o.extend_from_slice(&bin4(0)); // message queue maximum size
+            o.extend(field("*WRAP", 10)); // message queue full action (t13)
+            o.push(0); // reserved
+            o.extend_from_slice(&bin4(4)); // message queue maximum size (t13)
             o.extend_from_slice(&bin4(37)); // default coded character set ID
-            o.extend(field("", 80)); // routing data
+                                            // Routing data: none for a job not started by a routing
+                                            // entry (t13: a `system` command's job, 80 bytes X'00').
+            match &caller.job {
+                Some(_) => o.extend(field("QCMDB", 80)),
+                None => o.extend(vec![0u8; 80]),
+            }
             o.extend(field(" ", 1)); // decimal format (blank: a period)
             o.extend(field("", 10)); // character identifier control
             o.extend(field("", 30)); // server type
             o.extend(field("0", 1)); // allow multiple threads
             o.extend(field("0", 1)); // job log pending
-            o.extend(field("", 1));
+            o.push(0); // reserved
             o.extend_from_slice(&bin4(0)); // job end reason
             o.extend_from_slice(&bin4(0)); // job type enhanced
             o.extend(field("", 13)); // date and time ended
-            o.extend(field("", 1));
-            o.extend(field("", 10)); // spooled file action
+            o.push(0); // reserved
+            o.extend(field("*DETACH", 10)); // spooled file action (t13)
             o.extend_from_slice(&bin4(0)); // offset to ASP group information
             o.extend_from_slice(&bin4(0)); // number of entries
             o.extend_from_slice(&bin4(0)); // length of an entry
             o.extend(field("Q0000UTC", 10)); // time zone description
-            o.extend(field("", 10)); // job log output
-            o.extend(field("", 10)); // job description library ASP group
+            o.extend(field("*PND", 10)); // job log output (t13)
+            o.extend(field("*SYSBAS", 10)); // job description library ASP group (t13)
         }
         f => bail!("CPF3C21: Format name {f} is not valid."),
     }
@@ -1142,64 +1150,87 @@ async fn job_description(client: &Client, caller: &Caller, args: &mut dyn ApiArg
         .map(|r| r.get(0))
         .unwrap_or_default();
     let (jq_lib, jq) = d.jobq.split_once('/').unwrap_or(("*LIBL", &d.jobq));
+    // The attributes given when it was made (CRTJOBD/CHGJOBD), else
+    // CRTJOBD's defaults; layout and values as IBM i 7.5 returned them
+    // for QGPL/QDFTJOBD (PUB400 2026-10-28, tools/golden/verify13.txt
+    // t13_rows D: priorities right-aligned, a reserved X'00' after the
+    // text, *SYSVAL as one library-list entry, two fields after the job
+    // log output (*SYSVAL, the workload group *SBSD), the fixed part 472
+    // bytes long).
+    let other = crate::jobd::other_attributes(client, &d).await?;
+    let val = |k: &str, dft: &str| crate::jobd::given(&other, k).unwrap_or_else(|| dft.into());
+    let log = val("LOG", "4 0 *NOLIST");
+    let mut log = log.split_whitespace();
+    let (level, sev, logtext) = (
+        log.next().unwrap_or("4").to_string(),
+        log.next().unwrap_or("0").parse::<i64>().unwrap_or(0),
+        log.next().unwrap_or("*NOLIST").to_string(),
+    );
+    let prio = |k: &str| format!("{:>2}", val(k, "5"));
     let mut o = vec![0u8; 8];
     o.extend(field(&d.name, 10));
     o.extend(field(&d.library, 10));
     o.extend(field(&d.user, 10));
-    o.extend(field("*SYSVAL", 8)); // job date
-    o.extend(field("00000000", 8)); // job switches
+    o.extend(field(&val("DATE", "*SYSVAL"), 8)); // job date
+    o.extend(field(&val("SWS", "00000000"), 8)); // job switches
     o.extend(field(jq, 10));
     o.extend(field(jq_lib, 10));
-    o.extend(field("5", 2)); // job queue priority
-    o.extend(field("*NO", 10)); // hold on job queue
-    o.extend(field("*USRPRF", 10)); // output queue
-    o.extend(field("", 10));
-    o.extend(field("5", 2)); // output priority
-    o.extend(field("*USRPRF", 10)); // printer device
-    o.extend(field("*SYSVAL", 30)); // print text
-    o.extend_from_slice(&bin4(-1)); // syntax check severity (*NOCHK)
-    o.extend_from_slice(&bin4(30)); // end severity
-    o.extend_from_slice(&bin4(0)); // message logging severity
-    o.extend(field("4", 1)); // message logging level
-    o.extend(field("*NOLIST", 10)); // message logging text
-    o.extend(field("*NO", 10)); // log CL program commands
-    o.extend(field("*RQD", 10)); // inquiry message reply
+    o.extend(field(&prio("JOBPTY"), 2)); // job queue priority
+    o.extend(field(&val("HOLD", "*NO"), 10)); // hold on job queue
+    let outq = val("OUTQ", "*USRPRF");
+    let (oq_lib, oq) = outq.split_once('/').unwrap_or(("", &outq));
+    o.extend(field(oq, 10)); // output queue
+    o.extend(field(oq_lib, 10));
+    o.extend(field(&prio("OUTPTY"), 2)); // output priority
+    o.extend(field(&val("PRTDEV", "*USRPRF"), 10)); // printer device
+    o.extend(field(&val("PRTTXT", "*SYSVAL"), 30)); // print text
+    let syntax = match val("SYNTAX", "*NOCHK").as_str() {
+        "*NOCHK" => -1,
+        n => n.parse::<i64>().unwrap_or(-1),
+    };
+    o.extend_from_slice(&bin4(syntax)); // syntax check severity
+    o.extend_from_slice(&bin4(val("ENDSEV", "30").parse::<i64>().unwrap_or(30))); // end severity
+    o.extend_from_slice(&bin4(sev)); // message logging severity
+    o.extend(field(&level, 1)); // message logging level
+    o.extend(field(&logtext, 10)); // message logging text
+    o.extend(field(&val("LOGCLPGM", "*NO"), 10)); // log CL program commands
+    o.extend(field(&val("INQMSGRPY", "*RQD"), 10)); // inquiry message reply
     o.extend(field("*SYSVAL", 13)); // device recovery action
     o.extend(field("*SYSVAL", 10)); // time slice end pool
-    o.extend(field("*USRPRF", 15)); // accounting code
-    o.extend(field("QCMDB", 80)); // routing data
+    o.extend(field(&val("ACGCDE", "*USRPRF"), 15)); // accounting code
+    o.extend(field(&val("RTGDTA", "QCMDB"), 80)); // routing data
     o.extend(field(&desc, 50));
-    o.extend(field("", 1));
+    o.push(0); // reserved
     let libl: Vec<String> = match &d.inllibl {
         Some(l) => l.clone(),
-        None => crate::commands::USER_LIBRARY_LIST
-            .iter()
-            .map(|x| x.to_string())
-            .collect(),
+        None => vec!["*SYSVAL".to_string()],
     };
-    // The fixed part ends at 452 (after the log output); the library
-    // list and request data follow it.
-    let fixed = 452usize;
+    let fixed = 472usize;
     let rqs = e(&d.rqsdta);
     o.extend_from_slice(&bin4(fixed as i64)); // offset to the initial library list
     o.extend_from_slice(&bin4(libl.len() as i64));
     o.extend_from_slice(&bin4((fixed + 11 * libl.len()) as i64)); // offset to the request data
     o.extend_from_slice(&bin4(rqs.len() as i64));
     o.extend_from_slice(&bin4(0)); // job message queue maximum size
-    o.extend(field("*SYSVAL", 10)); // job message queue full action
-    o.extend(field("", 10)); // date (CYYMMDD)
-    o.extend(field("*NO", 10)); // allow multiple threads
-    o.extend(field("*SYSVAL", 10)); // spooled file action
+    o.extend(field(&val("JOBMSGQFL", "*SYSVAL"), 10)); // job message queue full action
+    o.extend(field("*SYSVAL", 10)); // (t13: *SYSVAL)
+    o.extend(field(&val("ALWMLTTHD", "*NO"), 10)); // allow multiple threads
+    o.extend(field(&val("SPLFACN", "*SYSVAL"), 10)); // spooled file action
     o.extend_from_slice(&bin4(0)); // offset to the ASP group information
     o.extend_from_slice(&bin4(0));
     o.extend_from_slice(&bin4(0));
-    o.extend(field("*KEEP", 10)); // DDM conversation
-    o.extend(field("*SYSVAL", 10)); // job log output
+    o.extend(field(&val("DDMCNV", "*KEEP"), 10)); // DDM conversation
+    o.extend(field(&val("LOGOUTPUT", "*SYSVAL"), 10)); // job log output
+    o.extend(field("*SYSVAL", 10)); // (t13: *SYSVAL)
+    o.extend(field("*SBSD", 10)); // workload group
     debug_assert_eq!(o.len(), fixed);
     for l in &libl {
         o.extend(field(l, 11));
     }
     o.extend(rqs);
+    // One blank more after the request data: 489 bytes returned for
+    // QDFTJOBD's five (t13_rows D000).
+    o.push(0x40);
     give(args, o)
 }
 

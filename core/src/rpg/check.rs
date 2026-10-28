@@ -28,6 +28,12 @@ pub struct Diag {
     pub id: String,
     pub sev: u8,
     pub text: String,
+    /// Where on its line the message points (characters from the start
+    /// of the source line, and how many): the listing shows it under the
+    /// line with a marker letter rather than in the additional
+    /// diagnostic messages (RNF3546: PUB400 2026-10-28,
+    /// tools/golden/verify13.txt t13_rpge).
+    pub at: Option<(usize, usize)>,
 }
 
 /// The checks' messages, and the names that are not defined (with the
@@ -149,6 +155,7 @@ impl Walker<'_> {
                 id: "RNF7030".into(),
                 sev: 30,
                 text: format!("Name or indicator {name} is not defined."),
+                at: None,
             });
         }
     }
@@ -161,6 +168,7 @@ impl Walker<'_> {
                 id: "RNF7503".into(),
                 sev: 30,
                 text: "The expression has an operand that is not defined.".into(),
+                at: None,
             });
         }
     }
@@ -222,6 +230,7 @@ impl Walker<'_> {
                         id: "RNF7503".into(),
                         sev: 30,
                         text: "The expression has an operand that is not defined.".into(),
+                        at: None,
                     });
                 }
                 self.value(l, value);
@@ -232,6 +241,7 @@ impl Walker<'_> {
                             id: "RNF7416".into(),
                             sev: 30,
                             text: "The types of the target and the value of the EVAL operation do not match.".into(),
+                            at: None,
                         });
                     }
                 }
@@ -261,6 +271,7 @@ impl Walker<'_> {
                         id: "RNF7260".into(),
                         sev: 30,
                         text: "The data structure in the result field cannot be used with this operation.".into(),
+                        at: None,
                     });
                     self.invalid_io.push(file.to_ascii_uppercase());
                 }
@@ -329,7 +340,8 @@ impl Walker<'_> {
 }
 
 /// Run the checks on a program's calculations.
-pub fn check(src: &Source, prog: &Program) -> Checked {
+/// `text`: the source as written (where a message points on its line).
+pub fn check(src: &Source, prog: &Program, text: &str) -> Checked {
     let mut w = Walker {
         prog,
         proc: None,
@@ -337,14 +349,14 @@ pub fn check(src: &Source, prog: &Program) -> Checked {
         bad_ds: Vec::new(),
         invalid_io: Vec::new(),
     };
-    let global_bad = self_likerec(&src.defs, &mut w.out.diags);
+    let global_bad = self_likerec(&src.defs, text, &mut w.out.diags);
     w.bad_ds = global_bad.clone();
     for c in &src.calcs {
         w.calc(c);
     }
     for p in &src.procs {
         w.proc = prog.procs.get(&p.name.to_ascii_uppercase());
-        let local = self_likerec(&p.defs, &mut w.out.diags);
+        let local = self_likerec(&p.defs, text, &mut w.out.diags);
         // A local definition of the name hides the global one.
         w.bad_ds = global_bad
             .iter()
@@ -387,6 +399,7 @@ pub fn check(src: &Source, prog: &Program) -> Checked {
                 id: "RNF7066".into(),
                 sev: 0,
                 text: format!("Record format {fmt} is not read or written."),
+                at: None,
             });
         }
     }
@@ -398,7 +411,7 @@ pub fn check(src: &Source, prog: &Program) -> Checked {
 
 /// RNF3546 for each data structure among `defs` whose LIKEREC names the
 /// data structure itself; their names.
-fn self_likerec(defs: &[super::ast::Def], diags: &mut Vec<Diag>) -> Vec<String> {
+fn self_likerec(defs: &[super::ast::Def], text: &str, diags: &mut Vec<Diag>) -> Vec<String> {
     let mut out = Vec::new();
     for d in defs {
         if d.kind != super::ast::DefKind::Ds {
@@ -413,11 +426,21 @@ fn self_likerec(defs: &[super::ast::Def], diags: &mut Vec<Diag>) -> Vec<String> 
             .map(|a| a.trim().to_ascii_uppercase())
             .unwrap_or_default();
         if fmt == d.name.to_ascii_uppercase() {
+            // The marker is under LIKEREC's argument (t13_rpge: "aaaa"
+            // under OUTR).
+            let at = text.lines().nth(d.line.wrapping_sub(1)).and_then(|l| {
+                let up = l.to_ascii_uppercase();
+                let k = up.find("LIKEREC")?;
+                let open = k + up[k..].find('(')? + 1;
+                let start = open + up[open..].len() - up[open..].trim_start().len();
+                Some((up[..start].chars().count(), fmt.chars().count()))
+            });
             diags.push(Diag {
                 line: d.line,
                 id: "RNF3546".into(),
                 sev: 20,
                 text: format!("LIKEREC({fmt}) does not name a record format here."),
+                at,
             });
             out.push(fmt);
         }
@@ -478,6 +501,7 @@ fn blocking(src: &Source) -> Vec<Diag> {
                 text: format!(
                     "RPG blocks the records of file {name}; its INFDS changes only when a block is read or written."
                 ),
+                at: None,
             });
         }
     }

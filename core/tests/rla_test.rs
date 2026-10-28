@@ -13585,10 +13585,29 @@ dcl-ds j len(1000) qualified;
   datfmt char(4) pos(220);
   timsep char(1) pos(300);
   decfmt char(1) pos(457);
+  mode char(8) pos(148);
+  devrcy char(13) pos(196);
+  ddm char(10) pos(209);
+  prtkey char(10) pos(313);
+  qfull char(10) pos(358);
+  qmax int(10) pos(369);
+  splfacn char(10) pos(523);
+  logout char(10) pos(555);
+  aspgrp char(10) pos(565);
+  sched char(8) pos(305);
+  rtg char(80) pos(377);
 end-ds;
 dcl-s err char(16) inz(x'00000010');
+dcl-s one int(10) inz(1);
 qusrjobi(j: %size(j): 'JOBI0400': '*': '': err);
 dsply (%char(j.avail) + ' ' + j.datfmt + j.datsep + j.timsep + '[' + j.decfmt + ']');
+dsply (%trim(j.mode) + ' ' + %trim(j.devrcy) + ' ' + %trim(j.ddm) + ' ' + %trim(j.prtkey)
+  + ' ' + %trim(j.qfull) + ' ' + %char(j.qmax) + ' ' + %trim(j.splfacn) + ' '
+  + %trim(j.logout) + ' ' + %trim(j.aspgrp));
+dsply (%char(%scan(x'40': j.sched)) + ' ' + %char(%scan(x'40': j.rtg)));
+// %EDITC of an expression edits its own length: %DEC(i: 4: 0) is four
+// digits (t13_rows: GLD13J's record IDs J0001, J0026...).
+dsply %editc(%dec(one: 4: 0): 'X');
 *inlr = *on;
 "#;
     let r = rpg::call(
@@ -13605,7 +13624,20 @@ dsply (%char(j.avail) + ' ' + j.datfmt + j.datsep + j.timsep + '[' + j.decfmt + 
     .await
     .unwrap();
     assert!(r.error.is_none(), "{:?}", r.error);
-    assert_eq!(r.messages, ["574 *MDY/:[ ]"]);
+    // PUB400 2026-10-28, tools/golden/verify13.txt t13_rows J (a
+    // `system` command's job on IBM i 7.5): mode *BLANK, device recovery
+    // *MSG, DDM *KEEP, print key *PRTHDR, queue full *WRAP, maximum 4,
+    // spooled file action *DETACH, job log output *PND, ASP group
+    // *SYSBAS; no scheduled date and no routing data (X'00', no blank).
+    assert_eq!(
+        r.messages,
+        [
+            "574 *MDY/:[ ]",
+            "*BLANK *MSG *KEEP *PRTHDR *WRAP 4 *DETACH *PND *SYSBAS",
+            "0 0",
+            "0001"
+        ]
+    );
 }
 
 /// INZ on a data structure initializes every subfield to its type's
@@ -13950,6 +13982,7 @@ dcl-ds d len(1000) qualified;
   text char(50) pos(310);
   ofs int(10) pos(361);
   n int(10) pos(365);
+  logsev int(10) pos(157);
 end-ds;
 dcl-s err char(16) inz(x'00000010');
 qcmdexc('CRTJOBD JOBD({lib}/TJOBD) INLLIBL(QGPL {lib}) TEXT(''Test jobd'')': 200);
@@ -13958,6 +13991,10 @@ dsply (%trim(d.text) + ' ' + %char(d.n) + ' ' + %trim(%subst(d: d.ofs + 1: 11))
   + ' ' + %trim(%subst(d: d.ofs + 12: 11)));
 qwdrjobd(d: %size(d): 'JOBD0100': 'NOSUCH    {lib}': err);
 dsply %subst(err: 9: 7);
+qwdrjobd(d: %size(d): 'JOBD0100': 'QDFTJOBD  QGPL': err);
+dsply (%char(d.avail) + ' [' + %subst(d: 75: 2) + '] ' + %char(d.logsev) + ' '
+  + %trim(%subst(d: 230: 80)) + ' ' + %char(d.n) + ' ' + %trim(%subst(d: d.ofs + 1: 11))
+  + ' ' + %subst(d: 453: 10) + %subst(d: 463: 10) + ' ' + %char(d.ofs));
 *inlr = *on;
 "#
     );
@@ -13983,10 +14020,19 @@ dsply %subst(err: 9: 7);
     .unwrap();
     assert!(r.error.is_none(), "{:?}", r.error);
     // CRTJOBD's completion message first.
-    let shown = &r.messages[r.messages.len().saturating_sub(2)..];
+    let shown = &r.messages[r.messages.len().saturating_sub(3)..];
+    // QGPL/QDFTJOBD as IBM i 7.5 returned it (PUB400 2026-10-28,
+    // tools/golden/verify13.txt t13_rows D): 489 bytes, job queue
+    // priority " 5", logging severity 20, routing data QCMDI, one
+    // initial library list entry *SYSVAL at offset 472, then *SYSVAL and
+    // *SBSD before it.
     assert_eq!(
         shown,
-        [format!("Test jobd 2 QGPL {lib}"), "CPF9801".to_string()],
+        [
+            format!("Test jobd 2 QGPL {lib}"),
+            "CPF9801".to_string(),
+            "489 [ 5] 20 QCMDI 1 *SYSVAL *SYSVAL   *SBSD      472".to_string()
+        ],
         "{:?}",
         r.messages
     );
@@ -17664,6 +17710,19 @@ async fn verify12_message_keys_likerec_and_crtsrcpf() {
     assert_eq!(o.status, 255, "{o:?}");
     assert_eq!(ids(&o.stderr), ["RNS9308", "RNS9310"]);
     let msg = |head: &str| o.stdout.iter().filter(|l| l.starts_with(head)).count();
+    // RNF3546 under its source line: a marker line with the letter under
+    // LIKEREC's argument, then the message with the letter (PUB400
+    // 2026-10-28, tools/golden/verify13.txt t13_rpge, the same source).
+    let at = o
+        .stdout
+        .iter()
+        .position(|l| l.starts_with("    34   dcl-ds outr likerec(OUTR: *output);"))
+        .unwrap_or_else(|| panic!("{o:?}"));
+    assert_eq!(o.stdout[at + 1], "======>                      aaaa");
+    assert!(
+        o.stdout[at + 2].starts_with("*RNF3546 20 a      000031  "),
+        "{o:?}"
+    );
     for (head, n) in [
         ("*RNF3546 20", 2), // the message and its summary line
         ("*RNF7030 30", 3),
@@ -17692,4 +17751,67 @@ async fn verify12_message_keys_likerec_and_crtsrcpf() {
 
     let o = sys!(format!("CRTSRCPF FILE({lib}/GLD12SRC) RCDLEN(92) MBR(M1)"));
     assert_eq!(ids(&o.stdout), ["CPC7301", "CPC7305"], "{o:?}");
+}
+
+/// SQL UPDATE and DELETE of a source file's records, the file named
+/// itself (PUB400 2026-10-28, tools/golden/verify13.txt t13_ins, t13_upd,
+/// t13_del, t13_src_print: three records 1.00, 2.00, 3.00 of 261029;
+/// UPDATE ... SET SRCDTA = 'TWO', SRCDAT = 261030 WHERE SRCSEQ = 2 and
+/// DELETE ... WHERE SRCSEQ = 1 leave 000200261030TWO and
+/// 000300261029three). Here a DELETE of two records in one statement
+/// too.
+#[tokio::test]
+async fn sql_update_and_delete_on_a_source_file() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    job.run(&format!("CRTSRCPF FILE({lib}/GLD13SRC) RCDLEN(92) MBR(M1)"))
+        .await
+        .unwrap();
+    for st in [
+        format!("INSERT INTO {lib}/GLD13SRC VALUES(1.00, 261029, 'one'), (2.00, 261029, 'two'), (3.00, 261029, 'three')"),
+        format!("UPDATE {lib}/GLD13SRC SET SRCDTA = 'TWO', SRCDAT = 261030 WHERE SRCSEQ = 2"),
+        format!("DELETE FROM {lib}/GLD13SRC WHERE SRCSEQ = 1"),
+    ] {
+        as4tainr_core::sql::run(&client, &url, std::slice::from_ref(&lib), &st)
+            .await
+            .unwrap_or_else(|e| panic!("{st}: {e:#}"));
+    }
+    let lines = || async {
+        client
+            .query(
+                "SELECT srcseq::text || '/' || srcdat::text || '/' || rtrim(srcdta)
+                   FROM as4tainr_svc.source_lines($1, 'GLD13SRC', 'M1')",
+                &[&lib],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(lines().await, ["2.00/261030/TWO", "3.00/261029/three"]);
+    // Two records in one statement: each finds its own line.
+    for st in [
+        format!("INSERT INTO {lib}/GLD13SRC VALUES(4.00, 0, 'four'), (5.00, 0, 'five')"),
+        format!("DELETE FROM {lib}.GLD13SRC WHERE SRCSEQ IN (2, 4)"),
+    ] {
+        as4tainr_core::sql::run(&client, &url, std::slice::from_ref(&lib), &st)
+            .await
+            .unwrap_or_else(|e| panic!("{st}: {e:#}"));
+    }
+    assert_eq!(lines().await, ["3.00/261029/three", "5.00/0/five"]);
 }

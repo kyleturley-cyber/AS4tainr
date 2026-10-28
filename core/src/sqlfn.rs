@@ -6,10 +6,12 @@
 
 /// The functions, as SQL for the services batch.
 pub fn sql() -> String {
+    // INSERT, UPDATE and DELETE on a source file SQL names (source.rs
+    // sql_sources).
+    let source = crate::source::insert_function("as4tainr_svc.source_insert")
+        + &crate::source::change_function("as4tainr_svc.source_change");
     format!(
-        "{FUNCTIONS}\n{MORE}\n{}\n{}\n{}",
-        // INSERT into a source file SQL names (source.rs sql_sources).
-        crate::source::insert_function("as4tainr_svc.source_insert"),
+        "{FUNCTIONS}\n{MORE}\n{source}\n{}\n{}",
         grants(),
         implicit_casts()
     )
@@ -75,6 +77,8 @@ fn grants() -> String {
         "job_name()",
         "source_lines(text, text, text)",
         "source_insert()",
+        "source_change()",
+        "source_records(text, text, text)",
         "char(numeric)",
         "char(smallint)",
         "char(integer)",
@@ -337,6 +341,21 @@ LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp A
 BEGIN
   RETURN QUERY
   SELECT CAST(coalesce(CAST(substr(q.v, 1, 6) AS numeric) / 100, l.n) AS numeric(6,2)),
+         CAST(coalesce(CAST(substr(q.v, 7, 6) AS numeric), 0) AS numeric(6,0)),
+         CAST(l.t AS varchar(32754))
+    FROM as4tainr.source_members m,
+         LATERAL regexp_split_to_table(regexp_replace(m.source, E'\n$', ''), E'\n') WITH ORDINALITY AS l(t, n),
+         LATERAL (SELECT (string_to_array(m.seqdat, E'\n'))[CAST(l.n AS int)] AS v) q
+   WHERE m.library = lib AND m.file = fil AND m.member = mbr AND m.source <> '';
+END $as4tainr$;
+-- The same with each record's relative record number (SQL naming a
+-- source file itself: source.rs sql_source_views).
+CREATE OR REPLACE FUNCTION as4tainr_svc.source_records(lib text, fil text, mbr text)
+RETURNS TABLE (rrn bigint, srcseq numeric(6,2), srcdat numeric(6,0), srcdta varchar(32754))
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $as4tainr$
+BEGIN
+  RETURN QUERY
+  SELECT l.n, CAST(coalesce(CAST(substr(q.v, 1, 6) AS numeric) / 100, l.n) AS numeric(6,2)),
          CAST(coalesce(CAST(substr(q.v, 7, 6) AS numeric), 0) AS numeric(6,0)),
          CAST(l.t AS varchar(32754))
     FROM as4tainr.source_members m,

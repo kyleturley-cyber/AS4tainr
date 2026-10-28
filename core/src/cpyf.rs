@@ -275,14 +275,26 @@ impl Job<'_> {
                 ));
             }
         }
+        let to_len = record_length(&to.file);
         let mut writer = rla::OpenFile::new(to.clone());
         for r in &records {
             let rec: rla::Record = if positional {
-                to_fields
-                    .iter()
-                    .zip(&fields)
-                    .filter_map(|(t, f)| r.get(f).map(|v| (t.clone(), v.clone())))
-                    .collect()
+                // FMTOPT(*NOCHK) copies the record's bytes: the from-record
+                // image, cut or padded with blanks to the to-file's length,
+                // read as the to-file's fields (PUB400 2026-10-22, y_print:
+                // CODE 5P 0 and NAME 20A copied into RCDLEN(30) print as
+                // three blank bytes, then the name). Bytes a decimal field
+                // cannot hold fall back to field by field.
+                let mut img = record_image(&from.file, r);
+                img.resize(to_len, crate::rpg::data::BLANK);
+                match image_record(&to.file, &img) {
+                    Ok(rec) => rec,
+                    Err(_) => to_fields
+                        .iter()
+                        .zip(&fields)
+                        .filter_map(|(t, f)| r.get(f).map(|v| (t.clone(), v.clone())))
+                        .collect(),
+                }
             } else {
                 r.iter()
                     .filter(|(k, _)| to_fields.contains(k) || k.as_str() == rla::NULLS)
@@ -407,7 +419,7 @@ pub fn printable(img: &[u8]) -> String {
 /// 2026-10-27 verify5 z_cpysplf_2f): a page header, the from-file, its
 /// member, record format and record length, the to-file; a ruler; each
 /// record's number (with the member number for a logical file) and its
-/// characters; the count line and the end line. 30 lines a page, the
+/// characters; the count line and the end line. Pages as below, the
 /// header and ruler repeated (v_print). The product line is as4tainr's.
 /// OUTFMT(*HEX): under each record's characters, a line of each byte's
 /// zone (high) digit and a line of its low digit (PUB400 2026-10-27,
@@ -424,7 +436,6 @@ pub fn print_listing(
     images: &[(i64, Vec<u8>)],
     stamp: &crate::report::Stamp,
 ) -> Vec<String> {
-    const PAGE: usize = 30;
     let qualified = format!("{lib}/{file}");
     let header = |page: usize| {
         format!(
@@ -452,45 +463,56 @@ pub fn print_listing(
         " To file . . . . . . :  *PRINT".to_string(),
         ruler.clone(),
     ];
+    // Pages: a record takes a line for each 100 bytes (three with
+    // OUTFMT(*HEX)) and one for the space before it, blank continuation
+    // lines left out but counted; the first page has room for 51 such
+    // lines, the others for 56 (PUB400 2026-10-22 v_print: 25 and 28 one-
+    // line records; 2026-10-27 verify8 c8_joblog7, verify10 e_pages: 17
+    // and 18 records of more than 100 bytes).
+    let chunks_per = reclen.div_ceil(100).max(1);
+    let units = chunks_per * if hex { 3 } else { 1 } + 1;
     let mut page = 1;
-    let mut on_page = out.len();
-    let need = if hex { 3 } else { 1 };
+    let mut room = 51;
     for (n, img) in images {
-        if on_page + need > PAGE {
+        if units > room {
             page += 1;
             out.push(header(page));
             out.push(ruler.clone());
-            on_page = 2;
+            room = 56;
         }
+        room = room.saturating_sub(units);
         let mbr = if logical { "1" } else { "" };
+        let nib = |c: &[u8], f: fn(u8) -> u8| -> String {
+            c.iter()
+                .map(|&b| char::from_digit(f(b) as u32, 16).unwrap_or('0'))
+                .collect::<String>()
+                .to_ascii_uppercase()
+        };
         // A record longer than 100 bytes goes on in further lines of 100,
-        // starting in column 20 (PUB400 2026-10-27, verify8 c8_joblog7:
-        // 132-byte records).
-        let text: Vec<char> = printable(img).chars().collect();
-        let mut chunks = text.chunks(100);
-        let first: String = chunks.next().unwrap_or(&[]).iter().collect();
-        out.push(format!("{mbr:>5}{n:>12}  {first}").trim_end().to_string());
+        // starting in column 20 (verify8 c8_joblog7: 132-byte records);
+        // with *HEX each part has its zone and digit lines under it
+        // (verify10 e_hex_long).
+        let parts: Vec<&[u8]> = img.chunks(100).collect();
+        let mut lines: Vec<String> = Vec::new();
+        for (k, c) in parts.iter().enumerate() {
+            let text = printable(c);
+            let lead = if k == 0 {
+                format!("{mbr:>5}{n:>12}  ")
+            } else {
+                format!("{:19}", "")
+            };
+            lines.push(format!("{lead}{text}").trim_end().to_string());
+            if hex {
+                lines.push(format!("{:19}{}", "", nib(c, |b| b >> 4)));
+                lines.push(format!("{:19}{}", "", nib(c, |b| b & 0x0F)));
+            }
+        }
         // Blank lines at the record's end are not printed (verify8
         // c8_dbr_rows: a 372-byte QADSPDBR record on one line).
-        let mut rest: Vec<String> = chunks.map(|c| c.iter().collect()).collect();
-        while rest.last().is_some_and(|c| c.trim().is_empty()) {
-            rest.pop();
+        while lines.len() > 1 && lines.last().is_some_and(|l| l.trim().is_empty()) {
+            lines.pop();
         }
-        for c in &rest {
-            out.push(format!("{:19}{c}", "").trim_end().to_string());
-        }
-        on_page += rest.len();
-        if hex {
-            let nib = |f: fn(u8) -> u8| -> String {
-                img.iter()
-                    .map(|&b| char::from_digit(f(b) as u32, 16).unwrap_or('0'))
-                    .collect::<String>()
-                    .to_ascii_uppercase()
-            };
-            out.push(format!("{:19}{}", "", nib(|b| b >> 4)));
-            out.push(format!("{:19}{}", "", nib(|b| b & 0x0F)));
-        }
-        on_page += need;
+        out.extend(lines);
     }
     out.push(format!(
         " {} records copied to member or label *N in file QSYSPRT in library QSYS. 0 records excluded.",
@@ -509,7 +531,7 @@ mod tests {
 
     // Expected lines: PUB400 (IBM i 7.5) 2026-10-22, files-and-programs
     // f_cpyf_print (a keyed logical file over CODE 5P 0, NAME 20A; the
-    // product line is as4tainr's) and rpg-sql v_print (30 lines a page).
+    // product line is as4tainr's) and rpg-sql v_print (25 records on the first page).
     #[test]
     fn print_layout() {
         let stamp = crate::report::Stamp {
@@ -633,6 +655,65 @@ mod tests {
         );
         assert_eq!(l[5], "                1  PGLD6TB");
         assert!(l[6].starts_with(" 1 records copied"), "{l:?}");
+    }
+
+    // verify10 e_pages: 40 records of 122 bytes, 17 on the first page and
+    // 18 on the next; e_hex_long: each 100-byte part with its hex lines.
+    #[test]
+    fn wrapped_pages_and_hex_parts() {
+        let rec = crate::tn5250::ebcdic::encode(&format!("{:<122}", "ASP_INFO"));
+        let recs: Vec<(i64, Vec<u8>)> = (1..=40).map(|n| (n, rec.clone())).collect();
+        let l = print_listing(
+            "L",
+            "F",
+            "F",
+            "F",
+            122,
+            false,
+            false,
+            &recs,
+            &crate::report::Stamp::default(),
+        );
+        let page2 = l
+            .iter()
+            .position(|x| x.ends_with("Page         2"))
+            .unwrap();
+        assert!(
+            l[page2 - 1].starts_with("               17  "),
+            "{:?}",
+            &l[page2 - 2..page2 + 3]
+        );
+        assert!(l[page2 + 2].starts_with("               18  "));
+        let page3 = l
+            .iter()
+            .position(|x| x.ends_with("Page         3"))
+            .unwrap();
+        assert!(l[page3 - 1].starts_with("               35  "));
+        let one = crate::tn5250::ebcdic::encode(&format!("{:<120}", "ASP_INFO"));
+        let mut img = one.clone();
+        img.extend([0x00, 0x7F]);
+        let l = print_listing(
+            "L",
+            "F",
+            "F",
+            "F",
+            122,
+            false,
+            true,
+            &[(2, img)],
+            &crate::report::Stamp::default(),
+        );
+        assert_eq!(
+            &l[5..11],
+            [
+                "                2  ASP_INFO".to_string(),
+                format!("{:19}CED6CDCD{}", "", "4".repeat(92)),
+                format!("{:19}127D9566{}", "", "0".repeat(92)),
+                format!("{:19}{:21}\"", "", ""),
+                format!("{:19}{}07", "", "4".repeat(20)),
+                format!("{:19}{}0F", "", "0".repeat(20)),
+            ]
+        );
     }
 
     // A packed field's bytes print as blanks, characters as themselves

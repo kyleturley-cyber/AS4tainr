@@ -17289,3 +17289,79 @@ async fn dspdbr_and_dspfd_outfiles() {
         "GLD7IX|L|K|GLD6TB|ID|A|1|1"
     );
 }
+
+/// CPYF FMTOPT(*NOCHK) copies the record's bytes (PUB400 2026-10-22,
+/// tools/golden/files-and-programs.txt y_fmt_nochk, y_print: CODE 5P 0
+/// and NAME 20A into a RCDLEN(30) file print as three blank bytes, then
+/// the name), X'00' included: a character field keeps any byte.
+#[tokio::test]
+async fn cpyf_nochk_copies_record_bytes() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    as4tainr_core::source::create_file(&client, &lib, "QDDSSRC", "")
+        .await
+        .unwrap();
+    as4tainr_core::source::put_member(
+        &client,
+        &as4tainr_core::source::Member {
+            library: lib.clone(),
+            file: "QDDSSRC".into(),
+            name: "GLDPF".into(),
+            srctype: "PF".into(),
+            text: String::new(),
+            source: "     A          R GLDR\n     A            CODE           5P 0\n     A            NAME          20A\n".into(),
+            ..Default::default()
+        },
+        true,
+    )
+    .await
+    .unwrap();
+    for c in [
+        format!("CRTPF FILE({lib}/GLDPF) SRCFILE({lib}/QDDSSRC)"),
+        format!("RUNSQL SQL('INSERT INTO {lib}/GLDPF VALUES(1, ''Alpha'')') COMMIT(*NONE)"),
+        format!("CRTPF FILE({lib}/GLDCPY2) RCDLEN(30)"),
+        format!("CPYF FROMFILE({lib}/GLDPF) TOFILE({lib}/GLDCPY2) MBROPT(*ADD) FMTOPT(*NOCHK)"),
+    ] {
+        job.run(&c).await.unwrap();
+    }
+    let v: String = client
+        .query_one(
+            &format!("SELECT gldcpy2 FROM {}.gldcpy2", lib.to_ascii_lowercase()),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    // Packed 1 is X'00001F'; then NAME and the 7 blank bytes of padding.
+    let bytes = as4tainr_core::tn5250::ebcdic::encode(&v);
+    assert_eq!(&bytes[..3], [0x00, 0x00, 0x1F]);
+    assert_eq!(
+        as4tainr_core::tn5250::ebcdic::decode(&bytes[3..]),
+        format!("{:<27}", "Alpha")
+    );
+    // Read back through record-level access, the bytes are the same.
+    let fr = as4tainr_core::catalog::resolve_file(&client, std::slice::from_ref(&lib), "GLDCPY2")
+        .await
+        .unwrap();
+    let mut f = as4tainr_core::rla::OpenFile::new(fr);
+    let r = f.read(&client).await.unwrap();
+    let got = r.record.unwrap()["GLDCPY2"].clone();
+    assert_eq!(
+        as4tainr_core::tn5250::ebcdic::encode(&got)[..3],
+        [0x00, 0x00, 0x1F]
+    );
+}

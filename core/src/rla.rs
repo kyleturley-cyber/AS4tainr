@@ -351,7 +351,10 @@ impl OpenFile {
 
     /// Normalize a value for a field before it is bound as a parameter.
     fn normalize(f: &FieldDef, v: &str) -> String {
-        f.to_db(v)
+        // A character field holds any bytes, X'00' too (a record is bytes
+        // on IBM i): PostgreSQL text cannot, so NUL is kept as
+        // ebcdic::NUL_CHAR, which converts back to X'00'.
+        f.to_db(&v.replace('\0', &crate::tn5250::ebcdic::NUL_CHAR.to_string()))
     }
 
     /// Build `(k1, ..., km) <op> (CAST($n AS t1), ...)` for a key prefix.

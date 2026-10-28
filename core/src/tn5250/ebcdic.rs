@@ -47,13 +47,20 @@ pub const FROM_UNICODE: [u8; 256] = [
     0x8C, 0x49, 0xCD, 0xCE, 0xCB, 0xCF, 0xCC, 0xE1, 0x70, 0xDD, 0xDE, 0xDB, 0xDC, 0x8D, 0x8E, 0xDF,
 ];
 
-/// Convert text to EBCDIC. Characters outside Latin-1 become '?'.
+/// How X'00' in a character field is stored (PostgreSQL text holds no
+/// NUL): a private-use character that `encode` turns back into X'00'.
+pub const NUL_CHAR: char = '\u{E000}';
+
+/// Convert text to EBCDIC. Characters outside Latin-1 become '?'
+/// (NUL_CHAR becomes X'00').
 pub fn encode(s: &str) -> Vec<u8> {
     s.chars()
         .map(|c| {
             let u = c as u32;
             if u < 256 {
                 FROM_UNICODE[u as usize]
+            } else if c == NUL_CHAR {
+                0x00
             } else {
                 0x6F
             }

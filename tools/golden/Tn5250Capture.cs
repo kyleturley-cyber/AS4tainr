@@ -382,8 +382,9 @@ public class Tn5250Capture
                         break;
                     }
                 default:
-                    if (b == 0x00 || b == 0x1C || b == 0x0E || b == 0x0F || b >= 0x20) { Put(b); i++; }
-                    else return "order " + b.ToString("X2") + " is not supported";
+                    // Any other byte is data: IBM i sends a record's own
+                    // bytes as they are (DSPPFM of a packed field: X'1F').
+                    Put(b); i++;
                     break;
             }
         }

@@ -225,6 +225,8 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] DSPFD OUTPUT(*OUTFILE) TYPE(*BASATR), *MBR, *RCDFMT, *ACCPTH
 - [x] Display commands' reports spooled under their IBM printer files (QPRTOBJD, QPDSPFD, QPDSPFFD...)
 - [x] CPYSPLF into a file of any record format (CPF3370, CPF9846); DSPDBR foreign key dependents
+- [x] CPYF FMTOPT(*NOCHK) copies record bytes; character fields keep X'00'
+- [x] CPYF TOFILE(*PRINT): OUTFMT(*HEX) parts of long records, IBM page breaks
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).
 - [x] Journals and trigger programs: COM's SETUPJRN, ORDAUDJV (QSYS2.DISPLAY_JOURNAL) and ORDTRG (ADDPFTRG) run (docs/journals.md).

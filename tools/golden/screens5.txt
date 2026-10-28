@@ -1,0 +1,24 @@
+# 5250 screens of PUB400 (IBM i 7.5), round 5: DSPPFM, how IBM i shows a
+# member's record bytes (a packed and a character field, a record of more
+# than one screen width), F10 hex, F11 character, F20 right.
+# Objects: table SCR5PF and file SCR5W in AS4TRAINR1 (created and deleted here).
+# Run: screens.ps1 -List tools\golden\screens5.txt -Out target\ibmi\screens5
+01_signon|{USER}{TAB}{PASSWORD}{ENTER}
+02_after_signon|{ENTER}
+03_cmd_entry|call qcmd{ERASEEOF}{ENTER}
+04_table|runsql sql('create table as4trainr1/scr5pf (code dec(5, 0) not null, name char(20) not null)') commit(*none){ERASEEOF}{ENTER}
+05_rows|runsql sql('insert into as4trainr1/scr5pf values(1, ''Alpha''), (-23, ''Beta''), (456, ''Gamma'')') commit(*none){ERASEEOF}{ENTER}
+06_wide|runsql sql('create table as4trainr1/scr5w (a char(100) not null, b char(60) not null)') commit(*none){ERASEEOF}{ENTER}
+07_wide_row|runsql sql('insert into as4trainr1/scr5w values(''left'', ''right end'')') commit(*none){ERASEEOF}{ENTER}
+08_dsppfm|dsppfm as4trainr1/scr5pf{ERASEEOF}{ENTER}
+09_dsppfm_f10|{F10}
+10_dsppfm_f11|{F11}
+11_dsppfm_exit|{F3}
+12_dsppfm_wide|dsppfm as4trainr1/scr5w{ERASEEOF}{ENTER}
+13_dsppfm_wide_f20|{F20}
+14_dsppfm_wide_f10|{F10}
+15_dsppfm_wide_exit|{F3}
+16_dltf|dltf as4trainr1/scr5pf{ERASEEOF}{ENTER}
+17_dltf_wide|dltf as4trainr1/scr5w{ERASEEOF}{ENTER}
+18_exit_cmd_entry|{F3}
+19_signoff|signoff{ERASEEOF}{ENTER}

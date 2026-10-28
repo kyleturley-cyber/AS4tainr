@@ -209,6 +209,49 @@ pub fn member(f: &FileInfo) -> Vec<Record> {
             ("MBUKV1", f.records.to_string()),
         ]);
     }
+    if f.logical {
+        // A logical member has no data of its own: sizes, capacity and
+        // counts are 0, allocation blank, no record formats selector, its
+        // based-on member and the records in its access path; an SQL
+        // index recovers *AFTIPL (A) (PUB400 2026-10-27, verify10
+        // e_mlf_vals, e_mix_vals: a DDS logical file and an SQL index).
+        let bf = f.based_on.clone().unwrap_or_default();
+        for (k, v) in [
+            ("MBJOIN", "N".to_string()),
+            ("MBSIZ", "0".into()),
+            ("MBSIZI", "0".into()),
+            ("MBSIZM", "0".into()),
+            ("MBRCDC", "0".into()),
+            ("MBNRCD", "0".into()),
+            ("MBNDTR", "0".into()),
+            ("MBALLO", String::new()),
+            ("MBCONT", String::new()),
+            ("MBFMTS", "*NONE".into()),
+            ("MBDSSZ", "0".into()),
+            ("MBDSZ2", "0".into()),
+            ("MBIXNT", "0".into()),
+            ("MBNSCM", "1".into()),
+            ("MBBOF", bf.1.clone()),
+            ("MBBOL", crate::qtemp::logical(&bf.0)),
+            ("MBBOM", bf.1.clone()),
+            ("MBBOLF", f.file.format.clone()),
+            ("MBBOR", f.records.to_string()),
+            ("MBUCEN", String::new()),
+            ("MBUDAT", String::new()),
+            ("MBUCNT", "0".into()),
+            ("MBAPBL", "0".into()),
+            ("MBINTR", String::new()),
+            ("MBRBCK", String::new()),
+            ("MBNSC2", "1".into()),
+        ] {
+            set(&mut r, k, v);
+        }
+        if sql_code(f) == "I" {
+            set(&mut r, "MBRECV", "A".into());
+            set(&mut r, "MBISIZ", "155648".into());
+            set(&mut r, "MBISZ2", "155648".into());
+        }
+    }
     if let Some((j, l, images)) = &f.journal {
         r.extend([
             ("MBJRNM", j.clone()),
@@ -217,6 +260,14 @@ pub fn member(f: &FileInfo) -> Vec<Record> {
         ]);
     }
     vec![r]
+}
+
+/// A field's value in a record, replaced or added.
+fn set(r: &mut Record, k: &'static str, v: String) {
+    match r.iter_mut().find(|(n, _)| *n == k) {
+        Some(e) => e.1 = v,
+        None => r.push((k, v)),
+    }
 }
 
 /// QAFDRFMT (c8_fmt_vals1): the record format.
@@ -632,6 +683,43 @@ mod tests {
             ("APNSC2", "0"),
         ] {
             assert_eq!(get(a, k), v, "{k}");
+        }
+    }
+
+    // PUB400 2026-10-27, verify10 e_mlf_vals1-3: the member of a DDS
+    // logical file over GLD10PF selecting 3 of its records.
+    #[test]
+    fn logical_member() {
+        let mut f = info();
+        f.name = "GLD10LF".into();
+        f.logical = true;
+        f.sql_type = String::new();
+        f.file.keys = vec!["ID".into()];
+        f.file.format = "GLD10R".into();
+        f.based_on = Some(("AS4TRAINR1".into(), "GLD10PF".into()));
+        f.records = 3;
+        let m = &member(&f)[0];
+        for (k, v) in [
+            ("MBJOIN", "N"),
+            ("MBSIZ", "0"),
+            ("MBRCDC", "0"),
+            ("MBNRCD", "0"),
+            ("MBALLO", ""),
+            ("MBFMTS", "*NONE"),
+            ("MBDSSZ", "0"),
+            ("MBIXNT", "0"),
+            ("MBNSCM", "1"),
+            ("MBBOF", "GLD10PF"),
+            ("MBBOM", "GLD10PF"),
+            ("MBBOLF", "GLD10R"),
+            ("MBBOR", "3"),
+            ("MBUCNT", "0"),
+            ("MBAPBL", "0"),
+            ("MBNSC2", "1"),
+            ("MBRECV", "N"),
+            ("MBISIZ", "90112"),
+        ] {
+            assert_eq!(get(m, k), v, "{k}");
         }
     }
 

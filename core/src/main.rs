@@ -189,6 +189,12 @@ fn split_lib_file(q: &str) -> Result<(String, String)> {
 }
 
 fn main() -> std::process::ExitCode {
+    // RPG's RETURN, LEAVESR and GOTO travel as errors: with
+    // RUST_BACKTRACE set, each would capture a backtrace (a call returning
+    // costs microseconds instead of nanoseconds). Panics still print one.
+    if std::env::var_os("RUST_LIB_BACKTRACE").is_none() {
+        std::env::set_var("RUST_LIB_BACKTRACE", "0");
+    }
     // Programs call programs that run CL, REXX and SQL that call programs
     // again (iRPGUnit's self-tests run its build scripts from a test):
     // each nested call is a frame of the interpreters on the thread's

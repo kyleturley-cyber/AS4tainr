@@ -170,6 +170,10 @@ pub struct ModuleInfo {
     /// It has a main procedure (cycle or ctl-opt MAIN): it can be a
     /// program's entry module.
     pub has_main: bool,
+    /// Binding directories its control specification names (BNDDIR):
+    /// kept with the module and used when it is bound (ILE RPG Reference,
+    /// BNDDIR keyword).
+    pub bnddir: Vec<String>,
 }
 
 /// Compile a module and say what it exports and imports.
@@ -185,6 +189,7 @@ pub async fn module_info(client: &Client, libl: &[String], m: &ModuleCopy) -> Re
             exports: vec![m.name.to_ascii_uppercase()],
             imports: p.called_procedures(),
             has_main: true,
+            bnddir: Vec::new(),
         });
     }
     let prog = crate::rpg::compile_with(client, libl, &m.name, &m.source, &m.options)
@@ -200,6 +205,15 @@ pub async fn module_info(client: &Client, libl: &[String], m: &ModuleCopy) -> Re
         exports,
         imports,
         has_main: !prog.nomain,
+        bnddir: crate::rpg::ast::keyword(&prog.control, "BNDDIR")
+            .map(|k| {
+                k.args
+                    .iter()
+                    .map(|a| a.trim().trim_matches('\'').to_ascii_uppercase())
+                    .filter(|a| !a.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -338,7 +352,16 @@ pub async fn bind(
         srvpgms.push((lib, n.clone(), b));
     }
     let mut dir: Vec<(String, String, String)> = Vec::new();
-    for d in bnddir {
+    // The command's binding directories, then those the modules name.
+    let mut dirs: Vec<String> = bnddir.to_vec();
+    for i in &infos {
+        for d in &i.bnddir {
+            if !dirs.contains(d) {
+                dirs.push(d.clone());
+            }
+        }
+    }
+    for d in &dirs {
         dir.extend(bnddir_entries(client, libl, d).await?);
     }
     // Resolve until nothing new is bound in (a module from a binding

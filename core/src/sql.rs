@@ -184,6 +184,30 @@ pub async fn grant_library(client: &Client, library: &str) -> Result<()> {
     Ok(())
 }
 
+/// GRANT CREATE ON SCHEMA to the SQL role, while a routine or view is
+/// defined. Another process granting on the same schema at that moment
+/// (`init`'s grants to every library) makes it fail with "tuple
+/// concurrently updated": it is tried again.
+async fn grant_create(client: &Client, schema: &str) -> Result<(), tokio_postgres::Error> {
+    let mut tries = 0;
+    loop {
+        match client
+            .batch_execute(&format!("GRANT CREATE ON SCHEMA {schema} TO {SQL_ROLE}"))
+            .await
+        {
+            Err(e)
+                if tries < 5
+                    && e.as_db_error()
+                        .is_some_and(|d| d.message().starts_with("tuple concurrently")) =>
+            {
+                tries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50 * tries)).await;
+            }
+            r => return r,
+        }
+    }
+}
+
 // ------------------------------------------------------------ tokens
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3000,9 +3024,7 @@ async fn create_view_locked(
     check_option: bool,
     me: &str,
 ) -> Result<()> {
-    client
-        .batch_execute(&format!("GRANT CREATE ON SCHEMA {schema} TO {SQL_ROLE}"))
-        .await?;
+    grant_create(client, schema).await?;
     let cols = if columns.is_empty() {
         String::new()
     } else {
@@ -3061,9 +3083,7 @@ pub(crate) async fn define_as_sql_role(
     let session = Session::open(client, database_url, libl).await?;
     let schema = ident(library);
     client.batch_execute(catalog::ROLE_DDL_LOCK).await?;
-    let granted = client
-        .batch_execute(&format!("GRANT CREATE ON SCHEMA {schema} TO {SQL_ROLE}"))
-        .await;
+    let granted = grant_create(client, &schema).await;
     if let Err(e) = granted {
         let _ = client.batch_execute(catalog::ROLE_DDL_UNLOCK).await;
         return Err(e.into());

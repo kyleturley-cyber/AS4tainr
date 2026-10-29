@@ -1009,6 +1009,54 @@ impl<'a> Machine<'a> {
                         return Ok(Value::str(&ts));
                     }
                 }
+                // An operand of float type makes the operation a float one:
+                // the other operand is converted to float first (ILE RPG
+                // Reference, "Floating-Point Arithmetic" / expression
+                // operands; OSSILE's arraylist unit test compares a decimal
+                // literal of 19 digits with an 8-byte float it stored).
+                if matches!(
+                    op,
+                    BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Div
+                        | BinOp::Eq
+                        | BinOp::Ne
+                        | BinOp::Lt
+                        | BinOp::Le
+                        | BinOp::Gt
+                        | BinOp::Ge
+                ) && (self.is_float(l) || self.is_float(r))
+                    && !matches!(x, Value::Char(_) | Value::Ind(_))
+                    && !matches!(y, Value::Char(_) | Value::Ind(_))
+                {
+                    let (fx, fy) = (float_value(&x)?, float_value(&y)?);
+                    let num = |f: f64| -> Value {
+                        match data::float_dec(f) {
+                            Ok(d) => Value::Num(d),
+                            Err(_) => Value::Float(f),
+                        }
+                    };
+                    return Ok(match op {
+                        BinOp::Add => num(fx + fy),
+                        BinOp::Sub => num(fx - fy),
+                        BinOp::Mul => num(fx * fy),
+                        BinOp::Div => {
+                            if fy == 0.0 {
+                                bail!(
+                                    "MCH1211: Attempt made to divide by zero for floating point."
+                                );
+                            }
+                            num(fx / fy)
+                        }
+                        BinOp::Eq => Value::Ind(fx == fy),
+                        BinOp::Ne => Value::Ind(fx != fy),
+                        BinOp::Lt => Value::Ind(fx < fy),
+                        BinOp::Le => Value::Ind(fx <= fy),
+                        BinOp::Gt => Value::Ind(fx > fy),
+                        _ => Value::Ind(fx >= fy),
+                    });
+                }
                 match op {
                     BinOp::Add => match (&x, &y) {
                         // An indicator is character data of length 1 (ILE
@@ -1143,6 +1191,34 @@ impl<'a> Machine<'a> {
             }
             Expr::Bif(b, args) if b == "ABS" => self.num_precision(args.first()?),
             _ => None,
+        }
+    }
+
+    /// Whether an expression has a float type: a float field, a call of
+    /// a procedure returning a float, %FLOAT, or arithmetic with one.
+    fn is_float(&self, ex: &Expr) -> bool {
+        match ex {
+            Expr::Name { parts, args } => match self.type_of(ex) {
+                Some(t) => matches!(t, DType::Float(_)),
+                None if args.is_some() || parts.len() == 1 => {
+                    let n = parts.join(".").to_ascii_uppercase();
+                    let ret = self
+                        .prog
+                        .protos
+                        .get(&n)
+                        .and_then(|p| p.returns)
+                        .or_else(|| self.prog.procs.get(&n).and_then(|p| p.returns));
+                    matches!(ret, Some(DType::Float(_)))
+                }
+                None => false,
+            },
+            Expr::Path { .. } => matches!(self.type_of(ex), Some(DType::Float(_))),
+            Expr::Bif(b, _) => b == "FLOAT",
+            Expr::Unary(UnOp::Neg | UnOp::Plus, e) => self.is_float(e),
+            Expr::Bin(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Pow, l, r) => {
+                self.is_float(l) || self.is_float(r)
+            }
+            _ => false,
         }
     }
 
@@ -6379,12 +6455,6 @@ impl<'a> Machine<'a> {
     ) -> Result<Option<Value>> {
         let client = self.io.client;
         let libl = self.io.libl.clone();
-        // A CL module's procedure (ILE CL: one procedure, named as the
-        // module): it runs in the job as a CL program does, its
-        // parameters by reference.
-        if let Some(m) = self.cl_module(sym, target, module)? {
-            return self.call_cl_module(&m, args);
-        }
         // Found and compiled at the first call in the activation group
         // (ILE Concepts: a service program is activated once, then its
         // procedures are called directly).
@@ -6401,6 +6471,12 @@ impl<'a> Machine<'a> {
         let (_, unit, binding, prog) = match cached.filter(|c| c.0 == generation) {
             Some(c) => c,
             None => {
+                // A CL module's procedure (ILE CL: one procedure, named as
+                // the module): it runs in the job as a CL program does, its
+                // parameters by reference.
+                if let Some(m) = self.cl_module(sym, target, module)? {
+                    return self.call_cl_module(&m, args);
+                }
                 let mut c = self.resolve_bound(sym, target, module, client, &libl)?;
                 c.0 = generation;
                 if let Ok(mut g) = BOUND.lock() {
@@ -6865,7 +6941,13 @@ impl<'a> Machine<'a> {
         let mut files = HashMap::new();
         let mut lengths = Vec::new();
         for (i, arg) in args.into_iter().enumerate() {
-            let p = &pi.params[i];
+            // More arguments than the procedure has parameters (a call
+            // through a procedure pointer whose prototype lists more): the
+            // procedure does not see them; %PARMS still counts them.
+            let Some(p) = pi.params.get(i) else {
+                passed = i + 1;
+                continue;
+            };
             lengths.push(match &arg {
                 Arg::Ref(l) => {
                     let cur = || {

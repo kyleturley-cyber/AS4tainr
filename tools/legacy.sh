@@ -24,7 +24,8 @@
 #   Make: `liblist -c` and `system` from a shell in the clone, which is
 #   in the IFS at the same path, so relative SRCSTMF paths work), each
 #   step run here with the current library and library list liblist
-#   sets; then MYPGM (printf and DSPLY).
+#   sets; then MYPGM (printf and DSPLY); after iRPGUnit is installed, its
+#   unit test (qtestsrc) made with RUCRTRPG and run with RUCALLTST.
 # - iRPGUnit (CPL-1.0): its members copied into the source files of
 #   library IRPGUNIT (CPYFRMSTMF; RPGUnit has RPGUNIT), built by its own
 #   REXX procedure A_INSTALL (STRREXPRC, as its README says) into that
@@ -36,6 +37,9 @@
 #   with validity checkers that look for QCATRS on the call stack,
 #   RTNVAL parameters), then its SPLFDLT command, which lists the user's
 #   spooled files with QUSLSPL SPLF0300 in a user space and deletes them.
+# - OSSILE (MIT): imported, then its arraylist and linked list unit tests
+#   (RPGUnit test service programs: ALIST01 made with RUCRTTST, LLIST_UT_1
+#   as its Makefile makes it) run with RUCALLTST in batch jobs.
 #
 #   tools/legacy.sh
 #
@@ -57,6 +61,7 @@ clone https://github.com/richardschoen/QshOni.git qshoni
 clone https://github.com/IBM/ibmi-company_system.git cmpsys
 clone https://github.com/tools-400/irpgunit.git irpgunit
 clone https://github.com/MarcoDeSenas/IBMi-topics-thanks-to-pub400.git topics
+clone https://github.com/OSSILE/OSSILE.git ossile
 
 step() {
   echo "== $*"
@@ -135,6 +140,27 @@ run "CRTBNDCL PGM(RPGUNIT/MKRPGUNITT) SRCFILE(RPGUNIT/RPGUNITT1)" | tail -1
 "$bin" --libl RPGUNIT batch "CALL RPGUNIT/MKRPGUNITT PARM(RPGUNIT)" 2>&1 |
   grep -E "^(Success|FAILURE|ERROR)\.|CPF124[01]"
 
+step "OSSILE (import, then the arraylist and linked list unit tests with RPGUnit)"
+"$bin" import "$work/ossile" --lib OSSILE | tail -1
+"$bin" put "$work/ossile" /home/ossile >/dev/null
+oss() { "$bin" --libl OSSILE,RPGUNIT,QGPL system "$1" 2>&1 | grep -E "^(CP[CDF]|RNF|RNS)" | tail -1; }
+# The unit tests call procedures the libraries' binder sources do not
+# export (arraylist_sublist; llist.bnd has two PGMLVL(*CURRENT) blocks),
+# so they are bound to service programs that export every procedure.
+oss "CRTSRVPGM SRVPGM(OSSILE/ALISTALL) MODULE(OSSILE/ARRAYLIST) EXPORT(*ALL)"
+oss "CRTSRVPGM SRVPGM(OSSILE/LLISTALL) MODULE(OSSILE/LLIST OSSILE/LLIST_SORT) EXPORT(*ALL)"
+# ALIST01 copies the prototypes as member ALIST_H; RUCRTTST compiles it.
+oss "CPYFRMSTMF FROMSTMF('/home/ossile/main/arraylist/arraylist_h.rpgle') TOMBR('/QSYS.LIB/OSSILE.LIB/QRPGLESRC.FILE/ALIST_H.MBR') MBROPT(*REPLACE)"
+oss "CPYFRMSTMF FROMSTMF('/home/ossile/main/arraylist/unittests/alist01.rpgle') TOMBR('/QSYS.LIB/OSSILE.LIB/QRPGLESRC.FILE/ALIST01.MBR') MBROPT(*REPLACE)"
+"$bin" --libl OSSILE,RPGUNIT,QGPL system "RUCRTTST TSTPGM(OSSILE/ALIST01) SRCFILE(OSSILE/QRPGLESRC) BNDSRVPGM(OSSILE/ALISTALL)" 2>&1 | grep -E "^(CPF|RNF)"
+# LLIST_UT_1 as its Makefile builds it (llist_h.rpgle from INCDIR).
+oss "CRTRPGMOD MODULE(OSSILE/LLIST_UT_1) SRCSTMF('/home/ossile/main/linkedlist/unittest/llist_ut_1.rpgle') INCDIR('/home/ossile/main/linkedlist')"
+oss "CRTSRVPGM SRVPGM(OSSILE/LLIST_UT_1) EXPORT(*ALL) BNDSRVPGM(RUTESTCASE LLISTALL)"
+for t in ALIST01 LLIST_UT_1; do
+  "$bin" --libl OSSILE,RPGUNIT,QGPL batch "RPGUNIT/RUCALLTST TSTPGM(OSSILE/$t)" 2>&1 |
+    grep -E "^(Success|FAILURE|ERROR)\.|CPF124[01]"
+done
+
 step "QshOni (build.sh, then QSHEXEC)"
 shim="$work/shim"
 mkdir -p "$shim"
@@ -203,6 +229,15 @@ irpg "CHKOBJ OBJ(IRPGUNIT/ASSERTT) OBJTYPE(*SRVPGM)" && echo "Test service progr
 irpg "RUCALLTST TSTPGM(IRPGUNIT/ASSERTT) TSTPRC(TESTASSERTCLEAR TESTASSERTCOUNT TESTASSERTEQUAL_DATE TESTASSERTEQUAL_IND TESTASSERTEQUAL_INTEGER TESTASSERTEQUAL_STRING TESTASSERTEQUAL_TIME TESTASSERTEQUAL_TIMESTAMP TESTASSERTWITHFAILURE TESTASSERTWITHSUCCESS TESTBIGINTEGEREQUALITY TESTCLEARASSERTFAILEVENT TESTGETASSERTFAILEVT TESTGETLOGVALUE TESTGOODBYEISNOTHELLO TESTHELLOEQUALSHELLO TESTTOIND TESTTWOANDTWOEQUALSFOUR TESTTWOANDTWOISNOTEQUALTOFIVE)" |
   grep -E "^ *(Success|FAILURE|ERROR)\."
 irpg "RUCALLTST TSTPGM(IRPGUNIT/ASSERTT)" | grep -a -E "^ *(Success|FAILURE|ERROR)\."
+
+step "Company System's unit test (qtestsrc: RUCRTRPG with testing.json's options, RUCALLTST)"
+# EMPDET's test (SQLRPGLE from the IFS) mocks EMPLOYEE and DEPARTMENT
+# with CRTDUPOBJ and OVRDBF OVRSCOPE(*JOB) in QTEMP; ctl-opt BNDDIR('APP')
+# binds it to EMPDET.
+cs() { "$bin" --libl CMPSYS,IRPGUNIT,QGPL --curlib CMPSYS batch "$1" 2>&1; }
+cs "IRPGUNIT/RUCRTRPG TSTPGM(CMPSYS/EMPDETT) SRCSTMF('$work/cmpsys/qtestsrc/empdet.test.sqlrpgle') INCDIR('$work/cmpsys') RPGPPOPT(*LVL2) TGTCCSID(*JOB) DBGVIEW(*SOURCE)" |
+  grep -a -E "^(Test program|CPF9897)"
+cs "IRPGUNIT/RUCALLTST TSTPGM(CMPSYS/EMPDETT)" | grep -a -E "^ *(Success|FAILURE|ERROR)\.|CPF124[01]"
 
 step "IBMi-topics (import, then SPLFDLT *LOGONLY and *BOTH in batch jobs)"
 "$bin" import "$work/topics" --lib TOPICS 2>/dev/null | tail -1

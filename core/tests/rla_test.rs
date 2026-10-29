@@ -5339,6 +5339,19 @@ async fn ile_modules_service_programs_bnddir() {
     .await
     .unwrap_err();
     assert!(e.contains("CPD5D03"), "{e}");
+    // A module keeps the binding directories its control specification
+    // names; CRTPGM binds with them (ILE RPG Reference, BNDDIR keyword),
+    // as IBM's Company System test binds EMPDET through ctl-opt BNDDIR.
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/USEMATH)"),
+        format!("CRTPGM PGM({lib}/USEMATH2) MODULE({lib}/USEMATH)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    let r = cl_cmd(&mut job, format!("CALL PGM({lib}/USEMATH2)"))
+        .await
+        .unwrap();
+    assert_eq!(r[..2], ["DSPLY  3.25", "DSPLY  10.00"]);
 }
 
 /// Run a CL command; its messages, or the error.
@@ -11103,6 +11116,53 @@ end-proc;
                 "100Linz 200Graz 300Bonn",
                 "30",
             ],
+        ),
+        // A call through a procedure pointer whose prototype has more
+        // parameters than the procedure (OSSILE's list_foreach passes its
+        // user data to a callback that takes only the value): the
+        // procedure gets its parameters; %PARMS is the number of
+        // parameters passed (ILE RPG Reference, %PARMS).
+        (
+            "OSSPARMS",
+            "**FREE
+ctl-opt dftactgrp(*no);
+dcl-pr each int(10) extproc(fn);
+  x int(10) value;
+  y int(10) value;
+end-pr;
+dcl-s fn pointer(*proc);
+fn = %paddr(one);
+dsply %char(each(4 : 9));
+*inlr = *on;
+dcl-proc one;
+  dcl-pi *n int(10);
+    x int(10) value;
+  end-pi;
+  return x * 10 + %parms();
+end-proc;
+"
+            .to_string(),
+            vec!["42"],
+        ),
+        // Arithmetic and comparisons with a float operand are done in
+        // float (ILE RPG Reference, expressions: an operand of float type
+        // makes the operation a float operation), as OSSILE's ALIST01
+        // compares a 19-digit literal with the float(8) it was stored in:
+        // in float the difference is 0.
+        (
+            "OSSFLOAT",
+            "**FREE
+dcl-s d float(8);
+d = 1.234567890123456789;
+if 1.234567890123456789 - d < 0.000000000000000001;
+  dsply 'equal';
+else;
+  dsply 'apart';
+endif;
+*inlr = *on;
+"
+            .to_string(),
+            vec!["equal"],
         ),
         // ILE CEE APIs (the CEEDAYS and CEEDATE pages): 16 May 1988 is
         // Lilian day 148138; 148143 written as "Wwwwwwwwwz, Mmmmmmmmmz

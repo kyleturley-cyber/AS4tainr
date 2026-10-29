@@ -124,6 +124,14 @@ pub enum Target {
     Module(String),
     /// A service program, bound by reference.
     SrvPgm { library: String, name: String },
+    /// A procedure of a program's entry module, reached through a
+    /// procedure pointer (%PADDR) from another program or service
+    /// program while the program is active in its activation group.
+    Pgm {
+        library: String,
+        name: String,
+        group: String,
+    },
 }
 
 /// How an object's modules are bound.
@@ -540,7 +548,7 @@ pub fn binder_language(source: &str) -> Result<BinderSource> {
                     seen_current = true;
                 }
                 let s = cmd.get("SIGNATURE");
-                block = Some((current, (s != "*GEN").then(|| s.to_string()), vec![]));
+                block = Some((current, (s != "*GEN").then(|| signature_value(s)), vec![]));
             }
             "EXPORT" => {
                 if let Some((_, _, ex)) = block.as_mut() {
@@ -572,6 +580,44 @@ pub fn binder_language(source: &str) -> Result<BinderSource> {
         bail!("CPD5D16: The binder source has no PGMLVL(*CURRENT) export block.");
     }
     Ok(out)
+}
+
+/// A signature as binder language writes it: text ('MATH V1'), or 16
+/// bytes in hexadecimal (X'...', as RTVBNDSRC writes every signature).
+/// Kept as the text, or as this binder's 16 hexadecimal digits for a
+/// generated one, so a retrieved source binds the same signature again.
+pub fn signature_value(s: &str) -> String {
+    let t = s.trim();
+    let hex = t
+        .strip_prefix("X'")
+        .or_else(|| t.strip_prefix("x'"))
+        .and_then(|h| h.strip_suffix('\''));
+    let Some(h) = hex.filter(|h| h.len() % 2 == 0 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+    else {
+        return t.trim_matches('\'').to_string();
+    };
+    let h = h.to_ascii_uppercase();
+    if h.len() == 32 && h.starts_with("0000000000000000") {
+        return h[16..].to_string();
+    }
+    let bytes: Vec<u8> = (0..h.len())
+        .step_by(2)
+        .filter_map(|i| u8::from_str_radix(&h[i..i + 2], 16).ok())
+        .collect();
+    crate::rpg::data::a(&bytes)
+        .trim_end_matches([' ', '\0'])
+        .to_string()
+}
+
+/// A signature as 32 hexadecimal digits (16 bytes): a generated one
+/// right-aligned after zeros, a text one in EBCDIC padded with blanks.
+pub fn signature_hex(sig: &str) -> String {
+    if sig.len() == 16 && sig.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return format!("0000000000000000{}", sig.to_ascii_uppercase());
+    }
+    let mut b = crate::rpg::data::e(sig);
+    b.resize(16, 0x40);
+    b.iter().take(16).map(|x| format!("{x:02X}")).collect()
 }
 
 /// A generated signature: a digest of the exports in order (ILE: the

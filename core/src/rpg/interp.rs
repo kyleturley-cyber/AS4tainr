@@ -452,6 +452,11 @@ fn ind_name(n: &str) -> String {
 }
 
 /// A value as a float: a big float as it is, a number converted.
+/// A module's global storage put where a call back finds it during a
+/// call out: (its activation unit, or the program's module key, and the
+/// storage as it was).
+type Reentry = Option<(Option<String>, String, Vec<Vec<u8>>)>;
+
 fn float_value(v: &Value) -> Result<f64> {
     match v {
         Value::Float(x) => Ok(*x),
@@ -1298,7 +1303,19 @@ impl<'a> Machine<'a> {
             "UCS2" | "GRAPH" => Value::Char(arg(self, 0)?.chars()?),
             // %FLOAT: the value as a float (8 bytes).
             "FLOAT" => {
-                let x = float_value(&arg(self, 0)?)?;
+                // A character argument is a number written as %DEC reads
+                // it, or in float form (1.5E3) (ILE RPG Reference,
+                // %FLOAT: character data interpreted as a numeric value).
+                let x = match arg(self, 0)? {
+                    Value::Char(c) => {
+                        let t = a(&c);
+                        match char_number(&t) {
+                            Ok(d) => float_value(&Value::Num(d))?,
+                            Err(e) => t.trim().replace(',', ".").parse::<f64>().map_err(|_| e)?,
+                        }
+                    }
+                    v => float_value(&v)?,
+                };
                 match data::float_dec(x) {
                     Ok(d) => Value::Num(d),
                     Err(_) => Value::Float(x),
@@ -1654,7 +1671,20 @@ impl<'a> Machine<'a> {
                         } else {
                             (l, format!("{sp}/{}", self.prog.name))
                         }),
-                        None => bound_module.map(|m| ("*MODULE".to_string(), m)),
+                        None => match bound_module {
+                            Some(m) => Some(("*MODULE".to_string(), m)),
+                            // A program's entry module: the program and
+                            // the activation group it is active in.
+                            None if self.io.program.contains('/')
+                                && !self.io.program.starts_with('*') =>
+                            {
+                                Some((
+                                    "*PGM".to_string(),
+                                    format!("{} {}", self.io.program, self.io.actgrp),
+                                ))
+                            }
+                            None => None,
+                        },
                     }
                 } else {
                     match self.io.binding.as_ref().and_then(|b| b.imports.get(&n)) {
@@ -4442,6 +4472,12 @@ impl<'a> Machine<'a> {
         if !self.reactivated {
             self.user_inz()?;
             self.auto_dtaaras(true)?;
+            // The external indicators U1-U8: the job switches when the
+            // program starts (ILE RPG Reference, External Indicators).
+            let sws = crate::jobattr::switches(&self.io.job_key, None);
+            for (i, c) in sws.bytes().enumerate().take(8) {
+                self.set_ind(&format!("U{}", i + 1), c == b'1');
+            }
         }
         let r = match &prog.main {
             // ctl-opt main: the main procedure, with no cycle.
@@ -4508,6 +4544,15 @@ impl<'a> Machine<'a> {
             Ok(()) if prog.main.is_some() || self.ind("LR") => self.auto_dtaaras(false),
             other => other,
         };
+        // Ended normally with LR on: U1-U8 go back to the job switches
+        // (ILE RPG Reference, External Indicators; RETURN without LR
+        // leaves them).
+        if r.is_ok() && prog.main.is_none() && self.ind("LR") {
+            let sws: String = (1..=8)
+                .map(|i| if self.ind(&format!("U{i}")) { '1' } else { '0' })
+                .collect();
+            crate::jobattr::set_switches(&self.io.job_key, &sws);
+        }
         if r.is_err() {
             self.release_dtaaras();
         }
@@ -6062,6 +6107,19 @@ impl<'a> Machine<'a> {
                     bail!("{what}: *OMIT is not allowed for parameter {}", p.name);
                 }
                 Arg::Omit
+            } else if let Some(d) = (p.konst && !p.by_value)
+                .then(|| self.whole_ds_array(a))
+                .flatten()
+            {
+                // A whole data structure array for a CONST LIKEDS DIM(n)
+                // parameter: all its elements, by reference (the
+                // callee's view of them is the same storage).
+                Arg::Ref(Loc {
+                    buf: d.buf,
+                    off: d.off,
+                    size: d.size * d.dim as usize,
+                    dtype: p.dtype,
+                })
             } else if p.konst
                 && !p.by_value
                 && self
@@ -6336,7 +6394,26 @@ impl<'a> Machine<'a> {
                 // A procedure of a service program (not this module of
                 // it): called there, in its activation.
                 // A procedure of another module bound into the program.
-                if let Some(("*MODULE", m)) = home.as_ref().map(|(l, m)| (l.as_str(), m.clone())) {
+                if let Some(("*PGM", spec)) = home.as_ref().map(|(l, m)| (l.as_str(), m.clone())) {
+                    let (pgm, group) = spec.split_once(' ').unwrap_or((spec.as_str(), ""));
+                    let here = self.io.program == pgm && prog.procs.contains_key(&pname);
+                    if !here {
+                        let (library, name) = pgm.split_once('/').unwrap_or(("", pgm));
+                        let a = self.args_for(name, &pr.params, args)?;
+                        return self.call_bound_in(
+                            &pname,
+                            &crate::ile::Target::Pgm {
+                                library: library.to_string(),
+                                name: name.to_string(),
+                                group: group.to_string(),
+                            },
+                            Some(name),
+                            a,
+                        );
+                    }
+                } else if let Some(("*MODULE", m)) =
+                    home.as_ref().map(|(l, m)| (l.as_str(), m.clone()))
+                {
                     let here =
                         self.io.program == format!("*BOUND/{m}") && prog.procs.contains_key(&pname);
                     if !here {
@@ -6521,6 +6598,7 @@ impl<'a> Machine<'a> {
                 let (_, b) = self.block(crate::ile::find_srvpgm(client, &libl, library, name))?;
                 b.modules.iter().find(|x| is_cl(x)).cloned()
             }
+            Target::Pgm { .. } => None,
         })
     }
 
@@ -6625,6 +6703,28 @@ impl<'a> Machine<'a> {
     ) -> Result<BoundModule> {
         use crate::ile::Target;
         let (code, unit, binding) = match target {
+            // A program's entry module (a procedure pointer into it): the
+            // program's own source, its binding.
+            Target::Pgm { library, name, .. } => {
+                let p = self
+                    .block(crate::catalog::find_program(
+                        client,
+                        std::slice::from_ref(library),
+                        name,
+                    ))?
+                    .ok_or_else(|| anyhow!("MCH3601: program {library}/{name} of a procedure pointer is not there any more."))?;
+                let code = crate::ile::ModuleCopy {
+                    name: p.name.clone(),
+                    source: p.source.clone(),
+                    options: p.options.clone(),
+                    attribute: p.attribute.clone(),
+                };
+                (
+                    code,
+                    format!("PGM {}/{}", p.library, p.name),
+                    std::sync::Arc::new(p.binding.clone().unwrap_or_default()),
+                )
+            }
             Target::Module(m) => {
                 let b = self.io.binding.clone().unwrap_or_default();
                 let code = b
@@ -6716,9 +6816,20 @@ impl<'a> Machine<'a> {
         let client = self.io.client;
         let libl = self.io.libl.clone();
         let srvpgm = matches!(target, Target::SrvPgm { .. });
+        let entry_of = match target {
+            Target::Pgm {
+                library,
+                name,
+                group,
+            } => Some((format!("{library}/{name}"), group.clone())),
+            _ => None,
+        };
         // A service program runs in its activation group: the caller's
-        // (*CALLER) or the one it names.
-        let group = if srvpgm && !binding.actgrp.is_empty() && binding.actgrp != "*CALLER" {
+        // (*CALLER) or the one it names; a program's entry module in the
+        // group the program is active in.
+        let group = if let Some((_, g)) = &entry_of {
+            g.clone()
+        } else if srvpgm && !binding.actgrp.is_empty() && binding.actgrp != "*CALLER" {
             binding.actgrp.clone()
         } else {
             self.io.actgrp.clone()
@@ -6726,7 +6837,7 @@ impl<'a> Machine<'a> {
         // A module of a service program (called from the service program
         // itself, or from outside it) keeps its storage in the service
         // program's activation.
-        let act_unit = if srvpgm {
+        let act_unit = if srvpgm || entry_of.is_some() {
             Some(unit.clone())
         } else {
             self.current_srvpgm()
@@ -6737,23 +6848,7 @@ impl<'a> Machine<'a> {
         // bound module's storage), so the callee (or a procedure it calls
         // through a pointer) runs on the same storage; what such a call
         // changed comes back after.
-        let reentry: Option<(Option<String>, String, Vec<Vec<u8>>)> = {
-            let n = self.prog.globals.len().min(self.bufs.own.len());
-            if let Some(u) = self.io.unit.clone() {
-                let snap = self.bufs.own[..n].to_vec();
-                crate::ile::keep_activation(&self.io.job_key, &self.io.actgrp, &u, snap.clone());
-                Some((Some(u), String::new(), snap))
-            } else if let Some(m) = self.io.program.strip_prefix("*BOUND/") {
-                let key = format!("MODULE {m}");
-                let snap = self.bufs.own[..n].to_vec();
-                if let Ok(mut g) = self.io.modules.lock() {
-                    g.insert(key.clone(), snap.clone());
-                }
-                Some((None, key, snap))
-            } else {
-                None
-            }
-        };
+        let reentry = self.reentry_out();
         // The module's global storage: its activation, or its first use.
         let storage = if let Some(u) = &act_unit {
             crate::ile::activation(&self.io.job_key, &group, u)
@@ -6787,7 +6882,10 @@ impl<'a> Machine<'a> {
                     self.io.modules.clone()
                 },
                 actgrp: group.clone(),
-                program: format!("*BOUND/{}", prog.name),
+                program: match &entry_of {
+                    Some((p, _)) => p.clone(),
+                    None => format!("*BOUND/{}", prog.name),
+                },
                 shared: self.io.shared.clone(),
             },
         );
@@ -6878,28 +6976,7 @@ impl<'a> Machine<'a> {
         self.bufs.own = m.bufs.lent.pop().map(|l| l.bufs).unwrap_or_default();
         self.bufs.lent = std::mem::take(&mut m.bufs.lent);
         self.bufs.heap = std::mem::take(&mut m.bufs.heap);
-        if let Some((u, key, snap)) = reentry {
-            let now = match u {
-                Some(u) => crate::ile::activation(&self.io.job_key, &self.io.actgrp, &u),
-                None => self
-                    .io
-                    .modules
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.get(&key).cloned()),
-            };
-            if let Some(now) = now {
-                for (i, (old, new)) in snap.iter().zip(&now).enumerate() {
-                    if old != new && old.len() == new.len() {
-                        for (j, (o, n)) in old.iter().zip(new).enumerate() {
-                            if o != n {
-                                self.bufs.own[i][j] = *n;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        self.reentry_in(reentry);
         self.share_in();
         self.messages.append(&mut m.messages);
         self.printed.append(&mut m.printed);
@@ -7143,15 +7220,24 @@ impl<'a> Machine<'a> {
                 refs.push(None);
             } else {
                 let mut b = p.dtype.initial();
-                data::store(
-                    &p.dtype,
-                    v,
-                    &mut b,
-                    Fit::Strict { half_adjust: false },
-                    false,
-                )?;
-                let idx = self.bufs.len();
                 let size = b.len();
+                // A character variable longer than the parameter (CALLPRC
+                // passes the CL variable itself, by reference): the
+                // procedure gets all its storage, as through a pointer to
+                // the parameter (OPTIONS(*VARSIZE), list parameters).
+                match v {
+                    Value::Char(c) if c.len() > size && matches!(p.dtype, DType::Char(_)) => {
+                        b = c.clone();
+                    }
+                    _ => data::store(
+                        &p.dtype,
+                        v,
+                        &mut b,
+                        Fit::Strict { half_adjust: false },
+                        false,
+                    )?,
+                }
+                let idx = self.bufs.len();
                 self.bufs.push(b);
                 call_args.push(Arg::Ref(Loc {
                     buf: idx,
@@ -7166,6 +7252,9 @@ impl<'a> Machine<'a> {
         let mut back = Vec::new();
         for ((r_idx, p), v) in refs.iter().zip(&pi.params).zip(&args) {
             back.push(match r_idx {
+                Some(idx) if self.bufs[*idx].len() > p.dtype.initial().len() => {
+                    Value::Char(self.bufs[*idx].clone())
+                }
                 Some(idx) => data::load(&p.dtype, &self.bufs[*idx])?,
                 None => v.clone(),
             });
@@ -7427,12 +7516,72 @@ impl<'a> Machine<'a> {
         Ok(parms.into_iter().next().unwrap_or_default())
     }
 
+    /// Before a call out of a module (a bound call, a program call, a
+    /// command): its global storage goes where a call back into it finds
+    /// it (its service program activation, or the program's copy of a
+    /// bound module's storage), so the call back runs on the same storage
+    /// (ILE Concepts: one static storage per activation).
+    fn reentry_out(&mut self) -> Reentry {
+        let n = self.prog.globals.len().min(self.bufs.own.len());
+        if let Some(u) = self.io.unit.clone() {
+            let snap = self.bufs.own[..n].to_vec();
+            crate::ile::keep_activation(&self.io.job_key, &self.io.actgrp, &u, snap.clone());
+            Some((Some(u), String::new(), snap))
+        } else if let Some(m) = self.io.program.strip_prefix("*BOUND/") {
+            let key = format!("MODULE {m}");
+            let snap = self.bufs.own[..n].to_vec();
+            if let Ok(mut g) = self.io.modules.lock() {
+                g.insert(key.clone(), snap.clone());
+            }
+            Some((None, key, snap))
+        } else if self.io.program.contains('/') && !self.io.program.starts_with('*') {
+            // A program's entry module: where a procedure pointer into it
+            // (Target::Pgm) finds its storage.
+            let u = format!("PGM {}", self.io.program);
+            let snap = self.bufs.own[..n].to_vec();
+            crate::ile::keep_activation(&self.io.job_key, &self.io.actgrp, &u, snap.clone());
+            Some((Some(u), String::new(), snap))
+        } else {
+            None
+        }
+    }
+
+    /// After the call: what a call back changed in the module's storage
+    /// comes back.
+    fn reentry_in(&mut self, reentry: Reentry) {
+        let Some((u, key, snap)) = reentry else {
+            return;
+        };
+        let now = match u {
+            Some(u) => crate::ile::activation(&self.io.job_key, &self.io.actgrp, &u),
+            None => self
+                .io
+                .modules
+                .lock()
+                .ok()
+                .and_then(|g| g.get(&key).cloned()),
+        };
+        if let Some(now) = now {
+            for (i, (old, new)) in snap.iter().zip(&now).enumerate() {
+                if old != new && old.len() == new.len() {
+                    for (j, (o, n)) in old.iter().zip(new).enumerate() {
+                        if o != n {
+                            self.bufs.own[i][j] = *n;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn call_program(&mut self, name: &str, locs: &[Loc]) -> Result<()> {
         // A called program sees what this one changed in user spaces
         // through pointers, and this one sees what it changed.
         self.spaces_flush()?;
         crate::pgmmsg::stack_line(&self.io.job_key, self.line);
+        let reentry = self.reentry_out();
         let r = self.call_program_inner(name, locs);
+        self.reentry_in(reentry);
         self.spaces_reload()?;
         r
     }

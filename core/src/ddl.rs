@@ -4483,7 +4483,12 @@ async fn create_alias(
             "CREATE VIEW {view} AS SELECT srcseq, srcdat, srcdta \
                FROM as4tainr_svc.source_lines({}, {}, {}); \
              CREATE TRIGGER as4tainr_alias INSTEAD OF INSERT ON {view} \
-               FOR EACH ROW EXECUTE FUNCTION as4tainr.source_alias_insert({}, {}, {})",
+               FOR EACH ROW EXECUTE FUNCTION as4tainr.source_alias_insert({}, {}, {}); \
+             CREATE TRIGGER as4tainr_alias_change INSTEAD OF UPDATE OR DELETE ON {view} \
+               FOR EACH ROW EXECUTE FUNCTION as4tainr.source_alias_change({}, {}, {})",
+            q(&tlib),
+            q(&tsys),
+            q(&member),
             q(&tlib),
             q(&tsys),
             q(&member),

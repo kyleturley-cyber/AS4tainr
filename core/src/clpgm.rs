@@ -599,9 +599,27 @@ fn expr_tokens(s: &str) -> Result<Vec<ET>> {
                 while i < cs.len() && cs[i].is_ascii_alphanumeric() {
                     i += 1;
                 }
-                out.push(ET::Builtin(
-                    cs[s0..i].iter().collect::<String>().to_ascii_uppercase(),
-                ));
+                let name = cs[s0..i].iter().collect::<String>().to_ascii_uppercase();
+                // %SWITCH(10XXXXXX): its mask is eight characters 0, 1
+                // and X, not an expression (CL reference, %SWITCH).
+                if name == "%SWITCH" {
+                    while i < cs.len() && cs[i] == ' ' {
+                        i += 1;
+                    }
+                    if cs.get(i) == Some(&'(') {
+                        let close = cs[i..].iter().position(|c| *c == ')').map(|p| p + i);
+                        if let Some(close) = close {
+                            let mask: String = cs[i + 1..close].iter().collect();
+                            out.push(ET::Builtin(name));
+                            out.push(ET::Open);
+                            out.push(ET::Str(mask.trim().trim_matches('\'').to_string()));
+                            out.push(ET::Close);
+                            i = close + 1;
+                            continue;
+                        }
+                    }
+                }
+                out.push(ET::Builtin(name));
             }
             '|' if next == Some('|') => {
                 out.push(ET::Op("*CAT".into()));
@@ -881,6 +899,15 @@ fn eval(e: &Expr, vars: &HashMap<String, Var>) -> Result<Value> {
                 )
             };
             match name.as_str() {
+                // %SWITCH: '1' when the job switches match the mask.
+                "%SWITCH" => {
+                    let key = match vars.get(JOB_KEY_VAR).map(|v| &v.value) {
+                        Some(Value::Char(k)) => k.clone(),
+                        _ => format!("PID{}", std::process::id()),
+                    };
+                    let sws = crate::jobattr::switches(&key, None);
+                    Value::Lgl(crate::jobattr::switch_matches(&sws, &arg(0)?.as_char()?)?)
+                }
                 "%SST" | "%SUBSTRING" => {
                     let s: Vec<char> = arg(0)?.as_char()?.chars().collect();
                     let start = arg(1)?.as_dec()?.to_usize().unwrap_or(0);
@@ -2889,12 +2916,28 @@ fn returned_text(v: &Var) -> String {
     }
 }
 
+/// The job key's place among a CL program's variables (`run_program`).
+const JOB_KEY_VAR: &str = "*JOBKEY";
+
 async fn run_program(
     job: &mut Job<'_>,
     pgm: &Program,
     args: &[String],
 ) -> Result<(Outcome, Vec<String>)> {
     let mut vars: HashMap<String, Var> = pgm.decls.iter().cloned().collect();
+    // The job, for %SWITCH (a name no CL variable can have).
+    vars.insert(
+        JOB_KEY_VAR.to_string(),
+        Var {
+            ty: VarType::Char,
+            len: 0,
+            decimals: 0,
+            value: Value::Char(job.job_key()),
+            defined: None,
+            based: None,
+            shadow: None,
+        },
+    );
     if args.len() > pgm.params.len() {
         bail!(
             "CPD0172: Program {} takes {} parameters, {} were passed.",
@@ -4505,21 +4548,90 @@ async fn command(
             Ok(None)
         }
         "RTVJOBA" => {
+            // The return variables in RTVJOBA's order (CL reference,
+            // Retrieve Job Attributes); the job's attributes are those
+            // DSPJOB shows (`dspjob::attribute`), with CHGJOB's changes.
             let p = named(
                 st,
                 &[
-                    "JOB", "USER", "NBR", "CURUSER", "TYPE", "CURLIB", "USRLIBL", "SYSLIBL",
-                    "DATFMT", "DATSEP", "TIMSEP", "DECFMT", "CCSID", "DFTCCSID", "LANGID",
+                    "JOB",
+                    "USER",
+                    "NBR",
+                    "CURUSER",
+                    "TYPE",
+                    "SUBTYPE",
+                    "SYSLIBL",
+                    "CURLIB",
+                    "USRLIBL",
+                    "ASPGRP",
+                    "LOGLVL",
+                    "LOGSEV",
+                    "LOGTYPE",
+                    "LOGCLPGM",
+                    "LOGOUTPUT",
+                    "JOBMSGQMX",
+                    "JOBMSGQFL",
+                    "INQMSGRPY",
+                    "STSMSG",
+                    "BRKMSG",
+                    "DEVRCYACN",
+                    "RTNCDE",
+                    "ENDSTS",
+                    "PRTDEV",
+                    "OUTQ",
+                    "OUTQLIB",
+                    "SPLFACN",
+                    "PRTTXT",
+                    "PRTKEYFMT",
+                    "SRTSEQ",
+                    "SRTSEQLIB",
+                    "LANGID",
                     "CNTRYID",
+                    "CCSID",
+                    "DFTCCSID",
+                    "CHRIDCTL",
+                    "DECFMT",
+                    "DATFMT",
+                    "DATSEP",
+                    "TIMSEP",
+                    "DATE",
+                    "CYMDDATE",
+                    "DATETIME",
+                    "DAYOFWEEK",
+                    "TIMZON",
+                    "TIMZONABBR",
+                    "TIMZONFULL",
+                    "TIMOFFSET",
+                    "YEAROFS",
+                    "ACGCDE",
+                    "SWS",
+                    "RUNPTY",
+                    "TIMESLICE",
+                    "PURGE",
+                    "DFTWAIT",
+                    "SBMMSGQ",
+                    "SBMMSGQLIB",
+                    "DDMCNV",
+                    "TSEPOOL",
                 ],
             )?;
             // A library list as RTVJOBA returns it: each name in 11
             // characters (CL reference, RTVJOBA USRLIBL and SYSLIBL).
             let names = |l: &[String]| -> String { l.iter().map(|x| format!("{x:<11}")).collect() };
+            let facts = job.job_facts("*").await?;
+            let attr = |k: &str| crate::dspjob::attribute(&facts, k).unwrap_or_default();
+            let dec = |v: String| -> Result<Value> {
+                let v = if v == "*NOMAX" { "-1".to_string() } else { v };
+                Ok(Value::Dec(
+                    Decimal::from_str(v.trim())
+                        .map_err(|_| anyhow!("RTVJOBA: {v} is not a number"))?,
+                ))
+            };
+            let ((y, mo, d), (h, mi, sec), us) = crate::rpg::dates::now();
             for (k, target) in &p {
                 let v = match k.as_str() {
                     "USER" | "CURUSER" => Value::Char(job.user.clone()),
-                    "CURLIB" => Value::Char(job.curlib.clone().unwrap_or_else(|| "*CRTDFT".into())),
+                    "CURLIB" => Value::Char(job.curlib.clone().unwrap_or_else(|| "*NONE".into())),
                     "USRLIBL" => Value::Char(names(&job.libl)),
                     "SYSLIBL" => Value::Char(names(
                         &crate::commands::SYSTEM_LIBRARY_LIST
@@ -4527,17 +4639,9 @@ async fn command(
                             .map(|l| l.to_string())
                             .collect::<Vec<_>>(),
                     )),
-                    // The job's attributes: the system values' (as
-                    // QUSRJOBI JOBI0400 gives them).
-                    "DATFMT" => Value::Char("*MDY".into()),
-                    "DATSEP" => Value::Char("/".into()),
-                    "TIMSEP" => Value::Char(":".into()),
-                    "DECFMT" => Value::Char(" ".into()),
-                    "CCSID" => Value::Dec(Decimal::from(65535)),
-                    "DFTCCSID" => Value::Dec(Decimal::from(37)),
-                    "LANGID" => Value::Char("ENU".into()),
-                    "CNTRYID" => Value::Char("US".into()),
                     "TYPE" => Value::Char(if job.display.is_some() { "1" } else { "0" }.into()),
+                    "SUBTYPE" => Value::Char("*".into()),
+                    "ASPGRP" => Value::Char("*NONE".into()),
                     "JOB" => {
                         Value::Char(job.id.as_ref().map(|i| i.name.clone()).unwrap_or_default())
                     }
@@ -4547,7 +4651,56 @@ async fn command(
                             .map(|i| format!("{:06}", i.number))
                             .unwrap_or_default(),
                     ),
-                    other => bail!("line {}: RTVJOBA {other} is not supported yet", st.line),
+                    "LOGLVL" => Value::Char(attr("LOG.Level")),
+                    "LOGSEV" => dec(attr("LOG.Severity"))?,
+                    "LOGTYPE" => Value::Char(attr("LOG.Text")),
+                    "OUTQLIB" => Value::Char(attr("OUTQ.Library")),
+                    "SRTSEQLIB" => Value::Char(attr("SRTSEQ.Library")),
+                    "PRTTXT" => Value::Char(attr("PRTTXT").trim_matches('\'').to_string()),
+                    "DECFMT" => Value::Char(match attr("DECFMT").as_str() {
+                        "*BLANK" => " ".into(),
+                        v => v.to_string(),
+                    }),
+                    "DATSEP" | "TIMSEP" => {
+                        let v = attr(k);
+                        Value::Char(if v.is_empty() { " ".into() } else { v })
+                    }
+                    "JOBMSGQMX" | "CCSID" | "DFTCCSID" | "RUNPTY" | "TIMESLICE" | "DFTWAIT" => {
+                        dec(attr(k))?
+                    }
+                    "RTNCDE" | "YEAROFS" => Value::Dec(Decimal::from(0)),
+                    "TIMOFFSET" => Value::Dec(Decimal::from(0)),
+                    "ENDSTS" => Value::Char("0".into()),
+                    // The job date in the job's date format, without
+                    // separators (RTVJOBA DATE), and as CYYMMDD.
+                    "DATE" => {
+                        let yy = y % 100;
+                        Value::Char(match attr("DATFMT").as_str() {
+                            "*YMD" => format!("{yy:02}{mo:02}{d:02}"),
+                            "*DMY" => format!("{d:02}{mo:02}{yy:02}"),
+                            "*JUL" => {
+                                let doy = crate::rpg::dates::days((y, mo, d))
+                                    - crate::rpg::dates::days((y, 1, 1))
+                                    + 1;
+                                format!("{yy:02}{doy:03}")
+                            }
+                            _ => format!("{mo:02}{d:02}{yy:02}"),
+                        })
+                    }
+                    "CYMDDATE" => Value::Char(format!(
+                        "{}{:02}{mo:02}{d:02}",
+                        if y >= 2000 { 1 } else { 0 },
+                        y % 100
+                    )),
+                    "DATETIME" => {
+                        Value::Char(format!("{y:04}{mo:02}{d:02}{h:02}{mi:02}{sec:02}{us:06}"))
+                    }
+                    "DAYOFWEEK" => Value::Char(attr("DAYOFWEEK")),
+                    "TIMZON" => Value::Char(attr("TIMZON")),
+                    "TIMZONABBR" => Value::Char(attr("TIMZON.Abbreviated name")),
+                    "TIMZONFULL" => Value::Char(attr("TIMZON.Full name")),
+                    "SBMMSGQ" | "SBMMSGQLIB" => Value::Char("*NONE".into()),
+                    other => Value::Char(attr(other)),
                 };
                 let name = target.trim().to_ascii_uppercase();
                 let var = vars

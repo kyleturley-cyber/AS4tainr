@@ -1437,6 +1437,53 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "CHGJOB",
+        description: "Change Job",
+        params: &[
+            p("JOB", Kind::Text, false, Some("*"), "Job name").ch("*, number/user/name"),
+            p("JOBPTY", Kind::Text, false, Some("*SAME"), "Job priority (on JOBQ)").ch("0-9, *SAME").keyword_only(),
+            p("OUTPTY", Kind::Text, false, Some("*SAME"), "Output priority (on OUTQ)").ch("1-9, *SAME").keyword_only(),
+            p("PRTDEV", Kind::Text, false, Some("*SAME"), "Print device").ch("Name, *SAME, *USRPRF, *SYSVAL, *WRKSTN").keyword_only(),
+            p("OUTQ", Kind::Text, false, Some("*SAME"), "Output queue").ch("Name, *SAME, *USRPRF, *DEV, *WRKSTN").keyword_only(),
+            p("RUNPTY", Kind::Text, false, Some("*SAME"), "Run priority").ch("1-99, *SAME").keyword_only(),
+            p("JOBQ", Kind::Text, false, Some("*SAME"), "Job queue").ch("Name, *SAME").keyword_only(),
+            p("PRTTXT", Kind::Text, false, Some("*SAME"), "Print text").ch("*SAME, *SYSVAL, *BLANK").keyword_only(),
+            p("LOG", Kind::List, false, Some("*SAME"), "Message logging").ch("Level 0-4, severity 0-99, *MSG, *SECLVL, *NOLIST").keyword_only(),
+            p("LOGCLPGM", Kind::Text, false, Some("*SAME"), "Log CL program commands").ch("*SAME, *NO, *YES").keyword_only(),
+            p("LOGOUTPUT", Kind::Text, false, Some("*SAME"), "Job log output").ch("*SAME, *SYSVAL, *JOBLOGSVR, *JOBEND, *PND").keyword_only(),
+            p("JOBMSGQFL", Kind::Text, false, Some("*SAME"), "Job message queue full action").ch("*SAME, *SYSVAL, *NOWRAP, *WRAP, *PRTWRAP").keyword_only(),
+            p("INQMSGRPY", Kind::Text, false, Some("*SAME"), "Inquiry message reply").ch("*SAME, *RQD, *DFT, *SYSRPYL").keyword_only(),
+            p("BRKMSG", Kind::Text, false, Some("*SAME"), "Break message handling").ch("*SAME, *NORMAL, *NOTIFY, *HOLD").keyword_only(),
+            p("STSMSG", Kind::Text, false, Some("*SAME"), "Status message").ch("*SAME, *USRPRF, *SYSVAL, *NONE, *NORMAL").keyword_only(),
+            p("DDMCNV", Kind::Text, false, Some("*SAME"), "DDM conversation").ch("*SAME, *KEEP, *DROP").keyword_only(),
+            p("SCDDATE", Kind::Text, false, Some("*SAME"), "Schedule date").ch("Date, *SAME, *CURRENT, *MONTHSTR, *MONTHEND, *MON...").keyword_only(),
+            p("SCDTIME", Kind::Text, false, Some("*SAME"), "Schedule time").ch("Time, *SAME, *CURRENT").keyword_only(),
+            p("DATE", Kind::Text, false, Some("*SAME"), "Job date").ch("Date, *SAME").keyword_only(),
+            p("DATFMT", Kind::Text, false, Some("*SAME"), "Date format").ch("*SAME, *SYSVAL, *YMD, *MDY, *DMY, *JUL").keyword_only(),
+            p("DATSEP", Kind::Text, false, Some("*SAME"), "Date separator").ch("*SAME, *SYSVAL, *BLANK, /, -, ., ,").keyword_only(),
+            p("TIMSEP", Kind::Text, false, Some("*SAME"), "Time separator").ch("*SAME, *SYSVAL, *BLANK, :, ., ,").keyword_only(),
+            p("SWS", Kind::Text, false, Some("*SAME"), "Job switches").ch("8 characters 0, 1, X, *SAME").keyword_only(),
+            p("TIMESLICE", Kind::Text, false, Some("*SAME"), "Time slice").ch("1-9999999, *SAME").keyword_only(),
+            p("PURGE", Kind::Text, false, Some("*SAME"), "Eligible for purge").ch("*SAME, *YES, *NO").keyword_only(),
+            p("DFTWAIT", Kind::Text, false, Some("*SAME"), "Default wait time").ch("1-9999999, *SAME, *NOMAX").keyword_only(),
+            p("DEVRCYACN", Kind::Text, false, Some("*SAME"), "Device recovery action").ch("*SAME, *SYSVAL, *MSG, *DSCMSG, *DSCENDRQS, *ENDJOB, *ENDJOBNOLIST").keyword_only(),
+            p("TSEPOOL", Kind::Text, false, Some("*SAME"), "Time slice end pool").ch("*SAME, *SYSVAL, *NONE, *BASE").keyword_only(),
+            p("PRTKEYFMT", Kind::Text, false, Some("*SAME"), "Print key format").ch("*SAME, *SYSVAL, *NONE, *PRTBDR, *PRTHDR, *PRTALL").keyword_only(),
+            p("SRTSEQ", Kind::Text, false, Some("*SAME"), "Sort sequence").ch("Name, *SAME, *USRPRF, *SYSVAL, *HEX, *LANGIDUNQ, *LANGIDSHR").keyword_only(),
+            p("LANGID", Kind::Text, false, Some("*SAME"), "Language ID").ch("Name, *SAME, *USRPRF, *SYSVAL").keyword_only(),
+            p("CNTRYID", Kind::Text, false, Some("*SAME"), "Country or region ID").ch("Name, *SAME, *USRPRF, *SYSVAL").keyword_only(),
+            p("CCSID", Kind::Text, false, Some("*SAME"), "Coded character set ID").ch("1-65535, *SAME, *USRPRF, *SYSVAL, *HEX").keyword_only(),
+            p("DECFMT", Kind::Text, false, Some("*SAME"), "Decimal format").ch("*SAME, *SYSVAL, *BLANK, I, J").keyword_only(),
+            p("CHRIDCTL", Kind::Text, false, Some("*SAME"), "Character identifier control").ch("*SAME, *USRPRF, *SYSVAL, *DEVD, *JOBCCSID").keyword_only(),
+            p("SPLFACN", Kind::Text, false, Some("*SAME"), "Spooled file action").ch("*SAME, *SYSVAL, *KEEP, *DETACH").keyword_only(),
+            p("WLCGRP", Kind::Text, false, Some("*SAME"), "Workload group").ch("Name, *SAME, *NONE").keyword_only(),
+            p("CPUTIME", Kind::Text, false, Some("*SAME"), "Maximum CPU time").ch("1-9999999, *SAME, *NOMAX").keyword_only(),
+            p("MAXTMPSTG", Kind::Text, false, Some("*SAME"), "Maximum temporary storage").ch("1-2147483647, *SAME, *NOMAX").keyword_only(),
+            p("PRCRSCPTY", Kind::Text, false, Some("*SAME"), "Processor resources priority").ch("*SAME, *SYSCTL, *NORMAL, *HIGH, *LOW").keyword_only(),
+            p("DUPJOBOPT", Kind::Name, false, Some("*SELECT"), "Duplicate job option").ch("*SELECT, *MSG").keyword_only(),
+        ],
+    },
+    CommandDef {
         name: "DSPJOBLOG",
         description: "Display Job Log",
         params: &[
@@ -2769,6 +2816,17 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[p("PGM", Kind::Qualified, true, None, "Program").ch("Name")],
     },
     CommandDef {
+        name: "RTVBNDSRC",
+        description: "Retrieve Binder Source",
+        params: &[
+            p("MODULE", Kind::Qualified, false, Some("*NONE"), "Module").ch("Name, *NONE"),
+            p("SRVPGM", Kind::Qualified, false, Some("*NONE"), "Service program").ch("Name, *NONE"),
+            p("SRCFILE", Kind::Qualified, false, Some("QSRVSRC"), "Source file").ch("Name"),
+            p("SRCMBR", Kind::Name, false, Some("*SRVPGM"), "Source member").ch("Name, *SRVPGM, *MODULE"),
+            p("MBROPT", Kind::Name, false, Some("*REPLACE"), "Member option").ch("*REPLACE, *ADD"),
+        ],
+    },
+    CommandDef {
         name: "DSPSRVPGM",
         description: "Display Service Program",
         params: &[p("SRVPGM", Kind::Qualified, true, None, "Service program").ch("Name")],
@@ -2998,6 +3056,12 @@ pub static COMMANDS: &[CommandDef] = &[
             .keyword_only(),
             p("OPTION", Kind::List, false, None, "Compiler options")
                 .ch("*XREF, *NOXREF, *SRCSTMT, *NOSRCSTMT...")
+                .keyword_only(),
+            p("GENLVL", Kind::Text, false, Some("10"), "Severity level")
+                .ch("0-40")
+                .keyword_only(),
+            p("PRTFILE", Kind::Qualified, false, Some("QSYSPRT"), "Printer file")
+                .ch("Name")
                 .keyword_only(),
             p(
                 "TGTRLS",
@@ -4029,6 +4093,19 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "CPYSRCF",
+        description: "Copy Source File",
+        params: &[
+            p("FROMFILE", Kind::Qualified, true, None, "From file").ch("Name"),
+            p("TOFILE", Kind::Qualified, true, None, "To file").ch("Name"),
+            p("FROMMBR", Kind::Name, true, None, "From member").ch("Name, generic*, *ALL"),
+            p("TOMBR", Kind::Name, false, Some("*FROMMBR"), "To member").ch("Name, *FROMMBR"),
+            p("MBROPT", Kind::Name, false, Some("*REPLACE"), "Replace or add records").ch("*REPLACE, *ADD"),
+            p("SRCOPT", Kind::List, false, Some("*SAME"), "Source update options").ch("*SAME, *SEQNBR, *DATE").keyword_only(),
+            p("SRCSEQ", Kind::List, false, Some("1.00 1.00"), "Source sequence numbering").ch("0.01-9999.99").keyword_only(),
+        ],
+    },
+    CommandDef {
         name: "CPYF",
         description: "Copy File",
         params: &[
@@ -4148,6 +4225,7 @@ pub static GROUPS: &[Group] = &[
             "DSPFFD",
             "DSPDBR",
             "CPYF",
+            "CPYSRCF",
             "DLTF",
             "ADDPFM",
             "RMVM",
@@ -4187,6 +4265,7 @@ pub static GROUPS: &[Group] = &[
             "WRKACTJOB",
             "WRKSBMJOB",
             "DSPJOB",
+            "CHGJOB",
             "DSPJOBLOG",
             "ENDJOB",
             "SNDMSG",
@@ -4244,6 +4323,7 @@ pub static GROUPS: &[Group] = &[
             "RCLRSC",
             "DSPPGM",
             "DSPSRVPGM",
+            "RTVBNDSRC",
             "UPDPGM",
             "UPDSRVPGM",
         ],
@@ -4490,6 +4570,20 @@ fn tokenize(s: &str) -> Result<Vec<Tok>> {
                     v = crate::qtemp::in_value(&v);
                 }
                 out.push(Tok::Quoted(v));
+            }
+            // A hexadecimal constant X'...' (CL reference, "Hexadecimal
+            // constants"): one value, kept as written.
+            'X' | 'x'
+                if cs.get(i + 1) == Some(&'\'')
+                    && (i == 0 || matches!(cs[i - 1], ' ' | '\t' | '(')) =>
+            {
+                let start = i + 2;
+                let Some(len) = cs[start..].iter().position(|c| *c == '\'') else {
+                    bail!("CPF0006: The command has errors and was not run. A closing apostrophe is missing.");
+                };
+                let hex: String = cs[start..start + len].iter().collect();
+                out.push(Tok::Word(format!("X'{}'", hex.to_ascii_uppercase())));
+                i = start + len + 1;
             }
             _ => {
                 let start = i;

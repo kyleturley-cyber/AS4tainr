@@ -54,6 +54,8 @@ pub struct Facts {
     pub groups: Vec<(String, u64, bool)>,
     /// The job's environment variables: name, value (None: *NULL), CCSID.
     pub envvars: Vec<(String, Option<String>, i32)>,
+    /// Attributes the job changed (CHGJOB, `jobattr`), by keyword.
+    pub changed: std::collections::BTreeMap<String, String>,
 }
 
 /// One call stack entry (*PGMSTK), innermost last.
@@ -112,6 +114,43 @@ fn row(ind: usize, label: &str, colon: usize, kw: (usize, &str), val: (usize, &s
     at(&f)
 }
 
+/// A changed attribute as the report shows it: DECFMT's blank as
+/// *BLANK, the print text in apostrophes padded to 30, *NOMAX for the
+/// limits.
+fn shown_value(kw: &str, v: &str) -> String {
+    match kw {
+        "DECFMT" if v.trim().is_empty() => "*BLANK".into(),
+        "PRTTXT" => format!("'{v:<30}'"),
+        _ => v.to_string(),
+    }
+}
+
+/// An attribute's value as the report shows it (`definition` and `run`
+/// lines read back by their keyword column), for RTVJOBA and the
+/// retrieve APIs: one source for what the job's attributes are. The parts
+/// of LOG are `LOG.Level`, `LOG.Severity` and `LOG.Text`.
+pub fn attribute(f: &Facts, kw: &str) -> Option<String> {
+    let scan = |lines: Vec<String>, kc: usize, vc: usize| -> Option<String> {
+        let mut last = String::new();
+        for l in lines {
+            let k = l.get(kc..vc.min(l.len())).unwrap_or("").trim().to_string();
+            let label = l.get(..kc).unwrap_or("").trim();
+            let label = label.split(" .").next().unwrap_or("").trim().to_string();
+            let key = if k.is_empty() {
+                format!("{last}.{label}")
+            } else {
+                last = k.clone();
+                k
+            };
+            if key == kw {
+                return Some(l.get(vc..).unwrap_or("").trim().to_string());
+            }
+        }
+        None
+    };
+    scan(definition(f), 52, 65).or_else(|| scan(run(f), 61, 74))
+}
+
 fn sv(name: &str) -> String {
     crate::clpgm::system_value_text(name)
         .and_then(|v| v.ok())
@@ -132,7 +171,8 @@ pub fn definition(f: &Facts) -> Vec<String> {
     let iso = format!("{y:04}-{mo:02}-{d:02}");
     let tsep = sv("QTIMSEP");
     let time = format!("{h:02}{tsep}{mi:02}{tsep}{s:02}");
-    let log = val("LOG", "4 0 *NOLIST", "4 0 *NOLIST");
+    let changed = |k: &str| f.changed.get(k).cloned();
+    let log = changed("LOG").unwrap_or_else(|| val("LOG", "4 0 *NOLIST", "4 0 *NOLIST"));
     let mut log = log.split_whitespace().map(str::to_string);
     let (level, sev, text) = (
         log.next().unwrap_or_default(),
@@ -151,10 +191,20 @@ pub fn definition(f: &Facts) -> Vec<String> {
     let logoutput = resolved(val("LOGOUTPUT", "*PND", "*SYSVAL"), "*PND");
     let prtdev = resolved(val("PRTDEV", "*USRPRF", "*USRPRF"), &sv("QPRTDEV"));
     let acgcde = resolved(val("ACGCDE", "*SYS", "*USRPRF"), "*SYS");
-    let (outq, outq_lib) = if f.system_job {
-        ("*DEV".to_string(), String::new())
-    } else {
-        ("QPRINT".to_string(), "QGPL".to_string())
+    let (outq, outq_lib) = match changed("OUTQ") {
+        Some(q) => match q.split_once('/') {
+            Some((l, n)) => (n.to_string(), l.to_string()),
+            None => (q, String::new()),
+        },
+        None if f.system_job => ("*DEV".to_string(), String::new()),
+        None => ("QPRINT".to_string(), "QGPL".to_string()),
+    };
+    let (srtseq, srtseq_lib) = match changed("SRTSEQ") {
+        Some(q) => match q.split_once('/') {
+            Some((l, n)) => (n.to_string(), l.to_string()),
+            None => (q, String::new()),
+        },
+        None => ("*HEX".to_string(), String::new()),
     };
     let utc = sv("QUTCOFFSET");
     let offset = format!(
@@ -172,9 +222,14 @@ pub fn definition(f: &Facts) -> Vec<String> {
         v => v.to_string(),
     };
     let prttxt = format!("'{:<30}'", sv("QPRTTXT"));
+    // What CHGJOB changed shows in place of the job's own value.
     let r = |ind: usize, l: &str, kw: &str, v: &str| {
         let vc = if ind == 4 { 66 } else { 68 };
-        row(ind, l, 49, (53, kw), (vc, v))
+        let shown = match kw {
+            "" | "OUTQ" | "SRTSEQ" | "LOG" => None,
+            _ => changed(kw).map(|c| shown_value(kw, &c)),
+        };
+        row(ind, l, 49, (53, kw), (vc, shown.as_deref().unwrap_or(v)))
     };
     let part = |l: &str, v: &str| row(6, l, 49, (53, ""), (66, v));
     let jobq_asp = if f.jobq.is_empty() { "" } else { "*SYSBAS" };
@@ -251,8 +306,8 @@ pub fn definition(f: &Facts) -> Vec<String> {
         r(4, "Device recovery action", "DEVRCYACN", "*MSG"),
         r(4, "Time slice end pool", "TSEPOOL", "*NONE"),
         r(4, "Print key format", "PRTKEYFMT", "*PRTHDR"),
-        r(4, "Sort sequence", "SRTSEQ", "*HEX"),
-        r(6, "Library", "", ""),
+        r(4, "Sort sequence", "SRTSEQ", &srtseq),
+        r(6, "Library", "", &srtseq_lib),
         r(4, "Language identifier", "LANGID", &sv("QLANGID")),
         r(
             4,
@@ -352,7 +407,13 @@ pub fn run(f: &Facts) -> Vec<String> {
         _ => ("20", "2000", "30"),
     };
     let (cpu, tmp, peak) = usage();
-    let r = |ind: usize, l: &str, kw: &str, v: &str| row(ind, l, 58, (62, kw), (75, v));
+    let r = |ind: usize, l: &str, kw: &str, v: &str| {
+        let shown = match kw {
+            "" => None,
+            _ => f.changed.get(kw).map(|c| shown_value(kw, c)),
+        };
+        row(ind, l, 58, (62, kw), (75, shown.as_deref().unwrap_or(v)))
+    };
     vec![
         at(&[(41, "Job Run Attributes")]),
         r(4, "Run priority", "RUNPTY", pty),

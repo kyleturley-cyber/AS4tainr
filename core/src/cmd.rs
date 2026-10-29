@@ -748,7 +748,14 @@ pub async fn create(client: &mut Client, d: &Definition, text: &str, replace: bo
         &[&d.library, &d.name, &text],
     )
     .await?;
-    let json = serde_json::to_string(d)?;
+    let mut json = serde_json::to_string(d)?;
+    // QTEMP in the definition (DFT(QTEMP), a qualifier's default) is the
+    // QTEMP of the job that runs the command, not of the job that made it.
+    if let Some(n) = crate::qtemp::current() {
+        json = json
+            .replace(&format!("\"{n}\""), "\"QTEMP\"")
+            .replace(&format!("\"{n}/"), "\"QTEMP/");
+    }
     tx.execute(
         "INSERT INTO as4tainr.commands (library, name, definition) VALUES ($1,$2,$3)
          ON CONFLICT (library, name) DO UPDATE SET definition = EXCLUDED.definition",

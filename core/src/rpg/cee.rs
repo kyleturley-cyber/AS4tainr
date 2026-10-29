@@ -47,6 +47,8 @@ pub const CEE_APIS: &[&str] = &[
     "CEEGMT",
     "QLGCONVERTCASE",
     "RSLVSP",
+    "_RSLVSP2",
+    "_RSLVSP4",
     "QLEACTBNDPGM",
     "QLEGETEXP",
 ];
@@ -952,6 +954,80 @@ impl<'a> Machine<'a> {
                     buf: super::super::mem::sys_id(&(objtype, l, obj)),
                     off: 0,
                 }))
+            }
+            // _RSLVSP2(pointer, template) and _RSLVSP4(pointer, template,
+            // library system pointer) (MI built-ins, Resolve System
+            // Pointer): the template is the object type (2 bytes), its
+            // name (30) and the authority wanted (2); _RSLVSP2 searches the
+            // library list (a library, type X'0401', is found in QSYS),
+            // _RSLVSP4 the library the third pointer addresses. MCH3401
+            // when the object is not there.
+            "_RSLVSP2" | "_RSLVSP4" => {
+                let tmpl = match self.cee_value(g(1))? {
+                    Some(Value::Char(c)) => c,
+                    _ => vec![],
+                };
+                if tmpl.len() < 32 {
+                    bail!("MCH3601: {name}: the template is shorter than 32 bytes.");
+                }
+                let h = u16::from_be_bytes([tmpl[0], tmpl[1]]);
+                let objtype = crate::sysapi::MI_TYPES
+                    .iter()
+                    .find(|(_, x)| *x == h)
+                    .map(|(n, _)| n.to_string())
+                    .ok_or_else(|| {
+                        anyhow!("MCH3401: {name}: object type {h:04X} is not one as4tainr knows.")
+                    })?;
+                let obj = a(&tmpl[2..32]).trim().to_ascii_uppercase();
+                let libs = if name == "_RSLVSP4" {
+                    match self.cee_value(g(2))? {
+                        Some(Value::Ptr(p)) if p.kind == super::super::mem::KIND_SYS => {
+                            match super::super::mem::sys_ref(p.buf) {
+                                Some((t, _, l)) if t == "*LIB" => vec![crate::qtemp::real(&l)],
+                                _ => {
+                                    bail!("MCH3601: _RSLVSP4 needs a system pointer to a library.")
+                                }
+                            }
+                        }
+                        _ => bail!("MCH3601: _RSLVSP4 needs a system pointer to a library."),
+                    }
+                } else if objtype == "*LIB" {
+                    vec!["QSYS".to_string()]
+                } else {
+                    self.io.libl.clone()
+                };
+                let client = self.io.client;
+                let mut found = None;
+                for l in libs {
+                    let there = if objtype == "*LIB" {
+                        self.block(crate::catalog::library_exists(
+                            client,
+                            &crate::qtemp::real(&obj),
+                        ))?
+                    } else {
+                        self.block(crate::catalog::object_exists(
+                            client,
+                            std::slice::from_ref(&l),
+                            &obj,
+                            &objtype,
+                        ))?
+                    };
+                    if there {
+                        found = Some(l);
+                        break;
+                    }
+                }
+                let Some(l) = found else {
+                    bail!("MCH3401: Object {obj} type {objtype} cannot be found.");
+                };
+                let ptr = Value::Ptr(super::super::mem::Ptr {
+                    kind: super::super::mem::KIND_SYS,
+                    owner: 0,
+                    buf: super::super::mem::sys_id(&(objtype, l, obj)),
+                    off: 0,
+                });
+                self.cee_set(g(0), ptr.clone())?;
+                Ok(Value::Fig(Fig::Null))
             }
             // QleActBndPgm(service program system pointer, activation mark,
             // activation information, its length, error code) (Activate

@@ -361,6 +361,23 @@ pub fn encode_num(t: &DType, v: &Dec, out: &mut [u8]) -> Result<()> {
                     "RNQ0103: The target for a numeric operation is too small to hold the result."
                 );
             }
+            // An integer or unsigned field holds only what its bytes can:
+            // a value outside is error 00103 (ILE RPG Reference, integer
+            // and unsigned format; status 00103).
+            let bits = (out.len() * 8) as u32;
+            let fits = match t {
+                DType::Int(_) => {
+                    let lim = 1i128 << (bits - 1);
+                    (-lim..lim).contains(&m)
+                }
+                DType::Uns(_) => m < (1i128 << bits),
+                _ => true,
+            };
+            if !fits {
+                bail!(
+                    "RNQ0103: The target for a numeric operation is too small to hold the result."
+                );
+            }
             let bytes = m.to_be_bytes();
             let n = out.len();
             out.copy_from_slice(&bytes[bytes.len() - n..]);
@@ -589,6 +606,21 @@ pub fn store(t: &DType, v: &Value, out: &mut [u8], fit: Fit, right: bool) -> Res
         }
         _ => {
             let n = match v {
+                // Integer and unsigned fields: the type's largest and
+                // smallest values (ILE RPG Reference, *HIVAL and *LOVAL:
+                // int(5) 32767 and -32768, uns(5) 65535 and 0).
+                Value::Fig(f @ (Fig::HiVal | Fig::LoVal))
+                    if matches!(t, DType::Int(_) | DType::Uns(_)) =>
+                {
+                    let bits = (out.len() * 8) as u32;
+                    let m: i128 = match (t, f) {
+                        (DType::Int(_), Fig::HiVal) => (1i128 << (bits - 1)) - 1,
+                        (DType::Int(_), _) => -(1i128 << (bits - 1)),
+                        (_, Fig::HiVal) => (1i128 << bits) - 1,
+                        _ => 0,
+                    };
+                    Dec::parse(&m.to_string())?
+                }
                 Value::Fig(Fig::HiVal) | Value::Fig(Fig::LoVal) => {
                     let (d, p) = t.precision();
                     let nines =

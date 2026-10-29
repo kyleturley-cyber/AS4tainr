@@ -18880,3 +18880,617 @@ async fn verify22_joblog_info_in_a_system_job() {
         .get(0);
     assert_eq!(n, 1);
 }
+
+/// What iMoq (danlong005/IBMiMock, MIT: a mocking framework with its own
+/// self-tests) needs of the RPG engine. ILE RPG Reference: %FLOAT of a
+/// character expression reads it as a number; a value that does not fit
+/// an integer field is error 00103 (status codes); a whole data structure
+/// array for a CONST LIKEDS DIM(n) parameter is passed by reference, its
+/// elements as they are; Db2 for i SQL Reference, INSERT: `n ROWS
+/// VALUES(:host-structure-array)` inserts the first n elements.
+#[tokio::test]
+async fn rpg_features_found_by_imoq() {
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {lib}.SRCW (srcseq numeric(6,2), srcdat numeric(6,0), srcdta varchar(80))"
+        ))
+        .await
+        .unwrap();
+    let programs: Vec<(&str, String, Vec<&str>)> = vec![
+        (
+            "IMQFLOAT",
+            "**FREE
+dcl-s t varchar(20) inz('1.5');
+dcl-s f8 float(8);
+f8 = %float(t);
+if f8 = 1.5;
+  dsply 'text';
+endif;
+if %float('2.5E1') = 25;
+  dsply 'exponent';
+endif;
+*inlr = *on;
+"
+            .to_string(),
+            vec!["text", "exponent"],
+        ),
+        (
+            "IMQINT",
+            "**FREE
+dcl-s i3 int(3);
+dcl-s u3 uns(3);
+dcl-s h3 int(3);
+dcl-s l5 int(5) inz(*loval);
+dcl-s hu uns(5) inz(*hival);
+monitor;
+  i3 = 100 + 100;
+  dsply 'no error';
+on-error;
+  dsply %char(%status);
+endmon;
+monitor;
+  u3 = %uns('300');
+  dsply 'no error';
+on-error;
+  dsply %char(%status);
+endmon;
+i3 = -128;
+u3 = 255;
+dsply (%char(i3) + ' ' + %char(u3));
+h3 = *hival;
+dsply (%char(h3) + ' ' + %char(l5) + ' ' + %char(hu));
+*inlr = *on;
+"
+            .to_string(),
+            // *HIVAL and *LOVAL of integer and unsigned fields: the
+            // type's largest and smallest values (ILE RPG Reference).
+            vec!["103", "103", "-128 255", "127 -32768 65535"],
+        ),
+        (
+            "IMQDSARR",
+            "**FREE
+ctl-opt dftactgrp(*no);
+dcl-ds m_t qualified template;
+  parmNo int(10);
+  val varchar(100);
+end-ds;
+dcl-ds arr likeds(m_t) dim(4);
+arr(1).parmNo = 1;
+arr(2).parmNo = 2;
+arr(2).val = 'two';
+arr(3).parmNo = 3;
+show(arr : 3);
+*inlr = *on;
+dcl-proc show;
+  dcl-pi *n;
+    m likeds(m_t) dim(4) const;
+    n int(10) const;
+  end-pi;
+  dcl-s i int(10);
+  for i = 1 to n;
+    dsply (%char(m(i).parmNo) + m(i).val);
+  endfor;
+end-proc;
+"
+            .to_string(),
+            vec!["1", "2two", "3"],
+        ),
+        (
+            "IMQROWS",
+            format!(
+                "**FREE
+dcl-ds src qualified dim(5) inz;
+  seq packed(6:2);
+  dat packed(6:0);
+  dta char(80);
+end-ds;
+dcl-s n int(10) inz(2);
+dcl-s c int(10);
+src(1).seq = 1;
+src(1).dta = 'first';
+src(2).seq = 2;
+src(2).dta = 'second';
+src(3).dta = 'not inserted';
+exec sql insert into {lib}.srcw (srcseq, srcdat, srcdta) :n rows values(:src);
+dsply %char(sqlcode);
+exec sql select count(*) into :c from {lib}.srcw;
+dsply %char(c);
+*inlr = *on;
+"
+            ),
+            vec!["0", "2"],
+        ),
+    ];
+    for (name, source, want) in programs {
+        let r = rpg::call(
+            &url,
+            vec![lib.clone()],
+            "QSECOFR".into(),
+            None,
+            None,
+            None,
+            name.into(),
+            source,
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(r.error.is_none(), "{name}: {:?}", r.error);
+        let got: Vec<String> = r
+            .messages
+            .iter()
+            .map(|m| m.trim_end().to_string())
+            .collect();
+        assert_eq!(got, want, "{name}");
+    }
+    let rows: Vec<String> = client
+        .query(
+            &format!("SELECT trim(srcdta) FROM {lib}.srcw ORDER BY srcseq"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(rows, ["first", "second"]);
+}
+
+/// CHGJOB and RTVJOBA (CL reference: SWS is eight characters 0, 1 or X,
+/// X leaving the switch as it is; DATFMT, DATSEP, INQMSGRPY and LOG
+/// level, severity and text; RTVJOBA returns them), %SWITCH (CL
+/// reference: '1' when the switches match the mask, X matching either),
+/// and the RPG external indicators U1-U8 (ILE RPG Reference, External
+/// Indicators: set from the job switches when the program starts, the
+/// switches set from them when it ends with LR on).
+#[tokio::test]
+async fn chgjob_rtvjoba_switch_and_external_indicators() {
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    source::create_file(&client, &lib, "QSRC", "")
+        .await
+        .unwrap();
+    let put = |name: &str, srctype: &str, text: &str| source::Member {
+        library: lib.clone(),
+        file: "QSRC".into(),
+        name: name.into(),
+        srctype: srctype.into(),
+        source: text.into(),
+        ..Default::default()
+    };
+    for m in [
+        put(
+            "JOBATR",
+            "CLLE",
+            "PGM
+DCL &SWS *CHAR 8
+DCL &FMT *CHAR 4
+DCL &SEP *CHAR 1
+DCL &RPY *CHAR 10
+DCL &LVL *CHAR 1
+DCL &SEV *DEC (2 0)
+DCL &TXT *CHAR 10
+CHGJOB SWS(10XXXXX1) DATFMT(*YMD) DATSEP('-') INQMSGRPY(*DFT) LOG(2 10 *SECLVL)
+CHGJOB LOG(3 *SAME *MSG)
+RTVJOBA SWS(&SWS) DATFMT(&FMT) DATSEP(&SEP) INQMSGRPY(&RPY) LOGLVL(&LVL) LOGSEV(&SEV) LOGTYPE(&TXT)
+SNDPGMMSG MSG(&SWS *BCAT &FMT *BCAT &SEP *BCAT &RPY *BCAT &LVL *BCAT %CHAR(&SEV) *BCAT &TXT) TOPGMQ(*EXT)
+IF COND(%SWITCH(1XXXXXX1)) THEN(SNDPGMMSG MSG('MATCH') TOPGMQ(*EXT))
+IF COND(%SWITCH(0XXXXXXX)) THEN(SNDPGMMSG MSG('NO MATCH') TOPGMQ(*EXT))
+CALL JOBSWS
+RTVJOBA SWS(&SWS)
+SNDPGMMSG MSG(&SWS) TOPGMQ(*EXT)
+ENDPGM
+",
+        ),
+        put(
+            "JOBSWS",
+            "RPGLE",
+            "**FREE
+if *inu1 and not *inu2 and *inu8;
+  dsply 'U1 U8';
+endif;
+*inu2 = *on;
+*inu8 = *off;
+*inlr = *on;
+",
+        ),
+    ] {
+        source::put_member(&client, &m, false).await.unwrap();
+    }
+    for c in [
+        format!("CRTBNDCL PGM({lib}/JOBATR) SRCFILE({lib}/QSRC)"),
+        format!("CRTBNDRPG PGM({lib}/JOBSWS) SRCFILE({lib}/QSRC)"),
+    ] {
+        run_in(&client, &url, &lib, &c)
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e:#}"));
+    }
+    let m = run_in_own_job(&client, &url, &lib, &format!("CALL {lib}/JOBATR"))
+        .await
+        .unwrap();
+    let m: Vec<String> = m.iter().map(|x| x.trim_end().to_string()).collect();
+    assert_eq!(
+        m,
+        [
+            "10000001 *YMD - *DFT 3 10 *MSG",
+            "MATCH",
+            "DSPLY  U1 U8",
+            "11000000",
+        ],
+        "{m:?}"
+    );
+    // Values CHGJOB does not take: diagnostics, then CPF0006.
+    let e = run_in(&client, &url, &lib, "CHGJOB SWS(12XXXXXX)")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("CPF0006"), "{e}");
+    let e = run_in(&client, &url, &lib, "CHGJOB JOBPTY(10)")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("CPF0006"), "{e}");
+}
+
+/// Source and binder commands iMoq's installer and mocks use. CPYSRCF
+/// (CL reference, Copy Source File): the member is added to the to-file
+/// with the from-member's type and text, MBROPT(*REPLACE) by default,
+/// *ADD after the lines there; SRCOPT(*SEQNBR) numbers the lines from
+/// SRCSEQ's start by its increment. CLRPFM of a source member leaves it
+/// with no records. RTVBNDSRC (CL reference, Retrieve Binder Source): a
+/// service program's exports and signature as binder language, which
+/// binds a service program with the same signature again. DLTMSGF of a
+/// message file that is not there: CPF2105 (CL reference, DLTMSGF error
+/// messages). A module's /COPY member in QTEMP: the program still runs
+/// in another job (on IBM i the copy is in the object). A procedure
+/// interface's EXTPROC('name') is the procedure's exported name (ILE RPG
+/// Reference, EXTPROC).
+#[tokio::test]
+async fn source_and_binder_commands_found_by_imoq() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QTEMP".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    for f in ["SRCA", "SRCB", "QSRVSRC", "QRPGLESRC"] {
+        source::create_file(&client, &lib, f, "").await.unwrap();
+    }
+    let put = |file: &str, name: &str, srctype: &str, text: &str, src: &str| source::Member {
+        library: lib.clone(),
+        file: file.into(),
+        name: name.into(),
+        srctype: srctype.into(),
+        text: text.into(),
+        source: src.into(),
+        ..Default::default()
+    };
+    for m in [
+        put("SRCA", "M1", "RPGLE", "Three lines", "one\ntwo\nthree\n"),
+        put(
+            "QRPGLESRC",
+            "PRICES",
+            "RPGLE",
+            "",
+            "**FREE
+ctl-opt nomain;
+dcl-proc mockp1 export;
+  dcl-pi *n packed(7:2) extproc('EX_PRICE');
+    item char(5) const;
+  end-pi;
+  return 12.5;
+end-proc;
+dcl-proc ex_count export;
+  dcl-pi *n int(10) end-pi;
+  return 3;
+end-proc;
+",
+        ),
+        put(
+            "QSRVSRC",
+            "PRICES",
+            "BND",
+            "",
+            "STRPGMEXP PGMLVL(*CURRENT) SIGNATURE('PRICES V1')\n  EXPORT SYMBOL(EX_PRICE)\n  EXPORT SYMBOL(EX_COUNT)\nENDPGMEXP\n",
+        ),
+    ] {
+        source::put_member(&client, &m, false).await.unwrap();
+    }
+    // CPYSRCF: added with type and text; renumbered from 10 by 5.
+    cl_cmd(
+        &mut job,
+        format!("CPYSRCF FROMFILE({lib}/SRCA) TOFILE({lib}/SRCB) FROMMBR(M1) SRCOPT(*SEQNBR) SRCSEQ(10 5)"),
+    )
+    .await
+    .unwrap();
+    let m = source::find_member(&client, std::slice::from_ref(&lib), "SRCB", "M1")
+        .await
+        .unwrap();
+    assert_eq!(
+        (m.srctype.as_str(), m.text.as_str()),
+        ("RPGLE", "Three lines")
+    );
+    let seqdat = source::member_seqdat(&client, &lib, "SRCB", "M1")
+        .await
+        .unwrap();
+    let recs = source::line_records(&m.source, seqdat.as_deref());
+    let seqs: Vec<&str> = recs.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(seqs, ["10.00", "15.00", "20.00"]);
+    // MBROPT(*ADD): after the lines there.
+    cl_cmd(
+        &mut job,
+        format!("CPYSRCF FROMFILE({lib}/SRCA) TOFILE({lib}/SRCB) FROMMBR(M1) MBROPT(*ADD)"),
+    )
+    .await
+    .unwrap();
+    let m = source::find_member(&client, std::slice::from_ref(&lib), "SRCB", "M1")
+        .await
+        .unwrap();
+    assert_eq!(m.source.lines().count(), 6);
+    // CLRPFM of the source member.
+    let r = cl_cmd(&mut job, format!("CLRPFM FILE({lib}/SRCB) MBR(M1)"))
+        .await
+        .unwrap();
+    assert!(r[0].starts_with("CPC3101"), "{r:?}");
+    let m = source::find_member(&client, std::slice::from_ref(&lib), "SRCB", "M1")
+        .await
+        .unwrap();
+    assert_eq!(m.source, "");
+    // A procedure exported by its interface's EXTPROC name; RTVBNDSRC
+    // gives source that binds the same signature again.
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/PRICES) SRCFILE({lib}/QRPGLESRC)"),
+        format!("CRTSRVPGM SRVPGM({lib}/PRICES) MODULE({lib}/PRICES) SRCFILE({lib}/QSRVSRC)"),
+        format!("RTVBNDSRC SRVPGM({lib}/PRICES) SRCFILE({lib}/SRCB) SRCMBR(PRICES2)"),
+        format!("CRTSRVPGM SRVPGM({lib}/PRICES2) MODULE({lib}/PRICES) SRCFILE({lib}/SRCB)"),
+    ] {
+        cl_cmd(&mut job, c.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    let sig = |name: &str| {
+        let client = &client;
+        let lib = lib.clone();
+        let name = name.to_string();
+        async move {
+            let b: String = client
+                .query_one(
+                    "SELECT binding FROM as4tainr.service_programs WHERE library=$1 AND name=$2",
+                    &[&lib, &name],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+            (v["signature"].clone(), v["exports"].clone())
+        }
+    };
+    let (s1, e1) = sig("PRICES").await;
+    let (s2, e2) = sig("PRICES2").await;
+    assert_eq!(s1, s2);
+    assert_eq!(e1, e2);
+    assert_eq!(e1, serde_json::json!(["EX_PRICE", "EX_COUNT"]));
+    // DLTMSGF of a message file that is not there.
+    let e = cl_cmd(&mut job, format!("DLTMSGF MSGF({lib}/NOSUCH)"))
+        .await
+        .unwrap_err();
+    assert!(e.contains("CPF2105"), "{e}");
+}
+
+/// More of what iMoq needs. ILE Concepts, procedure pointers: a pointer
+/// to a procedure of a program's module calls it from another program or
+/// service program, on the module's static storage (one per activation).
+/// ILE RPG Reference, OPTIONS(*VARSIZE): the procedure may use all of the
+/// storage passed for the parameter, longer than declared (a CL variable
+/// passed by CALLPRC). A program whose /COPY member was in its creating
+/// job's QTEMP runs in another job (the copy is part of the object). Db2
+/// for i SQL Reference, CREATE ALIAS: an alias of a source member takes
+/// DELETE. A command's DFT(QTEMP) is the QTEMP of the job that runs it.
+#[tokio::test]
+async fn pointers_varsize_qtemp_copy_and_aliases_found_by_imoq() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QTEMP".into(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    for f in ["QRPGLESRC", "QCLSRC", "QCMDSRC", "SRCA"] {
+        source::create_file(&client, &lib, f, "").await.unwrap();
+    }
+    let put = |file: &str, name: &str, srctype: &str, src: &str| source::Member {
+        library: lib.clone(),
+        file: file.into(),
+        name: name.into(),
+        srctype: srctype.into(),
+        source: src.into(),
+        ..Default::default()
+    };
+    for m in [
+        put(
+            "QRPGLESRC",
+            "CB",
+            "RPGLE",
+            "**FREE
+ctl-opt nomain;
+dcl-proc cbcall export;
+  dcl-pi *n int(10);
+    p pointer(*proc) value;
+    n int(10) value;
+  end-pi;
+  dcl-pr fn int(10) extproc(p);
+    x int(10) value;
+  end-pr;
+  return fn(n);
+end-proc;
+dcl-proc vsz export;
+  dcl-pi *n;
+    a char(1) options(*varsize);
+  end-pi;
+  dcl-s q pointer;
+  dcl-s full char(20) based(q);
+  q = %addr(a);
+  %subst(full : 11 : 10) = 'KLMNOPQRST';
+end-proc;
+",
+        ),
+        put(
+            "QRPGLESRC",
+            "PP",
+            "RPGLE",
+            "**FREE
+ctl-opt dftactgrp(*no) actgrp('PPGRP');
+dcl-pr cbcall int(10) extproc('CBCALL');
+  p pointer(*proc) value;
+  n int(10) value;
+end-pr;
+dcl-s calls int(10);
+dcl-s r int(10);
+r = cbcall(%paddr(twice) : 21);
+dsply (%char(r) + ' ' + %char(calls));
+*inlr = *on;
+dcl-proc twice;
+  dcl-pi *n int(10);
+    n int(10) value;
+  end-pi;
+  calls += 1;
+  return n * 2;
+end-proc;
+",
+        ),
+        put(
+            "QCLSRC",
+            "VSZCL",
+            "CLLE",
+            "PGM
+DCL &A *CHAR 20 VALUE('ABCDEFGHIJ')
+CALLPRC PRC('VSZ') PARM((&A))
+SNDPGMMSG MSG(&A) TOPGMQ(*EXT)
+ENDPGM
+",
+        ),
+        put(
+            "QRPGLESRC",
+            "USEINC",
+            "RPGLE",
+            "**FREE
+/COPY QTEMP/INC,G
+dsply GREETING;
+*inlr = *on;
+",
+        ),
+        put(
+            "QCMDSRC",
+            "TQ",
+            "CMD",
+            "CMD PROMPT('Test')
+PARM KWD(LIB) TYPE(*NAME) LEN(10) DFT(QTEMP)
+",
+        ),
+        put("SRCA", "M1", "TXT", "one\ntwo\nthree\n"),
+        put(
+            "QCLSRC",
+            "MKINC",
+            "CLLE",
+            &format!(
+                "PGM
+CRTSRCPF FILE(QTEMP/INC) RCDLEN(112)
+CPYFRMSTMF FROMSTMF('/t/{lib}/g.rpgle') TOMBR('/QSYS.LIB/QTEMP.LIB/INC.FILE/G.MBR')
+CRTBNDRPG PGM({lib}/USEINC) SRCFILE({lib}/QRPGLESRC)
+DLTF FILE(QTEMP/INC)
+CALL {lib}/USEINC
+ENDPGM
+"
+            ),
+        ),
+    ] {
+        source::put_member(&client, &m, false).await.unwrap();
+    }
+    source::put_stream_file(
+        &client,
+        &format!("/t/{lib}/g.rpgle"),
+        "**FREE\ndcl-c GREETING 'hello';\n",
+    )
+    .await
+    .unwrap();
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/CB) SRCFILE({lib}/QRPGLESRC)"),
+        format!("CRTSRVPGM SRVPGM({lib}/CB) MODULE({lib}/CB) EXPORT(*ALL)"),
+        format!("CRTRPGMOD MODULE({lib}/PP) SRCFILE({lib}/QRPGLESRC)"),
+        format!("CRTPGM PGM({lib}/PP) MODULE({lib}/PP) BNDSRVPGM({lib}/CB) ACTGRP(PPGRP)"),
+        format!("CRTCLMOD MODULE({lib}/VSZCL) SRCFILE({lib}/QCLSRC)"),
+        format!("CRTPGM PGM({lib}/VSZCL) MODULE({lib}/VSZCL) BNDSRVPGM({lib}/CB)"),
+        format!("CRTBNDCL PGM({lib}/MKINC) SRCFILE({lib}/QCLSRC)"),
+        format!("CRTCMD CMD({lib}/TQ) PGM({lib}/PP) SRCFILE({lib}/QCMDSRC)"),
+    ] {
+        cl_cmd(&mut job, c.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    // The program's procedure, called from the service program, counted
+    // in the program's storage.
+    let r = cl_cmd(&mut job, format!("CALL {lib}/PP")).await.unwrap();
+    assert_eq!(r, ["DSPLY  42 1"]);
+    let r = run_in_own_job(&client, &url, &lib, &format!("CALL {lib}/VSZCL"))
+        .await
+        .unwrap();
+    assert_eq!(r, ["ABCDEFGHIJKLMNOPQRST"]);
+    // Made with a /COPY member in its job's QTEMP, then the member gone
+    // (in that job), and in another job: the program has its copy.
+    let r = run_in_own_job(&client, &url, &lib, &format!("CALL {lib}/MKINC"))
+        .await
+        .unwrap();
+    assert_eq!(r.last().map(String::as_str), Some("DSPLY  hello"), "{r:?}");
+    let r = run_in_own_job(&client, &url, &lib, &format!("CALL {lib}/USEINC"))
+        .await
+        .unwrap();
+    assert_eq!(r, ["DSPLY  hello"]);
+    // DFT(QTEMP) kept as QTEMP.
+    let def: String = client
+        .query_one(
+            "SELECT definition FROM as4tainr.commands WHERE library=$1 AND name='TQ'",
+            &[&lib],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(def.contains("\"dft\":\"QTEMP\""), "{def}");
+    // DELETE through an alias of a source member.
+    for c in [
+        format!("RUNSQL SQL('CREATE ALIAS {lib}.A1 FOR {lib}.SRCA (M1)') COMMIT(*NONE)"),
+        format!("RUNSQL SQL('DELETE FROM {lib}.A1 WHERE SRCDTA = ''two''') COMMIT(*NONE)"),
+    ] {
+        cl_cmd(&mut job, c.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    let m = source::find_member(&client, std::slice::from_ref(&lib), "SRCA", "M1")
+        .await
+        .unwrap();
+    assert_eq!(m.source.lines().collect::<Vec<_>>(), ["one", "three"]);
+}

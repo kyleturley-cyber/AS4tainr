@@ -15,6 +15,7 @@ impl Job<'_> {
             "DSPFFD" => self.dspffd(cmd).await?,
             "DSPDBR" => self.dspdbr(cmd).await?,
             "CPYF" => self.cpyf(cmd).await?,
+            "CPYSRCF" => self.cpysrcf(cmd).await?,
             _ => return Ok(None),
         }))
     }

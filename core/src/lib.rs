@@ -42,6 +42,7 @@ pub mod ifs;
 pub mod ifs_commands;
 pub mod ile;
 pub mod import;
+pub mod jobattr;
 pub mod jobd;
 pub mod joblog;
 pub mod jobs;

@@ -41,9 +41,12 @@ Batch programs run without a display: `EXFMT` in a batch job fails, as it does o
 | `ENDJOB JOB(number/user/name)` | Ends a job that is still on the job queue |
 | `SNDMSG MSG('...') TOUSR(user)` | Sends a message to a user's message queue (`*SYSOPR` goes to `QSYSOPR`) |
 | `DSPMSG` | Shows your messages, newest first, and marks them as read |
-| `RTVJOBA JOB(&j) NBR(&n) USER(&u)` | In CL programs: the job's name, number and user |
+| `RTVJOBA JOB(&j) NBR(&n) USER(&u) SWS(&s) DATFMT(&f) ...` | In CL programs: the job's name, number and user, and its attributes as DSPJOB shows them (with CHGJOB's changes): every return variable of the CL reference |
+| `CHGJOB JOB(*) SWS(10XXXXX1) DATFMT(*YMD) INQMSGRPY(*DFT) LOG(...) ...` | Changes this job's attributes (`jobattr.rs`, kept in the process by job); values checked as the CL reference lists them (a value that is not valid: a diagnostic and CPF0006, nothing changed), *SYSVAL resolved when the command runs, X in SWS leaving a switch as it is; DEVRCYACN and TSEPOOL only for an interactive job (CPF1334), RUNPTY and the other run attributes only with *JOBCTL (CPF1337). DSPJOB and RTVJOBA show the changes. `%SWITCH(mask)` in CL tests the job switches; an RPG program's U1-U8 are the switches when it starts and become them when it ends with LR on |
 
 They are on the F4 menu under "Job and message commands".
+
+CHGJOB changes only this job: another job named is found (CPF1321 when it is not there) but not changed (its attributes live in its own process); JOBQ, SCDDATE and SCDTIME (a job on a job queue) are not changed (CPF1343). The attributes change what DSPJOB and RTVJOBA show, the job switches (%SWITCH, RPG U1-U8); the others (date format, inquiry reply, logging level...) do not change how the job runs yet (docs/fidelity-gaps.md).
 
 ## Not yet
 

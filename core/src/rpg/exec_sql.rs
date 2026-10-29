@@ -883,6 +883,7 @@ impl Machine<'_> {
                 }
             }
             "CALL" => return self.sql_call(sql),
+            "INSERT" if w.iter().any(|x| x == "ROWS") => return self.sql_insert_rows(sql),
             "GET" | "GRANT" | "REVOKE" | "LOCK" | "MERGE" => {
                 return Ok(Outcome::error(
                     -84,
@@ -960,6 +961,71 @@ impl Machine<'_> {
             out.push(self.host_literal(&name, ind.as_deref())?);
         }
         Ok(out)
+    }
+
+    /// The multiple-row INSERT (Db2 for i SQL Reference, INSERT: `n ROWS
+    /// VALUES (:host-structure-array)`): the first n elements of the data
+    /// structure array, each a row of its subfields' values.
+    fn sql_insert_rows(&mut self, sql: &str) -> Result<Outcome> {
+        let at = find_word(sql, "ROWS").ok_or_else(|| anyhow!("SQL0104: ROWS expected"))?;
+        let head = sql[..at].trim_end();
+        let (target, count) = match head.rfind(char::is_whitespace) {
+            Some(i) => (&head[..i], head[i + 1..].trim()),
+            None => bail!("SQL0104: the number of rows is missing before ROWS"),
+        };
+        let n = match count.strip_prefix(':') {
+            Some(h) => self.eval(&crate::rpg::expr::parse(h)?)?.num()?,
+            None => crate::rpg::dec::Dec::parse(count)?,
+        }
+        .to_i128()?
+        .max(0) as usize;
+        let rest = sql[at + 4..].trim_start();
+        let Some(vals) = rest
+            .strip_prefix("VALUES")
+            .or_else(|| rest.strip_prefix("values"))
+            .map(str::trim)
+        else {
+            bail!("SQL0104: VALUES expected after ROWS");
+        };
+        let host = vals
+            .trim_start_matches('(')
+            .trim_end_matches(';')
+            .trim_end_matches(')')
+            .trim()
+            .trim_start_matches(':')
+            .to_ascii_uppercase();
+        let Some(Sym::Ds(d)) = self.sym(&host) else {
+            bail!("SQL0312: {host} must be a host structure array for n ROWS");
+        };
+        if n == 0 {
+            return Ok(Outcome::ok(0));
+        }
+        if n > d.dim.max(1) as usize {
+            return Ok(Outcome::error(
+                -221,
+                format!(
+                    "SQL0221: {n} rows are more than the {} elements of {host}.",
+                    d.dim
+                ),
+            ));
+        }
+        let mut rows = Vec::new();
+        for i in 1..=n {
+            let mut parts = Vec::new();
+            for sf in &d.subfields {
+                let e = crate::rpg::expr::parse(&format!("{host}({i}).{sf}"))?;
+                let v = self.eval(&e)?;
+                match (self.type_of(&e), &v) {
+                    (Some(super::data::DType::Char(len)), Value::Char(_)) => {
+                        parts.push(format!("CAST({} AS char({len}))", literal(&v)?))
+                    }
+                    _ => parts.push(literal(&v)?),
+                }
+            }
+            rows.push(format!("({})", parts.join(", ")));
+        }
+        let text = format!("{} VALUES {}", self.bind_host(target)?, rows.join(", "));
+        self.sql_change(&text)
     }
 
     /// INSERT, UPDATE, DELETE (or a query run for nothing).

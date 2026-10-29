@@ -168,7 +168,8 @@ async fn find_include(
         let up = id.to_ascii_uppercase();
         let (libs, file, member) = match up.split_once(',') {
             Some((f, m)) => match f.split_once('/') {
-                Some((l, f)) => (vec![l.to_string()], f.to_string(), m.to_string()),
+                // QTEMP/FILE,MEMBER: the job's own QTEMP.
+                Some((l, f)) => (vec![crate::qtemp::real(l)], f.to_string(), m.to_string()),
                 None => (libl.to_vec(), f.to_string(), m.to_string()),
             },
             None => (libl.to_vec(), "QRPGLESRC".to_string(), up.clone()),
@@ -235,6 +236,62 @@ fn nested_path(path: Option<&IncludePath>, found: &Found) -> Option<IncludePath>
         }
         Found::Member(_) => Some(path.clone()),
     }
+}
+
+/// INCSNAP(key) out of compile options: (the other options, the key).
+fn take_incsnap(options: &str) -> (String, Option<String>) {
+    let up = options.to_ascii_uppercase();
+    let Some(at) = up.find("INCSNAP(") else {
+        return (options.to_string(), None);
+    };
+    let rest = &options[at + 8..];
+    let end = rest.find(')').unwrap_or(rest.len());
+    let key = rest[..end].trim().to_string();
+    let others = format!("{}{}", &options[..at], rest.get(end + 1..).unwrap_or(""));
+    (others.trim().to_string(), Some(key))
+}
+
+/// The includes an object is created with, kept (`as4tainr.include_
+/// snapshots`) as a compile option INCSNAP(key) for the object's options
+/// ("" when the source includes nothing). On IBM i a program does not
+/// need its /COPY members once it is created; here it is compiled again
+/// when activated, so an include that is gone by then (a member in the
+/// creating job's QTEMP) comes from the snapshot.
+pub async fn snapshot_option(
+    client: &Client,
+    libl: &[String],
+    source: &str,
+    options: &str,
+) -> Result<String> {
+    let (_, incpath) = take_incpath(options);
+    let includes = load_includes(client, libl, source, incpath.as_ref()).await;
+    if includes.is_empty() {
+        return Ok(String::new());
+    }
+    let mut ids: Vec<&String> = includes.keys().collect();
+    ids.sort();
+    let mut h: u64 = 0xcbf29ce484222325;
+    for id in &ids {
+        for b in id
+            .bytes()
+            .chain([0])
+            .chain(includes[*id].bytes())
+            .chain([0])
+        {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    let key = format!("{h:016X}");
+    for id in ids {
+        client
+            .execute(
+                "INSERT INTO as4tainr.include_snapshots VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                &[&key, id, &includes[id]],
+            )
+            .await?;
+    }
+    Ok(format!("INCSNAP({key})"))
 }
 
 /// Fetch every include a source needs (and theirs).
@@ -490,8 +547,24 @@ pub async fn compile_parts(
             source,
         );
     }
-    let (options, incpath) = take_incpath(options);
-    let includes = load_includes(client, libl, source, incpath.as_ref()).await;
+    let (options, snap) = take_incsnap(options);
+    let (options, incpath) = take_incpath(&options);
+    let mut includes = load_includes(client, libl, source, incpath.as_ref()).await;
+    // What is not there any more comes from what the object was created
+    // with.
+    if let Some(key) = snap {
+        if let Ok(rows) = client
+            .query(
+                "SELECT id, text FROM as4tainr.include_snapshots WHERE snap = $1",
+                &[&key],
+            )
+            .await
+        {
+            for r in rows {
+                includes.entry(r.get(0)).or_insert_with(|| r.get(1));
+            }
+        }
+    }
     // DEFINE(names) from the create command: condition names for /IF
     // DEFINED, not a control keyword.
     let (options, defines) = take_defines(&options);
@@ -841,6 +914,9 @@ pub async fn call_procedure(
             anyhow!("CPD5D02: Procedure {sym} is not bound to program {program}.")
         })?;
         let (code, unit, b, group) = match &target {
+            Target::Pgm { library, name, .. } => {
+                anyhow::bail!("CPD5D02: {library}/{name} is a program: CALLPRC cannot call into it.")
+            }
             Target::Module(m) => {
                 let code = binding
                     .modules

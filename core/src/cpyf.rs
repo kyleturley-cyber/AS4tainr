@@ -19,6 +19,186 @@ impl Job<'_> {
     /// records. The completion message is CPC2955 with the number of
     /// records copied (observed on IBM i 7.5); a copy that cannot be done
     /// ends with CPF2817.
+    /// CPYSRCF (CL reference, Copy Source File): members of a source
+    /// file (FROMMBR a name, generic name or *ALL) into an existing
+    /// source file; TOMBR *FROMMBR or a name; MBROPT *REPLACE (the
+    /// default) or *ADD; a member not in the to-file is added with the
+    /// from-member's type and text; each line is cut or padded to the
+    /// to-file's record; SRCOPT *SEQNBR numbers the lines again from
+    /// SRCSEQ's start by its increment, *DATE clears their dates.
+    pub(crate) async fn cpysrcf(&mut self, cmd: &Command) -> Result<Outcome> {
+        let from_q = cmd.get("FROMFILE").to_ascii_uppercase();
+        let (libs, from_name) = self.search(&from_q);
+        let from_label = from_q.split_once('/').map(|x| x.0).unwrap_or("*LIBL");
+        let mut from_lib = None;
+        for l in &libs {
+            if crate::source::is_source_file(self.client, l, &from_name).await? {
+                from_lib = Some(l.clone());
+                break;
+            }
+        }
+        let from_lib = from_lib.ok_or_else(|| {
+            anyhow!(
+                "CPF2802: From-file {from_name} in library {from_label} does not exist.\nCPF2817: The copy was not done."
+            )
+        })?;
+        crate::authority::check(
+            self.client,
+            &self.user,
+            &from_lib,
+            &from_name,
+            "*FILE",
+            crate::authority::Aut::Use,
+        )
+        .await?;
+        let to_q = cmd.get("TOFILE").to_ascii_uppercase();
+        let (to_libs, to_name) = self.search(&to_q);
+        let to_label = to_q.split_once('/').map(|x| x.0).unwrap_or("*LIBL");
+        let mut to_lib = None;
+        for l in &to_libs {
+            if crate::source::is_source_file(self.client, l, &to_name).await? {
+                to_lib = Some(l.clone());
+                break;
+            }
+        }
+        let to_lib = to_lib.ok_or_else(|| {
+            anyhow!(
+                "CPF2861: To-file {to_name} in library {to_label} does not exist.\nCPF2817: The copy was not done."
+            )
+        })?;
+        crate::authority::check(
+            self.client,
+            &self.user,
+            &to_lib,
+            &to_name,
+            "*FILE",
+            crate::authority::Aut::Change,
+        )
+        .await?;
+        let pattern = cmd.get("FROMMBR").trim().to_ascii_uppercase();
+        let all = crate::source::members(self.client, &from_lib, &from_name).await?;
+        let picked: Vec<(String, String, String)> = all
+            .into_iter()
+            .filter(|(m, _, _)| match pattern.strip_suffix('*') {
+                _ if pattern == "*ALL" => true,
+                Some(prefix) => m.starts_with(prefix),
+                None => *m == pattern,
+            })
+            .collect();
+        if picked.is_empty() {
+            bail!(
+                "CPF9815: Member {pattern} of file {from_name} in library {} does not exist.\nCPF2817: The copy was not done.",
+                crate::qtemp::logical(&from_lib)
+            );
+        }
+        let tombr = cmd.get("TOMBR").trim().to_ascii_uppercase();
+        if picked.len() > 1 && !matches!(tombr.as_str(), "*FROMMBR" | "") {
+            bail!("TOMBR must be *FROMMBR when more than one member is copied.\nCPF2817: The copy was not done.");
+        }
+        let add = cmd.get("MBROPT").eq_ignore_ascii_case("*ADD");
+        let srcopt: Vec<String> = cmd
+            .list("SRCOPT")
+            .iter()
+            .map(|o| o.to_ascii_uppercase())
+            .collect();
+        let renumber = srcopt.iter().any(|o| o == "*SEQNBR");
+        let undate = srcopt.iter().any(|o| o == "*DATE");
+        let seq = cmd.list("SRCSEQ");
+        // Sequence numbers are 4.2 digits: in hundredths.
+        let hundredths = |v: Option<&String>| -> i64 {
+            let v = v.map(|x| x.trim()).unwrap_or("1");
+            let (i, f) = v.split_once('.').unwrap_or((v, ""));
+            let f: String = f.chars().chain("00".chars()).take(2).collect();
+            i.parse::<i64>().unwrap_or(1) * 100 + f.parse::<i64>().unwrap_or(0)
+        };
+        let (start, incr) = (hundredths(seq.first()), hundredths(seq.get(1)));
+        let to_rcdlen = crate::source::record_length(self.client, &to_lib, &to_name).await?;
+        let width = to_rcdlen.saturating_sub(12) as usize;
+        let mut done = Vec::new();
+        for (mbr, srctype, text) in picked {
+            let m = crate::source::find_member(
+                self.client,
+                std::slice::from_ref(&from_lib),
+                &from_name,
+                &mbr,
+            )
+            .await?;
+            crate::source::note_used(self.client, &from_lib, &from_name, &mbr).await;
+            let seqdat =
+                crate::source::member_seqdat(self.client, &from_lib, &from_name, &mbr).await?;
+            let to_mbr = if matches!(tombr.as_str(), "*FROMMBR" | "") {
+                mbr.clone()
+            } else {
+                tombr.clone()
+            };
+            // The lines already there (MBROPT(*ADD)).
+            let mut lines: Vec<(String, String, String)> = Vec::new();
+            let existing = crate::source::find_member(
+                self.client,
+                std::slice::from_ref(&to_lib),
+                &to_name,
+                &to_mbr,
+            )
+            .await
+            .ok();
+            let (keep_type, keep_text) = match &existing {
+                Some(e) if add => {
+                    let sd = crate::source::member_seqdat(self.client, &to_lib, &to_name, &to_mbr)
+                        .await?;
+                    lines = crate::source::line_records(&e.source, sd.as_deref());
+                    (e.srctype.clone(), e.text.clone())
+                }
+                _ => (srctype.clone(), text.clone()),
+            };
+            let copied = crate::source::line_records(&m.source, seqdat.as_deref());
+            let count = copied.len();
+            for (i, (s, d, l)) in copied.into_iter().enumerate() {
+                let s = if renumber {
+                    let n = start + incr * i as i64;
+                    format!("{}.{:02}", (n / 100) % 10000, n % 100)
+                } else {
+                    s
+                };
+                let d = if undate { "0".to_string() } else { d };
+                let mut l: String = l.chars().take(width).collect();
+                let pad = l.trim_end().len();
+                l.truncate(pad);
+                lines.push((s, d, l));
+            }
+            let source: String = lines.iter().map(|(_, _, l)| format!("{l}\n")).collect();
+            let meta: Vec<String> = lines
+                .iter()
+                .map(|(s, d, _)| crate::source::line_meta(s, d))
+                .collect();
+            crate::source::put_member(
+                self.client,
+                &crate::source::Member {
+                    library: to_lib.clone(),
+                    file: to_name.clone(),
+                    name: to_mbr.clone(),
+                    srctype: keep_type,
+                    text: keep_text,
+                    source,
+                    ..Default::default()
+                },
+                true,
+            )
+            .await?;
+            crate::source::set_member_seqdat(
+                self.client,
+                &to_lib,
+                &to_name,
+                &to_mbr,
+                &meta.join("\n"),
+            )
+            .await?;
+            done.push(format!(
+                "{count} records copied from member {mbr} of file {from_name} to member {to_mbr} of file {to_name}."
+            ));
+        }
+        Ok(Outcome::Messages(done))
+    }
+
     pub(crate) async fn cpyf(&mut self, cmd: &Command) -> Result<Outcome> {
         let from_q = cmd.get("FROMFILE").to_ascii_uppercase();
         let (libs, from_name) = self.search(&from_q);

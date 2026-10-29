@@ -730,10 +730,13 @@ impl Program {
     /// Procedures this module exports.
     pub fn exports(&self) -> Vec<String> {
         // By the name other modules call it by (EXTPROC aliases too).
+        // A procedure whose interface names it (EXTPROC('name')) is
+        // exported by that name only.
         let mut v: Vec<String> = self
             .procs
             .iter()
             .filter(|(_, p)| p.export)
+            .filter(|(k, p)| p.written.as_ref().is_none_or(|w| w.eq_ignore_ascii_case(k)))
             .map(|(k, _)| k.clone())
             .collect();
         v.sort();
@@ -2802,12 +2805,16 @@ pub fn bind(
     // A procedure whose prototype has EXTPROC('name') is that name to
     // other modules (ILE RPG Reference, EXTPROC: the external name of the
     // procedure): it is found by both.
+    // So is a procedure whose procedure interface has EXTPROC('name')
+    // (ILE RPG Reference, EXTPROC on a procedure interface: the external
+    // name of the procedure).
     let aliases: Vec<(String, String)> = procs
-        .keys()
-        .filter_map(|n| {
+        .iter()
+        .filter_map(|(n, pi)| {
             protos
                 .get(n)
                 .and_then(|p| p.extproc.clone())
+                .or_else(|| pi.written.clone())
                 .map(|e| e.to_ascii_uppercase())
                 .filter(|e| e != n && !procs.contains_key(e))
                 .map(|e| (n.clone(), e))

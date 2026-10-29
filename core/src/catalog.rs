@@ -369,7 +369,10 @@ pub async fn init(client: &Client) -> Result<()> {
         // INSERT through an alias over a source member (ddl.rs CREATE
         // ALIAS).
         client
-            .batch_execute(&crate::source::insert_function("as4tainr.source_alias_insert"))
+            .batch_execute(
+                &(crate::source::insert_function("as4tainr.source_alias_insert")
+                    + &crate::source::alias_change_function("as4tainr.source_alias_change")),
+            )
             .await
             .context("creating catalog")?;
         client

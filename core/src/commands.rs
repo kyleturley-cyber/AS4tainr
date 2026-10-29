@@ -591,6 +591,7 @@ impl Job<'_> {
             "DLTPGM" | "DLTMOD" | "DLTSRVPGM" | "DLTBNDDIR" => self.dlt_ile(&cmd).await,
             "DSPPGM" => self.dsppgm(&cmd).await,
             "DSPSRVPGM" => self.dspsrvpgm(&cmd).await,
+            "RTVBNDSRC" => self.rtvbndsrc(&cmd).await,
             "UPDPGM" | "UPDSRVPGM" => self.updpgm(&cmd).await,
             "RCLACTGRP" | "RCLRSC" => {
                 let key = self
@@ -649,6 +650,7 @@ impl Job<'_> {
             "WRKSBMJOB" => self.wrksbmjob().await,
             "DSPJOBLOG" => self.dspjoblog(&cmd).await,
             "DSPJOB" => self.dspjob(&cmd).await,
+            "CHGJOB" => self.chgjob(&cmd).await,
             "ENDJOB" => self.endjob(&cmd).await,
             "SNDMSG" => self.sndmsg(&cmd).await,
             "DSPMSG" => self.dspmsg(&cmd).await,
@@ -1585,6 +1587,106 @@ impl Job<'_> {
         }))
     }
 
+    /// RTVBNDSRC (CL reference, Retrieve Binder Source): binder language
+    /// for a service program's current export block (its signature as
+    /// 16 bytes in hexadecimal, its exports in order) or a module's
+    /// exports, into a source member (SRCMBR *SRVPGM or *MODULE: named
+    /// like the object; MBROPT *REPLACE or *ADD; the member is added
+    /// with type BND when it is not there).
+    async fn rtvbndsrc(&mut self, cmd: &Command) -> Result<Outcome> {
+        let srvpgm = cmd.get("SRVPGM").trim().to_ascii_uppercase();
+        let module = cmd.get("MODULE").trim().to_ascii_uppercase();
+        let (object, lines) = if !matches!(srvpgm.as_str(), "" | "*NONE") {
+            let (lib, name) = self.ile_object(&srvpgm, "*SRVPGM", Aut::Use).await?;
+            let (_, b) =
+                crate::ile::find_srvpgm(self.client, &self.library_list(), &lib, &name).await?;
+            let mut l = vec![format!(
+                "STRPGMEXP PGMLVL(*CURRENT) SIGNATURE(X'{}')",
+                crate::ile::signature_hex(&b.signature)
+            )];
+            l.extend(
+                b.exports
+                    .iter()
+                    .map(|e| format!("  EXPORT SYMBOL(\"{e}\")")),
+            );
+            l.push("ENDPGMEXP".into());
+            (name, l)
+        } else if !matches!(module.as_str(), "" | "*NONE") {
+            let (lib, name) = self.ile_object(&module, "*MODULE", Aut::Use).await?;
+            let m = crate::ile::find_module(self.client, &self.library_list(), &lib, &name).await?;
+            let info = crate::ile::module_info(self.client, &self.library_list(), &m).await?;
+            let mut l = vec!["STRPGMEXP PGMLVL(*CURRENT)".to_string()];
+            l.extend(
+                info.exports
+                    .iter()
+                    .map(|e| format!("  EXPORT SYMBOL(\"{e}\")")),
+            );
+            l.push("ENDPGMEXP".into());
+            (name, l)
+        } else {
+            return Err(crate::cl::diag_error(
+                "",
+                "RTVBNDSRC needs a module (MODULE) or a service program (SRVPGM).",
+            ));
+        };
+        let file_q = cmd.get("SRCFILE").to_ascii_uppercase();
+        let (libs, file) = self.search(&file_q);
+        let mut lib = None;
+        for l in &libs {
+            if crate::source::is_source_file(self.client, l, &file).await? {
+                lib = Some(l.clone());
+                break;
+            }
+        }
+        let lib = lib.ok_or_else(|| {
+            anyhow!(
+                "CPF9812: There is no file {file} in library {}.",
+                file_q.split_once('/').map(|x| x.0).unwrap_or("*LIBL")
+            )
+        })?;
+        authority::check(self.client, &self.user, &lib, &file, "*FILE", Aut::Change).await?;
+        let mbr = match cmd.get("SRCMBR").trim().to_ascii_uppercase().as_str() {
+            "*SRVPGM" | "*MODULE" | "" => object.clone(),
+            m => m.to_string(),
+        };
+        let existing =
+            crate::source::find_member(self.client, std::slice::from_ref(&lib), &file, &mbr)
+                .await
+                .ok();
+        let mut source = String::new();
+        let (srctype, text) = match &existing {
+            Some(e) => {
+                if cmd.get("MBROPT").eq_ignore_ascii_case("*ADD") {
+                    source.push_str(&e.source);
+                }
+                (e.srctype.clone(), e.text.clone())
+            }
+            None => ("BND".to_string(), String::new()),
+        };
+        for l in &lines {
+            source.push_str(l);
+            source.push('\n');
+        }
+        crate::source::put_member(
+            self.client,
+            &crate::source::Member {
+                library: lib.clone(),
+                file: file.clone(),
+                name: mbr.clone(),
+                srctype,
+                text,
+                source,
+                ..Default::default()
+            },
+            true,
+        )
+        .await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Binder source for {object} was put in member {mbr} of file {file} in library {}.",
+            crate::qtemp::logical(&lib)
+        )]))
+    }
+
     /// DSPSRVPGM: a service program's activation group, signatures,
     /// modules and exports.
     async fn dspsrvpgm(&mut self, cmd: &Command) -> Result<Outcome> {
@@ -1821,7 +1923,9 @@ impl Job<'_> {
             String::new()
         } else {
             let inc = include_path_option(self.client, &self.job_key(), cmd, &m).await;
-            format!("{} {inc}", module_defines(cmd)).trim().to_string()
+            let o = format!("{} {inc}", module_defines(cmd)).trim().to_string();
+            let snap = crate::rpg::snapshot_option(self.client, &libl, &m.source, &o).await?;
+            format!("{o} {snap}").trim().to_string()
         };
         let mut severity = 0u8;
         let mut cl_listing = None;
@@ -3224,6 +3328,8 @@ impl Job<'_> {
             let options = format!("SQLCOMMIT({}) {inc}", cmd.get("COMMIT"))
                 .trim()
                 .to_string();
+            let snap = crate::rpg::snapshot_option(self.client, &libl, &m.source, &options).await?;
+            let options = format!("{options} {snap}").trim().to_string();
             crate::rpg::compile_with(self.client, &libl, &name, &m.source, &options).await?;
             let text = match cmd.get("TEXT") {
                 "*SRCMBRTXT" => m.text.clone(),
@@ -3313,6 +3419,12 @@ impl Job<'_> {
         if matches!(attribute, "RPGLE" | "SQLRPGLE") {
             let inc = include_path_option(self.client, &self.job_key(), cmd, &m).await;
             options = format!("{options} {inc}").trim().to_string();
+            let mut libl = self.library_list();
+            if !libl.contains(&lib) {
+                libl.insert(0, lib.clone());
+            }
+            let snap = crate::rpg::snapshot_option(self.client, &libl, &m.source, &options).await?;
+            options = format!("{options} {snap}").trim().to_string();
         }
         // CL: includes are part of the program; then it is checked.
         let source = if attribute == "RPGLE" || attribute == "SQLRPGLE" || attribute == "RPG" {
@@ -4845,6 +4957,56 @@ impl Job<'_> {
             [one] if cmd.get("FILE").contains('/') => format!("{one}/{name}"),
             _ => name.clone(),
         };
+        // A source file: the member's records go (CLRPFM of a source
+        // physical file member).
+        for l in &libs {
+            if !crate::source::is_source_file(self.client, l, &name).await? {
+                continue;
+            }
+            authority::check(self.client, &self.user, l, &name, "*FILE", Aut::Change).await?;
+            let mbr = match cmd.get("MBR").to_ascii_uppercase().as_str() {
+                "*FIRST" | "" => self
+                    .client
+                    .query_opt(
+                        "SELECT member FROM as4tainr.source_members WHERE library=$1 AND file=$2
+                          ORDER BY added, member LIMIT 1",
+                        &[l, &name],
+                    )
+                    .await?
+                    .map(|r| r.get::<_, String>(0))
+                    .ok_or_else(|| {
+                        anyhow!("CPF3141: Member *FIRST not found in file {name} in library {lib_label}.")
+                    })?,
+                "*LAST" => self
+                    .client
+                    .query_opt(
+                        "SELECT member FROM as4tainr.source_members WHERE library=$1 AND file=$2
+                          ORDER BY added DESC, member DESC LIMIT 1",
+                        &[l, &name],
+                    )
+                    .await?
+                    .map(|r| r.get::<_, String>(0))
+                    .ok_or_else(|| {
+                        anyhow!("CPF3141: Member *LAST not found in file {name} in library {lib_label}.")
+                    })?,
+                m => m.to_string(),
+            };
+            let n = self
+                .client
+                .execute(
+                    "UPDATE as4tainr.source_members SET source='', seqdat=NULL, changed=now()
+                      WHERE library=$1 AND file=$2 AND member=$3",
+                    &[l, &name, &mbr],
+                )
+                .await?;
+            if n == 0 {
+                bail!("CPF3141: Member {mbr} not found in file {name} in library {lib_label}.");
+            }
+            return Ok(Outcome::Messages(vec![format!(
+                "CPC3101: Member {mbr} of file {name} in library {} was cleared.",
+                crate::qtemp::logical(l)
+            )]));
+        }
         let fr = crate::catalog::resolve_file(self.client, &self.library_list(), &q)
             .await
             .map_err(|_| anyhow!("CPF3142: File {name} in library {lib_label} not found."))?;
@@ -4965,7 +5127,21 @@ impl Job<'_> {
 
     /// DLTMSGF.
     async fn dltmsgf(&mut self, cmd: &Command) -> Result<Outcome> {
-        let (lib, name) = self.message_file(cmd.get("MSGF")).await?;
+        // A message file that is not there: CPF2105, as for the other
+        // delete commands (iMoq's installer monitors DLTMSGF for it).
+        let q = cmd.get("MSGF");
+        let (lib, name) = match self.message_file(q).await {
+            Ok(x) => x,
+            Err(_) => {
+                let (_, n) = self.search(q);
+                let label = q.split_once('/').map(|(l, _)| l).unwrap_or("*LIBL");
+                bail!(
+                    "CPF2105: Object {} of type *MSGF in library {} not found.",
+                    n.to_ascii_uppercase(),
+                    label.to_ascii_uppercase()
+                )
+            }
+        };
         authority::check(self.client, &self.user, &lib, &name, "*MSGF", Aut::All).await?;
         crate::msgf::delete(self.client, &lib, &name).await?;
         authority::forget(self.client, &lib, &name, "*MSGF").await?;
@@ -5681,6 +5857,58 @@ impl Job<'_> {
         jobs::find(self.client, &jobs::parse_spec(spec)?).await
     }
 
+    /// CHGJOB: the attributes of this job (`jobattr.rs`). Another job
+    /// is found (CPF1321 when it is not there) but not changed: its
+    /// attributes live in its own process (docs/fidelity-gaps.md).
+    async fn chgjob(&mut self, cmd: &Command) -> Result<Outcome> {
+        let spec = cmd.get("JOB").trim().to_string();
+        if !matches!(spec.as_str(), "*" | "") {
+            let job = self.job_named(&spec).await?;
+            if self.id.as_ref().map(|i| i.number) != Some(job.id.number) {
+                bail!(
+                    "Changing another job's attributes is not supported here.\nCPF1336: CHGJOB of job {} did not change it.",
+                    job.id
+                );
+            }
+        }
+        for k in ["JOBQ", "SCDDATE", "SCDTIME"] {
+            if !matches!(
+                cmd.get(k).trim().to_ascii_uppercase().as_str(),
+                "*SAME" | ""
+            ) {
+                bail!("CPF1343: {k} can be changed only for a job on a job queue.");
+            }
+        }
+        let asked: Vec<(String, String)> = crate::jobattr::PARAMS
+            .iter()
+            .map(|k| {
+                let v = if *k == "LOG" {
+                    cmd.list(k).join(" ")
+                } else {
+                    cmd.get(k).to_string()
+                };
+                (k.to_string(), v)
+            })
+            .collect();
+        let key = self.job_key();
+        let jobd = match crate::jobd::find(self.client, &["QGPL".to_string()], "QDFTJOBD").await? {
+            Some(d) if self.id.is_some() => crate::jobd::other_attributes(self.client, &d).await?,
+            _ => String::new(),
+        };
+        let current = |k: &str| -> String {
+            crate::jobattr::get(&key, k)
+                .or_else(|| crate::jobd::given(&jobd, k))
+                .unwrap_or_else(|| match k {
+                    "SWS" => "00000000".into(),
+                    "LOG" => "4 0 *NOLIST".into(),
+                    _ => String::new(),
+                })
+        };
+        let jobctl = crate::users::has_special(self.client, &self.user, "*JOBCTL").await?;
+        crate::jobattr::change(&key, &asked, &current, self.display.is_some(), jobctl)?;
+        Ok(Outcome::Messages(vec![]))
+    }
+
     async fn dspjoblog(&mut self, cmd: &Command) -> Result<Outcome> {
         let this = matches!(cmd.get("JOB").trim(), "*" | "");
         if this && self.id.is_none() && cmd.get("OUTPUT") == "*PRINT" {
@@ -5935,13 +6163,15 @@ impl Job<'_> {
     /// call stack in IBM i 7.5's printed layout (crate::dspjob), printed
     /// (OUTPUT(*PRINT), `system`) or shown as a list. OPTION *DFNA,
     /// *STSA, *RUNA, *PGMSTK, or *SELECT/*ALL for the four.
-    async fn dspjob(&mut self, cmd: &Command) -> Result<Outcome> {
-        use crate::dspjob::{Facts, StackEntry};
-        let option = cmd.get("OPTION").trim().to_ascii_uppercase();
-        let this = matches!(cmd.get("JOB").trim(), "*" | "");
+    /// The facts DSPJOB shows of a job (`dspjob::Facts`): this job's
+    /// (`system`'s own when it has no ID) or the one named; this job's
+    /// attributes changed by CHGJOB (`jobattr`).
+    pub(crate) async fn job_facts(&self, spec: &str) -> Result<crate::dspjob::Facts> {
+        use crate::dspjob::Facts;
+        let this = matches!(spec.trim(), "*" | "");
         let ((y, mo, d), (h, mi, s), _) = crate::pgmmsg::job_started();
         let st = crate::report::Stamp::of((y, mo, d), (h, mi, s));
-        let mut f = if this && self.id.is_none() {
+        let f = if this && self.id.is_none() {
             // `system`'s own job (PUB400 2026-10-28,
             // tools/golden/verify19.txt b19_dfna, b19_stsa).
             Facts {
@@ -5959,7 +6189,7 @@ impl Job<'_> {
                 ..Default::default()
             }
         } else {
-            let job = self.job_named(cmd.get("JOB")).await?;
+            let job = self.job_named(spec).await?;
             let d = crate::jobd::find(self.client, &["QGPL".to_string()], "QDFTJOBD").await?;
             let other = match &d {
                 Some(d) => crate::jobd::other_attributes(self.client, d).await?,
@@ -5996,6 +6226,22 @@ impl Job<'_> {
                 ..Default::default()
             }
         };
+        let mut f = f;
+        let own = this
+            || self
+                .id
+                .as_ref()
+                .is_some_and(|i| f.number == format!("{:06}", i.number));
+        if own {
+            f.changed = crate::jobattr::all(&self.job_key());
+        }
+        Ok(f)
+    }
+
+    async fn dspjob(&mut self, cmd: &Command) -> Result<Outcome> {
+        use crate::dspjob::StackEntry;
+        let option = cmd.get("OPTION").trim().to_ascii_uppercase();
+        let mut f = self.job_facts(cmd.get("JOB")).await?;
         // The call stack as this process keeps it (QWVRCSTK's entries).
         let mut groups: Vec<String> = Vec::new();
         let mut in_use: Vec<String> = Vec::new();

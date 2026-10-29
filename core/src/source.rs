@@ -49,6 +49,16 @@ ALTER TABLE as4tainr.source_members ADD COLUMN IF NOT EXISTS days_used integer N
 ALTER TABLE as4tainr.source_members ADD COLUMN IF NOT EXISTS seqdat text;
 -- Stream files (a small IFS): include files that source refers to by
 -- path, such as RPG `/INCLUDE 'header.rpgleinc'`.
+-- The /COPY and /INCLUDE files an RPG object was created with (by a
+-- digest of them all, `rpg::snapshot_option`): a program or module whose
+-- include is gone (a QTEMP member of the job that created it) still
+-- compiles from what it was created with.
+CREATE TABLE IF NOT EXISTS as4tainr.include_snapshots (
+    snap  text NOT NULL,
+    id    text NOT NULL,
+    text  text NOT NULL,
+    PRIMARY KEY (snap, id)
+);
 CREATE TABLE IF NOT EXISTS as4tainr.stream_files (
     path    text PRIMARY KEY,
     data    text NOT NULL,
@@ -559,6 +569,64 @@ END $f$;
     )
 }
 
+/// The trigger function for UPDATE and DELETE through an alias over a
+/// source member (its view has no relative record numbers): the first
+/// line with the old row's SRCSEQ, SRCDAT and SRCDTA is changed or taken
+/// out (identical lines are the same record to the statement).
+pub fn alias_change_function(name: &str) -> String {
+    format!(
+        r#"CREATE OR REPLACE FUNCTION {name}() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+DECLARE
+  src text;
+  meta text;
+  lines text[];
+  metas text[];
+  old_meta text := lpad(CAST(CAST(abs(round(coalesce(OLD.srcseq, 0) * 100)) AS bigint) % 1000000 AS text), 6, '0')
+                || lpad(CAST(CAST(abs(coalesce(OLD.srcdat, 0)) AS bigint) % 1000000 AS text), 6, '0');
+  n int := 0;
+  i int;
+BEGIN
+  SELECT source, seqdat INTO src, meta FROM as4tainr.source_members
+   WHERE library = TG_ARGV[0] AND file = TG_ARGV[1] AND member = TG_ARGV[2] FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Member % of file % in library % not found.', TG_ARGV[2], TG_ARGV[1], TG_ARGV[0]
+      USING ERRCODE = '42704';
+  END IF;
+  src := regexp_replace(src, E'\n$', '');
+  lines := CASE WHEN src = '' THEN '{{}}'::text[] ELSE string_to_array(src, E'\n') END;
+  metas := coalesce(string_to_array(meta, E'\n'), '{{}}'::text[]);
+  FOR i IN 1 .. coalesce(array_length(lines, 1), 0) LOOP
+    IF i > coalesce(array_length(metas, 1), 0) OR length(metas[i]) <> 12 THEN
+      metas[i] := lpad(CAST((i * 100) % 1000000 AS text), 6, '0') || '000000';
+    END IF;
+    IF n = 0 AND metas[i] = old_meta AND rtrim(lines[i]) = rtrim(coalesce(OLD.srcdta, '')) THEN
+      n := i;
+    END IF;
+  END LOOP;
+  IF n = 0 THEN
+    RETURN NULL;
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    lines := lines[1 : n - 1] || lines[n + 1 :];
+    metas := metas[1 : n - 1] || metas[n + 1 :];
+  ELSE
+    lines[n] := rtrim(coalesce(NEW.srcdta, ''));
+    metas[n] := lpad(CAST(CAST(abs(round(coalesce(NEW.srcseq, 0) * 100)) AS bigint) % 1000000 AS text), 6, '0')
+             || lpad(CAST(CAST(abs(coalesce(NEW.srcdat, 0)) AS bigint) % 1000000 AS text), 6, '0');
+  END IF;
+  UPDATE as4tainr.source_members
+     SET source = array_to_string(lines, E'\n'),
+         seqdat = CASE WHEN coalesce(array_length(lines, 1), 0) = 0 THEN NULL
+                       ELSE array_to_string(metas[1 : array_length(lines, 1)], E'\n') END,
+         changed = now()
+   WHERE library = TG_ARGV[0] AND file = TG_ARGV[1] AND member = TG_ARGV[2];
+  RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END $f$;
+"#
+    )
+}
+
 /// A source file an SQL statement names: Db2 for i reads and adds to its
 /// first member (PUB400 2026-10-28, tools/golden/verify12.txt
 /// n12_ins_file: INSERT INTO the source file added record 4 to M1).
@@ -802,6 +870,23 @@ pub async fn member_seqdat(
         )
         .await?
         .and_then(|r| r.get(0)))
+}
+
+/// Keep a member's SRCSEQ and SRCDAT (twelve digits a line, `line_meta`).
+pub async fn set_member_seqdat(
+    client: &Client,
+    library: &str,
+    file: &str,
+    member: &str,
+    seqdat: &str,
+) -> Result<()> {
+    client
+        .execute(
+            "UPDATE as4tainr.source_members SET seqdat=$4 WHERE library=$1 AND file=$2 AND member=$3",
+            &[&library, &file, &member, &seqdat],
+        )
+        .await?;
+    Ok(())
 }
 
 /// A source file as a database file: its record format (named as the

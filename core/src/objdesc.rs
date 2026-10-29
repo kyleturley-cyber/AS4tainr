@@ -223,6 +223,14 @@ impl Job<'_> {
                 kv(&mut rows, "Key field", &format!("{k:<10} {order}"));
             }
         }
+        // TYPE(*MBRLIST) of a physical file: the printed report in IBM
+        // i 7.5's layout (PUB400 2026-10-29, tools/golden/verify24.txt
+        // q24_mbrd: a source file's two members).
+        let print = if ty == "*MBRLIST" && (attr == "PF" || source) {
+            self.mbrlist_report(&lib, &name, source, &members).await?
+        } else {
+            vec![]
+        };
         let mut heading = String::new();
         if ty == "*ALL" || ty == "*MBRLIST" {
             let line = format!("{:<10}  {:<10}  Text", "Member", "Type");
@@ -268,9 +276,123 @@ impl Job<'_> {
             ],
             heading,
             rows,
+            print,
             spool: Some(Box::new(view)),
             ..Default::default()
         }))
+    }
+
+    /// DSPFD TYPE(*MBRLIST) printed: the page header, what was asked
+    /// for, the file line, a line per member (size, source type, creation
+    /// date, last change date and time, records, deleted records) with
+    /// its text, and the totals, in the columns PUB400 printed them
+    /// (2026-10-29, tools/golden/verify24.txt q24_mbrd). A member's size
+    /// is shown as 8192 bytes, what the capture's small members had
+    /// (docs/fidelity-gaps.md).
+    async fn mbrlist_report(
+        &mut self,
+        lib: &str,
+        name: &str,
+        source: bool,
+        members: &[(String, String, String)],
+    ) -> Result<Vec<String>> {
+        const SIZE: i64 = 8192;
+        let stamp = crate::report::Stamp::now();
+        let when = format!("{}  {}", stamp.date, stamp.time);
+        let mut out = vec![
+            crate::report::at(&[
+                (2, crate::report::PRODUCT),
+                (18, crate::report::LEVEL),
+                (39, "Display File Description"),
+                (97, &when),
+                (122, "Page    1"),
+            ]),
+            format!("   File  . . . . . . . . . . . : {name}"),
+            format!("     Library . . . . . . . . . : {}", crate::qtemp::logical(lib)),
+            "   Type of information . . . . : *MBRLIST".into(),
+            "   File attributes . . . . . . : *ALL".into(),
+            "   System  . . . . . . . . . . : *LCL".into(),
+            "   Processor . . . . . . . . . : AS4TAINR Display File Description Processor".into(),
+            format!(
+                " File . : {name:<10}   Library . : {:<10}   Type of file . : {:<26}Auxiliary Storage Pool ID . : 00001",
+                crate::qtemp::logical(lib),
+                if source { "Physical *SRC" } else { "Physical *DATA" }
+            ),
+            crate::report::at(&[(44, "Member List")]),
+            crate::report::at(&[(31, "Source Creation"), (50, "Last Change"), (79, "Deleted")]),
+            crate::report::at(&[
+                (3, "Member"),
+                (20, "Size"),
+                (32, "Type"),
+                (38, "Date"),
+                (49, "Date"),
+                (58, "Time"),
+                (68, "Records"),
+                (79, "Records"),
+            ]),
+        ];
+        let mut total = 0i64;
+        for (m, srctype, text) in members {
+            let row = if source {
+                self.client
+                    .query_opt(
+                        "SELECT to_char(added, 'YYYY MM DD HH24 MI SS'), to_char(changed, 'YYYY MM DD HH24 MI SS'),
+                                (length(source) - length(replace(source, chr(10), '')))::bigint
+                           FROM as4tainr.source_members WHERE library=$1 AND file=$2 AND member=$3",
+                        &[&lib, &name, m],
+                    )
+                    .await?
+            } else {
+                self.client
+                    .query_opt(
+                        "SELECT to_char(created, 'YYYY MM DD HH24 MI SS'), to_char(created, 'YYYY MM DD HH24 MI SS'), 0::bigint
+                           FROM as4tainr.objects
+                          WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+                        &[&lib, &name],
+                    )
+                    .await?
+            };
+            let Some(row) = row else { continue };
+            let stamp_of = |t: String| {
+                let n: Vec<u32> = t.split(' ').map(|x| x.parse().unwrap_or(0)).collect();
+                let at = |i: usize| n.get(i).copied().unwrap_or(0);
+                crate::report::Stamp::of((at(0) as i32, at(1), at(2)), (at(3), at(4), at(5)))
+            };
+            let added: String = row.get(0);
+            let changed: String = row.get(1);
+            let mut records: i64 = row.get(2);
+            if !source {
+                let sql = format!(
+                    "SELECT count(*) FROM {}.{}",
+                    crate::catalog::ident(lib),
+                    crate::catalog::ident(name)
+                );
+                records = self
+                    .client
+                    .query_one(&sql, &[])
+                    .await
+                    .map(|r| r.get(0))
+                    .unwrap_or(0);
+            }
+            total += records;
+            let (a, c) = (stamp_of(added), stamp_of(changed));
+            out.push(format!(
+                "  {m:<10}{SIZE:>17} {srctype:<6} {:<8} {:<8} {:<8}{records:>11}{:>11}",
+                a.date, c.date, c.time, 0
+            ));
+            out.push(format!("    Text:  {text}").trim_end().to_string());
+        }
+        let n = members.len() as i64;
+        let tot = |label: &str, v: i64| format!("  {label}{v:>18}");
+        out.push(tot("Total number of members  . . . . . . . . . :", n));
+        out.push(tot("Total number of members not available  . . :", 0));
+        out.push(tot("Total records  . . . . . . . . . . . . . . :", total));
+        out.push(tot("Total deleted records  . . . . . . . . . . :", 0));
+        out.push(tot(
+            "Total of member sizes  . . . . . . . . . . :",
+            SIZE * n,
+        ));
+        Ok(out)
     }
 
     /// DSPFD TYPE(*MBRLIST) OUTPUT(*OUTFILE): a record per member in the

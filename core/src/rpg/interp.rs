@@ -1632,7 +1632,8 @@ impl<'a> Machine<'a> {
                     |a| matches!(a, Expr::Name { parts, .. } if parts.len() == 1 && parts[0] == "*DATA"),
                 );
                 let skip = match (data, l.dtype) {
-                    (true, DType::Varchar(_) | DType::VarUcs2(_)) => 2,
+                    (true, DType::Varchar(n)) => data::var_prefix(n),
+                    (true, DType::VarUcs2(_)) => 2,
                     _ => 0,
                 };
                 self.ptr_to(l.buf, l.off + skip)
@@ -3288,6 +3289,20 @@ impl<'a> Machine<'a> {
                         Some(Sym::Ds(d)) => self.clear_ds(&parts.join("."), &d),
                         _ => bail!("CLEAR of {} is not supported", parts.join(".")),
                     },
+                    // One element of a data structure array: its subfields
+                    // by type, as for the whole data structure.
+                    Expr::Name {
+                        parts,
+                        args: args @ Some(_),
+                    } if matches!(self.sym(&parts.join(".")), Some(Sym::Ds(_))) => {
+                        let name = parts.join(".");
+                        let Some(Sym::Ds(d)) = self.sym(&name) else {
+                            unreachable!()
+                        };
+                        let at = self.ds_element(&d, args)?;
+                        let img = self.ds_clear_image(&name, &d);
+                        self.bufs[d.buf][at..at + d.size].copy_from_slice(&img);
+                    }
                     Expr::Ind(n) => self.set_ind(n, false),
                     Expr::IndArray(None) => {
                         for n in 1..=99 {
@@ -4103,6 +4118,14 @@ impl<'a> Machine<'a> {
                     parms.push(raw);
                     continue;
                 }
+                // A caller's character variable longer than the parameter:
+                // the program gets all of it (by reference: a pointer to
+                // the parameter reaches the rest, as a stub that declares
+                // CHAR(1) parameters and writes through their addresses).
+                if raw.len() > t.size() && matches!(t, DType::Char(_)) {
+                    parms.push(raw);
+                    continue;
+                }
             }
             let v = if t.is_numeric() {
                 Value::Num(Dec::parse(a).map_err(|_| anyhow!("parameter '{a}' is not a number"))?)
@@ -4120,6 +4143,7 @@ impl<'a> Machine<'a> {
             .iter()
             .zip(&parms)
             .map(|(t, b)| match data::load(t, b) {
+                Ok(Value::Char(_)) if b.len() > t.size() => a(b),
                 Ok(Value::Num(d)) => d.to_string(),
                 Ok(other) => other.chars().map(|c| a(&c)).unwrap_or_default(),
                 Err(_) => String::new(),
@@ -4153,6 +4177,20 @@ impl<'a> Machine<'a> {
     }
 
     /// A data structure array named without an index.
+    /// A qualified name ending in a whole data structure array (no index
+    /// on its last part: `args`; `idx` indexes the parts before it).
+    fn ds_array_path(&mut self, e: &Expr) -> bool {
+        let Expr::Path {
+            parts,
+            idx,
+            args: None,
+        } = e
+        else {
+            return false;
+        };
+        matches!(self.path_sym(parts, idx), Ok(Sym::Ds(d)) if d.dim > 1)
+    }
+
     fn whole_ds_array(&self, e: &Expr) -> Option<super::program::DsInfo> {
         let Expr::Name { parts, args: None } = e else {
             return None;
@@ -4426,7 +4464,11 @@ impl<'a> Machine<'a> {
             .and_then(|mut g| g.as_mut().and_then(|m| m.remove(&key)));
         match active {
             Some(a) if a.bufs.len() == self.prog.globals.len() => {
+                // Its storage and heap as it left them; what callers lent
+                // for this call stays.
+                let lent = std::mem::take(&mut self.bufs.lent);
                 self.bufs = a.bufs;
+                self.bufs.lent = lent;
                 self.inds = a.inds;
                 for (f, o) in self.files.iter_mut().zip(a.files) {
                     f.open = o;
@@ -4513,7 +4555,10 @@ impl<'a> Machine<'a> {
                     let whole = l.off == 0
                         && bytes.len() > l.size
                         && self.bufs.get(l.buf).is_some_and(|b| {
-                            b.len() == l.size || b.len() == l.size + super::mem::SLACK
+                            // Storage of its own (rounded up to 16 bytes,
+                            // with the slack after it).
+                            let own = b.len().saturating_sub(super::mem::SLACK);
+                            b.len() == l.size || own == l.size || own == l.size.div_ceil(16) * 16
                         });
                     if whole {
                         self.bufs[l.buf] = bytes.clone();
@@ -6090,7 +6135,8 @@ impl<'a> Machine<'a> {
                 if !p.nopass {
                     bail!("{what}: parameter {} is missing", p.name);
                 }
-                out.push(Arg::Omit);
+                // Not passed (OPTIONS(*NOPASS)): no argument at all, so
+                // %PARMS does not count it (an *OMIT argument is passed).
                 continue;
             };
             out.push(if p.file {
@@ -6119,6 +6165,14 @@ impl<'a> Machine<'a> {
                     off: d.off,
                     size: d.size * d.dim as usize,
                     dtype: p.dtype,
+                })
+            } else if p.konst && !p.by_value && self.ds_array_path(a) {
+                // The same for a data structure array subfield of a data
+                // structure array element (gV(s).m).
+                let l = self.loc_of(a)?;
+                Arg::Ref(Loc {
+                    dtype: p.dtype,
+                    ..l
                 })
             } else if p.konst
                 && !p.by_value
@@ -6270,6 +6324,17 @@ impl<'a> Machine<'a> {
                 _ => {}
             }
         }
+    }
+
+    /// The bytes of one cleared element of a data structure (array):
+    /// CLEAR's result for the first element, the storage left as it was.
+    fn ds_clear_image(&mut self, name: &str, d: &DsInfo) -> Vec<u8> {
+        let end = (d.off + d.size * d.dim.max(1) as usize).min(self.bufs[d.buf].len());
+        let saved = self.bufs[d.buf][d.off..end].to_vec();
+        self.clear_ds(name, d);
+        let img = self.bufs[d.buf][d.off..d.off + d.size].to_vec();
+        self.bufs[d.buf][d.off..end].copy_from_slice(&saved);
+        img
     }
 
     /// A fixed-length character variable (or data structure) the
@@ -7028,10 +7093,14 @@ impl<'a> Machine<'a> {
             lengths.push(match &arg {
                 Arg::Ref(l) => {
                     let cur = || {
+                        let max = match l.dtype {
+                            DType::Varchar(n) => n,
+                            _ => 0,
+                        };
                         self.bufs
                             .get(l.buf)
-                            .and_then(|b| b.get(l.off..l.off + 2))
-                            .map(|x| u16::from_be_bytes([x[0], x[1]]) as usize)
+                            .and_then(|b| b.get(l.off..l.off + data::var_prefix(max)))
+                            .map(|x| data::var_len(max, x))
                             .unwrap_or(0)
                     };
                     Some(match l.dtype {
@@ -7621,11 +7690,7 @@ impl<'a> Machine<'a> {
         if self.system_program(name, locs)? {
             return Ok(());
         }
-        // An RPG program that is active cannot be called again (ILE RPG
-        // Reference: a program is not recursive; only procedures are).
-        if name == self.prog.name || self.io.callers.iter().any(|c| c == name) {
-            bail!("Program {name} called recursively: it is already active in the job.");
-        }
+        let active = name == self.prog.name || self.io.callers.iter().any(|c| c == name);
         let client = self.io.client;
         let libl = self.io.libl.clone();
         let found = self.block(crate::catalog::find_program(client, &libl, name))?;
@@ -7713,6 +7778,12 @@ impl<'a> Machine<'a> {
         let callee = self.block(super::compile_ovr(
             client, &libl, name, &source, &options, &ovr,
         ))?;
+        // An active program with an RPG cycle cannot be called again (ILE
+        // RPG Reference: a cycle-main program is not recursive); one with
+        // a linear main procedure (MAIN) can, as procedures can.
+        if active && callee.main.is_none() {
+            bail!("Program {name} called recursively: it is already active in the job.");
+        }
         let group = program_group(&callee, &self.io.actgrp);
         let mut parms: Vec<Vec<u8>> = locs
             .iter()
@@ -7746,7 +7817,21 @@ impl<'a> Machine<'a> {
                     shared: Default::default(),
                 },
             );
+            // This program's storage (and what was lent to it) is lent to
+            // the called program: a pointer it is given (in a parameter,
+            // or kept by a service program) still addresses storage of
+            // the programs and procedures active above it. (The heap
+            // stays with each program's activation.)
+            m.bufs.lent = std::mem::take(&mut self.bufs.lent);
+            m.bufs.lent.push(super::mem::Lent {
+                owner: self.frame_owner,
+                act: self.owner,
+                globals: self.prog.globals.len(),
+                bufs: std::mem::take(&mut self.bufs.own),
+            });
             let r = m.run_bytes(&mut parms);
+            self.bufs.own = m.bufs.lent.pop().map(|l| l.bufs).unwrap_or_default();
+            self.bufs.lent = std::mem::take(&mut m.bufs.lent);
             self.messages.append(&mut m.messages);
             self.printed.append(&mut m.printed);
             self.logged.append(&mut m.logged);

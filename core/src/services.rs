@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 32";
+const VERSION: &str = "as4tainr services 33";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -1341,6 +1341,30 @@ SELECT environment_variable_type AS var_type,
 FROM qsys2.environment_variable_info;
 "#;
 
+/// QSYS2.BOUND_SRVPGM_INFO (IBM i services, BOUND_SRVPGM_INFO view): the
+/// service programs each program and service program is bound to, with
+/// the library they were named with when bound (*LIBL, or a library).
+/// The signature is shown for generated signatures; one given as text in
+/// binder language is null (docs/fidelity-gaps.md).
+const BOUND_SRVPGM_INFO: &str = r#"
+CREATE OR REPLACE VIEW qsys2.bound_srvpgm_info AS
+SELECT CAST(o.library AS varchar(10)) COLLATE "C" AS program_library,
+       CAST(o.name AS varchar(10)) COLLATE "C" AS program_name,
+       CAST(o.objtype AS varchar(7)) COLLATE "C" AS object_type,
+       CAST(COALESCE(o.b->'srv_libraries'->>((s->>0) || '/' || (s->>1)), '*LIBL')
+            AS varchar(10)) COLLATE "C" AS bound_service_program_library,
+       CAST(s->>1 AS varchar(10)) COLLATE "C" AS bound_service_program,
+       CASE WHEN (o.b->'srv_signatures'->>((s->>0) || '/' || (s->>1))) ~ '^[0-9A-Fa-f]{16}$'
+            THEN decode('0000000000000000' || (o.b->'srv_signatures'->>((s->>0) || '/' || (s->>1))), 'hex')
+       END AS bound_service_program_signature,
+       CAST('*IMMED' AS varchar(6)) COLLATE "C" AS bound_service_program_activation
+FROM (SELECT library, name, '*PGM' AS objtype, binding::jsonb AS b
+        FROM as4tainr.programs WHERE binding IS NOT NULL
+      UNION ALL
+      SELECT library, name, '*SRVPGM', binding::jsonb FROM as4tainr.service_programs) o
+CROSS JOIN LATERAL jsonb_array_elements(COALESCE(o.b->'srvpgms', '[]'::jsonb)) s;
+"#;
+
 /// The services added with this version: definitions and grants.
 fn work_services() -> String {
     format!(
@@ -1355,6 +1379,8 @@ fn work_services() -> String {
          {}
          {IFS_READ}
          {ENV_VARS}
+         {BOUND_SRVPGM_INFO}
+         GRANT SELECT ON qsys2.bound_srvpgm_info TO {SQL_ROLE};
          GRANT SELECT ON qsys2.library_list_info, qsys2.user_info, qsys2.system_value_info,
                qsys2.sysroutines, qsys2.sysparms, qsys2.environment_variable_info,
                qsys2.env_vars TO {SQL_ROLE};",

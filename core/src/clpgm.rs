@@ -1057,7 +1057,23 @@ fn eval(e: &Expr, vars: &HashMap<String, Var>) -> Result<Value> {
                     Value::Dec(Decimal::from(n))
                 }
                 "%CHAR" => Value::Char(match arg(0)? {
-                    Value::Dec(d) => dec_text(&d),
+                    Value::Dec(d) => {
+                        let t = dec_text(&d);
+                        // A *DEC variable with no decimal positions: the
+                        // text padded with blanks to its digits plus one
+                        // (PUB400 2026-10-29, tools/golden/verify24.txt
+                        // q24_rows: *DEC (2 0) 10 gives "10 ", 0 gives
+                        // "0  ", *DEC (5 0) 273 gives "273   ").
+                        match args.first() {
+                            Some(Expr::Var(v)) => match vars.get(v) {
+                                Some(var) if var.ty == VarType::Dec && var.decimals == 0 => {
+                                    format!("{t:<w$}", w = var.len as usize + 1)
+                                }
+                                _ => t,
+                            },
+                            _ => t,
+                        }
+                    }
                     other => other.as_char()?,
                 }),
                 "%DEC" | "%INT" => {

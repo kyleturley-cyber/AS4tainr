@@ -1596,33 +1596,41 @@ impl Job<'_> {
     async fn rtvbndsrc(&mut self, cmd: &Command) -> Result<Outcome> {
         let srvpgm = cmd.get("SRVPGM").trim().to_ascii_uppercase();
         let module = cmd.get("MODULE").trim().to_ascii_uppercase();
-        let (object, lines) = if !matches!(srvpgm.as_str(), "" | "*NONE") {
+        let (object, olib, otype, lines) = if !matches!(srvpgm.as_str(), "" | "*NONE") {
             let (lib, name) = self.ile_object(&srvpgm, "*SRVPGM", Aut::Use).await?;
             let (_, b) =
                 crate::ile::find_srvpgm(self.client, &self.library_list(), &lib, &name).await?;
+            let mut spelled = std::collections::BTreeMap::new();
+            for m in &b.modules {
+                if let Ok(i) = crate::ile::module_info(self.client, &self.library_list(), m).await {
+                    spelled.extend(i.spelled);
+                }
+            }
             let mut l = vec![format!(
                 "STRPGMEXP PGMLVL(*CURRENT) SIGNATURE(X'{}')",
                 crate::ile::signature_hex(&b.signature)
             )];
+            l.extend(binder_comment("*SRVPGM", &name, &lib));
             l.extend(
                 b.exports
                     .iter()
-                    .map(|e| format!("  EXPORT SYMBOL(\"{e}\")")),
+                    .map(|e| format!("  EXPORT SYMBOL(\"{}\")", spelled.get(e).unwrap_or(e))),
             );
             l.push("ENDPGMEXP".into());
-            (name, l)
+            (name, lib, "SRVPGM", l)
         } else if !matches!(module.as_str(), "" | "*NONE") {
             let (lib, name) = self.ile_object(&module, "*MODULE", Aut::Use).await?;
             let m = crate::ile::find_module(self.client, &self.library_list(), &lib, &name).await?;
             let info = crate::ile::module_info(self.client, &self.library_list(), &m).await?;
             let mut l = vec!["STRPGMEXP PGMLVL(*CURRENT)".to_string()];
+            l.extend(binder_comment("*MODULE", &name, &lib));
             l.extend(
                 info.exports
                     .iter()
-                    .map(|e| format!("  EXPORT SYMBOL(\"{e}\")")),
+                    .map(|e| format!("  EXPORT SYMBOL(\"{}\")", info.spelled.get(e).unwrap_or(e))),
             );
             l.push("ENDPGMEXP".into());
-            (name, l)
+            (name, lib, "MODULE", l)
         } else {
             return Err(crate::cl::diag_error(
                 "",
@@ -1681,10 +1689,26 @@ impl Job<'_> {
             true,
         )
         .await?;
-        Ok(Outcome::Messages(vec![format!(
-            "Binder source for {object} was put in member {mbr} of file {file} in library {}.",
+        // Its messages (PUB400 2026-10-29, tools/golden/verify24.txt
+        // q24_rtvbndsrc, q24_rtv_again, q24_rtv_mod): CPI5D12 when the
+        // member was added, CPI5D11 naming the object, its library and
+        // type, CPC5D01 with the member, file and library and the number
+        // of objects included (one) and left out (none).
+        let mut msgs = Vec::new();
+        if existing.is_none() {
+            msgs.push(format!(
+                "CPI5D12: Member {mbr} was not there; it was added to the source file."
+            ));
+        }
+        msgs.push(format!(
+            "CPI5D11: The exports of {object} in library {}, type {otype}, were retrieved.",
+            crate::qtemp::logical(&olib)
+        ));
+        msgs.push(format!(
+            "CPC5D01: Binder language for 1 objects went to member {mbr} of file {file} in library {}; 0 objects were left out.",
             crate::qtemp::logical(&lib)
-        )]))
+        ));
+        Ok(Outcome::Messages(msgs))
     }
 
     /// DSPSRVPGM: a service program's activation group, signatures,
@@ -1804,7 +1828,15 @@ impl Job<'_> {
                 ),
             }
         }
-        let srvpgms = old.srvpgms.clone();
+        // Bound again as they were named (*LIBL stays *LIBL).
+        let srvpgms: Vec<(String, String)> = old
+            .srvpgms
+            .iter()
+            .map(|(l, n)| {
+                let named = old.srv_libraries.get(&format!("{l}/{n}"));
+                (named.cloned().unwrap_or_else(|| l.clone()), n.clone())
+            })
+            .collect();
         let (mut binding, infos) =
             crate::ile::bind(self.client, &libl, modules.clone(), &srvpgms, &[])
                 .await
@@ -4552,7 +4584,7 @@ impl Job<'_> {
             }
         }
         let crtcmd_vldckr = cmd.get("VLDCKR").to_ascii_uppercase();
-        let crtcmd_allow = cmd.get("ALLOW").to_ascii_uppercase();
+        let crtcmd_allow = cmd.list("ALLOW").join(" ").to_ascii_uppercase();
         // The CMD statement's VLDCKR, MAXPOS, TEXT and ALLOW override
         // CRTCMD's (CL reference, "Command Definition (CMD)").
         let stmt = std::mem::take(&mut d.statement);
@@ -4573,10 +4605,11 @@ impl Job<'_> {
                 _ => crate::cmd::raw_text(v).unwrap_or_default(),
             };
         }
+        // CRTCMD ALLOW is a list: every value counts, not just the first.
         let allow = stmt
             .get("ALLOW")
             .map(String::as_str)
-            .unwrap_or_else(|| cmd.get("ALLOW"));
+            .unwrap_or(crtcmd_allow.as_str());
         d.allow = allow
             .split_whitespace()
             .map(|x| x.trim_matches(['(', ')']).to_ascii_uppercase())
@@ -7972,7 +8005,11 @@ impl Job<'_> {
                                 g
                             };
                         }
-                        crate::clpgm::run(self, &program, &args).await
+                        let ile = program.pep;
+                        match crate::clpgm::run(self, &program, &args).await {
+                            Err(e) if ile => Err(unmonitored_in_ile_cl(&name, e)),
+                            r => r,
+                        }
                     }
                     _ => self.call_rpg(&name, Some(&p.library), args).await,
                 }
@@ -8258,6 +8295,53 @@ fn finals_of(e: &anyhow::Error) -> Vec<(String, u32, String)> {
 fn stamp_of_us(us: i64) -> crate::report::Stamp {
     let ((y, m, d), (h, mi, sec), _) = crate::rpg::dates::from_epoch_us(us);
     crate::report::Stamp::of((y, m, d), (h, mi, sec))
+}
+
+/// An escape message an ILE CL program did not monitor ends the program,
+/// and its caller gets CEE9901 naming that message, the program and the
+/// statement (PUB400 2026-10-29, tools/golden/verify24.txt q24_call: a
+/// CALL of a program that was not there, CPF0001 unmonitored at
+/// statement 4700 of a stream file source, line 47; `system` shows only
+/// CEE9901). An escape the program sent to its caller (SNDPGMMSG
+/// MSGTYPE(*ESCAPE)) is not one: it arrives as it was sent.
+fn unmonitored_in_ile_cl(name: &str, e: anyhow::Error) -> anyhow::Error {
+    let text = format!("{e:#}");
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let Some(last) = lines.last() else {
+        return e;
+    };
+    let Some(rest) = last.strip_prefix(&format!("Error in CL program {name} ")) else {
+        return e;
+    };
+    let line: u64 = rest
+        .strip_prefix("at line ")
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    let before = lines[..lines.len() - 1].join("\n");
+    let id = crate::jobs::escape_id(&before);
+    if id.is_empty() {
+        return e;
+    }
+    anyhow!(
+        "CEE9901: Program {name} ended: escape message {id} was not monitored at statement {:010} (line {line}).",
+        line * 100
+    )
+}
+
+/// The comment RTVBNDSRC writes after STRPGMEXP: a box naming the object's
+/// type, name and library and when the source was retrieved (yy/mm/dd
+/// and hh:mm:ss), in the columns PUB400 wrote them (2026-10-29,
+/// tools/golden/verify24.txt q24_print_rtv, q24_print_rtvm).
+fn binder_comment(objtype: &str, name: &str, lib: &str) -> Vec<String> {
+    let ((y, mo, d), (h, mi, s), _) = crate::rpg::dates::now();
+    let line = format!(
+        "/*   {objtype:<13}{name:<13}{:<13}{:02}/{mo:02}/{d:02}  {h:02}:{mi:02}:{s:02}",
+        crate::qtemp::logical(lib),
+        y.rem_euclid(100)
+    );
+    let rule = format!("/*{}*/", "*".repeat(66));
+    vec![rule.clone(), format!("{line:<68}*/"), rule]
 }
 
 #[cfg(test)]

@@ -2083,9 +2083,17 @@ ENDPGM";
     )
     .await
     .unwrap();
+    // %CHAR of a *DEC (5 0) is padded with blanks to six characters
+    // (corrected: PUB400 2026-10-29, tools/golden/verify24.txt q24_rows
+    // shows *DEC (5 0) 273 as "273   " inside *CAT; this expected "42"
+    // before that capture).
     assert_eq!(
         m,
-        ["HELLOfghijklmnopqrst|42|1", "From RPG|84", "DSPLY  done 30"]
+        [
+            "HELLOfghijklmnopqrst|42    |1",
+            "From RPG|84",
+            "DSPLY  done 30"
+        ]
     );
     // An external procedure (Db2 for i SQL Reference, CREATE PROCEDURE
     // (external), PARAMETER STYLE GENERAL): CALL runs the program; INOUT
@@ -19493,4 +19501,654 @@ ENDPGM
         .await
         .unwrap();
     assert_eq!(m.source.lines().collect::<Vec<_>>(), ["one", "three"]);
+}
+
+/// More of the RPG iMoq's engine and examples use: CLEAR of one element
+/// of a data structure array (ILE RPG Reference, CLEAR: each subfield by
+/// its type, numeric ones to zero); a data structure array subfield of a
+/// data structure array element passed for a CONST LIKEDS DIM parameter;
+/// a VARCHAR longer than 65535 (ILE RPG Reference, VARCHAR: a 4-byte
+/// length prefix then); %PARMS with an OPTIONS(*NOPASS : *OMIT) parameter
+/// not passed, passed as *OMIT and passed (ILE RPG Reference, %PARMS:
+/// *OMIT counts as passed).
+#[tokio::test]
+async fn rpg_engine_features_found_by_imoq_examples() {
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let programs: Vec<(&str, &str, Vec<&str>)> = vec![
+        (
+            "IMQCLR",
+            "**FREE
+dcl-ds m_t qualified template;
+  parmNo int(10);
+  val varchar(20);
+end-ds;
+dcl-ds gv qualified dim(4);
+  gen int(10);
+  obj char(10);
+  nm int(10);
+  m likeds(m_t) dim(8);
+end-ds;
+dcl-s s int(10);
+dcl-s g int(10);
+for g = 1 to 6;
+  s = %rem(g - 1 : 4) + 1;
+  clear gv(s);
+  gv(s).gen = g;
+  gv(s).nm += 1;
+  gv(s).m(gv(s).nm).parmNo = g;
+endfor;
+dsply (%char(gv(2).gen) + ' ' + %char(gv(2).nm) + ' ' + %char(gv(2).m(1).parmNo)
+       + ' ' + %char(gv(4).gen) + ' ' + %char(gv(4).nm));
+*inlr = *on;
+",
+            vec!["6 1 6 4 1"],
+        ),
+        (
+            "IMQPATH",
+            "**FREE
+dcl-ds m_t qualified template;
+  parmNo int(10);
+  val varchar(20);
+end-ds;
+dcl-ds gv qualified dim(3);
+  nm int(10);
+  m likeds(m_t) dim(8);
+end-ds;
+dcl-s s int(10) inz(3);
+gv(s).nm = 3;
+gv(s).m(1).parmNo = 1;
+gv(s).m(2).parmNo = 2;
+gv(s).m(3).parmNo = 3;
+gv(s).m(3).val = 'three';
+dsply show(gv(s).m : gv(s).nm);
+*inlr = *on;
+dcl-proc show;
+  dcl-pi *n varchar(50);
+    m likeds(m_t) dim(8) const;
+    n int(10) const;
+  end-pi;
+  dcl-s i int(10);
+  dcl-s o varchar(50);
+  for i = 1 to n;
+    o += %char(m(i).parmNo) + ' ';
+  endfor;
+  return o + m(3).val;
+end-proc;
+",
+            vec!["1 2 3 three"],
+        ),
+        (
+            "IMQV4",
+            "**FREE
+dcl-s big varchar(70000);
+dcl-s p pointer;
+dcl-s n4 int(10) based(p);
+big = 'hello';
+p = %addr(big);
+dsply (%char(n4) + ' ' + %char(%size(big)));
+dsply note('an urgent note');
+*inlr = *on;
+dcl-proc note;
+  dcl-pi *n varchar(40);
+    b varchar(70000:4) value;
+  end-pi;
+  dcl-s q pointer;
+  dcl-s len int(10) based(q);
+  q = %addr(b);
+  return %char(len) + ' ' + b;
+end-proc;
+",
+            vec!["5 70004", "14 an urgent note"],
+        ),
+        (
+            "IMQNOPASS",
+            "**FREE
+dsply (%char(f(1)) + ' ' + %char(f(1 : *omit)) + ' ' + %char(f(1 : 'x')));
+*inlr = *on;
+dcl-proc f;
+  dcl-pi *n int(10);
+    a int(10) const;
+    b char(10) const options(*nopass : *omit);
+  end-pi;
+  return %parms();
+end-proc;
+",
+            vec!["1 2 2"],
+        ),
+    ];
+    for (name, source, want) in programs {
+        let r = rpg::call(
+            &url,
+            vec![lib.clone()],
+            "QSECOFR".into(),
+            None,
+            None,
+            None,
+            name.into(),
+            source.to_string(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(r.error.is_none(), "{name}: {:?}", r.error);
+        let got: Vec<String> = r
+            .messages
+            .iter()
+            .map(|m| m.trim_end().to_string())
+            .collect();
+        assert_eq!(got, want, "{name}");
+    }
+}
+
+/// What iMoq's install and demo need of programs and commands: CRTCMD
+/// ALLOW with several values (CL reference, CRTCMD ALLOW: a list of
+/// where the command may run) for a command with a RTNVAL(*YES)
+/// parameter run in a CL program; QSYS2.BOUND_SRVPGM_INFO (IBM i
+/// services: BOUND_SERVICE_PROGRAM_LIBRARY is *LIBL for a service program
+/// bound through the library list, else the library named);
+/// a program with a linear-main procedure called recursively (ILE RPG
+/// Reference: only a cycle-main procedure cannot be called recursively;
+/// each call has its own automatic storage); pointers into the storage
+/// of programs still active above the one using them; and a CL variable
+/// longer than the RPG parameter it is passed for (passed by reference:
+/// the program addresses all of the variable).
+#[tokio::test]
+async fn commands_bindings_and_program_calls_found_by_imoq_demo() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    for f in ["QRPGLESRC", "QCLSRC", "QCMDSRC"] {
+        source::create_file(&client, &lib, f, "").await.unwrap();
+    }
+    let put = |file: &str, name: &str, srctype: &str, src: &str| source::Member {
+        library: lib.clone(),
+        file: file.into(),
+        name: name.into(),
+        srctype: srctype.into(),
+        source: src.into(),
+        ..Default::default()
+    };
+    let members = [
+        put(
+            "QCMDSRC",
+            "CNT",
+            "CMD",
+            "CMD PROMPT('Count')
+PARM KWD(OBJ) TYPE(*NAME) LEN(10) MIN(1)
+PARM KWD(RTNVAL) TYPE(*DEC) LEN(10 0) RTNVAL(*YES) MIN(1)
+",
+        ),
+        put(
+            "QCLSRC",
+            "CNTC",
+            "CLLE",
+            "PGM PARM(&OBJ &RTN)
+DCL &OBJ *CHAR 10
+DCL &RTN *DEC (10 0)
+CHGVAR &RTN 7
+ENDPGM
+",
+        ),
+        put(
+            "QCLSRC",
+            "USECNT",
+            "CLLE",
+            "PGM
+DCL &C *DEC (10 0)
+CNT OBJ(X) RTNVAL(&C)
+IF (&C *EQ 7) THEN(SNDPGMMSG MSG('SEVEN') TOPGMQ(*EXT))
+ENDPGM
+",
+        ),
+        put(
+            "QRPGLESRC",
+            "S1",
+            "RPGLE",
+            "**FREE
+ctl-opt nomain;
+dcl-proc one export;
+  dcl-pi *n int(10);
+  end-pi;
+  return 1;
+end-proc;
+",
+        ),
+        put(
+            "QRPGLESRC",
+            "B1",
+            "RPGLE",
+            "**FREE
+dcl-pr one int(10) extproc('ONE');
+end-pr;
+dsply %char(one());
+*inlr = *on;
+",
+        ),
+        put(
+            "QRPGLESRC",
+            "REC",
+            "RPGLE",
+            "**FREE
+ctl-opt main(main) dftactgrp(*no) actgrp(*caller);
+dcl-pr rec extpgm('REC');
+  n packed(3:0);
+end-pr;
+dcl-proc main;
+  dcl-pi *n;
+    n packed(3:0);
+  end-pi;
+  dcl-s mine packed(3:0);
+  mine = n;
+  if n < 3;
+    n += 1;
+    rec(n);
+  endif;
+  dsply %char(mine);
+end-proc;
+",
+        ),
+        put(
+            "QCLSRC",
+            "RECDRV",
+            "CLLE",
+            "PGM
+DCL &N *DEC (3 0) VALUE(1)
+CALL REC PARM(&N)
+ENDPGM
+",
+        ),
+        put(
+            "QRPGLESRC",
+            "LP1",
+            "RPGLE",
+            "**FREE
+dcl-pr lp2 extpgm('LP2');
+  p pointer;
+end-pr;
+dcl-s v char(10) inz('AAAAAAAAAA');
+dcl-s pp pointer;
+pp = %addr(v);
+lp2(pp);
+dsply v;
+*inlr = *on;
+",
+        ),
+        put(
+            "QRPGLESRC",
+            "LP2",
+            "RPGLE",
+            "**FREE
+dcl-pr lp3 extpgm('LP3');
+  p pointer;
+end-pr;
+dcl-pi *n;
+  p pointer;
+end-pi;
+dcl-s t char(10) based(p);
+%subst(t : 1 : 3) = 'BBB';
+lp3(p);
+*inlr = *on;
+",
+        ),
+        put(
+            "QRPGLESRC",
+            "LP3",
+            "RPGLE",
+            "**FREE
+dcl-pi *n;
+  p pointer;
+end-pi;
+dcl-s t char(10) based(p);
+%subst(t : 4 : 3) = 'CCC';
+*inlr = *on;
+",
+        ),
+        put(
+            "QRPGLESRC",
+            "STB",
+            "RPGLE",
+            "**FREE
+dcl-pi *n;
+  p1 char(1) options(*nopass);
+  p2 char(1) options(*nopass);
+end-pi;
+dcl-s q pointer;
+dcl-s name char(30) based(q);
+if %parms() >= 2;
+  q = %addr(p2);
+  name = 'Grace Hopper';
+endif;
+return;
+",
+        ),
+        put(
+            "QCLSRC",
+            "STBCL",
+            "CLLE",
+            "PGM
+DCL &NAME *CHAR 30
+CALL STB PARM('X' &NAME)
+SNDPGMMSG MSG(&NAME) TOPGMQ(*EXT)
+ENDPGM
+",
+        ),
+    ];
+    for m in members {
+        source::put_member(&client, &m, false).await.unwrap();
+    }
+    for c in [
+        format!("CRTBNDCL PGM({lib}/CNTC) SRCFILE({lib}/QCLSRC)"),
+        format!(
+            "CRTCMD CMD({lib}/CNT) PGM({lib}/CNTC) SRCFILE({lib}/QCMDSRC) ALLOW(*IPGM *BPGM *IMOD *BMOD)"
+        ),
+        format!("CRTBNDCL PGM({lib}/USECNT) SRCFILE({lib}/QCLSRC)"),
+        format!("CRTRPGMOD MODULE({lib}/S1) SRCFILE({lib}/QRPGLESRC)"),
+        format!("CRTSRVPGM SRVPGM({lib}/S1) MODULE({lib}/S1) EXPORT(*ALL)"),
+        format!("CRTRPGMOD MODULE({lib}/B1) SRCFILE({lib}/QRPGLESRC)"),
+        format!("CRTPGM PGM({lib}/B1) MODULE({lib}/B1) BNDSRVPGM((*LIBL/S1))"),
+        format!("CRTPGM PGM({lib}/B2) MODULE({lib}/B1) BNDSRVPGM(({lib}/S1))"),
+        format!("CRTBNDRPG PGM({lib}/REC) SRCFILE({lib}/QRPGLESRC)"),
+        format!("CRTBNDCL PGM({lib}/RECDRV) SRCFILE({lib}/QCLSRC)"),
+        format!("CRTBNDRPG PGM({lib}/LP1) SRCFILE({lib}/QRPGLESRC)"),
+        format!("CRTBNDRPG PGM({lib}/LP2) SRCFILE({lib}/QRPGLESRC)"),
+        format!("CRTBNDRPG PGM({lib}/LP3) SRCFILE({lib}/QRPGLESRC)"),
+        format!("CRTBNDRPG PGM({lib}/STB) SRCFILE({lib}/QRPGLESRC)"),
+        format!("CRTBNDCL PGM({lib}/STBCL) SRCFILE({lib}/QCLSRC)"),
+    ] {
+        cl_cmd(&mut job, c.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    // Every ALLOW value counts: the command runs in a CL program.
+    let r = run_in_own_job(&client, &url, &lib, &format!("CALL {lib}/USECNT"))
+        .await
+        .unwrap();
+    assert_eq!(r, ["SEVEN"]);
+    let rows: Vec<(String, String, String, String)> = client
+        .query(
+            "SELECT program_name, object_type, bound_service_program_library, bound_service_program
+               FROM qsys2.bound_srvpgm_info WHERE program_library = $1 ORDER BY program_name",
+            &[&lib],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .collect();
+    let want = vec![
+        (
+            "B1".to_string(),
+            "*PGM".to_string(),
+            "*LIBL".to_string(),
+            "S1".to_string(),
+        ),
+        (
+            "B2".to_string(),
+            "*PGM".to_string(),
+            lib.clone(),
+            "S1".to_string(),
+        ),
+    ];
+    assert_eq!(rows, want);
+    let r = run_in_own_job(&client, &url, &lib, &format!("CALL {lib}/RECDRV"))
+        .await
+        .unwrap();
+    assert_eq!(r, ["DSPLY  3", "DSPLY  2", "DSPLY  1"]);
+    let r = run_in_own_job(&client, &url, &lib, &format!("CALL {lib}/LP1"))
+        .await
+        .unwrap();
+    assert_eq!(r, ["DSPLY  BBBCCCAAAA"]);
+    let r = run_in_own_job(&client, &url, &lib, &format!("CALL {lib}/STBCL"))
+        .await
+        .unwrap();
+    assert_eq!(r, ["Grace Hopper"]);
+}
+
+/// What PUB400 showed for verify24 (2026-10-29, tools/golden/
+/// verify24.txt): CPYSRCF's messages (q24_cpysrcf: CPF4011 from a
+/// 92-byte to a 112-byte source file, CPF2889 when the member is added,
+/// CPC2955; q24_cpysrcf_add without CPF2889; q24_cpysrcf_nombr CPF2868
+/// then CPF2817), CPYF's CPC2955 naming the source member
+/// (q24_print_m2), DSPFD TYPE(*MBRLIST)'s printed report (q24_mbrd),
+/// RTVBNDSRC's messages and binder source (q24_rtvbndsrc, q24_rtv_again,
+/// q24_print_rtv: CPI5D12 when the member is added, CPI5D11, CPC5D01; the
+/// comment box; an EXTPROC('Mixed_Case') export as written), CEE9901 for
+/// the caller of an ILE CL program that left an escape unmonitored
+/// (q24_call) and CL %CHAR of a *DEC with no decimal positions padded to
+/// its digits plus one (q24_rows).
+#[tokio::test]
+async fn verify24_cpysrcf_rtvbndsrc_mbrlist_and_unmonitored_escapes() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let ids = |v: &[String]| -> Vec<String> {
+        v.iter()
+            .map(|l| as4tainr_core::jobs::message_id(l).to_string())
+            .filter(|i| !i.is_empty())
+            .collect()
+    };
+    for c in [
+        format!("CRTSRCPF FILE({lib}/S92) RCDLEN(92)"),
+        format!("CRTSRCPF FILE({lib}/T112) RCDLEN(112)"),
+        format!("CRTSRCPF FILE({lib}/QSRC) RCDLEN(112)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    let put = |file: &str, name: &str, srctype: &str, src: &str| source::Member {
+        library: lib.clone(),
+        file: file.into(),
+        name: name.into(),
+        srctype: srctype.into(),
+        source: src.into(),
+        ..Default::default()
+    };
+    for m in [
+        put("S92", "M1", "TXT", "one\ntwo\nthree\n"),
+        put(
+            "QSRC",
+            "MIX",
+            "RPGLE",
+            "**FREE
+ctl-opt nomain;
+dcl-proc mockp1 export;
+  dcl-pi *n packed(7:2) extproc('Mixed_Case');
+    item char(5) const;
+  end-pi;
+  return 12.5;
+end-proc;
+dcl-proc mixcnt export;
+  dcl-pi *n int(10) end-pi;
+  return 3;
+end-proc;
+",
+        ),
+        put(
+            "QSRC",
+            "MIXB",
+            "BND",
+            "STRPGMEXP PGMLVL(*CURRENT) SIGNATURE('MIX V1')\n  EXPORT SYMBOL('Mixed_Case')\n  EXPORT SYMBOL(MIXCNT)\nENDPGMEXP\n",
+        ),
+        put("QSRC", "FAILS", "CLLE", "PGM\nCALL NOSUCH24\nENDPGM\n"),
+        put(
+            "QSRC",
+            "CALLER",
+            "CLLE",
+            "PGM
+DCL &ID *CHAR 7
+DCL &S *DEC (2 0) VALUE(10)
+DCL &Z *DEC (5 0) VALUE(273)
+CALL FAILS
+MONMSG MSGID(CPF0001 CEE9901) EXEC(RCVMSG MSGTYPE(*EXCP) RMV(*NO) MSGID(&ID))
+SNDPGMMSG MSG('CAUGHT ' *CAT &ID) TOPGMQ(*EXT)
+SNDPGMMSG MSG('[' *CAT %CHAR(&S) *CAT '][' *CAT %CHAR(&Z) *CAT ']') TOPGMQ(*EXT)
+ENDPGM
+",
+        ),
+    ] {
+        source::put_member(&client, &m, false).await.unwrap();
+    }
+    let r = cl_cmd(
+        &mut job,
+        format!("CPYSRCF FROMFILE({lib}/S92) TOFILE({lib}/T112) FROMMBR(M1)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&r), ["CPF4011", "CPF2889", "CPC2955"]);
+    let r = cl_cmd(
+        &mut job,
+        format!(
+            "CPYSRCF FROMFILE({lib}/S92) TOFILE({lib}/T112) FROMMBR(M1) TOMBR(M2) MBROPT(*ADD)"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&r), ["CPF4011", "CPF2889", "CPC2955"]);
+    let r = cl_cmd(
+        &mut job,
+        format!(
+            "CPYSRCF FROMFILE({lib}/S92) TOFILE({lib}/T112) FROMMBR(M1) TOMBR(M2) MBROPT(*ADD)"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&r), ["CPF4011", "CPC2955"]);
+    let e = cl_cmd(
+        &mut job,
+        format!("CPYSRCF FROMFILE({lib}/S92) TOFILE({lib}/T112) FROMMBR(NOSUCH)"),
+    )
+    .await
+    .unwrap_err();
+    // cl_cmd puts the command before the messages.
+    let lines: Vec<String> = e
+        .split_once("): ")
+        .map_or(e.as_str(), |x| x.1)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(ids(&lines), ["CPF2868", "CPF2817"], "{e}");
+    let r = match job
+        .run(&format!(
+            "CPYF FROMFILE({lib}/T112) TOFILE(*PRINT) FROMMBR(M2)"
+        ))
+        .await
+        .unwrap()
+    {
+        Outcome::Display(d) => d.print,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        r[0].starts_with("CPC2955") && r[0].contains("member M2"),
+        "{r:?}"
+    );
+    // DSPFD TYPE(*MBRLIST) printed: q24_mbrd's columns.
+    let print = match job
+        .run(&format!(
+            "DSPFD FILE({lib}/T112) TYPE(*MBRLIST) OUTPUT(*PRINT)"
+        ))
+        .await
+        .unwrap()
+    {
+        Outcome::Display(d) => d.print,
+        other => panic!("{other:?}"),
+    };
+    let col = |line: &str, word: &str| line.find(word).map(|i| i + 1);
+    let list = print.iter().find(|l| l.contains("Member List")).unwrap();
+    assert_eq!(col(list, "Member List"), Some(44));
+    assert!(print
+        .iter()
+        .any(|l| l.contains("Type of file . : Physical *SRC")));
+    let m1 = print.iter().find(|l| l.starts_with("  M1 ")).unwrap();
+    // Size ends in column 29, the source type starts in 31, records end
+    // in 74 and deleted records in 85.
+    assert_eq!(&m1[25..29], "8192");
+    assert_eq!(&m1[30..33], "TXT");
+    assert_eq!(&m1[73..74], "3");
+    assert_eq!(&m1[84..85], "0");
+    let total = print
+        .iter()
+        .find(|l| l.starts_with("  Total records  "))
+        .unwrap();
+    assert_eq!(total.trim_end().len(), 64);
+    assert!(total.trim_end().ends_with(" 9"), "{total}");
+    // RTVBNDSRC.
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/MIX) SRCFILE({lib}/QSRC)"),
+        format!("CRTSRVPGM SRVPGM({lib}/MIX) MODULE({lib}/MIX) SRCFILE({lib}/QSRC) SRCMBR(MIXB)"),
+    ] {
+        cl_cmd(&mut job, c.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    let r = cl_cmd(
+        &mut job,
+        format!("RTVBNDSRC SRVPGM({lib}/MIX) SRCFILE({lib}/T112) SRCMBR(RTV)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&r), ["CPI5D12", "CPI5D11", "CPC5D01"]);
+    let r = cl_cmd(
+        &mut job,
+        format!("RTVBNDSRC SRVPGM({lib}/MIX) SRCFILE({lib}/T112) SRCMBR(RTV) MBROPT(*ADD)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&r), ["CPI5D11", "CPC5D01"]);
+    let m = source::find_member(&client, std::slice::from_ref(&lib), "T112", "RTV")
+        .await
+        .unwrap();
+    let l: Vec<&str> = m.source.lines().collect();
+    assert_eq!(l.len(), 14);
+    assert_eq!(l[1], format!("/*{}*/", "*".repeat(66)));
+    assert!(
+        l[2].starts_with(&format!("/*   *SRVPGM      MIX          {lib:<13}"))
+            && l[2].len() == 70
+            && l[2].ends_with("*/"),
+        "{}",
+        l[2]
+    );
+    assert_eq!(l[4], "  EXPORT SYMBOL(\"Mixed_Case\")");
+    assert_eq!(l[5], "  EXPORT SYMBOL(\"MIXCNT\")");
+    // CEE9901 for the caller; %CHAR of *DEC (2 0) and (5 0).
+    for c in [
+        format!("CRTBNDCL PGM({lib}/FAILS) SRCFILE({lib}/QSRC)"),
+        format!("CRTBNDCL PGM({lib}/CALLER) SRCFILE({lib}/QSRC)"),
+    ] {
+        cl_cmd(&mut job, c.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    let r = run_in_own_job(&client, &url, &lib, &format!("CALL {lib}/CALLER"))
+        .await
+        .unwrap();
+    assert_eq!(r, ["CAUGHT CEE9901", "[10 ][273   ]"]);
 }

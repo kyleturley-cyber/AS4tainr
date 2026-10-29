@@ -1,0 +1,36 @@
+/* verify25: RPG external indicators and the job switches; %CHAR of */
+/* decimals and integers; what a caller gets from an ILE CL program  */
+/* that left an escape message unmonitored                           */
+PGM
+DCL &L *CHAR 200
+DCL &R *CHAR 60
+DCL &SWS *CHAR 8
+DCL &ID *CHAR 7
+DCL &N *DEC (3 0) VALUE(0)
+DCL &D72 *DEC (7 2) VALUE(12.5)
+DCL &DN *DEC (5 0) VALUE(-3)
+DCL &D31 *DEC (3 1) VALUE(-0.5)
+DCL &D150 *DEC (15 0) VALUE(42)
+DCL &I *INT 4 VALUE(7)
+CHGJOB SWS(10000001)
+CALL GLD25B PARM(&R)
+CHGVAR &L ('RPG SEES|' *CAT &R)
+CALLSUBR ROW
+RTVJOBA SWS(&SWS)
+CHGVAR &L ('AFTER RPG|' *CAT &SWS)
+CALLSUBR ROW
+CHGVAR &L ('[' *CAT %CHAR(&D72) *CAT '][' *CAT %CHAR(&DN) *CAT '][' *CAT +
+  %CHAR(&D31) *CAT '][' *CAT %CHAR(&D150) *CAT '][' *CAT %CHAR(&I) *CAT ']')
+CALLSUBR ROW
+CHGVAR &ID ' '
+CALL GLD25D
+MONMSG MSGID(CPF0001 CEE9901 CPF9999) EXEC(RCVMSG MSGTYPE(*EXCP) RMV(*NO) MSGID(&ID))
+CHGVAR &L ('CALLEE FAILED|' *CAT &ID)
+CALLSUBR ROW
+RETURN
+SUBR ROW
+CHGVAR &N (&N + 1)
+RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD25OUT VALUES(' *CAT %CHAR(&N) *CAT ', ''' +
+  *CAT %TRIMR(&L) *CAT ''')') COMMIT(*NONE)
+ENDSUBR
+ENDPGM

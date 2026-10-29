@@ -85,10 +85,11 @@ impl Job<'_> {
                 None => *m == pattern,
             })
             .collect();
+        // No such member: CPF2868, then CPF2817 (PUB400 2026-10-29,
+        // tools/golden/verify24.txt q24_cpysrcf_nombr).
         if picked.is_empty() {
             bail!(
-                "CPF9815: Member {pattern} of file {from_name} in library {} does not exist.\nCPF2817: The copy was not done.",
-                crate::qtemp::logical(&from_lib)
+                "CPF2868: The from-file has no member {pattern}.\nCPF2817: The copy was not done."
             );
         }
         let tombr = cmd.get("TOMBR").trim().to_ascii_uppercase();
@@ -113,6 +114,7 @@ impl Job<'_> {
         };
         let (start, incr) = (hundredths(seq.first()), hundredths(seq.get(1)));
         let to_rcdlen = crate::source::record_length(self.client, &to_lib, &to_name).await?;
+        let from_rcdlen = crate::source::record_length(self.client, &from_lib, &from_name).await?;
         let width = to_rcdlen.saturating_sub(12) as usize;
         let mut done = Vec::new();
         for (mbr, srctype, text) in picked {
@@ -192,8 +194,25 @@ impl Job<'_> {
                 &meta.join("\n"),
             )
             .await?;
+            // Each member's messages (PUB400 2026-10-29, tools/golden/
+            // verify24.txt q24_cpysrcf, q24_cpysrcf_seq, q24_cpysrcf_add:
+            // from a 92-byte source file to a 112-byte one): CPF4011 when
+            // the from-file's records are shorter than the to-file's,
+            // CPF2889 when the to-member was added, CPC2955 with the
+            // number of records.
+            if from_rcdlen < to_rcdlen {
+                done.push(format!(
+                    "CPF4011: The records of member {mbr} are shorter than the buffer they are read into."
+                ));
+            }
+            if existing.is_none() {
+                done.push(format!(
+                    "CPF2889: Member {to_mbr} was added to file {to_name} in library {}.",
+                    crate::qtemp::logical(&to_lib)
+                ));
+            }
             done.push(format!(
-                "{count} records copied from member {mbr} of file {from_name} to member {to_mbr} of file {to_name}."
+                "CPC2955: {count} records were copied from member {mbr}."
             ));
         }
         Ok(Outcome::Messages(done))
@@ -214,6 +233,10 @@ impl Job<'_> {
             }
         }
         let mut source_records: Option<Vec<rla::Record>> = None;
+        // The member CPC2955 names: a source file's member (PUB400
+        // 2026-10-29, tools/golden/verify24.txt q24_print_m2), else the
+        // file's own member.
+        let mut from_member = from_name.clone();
         let from = if let Some(l) = source_lib {
             let mbr = match cmd.get("FROMMBR").to_ascii_uppercase().as_str() {
                 "" | "*FIRST" => self
@@ -235,6 +258,7 @@ impl Job<'_> {
             let m =
                 crate::source::find_member(self.client, std::slice::from_ref(&l), &from_name, &mbr)
                     .await?;
+            from_member = mbr.clone();
             // Reading a member is a use of it (source::note_used).
             crate::source::note_used(self.client, &l, &from_name, &mbr).await;
             let rcdlen = crate::source::record_length(self.client, &l, &from_name).await?;
@@ -304,7 +328,7 @@ impl Job<'_> {
             )
         } else {
             format!(
-                "CPC2955: {} records were copied from member {from_name}.",
+                "CPC2955: {} records were copied from member {from_member}.",
                 records.len()
             )
         };

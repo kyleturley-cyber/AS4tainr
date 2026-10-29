@@ -155,6 +155,11 @@ pub struct Binding {
     /// bound ("LIB/NAME" → signature), checked when it is activated.
     #[serde(default)]
     pub srv_signatures: BTreeMap<String, String>,
+    /// The library each bound service program ("LIB/NAME", where it was
+    /// found) was named with when bound: *LIBL or a library
+    /// (QSYS2.BOUND_SRVPGM_INFO, BOUND_SERVICE_PROGRAM_LIBRARY).
+    #[serde(default)]
+    pub srv_libraries: BTreeMap<String, String>,
     /// A service program's activation group (CRTSRVPGM ACTGRP): a name,
     /// or *CALLER.
     #[serde(default = "caller")]
@@ -182,6 +187,9 @@ pub struct ModuleInfo {
     /// kept with the module and used when it is bound (ILE RPG Reference,
     /// BNDDIR keyword).
     pub bnddir: Vec<String>,
+    /// Exports named in mixed case (EXTPROC('Name')): the name in
+    /// capitals, as bound here, and as written.
+    pub spelled: BTreeMap<String, String>,
 }
 
 /// Compile a module and say what it exports and imports.
@@ -198,6 +206,7 @@ pub async fn module_info(client: &Client, libl: &[String], m: &ModuleCopy) -> Re
             imports: p.called_procedures(),
             has_main: true,
             bnddir: Vec::new(),
+            spelled: BTreeMap::new(),
         });
     }
     let prog = crate::rpg::compile_with(client, libl, &m.name, &m.source, &m.options)
@@ -208,8 +217,20 @@ pub async fn module_info(client: &Client, libl: &[String], m: &ModuleCopy) -> Re
     exports.extend(prog.data_exports.iter().map(|x| x.0.clone()));
     let mut imports = prog.imports.clone();
     imports.extend(prog.data_imports.iter().map(|x| x.0.clone()));
+    let spelled = prog
+        .procs
+        .iter()
+        .filter(|(_, p)| p.export)
+        .filter_map(|(k, p)| {
+            p.written
+                .as_ref()
+                .filter(|w| w.eq_ignore_ascii_case(k) && *w != k)
+                .map(|w| (k.clone(), w.clone()))
+        })
+        .collect();
     Ok(ModuleInfo {
         name: m.name.clone(),
+        spelled,
         exports,
         imports,
         has_main: !prog.nomain,
@@ -355,8 +376,10 @@ pub async fn bind(
     }
     let mut binding = Binding::default();
     let mut srvpgms: Vec<(String, String, Binding)> = Vec::new();
+    let mut named = BTreeMap::new();
     for (l, n) in bndsrvpgm {
         let (lib, b) = find_srvpgm(client, libl, l, n).await?;
+        named.insert(format!("{lib}/{n}"), as_named(l));
         srvpgms.push((lib, n.clone(), b));
     }
     let mut dir: Vec<(String, String, String)> = Vec::new();
@@ -414,6 +437,7 @@ pub async fn bind(
                                 },
                             );
                             if !srvpgms.iter().any(|(sl, sn, _)| *sl == lib && sn == n) {
+                                named.insert(format!("{lib}/{n}"), as_named(l));
                                 srvpgms.push((lib, n.clone(), b));
                             }
                             found = true;
@@ -465,8 +489,17 @@ pub async fn bind(
         .iter()
         .map(|(l, n, b)| (format!("{l}/{n}"), b.signature.clone()))
         .collect();
+    binding.srv_libraries = named;
     binding.srvpgms = srvpgms.into_iter().map(|(l, n, _)| (l, n)).collect();
     Ok((binding, infos))
+}
+
+/// A service program's library as a bind names it: *LIBL when none.
+fn as_named(library: &str) -> String {
+    match library.trim() {
+        "" => "*LIBL".into(),
+        l => l.to_ascii_uppercase(),
+    }
 }
 
 /// What binder language says about a service program.

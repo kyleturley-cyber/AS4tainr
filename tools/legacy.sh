@@ -40,7 +40,8 @@
 # - iMoq (MIT): its BUILD program's steps (the repository's files copied
 #   into source members with CPYFRMSTMF instead of BUILD's Qshell loop,
 #   which would run its shell code on the host), its installer IMOQINST,
-#   then its self-tests IMOQTEST and its examples EXAMPLES in batch jobs.
+#   then its self-tests IMOQTEST, its demo IMOQDEMO and its examples
+#   EXAMPLES in batch jobs.
 # - OSSILE (MIT): imported, then its arraylist and linked list unit tests
 #   (RPGUnit test service programs: ALIST01 made with RUCRTTST, LLIST_UT_1
 #   as its Makefile makes it) run with RUCALLTST in batch jobs.
@@ -166,7 +167,7 @@ for t in ALIST01 LLIST_UT_1; do
     grep -E "^(Success|FAILURE|ERROR)\.|CPF124[01]"
 done
 
-step "iMoq (BUILD's steps: members, IMOQINST; then IMOQTEST and EXAMPLES)"
+step "iMoq (BUILD's steps: members, IMOQINST; then IMOQTEST, IMOQDEMO and EXAMPLES)"
 "$bin" put "$work/imoq" /home/imoq >/dev/null
 run "CRTLIB LIB(IMOQ)" | tail -1
 for f in QRPGLESRC QCLLESRC QCMDSRC QSRVSRC; do run "CRTSRCPF FILE(IMOQ/$f) RCDLEN(112)" >/dev/null; done
@@ -182,11 +183,11 @@ for d in QRPGLESRC QCLLESRC QCMDSRC QSRVSRC examples/QRPGLESRC examples/QCLLESRC
 done
 run "CRTBNDCL PGM(IMOQ/IMOQINST) SRCFILE(IMOQ/QCLLESRC) SRCMBR(IMOQINST)" | grep -E "^CP[CDF]" | tail -1
 "$bin" --libl IMOQ,QGPL batch "CALL PGM(IMOQ/IMOQINST) PARM(IMOQ IMOQ)" 2>&1 | grep -E "^CPF9897|CPF124[01]"
-for t in IMOQTEST EXAMPLES; do
+for t in IMOQTEST IMOQDEMO EXAMPLES; do
   run "CRTBNDCL PGM(IMOQ/$t) SRCFILE(IMOQ/QCLLESRC) SRCMBR($t)" | grep -E "^CPF" | tail -1
   parm="PARM(IMOQ IMOQ)"; [ $t = EXAMPLES ] && parm="PARM(IMOQ)"
   "$bin" --libl QGPL,QTEMP,IMOQ batch "CALL PGM(IMOQ/$t) $parm" 2>&1 |
-    grep -a -E "^CPF989[78]: ([0-9]+ passed|FAIL|EX[A-Z]+ passed|IMOQTEST|EXAMPLES)|CPF124[01]" | cut -c1-160
+    grep -a -E "^CPF989[78]: ([0-9]+ passed|FAIL|EX[A-Z]+ passed|IMOQTEST|IMOQDEMO|EXAMPLES)|CPF124[01]" | cut -c1-160
 done
 
 step "QshOni (build.sh, then QSHEXEC)"

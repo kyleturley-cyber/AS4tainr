@@ -1,0 +1,4 @@
+/* verify25: an ILE CL program that leaves an escape unmonitored */
+PGM
+CALL NOSUCH25
+ENDPGM

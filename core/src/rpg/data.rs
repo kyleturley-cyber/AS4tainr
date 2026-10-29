@@ -66,11 +66,31 @@ pub enum DType {
     VarUcs2(u32),
 }
 
+/// The length prefix of a VARCHAR: 2 bytes, 4 for one longer than 65535
+/// (ILE RPG Reference, VARCHAR: the default prefix size is 2 when the
+/// length is at most 65535, otherwise 4).
+pub fn var_prefix(max: u32) -> usize {
+    if max > 65535 {
+        4
+    } else {
+        2
+    }
+}
+
+/// The current length a VARCHAR's prefix holds.
+pub fn var_len(max: u32, b: &[u8]) -> usize {
+    if var_prefix(max) == 4 {
+        u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize
+    } else {
+        u16::from_be_bytes([b[0], b[1]]) as usize
+    }
+}
+
 impl DType {
     pub fn size(&self) -> usize {
         match *self {
             DType::Char(n) => n as usize,
-            DType::Varchar(n) => n as usize + 2,
+            DType::Varchar(n) => n as usize + var_prefix(n),
             DType::Zoned(d, _) => d as usize,
             DType::Packed(d, _) => d as usize / 2 + 1,
             // ILE RPG Reference, binary format: 1-4 digits in 2 bytes,
@@ -513,8 +533,13 @@ pub fn store(t: &DType, v: &Value, out: &mut [u8], fit: Fit, right: bool) -> Res
                 other => other.chars()?,
             };
             let n = src.len().min(*max as usize);
-            out[0..2].copy_from_slice(&(n as u16).to_be_bytes());
-            out[2..2 + n].copy_from_slice(&src[..n]);
+            let k = var_prefix(*max);
+            if k == 4 {
+                out[0..4].copy_from_slice(&(n as u32).to_be_bytes());
+            } else {
+                out[0..2].copy_from_slice(&(n as u16).to_be_bytes());
+            }
+            out[k..k + n].copy_from_slice(&src[..n]);
         }
         DType::Ind => {
             out[0] = if v.truth()? { 0xF1 } else { 0xF0 };
@@ -676,8 +701,9 @@ pub fn load(t: &DType, b: &[u8]) -> Result<Value> {
             Value::Char(b.to_vec())
         }
         DType::Varchar(max) => {
-            let n = (u16::from_be_bytes([b[0], b[1]]) as usize).min(*max as usize);
-            Value::Char(b[2..2 + n].to_vec())
+            let k = var_prefix(*max);
+            let n = var_len(*max, b).min(*max as usize);
+            Value::Char(b[k..k + n].to_vec())
         }
         // UCS-2 and graphic data are converted to the job's character set
         // (CCSID 37) when used with character data.

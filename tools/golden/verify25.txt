@@ -1,0 +1,40 @@
+# Golden: what verify24 left open. The RPG external indicators U1-U8 and
+# the job switches (GLD24R did not compile: is %CHAR of an indicator the
+# error?); CL %CHAR of *DEC with decimal positions, negative, 15 digits,
+# and of *INT; what the caller of an ILE CL program that left an escape
+# unmonitored gets (CEE9901 under `system` in verify24) and what an OPM
+# CL program does there; CPYSRCF between source files of the same record
+# length and from a longer to a shorter one (CPF4011?); RTVBNDSRC's
+# sequence numbers and dates in hexadecimal; DSPFD TYPE(*MBRLIST) of a
+# data physical file.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify25.txt -Files tools\golden\verify25
+r25_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLD25A)" "DLTPGM PGM(AS4TRAINR1/GLD25B)" "DLTPGM PGM(AS4TRAINR1/GLD25C)" "DLTPGM PGM(AS4TRAINR1/GLD25D)" "DLTPGM PGM(AS4TRAINR1/GLD25E)" "DLTMOD MODULE(AS4TRAINR1/GLD25P)" "DLTF FILE(AS4TRAINR1/GLD25OUT)" "DLTF FILE(AS4TRAINR1/GLD25S)" "DLTF FILE(AS4TRAINR1/GLD25T)" "DLTF FILE(AS4TRAINR1/GLD25U)"; do system -q "$c"; done; echo cleaned
+r25_tag|!for f in gld25a.rpgle gld25b.rpgle gld25c.clle gld25d.clle gld25p.rpgle gld25m.txt; do setccsid 819 /home/AS4TRAINR/gld/$f; done; ls /home/AS4TRAINR/gld | grep gld25
+r25_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD25OUT (N INT, LINE VARCHAR(200))') COMMIT(*NONE)
+# %CHAR of an indicator: the listing shows the error, if any.
+r25_rpga|!system "CRTBNDRPG PGM(AS4TRAINR1/GLD25A) SRCSTMF('/home/AS4TRAINR/gld/gld25a.rpgle')"
+r25_rpgb|!system -s "CRTBNDRPG PGM(AS4TRAINR1/GLD25B) SRCSTMF('/home/AS4TRAINR/gld/gld25b.rpgle')"
+r25_cld|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD25D) SRCSTMF('/home/AS4TRAINR/gld/gld25d.clle')"
+r25_clc|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD25C) SRCSTMF('/home/AS4TRAINR/gld/gld25c.clle')"
+r25_call|!system "CALL PGM(AS4TRAINR1/GLD25C)"
+r25_rows|CPYF FROMFILE(AS4TRAINR1/GLD25OUT) TOFILE(*PRINT)
+r25_mbrl_data|DSPFD FILE(AS4TRAINR1/GLD25OUT) TYPE(*MBRLIST) OUTPUT(*PRINT)
+# An ILE CL program alone under `system`, then the same source as OPM CL.
+r25_call_d|!system "CALL PGM(AS4TRAINR1/GLD25D)"
+r25_srcs|CRTSRCPF FILE(AS4TRAINR1/GLD25S) RCDLEN(92)
+r25_srct|CRTSRCPF FILE(AS4TRAINR1/GLD25T) RCDLEN(112)
+r25_srcu|CRTSRCPF FILE(AS4TRAINR1/GLD25U) RCDLEN(112)
+r25_mbr_d|CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld25d.clle') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD25T.FILE/D.MBR')
+r25_mbr_d_type|CHGPFM FILE(AS4TRAINR1/GLD25T) MBR(D) SRCTYPE(CLP)
+r25_clp|!system -s "CRTCLPGM PGM(AS4TRAINR1/GLD25E) SRCFILE(AS4TRAINR1/GLD25T) SRCMBR(D)"
+r25_call_e|!system "CALL PGM(AS4TRAINR1/GLD25E)"
+# CPYSRCF: same record length; longer to shorter.
+r25_m1|CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld25m.txt') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD25T.FILE/M1.MBR')
+r25_same|CPYSRCF FROMFILE(AS4TRAINR1/GLD25T) TOFILE(AS4TRAINR1/GLD25U) FROMMBR(M1)
+r25_shorter|CPYSRCF FROMFILE(AS4TRAINR1/GLD25T) TOFILE(AS4TRAINR1/GLD25S) FROMMBR(M1)
+r25_same_again|CPYSRCF FROMFILE(AS4TRAINR1/GLD25T) TOFILE(AS4TRAINR1/GLD25U) FROMMBR(M1)
+# RTVBNDSRC's records in hexadecimal (SRCSEQ, SRCDAT).
+r25_mod|!system -s "CRTRPGMOD MODULE(AS4TRAINR1/GLD25P) SRCSTMF('/home/AS4TRAINR/gld/gld25p.rpgle')"
+r25_rtvm|RTVBNDSRC MODULE(AS4TRAINR1/GLD25P) SRCFILE(AS4TRAINR1/GLD25U) SRCMBR(RTVM)
+r25_rtvm_hex|CPYF FROMFILE(AS4TRAINR1/GLD25U) TOFILE(*PRINT) FROMMBR(RTVM) OUTFMT(*HEX)
+r25_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLD25A)" "DLTPGM PGM(AS4TRAINR1/GLD25B)" "DLTPGM PGM(AS4TRAINR1/GLD25C)" "DLTPGM PGM(AS4TRAINR1/GLD25D)" "DLTPGM PGM(AS4TRAINR1/GLD25E)" "DLTMOD MODULE(AS4TRAINR1/GLD25P)" "DLTF FILE(AS4TRAINR1/GLD25OUT)" "DLTF FILE(AS4TRAINR1/GLD25S)" "DLTF FILE(AS4TRAINR1/GLD25T)" "DLTF FILE(AS4TRAINR1/GLD25U)"; do system -q "$c"; done; echo cleaned

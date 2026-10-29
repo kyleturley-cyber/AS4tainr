@@ -18626,8 +18626,9 @@ async fn verify21_escape_to_entry_procedure_rnx_and_dsply() {
 /// instruction on both ends: an ILE procedure's statement number (GLD22Q
 /// 20, GLD22A 1000 and 1300, QRNXIE 22, GLD22M 9), none for an entry
 /// procedure, QCMDEXC's 012F. A completion message RCVMSG RMV(*YES) took
-/// is still listed (2026-10-26, tools/golden/verify1.txt v_out: both
-/// CPC0904 of GLDVCALL's two CRTDTAARA).
+/// is not listed (2026-10-29, tools/golden/verify23.txt n23_rows: of
+/// GLD23A's messages only the one kept; the CPC0904 of a CRTDTAARA
+/// whose message was received with RMV(*YES) is not there).
 #[tokio::test]
 async fn verify22_joblog_info_in_a_system_job() {
     use as4tainr_core::commands::{Environment, Job};
@@ -18817,5 +18818,5 @@ async fn verify22_joblog_info_in_a_system_job() {
         .await
         .unwrap()
         .get(0);
-    assert_eq!(n, 2);
+    assert_eq!(n, 1);
 }

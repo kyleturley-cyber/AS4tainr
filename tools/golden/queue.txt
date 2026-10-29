@@ -1,0 +1,5 @@
+# Lists waiting for a capture on PUB400: tools\golden\pending.ps1 runs
+# each one whose captures are not all in target\ibmi\golden yet.
+# One list per line ("name", or "name|folder" when its files are in
+# another folder than tools\golden\<name>).
+verify23

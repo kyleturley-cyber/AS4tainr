@@ -5772,7 +5772,8 @@ impl Job<'_> {
     /// (PUB400 2026-10-28, tools/golden/verify22.txt u22_rows: the job
     /// start message from QWTPIIPP, then the messages the printed job log
     /// has, with each program's library, module, procedure and statement
-    /// or instruction), copied for SQL before a statement runs.
+    /// or instruction; removed messages are not listed, 2026-10-29,
+    /// verify23.txt n23_rows), copied for SQL before a statement runs.
     async fn mirror_system_job_log(&self) {
         use crate::joblog::{info_end, InfoRow};
         let ((y, mo, d), (h, mi, sec), us) = crate::pgmmsg::job_started();
@@ -5808,7 +5809,7 @@ impl Job<'_> {
             seclvl: String::new(),
             msgf: Some(("QCPFMSG".into(), "QSYS".into())),
         }];
-        for m in self.calls.logged_with_removed() {
+        for m in self.calls.logged() {
             rows.push(InfoRow {
                 msgid: (!m.msgid.is_empty()).then(|| m.msgid.clone()),
                 kind: match m.ty.as_str() {

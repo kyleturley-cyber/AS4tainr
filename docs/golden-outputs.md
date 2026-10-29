@@ -37,6 +37,14 @@ powershell -ExecutionPolicy Bypass -File tools\golden\golden.ps1 -List tools\gol
 
 A list has one `name|CL command` per line (run with `system`, standard output and error together) or `name|!shell line` (standard error lines prefixed `2> `). The script is copied to the IBM i with `scp` and run there over one SSH connection (piping a long script into `ssh` deadlocks in Windows PowerShell); the script retries when the run is cut short. It prints each command's name as it starts and writes what comes back to `target\ibmi\attempt<N>.out` as it arrives. A command still running after `-Timeout` seconds (default 120) is killed, and its output ends with `TIMEOUT after N s`. A command that sends an inquiry message waits for a reply forever in this job. Results go to `target\ibmi\golden\<name>.txt`. They hold IBM's message texts and are never committed: tests take values from them (message IDs, report layouts, exit statuses) and say so in a comment.
 
+**Everything waiting at once:** `tools\golden\queue.txt` names the lists waiting for a capture (one per line, `name` or `name|folder` when its files are in another folder than `tools\golden\<name>`). `tools\golden\pending.ps1` runs `golden.ps1` for each one whose captures are not all there yet, with `-Files` when the folder exists (`-DryRun` shows which):
+
+```
+powershell -ExecutionPolicy Bypass -File tools\golden\pending.ps1
+```
+
+It can run unattended (a scheduled task); a list PUB400 refused is tried again on the next run.
+
 The lists:
 
 - `tools/golden/basics.txt`: display commands and their printed reports (DSPLIBL, DSPSYSVAL, DSPOBJD, DSPMSGD, DSPFD), CHKOBJ, CRTPF RCDLEN, DLTF.

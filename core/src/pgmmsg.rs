@@ -175,14 +175,6 @@ impl CallStack {
             .collect()
     }
 
-    /// Every message logged, removed ones too: QSYS2.JOBLOG_INFO lists a
-    /// completion message RCVMSG RMV(*YES) took (PUB400 2026-10-26,
-    /// tools/golden/verify1.txt v_out: both of GLDVCALL's CPC0904), which
-    /// the printed job log leaves out (verify18 y18_joblog).
-    pub fn logged_with_removed(&self) -> &[QMsg] {
-        &self.log
-    }
-
     /// Messages removed from their queue leave the job log, whatever
     /// their type (PUB400 2026-10-28: impromptu messages a program removed,
     /// verify12 n12_keys and verify13 t13_joblog; a called program's

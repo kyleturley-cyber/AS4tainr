@@ -1,0 +1,30 @@
+/* Golden (tools/golden/verify23.txt): which removed messages        */
+/* QSYS2.JOBLOG_INFO('*') still lists (the printed job log lists     */
+/* none: verify18), with severity, subtype and message file, written */
+/* into AS4TRAINR1/GLD23OUT.                                          */
+PGM
+  DCL        VAR(&M) TYPE(*CHAR) LEN(80)
+  DCL        VAR(&K) TYPE(*CHAR) LEN(4)
+  SNDPGMMSG  MSG('GLD23 info removed') TOPGMQ(*SAME)
+  RCVMSG     MSGTYPE(*INFO) RMV(*YES) MSG(&M)
+  SNDPGMMSG  MSG('GLD23 diag rmvmsg') TOPGMQ(*SAME) MSGTYPE(*DIAG) +
+               KEYVAR(&K)
+  RMVMSG     MSGKEY(&K) CLEAR(*BYKEY)
+  SNDPGMMSG  MSG('GLD23 comp removed') TOPGMQ(*SAME) MSGTYPE(*COMP)
+  RCVMSG     MSGTYPE(*COMP) RMV(*YES) MSG(&M)
+  SNDPGMMSG  MSGID(CPF9898) MSGF(QCPFMSG) MSGDTA('GLD23 info id removed') +
+               TOPGMQ(*SAME)
+  RCVMSG     MSGTYPE(*INFO) RMV(*YES) MSG(&M)
+  CRTDTAARA  DTAARA(QTEMP/GLD23R) TYPE(*CHAR) TEXT('removed')
+  RCVMSG     MSGTYPE(*COMP) RMV(*YES) MSG(&M)
+  SNDPGMMSG  MSG('GLD23 kept') TOPGMQ(*SAME)
+  RUNSQL     SQL('INSERT INTO AS4TRAINR1/GLD23OUT SELECT +
+               ORDINAL_POSITION, COALESCE(MESSAGE_ID, ''*NONE''), +
+               CAST(MESSAGE_TYPE AS CHAR(13)), CHAR(SEVERITY), +
+               COALESCE(CAST(MESSAGE_SUBTYPE AS CHAR(22)), ''-''), +
+               COALESCE(CAST(MESSAGE_FILE AS CHAR(10)), ''-''), +
+               COALESCE(CAST(MESSAGE_LIBRARY AS CHAR(10)), ''-''), +
+               CAST(MESSAGE_TEXT AS VARCHAR(60)) FROM +
+               TABLE(QSYS2.JOBLOG_INFO(''*'')) X') COMMIT(*NONE)
+  DLTDTAARA  DTAARA(QTEMP/GLD23R)
+ENDPGM

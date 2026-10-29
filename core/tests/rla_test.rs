@@ -18618,3 +18618,204 @@ async fn verify21_escape_to_entry_procedure_rnx_and_dsply() {
     assert_eq!(&line[41..46], "'x21'");
     assert_eq!(line.len(), 128);
 }
+
+/// QSYS2.JOBLOG_INFO('*') in a `system` job (PUB400 2026-10-28,
+/// tools/golden/verify22.txt u22_rows, the same sources): the job start
+/// message from QWTPIIPP (04DC) to *EXT (*N), then the messages the
+/// printed job log has, with library, program, module, procedure and
+/// instruction on both ends: an ILE procedure's statement number (GLD22Q
+/// 20, GLD22A 1000 and 1300, QRNXIE 22, GLD22M 9), none for an entry
+/// procedure, QCMDEXC's 012F. A completion message RCVMSG RMV(*YES) took
+/// is still listed (2026-10-26, tools/golden/verify1.txt v_out: both
+/// CPC0904 of GLDVCALL's two CRTDTAARA).
+#[tokio::test]
+async fn verify22_joblog_info_in_a_system_job() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::pase_system;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let dir = format!("/tmp/{lib}");
+    let _ = as4tainr_core::ifs::mkdir_all(&client, &dir, "QSECOFR").await;
+    let removed = format!(
+        "PGM\n  CRTDTAARA  DTAARA(QTEMP/GLD22R) TYPE(*CHAR) TEXT('removed')\n  RCVMSG     MSGTYPE(*COMP) RMV(*YES)\n  CRTDTAARA  DTAARA(QTEMP/GLD22K) TYPE(*CHAR) TEXT('kept')\n  RUNSQL     SQL('INSERT INTO {lib}/GLD22OUT (N, ID) SELECT ORDINAL_POSITION, MESSAGE_ID FROM TABLE(QSYS2.JOBLOG_INFO(''*'')) X WHERE MESSAGE_ID = ''CPC0904''') COMMIT(*NONE)\n  DLTDTAARA  DTAARA(QTEMP/GLD22R)\n  DLTDTAARA  DTAARA(QTEMP/GLD22K)\nENDPGM\n"
+    );
+    for (f, text) in [
+        (
+            "gld22a.clle",
+            include_str!("../../tools/golden/verify22/gld22a.clle").to_string(),
+        ),
+        (
+            "gld22q.rpgle",
+            include_str!("../../tools/golden/verify22/gld22q.rpgle").to_string(),
+        ),
+        (
+            "gld22m.rpgle",
+            include_str!("../../tools/golden/verify22/gld22m.rpgle").to_string(),
+        ),
+        ("gld22v.clle", removed),
+    ] {
+        as4tainr_core::ifs::write_file(
+            &client,
+            &format!("{dir}/{f}"),
+            text.replace("AS4TRAINR1", &lib).as_bytes(),
+            819,
+            0o644,
+            "QSECOFR",
+        )
+        .await
+        .unwrap();
+    }
+    for c in [
+        format!("RUNSQL SQL('CREATE TABLE {lib}/GLD22OUT (N INT, ID CHAR(7), TY CHAR(13), SEV INT, FP CHAR(10), FL CHAR(10), FM CHAR(10), FPR VARCHAR(40), FI CHAR(8), TP CHAR(10), TL CHAR(10), TM CHAR(10), TPR VARCHAR(40), TI CHAR(8), FU CHAR(10), TX VARCHAR(60))') COMMIT(*NONE)"),
+        format!("CRTBNDRPG PGM({lib}/GLD22Q) SRCSTMF('{dir}/gld22q.rpgle')"),
+        format!("CRTBNDRPG PGM({lib}/GLD22M) SRCSTMF('{dir}/gld22m.rpgle')"),
+        format!("CRTBNDCL PGM({lib}/GLD22A) SRCSTMF('{dir}/gld22a.clle')"),
+        format!("CRTBNDCL PGM({lib}/GLD22V) SRCSTMF('{dir}/gld22v.clle')"),
+    ] {
+        let o = pase_system::run(&mut job, &[c]).await;
+        assert_eq!(o.status, 0, "{o:?}");
+    }
+    job.calls = Default::default();
+    let o = pase_system::run(&mut job, &[format!("CALL PGM({lib}/GLD22A)")]).await;
+    assert_eq!(o.status, 0, "{o:?}");
+    let table = format!(
+        "{}.{}",
+        as4tainr_core::catalog::ident(&lib),
+        as4tainr_core::catalog::ident("GLD22OUT")
+    );
+    let rows = client
+        .query(
+            &format!(
+                "SELECT n, rtrim(id), rtrim(ty), coalesce(rtrim(fp), ''), coalesce(rtrim(fl), ''),
+                        coalesce(rtrim(fm), ''), coalesce(fpr, ''), coalesce(rtrim(fi), ''),
+                        coalesce(rtrim(tp), ''), coalesce(rtrim(tl), ''), coalesce(rtrim(tm), ''),
+                        coalesce(tpr, ''), coalesce(rtrim(ti), ''), rtrim(fu)
+                   FROM {table} ORDER BY n"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let got: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            let mut v = vec![r.get::<_, i32>(0).to_string()];
+            v.extend((1..14).map(|i| r.get::<_, String>(i)));
+            v
+        })
+        .collect();
+    let l = lib.as_str();
+    let row = |v: [&str; 14]| v.map(str::to_string).to_vec();
+    assert_eq!(
+        got,
+        [
+            row([
+                "1",
+                "CPF1124",
+                "INFORMATIONAL",
+                "QWTPIIPP",
+                "QSYS",
+                "",
+                "",
+                "04DC",
+                "*EXT",
+                "",
+                "",
+                "",
+                "*N",
+                "QUSER"
+            ]),
+            row([
+                "2",
+                "CPF9898",
+                "ESCAPE",
+                "GLD22Q",
+                l,
+                "GLD22Q",
+                "GLD22Q",
+                "20",
+                "GLD22Q",
+                l,
+                "GLD22Q",
+                "_QRNP_PEP_GLD22Q",
+                "",
+                "QSECOFR"
+            ]),
+            row([
+                "3",
+                "*NONE",
+                "INFORMATIONAL",
+                "GLD22A",
+                l,
+                "GLD22A",
+                "GLD22A",
+                "1000",
+                "GLD22A",
+                l,
+                "GLD22A",
+                "GLD22A",
+                "1000",
+                "QSECOFR"
+            ]),
+            row([
+                "4",
+                "RNX0100",
+                "ESCAPE",
+                "QRNXIE",
+                "QSYS",
+                "QRNXMSG",
+                "SignalException",
+                "22",
+                "GLD22M",
+                l,
+                "GLD22M",
+                "GLD22M",
+                "9",
+                "QSECOFR"
+            ]),
+            row([
+                "5",
+                "CPF9898",
+                "INFORMATIONAL",
+                "GLD22A",
+                l,
+                "GLD22A",
+                "GLD22A",
+                "1300",
+                "QCMDEXC",
+                "QSYS",
+                "",
+                "",
+                "012F",
+                "QSECOFR"
+            ]),
+        ]
+    );
+
+    client
+        .execute(&format!("DELETE FROM {table}"), &[])
+        .await
+        .unwrap();
+    job.calls = Default::default();
+    let o = pase_system::run(&mut job, &[format!("CALL PGM({lib}/GLD22V)")]).await;
+    assert_eq!(o.status, 0, "{o:?}");
+    let n: i64 = client
+        .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 2);
+}

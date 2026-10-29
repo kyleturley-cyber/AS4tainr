@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 30";
+const VERSION: &str = "as4tainr services 32";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -769,9 +769,27 @@ DECLARE
 BEGIN
   IF q = '*' THEN
     q := upper(coalesce(current_setting('as4tainr.job', true), ''));
-    -- A process with no as4tainr job (PASE `system`, `call`) keeps no
-    -- job log in the catalog: no rows (fidelity-gaps).
+    -- A process with no as4tainr job (PASE `system`, `call`): the job log
+    -- it copied before the statement (as4tainr.process_job_log, by job
+    -- key; joblog.rs, commands.rs mirror_system_job_log).
     IF q = '' THEN
+      RETURN QUERY
+      SELECT CAST(row_number() OVER (ORDER BY l.seq) AS integer),
+             CAST(l.msgid AS varchar(7)), CAST(l.kind AS varchar(13)),
+             CAST(NULL AS varchar(22)), CAST(l.sev AS smallint), l.sent,
+             CAST(l.from_library AS varchar(10)), CAST(l.from_program AS varchar(256)),
+             CAST(l.from_module AS varchar(10)), CAST(l.from_procedure AS varchar(4096)),
+             CAST(l.from_instruction AS varchar(10)), CAST(l.to_library AS varchar(10)),
+             CAST(l.to_program AS varchar(10)), CAST(l.to_module AS varchar(10)),
+             CAST(l.to_procedure AS varchar(4096)), CAST(l.to_instruction AS varchar(10)),
+             CAST(l.from_user AS varchar(10)), CAST(l.msgf AS varchar(10)),
+             CAST(l.msgf_library AS varchar(10)), CAST(NULL AS smallint), CAST(NULL AS bytea),
+             CAST(l.text AS varchar(1024)), CAST(nullif(l.seclvl, '') AS varchar(4096)),
+             CAST(int4send(l.seq) AS bytea),
+             CAST(lpad((substr(l.job, 4)::bigint % 1000000)::text, 6, '0') || '/QUSER/QP0ZSPWT' AS varchar(28))
+        FROM as4tainr.process_job_log l
+       WHERE l.job = current_setting('as4tainr.job_key', true)
+       ORDER BY l.seq;
       RETURN;
     END IF;
   END IF;

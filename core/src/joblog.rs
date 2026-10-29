@@ -27,6 +27,116 @@
 //! shows them).
 
 use crate::commands::dsp_label;
+
+/// The job log of a process with no job of the catalog (PASE `system`,
+/// `call`), copied for QSYS2.JOBLOG_INFO('*') by job key
+/// (`Job::job_key`), as `as4tainr.job_environment_variables` is for
+/// environment variables.
+pub const DDL: &str = r#"
+CREATE UNLOGGED TABLE IF NOT EXISTS as4tainr.process_job_log (
+    job text NOT NULL,
+    seq integer NOT NULL,
+    msgid text,
+    kind text NOT NULL,
+    sev integer NOT NULL DEFAULT 0,
+    sent timestamp,
+    from_library text, from_program text, from_module text,
+    from_procedure text, from_instruction text,
+    to_library text, to_program text, to_module text,
+    to_procedure text, to_instruction text,
+    from_user text,
+    text text,
+    seclvl text,
+    msgf text,
+    msgf_library text,
+    PRIMARY KEY (job, seq)
+);
+ALTER TABLE as4tainr.process_job_log ADD COLUMN IF NOT EXISTS msgf text;
+ALTER TABLE as4tainr.process_job_log ADD COLUMN IF NOT EXISTS msgf_library text;
+"#;
+
+/// One row of QSYS2.JOBLOG_INFO for a process's job log.
+#[derive(Debug, Clone, Default)]
+pub struct InfoRow {
+    pub msgid: Option<String>,
+    pub kind: String,
+    pub sev: i32,
+    /// YYYY-MM-DD HH:MM:SS.uuuuuu
+    pub sent: String,
+    pub from: [Option<String>; 5],
+    pub to: [Option<String>; 5],
+    pub from_user: String,
+    pub text: String,
+    pub seclvl: String,
+    /// The message file and its library (None for an impromptu message).
+    pub msgf: Option<(String, String)>,
+}
+
+/// A sending or receiving program as JOBLOG_INFO gives it: library,
+/// program, module, procedure, instruction (an ILE procedure's
+/// statement number, a system program's instruction; none for an entry
+/// procedure: PUB400 2026-10-28, tools/golden/verify22.txt u22_rows).
+pub fn info_end(s: &crate::pgmmsg::Sender) -> [Option<String>; 5] {
+    let some = |v: &str| (!v.is_empty()).then(|| v.to_string());
+    let inst = if !s.module.is_empty() {
+        (s.line > 0).then(|| s.line.to_string())
+    } else {
+        some(&s.inst)
+    };
+    [
+        some(&s.lib),
+        some(&s.pgm),
+        some(&s.module),
+        some(&s.proc),
+        inst,
+    ]
+}
+
+/// Replace a process's copy of its job log.
+pub async fn mirror(client: &tokio_postgres::Client, job: &str, rows: &[InfoRow]) {
+    let _ = client
+        .execute(
+            "DELETE FROM as4tainr.process_job_log WHERE job = $1",
+            &[&job],
+        )
+        .await;
+    for (i, r) in rows.iter().enumerate() {
+        let seq = i as i32 + 1;
+        let _ = client
+            .execute(
+                "INSERT INTO as4tainr.process_job_log (job, seq, msgid, kind, sev, sent,
+                   from_library, from_program, from_module, from_procedure, from_instruction,
+                   to_library, to_program, to_module, to_procedure, to_instruction,
+                   from_user, text, seclvl, msgf, msgf_library)
+                 VALUES ($1, $2, $3, $4, $5, CAST(nullif($6, '') AS timestamp),
+                   $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
+                &[
+                    &job,
+                    &seq,
+                    &r.msgid,
+                    &r.kind,
+                    &r.sev,
+                    &r.sent,
+                    &r.from[0],
+                    &r.from[1],
+                    &r.from[2],
+                    &r.from[3],
+                    &r.from[4],
+                    &r.to[0],
+                    &r.to[1],
+                    &r.to[2],
+                    &r.to[3],
+                    &r.to[4],
+                    &r.from_user,
+                    &r.text,
+                    &r.seclvl,
+                    &r.msgf.as_ref().map(|m| m.0.clone()),
+                    &r.msgf.as_ref().map(|m| m.1.clone()),
+                ],
+            )
+            .await;
+    }
+}
 use crate::report::{at, Stamp};
 
 /// Lines per page (header included).

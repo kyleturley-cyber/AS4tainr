@@ -237,6 +237,7 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] DSPJOB printed report (*DFNA, *STSA, *RUNA, *PGMSTK) in IBM i 7.5's layout; RPG message API messages in a `system` job's printed job log, '*' counter 1 to the program entry procedure (verify19)
 - [x] RPG program entry procedures for the message APIs ('*' counter 1, *PGMBDY, *CTLBDY); DSPJOB *LIBL, *ACTGRP and *ALL's order (verify20)
 - [x] Escapes to an RPG entry procedure and RPG run-time errors in the printed job log; DSPLY under PASE system goes to QSYSOPR; DSPJOB *ENVVAR (verify21)
+- [x] QSYS2.JOBLOG_INFO('*') in a PASE system job: programs, modules, procedures, instructions, removed messages kept (verify22)
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).
 - [x] Journals and trigger programs: COM's SETUPJRN, ORDAUDJV (QSYS2.DISPLAY_JOURNAL) and ORDTRG (ADDPFTRG) run (docs/journals.md).

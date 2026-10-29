@@ -1,0 +1,13 @@
+# Golden: which messages a CL program removed (RCVMSG RMV(*YES), RMVMSG;
+# impromptu and predefined, *INFO, *DIAG, *COMP, a command's) are still
+# in QSYS2.JOBLOG_INFO('*') (verify1 v_out listed a removed CPC0904; the
+# printed job log lists none of them, verify18), and the severity,
+# subtype and message file columns.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify23.txt -Files tools\golden\verify23
+n23_cleanup|!system -q "DLTPGM PGM(AS4TRAINR1/GLD23A)"; system -q "DLTF FILE(AS4TRAINR1/GLD23OUT)"; echo cleaned
+n23_tag|!setccsid 819 /home/AS4TRAINR/gld/gld23a.clle; ls /home/AS4TRAINR/gld | grep gld23
+n23_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD23OUT (N INT, ID CHAR(7), TY CHAR(13), SEV CHAR(6), SUB CHAR(22), MF CHAR(10), ML CHAR(10), TX VARCHAR(60))') COMMIT(*NONE)
+n23_cla|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD23A) SRCSTMF('/home/AS4TRAINR/gld/gld23a.clle')"
+n23_call|!system "CALL PGM(AS4TRAINR1/GLD23A)"
+n23_rows|CPYF FROMFILE(AS4TRAINR1/GLD23OUT) TOFILE(*PRINT)
+n23_end|!system -q "DLTPGM PGM(AS4TRAINR1/GLD23A)"; system -q "DLTF FILE(AS4TRAINR1/GLD23OUT)"; echo cleaned

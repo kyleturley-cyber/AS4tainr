@@ -98,6 +98,8 @@ pub struct CallStack {
     /// whose program ended stays, PUB400 2026-10-28,
     /// tools/golden/verify17.txt x17_joblog; removed ones leave: `unlog`).
     log: Vec<QMsg>,
+    /// The keys of logged messages removed from their queue (`unlog`).
+    removed: Vec<u32>,
 }
 
 /// A CL program on the call stack.
@@ -163,8 +165,21 @@ impl CallStack {
         self.log.extend(msgs);
     }
 
-    /// The messages of the job log that are still there, oldest first.
-    pub fn logged(&self) -> &[QMsg] {
+    /// The messages of the printed job log, oldest first: those not
+    /// removed from their queue.
+    pub fn logged(&self) -> Vec<QMsg> {
+        self.log
+            .iter()
+            .filter(|m| !self.removed.contains(&m.key))
+            .cloned()
+            .collect()
+    }
+
+    /// Every message logged, removed ones too: QSYS2.JOBLOG_INFO lists a
+    /// completion message RCVMSG RMV(*YES) took (PUB400 2026-10-26,
+    /// tools/golden/verify1.txt v_out: both of GLDVCALL's CPC0904), which
+    /// the printed job log leaves out (verify18 y18_joblog).
+    pub fn logged_with_removed(&self) -> &[QMsg] {
         &self.log
     }
 
@@ -175,7 +190,7 @@ impl CallStack {
     /// messages, its own and CRTDTAARA's, taken with RCVMSG RMV(*YES) or
     /// RMVMSG, verify18 y18_joblog).
     fn unlog(&mut self, keys: &[u32]) {
-        self.log.retain(|m| !keys.contains(&m.key));
+        self.removed.extend_from_slice(keys);
     }
 }
 

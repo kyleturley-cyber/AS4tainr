@@ -958,6 +958,11 @@ impl Job<'_> {
     /// RUNSQL: one SQL statement that does not return rows.
     async fn runsql(&mut self, cmd: &Command) -> Result<Outcome> {
         let stmt = cmd.get("SQL");
+        // A process with no job of the catalog: its job log for
+        // QSYS2.JOBLOG_INFO('*').
+        if self.id.is_none() && stmt.to_ascii_uppercase().contains("JOBLOG_INFO") {
+            self.mirror_system_job_log().await;
+        }
         let mut schema = None;
         if let Some(msg) = crate::ddl::try_run(
             &self.env.database_url,
@@ -5763,6 +5768,92 @@ impl Job<'_> {
     /// the process's). The job started message CPF1124 first, then the
     /// messages its programs sent that are still on their queues
     /// (crate::joblog).
+    /// A `system` job's log as QSYS2.JOBLOG_INFO('*') lists it to the job
+    /// (PUB400 2026-10-28, tools/golden/verify22.txt u22_rows: the job
+    /// start message from QWTPIIPP, then the messages the printed job log
+    /// has, with each program's library, module, procedure and statement
+    /// or instruction), copied for SQL before a statement runs.
+    async fn mirror_system_job_log(&self) {
+        use crate::joblog::{info_end, InfoRow};
+        let ((y, mo, d), (h, mi, sec), us) = crate::pgmmsg::job_started();
+        let ts = |cyymmdd: &str, hms: &str, usec: &str| -> String {
+            let g = |v: &str, r: std::ops::Range<usize>| v.get(r).unwrap_or("00").to_string();
+            let century = if cyymmdd.starts_with('1') { "20" } else { "19" };
+            format!(
+                "{century}{}-{}-{} {}:{}:{}.{}",
+                g(cyymmdd, 1..3),
+                g(cyymmdd, 3..5),
+                g(cyymmdd, 5..7),
+                g(hms, 0..2),
+                g(hms, 2..4),
+                g(hms, 4..6),
+                if usec.is_empty() { "000000" } else { usec }
+            )
+        };
+        let mut rows = vec![InfoRow {
+            msgid: Some("CPF1124".into()),
+            kind: "INFORMATIONAL".into(),
+            sev: 0,
+            sent: format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{sec:02}.{us:06}"),
+            from: [
+                Some("QSYS".into()),
+                Some("QWTPIIPP".into()),
+                None,
+                None,
+                Some("04DC".into()),
+            ],
+            to: [None, Some("*EXT".into()), None, None, Some("*N".into())],
+            from_user: "QUSER".into(),
+            text: self.system_job_started_text(),
+            seclvl: String::new(),
+            msgf: Some(("QCPFMSG".into(), "QSYS".into())),
+        }];
+        for m in self.calls.logged_with_removed() {
+            rows.push(InfoRow {
+                msgid: (!m.msgid.is_empty()).then(|| m.msgid.clone()),
+                kind: match m.ty.as_str() {
+                    "*COMP" => "COMPLETION",
+                    "*DIAG" => "DIAGNOSTIC",
+                    "*ESCAPE" => "ESCAPE",
+                    "*NOTIFY" => "NOTIFY",
+                    "*INQ" => "INQUIRY",
+                    "*RPY" => "REPLY",
+                    "*RQS" => "REQUEST",
+                    _ => "INFORMATIONAL",
+                }
+                .into(),
+                sev: m.sev,
+                sent: ts(&m.sent.0, &m.sent.1, &m.usec),
+                from: info_end(m.logged_sender.as_ref().unwrap_or(&m.sender)),
+                to: info_end(&m.receiver),
+                from_user: self.user.clone(),
+                text: m.text.clone(),
+                seclvl: m.seclvl.clone(),
+                msgf: (!m.msgid.is_empty() && !m.msgf.is_empty()).then(|| {
+                    let lib = if m.msgflib.is_empty() {
+                        "QSYS".to_string()
+                    } else {
+                        m.msgflib.clone()
+                    };
+                    (m.msgf.clone(), lib)
+                }),
+            });
+        }
+        crate::joblog::mirror(self.client, &self.job_key(), &rows).await;
+    }
+
+    /// The text of a `system` job's start message CPF1124 (as4tainr's
+    /// own words).
+    fn system_job_started_text(&self) -> String {
+        let number = format!("{:06}", std::process::id() % 1_000_000);
+        let ((y, mo, d), (h, mi, sec), _) = crate::pgmmsg::job_started();
+        let started = crate::report::Stamp::of((y, mo, d), (h, mi, sec));
+        format!(
+            "Job {number}/QUSER/QP0ZSPWT began running in subsystem QUSRWRK in QSYS on {} at {}; it came into the system on {} at {}.",
+            started.date, started.time, started.date, started.time
+        )
+    }
+
     fn system_job_log(&self) -> Vec<String> {
         use crate::joblog::{date_text, time_text, End, Entry};
         let number = format!("{:06}", std::process::id() % 1_000_000);
@@ -5786,10 +5877,7 @@ impl Job<'_> {
                 inst: "*N".into(),
                 ..Default::default()
             },
-            text: format!(
-                "Job {number}/QUSER/QP0ZSPWT began running in subsystem QUSRWRK in QSYS on {} at {}; it came into the system on {} at {}.",
-                started.date, started.time, started.date, started.time
-            ),
+            text: self.system_job_started_text(),
             ..Default::default()
         }];
         // What the CL programs put on their queues (the message APIs'

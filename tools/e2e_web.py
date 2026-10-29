@@ -244,6 +244,51 @@ with sync_playwright() as pw:
     check(True, "SIGNOFF returns the second tab to the sign-on screen", t2)
     page2.close()
 
+    # A phone: touch, and a keyboard that sends text as input events with no
+    # key events (Android's keyboards send keydown "Unidentified"; words are
+    # compositions the keyboard changes until they are done).
+    ctx = browser.new_context(viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True)
+    m = ctx.new_page()
+    m.goto(URL + "/")
+    tm = Term(m)
+    tm.wait_for("Sign On")
+    tm.ready()
+    box = m.locator("#screen .cur").bounding_box()
+    m.touchscreen.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    check(m.evaluate("() => document.activeElement.id") == "kbd",
+          "tapping the screen focuses a text field, so the phone shows its keyboard", tm)
+    m.keyboard.insert_text("qsecofx")
+    # Backspace as Android sends it: the field loses its last character.
+    m.evaluate("""() => { const k = document.getElementById('kbd');
+        k.value = k.value.slice(0, -1);
+        k.dispatchEvent(new InputEvent('input', {inputType: 'deleteContentBackward', bubbles: true})); }""")
+    m.keyboard.insert_text("r")
+    check("QSECOFR" in tm.text().upper() and "QSECOFX" not in tm.text().upper(),
+          "text typed with a phone keyboard (input events, Backspace) goes into the field", tm)
+    m.tap('.keyboard .key[data-local="tab"]')
+    check(m.evaluate("() => document.activeElement.id") == "kbd",
+          "the Tab key of the bar keeps the phone keyboard open", tm)
+    # The password as a composition the keyboard extends letter by letter.
+    m.evaluate("""pw => { const k = document.getElementById('kbd'); const base = k.value;
+        k.dispatchEvent(new CompositionEvent('compositionstart', {data: ''}));
+        for (let i = 1; i <= pw.length; i++) {
+          k.value = base + pw.slice(0, i);
+          k.dispatchEvent(new InputEvent('input', {inputType: 'insertCompositionText', data: pw.slice(0, i), isComposing: true, bubbles: true}));
+        }
+        k.dispatchEvent(new CompositionEvent('compositionend', {data: pw})); }""", PW[:-1])
+    m.keyboard.insert_text(PW[-1])
+    m.tap('.keyboard .key[data-aid="ENTER"]')
+    tm.wait_for("Main Menu")
+    check(True, "signed on from a phone: user, Tab key, password typed as a composition, Enter key", tm)
+    tm.ready()
+    m.keyboard.insert_text("call qcmd\n")
+    tm.wait_for("Command Entry")
+    check(True, "the phone keyboard's Enter (a new line in the field) presses Enter", tm)
+    tm.ready()
+    m.keyboard.insert_text("signoff\n")
+    tm.wait_for("Sign On")
+    ctx.close()
+
     page.set_viewport_size({"width": 390, "height": 844})
     page.wait_for_timeout(200)
     overflow = page.evaluate("() => document.documentElement.scrollWidth - document.documentElement.clientWidth")

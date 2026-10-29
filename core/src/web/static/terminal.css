@@ -98,12 +98,12 @@ body {
 .gap { width: 10px; }
 .cluster {
   display: grid;
-  grid-template-columns: repeat(3, minmax(52px, auto)) minmax(64px, auto);
+  grid-template-columns: repeat(4, minmax(48px, auto)) minmax(60px, auto);
   grid-template-rows: 1fr 1fr;
   gap: 5px 6px;
   flex: 0 0 auto;
 }
-.key-enter { grid-column: 4; grid-row: 1 / span 2; }
+.key-enter { grid-column: 5; grid-row: 1 / span 2; }
 
 .key {
   appearance: none;
@@ -188,9 +188,21 @@ body {
 .hot { cursor: pointer; }
 .hot:hover { background: rgba(110, 168, 255, .18); border-radius: 2px; }
 .cur { background: var(--c-green); color: var(--screen-bg) !important; animation: blink 1.1s steps(1) infinite; }
-.screen:not(:focus) .cur { background: transparent; color: inherit !important; outline: 1px solid var(--c-green); animation: none; }
+.screen-wrap:not(:focus-within) .cur { background: transparent; color: inherit !important; outline: 1px solid var(--c-green); animation: none; }
 @keyframes blink { 50% { background: transparent; color: inherit; } }
 .screen.locked { cursor: progress; }
+/* The keyboard input field: invisible, kept at the cursor so the phone
+   scrolls to the cursor and an input method shows its suggestions there.
+   16px, or iOS Safari zooms the page when it gets the focus. */
+.kbd-input {
+  position: absolute; left: 0; top: 0;
+  width: 1px; height: 1px;
+  margin: 0; padding: 0; border: 0;
+  opacity: 0; resize: none; overflow: hidden;
+  font-size: 16px; line-height: 1;
+  color: transparent; background: transparent; caret-color: transparent;
+  white-space: pre;
+}
 
 .overlay {
   position: absolute; inset: 0;

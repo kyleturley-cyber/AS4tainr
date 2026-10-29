@@ -14,8 +14,8 @@ It runs in the same process and the same container as the 5250 server. There is 
 
 ```
  ┌────────────────────────────────────────────────────────────────────────────┐
- │ F13 F14 F15 F16   F17 F18 F19 F20   F21 F22 F23 F24 │ Help  PgUp  Reset │     │
- │ F1  F2  F3  F4    F5  F6  F7  F8    F9  F10 F11 F12 │ Clear PgDn  FldExit│Enter│
+ │ F13 F14 F15 F16   F17 F18 F19 F20   F21 F22 F23 F24 │ Help  PgUp Reset   Tab   │     │
+ │ F1  F2  F3  F4    F5  F6  F7  F8    F9  F10 F11 F12 │ Clear PgDn FldExit BkTab │Enter│
  │         Exit                                 Cancel │                   │     │
  ├────────────────────────────────────────────────────────────────────────────┤
  │                         Work with Customers                                │
@@ -26,7 +26,7 @@ It runs in the same process and the same container as the 5250 server. There is 
 
 - **F13–F24 sit above F1–F12** in groups of four, as on the 122-key 5250 keyboard.
 - **A key shows what it does on the current screen.** The page reads the key hints on the screen, such as `F3=Exit`. Each named key shows its function under its number and is highlighted. Keys the screen does not name are dimmed, but you can still click them. PgDn is highlighted when a list says `More...`.
-- **The keys on the right** are Help, Clear, Page Up/Down (Roll Down/Up), Reset, Field Exit and Enter.
+- **The keys on the right** are Help, Clear, Page Up/Down (Roll Down/Up), Reset, Tab and BkTab (next and previous input field), Field Exit and Enter. Tab, BkTab and Field Exit are there for phones and tablets, whose keyboards have no Tab key.
 - **The status line** at the bottom shows `X SYSTEM` while the host is working (keyboard locked), input errors such as "Cursor in protected area", the insert mode, and the cursor position.
 - Clicking the screen moves the cursor. Clicking a key hint on the screen, such as `F3=Exit`, presses that key.
 
@@ -46,6 +46,12 @@ It runs in the same process and the same container as the 5250 server. There is 
 | Esc | Reset (clears an input error) |
 
 The page catches F1–F12 itself. F5 does not reload the page and F12 does not open the developer tools while the terminal has focus. Paste (Ctrl+V) types the first line of the clipboard into the fields.
+
+### Phones and tablets
+
+Tap the screen to place the cursor and open the on-screen keyboard. The keyboard's Enter (or Go) key is Enter. Use the bar's keys for the function keys, Tab, BkTab and Field Exit; a tap on the bar does not open the on-screen keyboard if it was closed.
+
+The page types into a hidden text field that follows the cursor (the on-screen keyboard only opens for a text field). A desktop keyboard's keys are handled when they are pressed. Text from a phone keyboard or an input method arrives as input events instead, often as words the keyboard changes until they are done (suggestions, autocorrect). The page compares the field with what it held before and replays the difference on the screen as Backspaces and typed characters. Autocorrect, autocapitalization and spellcheck are turned off for that field.
 
 Fields behave like a display station's: monocase fields fold to upper case, numeric fields accept only digits (and sign and decimal characters where the field allows them), nondisplay fields (passwords) are not shown, and auto-enter fields press Enter when they are full.
 
@@ -93,6 +99,6 @@ Positions are 0-based offsets on the 24x80 screen (`row * 80 + col`). `f` is the
 ## Tests
 
 - Unit tests: `cargo test web::`. They cover the display station against screens from as4tainr's own data stream encoder, with round trips through the server's input parser. They also cover WebSocket framing and the handshake (RFC 6455 examples), SHA-1 (RFC 3174 vectors), base64 (RFC 4648 vectors), the telnet replies, and the origin check.
-- End to end in Chromium: `python3 tools/e2e_web.py http://127.0.0.1:5250` against a running server with the samples. It covers sign-on, the key bar's labels, clicked and typed function keys, a clicked key hint, Field Exit, subfile paging, order entry, two tabs as two jobs, and phone width.
+- End to end in Chromium: `python3 tools/e2e_web.py http://127.0.0.1:5250` against a running server with the samples. It covers sign-on, the key bar's labels, clicked and typed function keys, a clicked key hint, Field Exit, subfile paging, order entry, two tabs as two jobs, phone width, and a touch device whose keyboard sends input events only (as Android's do): typing, Backspace, a composed word, the Tab key of the bar and Enter as a new line.
 
 What is not there yet is in [fidelity-gaps.md](fidelity-gaps.md) under "Browser terminal".

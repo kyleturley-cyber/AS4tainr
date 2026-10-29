@@ -7,6 +7,10 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const screenEl = $("screen");
+  const kbd = $("kbd");
+  // A touch screen: tapping a key of the bar should not open the phone's
+  // keyboard unless it was already open.
+  const coarse = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
   const keyboardEl = $("row-base").closest(".keyboard");
 
   // ---- State ----------------------------------------------------------
@@ -50,13 +54,17 @@
   buildRow($("row-base"), 1);
 
   document.querySelectorAll(".keyboard .key").forEach((b) => {
-    // Keep keyboard focus on the screen when a key is clicked.
+    // Keep keyboard focus on the input field when a key is clicked.
+    let hadKeys = false;
+    b.addEventListener("pointerdown", () => { hadKeys = document.activeElement === kbd; });
     b.addEventListener("mousedown", (e) => e.preventDefault());
     b.addEventListener("click", () => {
       if (b.dataset.aid) sendAid(b.dataset.aid);
       else if (b.dataset.local === "reset") reset();
       else if (b.dataset.local === "fieldexit") fieldExit("");
-      screenEl.focus();
+      else if (b.dataset.local === "tab") tab(1);
+      else if (b.dataset.local === "backtab") tab(-1);
+      if (!coarse || hadKeys) focusKeys();
     });
   });
 
@@ -189,8 +197,73 @@
     }
     screenEl.innerHTML = html;
     screenEl.classList.toggle("locked", locked);
+    placeKbd();
     updateOia();
   }
+
+  // ---- Keyboard input field --------------------------------------------
+  // Typed characters arrive in two ways. A desktop keyboard (and iOS) sends
+  // keydown with the character in e.key: the keydown handler below types it
+  // and cancels the event, so nothing reaches the field. Android keyboards
+  // and input methods send keydown "Unidentified" (keyCode 229) and put the
+  // text into the field, often as a composition they keep changing until
+  // the word is done. The field holds PAD (zero-width spaces, so Backspace
+  // has something to delete) and what was typed after it; each change is
+  // compared with the last one and replayed on the screen as Backspaces
+  // and typed characters, then the field is set back to PAD once no
+  // composition is open.
+  const PAD = "\u200b".repeat(16);
+  let kbdValue = PAD;
+  let composing = false;
+  let skipInput = false; // the keydown handler already did this key
+
+  function focusKeys() {
+    if (document.activeElement !== kbd) kbd.focus({ preventScroll: true });
+  }
+  function resetKbd() {
+    kbd.value = PAD;
+    kbd.setSelectionRange(PAD.length, PAD.length);
+    kbdValue = PAD;
+  }
+  function placeKbd() {
+    const cur = screenEl.querySelector(".cur");
+    if (!cur) return;
+    const wrap = screenEl.parentElement;
+    const r = cur.getBoundingClientRect(), w = wrap.getBoundingClientRect();
+    kbd.style.left = Math.round(r.left - w.left + wrap.scrollLeft) + "px";
+    kbd.style.top = Math.round(r.top - w.top + wrap.scrollTop) + "px";
+  }
+  function takeInput() {
+    const v = kbd.value;
+    if (v === kbdValue) return;
+    let i = 0;
+    while (i < v.length && i < kbdValue.length && v[i] === kbdValue[i]) i++;
+    const removed = kbdValue.length - i;
+    const added = v.slice(i);
+    kbdValue = v;
+    for (let k = 0; k < removed; k++) if (!locked) backspace();
+    for (const ch of added) {
+      if (ch === "\u200b") continue;
+      if (ch === "\n" || ch === "\r") { sendAid("ENTER"); break; }
+      if (ch === "\t") { tab(1); continue; }
+      typeChar(ch);
+    }
+  }
+  kbd.addEventListener("compositionstart", () => { composing = true; });
+  kbd.addEventListener("compositionend", () => {
+    composing = false;
+    takeInput();
+    // Some browsers send the composition's last input event after this one.
+    setTimeout(() => { if (!composing) { takeInput(); resetKbd(); } }, 0);
+  });
+  kbd.addEventListener("input", () => {
+    if (skipInput) { resetKbd(); return; }
+    takeInput();
+    if (!composing) resetKbd();
+  });
+  kbd.addEventListener("focus", () => { if (!composing) resetKbd(); });
+  // Tabbing to the screen gives the focus to the input field.
+  screenEl.addEventListener("focus", focusKeys);
 
   function updateOia() {
     $("oia-lock").textContent = locked ? (lockText || "X SYSTEM") : "";
@@ -366,6 +439,11 @@
     render();
   }
 
+  function tab(dir) {
+    const n = nextField(cursor, dir);
+    if (n) moveTo(n.p);
+  }
+
   function endOfField() {
     const f = fieldAt(cursor);
     if (!f || !isInput(f)) return;
@@ -376,10 +454,11 @@
   const keyAids = { PageUp: "ROLLDOWN", PageDown: "ROLLUP" };
 
   document.addEventListener("keydown", (e) => {
-    if (e.isComposing) return;
+    // An input method's key: its text comes as input (takeInput).
+    if (e.isComposing || e.keyCode === 229) return;
     // Let the page's own controls (Connect again) work.
-    if (e.target !== screenEl && e.target !== document.body) return;
-    if (e.target === document.body) screenEl.focus();
+    if (e.target !== kbd && e.target !== screenEl && e.target !== document.body) return;
+    if (e.target !== kbd) focusKeys();
     const fk = /^F(\d{1,2})$/.exec(e.key);
     if (fk) {
       const n = Number(fk[1]);
@@ -398,7 +477,7 @@
         if (e.code === "NumpadEnter") fieldExit("");
         else sendAid("ENTER");
         break;
-      case "Tab": { const n = nextField(cursor, e.shiftKey ? -1 : 1); if (n) moveTo(n.p); break; }
+      case "Tab": tab(e.shiftKey ? -1 : 1); break;
       case "PageUp": case "PageDown": sendAid(keyAids[e.key]); break;
       case "ArrowLeft": moveTo(cursor - 1); break;
       case "ArrowRight": moveTo(cursor + 1); break;
@@ -416,29 +495,44 @@
         else if (e.key.length === 1) typeChar(e.key);
         else handled = false;
     }
-    if (handled) e.preventDefault();
+    if (handled) {
+      e.preventDefault();
+      // If a browser puts the key into the field anyway, it is not typed twice.
+      skipInput = true;
+      setTimeout(() => { skipInput = false; }, 0);
+    }
   });
 
-  screenEl.addEventListener("paste", (e) => {
+  function paste(e) {
     e.preventDefault();
     const text = (e.clipboardData || window.clipboardData).getData("text");
     for (const ch of text.replace(/\r?\n.*/s, "")) {
       if (locked) break;
       typeChar(ch);
     }
-  });
+  }
+  screenEl.addEventListener("paste", paste);
+  kbd.addEventListener("paste", paste);
 
   document.addEventListener("keydown", (e) => { if (e.key === "Shift") keyboardEl.classList.add("shift"); });
   document.addEventListener("keyup", (e) => { if (e.key === "Shift") keyboardEl.classList.remove("shift"); });
   window.addEventListener("blur", () => keyboardEl.classList.remove("shift"));
 
+  // A tap on the screen must not take the focus from the input field (the
+  // phone would hide its keyboard and show it again).
+  screenEl.addEventListener("mousedown", (e) => { if (document.activeElement === kbd) e.preventDefault(); });
+
   // Click moves the cursor; a key hint like "F3=Exit" presses that key.
+  // Clicking the screen also gives the input field the focus: on a phone
+  // that opens the keyboard (it must happen in the tap's own event).
   screenEl.addEventListener("click", (e) => {
     const span = e.target.closest("span");
     if (span && span.dataset.hot !== undefined) {
       const h = hotspots[Number(span.dataset.hot)];
-      if (h) { sendAid(h.aid); return; }
+      if (h) { if (!coarse) focusKeys(); sendAid(h.aid); return; }
     }
+    if (composing) { composing = false; resetKbd(); }
+    focusKeys();
     const rowEl = e.target.closest(".row");
     if (!rowEl) return;
     const r = Array.prototype.indexOf.call(screenEl.children, rowEl);
@@ -454,5 +548,5 @@
   fit();
   render();
   connect();
-  screenEl.focus();
+  focusKeys();
 })();

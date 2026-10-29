@@ -23,15 +23,21 @@
       <button type="button" class="key" data-aid="HELP"><span class="cap">Help</span></button>
       <button type="button" class="key" data-aid="ROLLDOWN" title="Page Up (Roll Down)"><span class="cap">PgUp</span></button>
       <button type="button" class="key" data-local="reset" title="Reset (Esc)"><span class="cap">Reset</span></button>
+      <button type="button" class="key" data-local="tab" title="Next field (Tab)"><span class="cap">Tab</span></button>
       <button type="button" class="key key-enter" data-aid="ENTER" title="Enter"><span class="cap">Enter</span></button>
       <button type="button" class="key" data-aid="CLEAR"><span class="cap">Clear</span></button>
       <button type="button" class="key" data-aid="ROLLUP" title="Page Down (Roll Up)"><span class="cap">PgDn</span></button>
       <button type="button" class="key" data-local="fieldexit" title="Field Exit (numeric keypad Enter)"><span class="cap">Fld Exit</span></button>
+      <button type="button" class="key" data-local="backtab" title="Previous field (Shift+Tab)"><span class="cap">BkTab</span></button>
     </div>
   </section>
 
   <section class="screen-wrap">
     <div class="screen" id="screen" role="application" aria-label="5250 display" tabindex="0"></div>
+    <!-- What the keyboard types into. Phones show their on-screen keyboard
+         only for a text field, and many send typed text as input events
+         rather than key events (terminal.js "Keyboard input field"). -->
+    <textarea class="kbd-input" id="kbd" aria-label="Keyboard input" rows="1" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="enter"></textarea>
     <div class="overlay" id="overlay" hidden>
       <p id="overlay-text">The session ended.</p>
       <button type="button" class="key" id="reconnect"><span class="cap">Connect again</span></button>

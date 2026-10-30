@@ -217,6 +217,15 @@
   let composing = false;
   let skipInput = false; // the keydown handler already did this key
 
+  // Hidden by the script as well as by terminal.css, so the field never
+  // shows as a text box, even with a style sheet that is missing or old.
+  Object.assign(kbd.style, {
+    position: "absolute", left: "0", top: "0", width: "1px", height: "1px",
+    margin: "0", padding: "0", border: "0", opacity: "0", resize: "none",
+    overflow: "hidden", fontSize: "16px", color: "transparent",
+    background: "transparent", caretColor: "transparent", outline: "none",
+  });
+
   function focusKeys() {
     if (document.activeElement !== kbd) kbd.focus({ preventScroll: true });
   }
@@ -473,10 +482,7 @@
     const f = fieldAt(cursor);
     let handled = true;
     switch (e.key) {
-      case "Enter":
-        if (e.code === "NumpadEnter") fieldExit("");
-        else sendAid("ENTER");
-        break;
+      case "Enter": sendAid("ENTER"); break; // the keypad's Enter too
       case "Tab": tab(e.shiftKey ? -1 : 1); break;
       case "PageUp": case "PageDown": sendAid(keyAids[e.key]); break;
       case "ArrowLeft": moveTo(cursor - 1); break;

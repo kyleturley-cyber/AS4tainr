@@ -213,13 +213,14 @@ with sync_playwright() as pw:
     t.key("F3")
     t.wait_for("Command Entry")
 
-    # Order entry: numeric input fields with the keypad's Enter (Field Exit),
-    # which right-adjusts the number, as on a 5250 keyboard.
+    # Order entry: numeric input fields with Field Exit from the key bar,
+    # which right-adjusts the number, as on a 5250 keyboard. The keypad's
+    # Enter is Enter (users of the page expect it to send the screen).
     t.command("call ordentc", "Order Entry", timeout=90)
-    t.type("2"); t.key("NumpadEnter"); t.key("Enter")
+    t.type("2"); t.ready(); page.click('.keyboard .key[data-local="fieldexit"]'); t.key("NumpadEnter")
     t.wait_for("Midwest Fasteners", timeout=30)
-    check("Chicago" in t.line(4), "keypad Enter is Field Exit: the customer number is accepted", t)
-    t.type("bolt-m8"); t.key("Tab"); t.type("40"); t.key("NumpadEnter"); t.key("Enter")
+    check("Chicago" in t.line(4), "Field Exit, then the keypad's Enter sends the screen: the customer is found", t)
+    t.type("bolt-m8"); t.key("Tab"); t.type("40"); t.ready(); page.click('.keyboard .key[data-local="fieldexit"]'); t.key("Enter")
     t.wait_for("Hex bolt M8 x 30", timeout=30)
     check("6.00" in t.line(9) and "6.00" in t.line(21), "a typed order line is priced from ITEMMAST", t)
     t.key("F3")
@@ -248,6 +249,18 @@ with sync_playwright() as pw:
     # key events (Android's keyboards send keydown "Unidentified"; words are
     # compositions the keyboard changes until they are done).
     ctx = browser.new_context(viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True)
+    # Without the style sheet (a proxy that kept an older one did this on a
+    # real deployment) the input field must still not show as a text box.
+    bare = ctx.new_page()
+    bare.route("**/terminal.css*", lambda route: route.abort())
+    bare.goto(URL + "/")
+    Term(bare).wait_for("Sign On")
+    look = bare.evaluate("""() => { const s = getComputedStyle(document.getElementById('kbd'));
+        return [s.opacity, s.position, s.width, s.height].join(' '); }""")
+    check(look == "0 absolute 1px 1px", f"the keyboard input field stays invisible without the style sheet ({look})")
+    bare.close()
+    check("terminal.js?v=" in urllib.request.urlopen(URL + "/").read().decode(),
+          "the page names its script with a version, so caches cannot mix old and new files")
     m = ctx.new_page()
     m.goto(URL + "/")
     tm = Term(m)

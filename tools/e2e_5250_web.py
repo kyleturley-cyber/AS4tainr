@@ -43,6 +43,10 @@ class _Page:
         self.ready()
         self.page.keyboard.type(s)
 
+    def field_exit(self):
+        self.ready()
+        self.page.click('.keyboard .key[data-local="fieldexit"]')
+
 
 class Tn5250:
     def __init__(self, host, cols=80, rows=26, binary=None):
@@ -102,8 +106,8 @@ class Tn5250:
         raise AssertionError(f"timed out waiting for {needle!r}; screen was:\n{self.text()}")
 
     def send(self, s):
-        if s == "\x0b":  # tn5250's Field Exit (Ctrl-K): the keypad Enter
-            self._call("press", "NumpadEnter")
+        if s == "\x0b":  # tn5250's Field Exit (Ctrl-K): the key bar's Fld Exit
+            self._call("field_exit")
         else:
             self._call("typ", s)
         time.sleep(0.15)

@@ -31,6 +31,26 @@ const INDEX_HTML: &str = include_str!("static/index.html");
 const TERMINAL_JS: &str = include_str!("static/terminal.js");
 const TERMINAL_CSS: &str = include_str!("static/terminal.css");
 
+/// The page names its script and style sheet with a version taken from
+/// their contents (`terminal.js?v=...`), so a browser or a proxy that keeps
+/// them longer than the server asks (`Cache-Control: no-cache`; Cloudflare
+/// can override it) loads a new page with its own script and styles, never
+/// an older style sheet with a newer page.
+fn asset_version() -> String {
+    // FNV-1a, 64 bits: stable across builds and platforms.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in TERMINAL_JS.bytes().chain(TERMINAL_CSS.bytes()) {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+fn index_html() -> &'static str {
+    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PAGE.get_or_init(|| INDEX_HTML.replace("ASSET_VERSION", &asset_version()))
+}
+
 /// The terminal type the browser terminal reports: a 24x80 color display.
 pub const TERMINAL_TYPE: &str = "IBM-3179-2";
 
@@ -188,7 +208,7 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, backend: SocketAddr) ->
                 "200 OK",
                 "text/html; charset=utf-8",
                 &format!("Content-Security-Policy: {csp}\r\nX-Frame-Options: DENY\r\n"),
-                INDEX_HTML.as_bytes(),
+                index_html().as_bytes(),
             )
             .await
         }
@@ -407,6 +427,16 @@ async fn session(stream: TcpStream, peer: SocketAddr, backend: SocketAddr) -> Re
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn page_names_versioned_assets() {
+        let page = super::index_html();
+        let v = super::asset_version();
+        assert_eq!(v.len(), 16);
+        assert!(!page.contains("ASSET_VERSION"));
+        assert!(page.contains(&format!("terminal.js?v={v}")));
+        assert!(page.contains(&format!("terminal.css?v={v}")));
+    }
+
     use super::*;
 
     #[test]

@@ -35,8 +35,8 @@ It runs in the same process and the same container as the 5250 server. There is 
 | Key | 5250 function |
 | --- | --- |
 | F1–F12, Shift+F1–F12 | F1–F12, F13–F24 |
-| Enter | Enter |
-| Keypad Enter | Field Exit (clears the rest of the field and goes to the next one; numeric fields are right-adjusted) |
+| Enter, keypad Enter | Enter |
+| Fld Exit on the key bar | Field Exit (clears the rest of the field and goes to the next one; numeric fields are right-adjusted) |
 | Keypad + / − (in a numeric field) | Field+ / Field− |
 | Tab, Shift+Tab | Next field, previous field |
 | Page Up, Page Down | Roll Down, Roll Up |

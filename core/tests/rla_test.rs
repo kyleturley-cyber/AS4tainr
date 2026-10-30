@@ -20607,3 +20607,120 @@ t = 'from B';
         assert_eq!(r, want, "{p}");
     }
 }
+
+/// The multiple-row FETCH (Db2 for i SQL Reference, FETCH: FOR n ROWS
+/// INTO a host structure array; SQLCA: SQLERRD(3) is the number of rows
+/// fetched, SQLERRD(5) is +100 when the last row of the result was
+/// fetched; SQLCODE +100 when no row was fetched).
+#[tokio::test]
+async fn embedded_sql_multiple_row_fetch() {
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {lib}.ITEMS (id integer, name varchar(10));
+             INSERT INTO {lib}.ITEMS VALUES (1,'one'),(2,'two'),(3,'three'),(4,'four'),(5,'five');"
+        ))
+        .await
+        .unwrap();
+    let source = format!(
+        "**FREE
+dcl-ds row qualified dim(3);
+  id int(10);
+  name varchar(10);
+end-ds;
+dcl-s n int(10) inz(3);
+exec sql declare c cursor for select id, name from {lib}.items order by id;
+exec sql open c;
+exec sql fetch next from c for :n rows into :row;
+dsply (%char(sqlcode) + ' ' + %char(sqlerrd(3)) + ' ' + %char(sqlerrd(5))
+       + ' ' + row(1).name + ' ' + row(3).name);
+exec sql fetch next from c for 3 rows into :row;
+dsply (%char(sqlcode) + ' ' + %char(sqlerrd(3)) + ' ' + %char(sqlerrd(5))
+       + ' ' + %char(row(1).id) + ' ' + row(2).name);
+exec sql fetch next from c for 3 rows into :row;
+dsply %char(sqlcode);
+exec sql close c;
+*inlr = *on;
+"
+    );
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        None,
+        "MROWS".into(),
+        source,
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let got: Vec<String> = r
+        .messages
+        .iter()
+        .map(|m| m.trim_end().to_string())
+        .collect();
+    assert_eq!(got, ["0 3 0 one three", "0 2 100 4 five", "100"]);
+}
+
+/// Positioned UPDATE and DELETE (Db2 for i SQL Reference, UPDATE and
+/// DELETE: WHERE CURRENT OF cursor changes the row the cursor is on;
+/// SQLCODE -508 when it is not on a row).
+#[tokio::test]
+async fn embedded_sql_where_current_of() {
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let source = format!(
+        "**FREE
+dcl-s id int(10);
+dcl-s qty int(10);
+exec sql create table {lib}.stock (id integer, qty integer);
+exec sql insert into {lib}.stock values (1, 10), (2, 20), (3, 30);
+exec sql declare c cursor for select id, qty from {lib}.stock order by id for update of qty;
+exec sql open c;
+exec sql update {lib}.stock set qty = 0 where current of c;
+dsply %char(sqlcode);
+exec sql fetch c into :id, :qty;
+exec sql update {lib}.stock set qty = qty + 5 where current of c;
+dsply (%char(sqlcode) + ' ' + %char(sqlerrd(3)));
+exec sql fetch c into :id, :qty;
+exec sql delete from {lib}.stock where current of c;
+dsply (%char(sqlcode) + ' ' + %char(sqlerrd(3)));
+exec sql close c;
+*inlr = *on;
+"
+    );
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        None,
+        "CURROF".into(),
+        source,
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let got: Vec<String> = r
+        .messages
+        .iter()
+        .map(|m| m.trim_end().to_string())
+        .collect();
+    assert_eq!(got, ["-508", "0 1", "0 1"]);
+    let rows: Vec<(i32, i32)> = client
+        .query(&format!("SELECT id, qty FROM {lib}.stock ORDER BY id"), &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(rows, [(1, 15), (3, 30)]);
+}

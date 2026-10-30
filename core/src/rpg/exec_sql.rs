@@ -90,6 +90,79 @@ struct OpenCursor {
     rows: Vec<Vec<Option<String>>>,
     /// The current row: -1 before the first, rows.len() after the last.
     pos: isize,
+    /// A cursor over one table: each row's relative record number, for
+    /// UPDATE and DELETE WHERE CURRENT OF.
+    rrns: Option<Vec<i64>>,
+}
+
+/// A cursor's query without its update or read-only clause.
+fn strip_cursor_clauses(query: &str) -> String {
+    let mut q = query.trim().trim_end_matches(';').to_string();
+    while let Some(at) = find_word(&q, "FOR") {
+        let rest: Vec<String> = q[at + 3..]
+            .split_whitespace()
+            .take(2)
+            .map(|w| w.to_ascii_uppercase())
+            .collect();
+        let is_clause = match rest.first().map(String::as_str) {
+            Some("UPDATE") => true,
+            Some("READ") | Some("FETCH") => rest.get(1).map(String::as_str) == Some("ONLY"),
+            _ => false,
+        };
+        if !is_clause {
+            break;
+        }
+        // The clause runs to the end, or to OPTIMIZE / WITH after it.
+        let tail = &q[at..];
+        let end = ["OPTIMIZE", "WITH"]
+            .iter()
+            .filter_map(|w| find_word(tail, w))
+            .min()
+            .unwrap_or(tail.len());
+        q = format!("{} {}", q[..at].trim_end(), &tail[end..])
+            .trim()
+            .to_string();
+    }
+    q
+}
+
+/// A query over one table, with RRN(table) added as its last column (a
+/// cursor that UPDATE and DELETE WHERE CURRENT OF can use): None for one
+/// that joins, groups, unions or selects distinct rows (Db2 for i SQL
+/// Reference, DECLARE CURSOR: such a cursor is read-only).
+fn with_rrn(query: &str) -> Option<String> {
+    let from = find_word(query, "FROM")?;
+    for w in ["UNION", "EXCEPT", "INTERSECT", "GROUP", "JOIN", "DISTINCT"] {
+        if find_word(query, w).is_some() {
+            return None;
+        }
+    }
+    let rest = &query[from + 4..];
+    // The table reference: up to WHERE, ORDER, FOR, FETCH, OPTIMIZE, WITH
+    // or the end.
+    let end = ["WHERE", "ORDER", "FOR", "FETCH", "OPTIMIZE", "WITH"]
+        .iter()
+        .filter_map(|w| find_word(rest, w))
+        .min()
+        .unwrap_or(rest.len());
+    let table_ref = rest[..end].trim();
+    if table_ref.is_empty() || table_ref.contains(',') || table_ref.contains('(') {
+        return None;
+    }
+    let parts: Vec<&str> = table_ref.split_whitespace().collect();
+    // RRN of the table's own name (a qualified table is named by its
+    // last part in the query) or of its correlation name.
+    let corr = match parts.as_slice() {
+        [t] => t.rsplit(['.', '/']).next().unwrap_or(t),
+        [_, a] => *a,
+        [_, as_, a] if as_.eq_ignore_ascii_case("AS") => *a,
+        _ => return None,
+    };
+    Some(format!(
+        "{}, RRN({corr}) {}",
+        query[..from].trim_end(),
+        &query[from..]
+    ))
 }
 
 /// How a statement ended: SQLCODE, SQLSTATE, rows (SQLERRD(3)), message.
@@ -99,6 +172,9 @@ struct Outcome {
     state: String,
     rows: i64,
     text: String,
+    /// SQLERRD(5): +100 after a multiple-row FETCH that fetched the last
+    /// row (Db2 for i SQL Reference, SQLCA), else 0.
+    errd5: i64,
 }
 
 impl Outcome {
@@ -108,6 +184,7 @@ impl Outcome {
             state: "00000".into(),
             rows,
             text: String::new(),
+            errd5: 0,
         }
     }
     fn not_found() -> Outcome {
@@ -116,6 +193,7 @@ impl Outcome {
             state: "02000".into(),
             rows: 0,
             text: String::new(),
+            errd5: 0,
         }
     }
     fn error(code: i64, text: impl Into<String>) -> Outcome {
@@ -124,6 +202,7 @@ impl Outcome {
             state: sqlstate(code).into(),
             rows: 0,
             text: text.into(),
+            errd5: 0,
         }
     }
 }
@@ -142,6 +221,10 @@ fn sqlstate(code: i64) -> &'static str {
         -501 => "24501",
         -502 => "24502",
         -504 => "34000",
+        // Db2 SQL codes: cursor not on a row; cursor cannot change the
+        // table (DB2 for i SQL Messages and Codes).
+        -508 => "24504",
+        -510 => "42828",
         -518 => "07003",
         -551 => "42501",
         -803 => "23505",
@@ -311,6 +394,16 @@ impl Machine<'_> {
         self.assign(
             &errd3,
             &Value::Num(Dec::from_i64(out.rows)),
+            Fit::Truncate { half_adjust: false },
+            false,
+        )?;
+        let errd5 = Expr::Name {
+            parts: vec!["SQLERRD".into()],
+            args: Some(vec![Expr::Num(Dec::from_i64(5))]),
+        };
+        self.assign(
+            &errd5,
+            &Value::Num(Dec::from_i64(out.errd5)),
             Fit::Truncate { half_adjust: false },
             false,
         )?;
@@ -895,10 +988,7 @@ impl Machine<'_> {
         if find_word(sql, "CURRENT").is_some()
             && w.windows(2).any(|p| p[0] == "CURRENT" && p[1] == "OF")
         {
-            return Ok(Outcome::error(
-                -84,
-                "SQL0084: WHERE CURRENT OF (positioned UPDATE and DELETE) is not supported yet.",
-            ));
+            return self.positioned_change(sql, &w);
         }
         let text = self.bind_host(sql)?;
         self.sql_change(&text)
@@ -1157,11 +1247,40 @@ impl Machine<'_> {
                 ))
             }
         };
-        let rows = match self.run_sql(&query)? {
-            Exec::Rows { rows, .. } => rows,
-            Exec::Count(..) => bail!("SQL0104: cursor {name} is not a query"),
+        // FOR UPDATE [OF columns], FOR READ ONLY, FOR FETCH ONLY (Db2 for
+        // i SQL Reference, select-statement: update and read-only
+        // clauses): the rows are read at OPEN here, so they say nothing
+        // more; WHERE CURRENT OF finds the row by its record number.
+        let query = strip_cursor_clauses(&query);
+        // Over one table: each row's record number too (WHERE CURRENT OF);
+        // the query as it is when that cannot be asked.
+        let rrn_query = with_rrn(&query);
+        let (rows, rrns) = match rrn_query.as_deref().map(|q| self.run_sql(q)) {
+            Some(Ok(Exec::Rows { mut rows, .. })) => {
+                let rrns = rows
+                    .iter_mut()
+                    .map(|r| {
+                        r.pop()
+                            .flatten()
+                            .and_then(|v| v.trim().parse::<i64>().ok())
+                            .unwrap_or(0)
+                    })
+                    .collect();
+                (rows, Some(rrns))
+            }
+            _ => match self.run_sql(&query)? {
+                Exec::Rows { rows, .. } => (rows, None),
+                Exec::Count(..) => bail!("SQL0104: cursor {name} is not a query"),
+            },
         };
-        self.sql.cursors.insert(name, OpenCursor { rows, pos: -1 });
+        self.sql.cursors.insert(
+            name,
+            OpenCursor {
+                rows,
+                pos: -1,
+                rrns,
+            },
+        );
         Ok(Outcome::ok(0))
     }
 
@@ -1191,10 +1310,7 @@ impl Machine<'_> {
         }
         let name = w.get(k).cloned().unwrap_or_default();
         if w.iter().any(|x| x == "ROWS") {
-            return Ok(Outcome::error(
-                -84,
-                "SQL0084: multiple-row FETCH (FOR n ROWS) is not supported yet.",
-            ));
+            return self.fetch_rows(sql, &name, orient, into);
         }
         let Some(c) = self.sql.cursors.get_mut(&name) else {
             return Ok(Outcome::error(
@@ -1227,6 +1343,150 @@ impl Machine<'_> {
         };
         let hosts = host_list(&sql[into + 4..])?;
         Ok(self.assign_hosts(&hosts, &row)?.unwrap_or(Outcome::ok(1)))
+    }
+}
+
+impl Machine<'_> {
+    /// UPDATE or DELETE WHERE CURRENT OF cursor (Db2 for i SQL Reference,
+    /// UPDATE and DELETE, positioned): the row the cursor is on, found by
+    /// its record number; SQLCODE -508 when the cursor is not on a row,
+    /// -501 when it is not open. A cursor over more than one table, or one
+    /// grouped or distinct, cannot be used (-510).
+    fn positioned_change(&mut self, sql: &str, w: &[String]) -> Result<Outcome> {
+        let at = w
+            .windows(2)
+            .position(|p| p[0] == "CURRENT" && p[1] == "OF")
+            .unwrap_or(0);
+        let name = w
+            .get(at + 2)
+            .map(|n| n.trim_end_matches(';').to_string())
+            .unwrap_or_default();
+        // The table: UPDATE table ... / DELETE FROM table ...
+        let table = match w.first().map(String::as_str) {
+            Some("UPDATE") => w.get(1),
+            Some("DELETE") => w.get(2),
+            _ => None,
+        }
+        .cloned()
+        .unwrap_or_default();
+        let Some(c) = self.sql.cursors.get(&name) else {
+            return Ok(Outcome::error(
+                -501,
+                format!("SQL0501: Cursor {name} is not open."),
+            ));
+        };
+        let Some(rrns) = &c.rrns else {
+            return Ok(Outcome::error(
+                -510,
+                format!("SQL0510: Cursor {name} cannot be used to change the table."),
+            ));
+        };
+        if c.pos < 0 || c.pos as usize >= rrns.len() {
+            return Ok(Outcome::error(
+                -508,
+                format!("SQL0508: Cursor {name} is not on a row."),
+            ));
+        }
+        let rrn = rrns[c.pos as usize];
+        // "WHERE CURRENT OF name" becomes "WHERE RRN(table) = n".
+        let where_at = find_word(sql, "WHERE").unwrap_or(sql.len());
+        let short = table.rsplit(['.', '/']).next().unwrap_or(&table);
+        let text = format!("{} WHERE RRN({short}) = {rrn}", sql[..where_at].trim_end());
+        let text = self.bind_host(&text)?;
+        self.sql_change(&text)
+    }
+
+    /// The multiple-row FETCH (Db2 for i SQL Reference, FETCH: `FOR n
+    /// ROWS INTO :host-structure-array`): up to n rows from the position
+    /// the orientation gives, into the array's first elements; the cursor
+    /// on the last row fetched; SQLERRD(3) the number of rows, SQLERRD(5)
+    /// +100 when the last row of the result was fetched; SQLCODE +100
+    /// when there was no row.
+    fn fetch_rows(
+        &mut self,
+        sql: &str,
+        name: &str,
+        orient: (String, i64),
+        into: Option<usize>,
+    ) -> Result<Outcome> {
+        let head = &sql[..into.unwrap_or(sql.len())];
+        let w = words(head);
+        let count = w
+            .iter()
+            .position(|x| x == "ROWS")
+            .and_then(|i| i.checked_sub(1))
+            .and_then(|i| w.get(i))
+            .cloned()
+            .unwrap_or_default();
+        let n = match count.strip_prefix(':') {
+            Some(h) => self.eval(&crate::rpg::expr::parse(h)?)?.num()?,
+            None => Dec::parse(&count)?,
+        }
+        .to_i128()?
+        .max(0) as usize;
+        let Some(into) = into else {
+            bail!("SQL0104: INTO is missing in a multiple-row FETCH");
+        };
+        let host = sql[into + 4..]
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .trim_start_matches(':')
+            .to_ascii_uppercase();
+        let Some(Sym::Ds(d)) = self.sym(&host) else {
+            bail!("SQL0312: {host} must be a host structure array for FOR n ROWS");
+        };
+        if n > d.dim.max(1) as usize {
+            return Ok(Outcome::error(
+                -221,
+                format!(
+                    "SQL0221: {n} rows are more than the {} elements of {host}.",
+                    d.dim
+                ),
+            ));
+        }
+        let Some(c) = self.sql.cursors.get_mut(name) else {
+            return Ok(Outcome::error(
+                -501,
+                format!("SQL0501: Cursor {name} is not open."),
+            ));
+        };
+        let len = c.rows.len() as isize;
+        let start = match orient.0.as_str() {
+            "PRIOR" => c.pos - 1,
+            "FIRST" => 0,
+            "LAST" => len - 1,
+            "CURRENT" => c.pos,
+            "RELATIVE" => c.pos + orient.1 as isize,
+            "ABSOLUTE" => orient.1 as isize - 1,
+            _ => c.pos + 1,
+        }
+        .clamp(0, len);
+        let end = (start + n as isize).min(len);
+        if n == 0 || start >= len {
+            c.pos = len;
+            return Ok(Outcome::not_found());
+        }
+        let rows: Vec<Vec<Option<String>>> = c.rows[start as usize..end as usize].to_vec();
+        c.pos = end - 1;
+        let last = end == len;
+        for (i, row) in rows.iter().enumerate() {
+            let hosts: Vec<(String, Option<String>)> = d
+                .subfields
+                .iter()
+                .map(|sf| (format!("{host}({}).{sf}", i + 1), None))
+                .collect();
+            if let Some(err) = self.assign_hosts(&hosts, row)? {
+                if err.code < 0 {
+                    return Ok(err);
+                }
+            }
+        }
+        let mut out = Outcome::ok(rows.len() as i64);
+        if last {
+            out.errd5 = 100;
+        }
+        Ok(out)
     }
 }
 

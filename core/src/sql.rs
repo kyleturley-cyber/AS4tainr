@@ -162,13 +162,27 @@ pub(crate) async fn connect_as_sql_role(client: &Client, database_url: &str) -> 
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || "+/".contains(c)) =>
         {
-            client
-                .batch_execute(&format!("ALTER ROLE {SQL_ROLE} PASSWORD '{password}'"))
-                .await
-                .map_err(|_| anyhow!("SQL is not available: cannot log in as {SQL_ROLE} ({e})."))?;
-            cfg.connect(tokio_postgres::NoTls)
-                .await
-                .map_err(|e| anyhow!("SQL is not available: cannot log in as {SQL_ROLE} ({e})."))?
+            // Processes of other databases may be doing the same at this
+            // moment: a few tries.
+            let mut tries = 0u64;
+            loop {
+                tries += 1;
+                let set = batch_retrying(
+                    client,
+                    &format!("ALTER ROLE {SQL_ROLE} PASSWORD '{password}'"),
+                )
+                .await;
+                match (set, cfg.connect(tokio_postgres::NoTls).await) {
+                    (Ok(()), Ok(x)) => break x,
+                    (_, Err(_)) | (Err(_), _) if tries < 5 => {
+                        tokio::time::sleep(std::time::Duration::from_millis(30 * tries)).await;
+                    }
+                    (_, Err(e)) => {
+                        bail!("SQL is not available: cannot log in as {SQL_ROLE} ({e}).")
+                    }
+                    (Err(_), Ok(x)) => break x,
+                }
+            }
         }
         Err(e) => bail!("SQL is not available: cannot log in as {SQL_ROLE} ({e})."),
     };

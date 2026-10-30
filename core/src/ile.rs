@@ -573,11 +573,14 @@ pub fn binder_language(source: &str) -> Result<BinderSource> {
         let cmd = crate::cl::parse(line).map_err(|e| anyhow!("binder language: {e}"))?;
         match cmd.def.name {
             "STRPGMEXP" => {
-                let current = cmd.get("PGMLVL") != "*PRV";
+                // A second PGMLVL(*CURRENT) block does not stop the
+                // binder: IBM i 7.5 created the service program (PUB400
+                // 2026-10-30, tools/golden/verify27.txt t27_srv2cur:
+                // CPC5D0B). The first is the current one here, a later
+                // one kept as a previous level (which one IBM i makes
+                // current is queued in verify28).
+                let current = cmd.get("PGMLVL") != "*PRV" && !seen_current;
                 if current {
-                    if seen_current {
-                        bail!("CPD5D17: Only one PGMLVL(*CURRENT) export block is allowed.");
-                    }
                     seen_current = true;
                 }
                 let s = cmd.get("SIGNATURE");
@@ -982,5 +985,15 @@ mod tests {
         // RPGUnit's TESTCASEBN names symbols in double quotes.
         assert_eq!(b.exports, ["LIST_CREATE", "AEQUAL"]);
         assert_eq!(b.signature.as_deref(), Some("A /* B"));
+    }
+
+    #[test]
+    fn binder_language_with_two_current_blocks() {
+        // IBM i 7.5 creates a service program from binder source with two
+        // PGMLVL(*CURRENT) blocks (PUB400 2026-10-30, tools/golden/
+        // verify27.txt t27_srv2cur: CPC5D0B).
+        let src = "STRPGMEXP PGMLVL(*CURRENT) SIGNATURE('V2')\n  EXPORT SYMBOL(ONE)\n  EXPORT SYMBOL(TWO)\nENDPGMEXP\nSTRPGMEXP PGMLVL(*CURRENT) SIGNATURE('V1')\n  EXPORT SYMBOL(ONE)\nENDPGMEXP\n";
+        let b = binder_language(src).unwrap();
+        assert_eq!(b.exports, ["ONE", "TWO"]);
     }
 }

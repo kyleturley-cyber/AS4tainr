@@ -20452,7 +20452,8 @@ ENDPGM
 /// name may be qualified); a program called in the caller's activation
 /// group sharing its heap (ILE Concepts: the default heap belongs to the
 /// activation group): a pointer to storage the callee allocated works in
-/// the caller; the C runtime's sleep and usleep (0).
+/// the caller; the C runtime's sleep and usleep (0) and pow (2 to the
+/// power 10 is 1024; OSSILE's PARMEVAL imports it).
 #[tokio::test]
 async fn rpg_features_found_by_ibmiunit() {
     use as4tainr_core::commands::{Environment, Job};
@@ -20553,12 +20554,19 @@ end-pr;
 dcl-pr usleep int(10) extproc('usleep');
   u uns(10) value;
 end-pr;
+dcl-pr pow float(8) extproc('pow');
+  x float(8) value;
+  y float(8) value;
+end-pr;
 dcl-s pgmName char(21) inz('{lib}/HEAPB');
 dcl-s p pointer;
 dcl-s t char(10) based(p);
 callee(p);
 dsply t;
 dsply (%char(sleep(0)) + %char(usleep(1000)));
+if pow(2 : 10) = 1024;
+  dsply 'pow';
+endif;
 *inlr = *on;
 "
             ),
@@ -20591,7 +20599,7 @@ t = 'from B';
     for (p, want) in [
         ("LOCALPR", vec!["DSPLY  none one"]),
         ("FLOATS", vec!["DSPLY  E3", "DSPLY  huge"]),
-        ("HEAPA", vec!["DSPLY  from B", "DSPLY  00"]),
+        ("HEAPA", vec!["DSPLY  from B", "DSPLY  00", "DSPLY  pow"]),
     ] {
         let r = run_in_own_job(&client, &url, &lib, &format!("CALL {lib}/{p}"))
             .await

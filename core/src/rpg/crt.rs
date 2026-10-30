@@ -135,6 +135,7 @@ pub const C_FUNCTIONS: &[&str] = &[
     "_C_IFS_TMPNAM",
     "SLEEP",
     "USLEEP",
+    "POW",
 ];
 
 /// strtok's position in the string it is splitting, by job.
@@ -630,6 +631,12 @@ impl<'a> Machine<'a> {
                     format!("{prefix}: {text}")
                 });
                 num(0)
+            }
+            // pow(x, y): x to the power y, a double (C library).
+            "POW" => {
+                let x = super::float_value(&val(0))?;
+                let y = super::float_value(&val(1))?;
+                Ok(Value::Float(x.powf(y)))
             }
             // sleep(seconds), usleep(microseconds): the job waits; 0
             // (C library: both return 0 when the time has passed).

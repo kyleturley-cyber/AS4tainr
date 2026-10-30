@@ -13,7 +13,9 @@
 //!   its subfields are not defined (RNF7030, RNF7503), it cannot be the
 //!   result of a file operation (RNF7260), and the record format is then
 //!   not used (RNF7066, 00) (PUB400 2026-10-28, tools/golden/verify12.txt
-//!   n12_rpgp, n12_rpgx, n12_rpgj: `dcl-ds outr likerec(OUTR: *output)`).
+//!   n12_rpgp, n12_rpgx, n12_rpgj: `dcl-ds outr likerec(OUTR: *output)`);
+//! - RNF7016 (20): DSPLY of a character field longer than 52 bytes
+//!   (PUB400 2026-10-30, tools/golden/verify26.txt s26_dsply60).
 //!
 //! The texts are as4tainr's own.
 
@@ -278,6 +280,27 @@ impl Walker<'_> {
             }
             Stmt::Dsply { message, response } => {
                 self.opt(l, message);
+                // At most 52 bytes are displayed (ILE RPG Reference,
+                // DSPLY): a longer character field is RNF7016, severity
+                // 20 (PUB400 2026-10-30, tools/golden/verify26.txt
+                // s26_dsply60, s26_dsply53; 52 compiles, s26_dsply52).
+                if let Some(Expr::Name { parts, args: None }) = message {
+                    if let Some(Sym::Var(v)) = self.sym(&parts.join(".")) {
+                        if let DType::Char(n) = v.dtype {
+                            if n > 52 {
+                                self.out.diags.push(Diag {
+                                    line: l,
+                                    id: "RNF7016".into(),
+                                    sev: 20,
+                                    text: format!(
+                                        "DSPLY shows at most 52 bytes; this message is {n}."
+                                    ),
+                                    at: None,
+                                });
+                            }
+                        }
+                    }
+                }
                 if let Some(r) = response {
                     self.expr(l, r);
                 }

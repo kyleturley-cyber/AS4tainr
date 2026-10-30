@@ -133,6 +133,8 @@ pub const C_FUNCTIONS: &[&str] = &[
     "SRAND",
     "TMPNAM",
     "_C_IFS_TMPNAM",
+    "SLEEP",
+    "USLEEP",
 ];
 
 /// strtok's position in the string it is splitting, by job.
@@ -627,6 +629,18 @@ impl<'a> Machine<'a> {
                 } else {
                     format!("{prefix}: {text}")
                 });
+                num(0)
+            }
+            // sleep(seconds), usleep(microseconds): the job waits; 0
+            // (C library: both return 0 when the time has passed).
+            "SLEEP" | "USLEEP" => {
+                let n = val(0).num()?.to_i128()?.max(0) as u64;
+                let d = if name == "SLEEP" {
+                    std::time::Duration::from_secs(n)
+                } else {
+                    std::time::Duration::from_micros(n)
+                };
+                std::thread::sleep(d);
                 num(0)
             }
             "STRLEN" => {

@@ -312,6 +312,11 @@ pub struct Machine<'a> {
     temp_strings: Vec<usize>,
     /// The heap block of errno (C runtime).
     errno_block: Option<usize>,
+    /// The heap is the caller's: a program called in the caller's
+    /// activation group shares its heap (ILE Concepts: the default heap
+    /// belongs to the activation group), so it neither keeps nor
+    /// restores one of its own.
+    heap_lent: bool,
     /// Indicators: 01-99 and the named ones (LR, RT, KA-KY, H1-H9,
     /// L1-L9, OF, OV, OA-OG, U1-U8, 1P, MR).
     inds: HashMap<String, bool>,
@@ -508,6 +513,7 @@ impl<'a> Machine<'a> {
             ptr_fault: Default::default(),
             temp_strings: Vec::new(),
             errno_block: None,
+            heap_lent: false,
             inds: HashMap::new(),
             files: prog
                 .files
@@ -969,6 +975,13 @@ impl<'a> Machine<'a> {
             Expr::Unary(op, x) => {
                 let v = self.eval(x)?;
                 match op {
+                    // A float stays a float (it may be beyond a decimal's
+                    // 63 digits: -1.797693134862315E+308).
+                    UnOp::Neg if matches!(v, Value::Float(_)) => match v {
+                        Value::Float(f) => Value::Float(-f),
+                        _ => unreachable!(),
+                    },
+                    UnOp::Plus if matches!(v, Value::Float(_)) => v,
                     UnOp::Neg => Value::Num(v.num()?.neg()),
                     UnOp::Plus => Value::Num(v.num()?),
                     UnOp::Not => Value::Ind(!v.truth()?),
@@ -1208,9 +1221,7 @@ impl<'a> Machine<'a> {
                 None if args.is_some() || parts.len() == 1 => {
                     let n = parts.join(".").to_ascii_uppercase();
                     let ret = self
-                        .prog
-                        .protos
-                        .get(&n)
+                        .proto(&n)
                         .and_then(|p| p.returns)
                         .or_else(|| self.prog.procs.get(&n).and_then(|p| p.returns));
                     matches!(ret, Some(DType::Float(_)))
@@ -1561,7 +1572,11 @@ impl<'a> Machine<'a> {
                     _ => Value::Num(d),
                 }
             }
-            "ABS" => Value::Num(arg(self, 0)?.num()?.abs()),
+            // %ABS of a float is a float (ILE RPG Reference, %ABS).
+            "ABS" => match arg(self, 0)? {
+                Value::Float(f) => Value::Float(f.abs()),
+                v => Value::Num(v.num()?.abs()),
+            },
             "DIV" => {
                 let x = arg(self, 0)?.num()?;
                 let y = arg(self, 1)?.num()?;
@@ -1645,7 +1660,7 @@ impl<'a> Machine<'a> {
                     Some(Expr::Str(b)) => a(b).trim().to_ascii_uppercase(),
                     Some(Expr::Name { parts, args: None }) if parts.len() == 1 => {
                         let n = parts[0].to_ascii_uppercase();
-                        match self.prog.protos.get(&n).and_then(|p| p.extproc.clone()) {
+                        match self.proto(&n).and_then(|p| p.extproc.clone()) {
                             Some(e) => e.to_ascii_uppercase(),
                             None => match self.sym(&n) {
                                 Some(Sym::Const(v)) => a(&v.chars()?).trim().to_ascii_uppercase(),
@@ -4467,8 +4482,12 @@ impl<'a> Machine<'a> {
                 // Its storage and heap as it left them; what callers lent
                 // for this call stays.
                 let lent = std::mem::take(&mut self.bufs.lent);
+                let heap = std::mem::take(&mut self.bufs.heap);
                 self.bufs = a.bufs;
                 self.bufs.lent = lent;
+                if self.heap_lent {
+                    self.bufs.heap = heap;
+                }
                 self.inds = a.inds;
                 for (f, o) in self.files.iter_mut().zip(a.files) {
                     f.open = o;
@@ -4635,8 +4654,11 @@ impl<'a> Machine<'a> {
         if keep {
             let globals = self.prog.globals.len();
             let mut kept = super::mem::Mem::new(self.bufs.own[..globals].to_vec());
-            // Heap storage lives as long as the activation.
-            kept.heap = std::mem::take(&mut self.bufs.heap);
+            // Heap storage lives as long as the activation (a shared
+            // heap stays with the caller).
+            if !self.heap_lent {
+                kept.heap = std::mem::take(&mut self.bufs.heap);
+            }
             let a = Active {
                 bufs: kept,
                 inds: self.inds.clone(),
@@ -6112,7 +6134,17 @@ impl<'a> Machine<'a> {
 
     /// A procedure or prototype of this program.
     fn callable(&self, name: &str) -> bool {
-        self.prog.procs.contains_key(name) || self.prog.protos.contains_key(name)
+        self.prog.procs.contains_key(name) || self.proto(name).is_some()
+    }
+
+    /// A prototype by name: the running procedure's own first, then the
+    /// module's.
+    fn proto(&self, name: &str) -> Option<&'a super::program::Proto> {
+        let prog: &'a Program = self.prog;
+        self.frames
+            .last()
+            .and_then(|f| f.proc.protos.get(name))
+            .or_else(|| prog.protos.get(name))
     }
 
     /// The arguments of a call, as the parameters take them.
@@ -6397,7 +6429,7 @@ impl<'a> Machine<'a> {
             let a = self.args_for(name, &pi.params, args)?;
             return self.call_proc(pi, a);
         }
-        let Some(pr) = prog.protos.get(name) else {
+        let Some(pr) = self.proto(name) else {
             bail!("{name} is not a procedure or prototype of this program");
         };
         if !pr.overload.is_empty() {
@@ -7687,13 +7719,24 @@ impl<'a> Machine<'a> {
     }
 
     fn call_program_inner(&mut self, name: &str, locs: &[Loc]) -> Result<()> {
+        // A qualified name, LIB/PGM (EXTPGM of a variable holding
+        // 'LIB/PGM'; ILE RPG Reference, EXTPGM): that library, *LIBL the
+        // library list.
+        let (qual, name) = match name.split_once('/') {
+            Some((l, n)) => (Some(l.trim().to_ascii_uppercase()), n.trim()),
+            None => (None, name),
+        };
         if self.system_program(name, locs)? {
             return Ok(());
         }
         let active = name == self.prog.name || self.io.callers.iter().any(|c| c == name);
         let client = self.io.client;
         let libl = self.io.libl.clone();
-        let found = self.block(crate::catalog::find_program(client, &libl, name))?;
+        let search = match &qual {
+            Some(l) if l != "*LIBL" => vec![crate::qtemp::real(l)],
+            _ => libl.clone(),
+        };
+        let found = self.block(crate::catalog::find_program(client, &search, name))?;
         let program_lib = found
             .as_ref()
             .map(|p| p.library.clone())
@@ -7820,8 +7863,7 @@ impl<'a> Machine<'a> {
             // This program's storage (and what was lent to it) is lent to
             // the called program: a pointer it is given (in a parameter,
             // or kept by a service program) still addresses storage of
-            // the programs and procedures active above it. (The heap
-            // stays with each program's activation.)
+            // the programs and procedures active above it.
             m.bufs.lent = std::mem::take(&mut self.bufs.lent);
             m.bufs.lent.push(super::mem::Lent {
                 owner: self.frame_owner,
@@ -7829,9 +7871,18 @@ impl<'a> Machine<'a> {
                 globals: self.prog.globals.len(),
                 bufs: std::mem::take(&mut self.bufs.own),
             });
+            // In the same activation group, the same heap.
+            let share_heap = m.io.actgrp == self.io.actgrp;
+            if share_heap {
+                m.bufs.heap = std::mem::take(&mut self.bufs.heap);
+                m.heap_lent = true;
+            }
             let r = m.run_bytes(&mut parms);
             self.bufs.own = m.bufs.lent.pop().map(|l| l.bufs).unwrap_or_default();
             self.bufs.lent = std::mem::take(&mut m.bufs.lent);
+            if share_heap {
+                self.bufs.heap = std::mem::take(&mut m.bufs.heap);
+            }
             self.messages.append(&mut m.messages);
             self.printed.append(&mut m.printed);
             self.logged.append(&mut m.logged);

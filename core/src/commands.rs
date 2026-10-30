@@ -8024,6 +8024,7 @@ impl Job<'_> {
                         let ile = program.pep;
                         match crate::clpgm::run(self, &program, &args).await {
                             Err(e) if ile => Err(unmonitored_in_ile_cl(&name, e)),
+                            Err(e) => Err(unmonitored_in_opm_cl(&name, e)),
                             r => r,
                         }
                     }
@@ -8321,28 +8322,61 @@ fn stamp_of_us(us: i64) -> crate::report::Stamp {
 /// CEE9901). An escape the program sent to its caller (SNDPGMMSG
 /// MSGTYPE(*ESCAPE)) is not one: it arrives as it was sent.
 fn unmonitored_in_ile_cl(name: &str, e: anyhow::Error) -> anyhow::Error {
+    let Some((line, before)) = unmonitored(name, &e) else {
+        return e;
+    };
+    let id = crate::jobs::escape_id(&before);
+    // From an OPM program it called (CPF9999): CEE9901 names that
+    // program, its message and its statement (PUB400 2026-10-30,
+    // tools/golden/verify26.txt s26_call_opm).
+    if id == "CPF9999" {
+        if let Some(l) = before
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("CPF9999: Program "))
+        {
+            return anyhow!("CEE9901: {}", &l["CPF9999: ".len()..]);
+        }
+    }
+    anyhow!(
+        "CEE9901: Program {name} ended: escape message {id} was not monitored at statement {:010} (line {line}).",
+        line * 100
+    )
+}
+
+/// An escape message an OPM CL program (CRTCLPGM) did not monitor: a
+/// function check, and with the default reply the caller gets CPF9999
+/// (PUB400 2026-10-30, tools/golden/verify26.txt s26_rows: a calling
+/// program monitoring CPF0001, CEE9901 and CPF9999 received CPF9999).
+fn unmonitored_in_opm_cl(name: &str, e: anyhow::Error) -> anyhow::Error {
+    let Some((line, before)) = unmonitored(name, &e) else {
+        return e;
+    };
+    let id = crate::jobs::escape_id(&before);
+    anyhow!(
+        "CPF9999: Program {name} ended: escape message {id} was not monitored at statement {} (line {line}).",
+        line * 100
+    )
+}
+
+/// The line where CL program `name` stopped on a message it did not
+/// monitor, and the messages before (None: it did not stop that way).
+fn unmonitored(name: &str, e: &anyhow::Error) -> Option<(u64, String)> {
     let text = format!("{e:#}");
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    let Some(last) = lines.last() else {
-        return e;
-    };
-    let Some(rest) = last.strip_prefix(&format!("Error in CL program {name} ")) else {
-        return e;
-    };
+    let rest = lines
+        .last()?
+        .strip_prefix(&format!("Error in CL program {name} "))?;
     let line: u64 = rest
         .strip_prefix("at line ")
         .and_then(|r| r.split_whitespace().next())
         .and_then(|n| n.parse().ok())
         .unwrap_or(0);
     let before = lines[..lines.len() - 1].join("\n");
-    let id = crate::jobs::escape_id(&before);
-    if id.is_empty() {
-        return e;
+    if crate::jobs::escape_id(&before).is_empty() {
+        return None;
     }
-    anyhow!(
-        "CEE9901: Program {name} ended: escape message {id} was not monitored at statement {:010} (line {line}).",
-        line * 100
-    )
+    Some((line, before))
 }
 
 /// The comment RTVBNDSRC writes after STRPGMEXP: a box naming the object's

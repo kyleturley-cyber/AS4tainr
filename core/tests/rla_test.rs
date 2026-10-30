@@ -20303,3 +20303,299 @@ ENDPGM
         )]
     );
 }
+
+/// What PUB400 showed for verify26 (2026-10-30, tools/golden/
+/// verify26.txt): DSPLY of a character field longer than 52 bytes does not
+/// compile (s26_dsply60, s26_dsply53: RNF7016 severity 20, RNS9308; 52
+/// compiles, s26_dsply52); with the default inquiry reply, a calling
+/// program monitoring CPF0001, CEE9901 and CPF9999 gets CEE9901 from a
+/// failed ILE CL program and CPF9999 from a failed OPM one (s26_rows), an
+/// ILE caller that does not monitor ends with CEE9901 naming the OPM
+/// program's message (s26_call_opm); %CHAR of *INT 2 and 8, *UINT 4 and a
+/// *DEC (7 2) zero (s26_rows: "[-5    ][9 and 19 blanks][8 and 10
+/// blanks][.00      ]").
+#[tokio::test]
+async fn verify26_dsply_length_opm_function_check_and_int_char() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    cl_cmd(&mut job, format!("CRTSRCPF FILE({lib}/QSRC) RCDLEN(112)"))
+        .await
+        .unwrap();
+    let put = |name: &str, srctype: &str, src: &str| source::Member {
+        library: lib.clone(),
+        file: "QSRC".into(),
+        name: name.into(),
+        srctype: srctype.into(),
+        source: src.into(),
+        ..Default::default()
+    };
+    let fails = "PGM\nCALL NOSUCH26\nENDPGM\n";
+    for m in [
+        put(
+            "D60",
+            "RPGLE",
+            "**FREE\ndcl-s line char(60) inz('sixty');\ndsply line;\n*inlr = *on;\n",
+        ),
+        put(
+            "D52",
+            "RPGLE",
+            "**FREE\ndcl-s line char(52) inz('fifty-two');\ndsply line;\n*inlr = *on;\n",
+        ),
+        put("ILEF", "CLLE", fails),
+        put("OPMF", "CLP", fails),
+        put(
+            "CALLER",
+            "CLLE",
+            "PGM PARM(&WHICH)
+DCL &WHICH *CHAR 1
+DCL &ID *CHAR 7
+DCL &I2 *INT 2 VALUE(-5)
+DCL &I8 *INT 8 VALUE(9)
+DCL &U4 *UINT 4 VALUE(8)
+DCL &D0 *DEC (7 2) VALUE(0)
+IF (&WHICH *EQ 'O') THEN(DO)
+  CALL OPMF
+  RETURN
+ENDDO
+SNDPGMMSG MSG('[' *CAT %CHAR(&I2) *CAT '][' *CAT %CHAR(&I8) *CAT '][' *CAT +
+  %CHAR(&U4) *CAT '][' *CAT %CHAR(&D0) *CAT ']') TOPGMQ(*EXT)
+CALL ILEF
+MONMSG MSGID(CPF0001 CEE9901 CPF9999) EXEC(RCVMSG MSGTYPE(*EXCP) RMV(*NO) MSGID(&ID))
+SNDPGMMSG MSG('ILE ' *CAT &ID) TOPGMQ(*EXT)
+CALL OPMF
+MONMSG MSGID(CPF0001 CEE9901 CPF9999) EXEC(RCVMSG MSGTYPE(*EXCP) RMV(*NO) MSGID(&ID))
+SNDPGMMSG MSG('OPM ' *CAT &ID) TOPGMQ(*EXT)
+ENDPGM
+",
+        ),
+    ] {
+        source::put_member(&client, &m, false).await.unwrap();
+    }
+    job.calls.printed.clear();
+    let e = job
+        .run(&format!("CRTBNDRPG PGM({lib}/D60) SRCFILE({lib}/QSRC)"))
+        .await
+        .err()
+        .map(|e| format!("{e:#}"))
+        .unwrap_or_default();
+    assert!(e.contains("RNS9308"), "{e}");
+    let listing = std::mem::take(&mut job.calls.printed).join("\n");
+    assert!(listing.contains("*RNF7016 20"), "{listing}");
+    cl_cmd(
+        &mut job,
+        format!("CRTBNDRPG PGM({lib}/D52) SRCFILE({lib}/QSRC)"),
+    )
+    .await
+    .unwrap();
+    for c in [
+        format!("CRTBNDCL PGM({lib}/ILEF) SRCFILE({lib}/QSRC)"),
+        format!("CRTCLPGM PGM({lib}/OPMF) SRCFILE({lib}/QSRC)"),
+        format!("CRTBNDCL PGM({lib}/CALLER) SRCFILE({lib}/QSRC)"),
+    ] {
+        cl_cmd(&mut job, c.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    let r = run_in_own_job(&client, &url, &lib, &format!("CALL {lib}/CALLER PARM(A)"))
+        .await
+        .unwrap();
+    assert_eq!(
+        r,
+        [
+            format!(
+                "[-5    ][9{}][8{}][.00      ]",
+                " ".repeat(19),
+                " ".repeat(10)
+            ),
+            "ILE CEE9901".to_string(),
+            "OPM CPF9999".to_string()
+        ]
+    );
+    let e = run_in_own_job(&client, &url, &lib, &format!("CALL {lib}/CALLER PARM(O)"))
+        .await
+        .unwrap_err()
+        .to_string();
+    let last = e
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("CEE9901"))
+        .unwrap_or("");
+    assert!(
+        // The CALL is on line 2: statement 200 (s26_call_opm: line 3, 300).
+        last.contains("OPMF") && last.contains("CPF0001") && last.contains("statement 200"),
+        "{e}"
+    );
+}
+
+/// What IBMiUnit's own test suites needed (github.com/MarinaSchwenk/
+/// IBMiUnit, run by tools/legacy.sh): a prototype declared in a
+/// subprocedure is that procedure's own (ILE RPG Reference, scope of
+/// definitions: two procedures each declare `callback`); a float literal
+/// (ILE RPG Reference, numeric literals: mantissa E exponent) beyond a
+/// decimal's 63 digits, negated, and %ABS of a float staying a float;
+/// EXTPGM of a variable holding 'LIB/PGM' (ILE RPG Reference, EXTPGM: the
+/// name may be qualified); a program called in the caller's activation
+/// group sharing its heap (ILE Concepts: the default heap belongs to the
+/// activation group): a pointer to storage the callee allocated works in
+/// the caller; the C runtime's sleep and usleep (0).
+#[tokio::test]
+async fn rpg_features_found_by_ibmiunit() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    cl_cmd(&mut job, format!("CRTSRCPF FILE({lib}/QSRC) RCDLEN(112)"))
+        .await
+        .unwrap();
+    let put = |name: &str, src: String| source::Member {
+        library: lib.clone(),
+        file: "QSRC".into(),
+        name: name.into(),
+        srctype: "RPGLE".into(),
+        source: src,
+        ..Default::default()
+    };
+    for m in [
+        put(
+            "LOCALPR",
+            "**FREE
+ctl-opt dftactgrp(*no);
+dsply (callNone(%paddr(none)) + ' ' + callOne(%paddr(one)));
+*inlr = *on;
+dcl-proc callNone;
+  dcl-pi *n char(4);
+    p pointer(*proc) const;
+  end-pi;
+  dcl-pr callback char(4) extproc(p);
+  end-pr;
+  return callback();
+end-proc;
+dcl-proc callOne;
+  dcl-pi *n char(4);
+    p pointer(*proc) const;
+  end-pi;
+  dcl-pr callback char(4) extproc(p);
+    x char(4) const;
+  end-pr;
+  return callback('one');
+end-proc;
+dcl-proc none;
+  dcl-pi *n char(4);
+  end-pi;
+  return 'none';
+end-proc;
+dcl-proc one;
+  dcl-pi *n char(4);
+    x char(4) const;
+  end-pi;
+  return x;
+end-proc;
+"
+            .into(),
+        ),
+        put(
+            "FLOATS",
+            "**FREE
+dcl-s f float(8);
+dcl-s d float(8);
+f = 1.5E3;
+if f = 1500;
+  dsply 'E3';
+endif;
+f = -1.797693134862315E+308;
+d = %abs(f - f / 2);
+if f < 0 and d > 0;
+  dsply 'huge';
+endif;
+*inlr = *on;
+"
+            .into(),
+        ),
+        put(
+            "HEAPA",
+            format!(
+                "**FREE
+ctl-opt dftactgrp(*no) actgrp('HEAPAG');
+dcl-pr callee extpgm(pgmName);
+  p pointer;
+end-pr;
+dcl-pr sleep int(10) extproc('sleep');
+  s uns(10) value;
+end-pr;
+dcl-pr usleep int(10) extproc('usleep');
+  u uns(10) value;
+end-pr;
+dcl-s pgmName char(21) inz('{lib}/HEAPB');
+dcl-s p pointer;
+dcl-s t char(10) based(p);
+callee(p);
+dsply t;
+dsply (%char(sleep(0)) + %char(usleep(1000)));
+*inlr = *on;
+"
+            ),
+        ),
+        put(
+            "HEAPB",
+            "**FREE
+ctl-opt dftactgrp(*no) actgrp('HEAPAG');
+dcl-pi *n;
+  p pointer;
+end-pi;
+dcl-s t char(10) based(p);
+p = %alloc(10);
+t = 'from B';
+*inlr = *on;
+"
+            .into(),
+        ),
+    ] {
+        source::put_member(&client, &m, false).await.unwrap();
+    }
+    for p in ["LOCALPR", "FLOATS", "HEAPA", "HEAPB"] {
+        cl_cmd(
+            &mut job,
+            format!("CRTBNDRPG PGM({lib}/{p}) SRCFILE({lib}/QSRC)"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{p}: {e}"));
+    }
+    for (p, want) in [
+        ("LOCALPR", vec!["DSPLY  none one"]),
+        ("FLOATS", vec!["DSPLY  E3", "DSPLY  huge"]),
+        ("HEAPA", vec!["DSPLY  from B", "DSPLY  00"]),
+    ] {
+        let r = run_in_own_job(&client, &url, &lib, &format!("CALL {lib}/{p}"))
+            .await
+            .unwrap();
+        assert_eq!(r, want, "{p}");
+    }
+}

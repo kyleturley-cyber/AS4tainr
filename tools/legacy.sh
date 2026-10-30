@@ -42,6 +42,13 @@
 #   which would run its shell code on the host), its installer IMOQINST,
 #   then its self-tests IMOQTEST, its demo IMOQDEMO and its examples
 #   EXAMPLES in batch jobs.
+# - IBMiUnit (GPL-3.0): its build script's steps with -s IBMIUNIT -t (the
+#   source copied into IBMIUNIT's source files, the test programs' /copy
+#   lines rewritten as its sed does), on the OSSILE pieces its README
+#   assumes (its own copies of OSSILE's MESSAGE and ARRAYLIST service
+#   programs, binding directories MESSAGE, ARRAYLIST and OSSILE/OSSILE,
+#   OSSILE's message_h.rpgle in /QIBM/UserData); then its test suites
+#   through RUNTEST UI(*DSPLY) in batch jobs.
 # - OSSILE (MIT): imported, then its arraylist and linked list unit tests
 #   (RPGUnit test service programs: ALIST01 made with RUCRTTST, LLIST_UT_1
 #   as its Makefile makes it) run with RUCALLTST in batch jobs.
@@ -68,6 +75,7 @@ clone https://github.com/tools-400/irpgunit.git irpgunit
 clone https://github.com/MarcoDeSenas/IBMi-topics-thanks-to-pub400.git topics
 clone https://github.com/OSSILE/OSSILE.git ossile
 clone https://github.com/danlong005/IBMiMock.git imoq
+clone https://github.com/MarinaSchwenk/IBMiUnit.git ibmiunit
 
 step() {
   echo "== $*"
@@ -188,6 +196,71 @@ for t in IMOQTEST IMOQDEMO EXAMPLES; do
   parm="PARM(IMOQ IMOQ)"; [ $t = EXAMPLES ] && parm="PARM(IMOQ)"
   "$bin" --libl QGPL,QTEMP,IMOQ batch "CALL PGM(IMOQ/$t) $parm" 2>&1 |
     grep -a -E "^CPF989[78]: ([0-9]+ passed|FAIL|EX[A-Z]+ passed|IMOQTEST|IMOQDEMO|EXAMPLES)|CPF124[01]" | cut -c1-160
+done
+
+step "IBMiUnit (build -s IBMIUNIT -t as CL commands; then its test suites)"
+iu() { "$bin" --libl IBMIUNIT,OSSILE,QGPL --curlib IBMIUNIT system "$1" 2>&1; }
+iuwork=$(mktemp -d)
+mkdir -p "$iuwork/test"
+for f in "$work"/ibmiunit/src/test/QRPGLESRC/*.rpgle; do
+  python3 -I -c 'import re,sys; t=open(sys.argv[1],encoding="utf-8",errors="replace").read(); print(re.sub(r"/copy \.\./\.\./main/QRPGLESRC/(.*)_h\.rpgle", r"/copy IBMIUNIT/QRPGLESRC,\1_h", t), end="")' "$f" > "$iuwork/test/$(basename "$f")"
+done
+"$bin" put "$work/ibmiunit/src/main" /home/ibmiunit/main >/dev/null
+"$bin" put "$iuwork/test" /home/ibmiunit/test >/dev/null
+"$bin" put "$work/ossile/main/message" /QIBM/UserData/OSSILE-master/main/message >/dev/null
+# TEST_SETUP copies it from its author's own directory.
+"$bin" put "$work/ossile/main/message" /QIBM/UserData/Stevers/OSSILE-master/main/message >/dev/null
+iu "CRTLIB LIB(IBMIUNIT)" | tail -1
+iu "CRTLIB LIB(OSSILE)" >/dev/null
+for f in QCMDSRC QSRVSRC; do iu "CRTSRCPF FILE(IBMIUNIT/$f)" >/dev/null; done
+iu "CRTSRCPF FILE(IBMIUNIT/QRPGLESRC) RCDLEN(112)" >/dev/null
+iucp() { # file member stmf type
+  iu "CPYFRMSTMF FROMSTMF('$3') TOMBR('/QSYS.LIB/IBMIUNIT.LIB/$1.FILE/$2.MBR') MBROPT(*REPLACE) STMFCCSID(*PCASCII) DBFCCSID(37)" | grep -v "^CPCA081"
+  iu "CHGPFM FILE(IBMIUNIT/$1) MBR($2) SRCTYPE($4)" | grep -v "^CPC3201"
+}
+iucp QCMDSRC RUNTEST /home/ibmiunit/main/QCMDSRC/RUNTEST.cmd CMD
+for p in "$work"/ibmiunit/src/main/QRPGLESRC/* "$work"/ibmiunit/src/main/QSRVSRC/* "$iuwork"/test/*.rpgle; do
+  b=$(basename "$p"); m=$(echo "${b%.*}" | tr a-z A-Z)
+  case "$p" in
+    */QSRVSRC/*) iucp QSRVSRC "$m" "/home/ibmiunit/main/QSRVSRC/$b" BND ;;
+    "$iuwork"/*) iucp QRPGLESRC "$m" "/home/ibmiunit/test/$b" RPGLE ;;
+    *) iucp QRPGLESRC "$m" "/home/ibmiunit/main/QRPGLESRC/$b" RPGLE ;;
+  esac
+done
+rm -rf "$iuwork"
+for m in MESSAGE ARRAYLIST; do
+  iu "CRTRPGMOD MODULE(IBMIUNIT/$m) SRCFILE(IBMIUNIT/QRPGLESRC)" | grep -E "^RN[SF]" | tail -1
+  iu "CRTSRVPGM SRVPGM(IBMIUNIT/$m) MODULE(IBMIUNIT/$m) EXPORT(*SRCFILE) SRCFILE(IBMIUNIT/QSRVSRC) SRCMBR($m)" | tail -1
+  iu "CRTBNDDIR BNDDIR(IBMIUNIT/$m)" >/dev/null
+  iu "ADDBNDDIRE BNDDIR(IBMIUNIT/$m) OBJ((IBMIUNIT/$m))" >/dev/null
+done
+iu "CRTBNDDIR BNDDIR(OSSILE/OSSILE)" >/dev/null
+iu "ADDBNDDIRE BNDDIR(OSSILE/OSSILE) OBJ((IBMIUNIT/MESSAGE) (IBMIUNIT/ARRAYLIST))" >/dev/null
+iu "CRTMSGF MSGF(IBMIUNIT/IBMIUNIT) TEXT('IBMiUnit messages')" | tail -1
+grep -o 'ADDMSGD [^"]*' "$work/ibmiunit/src/main/crtmsgf" | sed 's/\$TGTLIB/IBMIUNIT/g; s/\$BUILD/test/g' |
+  while read -r c; do iu "$c" >/dev/null; done
+iu "CRTBNDDIR BNDDIR(IBMIUNIT/IBMIUNIT) TEXT('IBMiUnit binding directory')" >/dev/null
+iu "ADDBNDDIRE BNDDIR(IBMIUNIT/IBMIUNIT) OBJ((IBMIUNIT/IBMIUNIT))" >/dev/null
+iu "CRTRPGMOD MODULE(IBMIUNIT/IBMIUNIT) SRCFILE(IBMIUNIT/QRPGLESRC) TGTRLS(V7R1M0) DBGVIEW(*SOURCE)" | grep -E "^RN[SF]" | tail -1
+iu "CRTSRVPGM SRVPGM(IBMIUNIT/IBMIUNIT) SRCFILE(IBMIUNIT/QSRVSRC) TEXT('IBMiUnit testing framework') TGTRLS(V7R1M0) USRPRF(*USER)" | tail -1
+# Its binder source has two PGMLVL(*CURRENT) blocks, which as4tainr
+# refuses (docs/fidelity-gaps.md): EXPORT(*ALL) then.
+case "$(iu "CHKOBJ OBJ(IBMIUNIT/IBMIUNIT) OBJTYPE(*SRVPGM)")" in
+  *CPF9801*) iu "CRTSRVPGM SRVPGM(IBMIUNIT/IBMIUNIT) MODULE(IBMIUNIT/IBMIUNIT) EXPORT(*ALL) TEXT('IBMiUnit testing framework')" | tail -1 ;;
+esac
+iu "CRTCMD CMD(IBMIUNIT/RUNTEST) PGM(IBMIUNIT/RUNTEST) SRCFILE(IBMIUNIT/QCMDSRC)" | grep "^CP" | tail -1
+iuopt="TGTRLS(V7R1M0) DBGVIEW(*SOURCE) USRPRF(*USER)"
+iu "CRTBNDRPG PGM(IBMIUNIT/RUNTEST) SRCFILE(IBMIUNIT/QRPGLESRC) BNDDIR(IBMIUNIT/IBMIUNIT) DFTACTGRP(*NO) $iuopt" | grep -E "^RN[SF]" | tail -1
+for p in IBMIUIDSP IBMIUIINT; do
+  iu "CRTBNDRPG PGM(IBMIUNIT/$p) SRCFILE(IBMIUNIT/QRPGLESRC) $iuopt" | grep -E "^RN[SF]|^CPF" | tail -1
+done
+iutests="TEST TEST_ACHAR TEST_ADATE TEST_AFLOA TEST_AIND TEST_ANULL TEST_ANUM TEST_ASSER TEST_ATIME TEST_ATS TEST_ERROR TEST_FAIL TEST_NUM0 TEST_NUM1 TEST_NUM2 TEST_NUM3 TEST_NUM4 TEST_NUM5 TEST_NUM6 TEST_SETUP"
+for t in $iutests; do
+  iu "CRTBNDRPG PGM(IBMIUNIT/$t) SRCFILE(IBMIUNIT/QRPGLESRC) BNDDIR(IBMIUNIT/IBMIUNIT) DFTACTGRP(*NO) $iuopt" | grep -E "^RNS9310|^CPF" | tail -1
+done
+for t in $iutests; do
+  echo "$t: $("$bin" --libl IBMIUNIT,OSSILE,QGPL --curlib IBMIUNIT batch "RUNTEST SUITE(IBMIUNIT/$t) UI(*DSPLY)" 2>&1 |
+    grep -E "DSPLY  Done:|CPF124[01]" | sed 's/^DSPLY  //; s/ Job [0-9]*\/.*//' | tr '\n' ' ')"
 done
 
 step "QshOni (build.sh, then QSHEXEC)"

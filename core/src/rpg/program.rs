@@ -238,6 +238,10 @@ pub struct ProcInfo {
     pub based: HashMap<usize, String>,
     /// Local pointers with INZ(%ADDR(x)): set at each call.
     pub ptr_inz: Vec<(String, Expr)>,
+    /// Prototypes declared in the procedure: its own, before the
+    /// module's (two procedures may each declare a `callback` prototype
+    /// of their own).
+    pub protos: HashMap<String, Proto>,
 }
 
 #[derive(Clone, Debug)]
@@ -2692,9 +2696,31 @@ pub fn bind(
             formats: b.formats.clone(),
             infds: b.infds.clone(),
         };
+        // Its prototypes are its own (ILE RPG Reference: definitions in
+        // a subprocedure are local to it): kept with the procedure; the
+        // module's map keeps the first of a name (for imports).
+        let local_names: Vec<String> = pr
+            .defs
+            .iter()
+            .filter(|d| d.kind == DefKind::Proto)
+            .map(|d| d.name.clone())
+            .collect();
+        let saved: Vec<(String, Option<Proto>)> = local_names
+            .iter()
+            .map(|n| (n.clone(), protos.get(n).cloned()))
+            .collect();
         let pi = pb
             .defs(&pr.defs, &mut protos)
             .map_err(|e| anyhow!("procedure {}: {e}", pr.name))?;
+        let mut local_protos = HashMap::new();
+        for (n, old) in saved {
+            if let Some(p) = protos.get(&n) {
+                local_protos.insert(n.clone(), p.clone());
+            }
+            if let Some(o) = old {
+                protos.insert(n, o);
+            }
+        }
         pb.apply_inz()?;
         // STATIC variables keep their values between calls: they live in
         // global storage.
@@ -2777,6 +2803,7 @@ pub fn bind(
                     .iter()
                     .map(|(n, e)| Ok((n.clone(), expr::parse(e)?)))
                     .collect::<Result<Vec<_>>>()?,
+                protos: local_protos,
             },
         );
     }
@@ -2843,6 +2870,7 @@ pub fn bind(
         .collect();
     let mut imports: Vec<String> = protos
         .values()
+        .chain(procs.values().flat_map(|pi| pi.protos.values()))
         .filter(|p| p.extpgm.is_none() && p.overload.is_empty())
         .filter(|p| called(&p.name) || via_overload.contains(&p.name))
         .filter_map(|p| p.extproc.clone())

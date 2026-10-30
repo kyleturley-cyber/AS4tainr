@@ -175,6 +175,22 @@ pub fn tokens(text: &str) -> Result<Vec<Tok>> {
                     i += 1;
                 }
             }
+            // A float literal: mantissa E exponent (ILE RPG Reference,
+            // numeric literals: +1.2E5, 3.4028235E38).
+            if matches!(cs.get(i), Some('E' | 'e')) {
+                let mut j = i + 1;
+                if matches!(cs.get(j), Some('+' | '-')) {
+                    j += 1;
+                }
+                if cs.get(j).is_some_and(|d| d.is_ascii_digit()) {
+                    while j < cs.len() && cs[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    n.push('E');
+                    n.extend(&cs[i + 1..j]);
+                    i = j;
+                }
+            }
             out.push(Tok::Num(n));
             continue;
         }
@@ -453,6 +469,10 @@ impl Parser {
 
     fn primary(&mut self) -> Result<Expr> {
         match self.next() {
+            // A float literal is a float value: %FLOAT of its text.
+            Some(Tok::Num(n)) if n.contains('E') => {
+                Ok(Expr::Bif("FLOAT".to_string(), vec![Expr::Str(e(&n))]))
+            }
             Some(Tok::Num(n)) => Ok(Expr::Num(Dec::parse(&n)?)),
             Some(Tok::Str(s)) => Ok(Expr::Str(e(&s))),
             // A date or time literal is a date or time value: %DATE or

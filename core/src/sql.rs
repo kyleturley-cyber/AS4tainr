@@ -60,8 +60,12 @@ pub fn joined_path(quoted: &[String]) -> String {
 /// refused.
 pub async fn init(client: &Client) -> Result<()> {
     use argon2::password_hash::{rand_core::OsRng, SaltString};
-    client
-        .batch_execute(&format!(
+    // The role is the cluster's, not the database's: processes starting
+    // at once on other databases alter it too ("tuple concurrently
+    // updated"), so these statements are tried again.
+    batch_retrying(
+        client,
+        &format!(
             "DO $$ BEGIN
                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{SQL_ROLE}') THEN
                  CREATE ROLE {SQL_ROLE};
@@ -72,8 +76,9 @@ pub async fn init(client: &Client) -> Result<()> {
              ALTER DEFAULT PRIVILEGES GRANT USAGE, SELECT ON SEQUENCES TO {SQL_ROLE};
              REVOKE ALL ON SCHEMA as4tainr FROM {SQL_ROLE};
              CREATE TABLE IF NOT EXISTS as4tainr.sql_login (id int PRIMARY KEY, password text NOT NULL);"
-        ))
-        .await?;
+        ),
+    )
+    .await?;
     let fresh = SaltString::generate(&mut OsRng).to_string();
     client
         .execute(
@@ -92,9 +97,11 @@ pub async fn init(client: &Client) -> Result<()> {
     {
         bail!("the stored SQL password has unexpected characters");
     }
-    client
-        .batch_execute(&format!("ALTER ROLE {SQL_ROLE} PASSWORD '{password}'"))
-        .await?;
+    batch_retrying(
+        client,
+        &format!("ALTER ROLE {SQL_ROLE} PASSWORD '{password}'"),
+    )
+    .await?;
     for lib in catalog::list_libraries(client).await? {
         // Jobs' QTEMP libraries got their grants when they were made, and
         // their jobs drop them at any moment: granting again would race
@@ -188,13 +195,12 @@ pub async fn grant_library(client: &Client, library: &str) -> Result<()> {
 /// defined. Another process granting on the same schema at that moment
 /// (`init`'s grants to every library) makes it fail with "tuple
 /// concurrently updated": it is tried again.
-async fn grant_create(client: &Client, schema: &str) -> Result<(), tokio_postgres::Error> {
+/// A batch tried again (up to five times) when another process changed
+/// the same catalog row at the same moment.
+async fn batch_retrying(client: &Client, sql: &str) -> Result<(), tokio_postgres::Error> {
     let mut tries = 0;
     loop {
-        match client
-            .batch_execute(&format!("GRANT CREATE ON SCHEMA {schema} TO {SQL_ROLE}"))
-            .await
-        {
+        match client.batch_execute(sql).await {
             Err(e)
                 if tries < 5
                     && e.as_db_error()
@@ -206,6 +212,14 @@ async fn grant_create(client: &Client, schema: &str) -> Result<(), tokio_postgre
             r => return r,
         }
     }
+}
+
+async fn grant_create(client: &Client, schema: &str) -> Result<(), tokio_postgres::Error> {
+    batch_retrying(
+        client,
+        &format!("GRANT CREATE ON SCHEMA {schema} TO {SQL_ROLE}"),
+    )
+    .await
 }
 
 // ------------------------------------------------------------ tokens

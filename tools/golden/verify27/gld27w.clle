@@ -1,0 +1,7 @@
+/* verify27: run GLD27F and record what it returns */
+PGM
+DCL &L *CHAR 200
+CALL GLD27F PARM(&L)
+RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD27OUT VALUES(1, ''' *CAT %TRIMR(&L) +
+  *CAT ''')') COMMIT(*NONE)
+ENDPGM

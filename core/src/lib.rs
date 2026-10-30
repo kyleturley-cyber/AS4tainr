@@ -31,6 +31,7 @@ pub mod dbr;
 pub mod ddl;
 pub mod dds;
 pub mod ddslist;
+pub mod ddsref;
 pub mod dspf;
 pub mod dspjob;
 pub mod dtaara;

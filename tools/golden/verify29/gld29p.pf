@@ -1,0 +1,11 @@
+     A* verify29: fields that refer to GLD29R and to this source
+     A                                      REF(GLD29R)
+     A          R GLD29PR
+     A            NAME      R
+     A            ADDR      R               REFFLD(NAME)
+     A                                      COLHDG('Address')
+     A            CITY      R               REFFLD(ADDR *SRC)
+     A            AMOUNT    R
+     A            BIGAMT    R   +2          REFFLD(AMOUNT)
+     A            SHORT     R   -5          REFFLD(NAME)
+     A            WHEN      R

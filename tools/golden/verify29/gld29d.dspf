@@ -1,0 +1,6 @@
+     A* verify29: display fields that refer to GLD29R
+     A                                      REF(GLD29R)
+     A          R GLD29DR
+     A            NAME      R        B  3  2
+     A            AMOUNT    R        B  4  2
+     A            WHEN      R        O  5  2

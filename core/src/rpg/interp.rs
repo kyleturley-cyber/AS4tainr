@@ -3302,6 +3302,21 @@ impl<'a> Machine<'a> {
                             }
                         }
                         Some(Sym::Ds(d)) => self.clear_ds(&parts.join("."), &d),
+                        // A record format: its fields (ILE RPG Reference,
+                        // CLEAR: with *ALL or for a format whose fields are
+                        // all input and output, as a disk file's are).
+                        _ if self.format_fields(&parts.join(".")).is_some() => {
+                            let fields = self.format_fields(&parts.join(".")).unwrap_or_default();
+                            for f in fields {
+                                if let Some(Sym::Var(v)) = self.sym(&f) {
+                                    for k in 0..v.dim.max(1) as usize {
+                                        let at = v.off + k * v.stride;
+                                        self.bufs[v.buf][at..at + v.dtype.size()]
+                                            .copy_from_slice(&v.dtype.initial());
+                                    }
+                                }
+                            }
+                        }
                         _ => bail!("CLEAR of {} is not supported", parts.join(".")),
                     },
                     // One element of a data structure array: its subfields
@@ -6651,6 +6666,9 @@ impl<'a> Machine<'a> {
                 if let Some(m) = self.cl_module(sym, target, module)? {
                     return self.call_cl_module(&m, args);
                 }
+                if let Some((m, callee)) = self.cycle_main_module(sym, target)? {
+                    return self.call_cycle_main(&m, &callee, args);
+                }
                 let mut c = self.resolve_bound(sym, target, module, client, &libl)?;
                 c.0 = generation;
                 if let Ok(mut g) = BOUND.lock() {
@@ -6667,6 +6685,139 @@ impl<'a> Machine<'a> {
             .filter(|pi| pi.export || module.is_some())
             .ok_or_else(|| anyhow!("CPD5D02: Module does not export {sym}."))?;
         self.run_bound(sym, target, args, unit, binding, prog, pi)
+    }
+
+    /// The program fields of a record format (a file's, or a display
+    /// file's format), if `name` is one.
+    fn format_fields(&self, name: &str) -> Option<Vec<String>> {
+        for f in &self.prog.files {
+            if f.format.eq_ignore_ascii_case(name) && !f.format.is_empty() {
+                return Some(f.fields.clone());
+            }
+            if let Some(d) = &f.display {
+                if let Some((_, fs)) = d.formats.iter().find(|(n, _)| n.eq_ignore_ascii_case(name))
+                {
+                    return Some(fs.iter().map(|(p, _)| p.clone()).collect());
+                }
+            }
+        }
+        None
+    }
+
+    /// The RPG module bound into this program whose cycle main procedure
+    /// a bound call of `sym` (the module's name) goes to, if it is one
+    /// (ILE RPG Programmer's Guide, "Using a bound call").
+    fn cycle_main_module(
+        &mut self,
+        sym: &str,
+        target: &crate::ile::Target,
+    ) -> Result<Option<(crate::ile::ModuleCopy, std::sync::Arc<Program>)>> {
+        let crate::ile::Target::Module(name) = target else {
+            return Ok(None);
+        };
+        if !name.eq_ignore_ascii_case(sym) {
+            return Ok(None);
+        }
+        let Some(m) = self.io.binding.as_ref().and_then(|b| {
+            b.modules
+                .iter()
+                .find(|x| &x.name == name && x.attribute != "CLLE")
+                .cloned()
+        }) else {
+            return Ok(None);
+        };
+        let client = self.io.client;
+        let libl = self.io.libl.clone();
+        let prog = self.block(super::compile_with(
+            client, &libl, &m.name, &m.source, &m.options,
+        ))?;
+        if prog.nomain || prog.main.is_some() || prog.procs.contains_key(sym) {
+            return Ok(None);
+        }
+        Ok(Some((m, std::sync::Arc::new(prog))))
+    }
+
+    /// A bound call of a module's cycle main procedure: it runs as a
+    /// called program does (its parameters by reference), in this
+    /// activation group, with this program's binding.
+    fn call_cycle_main(
+        &mut self,
+        m: &crate::ile::ModuleCopy,
+        callee: &Program,
+        args: Vec<Arg>,
+    ) -> Result<Option<Value>> {
+        let mut locs: Vec<Option<Loc>> = Vec::new();
+        let mut parms: Vec<Vec<u8>> = Vec::new();
+        for a in &args {
+            match a {
+                Arg::Ref(l) => {
+                    locs.push(Some(*l));
+                    parms.push(self.bufs[l.buf][l.off..l.off + l.size].to_vec());
+                }
+                Arg::Val(v) => {
+                    locs.push(None);
+                    parms.push(match v {
+                        Value::Char(b) => b.clone(),
+                        other => crate::rpg::data::e(&a_text(&other.chars()?)),
+                    });
+                }
+                Arg::Omit | Arg::File(_) => break,
+            }
+        }
+        let client = self.io.client;
+        let r = {
+            let mut mach = Machine::new(
+                callee,
+                Io {
+                    rt: self.io.rt.clone(),
+                    client,
+                    data: self.io.data,
+                    user: self.io.user.clone(),
+                    job_number: self.io.job_number,
+                    libl: self.io.libl.clone(),
+                    job: self.io.job.clone(),
+                    display: self.io.display.clone(),
+                    cl: self.io.cl.clone(),
+                    callers: {
+                        let mut c = self.io.callers.clone();
+                        c.push(self.prog.name.clone());
+                        c
+                    },
+                    database_url: self.io.database_url.clone(),
+                    job_key: self.io.job_key.clone(),
+                    binding: self.io.binding.clone(),
+                    unit: None,
+                    modules: Default::default(),
+                    actgrp: self.io.actgrp.clone(),
+                    program: format!("*BOUND/{}", m.name),
+                    shared: Default::default(),
+                },
+            );
+            mach.bufs.lent = std::mem::take(&mut self.bufs.lent);
+            mach.bufs.lent.push(super::mem::Lent {
+                owner: self.frame_owner,
+                act: self.owner,
+                globals: self.prog.globals.len(),
+                bufs: std::mem::take(&mut self.bufs.own),
+            });
+            mach.bufs.heap = std::mem::take(&mut self.bufs.heap);
+            mach.heap_lent = true;
+            let r = mach.run_bytes(&mut parms);
+            self.bufs.own = mach.bufs.lent.pop().map(|l| l.bufs).unwrap_or_default();
+            self.bufs.lent = std::mem::take(&mut mach.bufs.lent);
+            self.bufs.heap = std::mem::take(&mut mach.bufs.heap);
+            self.messages.append(&mut mach.messages);
+            self.printed.append(&mut mach.printed);
+            self.logged.append(&mut mach.logged);
+            r
+        };
+        r?;
+        for (l, bytes) in locs.iter().zip(parms) {
+            if let Some(l) = l {
+                self.bufs[l.buf][l.off..l.off + l.size].copy_from_slice(&bytes[..l.size]);
+            }
+        }
+        Ok(None)
     }
 
     /// The CL module a bound call of `sym` goes to, if it is one.

@@ -138,6 +138,11 @@ pub enum Ddl {
         name: Name,
         text: String,
     },
+    /// LABEL ON SEQUENCE: the text of the sequence's data area.
+    LabelSequence {
+        name: Name,
+        text: String,
+    },
     /// LABEL ON COLUMN with TEXT IS: the fields' text. Column headings
     /// (plain `IS`) are not kept.
     LabelColumns {
@@ -2207,6 +2212,65 @@ fn create_trigger(sql: &str, replace: bool) -> Result<Ddl> {
     if p.eat("MODE") {
         p.ident()?;
     }
+    // PROGRAM NAME (the trigger program's system name), SECURED or NOT
+    // SECURED, SET OPTION (Db2 for i SQL Reference, CREATE TRIGGER): the
+    // trigger runs here as a PostgreSQL trigger, so they change nothing.
+    loop {
+        if p.eat("PROGRAM") {
+            if !p.eat("NAME") {
+                bail!("SQL0104: NAME expected after PROGRAM{}.", p.at());
+            }
+            p.ident()?;
+        } else if p.eat("SECURED") {
+        } else if p.eat("NOT") {
+            if !p.eat("SECURED") {
+                bail!("SQL0104: SECURED expected after NOT{}.", p.at());
+            }
+        } else if p.word().as_deref() == Some("SET") {
+            // SET OPTION, not a SET action (SET N.X = ...).
+            let at_set = p.i;
+            p.i += 1;
+            if !p.eat("OPTION") {
+                p.i = at_set;
+                break;
+            }
+            loop {
+                p.ident()?;
+                if !p.is_punct("=") {
+                    bail!("SQL0104: = expected in SET OPTION{}.", p.at());
+                }
+                p.next();
+                if p.is_punct("(") {
+                    let mut depth = 0;
+                    loop {
+                        match p.next() {
+                            Some(Tok::Punct(x)) if x == "(" => depth += 1,
+                            Some(Tok::Punct(x)) if x == ")" => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            None => bail!("SQL0104: SET OPTION has no closing parenthesis."),
+                            _ => {}
+                        }
+                    }
+                } else {
+                    if p.is_punct("*") {
+                        p.next();
+                    }
+                    p.next();
+                }
+                if p.is_punct(",") {
+                    p.next();
+                } else {
+                    break;
+                }
+            }
+        } else {
+            break;
+        }
+    }
     let rest = |k: usize| -> String {
         at.get(k)
             .map(|&s| all[s..].iter().map(show).collect::<String>())
@@ -2695,9 +2759,18 @@ fn label(p: &mut P) -> Result<Ddl> {
                 texts: if is_text { vec![(col, s)] } else { vec![] },
             })
         }
+        Some("SEQUENCE") => {
+            p.i += 1;
+            let name = p.name()?;
+            p.expect("IS")?;
+            Ok(Ddl::LabelSequence {
+                name,
+                text: text(p)?,
+            })
+        }
         Some("ALIAS") | Some("PACKAGE") | Some("PROCEDURE") | Some("FUNCTION")
-        | Some("SEQUENCE") | Some("TRIGGER") | Some("MASK") | Some("PERMISSION") | Some("TYPE")
-        | Some("VARIABLE") | Some("CONSTRAINT") => {
+        | Some("TRIGGER") | Some("MASK") | Some("PERMISSION") | Some("TYPE") | Some("VARIABLE")
+        | Some("CONSTRAINT") => {
             bail!(
                 "SQL0084: LABEL ON {} is not supported yet.",
                 p.word().unwrap_or_default()
@@ -3223,9 +3296,23 @@ async fn create_trigger_run(ctx: &mut Ctx<'_>, t: &Trigger) -> Result<String> {
         Some(l) => l.clone(),
         None => lib.clone(),
     };
-    let tname = validate_name("trigger", &t.name.name).map_err(|_| {
-        anyhow!("SQL0084: trigger names longer than 10 characters are not supported yet.")
-    })?;
+    // A trigger's name is an SQL name (up to 128 characters; Db2 for i
+    // SQL Reference, CREATE TRIGGER). Here it names a PostgreSQL trigger
+    // and its function (`NAME~trigger`, 63 bytes at most).
+    let tname = match validate_name("trigger", &t.name.name) {
+        Ok(n) => n,
+        Err(_)
+            if t.name.name.len() <= 54
+                && t.name
+                    .name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_$#@".contains(c))
+                && !t.name.name.starts_with(|c: char| c.is_ascii_digit()) =>
+        {
+            t.name.name.to_ascii_uppercase()
+        }
+        Err(_) => bail!("SQL0084: trigger names longer than 54 characters are not supported yet."),
+    };
     let file = catalog::resolve_file(ctx.client, std::slice::from_ref(&lib), &sys).await?;
     let column = |c: &str| -> Result<String> {
         file.file
@@ -4005,6 +4092,29 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
             authority::check(ctx.client, ctx.user, &lib, &sys, "*FILE", Aut::Change).await?;
             catalog::set_file_text(ctx.client, &lib, &sys, text).await?;
             Ok(format!("Label on {} in {lib} changed.", name.name))
+        }
+        Ddl::LabelSequence { name, text } => {
+            let lib = ctx.target(name);
+            let seq = validate_name("sequence", &name.name).map_err(sql0104)?;
+            if ctx
+                .client
+                .query_opt(
+                    "SELECT 1 FROM as4tainr.sequences WHERE library=$1 AND name=$2",
+                    &[&lib, &seq],
+                )
+                .await?
+                .is_none()
+            {
+                bail!("SQL0204: {seq} in {lib} type *SQLSEQ not found.");
+            }
+            authority::check(ctx.client, ctx.user, &lib, &seq, "*DTAARA", Aut::Change).await?;
+            ctx.client
+                .execute(
+                    "UPDATE as4tainr.objects SET text=$3 WHERE library=$1 AND name=$2 AND objtype='*DTAARA'",
+                    &[&lib, &seq, text],
+                )
+                .await?;
+            Ok(format!("Label on {seq} in {lib} changed."))
         }
         Ddl::LabelColumns { table, texts } => {
             let Some((lib, _, sys)) = ctx.find(table).await? else {

@@ -32,6 +32,9 @@
 #   library; then its self-test suite
 #   ASSERTT made with RUCRTRPG and run with RUCALLTST: the test
 #   procedures that pass here, then the whole suite's result line.
+# - TOBi example (IBM, Apache-2.0): imported (a TOBi project with DDS
+#   reference files, ARCAD object scripts, SQL triggers); its unit tests
+#   VAT300 and CUS300 made with RUCRTRPG and run with RUCALLTST.
 # - IBMi-topics (MarcoDeSenas, GPL-3.0): imported (a TOBi-like project:
 #   sources built from the IFS, relative INCLUDE SRCSTMF paths, commands
 #   with validity checkers that look for QCATRS on the call stack,
@@ -76,6 +79,7 @@ clone https://github.com/MarcoDeSenas/IBMi-topics-thanks-to-pub400.git topics
 clone https://github.com/OSSILE/OSSILE.git ossile
 clone https://github.com/danlong005/IBMiMock.git imoq
 clone https://github.com/MarinaSchwenk/IBMiUnit.git ibmiunit
+clone https://github.com/IBM/tobi-example.git tobi
 
 step() {
   echo "== $*"
@@ -335,6 +339,22 @@ cs() { "$bin" --libl CMPSYS,IRPGUNIT,QGPL --curlib CMPSYS batch "$1" 2>&1; }
 cs "IRPGUNIT/RUCRTRPG TSTPGM(CMPSYS/EMPDETT) SRCSTMF('$work/cmpsys/qtestsrc/empdet.test.sqlrpgle') INCDIR('$work/cmpsys') RPGPPOPT(*LVL2) TGTCCSID(*JOB) DBGVIEW(*SOURCE)" |
   grep -a -E "^(Test program|CPF9897)"
 cs "IRPGUNIT/RUCALLTST TSTPGM(CMPSYS/EMPDETT)" | grep -a -E "^ *(Success|FAILURE|ERROR)\.|CPF124[01]"
+
+step "TOBi example (import, then its unit tests with iRPGUnit: RUCRTRPG with testing.json's options, RUCALLTST)"
+# IBM's sample project for its build tools (Apache-2.0): DDS files that
+# refer to a field reference file, binder sources, ARCAD object scripts
+# (.ILEPGM, .ILESRVPGM, .BNDDIR), SQL triggers, sequences, printer files.
+# Its tests (QTESTSRC) insert their own records, as VAT300 and CUS300's
+# setUpSuite do, and call the service programs FVAT and FCUSTOMER.
+"$bin" import "$work/tobi" --lib TOBI 2>/dev/null | tail -1
+"$bin" put "$work/tobi" "$work/tobi" >/dev/null
+tb() { "$bin" --libl TOBI,IRPGUNIT,QGPL --curlib TOBI batch "$1" 2>&1; }
+for t in vat300 cus300; do
+  u="$(echo "$t" | tr a-z A-Z)T"
+  tb "IRPGUNIT/RUCRTRPG TSTPGM(TOBI/$u) SRCSTMF('$work/tobi/QTESTSRC/$t.test.sqlrpgle') INCDIR('$work/tobi') RPGPPOPT(*LVL2) TGTCCSID(*JOB) DBGVIEW(*SOURCE)" |
+    grep -a -E "^(Test program|CPF9897)"
+  tb "IRPGUNIT/RUCALLTST TSTPGM(TOBI/$u)" | grep -a -E "^ *(Success|FAILURE|ERROR)\.|CPF124[01]"
+done
 
 step "IBMi-topics (import, then SPLFDLT *LOGONLY and *BOTH in batch jobs)"
 "$bin" import "$work/topics" --lib TOPICS 2>/dev/null | tail -1

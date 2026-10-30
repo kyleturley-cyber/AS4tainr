@@ -297,6 +297,31 @@ impl Machine<'_> {
             Content::PageNumber => (Dec::from_i64(page as i64), 4, 0, true),
             Content::Field => {
                 let v = self.eval(&Expr::name(&f.name))?;
+                if matches!(f.dtype, 'L' | 'T') {
+                    // Held in *ISO form; printed in the field's format
+                    // (*JOB: the job's, *MDY with / in as4tainr's jobs).
+                    let text = a(&v.chars()?);
+                    let fmt = match f.format.as_deref() {
+                        Some("*JOB") | None if f.dtype == 'L' => "*MDY".to_string(),
+                        Some(x) => x.to_string(),
+                        None => "*ISO".to_string(),
+                    };
+                    let shown = if f.dtype == 'L' {
+                        let d = crate::rpg::dates::parse_date(
+                            text.trim(),
+                            &crate::rpg::dates::DateFmt::iso(),
+                        )?;
+                        crate::rpg::dates::format_date(d, &crate::rpg::dates::DateFmt::parse(&fmt)?)
+                    } else {
+                        let t = crate::rpg::dates::parse_time(
+                            text.trim(),
+                            &crate::rpg::dates::TimeFmt::iso(),
+                        )?;
+                        crate::rpg::dates::format_time(t, &crate::rpg::dates::TimeFmt::parse(&fmt)?)
+                    };
+                    let n = f.length as usize;
+                    return Ok(format!("{shown:<n$}"));
+                }
                 match f.decimals {
                     Some(d) if f.dtype == 'S' => (v.num()?, f.length as u32, d as u32, true),
                     _ => {

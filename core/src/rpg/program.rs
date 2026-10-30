@@ -1203,10 +1203,15 @@ impl Binder<'_> {
                     if self.local && keyword(&d.keywords, "STATIC").is_some() {
                         self.statics.push(self.bufs.len() - 1);
                     }
-                    if let (Some(p), Some(Sym::Ds(ds))) =
-                        (basing_pointer(d), self.syms.get(&d.name))
-                    {
-                        self.based.insert(ds.buf, p);
+                    // An unnamed data structure is based too (its storage
+                    // the last buffer made).
+                    let buf = match self.syms.get(&d.name) {
+                        Some(Sym::Ds(ds)) => Some(ds.buf),
+                        _ if d.name.is_empty() => self.bufs.len().checked_sub(1),
+                        _ => None,
+                    };
+                    if let (Some(p), Some(buf)) = (basing_pointer(d), buf) {
+                        self.based.insert(buf, p);
                     }
                 }
                 DefKind::Proto | DefKind::Interface => {
@@ -2308,6 +2313,13 @@ pub fn bind(
                                     continue;
                                 }
                                 let t = match fd.decimals {
+                                    _ if fd.dtype == 'L' => {
+                                        DType::Date(crate::rpg::dates::DateFmt::iso())
+                                    }
+                                    _ if fd.dtype == 'T' => {
+                                        DType::Time(crate::rpg::dates::TimeFmt::iso())
+                                    }
+                                    _ if fd.dtype == 'Z' => DType::Timestamp(6),
                                     Some(d) if fd.dtype == 'S' => {
                                         DType::Zoned(fd.length as u32, d as u32)
                                     }

@@ -1037,6 +1037,7 @@ pub async fn record_format(
             double: false,
             generated: None,
             hidden: false,
+            keywords: String::new(),
         };
         return Ok((
             name.to_string(),

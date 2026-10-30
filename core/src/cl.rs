@@ -2813,7 +2813,11 @@ pub static COMMANDS: &[CommandDef] = &[
     CommandDef {
         name: "DSPPGM",
         description: "Display Program",
-        params: &[p("PGM", Kind::Qualified, true, None, "Program").ch("Name")],
+        params: &[
+            p("PGM", Kind::Qualified, true, None, "Program").ch("Name"),
+            p("DETAIL", Kind::List, false, Some("*ALL"), "Detail").ch("*ALL, *BASIC"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
     },
     CommandDef {
         name: "RTVBNDSRC",
@@ -2829,7 +2833,12 @@ pub static COMMANDS: &[CommandDef] = &[
     CommandDef {
         name: "DSPSRVPGM",
         description: "Display Service Program",
-        params: &[p("SRVPGM", Kind::Qualified, true, None, "Service program").ch("Name")],
+        params: &[
+            p("SRVPGM", Kind::Qualified, true, None, "Service program").ch("Name"),
+            p("DETAIL", Kind::List, false, Some("*ALL"), "Detail")
+                .ch("*ALL, *BASIC, *SIGNATURE, *PROCEXP"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
     },
     CommandDef {
         name: "UPDPGM",
@@ -3082,7 +3091,7 @@ pub static COMMANDS: &[CommandDef] = &[
             .ch("*NONE, *LVL1, *LVL2")
             .keyword_only(),
             p("INCFILE", Kind::Text, false, None, "Incfile").keyword_only(),
-            p("INCDIR", Kind::Text, false, None, "Incdir").keyword_only(),
+            p("INCDIR", Kind::List, false, Some("*NONE"), "Include directory").keyword_only(),
             p("ALWCPYDTA", Kind::Text, false, None, "Alwcpydta").keyword_only(),
             p(
                 "CLOSQLCSR",

@@ -236,20 +236,68 @@ fn cp1252(b: u8) -> char {
     }
 }
 
+/// The commands of a TOBi object script (`.BNDDIR`, `.ILEPGM`,
+/// `.ILESRVPGM`: CL commands with &O and &N), continuation lines joined as
+/// in CL: '+' goes on after the next line's leading blanks, '-' with them.
+fn cl_script(text: &str) -> Vec<String> {
+    let mut commands: Vec<String> = Vec::new();
+    let mut continued = false;
+    for line in text.lines() {
+        let line = line.trim_end();
+        if continued {
+            if let Some(prev) = commands.last_mut() {
+                let plus = prev.ends_with('+');
+                prev.pop();
+                prev.push_str(if plus { line.trim_start() } else { line });
+            }
+        } else {
+            commands.push(line.to_string());
+        }
+        let last = commands.last().map(|c| c.trim_end()).unwrap_or("");
+        continued = !last.starts_with("/*") && (last.ends_with('+') || last.ends_with('-'));
+    }
+    commands
+        .into_iter()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty() && !c.starts_with("/*"))
+        .collect()
+}
+
 /// TOBi build rules (`Rules.mk`): lines like `CONVSRV.SRVPGM: CONVSRV.bnd
 /// CONVSRV.MODULE`.
 fn read_rules(text: &str, out: &mut BTreeMap<String, (String, Vec<String>)>) {
-    for line in text.lines() {
-        let line = line.trim();
+    let mut current: Option<String> = None;
+    for raw in text.lines() {
+        // A recipe line of the rule above (`\tcl "CPYF ..."`, makei's way
+        // to make an object no rule makes): kept as `X.FILE:RECIPE`.
+        if raw.starts_with('\t') {
+            let r = raw.trim().trim_start_matches(['-', '@']).trim();
+            let command = ["cl ", "system "].iter().find_map(|p| r.strip_prefix(p));
+            if let (Some(target), Some(c)) = (&current, command) {
+                let c = c.trim().trim_matches('"').trim().to_string();
+                out.entry(format!("{target}:RECIPE"))
+                    .or_insert(("RECIPE".into(), Vec::new()))
+                    .1
+                    .push(c);
+            }
+            continue;
+        }
+        let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        current = line
+            .split_once(':')
+            .map(|(t, _)| t.trim().to_ascii_uppercase())
+            .filter(|t| !t.contains(' ') && t.contains('.'));
         let Some((target, deps)) = line.split_once(':') else {
             continue;
         };
-        // A target's variable (`X.SRVPGM: private TEXT := ...`, as makei
-        // reads them) is no rule: kept as `X.SRVPGM:TEXT`.
-        if let Some((var, value)) = deps.split_once(":=") {
+        // A target's variable (`X.SRVPGM: private TEXT := ...`, or with
+        // `=`, `::=`, `?=`, as makei reads them) is no rule: kept as
+        // `X.SRVPGM:TEXT`.
+        if let Some((var, value)) = deps.split_once('=') {
+            let var = var.trim_end_matches([':', '?', '+']);
             let var = var
                 .split_whitespace()
                 .last()
@@ -261,9 +309,6 @@ fn read_rules(text: &str, out: &mut BTreeMap<String, (String, Vec<String>)>) {
                     (var, vec![value.trim().to_string()]),
                 );
             }
-            continue;
-        }
-        if deps.trim_start().starts_with('=') {
             continue;
         }
         let Some((name, kind)) = target.trim().rsplit_once('.') else {
@@ -353,6 +398,30 @@ fn project_sources(dir: &Path) -> Vec<std::path::PathBuf> {
     }
     out.sort();
     out
+}
+
+/// A file of the project by its name (case not compared), hidden folders
+/// left out.
+fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            if n.starts_with('.') {
+                continue;
+            }
+            let p = e.path();
+            if p.is_dir() {
+                todo.push(p);
+            } else if n.eq_ignore_ascii_case(name) {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 /// A CL source with `INCLUDE SRCSTMF('a relative path')`.
@@ -792,8 +861,34 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
 
     let of_type = |t: &'static str| members.iter().filter(move |m| m.srctype == t);
 
-    // 2. Physical files and their data.
-    for m in of_type("PF") {
+    // 2. Physical files and their data; a file other files refer to
+    // (REF, REFFLD: a field reference file) before them.
+    let mut pfs: Vec<&Found> = of_type("PF").collect();
+    let mut refs: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for m in &pfs {
+        let src = source::find_member(job.client, std::slice::from_ref(&lib), &m.file, &m.member)
+            .await?
+            .source;
+        let names = crate::ddsref::referenced_files(&src)
+            .into_iter()
+            .map(|f| f.rsplit('/').next().unwrap_or(&f).to_string())
+            .filter(|f| f != &m.member)
+            .collect();
+        refs.insert(m.member.clone(), names);
+    }
+    let mut ordered: Vec<&Found> = Vec::new();
+    while !pfs.is_empty() {
+        let ready = pfs
+            .iter()
+            .position(|m| {
+                refs[&m.member]
+                    .iter()
+                    .all(|r| !pfs.iter().any(|p| &p.member == r))
+            })
+            .unwrap_or(0);
+        ordered.push(pfs.remove(ready));
+    }
+    for m in ordered {
         let existed =
             catalog::object_exists(job.client, std::slice::from_ref(&lib), &m.member, "*FILE")
                 .await?;
@@ -924,14 +1019,41 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
             step(job, &mut report, &m.member, &cmd).await;
         }
     }
+    // 3b. Objects a TOBi rule makes with CL commands of its own (a copy
+    // of a file: `TMPDETORD.FILE: DETORD.FILE` and `cl "CPYF ...
+    // CRTFILE(*YES)"`), $(OBJLIB) being the library.
+    for (key, (kind, commands)) in rules.iter() {
+        if kind != "RECIPE" {
+            continue;
+        }
+        let target = key.trim_end_matches(":RECIPE");
+        let name = target.split('.').next().unwrap_or(target);
+        for c in commands {
+            let c = c.replace("$(OBJLIB)", &lib).replace("$(BIN_LIB)", &lib);
+            if !step(job, &mut report, name, &c).await {
+                break;
+            }
+        }
+    }
     // 4. ILE: modules (TOBi rules X.MODULE, X.module.rpgle, or source with
     // ctl-opt NOMAIN), service programs from binder source (.bnd, with the
     // modules its rule names), binding directories (.bnddir scripts).
     let mut is_module = std::collections::BTreeSet::new();
-    for m in members
-        .iter()
-        .filter(|m| matches!(m.srctype.as_str(), "RPGLE" | "SQLRPGLE") && !m.included)
-    {
+    for m in members.iter().filter(|m| {
+        !m.included
+            && (matches!(m.srctype.as_str(), "RPGLE" | "SQLRPGLE")
+                || (m.srctype == "CLLE" && rules.contains_key(&format!("{}.MODULE", m.member))))
+    }) {
+        if m.srctype == "CLLE" {
+            // A CL module (TOBi rule X.MODULE: X.CLLE).
+            is_module.insert((m.file.clone(), m.member.clone()));
+            let cmd = format!(
+                "CRTCLMOD MODULE({lib}/{}) SRCFILE({lib}/{}) SRCMBR({})",
+                m.member, m.file, m.member
+            );
+            step(job, &mut report, &m.member, &cmd).await;
+            continue;
+        }
         let rule = if rules.contains_key(&format!("{}.MODULE", m.member)) {
             Some("MODULE")
         } else {
@@ -1081,6 +1203,50 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
         );
         step(job, &mut report, &m.member, &cmd).await;
     }
+    // Service programs made by an object script of their rule (X.SRVPGM:
+    // X.ILESRVPGM ...: the CRTSRVPGM command, &O the library and &N the
+    // object) and no binder source, after the service programs they bind.
+    let mut scripted: Vec<(String, PathBuf, Vec<String>)> = rules
+        .iter()
+        .filter(|(name, (kind, _))| kind == "SRVPGM" && !name.contains(['.', ':']))
+        .filter(|(name, _)| {
+            !members
+                .iter()
+                .any(|b| b.srctype == "BND" && &&b.member == name)
+        })
+        .filter_map(|(name, (_, deps))| {
+            let script = deps
+                .iter()
+                .find(|d| d.to_ascii_uppercase().ends_with(".ILESRVPGM"))
+                .and_then(|d| find_file(dir, d))?;
+            let binds = deps
+                .iter()
+                .filter_map(|d| {
+                    d.to_ascii_uppercase()
+                        .strip_suffix(".SRVPGM")
+                        .map(String::from)
+                })
+                .collect();
+            Some((name.clone(), script, binds))
+        })
+        .collect();
+    while !scripted.is_empty() {
+        let next = scripted
+            .iter()
+            .position(|(_, _, binds)| {
+                !binds
+                    .iter()
+                    .any(|b| scripted.iter().any(|(n, _, _)| n == b))
+            })
+            .unwrap_or(0);
+        let (name, script, _) = scripted.remove(next);
+        for c in cl_script(&read_text(&script)?) {
+            let c = c.replace("&O", &lib).replace("&N", &name);
+            if !step(job, &mut report, &name, &c).await {
+                break;
+            }
+        }
+    }
     // Programs bound from modules (TOBi `X.PGM: X.MODULE Y.SRVPGM`), with
     // the rule's TEXT and ACTGRP.
     for (name, (kind, deps)) in rules.iter() {
@@ -1097,6 +1263,21 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
                 .map(|d| format!("{lib}/{d}"))
                 .collect()
         };
+        // An object script (X.ILEPGM: the CRTPGM command the program was
+        // made with, &O the library and &N the object) is run as it is.
+        let script = deps.iter().find_map(|d| {
+            let u = d.to_ascii_uppercase();
+            u.ends_with(".ILEPGM").then(|| find_file(dir, d))?
+        });
+        if let Some(path) = script {
+            for c in cl_script(&read_text(&path)?) {
+                let c = c.replace("&O", &lib).replace("&N", name);
+                if !step(job, &mut report, name, &c).await {
+                    break;
+                }
+            }
+            continue;
+        }
         let modules = pick(".MODULE");
         if modules.is_empty() {
             continue;
@@ -1122,9 +1303,9 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
     for m in of_type("BNDDIR") {
         // A TOBi binding directory script: CL commands with &O (the
         // library) and &N (the object); a line starting with ! may fail.
-        let text = read_text(&m.path)?;
+        let commands = cl_script(&read_text(&m.path)?);
         let mut ok = true;
-        for line in text.lines() {
+        for line in &commands {
             let l = line.trim();
             if l.is_empty() || l.starts_with("/*") {
                 continue;
@@ -1297,6 +1478,54 @@ mod tests {
         assert_eq!(default_source_file("PF"), "QDDSSRC");
         assert_eq!(default_source_file("RPGLE"), "QRPGLESRC");
         assert_eq!(default_source_file("CLLE"), "QCLSRC");
+    }
+
+    #[test]
+    fn rules_with_target_variables_recipes_and_object_scripts() {
+        // makei's Rules.mk (IBM's tobi-example): `X: VAR = value` and
+        // `X: private VAR ::= value` set a target's variable, not its
+        // prerequisites; a tab-indented `cl "..."` line is the rule's
+        // recipe. An object script (.BNDDIR, .ILEPGM) is CL commands with
+        // CL's continuation characters ('+' skips the next line's leading
+        // blanks; CL reference, continuation).
+        let mut rules = BTreeMap::new();
+        read_rules(
+            "FCOUNTRY.SRVPGM: FCOUNTRY.BND COU300.MODULE COU301.MODULE\n\
+             FCOUNTRY.SRVPGM: TEXT = Functions Country\n\
+             VAT300.MODULE: private DBGVIEW ::= *SOURCE\n\
+             TMPDETORD.FILE: DETORD.FILE\n\
+             \tcl \"CPYF FROMFILE($(OBJLIB)/DETORD) TOFILE($(OBJLIB)/TMPDETORD) CRTFILE(*YES)\"\n",
+            &mut rules,
+        );
+        assert_eq!(
+            rules.get("FCOUNTRY").map(|r| r.1.clone()),
+            Some(vec![
+                "FCOUNTRY.BND".to_string(),
+                "COU300.MODULE".into(),
+                "COU301.MODULE".into()
+            ])
+        );
+        assert_eq!(
+            rules.get("FCOUNTRY.SRVPGM:TEXT").map(|r| r.1.clone()),
+            Some(vec!["Functions Country".to_string()])
+        );
+        assert!(rules.contains_key("VAT300.MODULE:DBGVIEW"));
+        assert_eq!(
+            rules.get("TMPDETORD.FILE:RECIPE").map(|r| r.1.clone()),
+            Some(vec![
+                "CPYF FROMFILE($(OBJLIB)/DETORD) TOFILE($(OBJLIB)/TMPDETORD) CRTFILE(*YES)"
+                    .to_string()
+            ])
+        );
+        assert_eq!(
+            cl_script(
+                "/* a comment */\n!DLTOBJ OBJ(&O/&N) OBJTYPE(*BNDDIR)\nADDBNDDIRE BNDDIR(&O/&N) +\n   OBJ((*LIBL/XML *SRVPGM) +\n       (*LIBL/TXT *SRVPGM))\n"
+            ),
+            [
+                "!DLTOBJ OBJ(&O/&N) OBJTYPE(*BNDDIR)",
+                "ADDBNDDIRE BNDDIR(&O/&N) OBJ((*LIBL/XML *SRVPGM) (*LIBL/TXT *SRVPGM))"
+            ]
+        );
     }
 
     #[test]

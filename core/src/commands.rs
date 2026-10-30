@@ -1761,13 +1761,99 @@ impl Job<'_> {
         for s in &b.prv_signatures {
             info.push(("Previous signature".into(), s.clone()));
         }
+        let print = self.srvpgm_print(cmd, &lib, &name, &b).await?;
         Ok(Outcome::Display(ListDisplay {
             title: "Display Service Program Information".into(),
             info,
             heading: String::new(),
             rows,
+            print,
             ..Default::default()
         }))
+    }
+
+    /// DSPSRVPGM DETAIL(*SIGNATURE) or DETAIL(*PROCEXP) printed: the
+    /// service program's header and its signatures (current first) or
+    /// procedure exports. Layout: PUB400 (IBM i 7.5), tools/golden/
+    /// verify28.txt u28_sigs, u28_exps (2026-10-30). Other details are
+    /// not printed (docs/fidelity-gaps.md).
+    async fn srvpgm_print(
+        &self,
+        cmd: &Command,
+        lib: &str,
+        name: &str,
+        b: &crate::ile::Binding,
+    ) -> Result<Vec<String>> {
+        let details: Vec<String> = cmd
+            .list("DETAIL")
+            .iter()
+            .map(|d| d.trim().to_ascii_uppercase())
+            .collect();
+        let wanted: Vec<&str> = details
+            .iter()
+            .map(String::as_str)
+            .filter(|d| matches!(*d, "*SIGNATURE" | "*PROCEXP"))
+            .collect();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (owner, attribute) = match self
+            .client
+            .query_opt(
+                "SELECT owner, attribute FROM as4tainr.objects
+                 WHERE library=$1 AND name=$2 AND objtype='*SRVPGM'",
+                &[&lib, &name],
+            )
+            .await?
+        {
+            Some(r) => (r.get::<_, String>(0), r.get::<_, String>(1)),
+            None => (String::new(), String::new()),
+        };
+        use crate::report::at;
+        let stamp = crate::report::Stamp::now();
+        let system = crate::report::system_name();
+        let mut print = Vec::new();
+        for (page, detail) in wanted.iter().enumerate() {
+            let [h1, h2] = crate::report::header_b(
+                41,
+                "Display Service Program Information",
+                &system,
+                &stamp,
+                page as u32 + 1,
+            );
+            print.push(h1);
+            print.push(h2);
+            print.push(format!(
+                " Service program  . . . . . . . . . . . . :   {name}"
+            ));
+            print.push(format!(
+                "   Library  . . . . . . . . . . . . . . . :     {lib}"
+            ));
+            print.push(format!(
+                " Owner  . . . . . . . . . . . . . . . . . :   {owner}"
+            ));
+            print.push(format!(
+                " Service program attribute  . . . . . . . :   {attribute}"
+            ));
+            print.push(format!(
+                " Detail . . . . . . . . . . . . . . . . . :   {detail}"
+            ));
+            if *detail == "*SIGNATURE" {
+                print.push(at(&[(61, "Signatures:")]));
+                print.push(format!(" {}", crate::ile::signature_hex(&b.signature)));
+                for s in &b.prv_signatures {
+                    print.push(format!(" {}", crate::ile::signature_hex(s)));
+                }
+            } else {
+                print.push(at(&[(58, "Procedure Exports:")]));
+                print.push(at(&[(2, "Procedure Name"), (77, "ARGOPT")]));
+                for e in &b.exports {
+                    print.push(at(&[(2, e), (77, "*NO")]));
+                }
+            }
+        }
+        print.push(crate::report::END_OBJD.into());
+        Ok(print)
     }
 
     /// UPDPGM, UPDSRVPGM: replace modules of a program or service program
@@ -3046,7 +3132,17 @@ impl Job<'_> {
             (String::new(), String::new())
         } else {
             let m = self.source_member(cmd, &name).await?;
-            (m.source, m.text)
+            let source = crate::ddsref::expand_from_catalog(
+                self.client,
+                &self.library_list(),
+                &m.source,
+                crate::ddsref::Kind::Device,
+            )
+            .await
+            .map_err(|e| {
+                anyhow!("{e:#}\nCPF7302: File {name} was not created in library {lib}.")
+            })?;
+            (source, m.text)
         };
         let size: Vec<String> = cmd
             .list("PAGESIZE")
@@ -3133,7 +3229,17 @@ impl Job<'_> {
         let mut c = runtime::connect_db(&self.env.database_url).await?;
         let msg = match cmd.def.name {
             "CRTPF" => {
-                let mut pf = match crate::dds::parse_pf(&name, &m.source) {
+                // Reference fields (R in position 29) take their attributes
+                // from the files REF and REFFLD name (ddsref.rs).
+                let expanded = crate::ddsref::expand_from_catalog(
+                    self.client,
+                    &self.library_list(),
+                    &m.source,
+                    crate::ddsref::Kind::Database,
+                )
+                .await;
+                let parsed = expanded.and_then(|src| crate::dds::parse_pf(&name, &src));
+                let mut pf = match parsed {
                     Ok(pf) => pf,
                     Err(e) if !rcdlen => {
                         return Err(self.dds_failed(cmd, &m, &lib, &name, true, e).await);
@@ -3225,10 +3331,17 @@ impl Job<'_> {
                 ]));
             }
             _ => {
+                let source = crate::ddsref::expand_from_catalog(
+                    self.client,
+                    &self.library_list(),
+                    &m.source,
+                    crate::ddsref::Kind::Device,
+                )
+                .await?;
                 if cmd.get("REPLACE") == "*NO" {
-                    catalog::create_display_file(&mut c, &lib, &name, &m.source).await?;
+                    catalog::create_display_file(&mut c, &lib, &name, &source).await?;
                 } else {
-                    catalog::replace_display_file(&mut c, &lib, &name, &m.source).await?;
+                    catalog::replace_display_file(&mut c, &lib, &name, &source).await?;
                 }
                 format!("Display file {name} created in library {lib}.")
             }

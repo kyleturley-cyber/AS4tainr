@@ -1,0 +1,491 @@
+//! Reference fields in DDS (physical, display and printer files): R in
+//! position 29 gives a field the attributes of another one, found with
+//! REFFLD and the file-level REF keyword. Written from IBM's DDS
+//! reference for physical and logical files (position 29; REF, REFFLD)
+//! and DDS concepts (appendix B: when to specify REF and REFFLD):
+//!
+//! - the referenced field is the field's own name, or REFFLD's
+//!   `[format/]field`; it is looked for in REFFLD's file, `*SRC` (a
+//!   field defined earlier in the same source), or else the REF file, or
+//!   else the same source;
+//! - the length, data type and decimal positions are copied unless the
+//!   referring field gives them; a length or decimal positions of `+n` or
+//!   `-n` changes the referenced one;
+//! - keywords copied unless the referring field has its own: ALIAS,
+//!   COLHDG, DATFMT, DATSEP (not with DATFMT *ISO, *EUR, *USA or *JIS),
+//!   FLTPCN, REFSHIFT, TEXT, TIMFMT, TIMSEP, VARLEN; the editing keywords
+//!   (EDTCDE, EDTWRD) unless the field has one, and the validity checking
+//!   keywords (CHECK, CHKMSGID, COMP, CMP, RANGE, VALUES) unless it has
+//!   one; neither when it gives its own data type, length or decimals.
+//!
+//! `expand` rewrites the source with each referring field's attributes in
+//! positions 30-37 and the copied keywords at the end of its keyword
+//! area, so the parsers (dds.rs, dspf.rs, prtf.rs) see plain fields; line
+//! numbers stay as they were. A display or printer file has no packed or
+//! binary fields: a reference to one is zoned (S).
+
+use std::collections::HashMap;
+
+use anyhow::{anyhow, bail, Result};
+use tokio_postgres::Client;
+
+use crate::dds::{keyword_name, split_keywords, DataType, PhysicalFile};
+
+/// The kind of file the source describes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    Database,
+    Device,
+}
+
+fn cols(line: &str, from: usize, to: usize) -> String {
+    line.chars()
+        .skip(from - 1)
+        .take(to.saturating_sub(from).saturating_add(1))
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// A field's attributes as a reference copies them.
+#[derive(Clone, Debug)]
+struct Attrs {
+    code: String,
+    length: u32,
+    decimals: u32,
+    numeric: bool,
+    /// Keywords as written (TEXT, COLHDG, EDTCDE...).
+    keywords: Vec<String>,
+}
+
+fn of_field(f: &crate::dds::FieldDef) -> Attrs {
+    let mut keywords = Vec::new();
+    if !f.text.is_empty() {
+        keywords.push(format!("TEXT('{}')", f.text.replace('\'', "''")));
+    }
+    if let Some(a) = &f.alias {
+        keywords.push(format!("ALIAS({a})"));
+    }
+    if f.varlen {
+        keywords.push("VARLEN".into());
+    }
+    if f.double {
+        keywords.push("FLTPCN(*DOUBLE)".into());
+    }
+    keywords.extend(split_keywords(&f.keywords));
+    Attrs {
+        code: f.data_type.code().to_string(),
+        length: f.length,
+        decimals: f.decimals,
+        numeric: f.data_type.is_numeric(),
+        keywords,
+    }
+}
+
+/// REFFLD's arguments: (field, file or `*SRC`, if given).
+fn reffld(keywords: &[String]) -> Option<(String, Option<String>)> {
+    let k = keywords.iter().find(|k| keyword_name(k) == "REFFLD")?;
+    let inner = k.split_once('(')?.1.trim_end_matches(')');
+    let mut parts = inner.split_whitespace();
+    let field = parts.next()?.to_ascii_uppercase();
+    let field = field.rsplit('/').next().unwrap_or(&field).to_string();
+    Some((field, parts.next().map(|f| f.to_ascii_uppercase())))
+}
+
+fn file_level_ref(source: &str) -> Option<String> {
+    for line in source.lines() {
+        if cols(line, 7, 7) == "*" || line.trim().is_empty() {
+            continue;
+        }
+        if !cols(line, 17, 17).is_empty() {
+            return None;
+        }
+        for k in split_keywords(&cols(line, 45, usize::MAX)) {
+            if keyword_name(&k) == "REF" {
+                let inner = k.split_once('(')?.1.trim_end_matches(')').to_string();
+                return inner
+                    .split_whitespace()
+                    .next()
+                    .map(|f| f.to_ascii_uppercase());
+            }
+        }
+    }
+    None
+}
+
+/// The database files the source refers to (REF, REFFLD), as written.
+pub fn referenced_files(source: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(f) = file_level_ref(source) {
+        out.push(f);
+    }
+    let mut joined: Vec<String> = Vec::new();
+    for line in source.lines() {
+        if cols(line, 7, 7) == "*" {
+            continue;
+        }
+        let area = cols(line, 45, usize::MAX);
+        match joined.last_mut() {
+            Some(prev) if prev.ends_with('-') => {
+                prev.pop();
+                let raw: String = line.chars().skip(44).collect();
+                prev.push_str(raw.trim_end());
+            }
+            Some(prev) if prev.ends_with('+') => {
+                prev.pop();
+                prev.push_str(&area);
+            }
+            _ => joined.push(area),
+        }
+    }
+    for area in &joined {
+        let kws = split_keywords(area);
+        if let Some((_, Some(f))) = reffld(&kws) {
+            if f != "*SRC" && !out.contains(&f) {
+                out.push(f);
+            }
+        }
+    }
+    out
+}
+
+/// Positions 7-44 blank: a line of keywords for the entry above it.
+fn keyword_line(line: &str) -> bool {
+    cols(line, 7, 44).is_empty() && !cols(line, 45, usize::MAX).is_empty()
+}
+
+fn adjust(given: &str, referenced: u32) -> Result<(u32, bool)> {
+    let given = given.trim();
+    if given.is_empty() {
+        return Ok((referenced, false));
+    }
+    let n = |s: &str| {
+        s.parse::<u32>()
+            .map_err(|_| anyhow!("'{given}' is not a length or decimal positions"))
+    };
+    Ok(if let Some(d) = given.strip_prefix('+') {
+        (referenced + n(d)?, true)
+    } else if let Some(d) = given.strip_prefix('-') {
+        (referenced.saturating_sub(n(d)?), true)
+    } else {
+        (n(given)?, true)
+    })
+}
+
+/// Give each referring field (R in position 29) its attributes; `files`
+/// holds the referenced database files by the name the source gives them.
+pub fn expand(source: &str, kind: Kind, files: &HashMap<String, PhysicalFile>) -> Result<String> {
+    let mut lines: Vec<String> = source
+        .lines()
+        .map(|l| l.trim_end_matches('\r').to_string())
+        .collect();
+    let file_ref = file_level_ref(source);
+    // Fields defined so far in this source (*SRC), by name.
+    let mut earlier: HashMap<String, Attrs> = HashMap::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].clone();
+        if cols(&line, 7, 7) == "*" || line.trim().is_empty() || keyword_line(&line) {
+            i += 1;
+            continue;
+        }
+        // The entry: this line and the keyword lines after it.
+        let mut last = i;
+        let mut keyword_text = cols(&line, 45, usize::MAX);
+        while last + 1 < lines.len() {
+            let next = &lines[last + 1];
+            if cols(next, 7, 7) == "*" {
+                break;
+            }
+            let more = cols(next, 45, usize::MAX);
+            if keyword_text.ends_with('-') {
+                // Continued as is (positions 45 on of the next line).
+                keyword_text.pop();
+                let raw: String = next.chars().skip(44).collect();
+                keyword_text.push_str(raw.trim_end());
+                last += 1;
+            } else if keyword_text.ends_with('+') {
+                keyword_text.pop();
+                keyword_text.push_str(&more);
+                last += 1;
+            } else if keyword_line(next) {
+                keyword_text.push(' ');
+                keyword_text.push_str(&more);
+                last += 1;
+            } else {
+                break;
+            }
+        }
+        let name = cols(&line, 19, 28).to_ascii_uppercase();
+        let named_field = cols(&line, 17, 17).is_empty() && !name.is_empty();
+        if !named_field {
+            i = last + 1;
+            continue;
+        }
+        let keywords = split_keywords(&keyword_text);
+        let own = |k: &str| keywords.iter().any(|w| keyword_name(w) == k);
+        if !cols(&line, 29, 29).eq_ignore_ascii_case("R") {
+            // A field of its own: noted for *SRC references.
+            let (len, _) = adjust(&cols(&line, 30, 34), 0).unwrap_or((0, false));
+            let (dec, _) = adjust(&cols(&line, 36, 37), 0).unwrap_or((0, false));
+            let code = cols(&line, 35, 35).to_ascii_uppercase();
+            let numeric = !cols(&line, 36, 37).is_empty()
+                || matches!(code.as_str(), "P" | "S" | "B" | "F" | "Y" | "I" | "N");
+            earlier.insert(
+                name.clone(),
+                Attrs {
+                    code: if code.is_empty() {
+                        if numeric {
+                            if kind == Kind::Database { "P" } else { "S" }.into()
+                        } else {
+                            "A".into()
+                        }
+                    } else {
+                        code
+                    },
+                    length: len,
+                    decimals: dec,
+                    numeric,
+                    keywords: keywords.clone(),
+                },
+            );
+            i = last + 1;
+            continue;
+        }
+        let (ref_name, ref_file) = match reffld(&keywords) {
+            Some((f, file)) => (f, file),
+            None => (name.clone(), None),
+        };
+        let from = ref_file.or_else(|| file_ref.clone());
+        let referenced = match from.as_deref() {
+            None | Some("*SRC") => earlier.get(&ref_name).cloned().ok_or_else(|| {
+                anyhow!(
+                    "line {}: field {name} refers to {ref_name}, not defined before it",
+                    i + 1
+                )
+            })?,
+            Some(file) => {
+                let pf = files.get(file).ok_or_else(|| {
+                    anyhow!(
+                        "line {}: file {file} that field {name} refers to not found",
+                        i + 1
+                    )
+                })?;
+                let f = pf
+                    .fields
+                    .iter()
+                    .find(|f| f.name == ref_name)
+                    .ok_or_else(|| {
+                        anyhow!(
+                        "line {}: field {name} refers to {ref_name}, not a field of file {file}",
+                        i + 1
+                    )
+                    })?;
+                of_field(f)
+            }
+        };
+        let (length, len_given) = adjust(&cols(&line, 30, 34), referenced.length)
+            .map_err(|e| anyhow!("line {}: {e}", i + 1))?;
+        let (decimals, dec_given) = adjust(&cols(&line, 36, 37), referenced.decimals)
+            .map_err(|e| anyhow!("line {}: {e}", i + 1))?;
+        let given_code = cols(&line, 35, 35).to_ascii_uppercase();
+        let type_given = !given_code.is_empty();
+        let mut code = if type_given {
+            given_code
+        } else {
+            referenced.code.clone()
+        };
+        if kind == Kind::Device && matches!(code.as_str(), "P" | "B") {
+            code = "S".into();
+        }
+        let numeric = match DataType::from_code(&code) {
+            Ok(t) => t.is_numeric(),
+            Err(_) => referenced.numeric || code == "Y",
+        };
+        let fixed = DataType::from_code(&code)
+            .ok()
+            .and_then(|t| t.fixed_length())
+            .is_some();
+        let attrs_given = type_given || len_given || dec_given;
+        // Keywords copied.
+        let mut copied: Vec<String> = Vec::new();
+        let datfmt_iso = keywords
+            .iter()
+            .chain(referenced.keywords.iter())
+            .find(|k| keyword_name(k) == "DATFMT")
+            .is_some_and(|k| {
+                let u = k.to_ascii_uppercase();
+                ["*ISO", "*EUR", "*USA", "*JIS"]
+                    .iter()
+                    .any(|f| u.contains(f))
+            });
+        let editing = ["EDTCDE", "EDTWRD"];
+        let validity = ["CHECK", "CHKMSGID", "COMP", "CMP", "RANGE", "VALUES"];
+        let has_editing = editing.iter().any(|k| own(k));
+        let has_validity = validity.iter().any(|k| own(k));
+        for k in &referenced.keywords {
+            let n = keyword_name(k);
+            let take = match n.as_str() {
+                "EDTCDE" | "EDTWRD" => !has_editing && !attrs_given,
+                "CHECK" | "CHKMSGID" | "COMP" | "CMP" | "RANGE" | "VALUES" => {
+                    !has_validity && !attrs_given
+                }
+                "DATSEP" => !own("DATSEP") && !datfmt_iso,
+                "COLHDG" | "ALIAS" | "VARLEN" | "FLTPCN" if kind == Kind::Device => false,
+                "TEXT" | "COLHDG" | "ALIAS" | "VARLEN" | "FLTPCN" | "DATFMT" | "TIMFMT"
+                | "TIMSEP" | "REFSHIFT" => !own(&n),
+                _ => false,
+            };
+            if take {
+                copied.push(k.clone());
+            }
+        }
+        // Positions 29-37 rewritten.
+        let mut chars: Vec<char> = line.chars().collect();
+        if chars.len() < 44 {
+            chars.resize(44, ' ');
+        }
+        let len_text = if fixed {
+            String::new()
+        } else {
+            length.to_string()
+        };
+        let dec_text = if numeric && !fixed {
+            decimals.to_string()
+        } else {
+            String::new()
+        };
+        let positional = format!(" {len_text:>5}{code:1}{dec_text:>2}");
+        if positional.chars().count() != 9 {
+            bail!("line {}: field {name}: attributes do not fit", i + 1);
+        }
+        for (k, c) in positional.chars().enumerate() {
+            chars[28 + k] = c;
+        }
+        lines[i] = chars.into_iter().collect::<String>();
+        if !copied.is_empty() {
+            let mut l = lines[last].clone();
+            if l.chars().count() < 44 {
+                let n = 44 - l.chars().count();
+                l.push_str(&" ".repeat(n));
+            }
+            l.push(' ');
+            l.push_str(&copied.join(" "));
+            lines[last] = l;
+        }
+        let mut all = keywords.clone();
+        all.extend(copied);
+        earlier.insert(
+            name.clone(),
+            Attrs {
+                code,
+                length,
+                decimals,
+                numeric,
+                keywords: all,
+            },
+        );
+        i = last + 1;
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    Ok(out)
+}
+
+/// `expand` with the referenced files found in the catalog (a library
+/// given, or the library list).
+pub async fn expand_from_catalog(
+    client: &Client,
+    libl: &[String],
+    source: &str,
+    kind: Kind,
+) -> Result<String> {
+    let mut files = HashMap::new();
+    let mut has_ref = false;
+    for line in source.lines() {
+        if cols(line, 7, 7) != "*" && cols(line, 29, 29).eq_ignore_ascii_case("R") {
+            has_ref = true;
+            break;
+        }
+    }
+    if !has_ref {
+        return Ok(source.to_string());
+    }
+    for spec in referenced_files(source) {
+        let spec_lookup = spec.trim_start_matches("*LIBL/").to_string();
+        if let Ok(f) = crate::catalog::resolve_file(client, libl, &spec_lookup).await {
+            files.insert(spec, f.file);
+        }
+    }
+    expand(source, kind, &files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // DDS concepts, appendix B and the example of a field reference file:
+    // R with REFFLD takes the referenced field's attributes; a field's own
+    // keyword (COLHDG) wins over the referenced one; "+2" in the length
+    // makes the field two longer (DDS reference, position 29 example
+    // `SUPNBR R +2 REFFLD(SUPID SUPLIB/SUPMST)`).
+    #[test]
+    fn referring_fields_take_the_referenced_attributes() {
+        let refsrc = "     A          R REFR
+     A            NAME          20A         TEXT('Name') COLHDG('Name')
+     A            AMOUNT         7P 2       EDTCDE(2)
+";
+        let refpf = crate::dds::parse_pf("REFF", refsrc).unwrap();
+        let mut files = HashMap::new();
+        files.insert("REFF".to_string(), refpf);
+        let src = "     A                                      REF(REFF)
+     A          R REC
+     A            NAME      R
+     A            ADDR      R               REFFLD(NAME)
+     A                                      COLHDG('Address')
+     A            CITY      R               REFFLD(ADDR *SRC)
+     A            AMOUNT    R
+     A            BIGAMT    R   +2          REFFLD(AMOUNT)
+";
+        let out = expand(src, Kind::Database, &files).unwrap();
+        let pf = crate::dds::parse_pf("X", &out).unwrap();
+        let f = |n: &str| pf.fields.iter().find(|f| f.name == n).unwrap().clone();
+        assert_eq!(
+            (f("NAME").data_type, f("NAME").length),
+            (DataType::Char, 20)
+        );
+        assert_eq!(f("NAME").text, "Name");
+        assert_eq!(f("ADDR").keywords, "COLHDG('Address')");
+        assert_eq!(f("ADDR").text, "Name");
+        assert_eq!(f("CITY").keywords, "COLHDG('Address')");
+        assert_eq!(
+            (
+                f("AMOUNT").data_type,
+                f("AMOUNT").length,
+                f("AMOUNT").decimals
+            ),
+            (DataType::Packed, 7, 2)
+        );
+        assert_eq!(f("AMOUNT").keywords, "EDTCDE(2)");
+        // A length of its own: the editing keywords are not copied.
+        assert_eq!((f("BIGAMT").length, f("BIGAMT").decimals), (9, 2));
+        assert_eq!(f("BIGAMT").keywords, "");
+        // Line numbers stay.
+        assert_eq!(out.lines().count(), src.lines().count());
+        // A display file: packed becomes zoned (S).
+        let d = expand(
+            "     A                                      REF(REFF)\n     A          R SCR\n     A            AMOUNT    R        B  5  2\n",
+            Kind::Device,
+            &files,
+        )
+        .unwrap();
+        assert!(d.contains("AMOUNT         7S 2B  5  2"), "{d}");
+        assert!(d.trim_end().ends_with(" EDTCDE(2)"), "{d}");
+        assert!(expand(
+            "     A          R REC\n     A            X         R\n",
+            Kind::Database,
+            &HashMap::new()
+        )
+        .is_err());
+    }
+}

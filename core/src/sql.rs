@@ -527,11 +527,29 @@ async fn system_column_names(client: &Client, libl: &[String], sql: &str) -> Res
     if names.is_empty() || libl.is_empty() {
         return Ok(sql.to_string());
     }
+    // The files the statement names (by system or SQL name): only their
+    // columns count, when it names any.
+    let all_words: Vec<String> = words
+        .iter()
+        .map(|(a, b)| sql[*a..*b].to_ascii_uppercase())
+        .collect();
+    let named_files: Vec<String> = client
+        .query(
+            "SELECT DISTINCT name FROM as4tainr.files
+              WHERE library = ANY($1) AND (name = ANY($2) OR upper(sql_name) = ANY($2))",
+            &[&libl, &all_words],
+        )
+        .await?
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
+    let scope = !named_files.is_empty();
     let rows = client
         .query(
             "SELECT DISTINCT name, alias FROM as4tainr.file_fields
-              WHERE library = ANY($1) AND alias IS NOT NULL AND alias <> name AND name = ANY($2)",
-            &[&libl, &names],
+              WHERE library = ANY($1) AND alias IS NOT NULL AND alias <> name AND name = ANY($2)
+                AND (NOT $4 OR file = ANY($3))",
+            &[&libl, &names, &named_files, &scope],
         )
         .await?;
     if rows.is_empty() {
@@ -551,9 +569,10 @@ async fn system_column_names(client: &Client, libl: &[String], sql: &str) -> Res
     // A name that is some file's own column (SQL name) stays as it is.
     let real: Vec<String> = client
         .query(
-            "SELECT DISTINCT alias FROM as4tainr.file_fields
-              WHERE library = ANY($1) AND alias = ANY($2)",
-            &[&libl, &names],
+            "SELECT DISTINCT coalesce(alias, name) FROM as4tainr.file_fields
+              WHERE library = ANY($1) AND coalesce(alias, name) = ANY($2)
+                AND (NOT $4 OR file = ANY($3))",
+            &[&libl, &names, &named_files, &scope],
         )
         .await?
         .into_iter()
@@ -3090,9 +3109,11 @@ async fn create_view_locked(
     if r.is_err() {
         let _ = session.client.batch_execute("ROLLBACK").await;
     }
-    let revoke = client
-        .batch_execute(&format!("REVOKE CREATE ON SCHEMA {schema} FROM {SQL_ROLE}"))
-        .await;
+    let revoke = batch_retrying(
+        client,
+        &format!("REVOKE CREATE ON SCHEMA {schema} FROM {SQL_ROLE}"),
+    )
+    .await;
     r.map_err(|e| map_error(&e, &text))?;
     revoke?;
     Ok(())
@@ -3116,16 +3137,34 @@ pub(crate) async fn define_as_sql_role(
         let _ = client.batch_execute(catalog::ROLE_DDL_UNLOCK).await;
         return Err(e.into());
     }
-    let r = session
-        .client
-        .batch_execute(&format!("BEGIN; {text}; COMMIT;"))
-        .await;
-    if r.is_err() {
-        let _ = session.client.batch_execute("ROLLBACK").await;
-    }
-    let revoke = client
-        .batch_execute(&format!("REVOKE CREATE ON SCHEMA {schema} FROM {SQL_ROLE}"))
-        .await;
+    // Retried when PostgreSQL saw a catalog row changed by another
+    // session at the same moment (concurrent definitions on one cluster).
+    let mut tries = 0;
+    let r = loop {
+        let r = session
+            .client
+            .batch_execute(&format!("BEGIN; {text}; COMMIT;"))
+            .await;
+        if r.is_err() {
+            let _ = session.client.batch_execute("ROLLBACK").await;
+        }
+        match r {
+            Err(e)
+                if tries < 5
+                    && e.as_db_error()
+                        .is_some_and(|d| d.message().starts_with("tuple concurrently")) =>
+            {
+                tries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50 * tries)).await;
+            }
+            r => break r,
+        }
+    };
+    let revoke = batch_retrying(
+        client,
+        &format!("REVOKE CREATE ON SCHEMA {schema} FROM {SQL_ROLE}"),
+    )
+    .await;
     let _ = client.batch_execute(catalog::ROLE_DDL_UNLOCK).await;
     r.map_err(|e| map_error(&e, text))?;
     revoke?;

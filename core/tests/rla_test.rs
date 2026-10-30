@@ -20724,3 +20724,339 @@ exec sql close c;
         .collect();
     assert_eq!(rows, [(1, 15), (3, 30)]);
 }
+
+/// DSPSRVPGM DETAIL(*SIGNATURE) and DETAIL(*PROCEXP) printed, as PUB400
+/// (IBM i 7.5) printed them for a service program made from binder source
+/// with two PGMLVL(*CURRENT) blocks, signatures 'GLD28 V2' (first, two
+/// exports) and 'GLD28 V1' (one export): tools/golden/verify28.txt
+/// u28_sigs (the header lines "Service program", "Library", "Owner",
+/// "Service program attribute", "Detail", "Signatures:" at column 61, the
+/// current signature C7D3C4F2F840E5F2 and blanks first, then the other)
+/// and u28_exps ("Procedure Exports:" at column 58, ARGOPT at column 77,
+/// *NO for each export, in the first block's order).
+#[tokio::test]
+async fn dspsrvpgm_signatures_and_procedure_exports_printed() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    cl_cmd(&mut job, format!("CRTSRCPF FILE({lib}/QSRC) RCDLEN(112)"))
+        .await
+        .unwrap();
+    for (name, t, text) in [
+        (
+            "GLD28M",
+            "RPGLE",
+            "**FREE\nctl-opt nomain;\ndcl-proc gld28one export;\n  dcl-pi *n int(10) end-pi;\n  return 1;\nend-proc;\ndcl-proc gld28two export;\n  dcl-pi *n int(10) end-pi;\n  return 2;\nend-proc;\n",
+        ),
+        (
+            "GLD28B",
+            "BND",
+            "STRPGMEXP PGMLVL(*CURRENT) SIGNATURE('GLD28 V2')\n  EXPORT SYMBOL(GLD28ONE)\n  EXPORT SYMBOL(GLD28TWO)\nENDPGMEXP\nSTRPGMEXP PGMLVL(*CURRENT) SIGNATURE('GLD28 V1')\n  EXPORT SYMBOL(GLD28ONE)\nENDPGMEXP\n",
+        ),
+    ] {
+        source::put_member(
+            &client,
+            &source::Member {
+                library: lib.clone(),
+                file: "QSRC".into(),
+                name: name.into(),
+                srctype: t.into(),
+                source: text.into(),
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/GLD28M) SRCFILE({lib}/QSRC)"),
+        format!(
+            "CRTSRVPGM SRVPGM({lib}/GLD28M) MODULE({lib}/GLD28M) SRCFILE({lib}/QSRC) SRCMBR(GLD28B)"
+        ),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    let print = |d: Outcome| match d {
+        Outcome::Display(d) => d.print,
+        other => panic!("{other:?}"),
+    };
+    let sigs = print(
+        job.run(&format!(
+            "DSPSRVPGM SRVPGM({lib}/GLD28M) DETAIL(*SIGNATURE) OUTPUT(*PRINT)"
+        ))
+        .await
+        .unwrap(),
+    );
+    // Lines 3 on (the two header lines carry the date and system).
+    assert_eq!(
+        sigs[2..],
+        [
+            " Service program  . . . . . . . . . . . . :   GLD28M".to_string(),
+            format!("   Library  . . . . . . . . . . . . . . . :     {lib}"),
+            " Owner  . . . . . . . . . . . . . . . . . :   QSECOFR".into(),
+            " Service program attribute  . . . . . . . :   RPGLE".into(),
+            " Detail . . . . . . . . . . . . . . . . . :   *SIGNATURE".into(),
+            format!("{}Signatures:", " ".repeat(60)),
+            " C7D3C4F2F840E5F24040404040404040".into(),
+            " C7D3C4F2F840E5F14040404040404040".into(),
+            format!(
+                "{}* * * * *   E N D   O F   L I S T I N G   * * * * *",
+                " ".repeat(40)
+            ),
+        ]
+    );
+    assert!(
+        sigs[0].starts_with(&format!(
+            "{}Display Service Program Information",
+            " ".repeat(40)
+        )),
+        "{sigs:?}"
+    );
+    let exps = print(
+        job.run(&format!(
+            "DSPSRVPGM SRVPGM({lib}/GLD28M) DETAIL(*PROCEXP) OUTPUT(*PRINT)"
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        exps[6..],
+        [
+            " Detail . . . . . . . . . . . . . . . . . :   *PROCEXP".to_string(),
+            format!("{}Procedure Exports:", " ".repeat(57)),
+            format!(" Procedure Name{}ARGOPT", " ".repeat(61)),
+            format!(" GLD28ONE{}*NO", " ".repeat(67)),
+            format!(" GLD28TWO{}*NO", " ".repeat(67)),
+            format!(
+                "{}* * * * *   E N D   O F   L I S T I N G   * * * * *",
+                " ".repeat(40)
+            ),
+        ]
+    );
+}
+
+/// What IBM's TOBi example project (github.com/IBM/tobi-example) needed,
+/// tools/legacy.sh: its VAT300 and CUS300 unit tests pass.
+///
+/// - DDS reference fields (iSeries DDS Reference: Physical and Logical
+///   Files, position 29, REF and REFFLD; DDS Concepts, appendix B): R takes
+///   the referenced field's length, type, decimals, TEXT and COLHDG; the
+///   file is REFFLD's, else REF's, else the same source (*SRC); `+2` makes
+///   it two longer, `-5` five shorter; a COLHDG of its own wins; a length
+///   of its own stops the editing keywords being copied.
+/// - CREATE TRIGGER with a name longer than 10 characters, PROGRAM NAME
+///   and SET OPTION before its body (Db2 for i SQL Reference, CREATE
+///   TRIGGER); LABEL ON SEQUENCE, shown as SYSSEQUENCES' SEQUENCE_TEXT.
+/// - A bound call to another module's cycle main procedure by the
+///   module's name (ILE RPG Programmer's Guide, "Using a bound call").
+/// - A basing pointer named only by an unnamed data structure's BASED is
+///   defined implicitly (ILE RPG Reference, BASED); CLEAR of a record
+///   format clears its fields (ILE RPG Reference, CLEAR).
+/// - A column named by its system name refers to the tables the statement
+///   names: another table's column of that system name with a longer SQL
+///   name does not change it (Db2 for i SQL Reference, column names).
+#[tokio::test]
+async fn tobi_example_dds_references_triggers_and_bound_main_calls() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    cl_cmd(&mut job, format!("CRTSRCPF FILE({lib}/QSRC) RCDLEN(112)"))
+        .await
+        .unwrap();
+    let put = |name: &str, srctype: &str, src: &str| source::Member {
+        library: lib.clone(),
+        file: "QSRC".into(),
+        name: name.into(),
+        srctype: srctype.into(),
+        source: src.into(),
+        ..Default::default()
+    };
+    for m in [
+        put(
+            "REFR",
+            "PF",
+            "     A          R REFRR
+     A            NAME          20A         TEXT('Name')
+     A                                      COLHDG('Name')
+     A            AMOUNT         7P 2       TEXT('Amount')
+     A                                      EDTCDE(2)
+     A            WHEN            L         TEXT('When')
+",
+        ),
+        put(
+            "REFP",
+            "PF",
+            "     A                                      REF(REFR)
+     A          R REFPR
+     A            NAME      R
+     A            ADDR      R               REFFLD(NAME)
+     A                                      COLHDG('Address')
+     A            CITY      R               REFFLD(ADDR *SRC)
+     A            AMOUNT    R
+     A            BIGAMT    R   +2          REFFLD(AMOUNT)
+     A            SHORT     R   -5          REFFLD(NAME)
+     A            WHEN      R
+",
+        ),
+        put(
+            "REFD",
+            "DSPF",
+            "     A                                      REF(REFR)
+     A          R REFDR
+     A            NAME      R        B  3  2
+     A            AMOUNT    R        B  4  2
+",
+        ),
+        put(
+            "MAINB",
+            "RPGLE",
+            "     D mainb           pr
+     D  n                            10a
+     D mainb           pi
+     D  n                            10a
+      /free
+        n = 'from B';
+        *inlr = *on;
+      /end-free
+",
+        ),
+        put(
+            "MAINA",
+            "RPGLE",
+            "**FREE
+dcl-pr callb extproc('MAINB');
+  n char(10);
+end-pr;
+dcl-ds *n based(p1);
+  pos int(10);
+end-ds;
+dcl-s spot int(10) inz(7);
+dcl-s r char(10);
+callb(r);
+p1 = %addr(spot);
+dsply (%trim(r) + ' ' + %char(pos));
+*inlr = *on;
+",
+        ),
+    ] {
+        source::put_member(&client, &m, false).await.unwrap();
+    }
+    for c in [
+        format!("CRTPF FILE({lib}/REFR) SRCFILE({lib}/QSRC)"),
+        format!("CRTPF FILE({lib}/REFP) SRCFILE({lib}/QSRC)"),
+        format!("CRTDSPF FILE({lib}/REFD) SRCFILE({lib}/QSRC)"),
+        format!("CRTRPGMOD MODULE({lib}/MAINA) SRCFILE({lib}/QSRC)"),
+        format!("CRTRPGMOD MODULE({lib}/MAINB) SRCFILE({lib}/QSRC)"),
+        format!("CRTPGM PGM({lib}/MAINA) MODULE({lib}/MAINA {lib}/MAINB)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    let f = as4tainr_core::catalog::resolve_file(&client, std::slice::from_ref(&lib), "REFP")
+        .await
+        .unwrap()
+        .file;
+    let field = |n: &str| f.fields.iter().find(|x| x.name == n).unwrap().clone();
+    let shape = |n: &str| {
+        let x = field(n);
+        (
+            x.data_type.code().to_string(),
+            x.length,
+            x.decimals,
+            x.text.clone(),
+        )
+    };
+    assert_eq!(shape("NAME"), ("A".into(), 20, 0, "Name".into()));
+    assert_eq!(shape("ADDR"), ("A".into(), 20, 0, "Name".into()));
+    assert_eq!(field("ADDR").keywords, "COLHDG('Address')");
+    assert_eq!(field("NAME").keywords, "COLHDG('Name')");
+    assert_eq!(shape("CITY"), ("A".into(), 20, 0, "Name".into()));
+    assert_eq!(field("CITY").keywords, "COLHDG('Address')");
+    assert_eq!(shape("AMOUNT"), ("P".into(), 7, 2, "Amount".into()));
+    assert_eq!(field("AMOUNT").keywords, "EDTCDE(2)");
+    assert_eq!(shape("BIGAMT"), ("P".into(), 9, 2, "Amount".into()));
+    assert_eq!(field("BIGAMT").keywords, "");
+    assert_eq!(shape("SHORT"), ("A".into(), 15, 0, "Name".into()));
+    assert_eq!(shape("WHEN"), ("L".into(), 10, 0, "When".into()));
+    // The bound call of MAINB's main procedure sets the parameter; the
+    // unnamed based data structure is over SPOT.
+    assert_eq!(
+        cl_cmd(&mut job, format!("CALL PGM({lib}/MAINA)"))
+            .await
+            .unwrap(),
+        ["DSPLY  from B 7"]
+    );
+    // SQL: a trigger with a long name, PROGRAM NAME and SET OPTION; a
+    // sequence's label; system column names by table.
+    for s in [
+        format!("CREATE TABLE {lib}.ORDS (ORDNO INT, CUSNO INT)"),
+        format!("CREATE TABLE {lib}.CUSTS (CUSNO INT, CUSTNM CHAR(20), LASTORD INT)"),
+        format!("CREATE TABLE {lib}.CUSTTBL (CUSTOMER_NAME FOR COLUMN CUSTNM VARCHAR(50))"),
+        format!(
+            "CREATE OR REPLACE TRIGGER {lib}.ORDS_INSERT_ORDER AFTER INSERT ON {lib}.ORDS \
+             REFERENCING NEW AS N FOR EACH ROW PROGRAM NAME ORD701 SET OPTION SQLPATH = *LIBL \
+             BEGIN UPDATE {lib}.CUSTS SET LASTORD = N.ORDNO WHERE CUSNO = N.CUSNO; END"
+        ),
+        format!("CREATE SEQUENCE {lib}.CUSSEQ START WITH 1551"),
+        format!("LABEL ON SEQUENCE {lib}.CUSSEQ IS 'Next customer number'"),
+        format!("INSERT INTO {lib}.CUSTS (CUSNO, CUSTNM) VALUES (1, 'Ann')"),
+        format!("INSERT INTO {lib}.ORDS VALUES (42, 1)"),
+    ] {
+        cl_cmd(
+            &mut job,
+            format!("RUNSQL SQL('{}') COMMIT(*NONE)", s.replace('\'', "''")),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        sql_rows(
+            &client,
+            &url,
+            &lib,
+            &format!("SELECT CUSTNM, LASTORD FROM {lib}.CUSTS")
+        )
+        .await,
+        ["Ann|42"]
+    );
+    assert_eq!(
+        sql_rows(
+            &client,
+            &url,
+            &lib,
+            &format!(
+                "SELECT SEQUENCE_TEXT FROM QSYS2.SYSSEQUENCES WHERE SEQUENCE_SCHEMA = '{lib}' AND SEQUENCE_NAME = 'CUSSEQ'"
+            )
+        )
+        .await,
+        ["Next customer number"]
+    );
+}

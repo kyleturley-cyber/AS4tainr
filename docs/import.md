@@ -149,6 +149,16 @@ What it found and as4tainr now does:
 
 What still fails: CMDGRP's script starts with `set schema = ?` (a parameter marker, for ACS's Run SQL Scripts; RUNSQLSTM cannot run it on IBM i either) and uses a system-period temporal table (GENERATED ALWAYS AS ROW BEGIN/END, PERIOD SYSTEM_TIME, ADD VERSIONING), which as4tainr does not have yet; so JOBLOGLST, which declares that file, is not created.
 
+### IBM's TOBi example
+
+IBM's sample project for its build tools (github.com/IBM/tobi-example, Apache-2.0: cloned at test time only) holds most source types in one place: DDS files that refer to a field reference file (SAMREF), display and printer files laid out by SDA, binder sources, ARCAD object scripts (`.ILEPGM`, `.ILESRVPGM`, `.BNDDIR`: CL commands with &O and &N), RPG IV, RPG/400, CL, COBOL, C and C++, SQL tables, views, sequences, triggers and functions, and two iRPGUnit test suites. On Oct 30, 2026 the import creates everything but 18 objects (C and C++, COBOL, external SQL functions, a global variable, the DBCS globalization samples, two OPM programs whose /COPY members are elsewhere, and the two test suites, which tools/legacy.sh builds with RUCRTRPG), and both test suites pass: VAT300 (4 test cases, 12 assertions) and CUS300 (14 test cases, 42 assertions). What it needed:
+
+- DDS reference fields: R in position 29 with REF and REFFLD, `+n`/`-n`, *SRC, keywords continued on the next lines; physical files created after the files they refer to;
+- Rules.mk: `X: VAR = value` and `X: private VAR ::= value` are variables, a rule's `cl "..."` recipe is run (TMPDETORD's CPYF CRTFILE(*YES)); object scripts with CL continuation lines; a CL module from an `X.MODULE: X.CLLE` rule; service programs and programs made by their `.ILESRVPGM` and `.ILEPGM` scripts;
+- CRTSQLRPGI INCDIR with several directories; printer file constants with their text on the following lines, date fields;
+- a bound call to another module's cycle main procedure by the module's name; an unnamed data structure BASED on an undeclared pointer; CLEAR of a record format;
+- CREATE TRIGGER with a long name, PROGRAM NAME and SET OPTION; LABEL ON SEQUENCE; a column's system name that is another table's short name for a long SQL name.
+
 ## Legacy applications, installed their own way
 
 `tools/legacy.sh` installs real IBM i applications the way their READMEs say, on an empty database, and reports what works. The repositories are cloned at test time and never added to as4tainr.

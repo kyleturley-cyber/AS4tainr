@@ -84,8 +84,12 @@ pub struct PField {
     pub name: String,
     pub content: Content,
     pub length: u16,
-    /// 'A' character, 'S' zoned decimal.
+    /// 'A' character, 'S' zoned decimal, 'L' date, 'T' time, 'Z'
+    /// timestamp.
     pub dtype: char,
+    /// A date's or time's format (DATFMT, TIMFMT): `*ISO`, `*MDY`, `*JOB`...
+    #[serde(default)]
+    pub format: Option<String>,
     pub decimals: Option<u16>,
     /// Usage P: passed to the system, not printed.
     pub printed: bool,
@@ -144,6 +148,25 @@ pub fn parse(name: &str, source: &str) -> Result<PrinterFile> {
                 prev.truncate(keep);
                 let cont = cols(&line, 45, 80).trim_end();
                 prev.push_str(if plus { cont.trim_start() } else { cont });
+                continue;
+            }
+            // A constant's position alone on a line, its text (or DATE,
+            // TIME...) on the keyword lines after it, as SDA writes them.
+            let position_only =
+                cols(prev, 7, 38).trim().is_empty() && !cols(prev, 39, 44).trim().is_empty();
+            if position_only
+                && cols(&line, 7, 7) != "*"
+                && cols(&line, 7, 44).trim().is_empty()
+                && !cols(&line, 45, usize::MAX).trim().is_empty()
+            {
+                let w = prev.chars().count();
+                if w < 44 {
+                    prev.push_str(&" ".repeat(44 - w));
+                }
+                if !cols(prev, 45, usize::MAX).trim().is_empty() {
+                    prev.push(' ');
+                }
+                prev.push_str(cols(&line, 45, usize::MAX).trim());
                 continue;
             }
         }
@@ -284,9 +307,32 @@ pub fn parse(name: &str, source: &str) -> Result<PrinterFile> {
                 cond: cond.clone(),
                 edit_code: None,
                 edit_word: None,
+                format: None,
                 spacing: Spacing::default(),
             };
-            if !fname.is_empty() {
+            // Date, time and timestamp fields (L, T, Z) take their length
+            // from their format (DDS for printer files: DATFMT *ISO, *USA,
+            // *EUR, *JIS 10, *MDY, *DMY, *YMD 8, *JUL 6, *JOB the job's;
+            // times 8; timestamps 26).
+            if !fname.is_empty() && matches!(dtype.as_str(), "L" | "T" | "Z") {
+                let fmt = kws
+                    .iter()
+                    .find(|(k, _)| k == if dtype == "T" { "TIMFMT" } else { "DATFMT" })
+                    .and_then(|(_, a)| a.first())
+                    .map(|a| a.trim().to_ascii_uppercase())
+                    .unwrap_or_else(|| "*ISO".into());
+                fld.length = match dtype.as_str() {
+                    "T" => 8,
+                    "Z" => 26,
+                    _ => match fmt.as_str() {
+                        "*MDY" | "*DMY" | "*YMD" | "*JOB" => 8,
+                        "*JUL" => 6,
+                        _ => 10,
+                    },
+                };
+                fld.dtype = dtype.chars().next().unwrap_or('L');
+                fld.format = Some(fmt);
+            } else if !fname.is_empty() {
                 fld.length = length
                     .parse()
                     .map_err(|_| anyhow!("line {lineno}: field {fname} needs a length"))?;
@@ -592,6 +638,37 @@ mod tests {
     // record, SPACEA after it; a field's SPACEB starts a new line; '+n'
     // places a field n positions after the one before; option indicators
     // condition fields.
+    // As SDA writes them (IBM's tobi-example ORD500O): a constant's
+    // position alone on its line and its text and keywords on the lines
+    // after it (DDS: a field's keywords may go on following lines with
+    // positions 7-44 blank); a date field (L) with DATFMT(*JOB) is the
+    // job's format, 8 characters for *MDY, *DMY and *YMD (DDS reference
+    // for printer files, DATFMT).
+    #[test]
+    fn constants_with_text_on_following_lines_and_date_fields() {
+        let src = concat!(
+            "     A          R HEADER\n",
+            "     A                                      SKIPB(005)\n",
+            "     A                                     3\n",
+            "     A                                      'Company Sample'\n",
+            "     A                                    66\n",
+            "     A                                      SPACEB(001)\n",
+            "     A                                      'Net'\n",
+            "     A            DATORD          L       79DATFMT(*JOB)\n",
+        );
+        let f = parse("X", src).unwrap();
+        let r = f.record("HEADER").unwrap();
+        assert_eq!(
+            r.fields[0].content,
+            Content::Literal("Company Sample".into())
+        );
+        assert_eq!(r.fields[0].pos, Some(3));
+        assert_eq!(r.fields[1].content, Content::Literal("Net".into()));
+        assert_eq!(r.fields[1].spacing.space_before, vec![(None, 1)]);
+        assert_eq!((r.fields[2].dtype, r.fields[2].length), ('L', 8));
+        assert_eq!(r.fields[2].format.as_deref(), Some("*JOB"));
+    }
+
     const SRC: &str = concat!(
         "     A                                      INDARA\n",
         "     A          R HEAD                      SKIPB(3) SPACEA(2)\n",

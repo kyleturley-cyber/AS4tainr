@@ -215,6 +215,11 @@ pub struct FieldDef {
     /// SELECT * or an INSERT without a column list.
     #[serde(default)]
     pub hidden: bool,
+    /// The field's DDS keywords that a field referring to it copies
+    /// (COLHDG, editing, validity checking, date and time formats), as
+    /// written: `EDTCDE(2) COLHDG('A' 'B')` (ddsref.rs).
+    #[serde(default)]
+    pub keywords: String,
 }
 
 /// What a generated column holds (Db2 for i SQL Programming, "Creating
@@ -321,6 +326,7 @@ impl FieldDef {
             double: false,
             generated: None,
             hidden: false,
+            keywords: String::new(),
         }
     }
 
@@ -710,6 +716,110 @@ fn keyword_args(area: &str, keyword: &str) -> Option<Vec<String>> {
     None
 }
 
+/// The keywords of a keyword area, each as written with its arguments
+/// (`EDTCDE(2)`, `COLHDG('Ref' 'sale')`, `UNIQUE`).
+pub fn split_keywords(area: &str) -> Vec<String> {
+    let cs: Vec<char> = area.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] == ' ' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < cs.len() && cs[i] != ' ' && cs[i] != '(' {
+            i += 1;
+        }
+        if i < cs.len() && cs[i] == '(' {
+            let mut depth = 0;
+            let mut quoted = false;
+            while i < cs.len() {
+                match cs[i] {
+                    '\'' => quoted = !quoted,
+                    '(' if !quoted => depth += 1,
+                    ')' if !quoted => {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        out.push(cs[start..i].iter().collect::<String>());
+    }
+    out
+}
+
+/// A keyword's name (`EDTCDE` of `EDTCDE(2)`), upper case.
+pub fn keyword_name(kw: &str) -> String {
+    kw.split('(')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase()
+}
+
+/// The keywords a referring field copies (DDS reference for physical and
+/// logical files, position 29: ALIAS, COLHDG, DATFMT, DATSEP, FLTPCN,
+/// REFSHIFT, TEXT, TIMFMT, TIMSEP, VARLEN and the editing and validity
+/// checking keywords); TEXT, ALIAS, VARLEN and FLTPCN are kept in a
+/// field's own members, the others in `FieldDef::keywords`.
+pub const REFERENCED_KEYWORDS: &[&str] = &[
+    "COLHDG", "DATFMT", "DATSEP", "TIMFMT", "TIMSEP", "REFSHIFT", "EDTCDE", "EDTWRD", "CHECK",
+    "CHKMSGID", "COMP", "CMP", "RANGE", "VALUES",
+];
+
+/// DDS source lines as entries: each line that is not a comment with the
+/// keyword-only lines after it (positions 7-44 blank) joined to it, when
+/// it names a record format, field or key; continuation lines ('-', '+')
+/// joined. Each entry keeps its first line's number.
+fn entries(source: &str) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut continued = false;
+    for (idx, raw) in source.lines().enumerate() {
+        let line = raw.trim_end_matches(['\r', '\n']);
+        if line.trim().is_empty() || cols(line, 7, 7) == "*" {
+            continue;
+        }
+        let keywords = cols(line, 45, usize::MAX);
+        if let Some((_, prev)) = out.last_mut() {
+            if continued {
+                let t = prev.trim_end();
+                let plus = t.ends_with('+');
+                let keep = t.len() - 1;
+                prev.truncate(keep);
+                prev.push_str(if plus {
+                    keywords.trim_start()
+                } else {
+                    keywords
+                });
+                continued = matches!(prev.trim_end().chars().last(), Some('-' | '+'));
+                continue;
+            }
+            let positional = line.get(6..44.min(line.len())).unwrap_or("x");
+            let names = !cols(prev, 17, 28).is_empty();
+            if positional.trim().is_empty() && !keywords.is_empty() && names {
+                if prev.chars().count() < 44 {
+                    let n = 44 - prev.chars().count();
+                    prev.push_str(&" ".repeat(n));
+                }
+                prev.push(' ');
+                prev.push_str(keywords);
+                continued = matches!(prev.trim_end().chars().last(), Some('-' | '+'));
+                continue;
+            }
+        }
+        out.push((idx + 1, line.to_string()));
+        continued = line.len() > 44 && matches!(line.trim_end().chars().last(), Some('-' | '+'));
+    }
+    out
+}
+
 /// Join DDS continuation lines: a keyword area ending in '-' continues
 /// with the next line's keyword area as is; '+' skips its leading blanks.
 fn join_continuations(source: &str) -> Vec<String> {
@@ -922,23 +1032,17 @@ pub fn parse_pf(file_name: &str, source: &str) -> Result<PhysicalFile> {
         source: None,
     };
 
-    for (idx, raw) in source.lines().enumerate() {
-        let lineno = idx + 1;
-        let line = raw.trim_end_matches(['\r', '\n']);
-        if line.trim().is_empty() {
-            continue;
-        }
-        // An asterisk in position 7 makes a comment line; the form type A
-        // in position 6 is optional (DDS reference, positions 1-7).
-        if cols(line, 7, 7) == "*" {
-            continue;
-        }
+    // An asterisk in position 7 makes a comment line; the form type A in
+    // position 6 is optional (DDS reference, positions 1-7). Keyword lines
+    // after a record format, field or key belong to it.
+    for (lineno, line) in entries(source) {
+        let line = line.as_str();
         if !cols(line, 6, 6).eq_ignore_ascii_case("A") && !cols(line, 6, 6).trim().is_empty() {
             bail!("line {lineno}: expected form type 'A' in column 6");
         }
         let name_type = cols(line, 17, 17).to_ascii_uppercase();
         let name = cols(line, 19, 28).to_ascii_uppercase();
-        let keywords = cols(line, 45, 80);
+        let keywords = cols(line, 45, usize::MAX);
 
         match name_type.as_str() {
             "R" => {
@@ -973,6 +1077,11 @@ pub fn parse_pf(file_name: &str, source: &str) -> Result<PhysicalFile> {
                     bail!(
                         "line {lineno}: field '{name}' appears before the record format (R) line"
                     );
+                }
+                if cols(line, 29, 29).eq_ignore_ascii_case("R") {
+                    // ddsref::expand gives a referring field its attributes
+                    // before the source is parsed.
+                    bail!("line {lineno}: field '{name}' refers to a field that was not found");
                 }
                 let type_txt = cols(line, 35, 35).to_ascii_uppercase();
                 // Dates, times and timestamps have no length of their own
@@ -1060,6 +1169,11 @@ pub fn parse_pf(file_name: &str, source: &str) -> Result<PhysicalFile> {
                 f.varlen = varlen;
                 f.null_capable = has_keyword(keywords, "ALWNULL");
                 f.double = double;
+                f.keywords = split_keywords(keywords)
+                    .into_iter()
+                    .filter(|k| REFERENCED_KEYWORDS.contains(&keyword_name(k).as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 // ALIAS(name): the field's alternative name (what SQL uses).
                 if let Some(a) = keyword_arg(keywords, "ALIAS") {
                     let a = a.trim().to_ascii_uppercase();

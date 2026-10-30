@@ -183,6 +183,10 @@ pub struct ModuleInfo {
     /// It has a main procedure (cycle or ctl-opt MAIN): it can be a
     /// program's entry module.
     pub has_main: bool,
+    /// Its main procedure is the RPG cycle's: a bound call by the module's
+    /// name reaches it (ILE RPG Programmer's Guide, "Using a bound call":
+    /// the main procedure of a module is called by the module's name).
+    pub cycle_main: bool,
     /// Binding directories its control specification names (BNDDIR):
     /// kept with the module and used when it is bound (ILE RPG Reference,
     /// BNDDIR keyword).
@@ -205,6 +209,7 @@ pub async fn module_info(client: &Client, libl: &[String], m: &ModuleCopy) -> Re
             exports: vec![m.name.to_ascii_uppercase()],
             imports: p.called_procedures(),
             has_main: true,
+            cycle_main: false,
             bnddir: Vec::new(),
             spelled: BTreeMap::new(),
         });
@@ -234,6 +239,7 @@ pub async fn module_info(client: &Client, libl: &[String], m: &ModuleCopy) -> Re
         exports,
         imports,
         has_main: !prog.nomain,
+        cycle_main: !prog.nomain && prog.main.is_none(),
         bnddir: crate::rpg::ast::keyword(&prog.control, "BNDDIR")
             .map(|k| {
                 k.args
@@ -405,6 +411,16 @@ pub async fn bind(
                 continue;
             }
             if let Some(m) = infos.iter().find(|i| i.exports.contains(&sym)) {
+                binding
+                    .imports
+                    .insert(sym.clone(), Target::Module(m.name.clone()));
+                continue;
+            }
+            // The main procedure of another module bound in, called by the
+            // module's name.
+            if let Some(m) = infos.iter().find(|i| {
+                i.cycle_main && i.name.eq_ignore_ascii_case(&sym) && i.name != infos[k].name
+            }) {
                 binding
                     .imports
                     .insert(sym.clone(), Target::Module(m.name.clone()));

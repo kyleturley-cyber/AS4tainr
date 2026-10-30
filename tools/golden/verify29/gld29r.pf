@@ -1,0 +1,7 @@
+     A* verify29: a field reference file
+     A          R GLD29RR
+     A            NAME          20A         TEXT('Name')
+     A                                      COLHDG('Name')
+     A            AMOUNT         7P 2       TEXT('Amount')
+     A                                      EDTCDE(2)
+     A            WHEN            L         TEXT('When')

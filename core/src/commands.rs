@@ -1527,7 +1527,12 @@ impl Job<'_> {
             let up = p.options.to_ascii_uppercase();
             if !ilerpg {
                 "*DFTACTGRP (OPM program)".to_string()
-            } else if let Some(i) = up.find("ACTGRP(").filter(|_| up.contains("DFTACTGRP(*NO)")) {
+            } else if let Some(i) = up
+                .match_indices("ACTGRP(")
+                .map(|(i, _)| i)
+                .find(|&i| !up[..i].ends_with("DFT"))
+                .filter(|_| up.contains("DFTACTGRP(*NO)"))
+            {
                 up[i + 7..].split(')').next().unwrap_or("").to_string()
             } else if up.contains("DFTACTGRP(*NO)") {
                 "QILE".to_string()
@@ -1569,8 +1574,64 @@ impl Job<'_> {
                 rows.push(format!("{n:<10}  {l:<10}  {sig}"));
             }
         }
+        // DETAIL(*SRVPGM) printed (PUB400 2026-10-30, verify29 v29_psrv):
+        // the bound service programs, *IMMED, their signatures. IBM i's
+        // own runtime service programs (QRNXIE, QLEAWI...) are not
+        // listed: as4tainr binds none.
+        let mut print = Vec::new();
+        let detail_srvpgm = cmd
+            .list("DETAIL")
+            .iter()
+            .any(|d| d.trim().eq_ignore_ascii_case("*SRVPGM"));
+        if detail_srvpgm {
+            use crate::report::at;
+            let owner: String = self
+                .client
+                .query_opt(
+                    "SELECT owner FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype='*PGM'",
+                    &[&lib, &name],
+                )
+                .await?
+                .map(|r| r.get(0))
+                .unwrap_or_default();
+            let [h1, h2] = crate::report::header_b(
+                45,
+                "Display Program Information",
+                &crate::report::system_name(),
+                &crate::report::Stamp::now(),
+                1,
+            );
+            print.push(h1);
+            print.push(h2);
+            print.push(at(&[
+                (2, "Program  . . . . . . . :"),
+                (29, &name),
+                (69, "Library  . . . . . . . :"),
+                (96, &lib),
+            ]));
+            print.push(at(&[(2, "Owner  . . . . . . . . :"), (29, &owner)]));
+            print.push(at(&[(2, "Program attribute  . . :"), (29, &p.attribute)]));
+            print.push(at(&[(2, "Detail . . . . . . . . :"), (29, "*SRVPGM")]));
+            print.push(at(&[(2, "Service")]));
+            print.push(at(&[
+                (2, "Program"),
+                (17, "Library"),
+                (32, "Activation"),
+                (47, "Signature"),
+            ]));
+            for (l, n) in &b.srvpgms {
+                let sig = b
+                    .srv_signatures
+                    .get(&format!("{l}/{n}"))
+                    .map(|s| crate::ile::signature_hex(s))
+                    .unwrap_or_default();
+                print.push(at(&[(2, n), (17, l), (32, "*IMMED"), (47, &sig)]));
+            }
+            print.push(crate::report::END_OBJD.into());
+        }
         Ok(Outcome::Display(ListDisplay {
             title: "Display Program Information".into(),
+            print,
             info: vec![
                 ("Program".into(), name.clone()),
                 ("Library".into(), lib.clone()),
@@ -1772,6 +1833,31 @@ impl Job<'_> {
         }))
     }
 
+    /// An object's creation date as reports show it (the system's date
+    /// format), if the object is there.
+    async fn object_date(&self, lib: &str, name: &str, objtype: &str) -> Result<Option<String>> {
+        Ok(self
+            .client
+            .query_opt(
+                "SELECT extract(year FROM created)::int, extract(month FROM created)::int,
+                        extract(day FROM created)::int
+                   FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype=$3",
+                &[&lib, &name, &objtype],
+            )
+            .await?
+            .map(|r| {
+                crate::report::Stamp::of(
+                    (
+                        r.get::<_, i32>(0),
+                        r.get::<_, i32>(1) as u32,
+                        r.get::<_, i32>(2) as u32,
+                    ),
+                    (0, 0, 0),
+                )
+                .date
+            }))
+    }
+
     /// DSPSRVPGM DETAIL(*SIGNATURE) or DETAIL(*PROCEXP) printed: the
     /// service program's header and its signatures (current first) or
     /// procedure exports. Layout: PUB400 (IBM i 7.5), tools/golden/
@@ -1792,7 +1878,7 @@ impl Job<'_> {
         let wanted: Vec<&str> = details
             .iter()
             .map(String::as_str)
-            .filter(|d| matches!(*d, "*SIGNATURE" | "*PROCEXP"))
+            .filter(|d| matches!(*d, "*MODULE" | "*SIGNATURE" | "*PROCEXP"))
             .collect();
         if wanted.is_empty() {
             return Ok(Vec::new());
@@ -1838,7 +1924,35 @@ impl Job<'_> {
             print.push(format!(
                 " Detail . . . . . . . . . . . . . . . . . :   {detail}"
             ));
-            if *detail == "*SIGNATURE" {
+            if *detail == "*MODULE" {
+                // PUB400 2026-10-30, verify29 v29_smod: the module, its
+                // library, attribute, creation date, *NONE optimization
+                // and debug data *YES (as4tainr keeps no other levels).
+                print.push(at(&[(47, "Creation"), (60, "Optimization"), (77, "Debug")]));
+                print.push(at(&[
+                    (2, "Module"),
+                    (17, "Library"),
+                    (32, "Attribute"),
+                    (47, "Date"),
+                    (63, "Level"),
+                    (77, "Data"),
+                ]));
+                for m in &b.modules {
+                    let date = self
+                        .object_date(lib, &m.name, "*MODULE")
+                        .await?
+                        .or(self.object_date(lib, name, "*SRVPGM").await?)
+                        .unwrap_or_default();
+                    print.push(at(&[
+                        (2, &m.name),
+                        (17, lib),
+                        (32, &m.attribute),
+                        (47, &date),
+                        (60, "*NONE"),
+                        (77, "*YES"),
+                    ]));
+                }
+            } else if *detail == "*SIGNATURE" {
                 print.push(at(&[(61, "Signatures:")]));
                 print.push(format!(" {}", crate::ile::signature_hex(&b.signature)));
                 for s in &b.prv_signatures {
@@ -2225,7 +2339,15 @@ impl Job<'_> {
     async fn crtpgm_bound(&mut self, cmd: &Command) -> Result<Outcome> {
         let (lib, name) = self.create_target(cmd.get("PGM"));
         let (lib, name) = (lib.to_ascii_uppercase(), name.to_ascii_uppercase());
-        let mut modules = self.module_list(cmd, &lib, &name).await?;
+        // A module not there: CPF3C50, the program not created (PUB400
+        // 2026-10-30, verify28 u28_pgmu).
+        let mut modules = self.module_list(cmd, &lib, &name).await.map_err(|e| {
+            if crate::jobs::escape_id(&format!("{e:#}")) == "CPF5D05" {
+                anyhow!("CPF3C50: Program {name} was not created: a module it names is not there.")
+            } else {
+                e
+            }
+        })?;
         let (srv, dirs) = Self::bind_lists(cmd);
         let mut libl = self.library_list();
         if !libl.contains(&lib) {
@@ -2292,8 +2414,9 @@ impl Job<'_> {
         catalog::set_program_options(self.client, &lib, &name, &options).await?;
         crate::ile::set_program_binding(self.client, &lib, &name, Some(&binding)).await?;
         authority::set_owner(self.client, &lib, &name, "*PGM", &self.user).await?;
+        // CPC5D07 (PUB400 2026-10-30, verify29 v29_pgmu).
         Ok(Outcome::Messages(vec![format!(
-            "Program {name} was created in library {lib}."
+            "CPC5D07: Program {name} was created in library {lib}."
         )]))
     }
 
@@ -3136,7 +3259,7 @@ impl Job<'_> {
                 self.client,
                 &self.library_list(),
                 &m.source,
-                crate::ddsref::Kind::Device,
+                crate::ddsref::Kind::Printer,
             )
             .await
             .map_err(|e| {
@@ -3343,7 +3466,9 @@ impl Job<'_> {
                 } else {
                     catalog::replace_display_file(&mut c, &lib, &name, &source).await?;
                 }
-                format!("Display file {name} created in library {lib}.")
+                // CPC7301, as for a physical file (PUB400 2026-10-30,
+                // verify29 v29_crtd).
+                format!("CPC7301: File {name} was created in library {lib}.")
             }
         };
         authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
@@ -3961,6 +4086,9 @@ impl Job<'_> {
                 at: None,
             });
         }
+        if cmd.def.name == "CRTRPGMOD" {
+            checked.diags.extend(module_control_keywords(&m.source));
+        }
         let max = checked.diags.iter().map(|d| d.sev).max().unwrap_or(0);
         let ok = compiled.is_ok() && max <= 10;
         if listed {
@@ -3985,8 +4113,15 @@ impl Job<'_> {
                 } else {
                     "Program"
                 };
+                // A module: RNS9309; a program: RNS9310 (PUB400
+                // 2026-10-30, verify29 v29_dmod; verify24 q24_rpg).
+                let id = if what == "Module" {
+                    "RNS9309"
+                } else {
+                    "RNS9310"
+                };
                 bail!(
-                    "RNS9308: Compilation stopped: errors of severity {max} were found in the program.\nRNS9310: {what} {name} was not created in library {lib}."
+                    "RNS9308: Compilation stopped: errors of severity {max} were found in the program.\n{id}: {what} {name} was not created in library {lib}."
                 );
             }
             match compiled {
@@ -8505,6 +8640,64 @@ fn binder_comment(objtype: &str, name: &str, lib: &str) -> Vec<String> {
     );
     let rule = format!("/*{}*/", "*".repeat(66));
     vec![rule.clone(), format!("{line:<68}*/"), rule]
+}
+
+/// RNF1324 (severity 20): a module's control specification names
+/// DFTACTGRP, ACTGRP or USRPRF, which only a program (CRTBNDRPG) takes;
+/// CRTRPGMOD then stops (PUB400 2026-10-30, tools/golden/verify29.txt
+/// v29_vlst, v29_dlst: the message points at the keyword, marker a).
+pub(crate) fn module_control_keywords(source: &str) -> Vec<crate::rpg::check::Diag> {
+    let mut out = Vec::new();
+    let mut in_ctl = false;
+    let free = source
+        .lines()
+        .next()
+        .is_some_and(|l| l.trim_start().to_ascii_uppercase().starts_with("**FREE"));
+    for (i, line) in source.lines().enumerate() {
+        let u = line.to_ascii_uppercase();
+        let fixed_h = !free
+            && u.len() > 6
+            && u.as_bytes()[5] == b'H'
+            && !matches!(u.as_bytes()[6], b'*' | b'/');
+        let code = u.split("//").next().unwrap_or("");
+        let starts = code.trim_start().starts_with("CTL-OPT");
+        if !(fixed_h || starts || in_ctl) {
+            continue;
+        }
+        if starts {
+            in_ctl = true;
+        }
+        let area = if fixed_h { &u[6.min(u.len())..] } else { code };
+        let base = if fixed_h { 6 } else { 0 };
+        let chars: Vec<char> = area.chars().collect();
+        let mut k = 0;
+        while k < chars.len() {
+            if chars[k].is_ascii_alphabetic() && (k == 0 || !chars[k - 1].is_ascii_alphanumeric()) {
+                let start = k;
+                while k < chars.len() && (chars[k].is_ascii_alphanumeric() || chars[k] == '-') {
+                    k += 1;
+                }
+                let word: String = chars[start..k].iter().collect();
+                if matches!(word.as_str(), "DFTACTGRP" | "ACTGRP" | "USRPRF") {
+                    out.push(crate::rpg::check::Diag {
+                        line: i + 1,
+                        id: "RNF1324".into(),
+                        sev: 20,
+                        text: format!(
+                            "{word} is a program's keyword: DFTACTGRP, ACTGRP and USRPRF are not valid for a module."
+                        ),
+                        at: Some((base + start, word.len())),
+                    });
+                }
+            } else {
+                k += 1;
+            }
+        }
+        if in_ctl && code.contains(';') {
+            in_ctl = false;
+        }
+    }
+    out
 }
 
 #[cfg(test)]

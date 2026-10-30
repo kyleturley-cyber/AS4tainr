@@ -220,6 +220,22 @@ pub struct FieldDef {
     /// written: `EDTCDE(2) COLHDG('A' 'B')` (ddsref.rs).
     #[serde(default)]
     pub keywords: String,
+    /// The field a DDS reference field (R) took its attributes from.
+    #[serde(default)]
+    pub reference: Option<FieldRef>,
+}
+
+/// A reference field's origin, as DSPFFD shows it ("Referenced
+/// information"): the file (none for a field of the same source), its
+/// library and record format, the field, and what was changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldRef {
+    pub library: String,
+    pub file: String,
+    pub format: String,
+    pub field: String,
+    /// "None", "Field length" or "Other".
+    pub changed: String,
 }
 
 /// What a generated column holds (Db2 for i SQL Programming, "Creating
@@ -327,6 +343,7 @@ impl FieldDef {
             generated: None,
             hidden: false,
             keywords: String::new(),
+            reference: None,
         }
     }
 
@@ -1169,6 +1186,39 @@ pub fn parse_pf(file_name: &str, source: &str) -> Result<PhysicalFile> {
                 f.varlen = varlen;
                 f.null_capable = has_keyword(keywords, "ALWNULL");
                 f.double = double;
+                // ddsref.rs notes where a reference field came from.
+                if let Some(r) = split_keywords(keywords)
+                    .iter()
+                    .find(|k| k.starts_with("@REF("))
+                {
+                    let inner = r.trim_start_matches("@REF(").trim_end_matches(')');
+                    let p: Vec<&str> = inner.split_whitespace().collect();
+                    if let [lib, file, format, field, changed] = p.as_slice() {
+                        let blank = |x: &str| {
+                            if x == "*N" {
+                                String::new()
+                            } else {
+                                x.to_string()
+                            }
+                        };
+                        f.reference = Some(FieldRef {
+                            library: blank(lib),
+                            file: blank(file),
+                            format: if *format == "*SRC" {
+                                pf.format.clone()
+                            } else {
+                                format.to_string()
+                            },
+                            field: field.to_string(),
+                            changed: match *changed {
+                                "L" => "Field length",
+                                "O" => "Other",
+                                _ => "None",
+                            }
+                            .into(),
+                        });
+                    }
+                }
                 f.keywords = split_keywords(keywords)
                     .into_iter()
                     .filter(|k| REFERENCED_KEYWORDS.contains(&keyword_name(k).as_str()))

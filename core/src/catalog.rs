@@ -114,6 +114,10 @@ BEGIN
     ALTER TABLE as4tainr.file_fields ADD COLUMN IF NOT EXISTS flt_double boolean NOT NULL DEFAULT false;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='file_fields' AND column_name='reference') THEN
+    ALTER TABLE as4tainr.file_fields ADD COLUMN IF NOT EXISTS reference text;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
                  WHERE table_schema='as4tainr' AND table_name='file_fields' AND column_name='ref_keywords') THEN
     ALTER TABLE as4tainr.file_fields ADD COLUMN IF NOT EXISTS ref_keywords text NOT NULL DEFAULT '';
   END IF;
@@ -1428,7 +1432,7 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
         let Some(row) = row else { continue };
         let fields = client
             .query(
-                "SELECT name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity, flt_double, generated, hidden, ref_keywords FROM as4tainr.file_fields
+                "SELECT name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity, flt_double, generated, hidden, ref_keywords, reference FROM as4tainr.file_fields
                  WHERE library=$1 AND file=$2 ORDER BY seq",
                 &[lib, &name],
             )
@@ -1456,6 +1460,9 @@ pub async fn resolve_file(client: &Client, libl: &[String], name: &str) -> Resul
                         .and_then(|d| serde_json::from_str(d).ok()),
                     hidden: r.get(12),
                     keywords: r.get(13),
+                    reference: r
+                        .get::<_, Option<&str>>(14)
+                        .and_then(|d| serde_json::from_str(d).ok()),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2073,8 +2080,8 @@ pub async fn insert_field(
     f: &FieldDef,
 ) -> Result<()> {
     c.execute(
-        "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity, flt_double, generated, hidden, ref_keywords)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
+        "INSERT INTO as4tainr.file_fields (library, file, seq, name, data_type, length, decimals, text, varlen, null_capable, dft, alias, identity, flt_double, generated, hidden, ref_keywords, reference)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)",
         &[
             &library,
             &file,
@@ -2093,6 +2100,7 @@ pub async fn insert_field(
             &f.generated.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
             &f.hidden,
             &f.keywords,
+            &f.reference.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
         ],
     )
     .await?;

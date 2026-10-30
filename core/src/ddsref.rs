@@ -35,7 +35,10 @@ use crate::dds::{keyword_name, split_keywords, DataType, PhysicalFile};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Database,
+    /// A display file.
     Device,
+    /// A printer file (no numeric-only Y fields).
+    Printer,
 }
 
 fn cols(line: &str, from: usize, to: usize) -> String {
@@ -56,6 +59,8 @@ struct Attrs {
     numeric: bool,
     /// Keywords as written (TEXT, COLHDG, EDTCDE...).
     keywords: Vec<String>,
+    /// The field's name: its column heading when it has no COLHDG.
+    name: String,
 }
 
 fn of_field(f: &crate::dds::FieldDef) -> Attrs {
@@ -79,6 +84,7 @@ fn of_field(f: &crate::dds::FieldDef) -> Attrs {
         decimals: f.decimals,
         numeric: f.data_type.is_numeric(),
         keywords,
+        name: f.name.clone(),
     }
 }
 
@@ -174,7 +180,11 @@ fn adjust(given: &str, referenced: u32) -> Result<(u32, bool)> {
 
 /// Give each referring field (R in position 29) its attributes; `files`
 /// holds the referenced database files by the name the source gives them.
-pub fn expand(source: &str, kind: Kind, files: &HashMap<String, PhysicalFile>) -> Result<String> {
+pub fn expand(
+    source: &str,
+    kind: Kind,
+    files: &HashMap<String, (String, PhysicalFile)>,
+) -> Result<String> {
     let mut lines: Vec<String> = source
         .lines()
         .map(|l| l.trim_end_matches('\r').to_string())
@@ -247,6 +257,7 @@ pub fn expand(source: &str, kind: Kind, files: &HashMap<String, PhysicalFile>) -
                     decimals: dec,
                     numeric,
                     keywords: keywords.clone(),
+                    name: name.clone(),
                 },
             );
             i = last + 1;
@@ -257,6 +268,9 @@ pub fn expand(source: &str, kind: Kind, files: &HashMap<String, PhysicalFile>) -
             None => (name.clone(), None),
         };
         let from = ref_file.or_else(|| file_ref.clone());
+        // Where the field came from (DSPFFD's referenced information):
+        // library, file and record format; *SRC: none, this file's format.
+        let mut origin = ("*N".to_string(), "*N".to_string(), "*SRC".to_string());
         let referenced = match from.as_deref() {
             None | Some("*SRC") => earlier.get(&ref_name).cloned().ok_or_else(|| {
                 anyhow!(
@@ -265,7 +279,7 @@ pub fn expand(source: &str, kind: Kind, files: &HashMap<String, PhysicalFile>) -
                 )
             })?,
             Some(file) => {
-                let pf = files.get(file).ok_or_else(|| {
+                let (library, pf) = files.get(file).ok_or_else(|| {
                     anyhow!(
                         "line {}: file {file} that field {name} refers to not found",
                         i + 1
@@ -281,6 +295,7 @@ pub fn expand(source: &str, kind: Kind, files: &HashMap<String, PhysicalFile>) -
                         i + 1
                     )
                     })?;
+                origin = (library.clone(), pf.name.clone(), pf.format.clone());
                 of_field(f)
             }
         };
@@ -295,7 +310,7 @@ pub fn expand(source: &str, kind: Kind, files: &HashMap<String, PhysicalFile>) -
         } else {
             referenced.code.clone()
         };
-        if kind == Kind::Device && matches!(code.as_str(), "P" | "B") {
+        if kind != Kind::Database && matches!(code.as_str(), "P" | "B") {
             code = "S".into();
         }
         let numeric = match DataType::from_code(&code) {
@@ -331,14 +346,77 @@ pub fn expand(source: &str, kind: Kind, files: &HashMap<String, PhysicalFile>) -
                     !has_validity && !attrs_given
                 }
                 "DATSEP" => !own("DATSEP") && !datfmt_iso,
-                "COLHDG" | "ALIAS" | "VARLEN" | "FLTPCN" if kind == Kind::Device => false,
+                "COLHDG" | "ALIAS" | "VARLEN" | "FLTPCN" if kind != Kind::Database => false,
                 "TEXT" | "COLHDG" | "ALIAS" | "VARLEN" | "FLTPCN" | "DATFMT" | "TIMFMT"
                 | "TIMSEP" | "REFSHIFT" => !own(&n),
                 _ => false,
             };
+            // A heading of its own: the referenced text is not taken; the
+            // heading is the field's text (PUB400 2026-10-30, verify29
+            // v29_ffdp: ADDR, COLHDG('Address'), shows text Address).
+            let take = take && !(n == "TEXT" && own("COLHDG"));
             if take {
                 copied.push(k.clone());
             }
+        }
+        if kind == Kind::Database {
+            if own("COLHDG") && !own("TEXT") {
+                if let Some(h) = keywords.iter().find(|k| keyword_name(k) == "COLHDG") {
+                    let inner = h.split_once('(').map(|x| x.1).unwrap_or("");
+                    let inner = inner.strip_suffix(')').unwrap_or(inner);
+                    let parts: Vec<String> = inner
+                        .split('\'')
+                        .enumerate()
+                        .filter(|(j, _)| j % 2 == 1)
+                        .map(|(_, p)| p.trim().to_string())
+                        .collect();
+                    copied.push(format!("TEXT('{}')", parts.join(" ")));
+                }
+            }
+            // No heading here or there: the referenced field's name
+            // (v29_ffdp: BIGAMT, referring to AMOUNT, is headed AMOUNT).
+            if !own("COLHDG")
+                && !referenced
+                    .keywords
+                    .iter()
+                    .any(|k| keyword_name(k) == "COLHDG")
+            {
+                copied.push(format!("COLHDG('{}')", referenced.name));
+            }
+        }
+        // What was changed from the referenced field (DSPFFD's "Attributes
+        // changed": v29_ffdp: None, Field length for +2 and -5, Other for
+        // a heading of its own).
+        let changed = if type_given || len_given || dec_given {
+            "L"
+        } else if keywords.iter().any(|k| {
+            crate::dds::REFERENCED_KEYWORDS.contains(&keyword_name(k).as_str())
+                || matches!(keyword_name(k).as_str(), "TEXT" | "ALIAS")
+        }) {
+            "O"
+        } else {
+            "N"
+        };
+        // For a physical file's description (dds.rs); display and printer
+        // file parsers do not read it.
+        if kind == Kind::Database {
+            copied.push(format!(
+                "@REF({} {} {} {} {changed})",
+                origin.0, origin.1, origin.2, ref_name
+            ));
+        }
+        // A display file's numeric field with an edit code or word is
+        // numeric-only, Y (PUB400 2026-10-30, verify29 v29_crtd:
+        // AMOUNT, packed with EDTCDE(2), expanded as 7Y 2).
+        if kind == Kind::Device
+            && !type_given
+            && code == "S"
+            && (has_editing
+                || copied
+                    .iter()
+                    .any(|k| matches!(keyword_name(k).as_str(), "EDTCDE" | "EDTWRD")))
+        {
+            code = "Y".into();
         }
         // Positions 29-37 rewritten.
         let mut chars: Vec<char> = line.chars().collect();
@@ -383,6 +461,7 @@ pub fn expand(source: &str, kind: Kind, files: &HashMap<String, PhysicalFile>) -
                 decimals,
                 numeric,
                 keywords: all,
+                name: name.clone(),
             },
         );
         i = last + 1;
@@ -414,7 +493,7 @@ pub async fn expand_from_catalog(
     for spec in referenced_files(source) {
         let spec_lookup = spec.trim_start_matches("*LIBL/").to_string();
         if let Ok(f) = crate::catalog::resolve_file(client, libl, &spec_lookup).await {
-            files.insert(spec, f.file);
+            files.insert(spec, (f.library, f.file));
         }
     }
     expand(source, kind, &files)
@@ -437,7 +516,7 @@ mod tests {
 ";
         let refpf = crate::dds::parse_pf("REFF", refsrc).unwrap();
         let mut files = HashMap::new();
-        files.insert("REFF".to_string(), refpf);
+        files.insert("REFF".to_string(), ("LIB".to_string(), refpf));
         let src = "     A                                      REF(REFF)
      A          R REC
      A            NAME      R
@@ -456,8 +535,34 @@ mod tests {
         );
         assert_eq!(f("NAME").text, "Name");
         assert_eq!(f("ADDR").keywords, "COLHDG('Address')");
-        assert_eq!(f("ADDR").text, "Name");
+        // A heading of its own and no text: the heading is its text
+        // (PUB400 2026-10-30, verify29 v29_ffdp: ADDR's text is Address);
+        // CITY takes both from ADDR.
+        assert_eq!(f("ADDR").text, "Address");
         assert_eq!(f("CITY").keywords, "COLHDG('Address')");
+        assert_eq!(f("CITY").text, "Address");
+        let r = f("ADDR").reference.unwrap();
+        assert_eq!(
+            (
+                r.library.as_str(),
+                r.file.as_str(),
+                r.format.as_str(),
+                r.field.as_str(),
+                r.changed.as_str()
+            ),
+            ("LIB", "REFF", "REFR", "NAME", "Other")
+        );
+        // From the same source: no file or library, this file's format.
+        let r = f("CITY").reference.unwrap();
+        assert_eq!(
+            (
+                r.file.as_str(),
+                r.format.as_str(),
+                r.field.as_str(),
+                r.changed.as_str()
+            ),
+            ("", "REC", "ADDR", "None")
+        );
         assert_eq!(
             (
                 f("AMOUNT").data_type,
@@ -466,10 +571,13 @@ mod tests {
             ),
             (DataType::Packed, 7, 2)
         );
-        assert_eq!(f("AMOUNT").keywords, "EDTCDE(2)");
+        // No heading anywhere: the referenced field's name (v29_ffdp:
+        // AMOUNT and BIGAMT are headed AMOUNT).
+        assert_eq!(f("AMOUNT").keywords, "EDTCDE(2) COLHDG('AMOUNT')");
         // A length of its own: the editing keywords are not copied.
         assert_eq!((f("BIGAMT").length, f("BIGAMT").decimals), (9, 2));
-        assert_eq!(f("BIGAMT").keywords, "");
+        assert_eq!(f("BIGAMT").keywords, "COLHDG('AMOUNT')");
+        assert_eq!(f("BIGAMT").reference.unwrap().changed, "Field length");
         // Line numbers stay.
         assert_eq!(out.lines().count(), src.lines().count());
         // A display file: packed becomes zoned (S).
@@ -479,8 +587,18 @@ mod tests {
             &files,
         )
         .unwrap();
-        assert!(d.contains("AMOUNT         7S 2B  5  2"), "{d}");
+        // With its edit code: Y (verify29 v29_crtd: 7Y 2).
+        assert!(d.contains("AMOUNT         7Y 2B  5  2"), "{d}");
         assert!(d.trim_end().ends_with(" EDTCDE(2)"), "{d}");
+        // A printer file has no Y fields (DDS for printer files, data
+        // type): zoned, S.
+        let p = expand(
+            "     A                                      REF(REFF)\n     A          R LINE\n     A            AMOUNT    R        O    +2\n",
+            Kind::Printer,
+            &files,
+        )
+        .unwrap();
+        assert!(p.contains("AMOUNT         7S 2O"), "{p}");
         assert!(expand(
             "     A          R REC\n     A            X         R\n",
             Kind::Database,

@@ -2815,7 +2815,7 @@ pub static COMMANDS: &[CommandDef] = &[
         description: "Display Program",
         params: &[
             p("PGM", Kind::Qualified, true, None, "Program").ch("Name"),
-            p("DETAIL", Kind::List, false, Some("*ALL"), "Detail").ch("*ALL, *BASIC"),
+            p("DETAIL", Kind::List, false, Some("*ALL"), "Detail").ch("*ALL, *BASIC, *SRVPGM"),
             p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
         ],
     },
@@ -2836,7 +2836,7 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[
             p("SRVPGM", Kind::Qualified, true, None, "Service program").ch("Name"),
             p("DETAIL", Kind::List, false, Some("*ALL"), "Detail")
-                .ch("*ALL, *BASIC, *SIGNATURE, *PROCEXP"),
+                .ch("*ALL, *BASIC, *MODULE, *SIGNATURE, *PROCEXP"),
             p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
         ],
     },

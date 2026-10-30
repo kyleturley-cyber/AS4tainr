@@ -1,0 +1,8 @@
+     A* verify30: a field reference file
+     A          R GLD30RR
+     A            NAME          10A         TEXT('Name')
+     A            PK             5P 0       TEXT('Packed')
+     A            BIN            9B 0       TEXT('Binary')
+     A            ZD             7S 2       TEXT('Zoned')
+     A                                      EDTCDE(J)
+     A            DT              L         TEXT('Date')

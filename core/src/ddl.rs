@@ -1873,6 +1873,7 @@ async fn add_foreign_key(
 
 /// What ALTER TABLE does.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Alter {
     /// ADD COLUMN: the field (its system name may be renumbered when the
     /// column is added), its unique and check constraints.

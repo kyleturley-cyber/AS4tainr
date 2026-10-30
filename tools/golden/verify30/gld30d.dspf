@@ -1,0 +1,14 @@
+     A* verify30: two record formats, reference and own fields
+     A                                      REF(GLD30R)
+     A          R GLD30A
+     A                                  1  2'Header'
+     A            NAME      R        B  3  2
+     A            PK        R        O  4  2
+     A            BIN       R        B  5  2
+     A            ZD        R        I  6  2
+     A            OWNY           5Y 0B  7  2
+     A            OWNA          10A  I  8  2
+     A            OWNS           3S 1O  9  2
+     A          R GLD30B
+     A            DT        R        B  2  2
+     A            HID           10A  H

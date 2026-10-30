@@ -790,7 +790,43 @@ impl Job<'_> {
             ]),
         ];
         let mut pos = 1u32;
+        let field_header = [body[body.len() - 2].clone(), body[body.len() - 1].clone()];
+        let mut after_reference = false;
         for x in &fields {
+            // After a field with referenced information, the column
+            // headings again (PUB400 2026-10-30, verify29 v29_ffdp).
+            if after_reference {
+                body.extend(field_header.iter().cloned());
+            }
+            after_reference = x.reference.is_some();
+            let kws = crate::dds::split_keywords(&x.keywords);
+            let kw_args = |name: &str| -> Vec<String> {
+                kws.iter()
+                    .find(|k| crate::dds::keyword_name(k) == name)
+                    .map(|k| {
+                        let inner = k.split_once('(').map(|v| v.1).unwrap_or("");
+                        let inner = inner.strip_suffix(')').unwrap_or(inner);
+                        if inner.contains('\'') {
+                            inner
+                                .split('\'')
+                                .enumerate()
+                                .filter(|(j, _)| j % 2 == 1)
+                                .map(|(_, p)| p.to_string())
+                                .collect()
+                        } else {
+                            inner.split_whitespace().map(str::to_string).collect()
+                        }
+                    })
+                    .unwrap_or_default()
+            };
+            let headings = {
+                let h = kw_args("COLHDG");
+                if h.is_empty() {
+                    vec![x.name.clone()]
+                } else {
+                    h
+                }
+            };
             let ty = match x.data_type {
                 DataType::Char => "CHAR".to_string(),
                 t => format!("{t:?}").to_ascii_uppercase(),
@@ -808,10 +844,38 @@ impl Job<'_> {
                 x.name, ty, size, pos
             );
             if heading {
-                line = format!("{line:<66}{}", x.name);
+                line = format!("{line:<66}{}", headings[0]);
             }
             body.push(line);
-            if x.data_type == DataType::Char {
+            if heading {
+                for h in &headings[1..] {
+                    body.push(format!("{:66}{h}", ""));
+                }
+            }
+            if !x.text.is_empty() {
+                body.push(kv(6, "Field text", &x.text));
+            }
+            // Referenced information, editing, the date format (v29_ffdp).
+            if let Some(r) = &x.reference {
+                body.push(at(&[(6, "Referenced information")]));
+                body.push(kv(8, "Referenced file", &r.file));
+                body.push(kv(10, "Library", &r.library));
+                body.push(kv(8, "Referenced record format", &r.format));
+                body.push(kv(8, "Referenced field", &r.field));
+                body.push(kv(8, "Attributes changed", &r.changed));
+            }
+            if let Some(code) = kw_args("EDTCDE").first() {
+                body.push(at(&[(6, "Editing Information")]));
+                body.push(kv(8, "Edit code", code));
+            }
+            if x.data_type == DataType::Date {
+                let f = kw_args("DATFMT")
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "*ISO".into());
+                body.push(kv(6, "Date Format", &f));
+            }
+            if matches!(x.data_type, DataType::Char | DataType::Date) {
                 body.push(format!(
                     "     {}{ccsid:>7}",
                     crate::commands::dsp_label("Coded Character Set Identifier", 48 - 6 - 2)
@@ -1038,6 +1102,7 @@ pub async fn record_format(
             generated: None,
             hidden: false,
             keywords: String::new(),
+            reference: None,
         };
         return Ok((
             name.to_string(),

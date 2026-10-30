@@ -5967,7 +5967,9 @@ async fn ile_activation_groups_and_signatures() {
         ("SIGSRV", "BND", "STRPGMEXP PGMLVL(*CURRENT) SIGNATURE('V1')\n  EXPORT SYMBOL(HELLO)\nENDPGMEXP\n".to_string()),
         ("SIGSRV2", "BND", "STRPGMEXP PGMLVL(*CURRENT) SIGNATURE('V2')\n  EXPORT SYMBOL(HELLO)\nENDPGMEXP\n".to_string()),
         ("SIGSRV3", "BND", "STRPGMEXP PGMLVL(*CURRENT) SIGNATURE('V3')\n  EXPORT SYMBOL(HELLO)\nENDPGMEXP\nSTRPGMEXP PGMLVL(*PRV) SIGNATURE('V2')\n  EXPORT SYMBOL(HELLO)\nENDPGMEXP\n".to_string()),
-        ("SIGUSER", "RPGLE", "**FREE\nctl-opt dftactgrp(*no);\ndcl-pr hello varchar(20) end-pr;\ndsply hello();\n*inlr = *on;\n".to_string()),
+        // A module (CRTRPGMOD) takes no DFTACTGRP: RNF1324 (PUB400
+        // 2026-10-30, verify29 v29_dlst).
+        ("SIGUSER", "RPGLE", "**FREE\ndcl-pr hello varchar(20) end-pr;\ndsply hello();\n*inlr = *on;\n".to_string()),
     ];
     for (name, t, text) in &members {
         let file = if *t == "BND" { "QSRVSRC" } else { "QRPGLESRC" };
@@ -19374,8 +19376,10 @@ end-proc;
             "QRPGLESRC",
             "PP",
             "RPGLE",
+            // No DFTACTGRP or ACTGRP in a module: CRTRPGMOD stops with
+            // RNF1324 (PUB400 2026-10-30, verify29 v29_vlst); CRTPGM's
+            // ACTGRP(PPGRP) names the activation group.
             "**FREE
-ctl-opt dftactgrp(*no) actgrp('PPGRP');
 dcl-pr cbcall int(10) extproc('CBCALL');
   p pointer(*proc) value;
   n int(10) value;
@@ -20848,6 +20852,86 @@ async fn dspsrvpgm_signatures_and_procedure_exports_printed() {
             ),
         ]
     );
+    // DETAIL(*MODULE): the module, library, attribute, creation date,
+    // optimization *NONE and debug data *YES (PUB400 2026-10-30, verify29
+    // v29_smod); DSPPGM DETAIL(*SRVPGM) of a program bound to it: *IMMED
+    // and the signature (v29_psrv; IBM i's own runtime service programs
+    // are left out, fidelity-gaps.md).
+    let mods = print(
+        job.run(&format!(
+            "DSPSRVPGM SRVPGM({lib}/GLD28M) DETAIL(*MODULE) OUTPUT(*PRINT)"
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        mods[7],
+        format!("{}Creation     Optimization     Debug", " ".repeat(46))
+    );
+    assert_eq!(
+        mods[8],
+        " Module         Library        Attribute      Date            Level         Data"
+    );
+    assert!(
+        mods[9].starts_with(&format!(" GLD28M         {lib:<15}RPGLE          ")),
+        "{mods:?}"
+    );
+    assert!(mods[9].ends_with("     *NONE            *YES"), "{mods:?}");
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QSRC".into(),
+            name: "GLD28U".into(),
+            srctype: "RPGLE".into(),
+            source: "**FREE\ndcl-pr gld28two int(10) extproc('GLD28TWO');\nend-pr;\ndcl-pi *n;\n  r char(10);\nend-pi;\nr = %char(gld28two());\n*inlr = *on;\n".into(),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/GLD28U) SRCFILE({lib}/QSRC)"),
+        format!("CRTPGM PGM({lib}/GLD28U) MODULE({lib}/GLD28U) BNDSRVPGM(({lib}/GLD28M))"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    let srv = print(
+        job.run(&format!(
+            "DSPPGM PGM({lib}/GLD28U) DETAIL(*SRVPGM) OUTPUT(*PRINT)"
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        srv[2],
+        format!(
+            " Program  . . . . . . . :   GLD28U{}Library  . . . . . . . :   {lib}",
+            " ".repeat(34)
+        )
+    );
+    assert_eq!(srv[5], " Detail . . . . . . . . :   *SRVPGM");
+    assert_eq!(srv[6], " Service");
+    assert_eq!(
+        srv[7],
+        " Program        Library        Activation     Signature"
+    );
+    assert_eq!(
+        srv[8],
+        format!(" GLD28M         {lib:<15}*IMMED         C7D3C4F2F840E5F24040404040404040")
+    );
+    // CRTPGM of a module that is not there: CPF3C50 (verify28 u28_pgmu).
+    let e = cl_cmd(
+        &mut job,
+        format!("CRTPGM PGM({lib}/NOMOD) MODULE({lib}/NOMOD)"),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        e.contains(": CPF3C50: Program NOMOD was not created"),
+        "{e}"
+    );
 }
 
 /// What IBM's TOBi example project (github.com/IBM/tobi-example) needed,
@@ -20995,17 +21079,93 @@ dsply (%trim(r) + ' ' + %char(pos));
         )
     };
     assert_eq!(shape("NAME"), ("A".into(), 20, 0, "Name".into()));
-    assert_eq!(shape("ADDR"), ("A".into(), 20, 0, "Name".into()));
+    // A heading of its own and no text: its heading is its text; no
+    // heading anywhere: the referenced field's name (PUB400 2026-10-30,
+    // verify29 v29_ffdp: ADDR and CITY show text Address, AMOUNT and
+    // BIGAMT are headed AMOUNT).
+    assert_eq!(shape("ADDR"), ("A".into(), 20, 0, "Address".into()));
     assert_eq!(field("ADDR").keywords, "COLHDG('Address')");
     assert_eq!(field("NAME").keywords, "COLHDG('Name')");
-    assert_eq!(shape("CITY"), ("A".into(), 20, 0, "Name".into()));
+    assert_eq!(shape("CITY"), ("A".into(), 20, 0, "Address".into()));
     assert_eq!(field("CITY").keywords, "COLHDG('Address')");
     assert_eq!(shape("AMOUNT"), ("P".into(), 7, 2, "Amount".into()));
-    assert_eq!(field("AMOUNT").keywords, "EDTCDE(2)");
+    assert_eq!(field("AMOUNT").keywords, "EDTCDE(2) COLHDG('AMOUNT')");
     assert_eq!(shape("BIGAMT"), ("P".into(), 9, 2, "Amount".into()));
-    assert_eq!(field("BIGAMT").keywords, "");
+    assert_eq!(field("BIGAMT").keywords, "COLHDG('AMOUNT')");
     assert_eq!(shape("SHORT"), ("A".into(), 15, 0, "Name".into()));
     assert_eq!(shape("WHEN"), ("L".into(), 10, 0, "When".into()));
+    // DSPFFD prints a reference field's text, heading, referenced
+    // information, edit code and date format, and the column headings
+    // again after a field with referenced information (PUB400 2026-10-30,
+    // verify29 v29_ffdp, lines 21-29 and 54-63).
+    let print = match job
+        .run(&format!("DSPFFD FILE({lib}/REFP) OUTPUT(*PRINT)"))
+        .await
+        .unwrap()
+    {
+        as4tainr_core::commands::Outcome::Display(d) => d.print,
+        other => panic!("{other:?}"),
+    };
+    let from = print
+        .iter()
+        .position(|l| l.starts_with("   NAME "))
+        .unwrap();
+    let mut expected: Vec<String> = [
+        "   NAME       CHAR           20      20         1        Both     Name",
+        "     Field text  . . . . . . . . . . . . . . . :  Name",
+        "     Referenced information",
+        "       Referenced file . . . . . . . . . . . . :  REFR",
+    ]
+    .iter()
+    .map(|x| x.to_string())
+    .collect();
+    expected.push(format!(
+        "         Library . . . . . . . . . . . . . . . :  {lib}"
+    ));
+    expected.extend(
+        [
+            "       Referenced record format  . . . . . . . :  REFRR",
+            "       Referenced field  . . . . . . . . . . . :  NAME",
+            "       Attributes changed  . . . . . . . . . . :  None",
+            "     Coded Character Set Identifier  . . . . . :     37",
+            "              Data        Field  Buffer    Buffer        Field    Column",
+            "   Field      Type       Length  Length  Position        Usage    Heading",
+            "   ADDR       CHAR           20      20        21        Both     Address",
+            "     Field text  . . . . . . . . . . . . . . . :  Address",
+        ]
+        .iter()
+        .map(|x| x.to_string()),
+    );
+    assert_eq!(print[from..from + expected.len()], expected[..]);
+    for l in [
+        "       Attributes changed  . . . . . . . . . . :  Other",
+        "       Attributes changed  . . . . . . . . . . :  Field length",
+        "       Edit code . . . . . . . . . . . . . . . :  2",
+        "     Date Format . . . . . . . . . . . . . . . :  *ISO",
+        "   BIGAMT     PACKED       9  2       5        65        Both     AMOUNT",
+    ] {
+        assert!(print.iter().any(|x| x == l), "{l}: {print:#?}");
+    }
+    // A module whose control specification names DFTACTGRP is not
+    // created: RNF1324, then RNS9308 and RNS9309 (verify29 v29_dmod).
+    source::put_member(
+        &client,
+        &put(
+            "DFTMOD",
+            "RPGLE",
+            "**FREE\nctl-opt dftactgrp(*yes);\ndcl-s n int(10);\nn = 1;\n*inlr = *on;\n",
+        ),
+        false,
+    )
+    .await
+    .unwrap();
+    let e = cl_cmd(
+        &mut job,
+        format!("CRTRPGMOD MODULE({lib}/DFTMOD) SRCFILE({lib}/QSRC)"),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("RNS9308") && e.contains("RNS9309"), "{e}");
     // The bound call of MAINB's main procedure sets the parameter; the
     // unnamed based data structure is over SPOT.
     assert_eq!(

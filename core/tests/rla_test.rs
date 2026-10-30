@@ -3555,7 +3555,10 @@ async fn record_locks() {
         include_str!("../../samples/qddssrc/CUSTNAME.lf"),
     )
     .await;
-    let wait = std::time::Duration::from_millis(700);
+    // The record wait: long enough that A's UPDATE, 200 ms after B starts
+    // waiting, comes before it ends even on a loaded machine (700 ms
+    // timed out once in a full run, 2026-10-29).
+    let wait = std::time::Duration::from_millis(2000);
     let holder = format!("000042/QSECOFR/L{lib}");
     let a = runtime::connect_db(&url).await.unwrap();
     runtime::job_session(&a, Some(&holder), wait).await.unwrap();
@@ -20151,4 +20154,152 @@ ENDPGM
         .await
         .unwrap();
     assert_eq!(r, ["CAUGHT CEE9901", "[10 ][273   ]"]);
+}
+
+/// What PUB400 showed for verify25 (2026-10-29, tools/golden/
+/// verify25.txt): CL %CHAR of variables padded to a fixed length with no
+/// zero before the decimal point (r25_rows: "[12.50    ][-3    ][-.5  ]
+/// [42 and 14 blanks][7 and 10 blanks]"); CPYSRCF of the same record
+/// length (r25_same: CPF2889, CPC2955) and into a shorter source file
+/// (r25_shorter: CPF2889, CPF2973, CPC2955); RTVBNDSRC numbering its
+/// records 0000.01, 0000.02... (r25_rtvm_hex); DSPFD TYPE(*MBRLIST) of a
+/// data file showing 16384 bytes for a small member (r25_mbrl_data).
+#[tokio::test]
+async fn verify25_char_padding_cpysrcf_rtvbndsrc_numbers_and_data_mbrlist() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let ids = |v: &[String]| -> Vec<String> {
+        v.iter()
+            .map(|l| as4tainr_core::jobs::message_id(l).to_string())
+            .filter(|i| !i.is_empty())
+            .collect()
+    };
+    for c in [
+        format!("CRTSRCPF FILE({lib}/S92) RCDLEN(92)"),
+        format!("CRTSRCPF FILE({lib}/T112) RCDLEN(112)"),
+        format!("CRTSRCPF FILE({lib}/U112) RCDLEN(112)"),
+        format!("RUNSQL SQL('CREATE TABLE {lib}/OUT25 (N INT, LINE VARCHAR(200))') COMMIT(*NONE)"),
+        format!("RUNSQL SQL('INSERT INTO {lib}/OUT25 VALUES(1, ''a''), (2, ''b''), (3, ''c'')') COMMIT(*NONE)"),
+    ] {
+        cl_cmd(&mut job, c.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    let put = |file: &str, name: &str, srctype: &str, src: &str| source::Member {
+        library: lib.clone(),
+        file: file.into(),
+        name: name.into(),
+        srctype: srctype.into(),
+        source: src.into(),
+        ..Default::default()
+    };
+    for m in [
+        put("T112", "M1", "TXT", "one\ntwo\nthree\n"),
+        put(
+            "T112",
+            "P",
+            "RPGLE",
+            "**FREE
+ctl-opt nomain;
+dcl-proc p25cnt export;
+  dcl-pi *n int(10) end-pi;
+  return 3;
+end-proc;
+",
+        ),
+        put(
+            "T112",
+            "CHARS",
+            "CLLE",
+            "PGM
+DCL &D72 *DEC (7 2) VALUE(12.5)
+DCL &DN *DEC (5 0) VALUE(-3)
+DCL &D31 *DEC (3 1) VALUE(-0.5)
+DCL &D150 *DEC (15 0) VALUE(42)
+DCL &I *INT 4 VALUE(7)
+DCL &L *CHAR 200
+CHGVAR &L ('[' *CAT %CHAR(&D72) *CAT '][' *CAT %CHAR(&DN) *CAT '][' *CAT +
+  %CHAR(&D31) *CAT '][' *CAT %CHAR(&D150) *CAT '][' *CAT %CHAR(&I) *CAT ']')
+SNDPGMMSG MSG(&L) TOPGMQ(*EXT)
+ENDPGM
+",
+        ),
+    ] {
+        source::put_member(&client, &m, false).await.unwrap();
+    }
+    let r = cl_cmd(
+        &mut job,
+        format!("CPYSRCF FROMFILE({lib}/T112) TOFILE({lib}/U112) FROMMBR(M1)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&r), ["CPF2889", "CPC2955"]);
+    let r = cl_cmd(
+        &mut job,
+        format!("CPYSRCF FROMFILE({lib}/T112) TOFILE({lib}/S92) FROMMBR(M1)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&r), ["CPF2889", "CPF2973", "CPC2955"]);
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/P) SRCFILE({lib}/T112)"),
+        format!("RTVBNDSRC MODULE({lib}/P) SRCFILE({lib}/U112) SRCMBR(RTVM)"),
+        format!("CRTBNDCL PGM({lib}/CHARS) SRCFILE({lib}/T112)"),
+    ] {
+        cl_cmd(&mut job, c.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    let m = source::find_member(&client, std::slice::from_ref(&lib), "U112", "RTVM")
+        .await
+        .unwrap();
+    let sd = source::member_seqdat(&client, &lib, "U112", "RTVM")
+        .await
+        .unwrap();
+    let seqs: Vec<String> = source::line_records(&m.source, sd.as_deref())
+        .into_iter()
+        .map(|r| r.0)
+        .collect();
+    assert_eq!(seqs, ["0.01", "0.02", "0.03", "0.04", "0.05", "0.06"]);
+    let print = match job
+        .run(&format!(
+            "DSPFD FILE({lib}/OUT25) TYPE(*MBRLIST) OUTPUT(*PRINT)"
+        ))
+        .await
+        .unwrap()
+    {
+        Outcome::Display(d) => d.print,
+        other => panic!("{other:?}"),
+    };
+    let m1 = print.iter().find(|l| l.starts_with("  OUT25 ")).unwrap();
+    assert_eq!(&m1[24..29], "16384");
+    assert!(print
+        .iter()
+        .any(|l| l.contains("Type of file . : Physical *DATA")));
+    let r = run_in_own_job(&client, &url, &lib, &format!("CALL {lib}/CHARS"))
+        .await
+        .unwrap();
+    assert_eq!(
+        r,
+        [format!(
+            "[12.50    ][-3    ][-.5  ][42{}][7{}]",
+            " ".repeat(14),
+            " ".repeat(10)
+        )]
+    );
 }

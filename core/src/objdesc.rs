@@ -296,7 +296,10 @@ impl Job<'_> {
         source: bool,
         members: &[(String, String, String)],
     ) -> Result<Vec<String>> {
-        const SIZE: i64 = 8192;
+        // What the captures' small members took: 8192 bytes for a source
+        // member (verify24 q24_mbrd), 16384 for a data member (verify25
+        // r25_mbrl_data).
+        let size: i64 = if source { 8192 } else { 16384 };
         let stamp = crate::report::Stamp::now();
         let when = format!("{}  {}", stamp.date, stamp.time);
         let mut out = vec![
@@ -377,7 +380,7 @@ impl Job<'_> {
             total += records;
             let (a, c) = (stamp_of(added), stamp_of(changed));
             out.push(format!(
-                "  {m:<10}{SIZE:>17} {srctype:<6} {:<8} {:<8} {:<8}{records:>11}{:>11}",
+                "  {m:<10}{size:>17} {srctype:<6} {:<8} {:<8} {:<8}{records:>11}{:>11}",
                 a.date, c.date, c.time, 0
             ));
             out.push(format!("    Text:  {text}").trim_end().to_string());
@@ -390,7 +393,7 @@ impl Job<'_> {
         out.push(tot("Total deleted records  . . . . . . . . . . :", 0));
         out.push(tot(
             "Total of member sizes  . . . . . . . . . . :",
-            SIZE * n,
+            size * n,
         ));
         Ok(out)
     }

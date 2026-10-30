@@ -1058,21 +1058,35 @@ fn eval(e: &Expr, vars: &HashMap<String, Var>) -> Result<Value> {
                 }
                 "%CHAR" => Value::Char(match arg(0)? {
                     Value::Dec(d) => {
-                        let t = dec_text(&d);
-                        // A *DEC variable with no decimal positions: the
-                        // text padded with blanks to its digits plus one
-                        // (PUB400 2026-10-29, tools/golden/verify24.txt
-                        // q24_rows: *DEC (2 0) 10 gives "10 ", 0 gives
-                        // "0  ", *DEC (5 0) 273 gives "273   ").
-                        match args.first() {
-                            Some(Expr::Var(v)) => match vars.get(v) {
-                                Some(var) if var.ty == VarType::Dec && var.decimals == 0 => {
-                                    format!("{t:<w$}", w = var.len as usize + 1)
-                                }
-                                _ => t,
-                            },
-                            _ => t,
+                        // No zero before the decimal point (verify25
+                        // r25_rows: *DEC (3 1) -0.5 gives "-.5").
+                        let mut t = dec_text(&d);
+                        if let Some(r) = t.strip_prefix("0.") {
+                            t = format!(".{r}");
+                        } else if let Some(r) = t.strip_prefix("-0.") {
+                            t = format!("-.{r}");
                         }
+                        // A variable's text is padded with blanks to a
+                        // fixed length (PUB400 2026-10-29): a *DEC to its
+                        // digits plus one, plus one more with decimal
+                        // positions (verify24 q24_rows: *DEC (2 0) 10 is
+                        // "10 ", (5 0) 273 "273   "; verify25 r25_rows:
+                        // (7 2) 12.5 "12.50    ", (5 0) -3 "-3    ",
+                        // (3 1) -0.5 "-.5  ", (15 0) 42 with 14 blanks);
+                        // an *INT to its largest number of digits plus
+                        // one (*INT 4 7: "7" and 10 blanks).
+                        let width = match args.first() {
+                            Some(Expr::Var(v)) => match vars.get(v) {
+                                Some(var) if var.ty == VarType::Dec => {
+                                    var.len as usize + if var.decimals == 0 { 1 } else { 2 }
+                                }
+                                // Its length is its digits (5, 10, 19).
+                                Some(var) if var.ty == VarType::Int => var.len as usize + 1,
+                                _ => 0,
+                            },
+                            _ => 0,
+                        };
+                        format!("{t:<width$}")
                     }
                     other => other.as_char()?,
                 }),

@@ -1,0 +1,4 @@
+/* verify26: an ILE CL program that leaves an escape unmonitored */
+PGM
+CALL NOSUCH26
+ENDPGM

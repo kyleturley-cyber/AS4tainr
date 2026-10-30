@@ -2,4 +2,4 @@
 # each one whose captures are not all in target\ibmi\golden yet.
 # One list per line ("name", or "name|folder" when its files are in
 # another folder than tools\golden\<name>).
-verify25
+verify26

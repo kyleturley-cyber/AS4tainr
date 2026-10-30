@@ -1662,18 +1662,33 @@ impl Job<'_> {
                 .await
                 .ok();
         let mut source = String::new();
+        let mut meta: Vec<String> = Vec::new();
         let (srctype, text) = match &existing {
             Some(e) => {
                 if cmd.get("MBROPT").eq_ignore_ascii_case("*ADD") {
                     source.push_str(&e.source);
+                    let sd = crate::source::member_seqdat(self.client, &lib, &file, &mbr).await?;
+                    meta = crate::source::line_records(&e.source, sd.as_deref())
+                        .iter()
+                        .map(|(q, d, _)| crate::source::line_meta(q, d))
+                        .collect();
                 }
                 (e.srctype.clone(), e.text.clone())
             }
             None => ("BND".to_string(), String::new()),
         };
+        // Its records are numbered 0000.01, 0000.02... by their place in
+        // the member (verify25 r25_rtvm_hex; verify24 q24_print_rtv2 after
+        // MBROPT(*ADD)); their date bytes print as 00 and blanks there,
+        // zero here (docs/fidelity-gaps.md).
         for l in &lines {
             source.push_str(l);
             source.push('\n');
+            let n = meta.len() + 1;
+            meta.push(crate::source::line_meta(
+                &format!("{}.{:02}", n / 100, n % 100),
+                "0",
+            ));
         }
         crate::source::put_member(
             self.client,
@@ -1689,6 +1704,7 @@ impl Job<'_> {
             true,
         )
         .await?;
+        crate::source::set_member_seqdat(self.client, &lib, &file, &mbr, &meta.join("\n")).await?;
         // Its messages (PUB400 2026-10-29, tools/golden/verify24.txt
         // q24_rtvbndsrc, q24_rtv_again, q24_rtv_mod): CPI5D12 when the
         // member was added, CPI5D11 naming the object, its library and

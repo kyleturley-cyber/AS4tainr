@@ -211,6 +211,16 @@ impl Job<'_> {
                     crate::qtemp::logical(&to_lib)
                 ));
             }
+            // Into a shorter source file: CPF2973 with the to-file's
+            // data length, whatever the lines hold (verify25
+            // r25_shorter: from 112 to 92 bytes, three short lines).
+            if from_rcdlen > to_rcdlen {
+                done.push(format!(
+                    "CPF2973: The source data of file {from_name} in library {} was cut to {} characters.",
+                    crate::qtemp::logical(&from_lib),
+                    width
+                ));
+            }
             done.push(format!(
                 "CPC2955: {count} records were copied from member {mbr}."
             ));

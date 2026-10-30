@@ -1,0 +1,25 @@
+# Golden: what verify25 left open. Why GLD24R did not compile (DSPLY of a
+# 60-byte field? The ILE RPG Reference gives 52 bytes as the most DSPLY
+# shows): listings for 60, 52 and 53 bytes. With the inquiry reply *DFT
+# (verify25's calls waited for a reply with *RQD): what a caller monitors
+# from a failed ILE and a failed OPM CL program, and what `system` shows
+# when the caller does not monitor; %CHAR of *INT 2 and 8, *UINT 4 and a
+# *DEC (7 2) zero.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify26.txt -Files tools\golden\verify26
+s26_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLD26A)" "DLTPGM PGM(AS4TRAINR1/GLD26B)" "DLTPGM PGM(AS4TRAINR1/GLD26C)" "DLTPGM PGM(AS4TRAINR1/GLD26D)" "DLTPGM PGM(AS4TRAINR1/GLD26E)" "DLTPGM PGM(AS4TRAINR1/GLD26W)" "DLTF FILE(AS4TRAINR1/GLD26OUT)" "DLTF FILE(AS4TRAINR1/GLD26S)"; do system -q "$c"; done; echo cleaned
+s26_tag|!for f in gld26a.rpgle gld26b.rpgle gld26c.rpgle gld26d.clle gld26w.clle; do setccsid 819 /home/AS4TRAINR/gld/$f; done; ls /home/AS4TRAINR/gld | grep gld26
+s26_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD26OUT (N INT, LINE VARCHAR(200))') COMMIT(*NONE)
+s26_dsply60|!system "CRTBNDRPG PGM(AS4TRAINR1/GLD26A) SRCSTMF('/home/AS4TRAINR/gld/gld26a.rpgle')"
+s26_dsply52|!system -s "CRTBNDRPG PGM(AS4TRAINR1/GLD26B) SRCSTMF('/home/AS4TRAINR/gld/gld26b.rpgle')"
+s26_dsply53|!system "CRTBNDRPG PGM(AS4TRAINR1/GLD26C) SRCSTMF('/home/AS4TRAINR/gld/gld26c.rpgle')"
+s26_cld|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD26D) SRCSTMF('/home/AS4TRAINR/gld/gld26d.clle')"
+s26_srcs|CRTSRCPF FILE(AS4TRAINR1/GLD26S) RCDLEN(112)
+s26_mbr_e|CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld26d.clle') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD26S.FILE/E.MBR')
+s26_mbr_e_type|CHGPFM FILE(AS4TRAINR1/GLD26S) MBR(E) SRCTYPE(CLP)
+s26_clp|!system -s "CRTCLPGM PGM(AS4TRAINR1/GLD26E) SRCFILE(AS4TRAINR1/GLD26S) SRCMBR(E)"
+s26_clw|!system -s "CRTBNDCL PGM(AS4TRAINR1/GLD26W) SRCSTMF('/home/AS4TRAINR/gld/gld26w.clle')"
+s26_call_all|!system "CALL PGM(AS4TRAINR1/GLD26W) PARM('A')"
+s26_rows|CPYF FROMFILE(AS4TRAINR1/GLD26OUT) TOFILE(*PRINT)
+s26_call_ile|!system "CALL PGM(AS4TRAINR1/GLD26W) PARM('I')"
+s26_call_opm|!system "CALL PGM(AS4TRAINR1/GLD26W) PARM('O')"
+s26_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLD26A)" "DLTPGM PGM(AS4TRAINR1/GLD26B)" "DLTPGM PGM(AS4TRAINR1/GLD26C)" "DLTPGM PGM(AS4TRAINR1/GLD26D)" "DLTPGM PGM(AS4TRAINR1/GLD26E)" "DLTPGM PGM(AS4TRAINR1/GLD26W)" "DLTF FILE(AS4TRAINR1/GLD26OUT)" "DLTF FILE(AS4TRAINR1/GLD26S)"; do system -q "$c"; done; echo cleaned

@@ -8516,6 +8516,9 @@ fn listing_message(
     let w: Vec<&str> = words.iter().map(String::as_str).collect();
     match w.as_slice() {
         ["SET", "SCHEMA", ..] | ["SET", "CURRENT", "SCHEMA", ..] => msg("SQL790F", 0, text),
+        // SET of a global variable: SQL7948 (PUB400 2026-10-30, verify30
+        // w30_script).
+        ["SET", ..] if text.starts_with("Variable ") => msg("SQL7948", 0, text),
         // Journaled to the library's QSQJRN: SQL7950 (verify4 y_ids);
         // else SQL7905, severity 20.
         ["CREATE", "TABLE", ..] | ["CREATE", "OR", "REPLACE", "TABLE", ..]

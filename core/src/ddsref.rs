@@ -341,7 +341,18 @@ pub fn expand(
         for k in &referenced.keywords {
             let n = keyword_name(k);
             let take = match n.as_str() {
-                "EDTCDE" | "EDTWRD" => !has_editing && !attrs_given,
+                // An input-only or hidden display field takes no editing
+                // (PUB400 2026-10-30, verify30 w30_crtd: ZD, usage I, is
+                // 7S 2 without its EDTCDE(J)).
+                "EDTCDE" | "EDTWRD" => {
+                    !has_editing
+                        && !attrs_given
+                        && !(kind != Kind::Database
+                            && matches!(
+                                cols(&line, 38, 38).to_ascii_uppercase().as_str(),
+                                "I" | "H"
+                            ))
+                }
                 "CHECK" | "CHKMSGID" | "COMP" | "CMP" | "RANGE" | "VALUES" => {
                     !has_validity && !attrs_given
                 }
@@ -451,6 +462,19 @@ pub fn expand(
             l.push_str(&copied.join(" "));
             lines[last] = l;
         }
+        // A display file's field: where it came from, on a comment line
+        // after it (the display file parser skips it; DSPFFD reads it).
+        let mut next = last + 1;
+        if kind == Kind::Device {
+            lines.insert(
+                last + 1,
+                format!(
+                    "     A*@REF {} {} {} {} {changed}",
+                    origin.0, origin.1, origin.2, ref_name
+                ),
+            );
+            next += 1;
+        }
         let mut all = keywords.clone();
         all.extend(copied);
         earlier.insert(
@@ -464,7 +488,7 @@ pub fn expand(
                 name: name.clone(),
             },
         );
-        i = last + 1;
+        i = next;
     }
     let mut out = lines.join("\n");
     out.push('\n');
@@ -589,7 +613,21 @@ mod tests {
         .unwrap();
         // With its edit code: Y (verify29 v29_crtd: 7Y 2).
         assert!(d.contains("AMOUNT         7Y 2B  5  2"), "{d}");
-        assert!(d.trim_end().ends_with(" EDTCDE(2)"), "{d}");
+        assert!(
+            d.contains("2B  5  2 EDTCDE(2)\n     A*@REF LIB REFF REFR AMOUNT N\n"),
+            "{d}"
+        );
+        // Input only: no editing, so zoned (verify30 w30_crtd: ZD).
+        let i = expand(
+            "     A                                      REF(REFF)\n     A          R SCR\n     A            AMOUNT    R        I  5  2\n",
+            Kind::Device,
+            &files,
+        )
+        .unwrap();
+        assert!(
+            i.contains("AMOUNT         7S 2I  5  2") && !i.contains("EDTCDE"),
+            "{i}"
+        );
         // A printer file has no Y fields (DDS for printer files, data
         // type): zoned, S.
         let p = expand(

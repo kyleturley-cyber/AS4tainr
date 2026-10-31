@@ -75,6 +75,14 @@ CREATE TABLE IF NOT EXISTS as4tainr.sql_triggers (
     created    timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (library, name)
 );
+-- SQL global variables (CREATE VARIABLE; sqlvar.rs).
+CREATE TABLE IF NOT EXISTS as4tainr.sql_variables (
+    library   text NOT NULL,
+    name      text NOT NULL,
+    data_type text NOT NULL,
+    dft       text,
+    PRIMARY KEY (library, name)
+);
 CREATE TABLE IF NOT EXISTS as4tainr.sequences (
     library    text NOT NULL,
     name       text NOT NULL,

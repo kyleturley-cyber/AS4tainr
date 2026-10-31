@@ -21220,3 +21220,188 @@ dsply (%trim(r) + ' ' + %char(pos));
         ["Next customer number"]
     );
 }
+
+/// PUB400 2026-10-30, tools/golden/verify30.txt:
+/// - w30_ffdd: DSPFFD of a display file: per record format its named
+///   fields, input and output buffer positions (I, B, H fields in the
+///   input buffer; O, B, H in the output), usage, row and column, field
+///   text, keyboard shift, referenced information; a reference to a packed
+///   field without an edit code is ZONED, shift S; an input field takes no
+///   edit code (w30_crtd: ZD 7S 2); the record length adds the fields up.
+/// - w30_dft, w30_script, w30_after, w30_cat, w30_rows, w30_obj: a global
+///   variable (CREATE VARIABLE ... DEFAULT 'N') is 'N' in a job until SET
+///   there (a RUNSQLSTM script: 'Y' for the rest of the script, by its
+///   name or qualified), 'N' again in the next job; LABEL ON VARIABLE is
+///   SYSVARIABLES' VARIABLE_TEXT; the variable is a *SRVPGM, attribute CLE;
+///   RUNSQLSTM's listing message for the SET is SQL7948 (golden w30_script).
+#[tokio::test]
+async fn verify30_display_file_ffd_and_global_variables() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    cl_cmd(&mut job, format!("CRTSRCPF FILE({lib}/QSRC) RCDLEN(112)"))
+        .await
+        .unwrap();
+    for (name, t, text) in [
+        (
+            "GLD30R",
+            "PF",
+            "     A          R GLD30RR
+     A            NAME          10A         TEXT('Name')
+     A            PK             5P 0       TEXT('Packed')
+     A            BIN            9B 0       TEXT('Binary')
+     A            ZD             7S 2       TEXT('Zoned')
+     A                                      EDTCDE(J)
+     A            DT              L         TEXT('Date')
+",
+        ),
+        (
+            "GLD30D",
+            "DSPF",
+            "     A                                      REF(GLD30R)
+     A          R GLD30A
+     A                                  1  2'Header'
+     A            NAME      R        B  3  2
+     A            PK        R        O  4  2
+     A            BIN       R        B  5  2
+     A            ZD        R        I  6  2
+     A            OWNY           5Y 0B  7  2
+     A            OWNA          10A  I  8  2
+     A            OWNS           3S 1O  9  2
+     A          R GLD30B
+     A            DT        R        B  2  2
+     A            HID           10A  H
+",
+        ),
+    ] {
+        source::put_member(
+            &client,
+            &source::Member {
+                library: lib.clone(),
+                file: "QSRC".into(),
+                name: name.into(),
+                srctype: t.into(),
+                source: text.into(),
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    for c in [
+        format!("CRTPF FILE({lib}/GLD30R) SRCFILE({lib}/QSRC)"),
+        format!("CRTDSPF FILE({lib}/GLD30D) SRCFILE({lib}/QSRC)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    let print = match job
+        .run(&format!("DSPFFD FILE({lib}/GLD30D) OUTPUT(*PRINT)"))
+        .await
+        .unwrap()
+    {
+        Outcome::Display(d) => d.print,
+        other => panic!("{other:?}"),
+    };
+    let has = |l: &str| assert!(print.iter().any(|x| x == l), "{l}: {print:#?}");
+    for l in [
+        "   Number of record formats  . . . . . . . . . :      2",
+        "   Type of file  . . . . . . . . . . . . . . . :  Device",
+        "   Number of fields  . . . . . . . . . . . . . :      7",
+        "   Record length . . . . . . . . . . . . . . . :     49",
+        "              Data        Field  Buffer   Input  Output  Field",
+        "   Field      Type       Length  Length  Buffer  Buffer  Usage     Row  Column",
+        "   NAME       CHAR           10      10       1       1  Both        3       2",
+        "   PK         ZONED        5  0       5              11  Output      4       2",
+        "   BIN        ZONED        9  0       9      11      16  Both        5       2",
+        "   ZD         ZONED        7  2       7      20          Input       6       2",
+        "   OWNY       ZONED        5  0       5      27      25  Both        7       2",
+        "   OWNA       CHAR           10      10      32          Input       8       2",
+        "   OWNS       ZONED        3  1       3              30  Output      9       2",
+        "   DT         DATE           10      10       1       1  Both        2       2",
+        "   HID        CHAR           10      10      11      11  Both",
+        "     Field text  . . . . . . . . . . . . . . . :  Packed",
+        "     Keyboard shift  . . . . . . . . . . . . . :  S",
+        "     Keyboard shift  . . . . . . . . . . . . . :  Y",
+        "       Referenced field  . . . . . . . . . . . :  ZD",
+        "     Date Format . . . . . . . . . . . . . . . :  *ISO",
+        "   Number of fields  . . . . . . . . . . . . . :      2",
+        "   Record length . . . . . . . . . . . . . . . :     20",
+    ] {
+        has(l);
+    }
+    // An input field: no editing information.
+    assert!(!print.iter().any(|x| x.contains("Edit code")), "{print:#?}");
+    // Global variables.
+    let sql = |s: &str| format!("RUNSQL SQL('{}') COMMIT(*NONE)", s.replace('\'', "''"));
+    for s in [
+        format!("CREATE TABLE {lib}.GLD30OUT (N INT, V CHAR(1))"),
+        format!("CREATE OR REPLACE VARIABLE {lib}.GLD30V CHAR(1) DEFAULT 'N'"),
+        format!("LABEL ON VARIABLE {lib}.GLD30V IS 'Indicator'"),
+        format!("GRANT ALTER, READ, WRITE ON VARIABLE {lib}.GLD30V TO PUBLIC"),
+        format!("INSERT INTO {lib}.GLD30OUT VALUES (1, {lib}.GLD30V)"),
+    ] {
+        cl_cmd(&mut job, sql(&s)).await.unwrap();
+    }
+    let script = format!(
+        "SET GLD30V = 'Y';\nINSERT INTO {lib}.GLD30OUT VALUES (2, GLD30V);\nINSERT INTO {lib}.GLD30OUT VALUES (3, {lib}.GLD30V);\n"
+    );
+    let lines = job
+        .run_sql_script(&script, "test script", 10, Some(lib.clone()), false)
+        .await
+        .unwrap();
+    assert!(lines[0].contains("Variable GLD30V"), "{lines:?}");
+    // The next job: the default again (a job of its own here: values
+    // are kept by job, by its QTEMP library).
+    as4tainr_core::sqlvar::clear(&lib, "GLD30V");
+    for s in [
+        format!("INSERT INTO {lib}.GLD30OUT VALUES (4, {lib}.GLD30V)"),
+        format!(
+            "INSERT INTO {lib}.GLD30OUT SELECT 5, CAST(VARIABLE_TEXT AS CHAR(1)) FROM QSYS2.SYSVARIABLES WHERE VARIABLE_SCHEMA = '{lib}' AND VARIABLE_NAME = 'GLD30V'"
+        ),
+    ] {
+        cl_cmd(&mut job, sql(&s)).await.unwrap();
+    }
+    assert_eq!(
+        sql_rows(
+            &client,
+            &url,
+            &lib,
+            &format!("SELECT N, V FROM {lib}.GLD30OUT ORDER BY N")
+        )
+        .await,
+        ["1|N", "2|Y", "3|Y", "4|N", "5|I"]
+    );
+    let objd = match job
+        .run(&format!(
+            "DSPOBJD OBJ({lib}/GLD30V) OBJTYPE(*SRVPGM) OUTPUT(*PRINT)"
+        ))
+        .await
+        .unwrap()
+    {
+        Outcome::Display(d) => d.print,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        objd.iter()
+            .any(|l| l.starts_with(" GLD30V         *SRVPGM      CLE ") && l.ends_with("Indicator")),
+        "{objd:#?}"
+    );
+    cl_cmd(&mut job, sql(&format!("DROP VARIABLE {lib}.GLD30V")))
+        .await
+        .unwrap();
+}

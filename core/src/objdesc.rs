@@ -712,6 +712,9 @@ impl Job<'_> {
             (0, 0, 0),
         )
         .date;
+        if attr == "DSPF" {
+            return self.dspffd_display(&lib, &name, &created).await;
+        }
         use crate::dds::DataType;
         let (format, fields, external) = record_format(self.client, &lib, &name, &attr)
             .await
@@ -916,6 +919,316 @@ impl Job<'_> {
 }
 
 impl Job<'_> {
+    /// DSPFFD of a display file, printed in IBM i 7.5's layout (PUB400
+    /// 2026-10-30, tools/golden/verify29.txt v29_ffdd, verify30.txt
+    /// w30_ffdd): each record format with its named fields, their type,
+    /// lengths, input and output buffer positions (input: I, B and H
+    /// fields; output: O, B and H), usage, row and column, field text,
+    /// keyboard shift (A, S, Y), where a reference field came from, edit
+    /// code (not for input fields) and date format; the record length is
+    /// the fields' lengths added up. Not as IBM: one page (IBM i starts a
+    /// page for each record format), the format level identifier.
+    async fn dspffd_display(&mut self, lib: &str, name: &str, created: &str) -> Result<Outcome> {
+        let (_, source) = crate::catalog::resolve_display_file(
+            self.client,
+            std::slice::from_ref(&lib.to_string()),
+            name,
+        )
+        .await?;
+        struct DField {
+            name: String,
+            dtype: char,
+            len: u32,
+            dec: Option<u32>,
+            usage: char,
+            pos: Option<(String, String)>,
+            keywords: Vec<String>,
+            reference: Option<[String; 5]>,
+        }
+        let cols = |l: &str, a: usize, b: usize| -> String {
+            l.chars()
+                .skip(a - 1)
+                .take(b + 1 - a)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
+        let mut records: Vec<(String, Vec<DField>)> = Vec::new();
+        let mut continued = false;
+        for line in source.lines() {
+            let line = line.trim_end();
+            if let Some(r) = line.trim_start().strip_prefix("A*@REF ") {
+                let p: Vec<String> = r.split_whitespace().map(str::to_string).collect();
+                if let (Ok(p), Some((_, fs))) = (<[String; 5]>::try_from(p), records.last_mut()) {
+                    if let Some(f) = fs.last_mut() {
+                        f.reference = Some(p);
+                    }
+                }
+                continue;
+            }
+            if line.trim().is_empty() || cols(line, 7, 7) == "*" {
+                continue;
+            }
+            let kw = if line.chars().count() > 44 {
+                line.chars().skip(44).collect::<String>()
+            } else {
+                String::new()
+            };
+            let name_type = cols(line, 17, 17).to_ascii_uppercase();
+            let fname = cols(line, 19, 28).to_ascii_uppercase();
+            if name_type == "R" {
+                records.push((fname, Vec::new()));
+                continued = false;
+                continue;
+            }
+            if !fname.is_empty() && name_type.is_empty() {
+                let Some((_, fs)) = records.last_mut() else {
+                    continue;
+                };
+                let len_txt = cols(line, 30, 34);
+                let ty = cols(line, 35, 35).to_ascii_uppercase();
+                let dec_txt = cols(line, 36, 37);
+                let dtype = match ty.chars().next() {
+                    Some(c) => c,
+                    None if !dec_txt.is_empty() => 'S',
+                    None => 'A',
+                };
+                let len = match dtype {
+                    'L' => 10,
+                    'T' => 8,
+                    'Z' => 26,
+                    _ => len_txt.parse().unwrap_or(0),
+                };
+                let row = cols(line, 39, 41);
+                let col = cols(line, 42, 44);
+                fs.push(DField {
+                    name: fname,
+                    dtype,
+                    len,
+                    dec: dec_txt.parse().ok(),
+                    usage: cols(line, 38, 38).chars().next().unwrap_or('O'),
+                    pos: (!row.is_empty()).then_some((row, col)),
+                    keywords: crate::dds::split_keywords(&kw),
+                    reference: None,
+                });
+                continued = kw.trim_end().ends_with(['-', '+']);
+                continue;
+            }
+            // Keywords for the field above (a constant's line has a
+            // position and no name: not a field's).
+            if fname.is_empty() && cols(line, 39, 44).is_empty() || continued {
+                if let Some(f) = records.last_mut().and_then(|(_, fs)| fs.last_mut()) {
+                    f.keywords.extend(crate::dds::split_keywords(&kw));
+                }
+            }
+            continued = kw.trim_end().ends_with(['-', '+']);
+        }
+        let at = crate::report::at;
+        let kv = |col: usize, label: &str, value: &str| {
+            let l = crate::commands::dsp_label(label, 48 - col - 2);
+            format!("{}{l}  {value}", " ".repeat(col - 1))
+                .trim_end()
+                .to_string()
+        };
+        let num = |col: usize, label: &str, n: usize| {
+            let l = crate::commands::dsp_label(label, 48 - col - 2);
+            format!("{}{l}{n:>7}", " ".repeat(col - 1))
+        };
+        let arg = |f: &DField, k: &str| -> Option<String> {
+            f.keywords
+                .iter()
+                .find(|x| crate::dds::keyword_name(x) == k)
+                .map(|x| {
+                    let inner = x.split_once('(').map(|v| v.1).unwrap_or("");
+                    let inner = inner.strip_suffix(')').unwrap_or(inner);
+                    inner.trim().trim_matches('\'').trim().to_string()
+                })
+        };
+        let mut body = vec![
+            at(&[(2, "Input parameters")]),
+            kv(4, "File", name),
+            kv(6, "Library", lib),
+            at(&[(2, "File Information")]),
+            kv(4, "File", name),
+            kv(6, "Library", lib),
+            num(4, "Number of record formats", records.len()),
+            kv(4, "Type of file", "Device"),
+            kv(4, "File creation date", created),
+        ];
+        let header = [
+            at(&[
+                (15, "Data"),
+                (27, "Field"),
+                (34, "Buffer"),
+                (43, "Input"),
+                (50, "Output"),
+                (58, "Field"),
+            ]),
+            at(&[
+                (4, "Field"),
+                (15, "Type"),
+                (26, "Length"),
+                (34, "Length"),
+                (42, "Buffer"),
+                (50, "Buffer"),
+                (58, "Usage"),
+                (68, "Row"),
+                (73, "Column"),
+            ]),
+        ];
+        for (format, fields) in &records {
+            let defs: Vec<crate::dds::FieldDef> = fields
+                .iter()
+                .map(|f| {
+                    let t = match f.dtype {
+                        'L' => crate::dds::DataType::Date,
+                        'T' => crate::dds::DataType::Time,
+                        'Z' => crate::dds::DataType::Timestamp,
+                        'A' => crate::dds::DataType::Char,
+                        _ => crate::dds::DataType::Zoned,
+                    };
+                    crate::dds::FieldDef::new(&f.name, t, f.len, f.dec.unwrap_or(0))
+                })
+                .collect();
+            body.push(at(&[(2, "Record Format Information")]));
+            body.push(kv(4, "Record format", format));
+            body.push(kv(4, "Format level identifier", &level_id(format, &defs)));
+            body.push(num(4, "Number of fields", fields.len()));
+            body.push(num(
+                4,
+                "Record length",
+                fields.iter().map(|f| f.len as usize).sum(),
+            ));
+            body.push(at(&[(2, "Field Level Information")]));
+            body.extend(header.iter().cloned());
+            let (mut input, mut output) = (1u32, 1u32);
+            let mut after_reference = false;
+            for f in fields {
+                if after_reference {
+                    body.extend(header.iter().cloned());
+                }
+                after_reference = f.reference.is_some();
+                let ty = match f.dtype {
+                    'A' => "CHAR",
+                    'L' => "DATE",
+                    'T' => "TIME",
+                    'Z' => "TIMESTAMP",
+                    _ => "ZONED",
+                };
+                let numeric = matches!(f.dtype, 'S' | 'Y');
+                let length = if numeric {
+                    format!("{:>7}{:>3}", f.len, f.dec.unwrap_or(0))
+                } else {
+                    format!("{:>10}", f.len)
+                };
+                let takes_input = matches!(f.usage, 'I' | 'B' | 'H');
+                let takes_output = matches!(f.usage, 'O' | 'B' | 'H');
+                let inb = if takes_input {
+                    input.to_string()
+                } else {
+                    String::new()
+                };
+                let outb = if takes_output {
+                    output.to_string()
+                } else {
+                    String::new()
+                };
+                let usage = match f.usage {
+                    'I' => "Input",
+                    'O' => "Output",
+                    _ => "Both",
+                };
+                let (row, col) = f.pos.clone().unwrap_or_default();
+                body.push(
+                    format!(
+                        "   {:<10} {:<7}{length}{:>8}{inb:>8}{outb:>8}  {usage:<9}{row:>4}{col:>8}",
+                        f.name, ty, f.len
+                    )
+                    .trim_end()
+                    .to_string(),
+                );
+                if takes_input {
+                    input += f.len;
+                }
+                if takes_output {
+                    output += f.len;
+                }
+                if let Some(t) = arg(f, "TEXT").filter(|t| !t.is_empty()) {
+                    body.push(kv(6, "Field text", &t));
+                }
+                if matches!(f.dtype, 'A' | 'S' | 'Y') {
+                    body.push(kv(6, "Keyboard shift", &f.dtype.to_string()));
+                }
+                if let Some([l, file, fmt, field, changed]) = &f.reference {
+                    let blank = |x: &str| {
+                        if x == "*N" {
+                            String::new()
+                        } else {
+                            x.to_string()
+                        }
+                    };
+                    body.push(at(&[(6, "Referenced information")]));
+                    body.push(kv(8, "Referenced file", &blank(file)));
+                    body.push(kv(10, "Library", &blank(l)));
+                    body.push(kv(
+                        8,
+                        "Referenced record format",
+                        if fmt == "*SRC" { format } else { fmt },
+                    ));
+                    body.push(kv(8, "Referenced field", field));
+                    body.push(kv(
+                        8,
+                        "Attributes changed",
+                        match changed.as_str() {
+                            "L" => "Field length",
+                            "O" => "Other",
+                            _ => "None",
+                        },
+                    ));
+                }
+                if f.usage != 'I' {
+                    if let Some(c) = arg(f, "EDTCDE") {
+                        body.push(at(&[(6, "Editing Information")]));
+                        body.push(kv(8, "Edit code", &c));
+                    }
+                }
+                if f.dtype == 'L' {
+                    let fmt = arg(f, "DATFMT").unwrap_or_else(|| "*ISO".into());
+                    body.push(kv(6, "Date Format", &fmt));
+                }
+            }
+        }
+        let title = "Display File Field Description";
+        let stamp = crate::report::Stamp::now();
+        let when = format!("{}  {}", stamp.date, stamp.time);
+        let mut print = vec![at(&[
+            (2, crate::report::PRODUCT),
+            (18, crate::report::LEVEL),
+            (30, title),
+            (97, &when),
+            (122, "Page    1"),
+        ])];
+        print.extend(body.iter().cloned());
+        let mut shown = vec![at(&[(30, title)])];
+        shown.extend(body);
+        let view = crate::commands::SpoolView {
+            file: "QPDSPFFD".into(),
+            lines: shown
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (1, i + 1, t.clone()))
+                .collect(),
+            width: 132,
+        };
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display Spooled File".into(),
+            rows: shown,
+            print,
+            spool: Some(Box::new(view)),
+            ..Default::default()
+        }))
+    }
+
     /// DSPFFD OUTPUT(*OUTFILE): a record per field in the format of
     /// QSYS/QADSPFFD (QWHDRFFD; outfile.rs, from the PUB400 DSPFFD capture
     /// 2026-10-26, tools/golden/verify2.txt m_ffd, whose field

@@ -2282,6 +2282,7 @@ pub async fn run_as(
         }));
     }
     let libraries = catalog::list_libraries(client).await?;
+    let sql = &crate::sqlvar::substitute(client, libl, sql).await?;
     let sql = &crate::temporal::rewrite(client, libl, sql).await?;
     let t = translate(sql, &|n| libraries.iter().any(|l| l == n))?;
     let mut text = system_column_names(client, libl, &t.sql).await?;
@@ -2830,6 +2831,7 @@ impl Session {
     /// Run one statement (host variables already in it as literals).
     /// `catalog_client` reads file descriptions (INSERT without columns).
     pub async fn exec(&self, catalog_client: &Client, sql: &str) -> Result<Exec> {
+        let sql = &crate::sqlvar::substitute(catalog_client, &self.libl, sql).await?;
         let sql = &crate::temporal::rewrite(catalog_client, &self.libl, sql).await?;
         let t = translate(sql, &|n| self.libraries.iter().any(|l| l == n))?;
         let mut text = system_column_names(catalog_client, &self.libl, &t.sql).await?;

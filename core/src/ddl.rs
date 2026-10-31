@@ -138,6 +138,24 @@ pub enum Ddl {
         name: Name,
         text: String,
     },
+    /// CREATE [OR REPLACE] VARIABLE name type [DEFAULT expression]
+    /// (sqlvar.rs): the type and default as written.
+    CreateVariable {
+        name: Name,
+        replace: bool,
+        data_type: String,
+        default: Option<String>,
+    },
+    /// LABEL ON VARIABLE: the variable object's text.
+    LabelVariable {
+        name: Name,
+        text: String,
+    },
+    /// SET variable = expression: the job's value of a global variable.
+    SetVariable {
+        name: Name,
+        expr: String,
+    },
     /// LABEL ON SEQUENCE: the text of the sequence's data area.
     LabelSequence {
         name: Name,
@@ -303,6 +321,31 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
                         member,
                     }
                 }
+                Some("VARIABLE") if !unique => {
+                    p.i += 1;
+                    let name = p.name()?;
+                    let rest: Vec<String> = p.t[p.i..].iter().map(show).collect();
+                    let at = p.t[p.i..].iter().position(
+                        |t| matches!(t, Tok::Word(w) if w.eq_ignore_ascii_case("DEFAULT")),
+                    );
+                    let (ty, dft) = match at {
+                        Some(k) => (rest[..k].join(" "), Some(rest[k + 1..].join(" "))),
+                        None => (rest.join(" "), None),
+                    };
+                    let ty = ty.trim().trim_end_matches(';').trim().to_string();
+                    let dft = dft
+                        .map(|d| d.trim().trim_end_matches(';').trim().to_string())
+                        .filter(|d| !d.is_empty());
+                    if ty.is_empty() {
+                        bail!("SQL0104: CREATE VARIABLE needs a data type.");
+                    }
+                    return Ok(Some(Ddl::CreateVariable {
+                        name,
+                        replace,
+                        data_type: ty,
+                        default: dft,
+                    }));
+                }
                 Some("SEQUENCE") if !unique => {
                     p.i += 1;
                     let name = p.name()?;
@@ -350,6 +393,7 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
                 Some("INDEX") => "INDEX",
                 Some("VIEW") => "VIEW",
                 Some("SEQUENCE") => "SEQUENCE",
+                Some("VARIABLE") => "VARIABLE",
                 Some(other) => bail!("SQL0084: DROP {other} is not supported yet."),
                 None => bail!("SQL0104: DROP needs an object type."),
             };
@@ -399,6 +443,35 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
             if !p.eat("SCHEMA") {
                 if current {
                     p.i -= 1;
+                }
+                // SET name = expression, name a global variable (special
+                // registers and SET OPTION, PATH, TRANSACTION... are not).
+                if !current
+                    && !matches!(
+                        p.word().as_deref(),
+                        Some(
+                            "PATH"
+                                | "OPTION"
+                                | "TRANSACTION"
+                                | "SESSION"
+                                | "ENCRYPTION"
+                                | "CONNECTION"
+                                | "RESULT"
+                                | "CURRENT_SCHEMA"
+                                | "SQLID"
+                        )
+                    )
+                {
+                    let save = p.i;
+                    if let Ok(name) = p.name() {
+                        if p.punct("=") {
+                            let expr: Vec<String> = p.t[p.i..].iter().map(show).collect();
+                            let expr = expr.join(" ");
+                            let expr = expr.trim().trim_end_matches(';').trim().to_string();
+                            return Ok(Some(Ddl::SetVariable { name, expr }));
+                        }
+                    }
+                    p.i = save;
                 }
                 p.i -= 1;
                 return Ok(None);
@@ -2760,6 +2833,15 @@ fn label(p: &mut P) -> Result<Ddl> {
                 texts: if is_text { vec![(col, s)] } else { vec![] },
             })
         }
+        Some("VARIABLE") => {
+            p.i += 1;
+            let name = p.name()?;
+            p.expect("IS")?;
+            Ok(Ddl::LabelVariable {
+                name,
+                text: text(p)?,
+            })
+        }
         Some("SEQUENCE") => {
             p.i += 1;
             let name = p.name()?;
@@ -2770,7 +2852,7 @@ fn label(p: &mut P) -> Result<Ddl> {
             })
         }
         Some("ALIAS") | Some("PACKAGE") | Some("PROCEDURE") | Some("FUNCTION")
-        | Some("TRIGGER") | Some("MASK") | Some("PERMISSION") | Some("TYPE") | Some("VARIABLE")
+        | Some("TRIGGER") | Some("MASK") | Some("PERMISSION") | Some("TYPE")
         | Some("CONSTRAINT") => {
             bail!(
                 "SQL0084: LABEL ON {} is not supported yet.",
@@ -3524,6 +3606,28 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
         } => create_sequence(ctx, name, *replace, opts).await,
         Ddl::AlterSequence { name, opts } => alter_sequence(ctx, name, opts).await,
         Ddl::Drop {
+            kind: "VARIABLE",
+            name,
+            if_exists,
+        } => {
+            let found = crate::sqlvar::find(
+                ctx.client,
+                &ctx.search(name),
+                name.lib.as_deref(),
+                &name.name,
+            )
+            .await?;
+            let Some((lib, _, _)) = found else {
+                if *if_exists {
+                    return Ok(format!("{} does not exist; nothing dropped.", name.name));
+                }
+                bail!("SQL0204: {} in *LIBL type *SRVPGM not found.", name.name);
+            };
+            authority::check_manage(ctx.client, ctx.user, &lib, &name.name, "*SRVPGM").await?;
+            crate::sqlvar::drop(ctx.client, &lib, &name.name).await?;
+            Ok(format!("Variable {} in {lib} dropped.", name.name))
+        }
+        Ddl::Drop {
             kind: "SEQUENCE",
             name,
             if_exists,
@@ -4093,6 +4197,94 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
             authority::check(ctx.client, ctx.user, &lib, &sys, "*FILE", Aut::Change).await?;
             catalog::set_file_text(ctx.client, &lib, &sys, text).await?;
             Ok(format!("Label on {} in {lib} changed.", name.name))
+        }
+        Ddl::CreateVariable {
+            name,
+            replace,
+            data_type,
+            default,
+        } => {
+            let lib = ctx.target(name);
+            let var = validate_name("variable", &name.name).map_err(|_| {
+                anyhow!("SQL0084: variable names longer than 10 characters are not supported yet.")
+            })?;
+            if !catalog::library_exists(ctx.client, &lib).await? {
+                bail!("SQL0204: Schema {lib} not found.");
+            }
+            authority::check_manage(ctx.client, ctx.user, &lib, &var, "*SRVPGM").await?;
+            crate::sqlvar::create(
+                ctx.client,
+                &lib,
+                &var,
+                data_type,
+                default.as_deref(),
+                *replace,
+            )
+            .await
+        }
+        Ddl::LabelVariable { name, text } => {
+            let found = crate::sqlvar::find(
+                ctx.client,
+                &ctx.search(name),
+                name.lib.as_deref(),
+                &name.name,
+            )
+            .await?;
+            let Some((lib, _, _)) = found else {
+                bail!("SQL0204: {} in *LIBL type *SRVPGM not found.", name.name);
+            };
+            ctx.client
+                .execute(
+                    "UPDATE as4tainr.objects SET text=$3 WHERE library=$1 AND name=$2 AND objtype='*SRVPGM'",
+                    &[&lib, &name.name, text],
+                )
+                .await?;
+            Ok(format!("Label on {} in {lib} changed.", name.name))
+        }
+        Ddl::SetVariable { name, expr } => {
+            let found = crate::sqlvar::find(
+                ctx.client,
+                &ctx.search(name),
+                name.lib.as_deref(),
+                &name.name,
+            )
+            .await?;
+            let Some((lib, ty, _)) = found else {
+                bail!(
+                    "SQL0206: Column or global variable {} not found.",
+                    name.name
+                );
+            };
+            // The value, checked against the variable's type, as text.
+            let q = format!("VALUES CAST(CAST(({expr}) AS {ty}) AS VARCHAR(32740))");
+            let libl: Vec<String> = match &ctx.schema {
+                Some(s) => {
+                    let mut l = vec![s.clone()];
+                    l.extend(ctx.libl.iter().filter(|x| *x != s).cloned());
+                    l
+                }
+                None => ctx.libl.to_vec(),
+            };
+            let value = match crate::sql::run_as(
+                ctx.client,
+                &ctx.database_url,
+                &libl,
+                ctx.user,
+                ctx.curlib.clone(),
+                None,
+                &q,
+            )
+            .await?
+            {
+                crate::sql::Outcome::Rows { rows, .. } => rows
+                    .into_iter()
+                    .next()
+                    .and_then(|r| r.into_iter().next())
+                    .filter(|v| v != "-"),
+                _ => None,
+            };
+            crate::sqlvar::set(&lib, &name.name, value);
+            Ok(format!("Variable {} in {lib} set.", name.name))
         }
         Ddl::LabelSequence { name, text } => {
             let lib = ctx.target(name);

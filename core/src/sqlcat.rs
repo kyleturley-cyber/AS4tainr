@@ -178,6 +178,17 @@ SELECT CAST(x.trg_lib AS varchar(128)), CAST(x.trg AS varchar(128)),
   FROM as4tainr.file_triggers x
   LEFT JOIN as4tainr.files f ON f.library = x.library AND f.name = x.file;
 
+CREATE OR REPLACE VIEW qsys2.sysvariables AS
+SELECT CAST(v.library AS varchar(128)) COLLATE "C" AS variable_schema,
+       CAST(v.name AS varchar(128)) COLLATE "C" AS variable_name,
+       CAST(upper(split_part(trim(v.data_type), '(', 1)) AS varchar(128)) COLLATE "C" AS data_type,
+       CAST(v.dft AS varchar(2000)) COLLATE "C" AS "default",
+       CAST(nullif(o.text, '') AS varchar(50)) COLLATE "C" AS variable_text,
+       CAST(v.library AS char(10)) COLLATE "C" AS system_var_schema,
+       CAST(v.name AS char(10)) COLLATE "C" AS system_var_name
+  FROM as4tainr.sql_variables v
+  JOIN as4tainr.objects o ON o.library = v.library AND o.name = v.name AND o.objtype = '*SRVPGM';
+
 CREATE OR REPLACE VIEW qsys2.syssequences AS
 SELECT CAST(s.library AS varchar(128)) COLLATE "C" AS sequence_schema,
        CAST(s.name AS varchar(128)) COLLATE "C" AS sequence_name,
@@ -361,7 +372,7 @@ SELECT CAST(CASE WHEN family(a.client_addr) = 6 THEN 'IPV6' ELSE 'IPV4' END AS c
  WHERE a.client_port IS NOT NULL AND a.client_port > 0;
 
 GRANT SELECT ON qsys2.syscst, qsys2.syskeycst, qsys2.syschkcst, qsys2.sysrefcst, qsys2.systriggers,
-    qsys2.syssequences, qsys2.output_queue_entries_basic, qsys2.output_queue_entries,
+    qsys2.syssequences, qsys2.sysvariables, qsys2.output_queue_entries_basic, qsys2.output_queue_entries,
     qsys2.object_privileges, qsys2.netstat_job_info TO {role};
 GRANT EXECUTE ON FUNCTION qsys2.job_info(varchar, varchar, varchar, varchar, varchar) TO {role};
 "#,

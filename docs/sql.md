@@ -101,6 +101,10 @@ New objects go to the library named, else the default schema, else the current l
 
 The statements are parsed by as4tainr and the PostgreSQL objects built from the parsed description; no part of the statement text is passed on. Procedures and functions are described above. Not supported yet: quoted names with lower case or special characters, ADD COLUMN ... BEFORE, generated columns other than identity columns, ROW CHANGE TIMESTAMP and the auditing expressions (fidelity-gaps.md), the other data types (ROWID, DATALINK, arrays), external functions, table functions with a compound body, triggers with REFERENCING OLD/NEW TABLE (trigger programs, ADDPFTRG: journals.md). See fidelity-gaps.md.
 
+## Global variables
+
+`CREATE [OR REPLACE] VARIABLE lib.name type [DEFAULT expression]` makes a global variable (a *SRVPGM object, attribute CLE, as IBM i shows it; `as4tainr.sql_variables`), `DROP VARIABLE` removes it, `LABEL ON VARIABLE` gives it its text and `GRANT ... ON VARIABLE` is accepted. Each job has its own value: the default until the job runs `SET name = expression` (from RUNSQL, RUNSQLSTM, STRSQL or a program), kept in the process for the job (`sqlvar.rs`). A statement that names a variable, alone or qualified, has the job's value put in its place, cast to the variable's type, before it is translated; a column of a table the statement names wins over a variable of the same name. QSYS2.SYSVARIABLES lists them. Checked against PUB400 (tools/golden/verify30.txt).
+
 ## IBM i services
 
 Written from the Db2 for i SQL Reference (catalog views) and the IBM i services reference. The catalog views are in QSYS2, so they are found through the system part of the library list or by their qualified names; column names, order and code values are IBM's.

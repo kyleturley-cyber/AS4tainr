@@ -3262,7 +3262,7 @@ impl Job<'_> {
             let source = crate::ddsref::expand_from_catalog(
                 self.client,
                 &self.library_list(),
-                &m.source,
+                &dds_columns(&m.source),
                 crate::ddsref::Kind::Printer,
             )
             .await
@@ -3361,7 +3361,7 @@ impl Job<'_> {
                 let expanded = crate::ddsref::expand_from_catalog(
                     self.client,
                     &self.library_list(),
-                    &m.source,
+                    &dds_columns(&m.source),
                     crate::ddsref::Kind::Database,
                 )
                 .await;
@@ -3434,7 +3434,7 @@ impl Job<'_> {
                 };
             }
             "CRTLF" => {
-                let lf = match crate::dds::parse_lf(&name, &m.source) {
+                let lf = match crate::dds::parse_lf(&name, &dds_columns(&m.source)) {
                     Ok(lf) => lf,
                     Err(e) => return Err(self.dds_failed(cmd, &m, &lib, &name, false, e).await),
                 };
@@ -3475,7 +3475,7 @@ impl Job<'_> {
                 let source = crate::ddsref::expand_from_catalog(
                     self.client,
                     &self.library_list(),
-                    &m.source,
+                    &dds_columns(&m.source),
                     crate::ddsref::Kind::Device,
                 )
                 .await?;
@@ -8698,6 +8698,20 @@ fn objaut_print(
         out.push(line(u, *x));
     }
     out.push(crate::report::END_OBJD.into());
+    out
+}
+
+/// DDS source as the DDS compilers read it: positions 1-80 of each line
+/// (what a member's line has after position 80 is not DDS: PUB400
+/// 2026-10-31, verify32 y32_crtp, a keyword going on after position 80
+/// is cut there).
+fn dds_columns(src: &str) -> String {
+    let mut out: String = src
+        .lines()
+        .map(|l| l.chars().take(80).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    out.push('\n');
     out
 }
 

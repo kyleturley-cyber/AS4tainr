@@ -21996,3 +21996,122 @@ return;
         .unwrap_or_else(|_| String::new());
     assert_eq!(value.trim(), "1");
 }
+
+/// QSYS2.STACK_INFO('*') from embedded SQL in an RPG program a CL program
+/// calls (PUB400 2026-10-31, tools/golden/verify32.txt y32_rows): the
+/// newest entry first, numbered from the oldest; the RPG program's main
+/// procedure with its program entry procedure _QRNP_PEP_ and its name
+/// below it; the CL program's _CL_PEP a control boundary; a subprocedure
+/// on top when it runs the statement.
+#[tokio::test]
+async fn stack_info_lists_the_call_stack() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    source::create_file(&client, &lib, "QSRC", "")
+        .await
+        .unwrap();
+    let rpg = format!(
+        "**FREE
+ctl-opt dftactgrp(*no) actgrp(*caller);
+exec sql
+  INSERT INTO {lib}.STKOUT
+    SELECT ORDINAL_POSITION, PROGRAM_NAME CONCAT ' ' CONCAT COALESCE(PROCEDURE_NAME, '-')
+           CONCAT ' ' CONCAT CONTROL_BOUNDARY
+      FROM TABLE(QSYS2.STACK_INFO('*')) X
+     WHERE PROGRAM_LIBRARY_NAME = '{lib}';
+inner();
+*inlr = *on;
+
+dcl-proc inner;
+  exec sql
+    INSERT INTO {lib}.STKOUT
+      SELECT 100 + ORDINAL_POSITION, COALESCE(PROCEDURE_NAME, '-')
+        FROM TABLE(QSYS2.STACK_INFO('*')) X
+       WHERE PROGRAM_LIBRARY_NAME = '{lib}';
+end-proc;
+"
+    );
+    for (name, t, text) in [
+        ("STKS", "SQLRPGLE", rpg),
+        (
+            "STKC",
+            "CLLE",
+            format!("PGM\nCALL PGM({lib}/STKS)\nENDPGM\n"),
+        ),
+    ] {
+        source::put_member(
+            &client,
+            &source::Member {
+                library: lib.clone(),
+                file: "QSRC".into(),
+                name: name.into(),
+                srctype: t.into(),
+                source: text,
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    for c in [
+        format!("RUNSQL SQL('CREATE TABLE {lib}.STKOUT (N INT, LINE VARCHAR(200))') COMMIT(*NONE)"),
+        format!("CRTSQLRPGI OBJ({lib}/STKS) SRCFILE({lib}/QSRC) COMMIT(*NONE)"),
+        format!("CRTBNDCL PGM({lib}/STKC) SRCFILE({lib}/QSRC)"),
+    ] {
+        cl_cmd(&mut job, c.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    // In a job of its own: the call stack is the job's (a test's Job
+    // without one shares the process's with the tests running beside it).
+    run_in_own_job(&client, &url, &lib, &format!("CALL PGM({lib}/STKC)"))
+        .await
+        .unwrap();
+    // Rows in the order STACK_INFO gave them (no ORDER BY): RRN order.
+    let rows = sql_rows(
+        &client,
+        &url,
+        &lib,
+        &format!("SELECT N, LINE FROM {lib}.STKOUT ORDER BY RRN(STKOUT)"),
+    )
+    .await;
+    let lines: Vec<&str> = rows.iter().map(|r| r.split_once('|').unwrap().1).collect();
+    assert_eq!(
+        lines,
+        [
+            "STKS STKS NO",
+            "STKS _QRNP_PEP_STKS NO",
+            "STKC STKC NO",
+            "STKC _CL_PEP YES",
+            "INNER",
+            "STKS",
+            "_QRNP_PEP_STKS",
+            "STKC",
+            "_CL_PEP",
+        ]
+    );
+    // Numbered from the oldest: each row's number is one below the one
+    // before it.
+    let n: Vec<i64> = rows
+        .iter()
+        .map(|r| r.split_once('|').unwrap().0.parse().unwrap())
+        .collect();
+    assert!(n[..4].windows(2).all(|w| w[0] == w[1] + 1), "{n:?}");
+    assert!(n[4..].windows(2).all(|w| w[0] == w[1] + 1), "{n:?}");
+}

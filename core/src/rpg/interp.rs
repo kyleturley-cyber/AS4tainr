@@ -1610,7 +1610,13 @@ impl<'a> Machine<'a> {
                     },
                     None => (v.int_digits() + v.scale() as u32, v.scale() as u32),
                 };
-                let mut out = edit_code(&v, digits, decs, code.chars().next().unwrap_or('Z'));
+                let mut out = edit_code_with(
+                    &v,
+                    digits,
+                    decs,
+                    code.chars().next().unwrap_or('Z'),
+                    self.prog.decedit(),
+                );
                 // The third argument (ILE RPG Reference, %EDITC): *ASTFILL
                 // replaces the leading blanks with asterisks; *CURSYM (the
                 // currency symbol, '$' unless CURSYM says otherwise) or a
@@ -8183,7 +8189,7 @@ impl Machine<'_> {
             return edit_word(&value, digits, decs, &word);
         }
         Ok(match f.edit_code {
-            Some(c) => edit_code(&value, digits, decs, c),
+            Some(c) => edit_code_with(&value, digits, decs, c, self.prog.decedit()),
             None => {
                 // No edit code: every digit, a minus sign after a
                 // negative number.
@@ -8538,7 +8544,23 @@ pub fn edit_word(v: &Dec, digits: u32, decs: u32, word: &str) -> Result<String> 
 }
 
 pub fn edit_code(v: &Dec, digits: u32, decs: u32, code: char) -> String {
+    edit_code_with(v, digits, decs, code, ('.', false))
+}
+
+/// An edit code with the program's DECEDIT (ILE RPG Reference, control
+/// keyword DECEDIT: the decimal point character, a comma for the
+/// thousands separator when the point is a period and a period when it
+/// is a comma, and with '0,' or '0.' a zero before the point of a value
+/// below 1).
+pub fn edit_code_with(
+    v: &Dec,
+    digits: u32,
+    decs: u32,
+    code: char,
+    (point, zero): (char, bool),
+) -> String {
     let code = code.to_ascii_uppercase();
+    let thousands = if point == ',' { '.' } else { ',' };
     let d = v.rescale(decs as u8, false).unwrap_or(*v);
     let raw = d.mantissa().unsigned_abs().to_string();
     let raw = format!("{:0>w$}", raw, w = digits as usize);
@@ -8586,12 +8608,15 @@ pub fn edit_code(v: &Dec, digits: u32, decs: u32, code: char) -> String {
     let mut int_out = String::new();
     for (k, c) in int_trim.chars().enumerate() {
         if commas && k > 0 && (int_trim.len() - k) % 3 == 0 {
-            int_out.push(',');
+            int_out.push(thousands);
         }
         int_out.push(c);
     }
+    if zero && decs > 0 && int_out.is_empty() {
+        int_out.push('0');
+    }
     let body = if decs > 0 && code != 'Z' {
-        format!("{int_out}.{frac}")
+        format!("{int_out}{point}{frac}")
     } else if int_out.is_empty() {
         // Codes that do not blank zero show one zero.
         "0".to_string()
@@ -9167,6 +9192,22 @@ mod tests {
         assert_eq!(ew("1000.00", 6, 2, "  ,  $0.  "), " $1,000.00");
         // The ampersand is a blank.
         assert_eq!(ew("12", 2, 0, "  &DOLLARS"), "12 DOLLARS");
+    }
+
+    #[test]
+    fn edit_codes_with_decedit() {
+        // ILE RPG Reference, control keyword DECEDIT: '0,' makes the
+        // decimal point a comma, the thousands separator a period, and
+        // puts a zero before the point of a value below 1 (iRPGUnit's
+        // H_SPEC, DECEDIT('0,'), formats numbers this way).
+        assert_eq!(
+            edit_code_with(&Dec::parse("-0.5").unwrap(), 15, 5, 'P', (',', true)).trim(),
+            "-0,50000"
+        );
+        assert_eq!(
+            edit_code_with(&Dec::parse("1234.50").unwrap(), 7, 2, '1', (',', false)).trim(),
+            "1.234,50"
+        );
     }
 
     #[test]

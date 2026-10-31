@@ -880,15 +880,22 @@ impl Machine<'_> {
     fn sql_statement(&mut self, sql: &str) -> Result<Outcome> {
         // QSYS2.STACK_INFO('*'): the job's call stack as it is now.
         if sql.to_ascii_uppercase().contains("STACK_INFO") {
-            let entries: Vec<serde_json::Value> = crate::pgmmsg::stack_listed(&self.io.job_key)
-                .iter()
-                .map(|e| {
-                    serde_json::json!({
+            // An RPG program's main procedure has its program entry
+            // procedure below it, _QRNP_PEP_ and the program's name
+            // (PUB400 2026-10-31, verify32 y32_rows).
+            let mut entries: Vec<serde_json::Value> = Vec::new();
+            for e in crate::pgmmsg::stack_listed(&self.io.job_key) {
+                if e.pep {
+                    entries.push(serde_json::json!({
                         "pgm": e.pgm, "lib": e.lib, "module": e.module,
-                        "proc": e.proc, "actgrp": e.actgrp, "line": e.line,
-                    })
-                })
-                .collect();
+                        "proc": format!("_QRNP_PEP_{}", e.pgm), "actgrp": e.actgrp, "line": 0,
+                    }));
+                }
+                entries.push(serde_json::json!({
+                    "pgm": e.pgm, "lib": e.lib, "module": e.module,
+                    "proc": e.proc, "actgrp": e.actgrp, "line": e.line,
+                }));
+            }
             let json = serde_json::Value::Array(entries).to_string();
             let rt = self.io.rt.clone();
             self.session()?;

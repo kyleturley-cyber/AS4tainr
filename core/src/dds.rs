@@ -1057,6 +1057,25 @@ pub fn parse_pf(file_name: &str, source: &str) -> Result<PhysicalFile> {
         if !cols(line, 6, 6).eq_ignore_ascii_case("A") && !cols(line, 6, 6).trim().is_empty() {
             bail!("line {lineno}: expected form type 'A' in column 6");
         }
+        // A quoted string not closed: CPD7672, severity 20 (PUB400
+        // 2026-10-31, verify32 y32_crtp: a heading cut at position 80).
+        let quotes: Vec<usize> = line
+            .char_indices()
+            .skip_while(|(i, _)| *i < 44)
+            .filter(|(_, c)| *c == '\'')
+            .map(|(i, _)| i)
+            .collect();
+        if quotes.len() % 2 == 1 {
+            return Err(anyhow::Error::new(crate::ddslist::DdsError(
+                crate::ddslist::Msg {
+                    id: Some("CPD7672".into()),
+                    sev: 20,
+                    line: lineno,
+                    pos: quotes.last().map(|q| q + 1).unwrap_or(1),
+                    text: "A quoted string has no closing apostrophe.".into(),
+                },
+            )));
+        }
         let name_type = cols(line, 17, 17).to_ascii_uppercase();
         let name = cols(line, 19, 28).to_ascii_uppercase();
         let keywords = cols(line, 45, usize::MAX);
@@ -1270,6 +1289,18 @@ pub fn parse_pf(file_name: &str, source: &str) -> Result<PhysicalFile> {
 
 #[cfg(test)]
 mod tests {
+
+    // PUB400 2026-10-31, tools/golden/verify32.txt y32_crtp: a keyword
+    // area cut at position 80 inside a quoted string is CPD7672, severity
+    // 20 (the file is not created at generation level 20).
+    #[test]
+    fn unclosed_quote_is_cpd7672() {
+        let src = "     A          R R1\n     A            NOTE          20A         TEXT('A note') COLHDG('Note' 'line t\n";
+        let e = parse_pf("P", src).unwrap_err();
+        let m = crate::ddslist::message_of(&e);
+        assert_eq!((m.id.as_deref(), m.sev, m.line), (Some("CPD7672"), 20, 2));
+    }
+
     use super::*;
 
     const CUSTMAST: &str = "

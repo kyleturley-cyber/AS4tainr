@@ -20,6 +20,9 @@ enum Column {
         json: bool,
         omit_quotes: bool,
         wrapper: bool,
+        /// DEFAULT value ON EMPTY and ON ERROR (SQL literals).
+        on_empty: Option<String>,
+        on_error: Option<String>,
     },
     /// NESTED [PATH] 'p' COLUMNS (...)
     Nested(String, Vec<Column>),
@@ -175,8 +178,29 @@ impl P {
                     let json = self.eat("FORMAT") && self.eat("JSON");
                     let mut path = format!("$.{name}");
                     let (mut omit_quotes, mut wrapper) = (false, false);
+                    let (mut on_empty, mut on_error) = (None, None);
                     loop {
-                        if self.eat("PATH") {
+                        if self.eat("DEFAULT") {
+                            // DEFAULT constant ON EMPTY | ON ERROR.
+                            let lit = match self.peek() {
+                                Some(Tok::Str(v)) => quote(v),
+                                Some(Tok::Number(n)) => n.clone(),
+                                _ => bail!(
+                                    "SQL0104: JSON_TABLE: a constant is expected after DEFAULT."
+                                ),
+                            };
+                            self.i += 1;
+                            if !self.eat("ON") {
+                                bail!("SQL0104: JSON_TABLE: ON EMPTY or ON ERROR is expected after DEFAULT.");
+                            }
+                            if self.eat("EMPTY") {
+                                on_empty = Some(lit);
+                            } else if self.eat("ERROR") {
+                                on_error = Some(lit);
+                            } else {
+                                bail!("SQL0104: JSON_TABLE: ON EMPTY or ON ERROR is expected after DEFAULT.");
+                            }
+                        } else if self.eat("PATH") {
                             path = self.string("a column path")?;
                         } else if matches!(self.word().as_deref(), Some("OMIT" | "KEEP")) {
                             omit_quotes = self.word().as_deref() == Some("OMIT");
@@ -208,6 +232,8 @@ impl P {
                         json,
                         omit_quotes,
                         wrapper,
+                        on_empty,
+                        on_error,
                     });
                 }
             }
@@ -249,6 +275,8 @@ fn build(
                 json,
                 omit_quotes,
                 wrapper,
+                on_empty,
+                on_error,
             } => {
                 let pg = crate::ddl::parse_type(ty)?.sql_type();
                 let first = format!(
@@ -268,15 +296,20 @@ fn build(
                     format!("({first})::text")
                 } else {
                     // A scalar column: an object or array is an error, so
-                    // the null value.
+                    // the null value (or the DEFAULT ON ERROR).
+                    let err = on_error.clone().unwrap_or_else(|| "NULL".into());
                     format!(
-                        "CASE WHEN jsonb_typeof({first}) IN ('object', 'array') THEN NULL ELSE jsonb_build_array({first}) ->> 0 END"
+                        "CASE WHEN jsonb_typeof({first}) IN ('object', 'array') THEN {err} ELSE jsonb_build_array({first}) ->> 0 END"
                     )
                 };
-                select.push(format!(
-                    "CAST({e} AS {pg}) AS {}",
-                    crate::catalog::ident(name)
-                ));
+                // Nothing at the path: the DEFAULT ON EMPTY.
+                let e = match on_empty {
+                    Some(d) => format!(
+                        "CASE WHEN {first} IS NULL THEN CAST({d} AS {pg}) ELSE CAST({e} AS {pg}) END"
+                    ),
+                    None => format!("CAST({e} AS {pg})"),
+                };
+                select.push(format!("{e} AS {}", crate::catalog::ident(name)));
             }
             Column::Nested(path, inner) => {
                 if nested_seen {

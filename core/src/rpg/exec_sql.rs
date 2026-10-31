@@ -1139,7 +1139,29 @@ impl Machine<'_> {
         let mut exprs = Vec::new();
         let mut targets: Vec<Option<(String, Option<String>)>> = Vec::new();
         for a in &args {
-            let t = a.trim();
+            // An argument by name (PATH_NAME => :hv): the name kept, the
+            // value put in.
+            let (kw, t) = match a.split_once("=>") {
+                Some((k, e)) if !k.trim().is_empty() && !k.contains('\'') => {
+                    (format!("{} => ", k.trim()), e.trim())
+                }
+                _ => (String::new(), a.trim()),
+            };
+            if !kw.is_empty() {
+                if let Some(rest) = t.strip_prefix(':') {
+                    let parts: Vec<&str> = rest
+                        .split_whitespace()
+                        .filter(|w| !w.eq_ignore_ascii_case("INDICATOR"))
+                        .collect();
+                    let hv = parts.first().copied().unwrap_or("").to_string();
+                    let ind = parts.get(1).map(|i| i.trim_start_matches(':').to_string());
+                    exprs.push(format!("{kw}{}", self.host_literal(&hv, ind.as_deref())?));
+                } else {
+                    exprs.push(format!("{kw}{t}"));
+                }
+                targets.push(None);
+                continue;
+            }
             if let Some(rest) = t.strip_prefix(':') {
                 // :hv, :hv :ind, :hv INDICATOR :ind
                 let parts: Vec<&str> = rest

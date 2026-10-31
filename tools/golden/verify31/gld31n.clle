@@ -1,0 +1,5 @@
+/* verify31: a CL program in a new activation group calls GLD31C.     */
+PGM
+DCLPRCOPT  DFTACTGRP(*NO) ACTGRP(*NEW)
+CALL       PGM(AS4TRAINR1/GLD31C)
+ENDPGM

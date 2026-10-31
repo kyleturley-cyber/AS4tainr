@@ -53,6 +53,7 @@ pub fn is_api(name: &str) -> bool {
             | "QUSLFLD"
             | "QUSLSPL"
             | "QBNLSPGM"
+            | "QSRLSAVF"
     )
 }
 
@@ -69,6 +70,7 @@ fn error_code_param(name: &str) -> Option<usize> {
         "QUSLFLD" => Some(5),
         "QUSLSPL" => Some(6),
         "QBNLSPGM" => Some(3),
+        "QSRLSAVF" => Some(6),
         _ => None,
     }
 }
@@ -94,6 +96,7 @@ pub async fn call_api(
         "QUSLFLD" => list_fields(client, caller, args).await,
         "QUSLSPL" => list_spooled_files(client, caller, args).await,
         "QBNLSPGM" => list_service_program(client, caller, args).await,
+        "QSRLSAVF" => list_save_file(client, caller, args).await,
         _ => bail!("{name} is not a user space API."),
     };
     crate::dtaq::error_code(args, error_code_param(&name), r)
@@ -904,6 +907,108 @@ async fn list_objects(client: &Client, caller: &Caller, args: &mut dyn ApiArgs) 
         &header,
         &entries,
         size,
+    )
+    .await
+}
+
+/// QSRLSAVF (qualified user space, format, qualified save file, object
+/// name filter (a name, generic* or *ALL), object type filter (*ALL or a
+/// type), continuation handle, error code). Format SAVF0200: one entry
+/// per object the save file holds: object name, library saved, object
+/// type, extended attribute, save date and time (*DTS), object size and
+/// its multiplier, ASP, data saved, owner, DLO name, folder, text and ASP
+/// device name (214 bytes).
+async fn list_save_file(client: &Client, caller: &Caller, args: &mut dyn ApiArgs) -> Result<()> {
+    need(args, 5)?;
+    let format = text(args, 1);
+    if format != "SAVF0200" {
+        bail!("CPF3C21: Format name {format} is not valid.");
+    }
+    let (savf, slib) = qualified(&args.bytes(2));
+    let obj = text(args, 3);
+    let obj = if obj.is_empty() {
+        "*ALL".to_string()
+    } else {
+        obj
+    };
+    let objtype = text(args, 4);
+    let objtype = if objtype.is_empty() {
+        "*ALL".to_string()
+    } else {
+        objtype
+    };
+    let libs = match slib.as_str() {
+        "*LIBL" | "" => caller.libl.clone(),
+        "*CURLIB" => vec![caller.curlib.clone()],
+        l => vec![l.to_string()],
+    };
+    let mut found = None;
+    for l in &libs {
+        if let Some(r) = client
+            .query_opt(
+                "SELECT s.data FROM as4tainr.save_files s JOIN as4tainr.objects o
+                    ON o.library = s.library AND o.name = s.name AND o.objtype = '*FILE'
+                 WHERE s.library = $1 AND s.name = $2",
+                &[l, &savf],
+            )
+            .await?
+        {
+            found = Some((l.clone(), r.get::<_, Option<Vec<u8>>>(0)));
+            break;
+        }
+    }
+    let Some((lib, data)) = found else {
+        if !slib.starts_with('*') && !crate::catalog::library_exists(client, &slib).await? {
+            bail!("CPF9810: There is no library {slib}.");
+        }
+        bail!("CPF9812: There is no file {savf} in library {slib}.");
+    };
+    authority::check(client, &caller.user, &lib, &savf, "*FILE", Aut::Use).await?;
+    let image = data.map(|d| crate::save::unpack(&d)).transpose()?;
+    let mut entries = Vec::new();
+    for l in image.iter().flat_map(|i| i.libraries.iter()) {
+        for o in &l.objects {
+            if !crate::catalog::name_matches(&obj, &o.name)
+                || !(objtype == "*ALL" || objtype == o.objtype)
+            {
+                continue;
+            }
+            let mut en = field(&o.name, 10);
+            en.extend(field(&l.name, 10));
+            en.extend(field(&o.objtype, 10));
+            en.extend(field(&o.attribute, 10));
+            en.extend([0u8; 8]); // save date and time: not kept as *DTS
+            en.extend_from_slice(&0i32.to_be_bytes()); // object size
+            en.extend_from_slice(&1i32.to_be_bytes()); // size multiplier
+            en.extend_from_slice(&1i32.to_be_bytes()); // ASP: the system ASP
+            en.extend(e("1")); // data saved
+            en.extend(field(&o.owner, 10));
+            en.extend(field("", 20)); // DLO name
+            en.extend(field("", 63)); // folder
+            en.extend(field(&o.text, 50));
+            en.extend(field("", 10)); // ASP device name
+            entries.push(en);
+        }
+    }
+    let mut input = args.bytes(0);
+    input.resize(20, 0x40);
+    input.extend(field(&format, 8));
+    input.extend(field(&savf, 10));
+    input.extend(field(&slib, 10));
+    input.extend(field(&obj, 10));
+    input.extend(field(&objtype, 10));
+    let mut header = field(&savf, 10);
+    header.extend(field(&lib, 10));
+    write_list(
+        client,
+        caller,
+        &args.bytes(0),
+        "QSRLSAVF",
+        &format,
+        &input,
+        &header,
+        &entries,
+        214,
     )
     .await
 }

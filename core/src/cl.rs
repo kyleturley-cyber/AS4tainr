@@ -1679,9 +1679,14 @@ pub static COMMANDS: &[CommandDef] = &[
             p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
             p("OBJTYPE", Kind::Name, true, None, "Object type")
                 .ch("*FILE, *PGM, *DTAARA, *MENU, *LIB"),
-            p("USER", Kind::List, true, None, "Users").ch("Name, *PUBLIC"),
+            p("USER", Kind::List, false, None, "Users").ch("Name, *PUBLIC"),
             p("AUT", Kind::Name, false, Some("*CHANGE"), "Authority")
                 .ch("*CHANGE, *ALL, *USE, *EXCLUDE"),
+            p("ASPDEV", Kind::Name, false, Some("*"), "ASP device").keyword_only(),
+            p("REFOBJ", Kind::Qualified, false, Some("*NONE"), "Reference object").ch("Name, *NONE").keyword_only(),
+            p("REFOBJTYPE", Kind::Name, false, Some("*OBJTYPE"), "Reference object type").ch("*OBJTYPE, *FILE, *PGM...").keyword_only(),
+            p("REFASPDEV", Kind::Name, false, Some("*"), "Reference ASP device").keyword_only(),
+            p("REPLACE", Kind::Name, false, Some("*NO"), "Replace authority").ch("*NO, *YES").keyword_only(),
         ],
     },
     CommandDef {
@@ -1712,6 +1717,46 @@ pub static COMMANDS: &[CommandDef] = &[
             p("OBJTYPE", Kind::Name, true, None, "Object type")
                 .ch("*FILE, *PGM, *DTAARA, *MENU, *LIB"),
             p("NEWOWN", Kind::Name, true, None, "New owner").ch("Name"),
+            p("CUROWNAUT", Kind::Name, false, Some("*REVOKE"), "Current owner authority").ch("*REVOKE, *SAME"),
+            p("ASPDEV", Kind::Name, false, Some("*"), "ASP device").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "DLTOBJ",
+        description: "Delete Object",
+        params: &[
+            p("OBJ", Kind::Qualified, true, None, "Object").ch("Name, generic*"),
+            p("OBJTYPE", Kind::Name, true, None, "Object type").ch("*FILE, *PGM, *SRVPGM, *MODULE, *DTAARA, *DTAQ..."),
+            p("RMVMSG", Kind::Name, false, Some("*NO"), "Remove message").ch("*NO, *YES").keyword_only(),
+            p("ASPDEV", Kind::Name, false, Some("*"), "ASP device").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "RNMOBJ",
+        description: "Rename Object",
+        params: &[
+            p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
+            p("OBJTYPE", Kind::Name, true, None, "Object type").ch("*FILE, *PGM, *SRVPGM, *MODULE, *DTAARA, *DTAQ..."),
+            p("NEWOBJ", Kind::Name, true, None, "New object").ch("Name"),
+            p("SYSOBJNAM", Kind::Name, false, Some("*NO"), "System object name").keyword_only(),
+            p("ASPDEV", Kind::Name, false, Some("*"), "ASP device").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "ALCOBJ",
+        description: "Allocate Object",
+        params: &[
+            p("OBJ", Kind::List, true, None, "Object specifications").ch("(Name type lock-state member)"),
+            p("WAIT", Kind::Text, false, Some("*CLS"), "Wait time").ch("Number, *CLS, *IMMED, *NOMAX"),
+            p("CONFLICT", Kind::Name, false, Some("*NORQSRLS"), "Lock conflict action").ch("*NORQSRLS, *RQSRLS").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "DLCOBJ",
+        description: "Deallocate Object",
+        params: &[
+            p("OBJ", Kind::List, true, None, "Object specifications").ch("(Name type lock-state member)"),
+            p("LCKSCOPE", Kind::Name, false, Some("*JOB"), "Lock scope").ch("*JOB, *THREAD, *LCKSPC").keyword_only(),
         ],
     },
     CommandDef {
@@ -1803,6 +1848,17 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[
             p("SYSVAL", Kind::Name, true, None, "System value").ch("QCCSID, QDATFMT, QDATSEP, ..."),
             p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
+    },
+    CommandDef {
+        name: "CHGOBJD",
+        description: "Change Object Description",
+        params: &[
+            p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
+            p("OBJTYPE", Kind::Name, true, None, "Object type").ch("*ALRTBL, *BNDDIR, *CMD, *DTAARA, *DTAQ, *FILE, *LIB, *MENU, *MODULE, *MSGF, *PGM, *SRVPGM..."),
+            p("PART", Kind::Name, false, Some("*NONE"), "Library member or partition").keyword_only(),
+            p("TEXT", Kind::Text, false, Some("*SAME"), "Text 'description'"),
+            p("DAYS", Kind::Name, false, Some("*SAME"), "Days used count").ch("*SAME, *RESET"),
         ],
     },
     CommandDef {
@@ -3868,6 +3924,8 @@ pub static COMMANDS: &[CommandDef] = &[
                 Some("*BLANK"),
                 "Text 'description'",
             ),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
+                .ch("*LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE"),
         ],
     },
     CommandDef {
@@ -3907,6 +3965,11 @@ pub static COMMANDS: &[CommandDef] = &[
             p("SPLFDTA", Kind::Name, false, Some("*NONE"), "Spooled file data").keyword_only(),
             p("QDTA", Kind::Name, false, Some("*NONE"), "Queue data").keyword_only(),
             p("DTACPR", Kind::Name, false, Some("*DEV"), "Data compression").keyword_only(),
+            p("ACCPTH", Kind::Name, false, Some("*SYSVAL"), "Save access paths").ch("*SYSVAL, *NO, *YES").keyword_only(),
+            p("COMPACT", Kind::Name, false, Some("*DEV"), "Data compaction").keyword_only(),
+            p("SAVACTWAIT", Kind::List, false, Some("120"), "Save active wait time").keyword_only(),
+            p("SAVACTMSGQ", Kind::Qualified, false, Some("*NONE"), "Save active message queue").keyword_only(),
+            p("PVTAUT", Kind::Name, false, Some("*NO"), "Private authorities").keyword_only(),
         ],
     },
     CommandDef {
@@ -3933,6 +3996,11 @@ pub static COMMANDS: &[CommandDef] = &[
             p("SPLFDTA", Kind::Name, false, Some("*NONE"), "Spooled file data").keyword_only(),
             p("QDTA", Kind::Name, false, Some("*NONE"), "Queue data").keyword_only(),
             p("DTACPR", Kind::Name, false, Some("*DEV"), "Data compression").keyword_only(),
+            p("ACCPTH", Kind::Name, false, Some("*SYSVAL"), "Save access paths").ch("*SYSVAL, *NO, *YES").keyword_only(),
+            p("COMPACT", Kind::Name, false, Some("*DEV"), "Data compaction").keyword_only(),
+            p("SAVACTWAIT", Kind::List, false, Some("120"), "Save active wait time").keyword_only(),
+            p("SAVACTMSGQ", Kind::Qualified, false, Some("*NONE"), "Save active message queue").keyword_only(),
+            p("PVTAUT", Kind::Name, false, Some("*NO"), "Private authorities").keyword_only(),
         ],
     },
     CommandDef {
@@ -3970,6 +4038,11 @@ pub static COMMANDS: &[CommandDef] = &[
             p("SPLFDTA", Kind::Name, false, Some("*NONE"), "Spooled file data").keyword_only(),
             p("QDTA", Kind::Name, false, Some("*NONE"), "Queue data").keyword_only(),
             p("DTACPR", Kind::Name, false, Some("*DEV"), "Data compression").keyword_only(),
+            p("ACCPTH", Kind::Name, false, Some("*SYSVAL"), "Save access paths").ch("*SYSVAL, *NO, *YES").keyword_only(),
+            p("COMPACT", Kind::Name, false, Some("*DEV"), "Data compaction").keyword_only(),
+            p("SAVACTWAIT", Kind::List, false, Some("120"), "Save active wait time").keyword_only(),
+            p("SAVACTMSGQ", Kind::Qualified, false, Some("*NONE"), "Save active message queue").keyword_only(),
+            p("PVTAUT", Kind::Name, false, Some("*NO"), "Private authorities").keyword_only(),
         ],
     },
     CommandDef {
@@ -4155,6 +4228,11 @@ pub static COMMANDS: &[CommandDef] = &[
             p("OUTFMT", Kind::Name, false, Some("*CHAR"), "Print format")
                 .ch("*CHAR, *HEX")
                 .keyword_only(),
+            // Errors allowed: accepted; the copy ends at the first
+            // record that cannot be copied (fidelity-gaps.md).
+            p("ERRLVL", Kind::Text, false, Some("0"), "Errors allowed")
+                .ch("Number, *NOMAX")
+                .keyword_only(),
         ],
     },
 ];
@@ -4217,6 +4295,11 @@ pub static GROUPS: &[Group] = &[
         commands: &[
             "WRKOBJ",
             "DSPOBJD",
+            "CHGOBJD",
+            "RNMOBJ",
+            "DLTOBJ",
+            "ALCOBJ",
+            "DLCOBJ",
             "CHKOBJ",
             "CRTDTAARA",
             "CHGDTAARA",

@@ -521,8 +521,9 @@ with Tn5250(HOST) as t:
         t.fkey(3); t.wait_for("Command Entry")
         t2.fkey(3); t2.wait_for("Command Entry")
         # Object authority: with *PUBLIC *USE, BOB cannot open CUSTMAST
-        # for update; a private *CHANGE lets him.
-        command(t, "grtobjaut obj(custmast) objtype(*file) user(*public) aut(*use)", "*PUBLIC has authority *USE")
+        # for update; a private *CHANGE lets him. REPLACE(*YES): *USE in
+        # place of *PUBLIC's *CHANGE (GRTOBJAUT's default adds).
+        command(t, "grtobjaut obj(custmast) objtype(*file) user(*public) aut(*use) replace(*yes)", "*PUBLIC has authority *USE")
         command(t2, "call custmnt", "Not authorized", timeout=90)
         check("Not authorized" in t2.text(),
               "with *PUBLIC *USE, BOB's program cannot open CUSTMAST for update (CPF9802)", t2)

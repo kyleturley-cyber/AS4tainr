@@ -110,6 +110,15 @@ struct CatTable {
 }
 
 const CATALOG: &[CatTable] = &[
+    // A save file's contents (SAVFDTA(*YES), the default of the save
+    // commands: CL reference, SAVOBJ SAVFDTA).
+    CatTable {
+        table: "save_files",
+        lib: "library",
+        name: "name",
+        types: &["*FILE"],
+        libs: &[],
+    },
     CatTable {
         table: "files",
         lib: "library",
@@ -426,6 +435,14 @@ pub struct SavedObj {
     pub created: String,
     /// Private authorities: (user, authority).
     pub auths: Vec<(String, String)>,
+    /// The rest of the object's description (QLICOBJD, QUSROBJD OBJD0300
+    /// and OBJD0400): the user-defined attribute and where its source
+    /// was (file, library, member, when it changed). Saves made before
+    /// they were kept have none.
+    #[serde(default)]
+    pub user_attr: String,
+    #[serde(default)]
+    pub source: (String, String, String, String),
 }
 
 /// A PostgreSQL object, as the SQL that makes it (the library's schema
@@ -519,7 +536,8 @@ async fn save_library(
         .await?;
     let rows = tx
         .query(
-            "SELECT o.name, o.objtype, o.attribute, o.text, o.owner, o.public_aut, o.created::text
+            "SELECT o.name, o.objtype, o.attribute, o.text, o.owner, o.public_aut, o.created::text,
+                    o.user_attr, o.src_file, o.src_lib, o.src_mbr, o.src_changed
                FROM as4tainr.objects o WHERE o.library = $1 ORDER BY o.created, o.name",
             &[&lib],
         )
@@ -527,10 +545,7 @@ async fn save_library(
     let mut objects = Vec::new();
     for r in &rows {
         let (name, objtype, attribute): (String, String, String) = (r.get(0), r.get(1), r.get(2));
-        if NOT_SAVED.contains(&objtype.as_str())
-            || attribute == "SAVF"
-            || !pick.has(&name, &objtype)
-        {
+        if NOT_SAVED.contains(&objtype.as_str()) || !pick.has(&name, &objtype) {
             continue;
         }
         let auths = tx
@@ -551,6 +566,8 @@ async fn save_library(
             public_aut: r.get(5),
             created: r.get(6),
             auths,
+            user_attr: r.get(7),
+            source: (r.get(8), r.get(9), r.get(10), r.get(11)),
         });
     }
     let names_of = |t: &str| -> Vec<String> {
@@ -1069,7 +1086,7 @@ async fn restore_library(
     for o in saved.objects.iter().filter(|o| pick(o)) {
         let exists = catalog::object_exists(client, &[to.to_string()], &o.name, &o.objtype).await?;
         if exists {
-            if o.objtype == "*FILE" {
+            if o.objtype == "*FILE" && o.attribute != "SAVF" {
                 skip_pg.insert((o.name.clone(), o.objtype.clone()));
                 if o.attribute == "PF" {
                     data_only.insert(pg_name(&o.name));
@@ -1280,8 +1297,9 @@ async fn restore_library(
     for o in &todo {
         if skip_pg.contains(&(o.name.clone(), o.objtype.clone())) {
             tx.execute(
-                "UPDATE as4tainr.objects SET restored = now(), changed = now() WHERE library=$1 AND name=$2 AND objtype=$3",
-                &[&to, &o.name, &o.objtype],
+                "UPDATE as4tainr.objects SET restored = now(), changed = now(), user_attr = $4
+                  WHERE library=$1 AND name=$2 AND objtype=$3",
+                &[&to, &o.name, &o.objtype, &o.user_attr],
             )
             .await?;
             done.push((*o).clone());
@@ -1299,9 +1317,24 @@ async fn restore_library(
             _ => user.to_string(),
         };
         tx.execute(
-            "INSERT INTO as4tainr.objects (library, name, objtype, attribute, text, owner, public_aut, created, restored)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::timestamptz, now())",
-            &[&to, &o.name, &o.objtype, &o.attribute, &o.text, &owner, &o.public_aut, &o.created],
+            "INSERT INTO as4tainr.objects (library, name, objtype, attribute, text, owner, public_aut, created, restored,
+                                           user_attr, src_file, src_lib, src_mbr, src_changed)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::timestamptz, now(), $9, $10, $11, $12, $13)",
+            &[
+                &to,
+                &o.name,
+                &o.objtype,
+                &o.attribute,
+                &o.text,
+                &owner,
+                &o.public_aut,
+                &o.created,
+                &o.user_attr,
+                &o.source.0,
+                &o.source.1,
+                &o.source.2,
+                &o.source.3,
+            ],
         )
         .await?;
         for (u, a) in &o.auths {
@@ -1617,6 +1650,8 @@ impl Job<'_> {
             "RSTOBJ" | "RSTLIB" => self.restore(cmd).await?,
             "DLTLIB" | "CLRLIB" => self.dltlib(cmd).await?,
             "CRTDUPOBJ" => self.crtdupobj(cmd).await?,
+            "RNMOBJ" => self.rnmobj(cmd).await?,
+            "DLTOBJ" => self.dltobj(cmd).await?,
             _ => return Ok(None),
         };
         Ok(Some(Outcome::Messages(msgs)))
@@ -1648,6 +1683,20 @@ impl Job<'_> {
             )
             .await?;
         crate::authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
+        // AUT: the public authority (*LIBCRTAUT: the library's default,
+        // *CHANGE here).
+        let aut = cmd.get("AUT").trim().to_ascii_uppercase();
+        if matches!(aut.as_str(), "*ALL" | "*CHANGE" | "*USE" | "*EXCLUDE") {
+            crate::authority::grant(
+                self.client,
+                &lib,
+                &name,
+                "*FILE",
+                "*PUBLIC",
+                crate::authority::Aut::parse(&aut)?,
+            )
+            .await?;
+        }
         Ok(vec![format!(
             "CPC7301: File {name} was created in library {lib}."
         )])
@@ -1881,8 +1930,13 @@ impl Job<'_> {
                         continue;
                     }
                 }
-                if NOT_SAVED.contains(&t.as_str()) || a == "SAVF" {
+                if NOT_SAVED.contains(&t.as_str()) {
                     not_saved.push(format!("{n} {t}"));
+                    continue;
+                }
+                // The save file being written is not in the save.
+                if a == "SAVF" && *lib == slib && n == sname {
+                    omitted = true;
                     continue;
                 }
                 crate::authority::check(
@@ -1908,7 +1962,20 @@ impl Job<'_> {
                     Some(chosen)
                 },
             };
-            let saved = save_library(&mut c, lib, &pick, whole).await?;
+            let mut saved = save_library(&mut c, lib, &pick, whole).await?;
+            // SAVFDTA(*NO): save files without their contents.
+            if cmd.get("SAVFDTA").eq_ignore_ascii_case("*NO") {
+                for (table, rows) in saved.catalog.iter_mut() {
+                    if table == "save_files" {
+                        for r in rows.iter_mut() {
+                            if let Some(o) = r.as_object_mut() {
+                                o.insert("data".into(), serde_json::Value::Null);
+                                o.insert("saved".into(), serde_json::Value::Null);
+                            }
+                        }
+                    }
+                }
+            }
             msgs.push(format!(
                 "CPC3722: {} objects were saved from library {lib}.",
                 saved.objects.len()
@@ -2281,6 +2348,125 @@ impl Job<'_> {
         Ok(msgs)
     }
 
+    /// RNMOBJ (CL reference): the object gets the new name in its
+    /// library and keeps everything else (owner, authorities, dates,
+    /// description, contents). Done as a duplicate under the new name
+    /// (as CRTDUPOBJ NEWOBJ with DATA(*YES), which keeps the creation
+    /// date) and the deletion of the old one; when the old one cannot
+    /// be deleted (a physical file with logical files or views over it),
+    /// the duplicate is deleted again and the rename fails. A library is
+    /// not renamed here.
+    async fn rnmobj(&mut self, cmd: &Command) -> Result<Vec<String>> {
+        let objtype = cmd.get("OBJTYPE").trim().to_ascii_uppercase();
+        let new = catalog::validate_name("object", &cmd.get("NEWOBJ").to_ascii_uppercase())?;
+        if objtype == "*LIB" {
+            bail!("CPF9898: as4tainr does not rename libraries.");
+        }
+        let (lib, name) = match cmd.get("OBJ").to_ascii_uppercase().split_once('/') {
+            Some(("*CURLIB", n)) => (self.current_library(), n.to_string()),
+            Some(("*LIBL", n)) => ("*LIBL".to_string(), n.to_string()),
+            Some((l, n)) => (crate::qtemp::real(l), n.to_string()),
+            None => ("*LIBL".to_string(), cmd.get("OBJ").to_ascii_uppercase()),
+        };
+        let libs = if lib == "*LIBL" {
+            self.library_list()
+        } else {
+            vec![lib.clone()]
+        };
+        let mut found = None;
+        for l in &libs {
+            if catalog::object_exists(self.client, std::slice::from_ref(l), &name, &objtype).await?
+            {
+                found = Some(l.clone());
+                break;
+            }
+        }
+        let Some(lib) = found else {
+            bail!(
+                "CPF2105: Object {name} of type {objtype} in library {} not found.",
+                crate::qtemp::logical(&lib)
+            );
+        };
+        crate::authority::check(
+            self.client,
+            &self.user,
+            &lib,
+            &name,
+            &objtype,
+            crate::authority::Aut::All,
+        )
+        .await?;
+        if catalog::object_exists(self.client, std::slice::from_ref(&lib), &new, &objtype).await? {
+            bail!(
+                "CPF2112: There is already an object {new} of type {objtype} in library {}.",
+                crate::qtemp::logical(&lib)
+            );
+        }
+        let pick = Pick {
+            objects: Some([(name.clone(), objtype.clone())].into_iter().collect()),
+        };
+        let mut c = crate::runtime::connect_db(&self.env.database_url).await?;
+        let mut saved = save_library(&mut c, &lib, &pick, false).await?;
+        rename_saved(&mut saved, &name, &new, &objtype);
+        restore_library(&mut c, &saved, &lib, &|_| true, &self.user).await?;
+        let shown = crate::qtemp::logical(&lib);
+        let delete = format!("DLTOBJ OBJ({lib}/{name}) OBJTYPE({objtype})");
+        if let Err(e) = Box::pin(self.run(&delete)).await {
+            let undo = format!("DLTOBJ OBJ({lib}/{new}) OBJTYPE({objtype})");
+            let _ = Box::pin(self.run(&undo)).await;
+            return Err(e.context(format!(
+                "Object {name} in {shown} type {objtype} not renamed: it could not be replaced."
+            )));
+        }
+        Ok(vec![format!(
+            "Object {name} in {shown} type {objtype} renamed {new}."
+        )])
+    }
+
+    /// DLTOBJ (CL reference): an object, or the objects a generic name
+    /// matches, of one type, deleted by the type's own delete command
+    /// (DLTF, DLTPGM...), whose messages it sends.
+    async fn dltobj(&mut self, cmd: &Command) -> Result<Vec<String>> {
+        let objtype = cmd.get("OBJTYPE").trim().to_ascii_uppercase();
+        let (kw, verb) = match objtype.as_str() {
+            "*FILE" => ("FILE", "DLTF"),
+            "*PGM" => ("PGM", "DLTPGM"),
+            "*SRVPGM" => ("SRVPGM", "DLTSRVPGM"),
+            "*MODULE" => ("MODULE", "DLTMOD"),
+            "*BNDDIR" => ("BNDDIR", "DLTBNDDIR"),
+            "*DTAARA" => ("DTAARA", "DLTDTAARA"),
+            "*DTAQ" => ("DTAQ", "DLTDTAQ"),
+            "*MSGF" => ("MSGF", "DLTMSGF"),
+            "*MSGQ" => ("MSGQ", "DLTMSGQ"),
+            "*CMD" => ("CMD", "DLTCMD"),
+            "*MENU" => ("MENU", "DLTMNU"),
+            "*PNLGRP" => ("PNLGRP", "DLTPNLGRP"),
+            "*JOBD" => ("JOBD", "DLTJOBD"),
+            "*OUTQ" => ("OUTQ", "DLTOUTQ"),
+            "*JRN" => ("JRN", "DLTJRN"),
+            "*JRNRCV" => ("JRNRCV", "DLTJRNRCV"),
+            "*LIB" => ("LIB", "DLTLIB"),
+            t if t.starts_with('*') && t.len() > 1 => {
+                bail!("CPF9898: DLTOBJ of type {t} is not done by as4tainr.")
+            }
+            t => bail!("CPD0084: Object type {t} is not valid."),
+        };
+        let obj = cmd.get("OBJ").to_ascii_uppercase();
+        let (lib, name) = match obj.split_once('/') {
+            Some((l, n)) => (l.to_string(), n.to_string()),
+            None => ("*LIBL".to_string(), obj.clone()),
+        };
+        let line = if objtype == "*LIB" {
+            format!("DLTLIB LIB({name})")
+        } else {
+            format!("{verb} {kw}({lib}/{name})")
+        };
+        match Box::pin(self.run(&line)).await? {
+            Outcome::Messages(m) => Ok(m),
+            _ => Ok(Vec::new()),
+        }
+    }
+
     /// RSTOBJ OBJ(...) SAVLIB(lib) DEV(*SAVF) OBJTYPE(...) SAVF(...)
     /// RSTLIB(...), RSTLIB SAVLIB(lib) DEV(*SAVF) SAVF(...) RSTLIB(...).
     async fn restore(&mut self, cmd: &Command) -> Result<Vec<String>> {
@@ -2480,8 +2666,26 @@ fn rename_saved(saved: &mut SavedLib, old: &str, new: &str, objtype: &str) {
                 let starts = (i == 0 || !ident(cs[i - 1]))
                     && cs[i..].iter().take(po.len() + 1).collect::<String>() == format!("{po}_");
                 if starts {
-                    out.push_str(&pn);
-                    i += po.len();
+                    // The whole name, quoted when the new one is not a
+                    // plain identifier (#U00000001_pk).
+                    let mut j = i + po.len();
+                    while j < cs.len() && ident(cs[j]) {
+                        j += 1;
+                    }
+                    let renamed = format!("{pn}{}", cs[i + po.len()..j].iter().collect::<String>());
+                    let plain = renamed
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+                        && renamed
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                    if plain {
+                        out.push_str(&renamed);
+                    } else {
+                        out.push_str(&q(&renamed));
+                    }
+                    i = j;
                 } else {
                     out.push(cs[i]);
                     i += 1;

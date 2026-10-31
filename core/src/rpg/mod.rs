@@ -656,6 +656,9 @@ pub struct ClContext {
     pub user_libl: Vec<String>,
     /// The file overrides in effect for the call.
     pub overrides: Vec<crate::ovr::Override>,
+    /// The activation group of the calling CL program (None: the
+    /// default activation group).
+    pub caller_group: Option<String>,
 }
 
 /// What a call produced: DSPLY output, and an error if it ended
@@ -831,8 +834,13 @@ async fn call_any(
         });
         let ovr = cl.as_ref().map(|c| c.overrides.clone()).unwrap_or_default();
         let prog = rt.block_on(compile_ovr(&client, &libl, &name, &source, &options, &ovr))?;
-        // Called from CL: the caller is in the default activation group.
-        let actgrp = interp::program_group(&prog, crate::ile::DEFAULT_GROUP);
+        // Called from CL: the caller's activation group (an ILE CL
+        // program's own; else the default activation group).
+        let caller_group = cl
+            .as_ref()
+            .and_then(|c| c.caller_group.clone())
+            .unwrap_or_else(|| crate::ile::DEFAULT_GROUP.to_string());
+        let actgrp = interp::program_group(&prog, &caller_group);
         let mut m = interp::Machine::new(
             &prog,
             interp::Io {

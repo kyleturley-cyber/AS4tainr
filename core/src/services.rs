@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 34";
+const VERSION: &str = "as4tainr services 39";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -93,7 +93,7 @@ SELECT o.library, o.name, o.objtype, o.attribute, o.text, o.created, o.owner,
             THEN coalesce((SELECT octet_length(p.source) FROM as4tainr.programs p
                            WHERE p.library = o.library AND p.name = o.name), 0)
             ELSE 0 END AS size,
-       o.changed
+       o.changed, o.user_attr, o.src_file, o.src_lib, o.src_mbr
 FROM as4tainr.objects o
 LEFT JOIN as4tainr.files f ON o.objtype = '*FILE' AND f.library = o.library AND f.name = o.name;
 
@@ -333,10 +333,18 @@ const OBJECT_STATISTICS_COLUMNS: &[(&str, &str, &str)] = &[
     ("iasp_number", "smallint", "0"),
     ("iasp_name", "varchar(10)", "'*SYSBAS'"),
     ("objattribute", "varchar(10)", "nullif(o.attribute, '')"),
-    ("objlongschema", "varchar(128)", "o.library"),
+    (
+        "objlongschema",
+        "varchar(128)",
+        "CASE WHEN o.library = arg.qtemp THEN 'QTEMP' ELSE o.library END",
+    ),
     ("text", "varchar(50)", "o.text"),
     ("sql_object_type", "varchar(9)", "o.sql_object_type"),
-    ("objlib", "varchar(10)", "o.library"),
+    (
+        "objlib",
+        "varchar(10)",
+        "CASE WHEN o.library = arg.qtemp THEN 'QTEMP' ELSE o.library END",
+    ),
     ("change_timestamp", "timestamp", "o.changed"),
     ("user_changed", "varchar(3)", "'NO'"),
     ("source_file", "varchar(10)", "NULL"),
@@ -352,7 +360,11 @@ const OBJECT_STATISTICS_COLUMNS: &[(&str, &str, &str)] = &[
     ("object_control_level", "char(8)", "NULL"),
     ("ptf_number", "char(7)", "NULL"),
     ("apar_id", "char(6)", "NULL"),
-    ("user_defined_attribute", "varchar(10)", "NULL"),
+    (
+        "user_defined_attribute",
+        "varchar(10)",
+        "nullif(o.user_attr, '')",
+    ),
     ("allow_change_by_program", "varchar(3)", "'NO'"),
     ("changed_by_program", "varchar(3)", "'NO'"),
     ("compressed", "varchar(4)", "'NO'"),
@@ -407,16 +419,22 @@ fn object_statistics() -> String {
                                                  object_name varchar DEFAULT '*ALL')
          RETURNS TABLE ({})
          LANGUAGE sql STABLE AS $as4tainr$
-         WITH arg AS (
-           SELECT upper(trim(object_schema)) AS sch,
+         WITH job AS (
+           SELECT coalesce(nullif(current_setting('as4tainr.qtemp', true), ''), 'QTEMP') AS qtemp
+         ),
+         arg AS (
+           SELECT CASE WHEN upper(trim(object_schema)) = 'QTEMP' THEN job.qtemp
+                       ELSE upper(trim(object_schema)) END AS sch,
+                  job.qtemp,
                   upper(trim(coalesce(object_name, '*ALL'))) AS nam,
                   ARRAY(SELECT '*' || ltrim(t, '*')
                         FROM regexp_split_to_table(upper(trim(objtypelist)), '[ ,]+') AS t
                         WHERE t <> '') AS types
+           FROM job
          ),
          libl AS (
-           SELECT upper(s) AS lib, n
-           FROM unnest(current_schemas(false)) WITH ORDINALITY AS x(s, n)
+           SELECT upper(btrim(btrim(s), chr(34))) AS lib, n
+           FROM regexp_split_to_table(current_setting('search_path'), ',') WITH ORDINALITY AS x(s, n)
          )
          SELECT {}
          FROM as4tainr_svc.objects o
@@ -1210,6 +1228,45 @@ BEGIN
     END LOOP;
   END LOOP;
 END $as4tainr$;
+
+DROP FUNCTION IF EXISTS qsys2.ifs_object_statistics(varchar, varchar, varchar, varchar, varchar);
+CREATE FUNCTION qsys2.ifs_object_statistics(start_path_name varchar,
+    subtree_directories varchar DEFAULT 'YES', object_type_list varchar DEFAULT NULL,
+    omit_list varchar DEFAULT NULL, ignore_errors varchar DEFAULT 'YES')
+RETURNS TABLE (path_name varchar(16000), object_type varchar(10), symbolic_link varchar(16000),
+    object_owner varchar(10), create_timestamp timestamp, data_change_timestamp timestamp,
+    object_change_timestamp timestamp, data_size bigint, ccsid integer)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $as4tainr$
+  WITH arg AS (
+    SELECT lower(as4tainr_svc.ifs_path(start_path_name)) AS k,
+           upper(coalesce(subtree_directories, 'YES')) <> 'NO' AS subtree,
+           ARRAY(SELECT t FROM regexp_split_to_table(upper(trim(coalesce(object_type_list, ''))), '[ ,]+') AS t
+                  WHERE t <> '') AS types,
+           ARRAY(SELECT lower(as4tainr_svc.ifs_path(t))
+                   FROM regexp_split_to_table(trim(coalesce(omit_list, '')), ' +') AS t
+                  WHERE t <> '') AS omit
+  ),
+  objs AS (
+    SELECT f.*, CASE f.kind WHEN 'D' THEN '*DIR' WHEN 'F' THEN '*STMF' ELSE '*SYMLNK' END AS t
+      FROM as4tainr.ifs f, arg
+     WHERE f.path_key = arg.k
+        OR (f.path_key LIKE CASE WHEN arg.k = '/' THEN '/' ELSE arg.k || '/' END || '%'
+            AND (arg.subtree
+                 OR position('/' IN substr(f.path_key,
+                      length(CASE WHEN arg.k = '/' THEN '/' ELSE arg.k || '/' END) + 1)) = 0))
+  )
+  SELECT CAST(o.path AS varchar(16000)), CAST(o.t AS varchar(10)), CAST(NULL AS varchar(16000)),
+         CAST(o.owner AS varchar(10)), o.created::timestamp, o.changed::timestamp,
+         o.changed::timestamp, octet_length(o.data)::bigint,
+         CASE WHEN o.kind = 'F' THEN o.ccsid END
+    FROM objs o, arg
+   WHERE (cardinality(arg.types) = 0 OR '*ALLOBJ' = ANY (arg.types) OR o.t = ANY (arg.types)
+          OR ('*ALLDIR' = ANY (arg.types) AND o.t = '*DIR')
+          OR ('*ALLSTMF' = ANY (arg.types) AND o.t = '*STMF'))
+     AND NOT EXISTS (SELECT 1 FROM unnest(arg.omit) AS m
+                      WHERE o.path_key = m OR o.path_key LIKE m || '/%')
+   ORDER BY o.path_key
+$as4tainr$;
 "#;
 
 /// JSON text as jsonb, or the null value when it is not JSON (JSON_TABLE

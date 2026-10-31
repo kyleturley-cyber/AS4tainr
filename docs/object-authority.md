@@ -28,17 +28,17 @@ Without the authority needed, the operation fails with `CPF9802`. In an RPG prog
 
 | Command | What it does |
 | --- | --- |
-| `GRTOBJAUT OBJ(lib/obj) OBJTYPE(*FILE) USER(name *PUBLIC ...) AUT(*USE)` | Gives users, or *PUBLIC, an authority (default `*CHANGE`) |
+| `GRTOBJAUT OBJ(lib/obj) OBJTYPE(*FILE) USER(name *PUBLIC ...) AUT(*USE)` | Gives users, or *PUBLIC, an authority (default `*CHANGE`). `REPLACE(*NO)`, the default, adds it to what the user has (the greater of the two here); `REPLACE(*YES)` replaces it; `REFOBJ(lib/obj)` gives the authorities another object has |
 | `RVKOBJAUT OBJ(...) OBJTYPE(...) USER(name)` | Removes a user's private authority (they fall back to *PUBLIC). For `*PUBLIC`, the public authority becomes `*EXCLUDE` |
 | `DSPOBJAUT OBJ(...) OBJTYPE(...)` | Shows the owner, private authorities and *PUBLIC |
-| `CHGOBJOWN OBJ(...) OBJTYPE(...) NEWOWN(name)` | Gives the object to another user |
+| `CHGOBJOWN OBJ(...) OBJTYPE(...) NEWOWN(name)` | Gives the object to another user (`CUROWNAUT(*SAME)`: the old owner keeps *ALL) |
 
 Object types are `*FILE`, `*PGM`, `*DTAARA`, `*MENU` and `*LIB`. These commands are on the F4 menu under "Security commands".
 
 ## Example
 
 ```
-GRTOBJAUT OBJ(CUSTMAST) OBJTYPE(*FILE) USER(*PUBLIC) AUT(*USE)
+GRTOBJAUT OBJ(CUSTMAST) OBJTYPE(*FILE) USER(*PUBLIC) AUT(*USE) REPLACE(*YES)
 GRTOBJAUT OBJ(CUSTMAST) OBJTYPE(*FILE) USER(BOB) AUT(*CHANGE)
 DSPOBJAUT OBJ(CUSTMAST) OBJTYPE(*FILE)
 ```

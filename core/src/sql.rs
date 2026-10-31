@@ -53,6 +53,19 @@ pub fn joined_path(quoted: &[String]) -> String {
     path.join(", ")
 }
 
+/// The job's QTEMP library for the IBM i services (as4tainr.qtemp, read
+/// by OBJECT_STATISTICS, whose schema parameter may be QTEMP while QTEMP
+/// is not in the library list): a statement to follow SET search_path.
+pub fn qtemp_setting(local: bool) -> String {
+    match crate::qtemp::current() {
+        Some(q) => format!(
+            "; SELECT set_config('as4tainr.qtemp', '{}', {local})",
+            q.replace('\'', "''")
+        ),
+        None => String::new(),
+    }
+}
+
 /// Create the SQL login role with a random password (made once, then
 /// kept, so processes starting together agree on it) and give it the
 /// library schemas (idempotent). Called from `catalog::init`. Fails if
@@ -2359,8 +2372,12 @@ async fn run_in_transaction(
     text: &str,
     path: &[String],
 ) -> Result<Outcome> {
-    tx.batch_execute(&format!("SET LOCAL search_path TO {}", joined_path(path)))
-        .await?;
+    tx.batch_execute(&format!(
+        "SET LOCAL search_path TO {}{}",
+        joined_path(path),
+        qtemp_setting(true)
+    ))
+    .await?;
     let stmt = tx.prepare(text).await.map_err(|e| map_error(&e, text))?;
     let outcome = if t.kind == Kind::Query {
         let cols = stmt.columns();
@@ -2794,7 +2811,11 @@ impl Session {
         let sql_client = connect_as_sql_role(client, database_url).await?;
         let path: Vec<String> = libl.iter().map(|l| ident(l)).collect();
         sql_client
-            .batch_execute(&format!("SET search_path TO {}", joined_path(&path)))
+            .batch_execute(&format!(
+                "SET search_path TO {}{}",
+                joined_path(&path),
+                qtemp_setting(false)
+            ))
             .await?;
         Ok(Session {
             context: None,
@@ -2880,8 +2901,9 @@ impl Session {
         let path: Vec<String> = self.libl.iter().map(|l| ident(l)).collect();
         d.client
             .batch_execute(&format!(
-                "SAVEPOINT as4tainr_stmt; SET LOCAL search_path TO {}",
-                joined_path(&path)
+                "SAVEPOINT as4tainr_stmt; SET LOCAL search_path TO {}{}",
+                joined_path(&path),
+                qtemp_setting(true)
             ))
             .await?;
         if let Some((u, c, j)) = &self.context {

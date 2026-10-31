@@ -194,6 +194,15 @@ pub fn program_active(job: &str, group: &str, program: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A name for a new activation group (ACTGRP(*NEW)): one per call.
+pub fn new_group() -> String {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    format!(
+        "*NEW{}",
+        N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    )
+}
+
 /// The activation group a program runs in (ILE RPG Reference, DFTACTGRP
 /// and ACTGRP keywords; CRTBNDRPG, CRTPGM): DFTACTGRP(*YES), the
 /// default for a program without ACTGRP or BNDDIR, is the default
@@ -208,13 +217,7 @@ pub fn program_group(prog: &Program, caller: &str) -> String {
         (Some(true), _) => crate::ile::DEFAULT_GROUP.into(),
         (None, None) if !bnddir => crate::ile::DEFAULT_GROUP.into(),
         (_, Some(a)) if a == "*CALLER" => caller.into(),
-        (_, Some(a)) if a == "*NEW" => {
-            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-            format!(
-                "*NEW{}",
-                N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            )
-        }
+        (_, Some(a)) if a == "*NEW" => new_group(),
         (_, Some(a)) if a != "*STGMDL" && a != "*ENTMOD" => a,
         _ => "QILE".into(),
     }

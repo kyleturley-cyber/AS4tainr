@@ -27,7 +27,7 @@ RSTOBJ  OBJ(ORDHDR ORDLIN) SAVLIB(ORDERS) DEV(*SAVF) OBJTYPE(*FILE) SAVF(BACKUP/
 | `DLTF FILE(lib/savf)` | Deletes a save file |
 | `OMITOBJ((lib/obj type) ...)`, `SELECT((*INCLUDE\|*OMIT lib/obj type attribute member) ...)` | On the four save and restore commands: OMITOBJ leaves objects out; *INCLUDE entries choose objects (every object when there are none) and *OMIT entries leave them out; names, libraries and attributes can be generic or *ALL, the member must be *ALL (whole files). RSTOBJ FILEMBR((*ALL *ALL)) is taken |
 
-A save file that has data is only saved into again with `CLEAR(*ALL)` or `CLEAR(*REPLACE)` (IBM i would ask; as4tainr ends with CPF9898). Journals, journal receivers and save files are not saved: each is named in a message.
+A save file that has data is only saved into again with `CLEAR(*ALL)` or `CLEAR(*REPLACE)` (IBM i would ask; as4tainr ends with CPF9898). Journals and journal receivers are not saved: each is named in a message. A save file is saved with its contents (`SAVFDTA(*NO)`: without them), except the save file being written; a save keeps each object's description (text, owner, authorities, the user-defined attribute QLICOBJD sets, its source). The API QSRLSAVF (format SAVF0200) lists a save file's objects in a user space (docs/fidelity-gaps.md).
 
 ## What is saved
 

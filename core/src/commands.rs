@@ -645,6 +645,10 @@ impl Job<'_> {
             }
             "DSPSYSVAL" => self.dspsysval(&cmd),
             "DSPOBJD" => self.dspobjd(&cmd).await,
+            "CHGOBJD" => self.chgobjd(&cmd).await,
+            // ALCOBJ, DLCOBJ: as4tainr has no object locks (database
+            // records are locked as PostgreSQL rows): accepted.
+            "ALCOBJ" | "DLCOBJ" => Ok(Outcome::Messages(Vec::new())),
             "SBMJOB" => self.sbmjob(&cmd).await,
             "WRKACTJOB" => self.wrkactjob().await,
             "WRKSBMJOB" => self.wrksbmjob().await,
@@ -6919,11 +6923,9 @@ impl Job<'_> {
 
     /// The library and name of an existing object (OBJ and OBJTYPE).
     async fn object_named(&self, cmd: &Command) -> Result<(String, String, String)> {
-        let objtype = cmd.get("OBJTYPE").to_string();
-        if !["*FILE", "*PGM", "*DTAARA", "*LIB", "*MENU"].contains(&objtype.as_str()) {
-            bail!(
-                "Object type {objtype} is not supported; use *FILE, *PGM, *DTAARA, *MENU or *LIB."
-            );
+        let objtype = cmd.get("OBJTYPE").trim().to_ascii_uppercase();
+        if !objtype.starts_with('*') || objtype.len() < 2 {
+            bail!("CPD0084: Object type {objtype} is not valid.");
         }
         let (lib, name) = match cmd.get("OBJ").split_once('/') {
             Some(("*CURLIB", n)) => (self.current_library(), n.to_string()),
@@ -6947,18 +6949,86 @@ impl Job<'_> {
         bail!("CPF9801: Object {name} in library {lib} type {objtype} not found.")
     }
 
-    /// GRTOBJAUT and RVKOBJAUT.
+    /// GRTOBJAUT and RVKOBJAUT. GRTOBJAUT (CL reference): REPLACE(*NO)
+    /// adds the authority to what the user has (as4tainr keeps the
+    /// system-defined authorities, so the greater of the two; *EXCLUDE
+    /// replaces), REPLACE(*YES) replaces it; REFOBJ gives the object the
+    /// reference object's *PUBLIC and private authorities.
     async fn objaut(&mut self, cmd: &Command) -> Result<Outcome> {
         let (lib, name, objtype) = self.object_named(cmd).await?;
         authority::check_manage(self.client, &self.user, &lib, &name, &objtype).await?;
         let grant = cmd.def.name == "GRTOBJAUT";
+        let replace = cmd.get("REPLACE").eq_ignore_ascii_case("*YES");
+        let refobj = cmd.get("REFOBJ").to_ascii_uppercase();
+        let users_given = cmd.list("USER");
+        if grant && !refobj.is_empty() && refobj != "*NONE" {
+            let reftype = match cmd.get("REFOBJTYPE").to_ascii_uppercase().as_str() {
+                "" | "*OBJTYPE" => objtype.clone(),
+                t => t.to_string(),
+            };
+            let (rlib, rname) = match refobj.split_once('/') {
+                Some(("*LIBL", n)) | Some(("", n)) => ("*LIBL".to_string(), n.to_string()),
+                Some(("*CURLIB", n)) => (self.current_library(), n.to_string()),
+                Some((l, n)) => (crate::qtemp::real(l), n.to_string()),
+                None => ("*LIBL".to_string(), refobj.clone()),
+            };
+            let libs = if rlib == "*LIBL" {
+                self.library_list()
+            } else {
+                vec![rlib.clone()]
+            };
+            let mut found = None;
+            for l in &libs {
+                if let Some(a) = authority::get(self.client, l, &rname, &reftype).await? {
+                    found = Some((l.clone(), a));
+                    break;
+                }
+            }
+            let Some((rlib, a)) = found else {
+                bail!("CPF9801: Object {rname} in library {rlib} type {reftype} not found.");
+            };
+            let mut give: Vec<(String, Aut)> = a.private.clone();
+            give.push(("*PUBLIC".to_string(), a.public));
+            for (u, aut) in give {
+                let aut = if replace || aut == Aut::Exclude {
+                    aut
+                } else {
+                    aut.max(
+                        self.held_authority(&lib, &name, &objtype, &u)
+                            .await?
+                            .unwrap_or(aut),
+                    )
+                };
+                authority::grant(self.client, &lib, &name, &objtype, &u, aut).await?;
+            }
+            return Ok(Outcome::Messages(vec![format!(
+                "Authorities of {}/{rname} {reftype} given to {}/{name} {objtype}.",
+                crate::qtemp::logical(&rlib),
+                crate::qtemp::logical(&lib)
+            )]));
+        }
+        if users_given.is_empty() {
+            return Err(crate::cl::diag_error(
+                "CPD0071",
+                "Parameter USER needs a value.",
+            ));
+        }
         let aut = Aut::parse(cmd.get("AUT"))?;
         let mut done = Vec::new();
-        for user in cmd.list("USER") {
+        for user in users_given {
             if user != "*PUBLIC" && users::get(self.client, &user).await?.is_none() {
                 bail!("CPF2204: User profile {user} not found.");
             }
             if grant {
+                let aut = if replace || aut == Aut::Exclude {
+                    aut
+                } else {
+                    aut.max(
+                        self.held_authority(&lib, &name, &objtype, &user)
+                            .await?
+                            .unwrap_or(aut),
+                    )
+                };
                 authority::grant(self.client, &lib, &name, &objtype, &user, aut).await?;
                 done.push(format!(
                     "{user} has authority {} to {lib}/{name} {objtype}.",
@@ -6974,6 +7044,47 @@ impl Job<'_> {
             }
         }
         Ok(Outcome::Messages(done))
+    }
+
+    /// The authority a user holds to an object of their own (a private
+    /// authority; *PUBLIC's for *PUBLIC), if any.
+    async fn held_authority(
+        &self,
+        lib: &str,
+        name: &str,
+        objtype: &str,
+        user: &str,
+    ) -> Result<Option<Aut>> {
+        let Some(a) = authority::get(self.client, lib, name, objtype).await? else {
+            return Ok(None);
+        };
+        if user == "*PUBLIC" {
+            return Ok(Some(a.public));
+        }
+        Ok(a.private.iter().find(|(u, _)| u == user).map(|(_, x)| *x))
+    }
+
+    /// CHGOBJD: an object's text (TEXT *SAME, *BLANK or a text). DAYS
+    /// (*RESET of the days used count) is accepted; as4tainr keeps no
+    /// usage counts.
+    async fn chgobjd(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (lib, name, objtype) = self.object_named(cmd).await?;
+        authority::check(self.client, &self.user, &lib, &name, &objtype, Aut::Change).await?;
+        match cmd.get("TEXT") {
+            "*SAME" | "" => {}
+            t => {
+                let text = if t == "*BLANK" { "" } else { t };
+                self.client
+                    .execute(
+                        "UPDATE as4tainr.objects SET text=$4 WHERE library=$1 AND name=$2 AND objtype=$3",
+                        &[&lib, &name, &objtype, &text],
+                    )
+                    .await?;
+            }
+        }
+        Ok(Outcome::Messages(vec![format!(
+            "Description of object {name} in {lib} type {objtype} changed."
+        )]))
     }
 
     async fn dspobjaut(&mut self, cmd: &Command) -> Result<Outcome> {
@@ -7007,7 +7118,16 @@ impl Job<'_> {
         if users::get(self.client, &new).await?.is_none() {
             bail!("CPF2204: User profile {new} not found.");
         }
+        let old = authority::get(self.client, &lib, &name, &objtype)
+            .await?
+            .map(|a| a.owner)
+            .unwrap_or_default();
         authority::set_owner(self.client, &lib, &name, &objtype, &new).await?;
+        // CUROWNAUT(*SAME): the old owner keeps *ALL as a private
+        // authority; *REVOKE (the default): it has none.
+        if cmd.get("CUROWNAUT").eq_ignore_ascii_case("*SAME") && !old.is_empty() && old != new {
+            authority::grant(self.client, &lib, &name, &objtype, &old, Aut::All).await?;
+        }
         Ok(Outcome::Messages(vec![format!(
             "Owner of {lib}/{name} {objtype} changed to {new}."
         )]))
@@ -8264,17 +8384,29 @@ impl Job<'_> {
                                 .unwrap_or("QILE")
                                 .to_string();
                             program.actgrp = if g == "*NEW" {
-                                format!("*NEW{}", std::process::id())
+                                crate::rpg::interp::new_group()
                             } else {
                                 g
                             };
                         }
                         let ile = program.pep;
-                        match crate::clpgm::run(self, &program, &args).await {
+                        let r = match crate::clpgm::run(self, &program, &args).await {
                             Err(e) if ile => Err(unmonitored_in_ile_cl(&name, e)),
                             Err(e) => Err(unmonitored_in_opm_cl(&name, e)),
                             r => r,
+                        };
+                        // ACTGRP(*NEW): the group ends with the program,
+                        // and the programs that ran in it (*CALLER) with
+                        // it, their storage and files (ILE Concepts,
+                        // "Activation group deletion").
+                        if program.actgrp.starts_with("*NEW") {
+                            crate::ile::end_activations(
+                                &self.job_key(),
+                                &crate::ile::Groups::Named(&program.actgrp),
+                            );
+                            crate::rpg::interp::close_ended_spools(self.client).await;
                         }
+                        r
                     }
                     _ => self.call_rpg(&name, Some(&p.library), args).await,
                 }
@@ -8346,6 +8478,9 @@ impl Job<'_> {
                 curlib: self.curlib.clone(),
                 user_libl: self.libl.clone(),
                 overrides: self.calls.overrides.clone(),
+                caller_group: crate::pgmmsg::stack_listed(&self.job_key())
+                    .last()
+                    .map(|e| e.actgrp.clone()),
             }),
             pgm.to_string(),
             source,

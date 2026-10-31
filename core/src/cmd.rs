@@ -1029,7 +1029,13 @@ fn encode_value(d: &Definition, p: &Parm, items: Option<Vec<Item>>) -> Result<Ve
             let up = text.to_ascii_uppercase();
             if let Some((_, to)) = p.sngval.iter().find(|(f, _)| *f == up) {
                 let mut out = be16(1).to_vec();
-                out.extend(single(d, p, to)?);
+                // A list of mixed lists or qualified names: the value
+                // in the form of the first element, as for a single
+                // value of a mixed list.
+                match label {
+                    Some(l) => out.extend(single(d, &l.items[0], to)?),
+                    None => out.extend(single(d, p, to)?),
+                }
                 return Ok(out);
             }
         }
@@ -1657,6 +1663,40 @@ E1:          ELEM       TYPE(*CHAR) LEN(2) DFT(AA)
 
     fn def() -> Definition {
         compile("LIB", "TST", "LIB/TSTPGM", SRC).unwrap()
+    }
+
+    // CL Programming, "Data passed to the command processing program":
+    // a list of mixed lists is the count, an offset of each mixed list,
+    // then the mixed lists; a single value (SNGVAL) for the list is the
+    // count 1 and the value, as for a simple list. IBM i Packager's
+    // UNPACK LIBMAP(*NONE) (MAX(30), SNGVAL((*NONE))) is read this way
+    // (UNPACKR ParseLibMap: count 1 and '*NONE' at byte 3).
+    #[test]
+    fn single_value_of_a_list_of_mixed_lists() {
+        let d = compile(
+            "LIB",
+            "MAP",
+            "LIB/MAPPGM",
+            "
+             CMD        PROMPT('Map')
+             PARM       KWD(LIBMAP) TYPE(M1) MAX(30) DFT(*NONE) SNGVAL((*NONE))
+M1:          ELEM       TYPE(*CHAR) LEN(10)
+             ELEM       TYPE(*NAME) LEN(10)
+",
+        )
+        .unwrap();
+        let bytes = |a: &Arg| match a {
+            Arg::Bytes(b) => b.clone(),
+            Arg::Number(_) => panic!(),
+        };
+        let none = bytes(&encode(&d, "MAP").unwrap()[0]);
+        assert_eq!(&none[..2], &[0, 1]);
+        assert_eq!(crate::rpg::data::a(&none[2..]), "*NONE     ");
+        let two = bytes(&encode(&d, "MAP LIBMAP((*PGM PGMLIB) (*FILE DTALIB))").unwrap()[0]);
+        // Two lists at offsets 6 and 28 (2 + 2*2, then 2 + 10 + 10 on).
+        assert_eq!(&two[..6], &[0, 2, 0, 6, 0, 28]);
+        assert_eq!(&two[6..8], &[0, 2]);
+        assert_eq!(crate::rpg::data::a(&two[8..28]), "*PGM      PGMLIB    ");
     }
 
     #[test]

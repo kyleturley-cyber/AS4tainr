@@ -3919,9 +3919,11 @@ async fn object_authority() {
     );
     b.run("CHGDTAARA AREA 'by bob'").await.unwrap();
 
-    // *PUBLIC *USE: BOB can read but not change.
+    // *PUBLIC *USE: BOB can read but not change. REPLACE(*YES): the
+    // authority replaces *PUBLIC's *CHANGE (CL reference, GRTOBJAUT
+    // REPLACE: with *NO, the default, it would be added to it).
     sec.run(&format!(
-        "GRTOBJAUT OBJ({lib}/AREA) OBJTYPE(*DTAARA) USER(*PUBLIC) AUT(*USE)"
+        "GRTOBJAUT OBJ({lib}/AREA) OBJTYPE(*DTAARA) USER(*PUBLIC) AUT(*USE) REPLACE(*YES)"
     ))
     .await
     .unwrap();
@@ -3990,8 +3992,10 @@ async fn object_authority() {
             .as_ref()
             .is_some_and(|e| format!("{e:#}").contains("CPF9802"))
     };
+    // REPLACE(*YES): *USE in place of *PUBLIC's *CHANGE (CL reference,
+    // GRTOBJAUT REPLACE).
     sec.run(&format!(
-        "GRTOBJAUT {lib}/CUSTMAST *FILE USER(*PUBLIC) AUT(*USE)"
+        "GRTOBJAUT {lib}/CUSTMAST *FILE USER(*PUBLIC) AUT(*USE) REPLACE(*YES)"
     ))
     .await
     .unwrap();
@@ -4482,6 +4486,7 @@ async fn native_rpg_engine_runs_a_program() {
             curlib: None,
             user_libl: vec![lib.clone()],
             overrides: vec![],
+            caller_group: None,
         }),
         "SYSAPI".into(),
         "**FREE\ndcl-pr qcmdexc extpgm('QCMDEXC');\n  cmd char(3000) const;\n  len packed(15:5) const;\nend-pr;\ndcl-pr xlate extpgm('QDCXLATE');\n  len packed(5:0) const;\n  data char(10);\n  table char(10) const;\nend-pr;\ndcl-pr printf int(10) extproc('Qp0zLprintf');\n  fmt pointer value options(*string);\n  a1 pointer value options(*string:*nopass);\n  a2 int(10) value options(*nopass);\nend-pr;\ndcl-s d char(2) inz('AB');\nqcmdexc('CRTLIB LIB(RPGLIB1)': 19);\nmonitor;\n  qcmdexc('CRTLIB LIB(RPGLIB1)': 19);\non-error;\n  dsply 'CRTLIB failed';\nendmon;\nxlate(2: d: 'QTCPASC');\nif d = x'4142';\n  dsply 'ascii';\nendif;\nxlate(2: d: 'QTCPEBC');\ndsply d;\nprintf('%s has %d items' + x'25': 'cart': 3);\n*inlr = *on;\n".into(),
@@ -13339,6 +13344,7 @@ dsply %char(rc);
             curlib: None,
             user_libl: vec![lib.clone()],
             overrides: vec![],
+            caller_group: None,
         }),
         "SYSFN".into(),
         src.into(),
@@ -13414,6 +13420,7 @@ dsply (%char(j.ncur) + ' ' + %char(j.nusr));
             curlib: None,
             user_libl: vec!["QGPL".into()],
             overrides: vec![],
+            caller_group: None,
         }),
         "CHGLL".into(),
         src,
@@ -13527,6 +13534,7 @@ endmon;
             curlib: None,
             user_libl: vec![],
             overrides: vec![],
+            caller_group: None,
         }),
         "MSGQL".into(),
         src,
@@ -14108,6 +14116,7 @@ dsply (%char(d.avail) + ' [' + %subst(d: 75: 2) + '] ' + %char(d.logsev) + ' '
             curlib: None,
             user_libl: vec![],
             overrides: vec![],
+            caller_group: None,
         }),
         "RTVJOBD".into(),
         src,
@@ -21404,4 +21413,485 @@ async fn verify30_display_file_ffd_and_global_variables() {
     cl_cmd(&mut job, sql(&format!("DROP VARIABLE {lib}.GLD30V")))
         .await
         .unwrap();
+}
+
+/// What IBM i Packager (JDubbTX/ibm-i-packager) does with save files and
+/// object descriptions, each step from IBM's documentation:
+/// - "List Save File (QSRLSAVF) API", format SAVF0200: one entry per
+///   object in the save file (object name, library saved, type,
+///   extended attribute, ..., owner, ..., text), selected by object name
+///   and type; the entries through the generic header (list offset at
+///   124, count at 132, entry size at 136);
+/// - SAVOBJ SAVFDTA(*YES) (the default): a save file saved with its
+///   contents, which RSTOBJ brings back;
+/// - QLICOBJD key 9, the user-defined attribute, kept by a save and
+///   restore (an object's description travels with it);
+/// - RNMOBJ: the object under its new name with its records and
+///   description; DLTOBJ: the object deleted;
+/// - GRTOBJAUT REPLACE(*NO) adds the authority to what the user has,
+///   REPLACE(*YES) replaces it, REFOBJ gives the reference object's
+///   authorities; CHGOBJOWN CUROWNAUT(*SAME) leaves the old owner *ALL.
+#[tokio::test]
+async fn save_file_lists_descriptions_and_object_commands() {
+    use as4tainr_core::authority::{self, Aut};
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    for c in [
+        format!("CRTDTAARA DTAARA({lib}/PKD1) TYPE(*CHAR) LEN(10) VALUE('ONE') TEXT('First')"),
+        format!("CRTDTAARA DTAARA({lib}/PKD2) TYPE(*CHAR) LEN(10)"),
+        format!("CRTDTAQ DTAQ({lib}/PKQ1) MAXLEN(10)"),
+        format!("CRTSAVF FILE({lib}/PKS1)"),
+        format!("CRTSAVF FILE({lib}/PKS2)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    // The version stamp (QLICOBJD key 9).
+    let stamp = format!(
+        "**FREE
+dcl-pr QLICOBJD extpgm('QLICOBJD');
+  rtnlib char(10);
+  obj char(20) const;
+  type char(10) const;
+  info char(22) const;
+  err char(8);
+end-pr;
+dcl-s rtn char(10);
+dcl-s err char(8) inz(x'0000000000000000');
+QLICOBJD(rtn : 'PKD1      {lib}' : '*DTAARA' : x'00000001000000090000000A' + 'V1.0      ' : err);
+*inlr = *on;
+"
+    );
+    let r = run_rpg(&url, &lib, "QSECOFR", "STAMP", &stamp, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    cl_cmd(
+        &mut job,
+        format!("SAVOBJ OBJ(PKD1 PKD2 PKQ1) LIB({lib}) DEV(*SAVF) SAVF({lib}/PKS1)"),
+    )
+    .await
+    .unwrap();
+    let list = |filter: &str, ty: &str| {
+        format!(
+            "**FREE
+dcl-pr QUSCRTUS extpgm('QUSCRTUS');
+  name char(20) const;
+  attr char(10) const;
+  size int(10) const;
+  init char(1) const;
+  aut char(10) const;
+  text char(50) const;
+  repl char(10) const;
+end-pr;
+dcl-pr QUSPTRUS extpgm('QUSPTRUS');
+  name char(20) const;
+  ptr pointer;
+end-pr;
+dcl-pr QSRLSAVF extpgm('QSRLSAVF');
+  space char(20) const;
+  format char(8) const;
+  savf char(20) const;
+  obj char(10) const;
+  type char(10) const;
+  handle char(36) const;
+  err char(8);
+end-pr;
+dcl-s p pointer;
+dcl-s e pointer;
+dcl-s listoff int(10) based(p1);
+dcl-s count int(10) based(p2);
+dcl-s entsize int(10) based(p3);
+dcl-s p1 pointer;
+dcl-s p2 pointer;
+dcl-s p3 pointer;
+dcl-ds ent based(e);
+  oname char(10);
+  olib char(10);
+  otype char(10);
+  oattr char(10);
+  saved char(8);
+  size int(10);
+  mult int(10);
+  asp int(10);
+  data char(1);
+  owner char(10);
+  dlo char(20);
+  folder char(63);
+  text char(50);
+end-ds;
+dcl-s err char(8) inz(x'0000000000000000');
+dcl-s i int(10);
+QUSCRTUS('SAVFLIST  {lib}' : 'LIST' : 1000 : x'00' : '*ALL' : 'List' : '*YES');
+QSRLSAVF('SAVFLIST  {lib}' : 'SAVF0200' : 'PKS1      {lib}' : '{filter}' : '{ty}' : ' ' : err);
+QUSPTRUS('SAVFLIST  {lib}' : p);
+p1 = p + 124;
+p2 = p + 132;
+p3 = p + 136;
+dsply (%char(count) + ' ' + %char(entsize));
+for i = 0 to count - 1;
+  e = p + listoff + i * entsize;
+  dsply (%trim(oname) + ' ' + %trim(otype) + ' ' + %trim(owner) + ' ' + %trim(text) + ' ' + data);
+endfor;
+*inlr = *on;
+"
+        )
+    };
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "LSAVF",
+        &list("*ALL", "*ALL"),
+        None,
+        None,
+    )
+    .await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "3 214",
+            "PKD1 *DTAARA QSECOFR First 1",
+            "PKD2 *DTAARA QSECOFR  1",
+            "PKQ1 *DTAQ QSECOFR  1",
+        ]
+    );
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "LSAVF2",
+        &list("PKD*", "*DTAARA"),
+        None,
+        None,
+    )
+    .await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages[0], "2 214", "{:?}", r.messages);
+    let r = run_rpg(
+        &url,
+        &lib,
+        "QSECOFR",
+        "LSAVF3",
+        &list("*ALL", "*DTAQ"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(r.messages, ["1 214", "PKQ1 *DTAQ QSECOFR  1"]);
+    // A save file saved in another one, with its contents.
+    cl_cmd(
+        &mut job,
+        format!("SAVOBJ OBJ(PKS1) LIB({lib}) DEV(*SAVF) OBJTYPE(*FILE) SAVF({lib}/PKS2)"),
+    )
+    .await
+    .unwrap();
+    for c in [
+        format!("DLTF FILE({lib}/PKS1)"),
+        format!("DLTDTAARA DTAARA({lib}/PKD1)"),
+        format!("RSTOBJ OBJ(PKS1) SAVLIB({lib}) DEV(*SAVF) SAVF({lib}/PKS2)"),
+        format!("RSTOBJ OBJ(PKD1) SAVLIB({lib}) DEV(*SAVF) SAVF({lib}/PKS1)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    let attr = |name: &'static str| {
+        let client = &client;
+        let lib = lib.clone();
+        async move {
+            client
+                .query_one(
+                    "SELECT user_attr FROM as4tainr.objects WHERE library=$1 AND name=$2",
+                    &[&lib, &name],
+                )
+                .await
+                .unwrap()
+                .get::<_, String>(0)
+        }
+    };
+    assert_eq!(attr("PKD1").await, "V1.0");
+    // RNMOBJ: a data area and a table with its records.
+    let sql = |s: &str| format!("RUNSQL SQL('{}') COMMIT(*NONE)", s.replace('\'', "''"));
+    for c in [
+        sql(&format!(
+            "CREATE TABLE {lib}.PKT1 (ID INT NOT NULL PRIMARY KEY, NAME CHAR(10))"
+        )),
+        sql(&format!("INSERT INTO {lib}.PKT1 VALUES (1, 'A'), (2, 'B')")),
+        format!("RNMOBJ OBJ({lib}/PKT1) OBJTYPE(*FILE) NEWOBJ(PKT9)"),
+        format!("RNMOBJ OBJ({lib}/PKD1) OBJTYPE(*DTAARA) NEWOBJ(PKD9)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    assert_eq!(
+        sql_rows(
+            &client,
+            &url,
+            &lib,
+            &format!("SELECT COUNT(*) FROM {lib}.PKT9")
+        )
+        .await,
+        ["2"]
+    );
+    assert_eq!(attr("PKD9").await, "V1.0");
+    let exists = |n: &'static str, t: &'static str| {
+        as4tainr_core::catalog::object_exists(&client, std::slice::from_ref(&lib), n, t)
+    };
+    assert!(!exists("PKT1", "*FILE").await.unwrap());
+    assert!(!exists("PKD1", "*DTAARA").await.unwrap());
+    cl_cmd(&mut job, format!("DLTOBJ OBJ({lib}/PKD9) OBJTYPE(*DTAARA)"))
+        .await
+        .unwrap();
+    assert!(!exists("PKD9", "*DTAARA").await.unwrap());
+    // GRTOBJAUT REPLACE and REFOBJ, CHGOBJOWN CUROWNAUT.
+    let public = |n: &'static str| {
+        let client = &client;
+        let lib = lib.clone();
+        async move {
+            authority::get(client, &lib, n, "*DTAARA")
+                .await
+                .unwrap()
+                .unwrap()
+                .public
+        }
+    };
+    cl_cmd(
+        &mut job,
+        format!("GRTOBJAUT OBJ({lib}/PKD2) OBJTYPE(*DTAARA) USER(*PUBLIC) AUT(*ALL)"),
+    )
+    .await
+    .unwrap();
+    cl_cmd(
+        &mut job,
+        format!("GRTOBJAUT OBJ({lib}/PKD2) OBJTYPE(*DTAARA) USER(*PUBLIC) AUT(*USE)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(public("PKD2").await, Aut::All);
+    cl_cmd(
+        &mut job,
+        format!("GRTOBJAUT OBJ({lib}/PKD2) OBJTYPE(*DTAARA) USER(*PUBLIC) AUT(*USE) REPLACE(*YES)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(public("PKD2").await, Aut::Use);
+    cl_cmd(
+        &mut job,
+        format!("CRTDTAARA DTAARA({lib}/PKD3) TYPE(*CHAR) LEN(1)"),
+    )
+    .await
+    .unwrap();
+    cl_cmd(
+        &mut job,
+        format!("GRTOBJAUT OBJ({lib}/PKD3) OBJTYPE(*DTAARA) REFOBJ({lib}/PKD2) REPLACE(*YES)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(public("PKD3").await, Aut::Use);
+    let user = format!("U{}", &lib[1..]);
+    cl_cmd(
+        &mut job,
+        format!("CRTUSRPRF USRPRF({user}) PASSWORD(*NONE)"),
+    )
+    .await
+    .unwrap();
+    cl_cmd(
+        &mut job,
+        format!("CHGOBJOWN OBJ({lib}/PKD3) OBJTYPE(*DTAARA) NEWOWN({user}) CUROWNAUT(*SAME)"),
+    )
+    .await
+    .unwrap();
+    let a = authority::get(&client, &lib, "PKD3", "*DTAARA")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.owner, user);
+    assert!(
+        a.private.contains(&("QSECOFR".to_string(), Aut::All)),
+        "{:?}",
+        a.private
+    );
+    cl_cmd(
+        &mut job,
+        format!("DLTUSRPRF USRPRF({user}) OWNOBJOPT(*DLT)"),
+    )
+    .await
+    .ok();
+}
+
+/// IBM i services and activation groups IBM i Packager relies on:
+/// - IFS_OBJECT_STATISTICS (IBM i services): a stream file's row with
+///   OBJECT_TYPE *STMF and DATA_SIZE its bytes; SUBTREE_DIRECTORIES 'NO':
+///   the start directory and what is in it, not below;
+/// - JSON_TABLE (Db2 for i SQL Reference): DEFAULT value ON EMPTY when
+///   the path finds nothing;
+/// - an SQL CALL in RPG with arguments by name (PATH_NAME => :hv) and
+///   host variables (Embedded SQL programming, CALL);
+/// - ILE Concepts, "Activation groups": a CL program with
+///   ACTGRP(*NEW) (DCLPRCOPT) runs in a new activation group each call,
+///   which ends with it, and an RPG program it calls with
+///   ACTGRP(*CALLER) runs in that group: its global storage starts over
+///   each time (a count kept in it is 1 after each call).
+#[tokio::test]
+async fn ifs_statistics_json_defaults_and_new_activation_groups() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let dir = format!("/tmp/{}", lib.to_ascii_lowercase());
+    // A stream file written from RPG by named arguments.
+    let src = format!(
+        "**FREE
+dcl-s path varchar(256);
+dcl-s line varchar(100);
+path = '{dir}/a.txt';
+line = 'hello';
+exec sql CALL QSYS2.IFS_WRITE_UTF8(PATH_NAME => :path, LINE => :line, OVERWRITE => 'REPLACE', END_OF_LINE => 'NONE');
+dsply %char(sqlcode);
+*inlr = *on;
+"
+    );
+    cl_cmd(&mut job, format!("MKDIR DIR('{dir}')"))
+        .await
+        .unwrap();
+    cl_cmd(&mut job, format!("MKDIR DIR('{dir}/sub')"))
+        .await
+        .unwrap();
+    let r = run_rpg(&url, &lib, "QSECOFR", "IFSW", &src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["0"]);
+    let q = |s: String| {
+        let (client, url, lib) = (&client, &url, &lib);
+        async move { sql_rows(client, url, lib, &s).await }
+    };
+    assert_eq!(
+        q(format!(
+            "SELECT PATH_NAME, OBJECT_TYPE, DATA_SIZE FROM TABLE(QSYS2.IFS_OBJECT_STATISTICS(
+               START_PATH_NAME => '{dir}/a.txt', SUBTREE_DIRECTORIES => 'NO')) X"
+        ))
+        .await,
+        [format!("{dir}/a.txt|*STMF|5")]
+    );
+    cl_cmd(
+        &mut job,
+        format!("RUNSQL SQL('CALL QSYS2.IFS_WRITE(''{dir}/sub/b.txt'', ''x'')') COMMIT(*NONE)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        q(format!(
+            "SELECT PATH_NAME, OBJECT_TYPE FROM TABLE(QSYS2.IFS_OBJECT_STATISTICS(
+               START_PATH_NAME => '{dir}', SUBTREE_DIRECTORIES => 'NO')) X ORDER BY PATH_NAME"
+        ))
+        .await,
+        [
+            format!("{dir}|*DIR"),
+            format!("{dir}/a.txt|*STMF"),
+            format!("{dir}/sub|*DIR"),
+        ]
+    );
+    assert_eq!(
+        q(format!(
+            "SELECT COUNT(*) FROM TABLE(QSYS2.IFS_OBJECT_STATISTICS('{dir}')) X"
+        ))
+        .await,
+        ["4"]
+    );
+    // JSON_TABLE DEFAULT ... ON EMPTY.
+    assert_eq!(
+        q(
+            "SELECT T, A FROM JSON_TABLE('{\"m\":[{\"t\":\"*FILE\"},{\"a\":\"PF\"}]}', '$.m[*]'
+             COLUMNS(T VARCHAR(10) PATH '$.t' DEFAULT '*ALL' ON EMPTY,
+                     A VARCHAR(10) PATH '$.a' DEFAULT '*ALL' ON EMPTY)) AS X"
+                .to_string()
+        )
+        .await,
+        ["*FILE|*ALL", "*ALL|PF"]
+    );
+    // ACTGRP(*NEW) and *CALLER.
+    source::create_file(&client, &lib, "QSRC", "")
+        .await
+        .unwrap();
+    for (name, t, text) in [
+        (
+            "CNT",
+            "RPGLE",
+            format!(
+                "**FREE
+ctl-opt dftactgrp(*no) actgrp(*caller);
+dcl-pr QCMDEXC extpgm('QCMDEXC');
+  cmd char(200) const;
+  len packed(15:5) const;
+end-pr;
+dcl-s n int(10) inz(0);
+n += 1;
+QCMDEXC('CHGDTAARA DTAARA({lib}/NEWCNT) VALUE(''' + %char(n) + ''')' : 200);
+return;
+"
+            ),
+        ),
+        (
+            "NEWG",
+            "CLLE",
+            "PGM\nDCLPRCOPT DFTACTGRP(*NO) ACTGRP(*NEW)\nCALL PGM(CNT)\nENDPGM\n".to_string(),
+        ),
+    ] {
+        source::put_member(
+            &client,
+            &source::Member {
+                library: lib.clone(),
+                file: "QSRC".into(),
+                name: name.into(),
+                srctype: t.into(),
+                source: text,
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    for c in [
+        format!("CRTDTAARA DTAARA({lib}/NEWCNT) TYPE(*CHAR) LEN(5)"),
+        format!("CRTBNDRPG PGM({lib}/CNT) SRCFILE({lib}/QSRC)"),
+        format!("CRTBNDCL PGM({lib}/NEWG) SRCFILE({lib}/QSRC)"),
+        format!("CALL PGM({lib}/NEWG)"),
+        format!("CALL PGM({lib}/NEWG)"),
+    ] {
+        cl_cmd(&mut job, c.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    let value: String = client
+        .query_one(
+            "SELECT value FROM as4tainr.data_areas WHERE library=$1 AND name='NEWCNT'",
+            &[&lib],
+        )
+        .await
+        .map(|r| r.get(0))
+        .unwrap_or_else(|_| String::new());
+    assert_eq!(value.trim(), "1");
 }

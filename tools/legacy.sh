@@ -35,6 +35,9 @@
 # - TOBi example (IBM, Apache-2.0): imported (a TOBi project with DDS
 #   reference files, ARCAD object scripts, SQL triggers); its unit tests
 #   VAT300 and CUS300 made with RUCRTRPG and run with RUCALLTST.
+# - IBM i Packager (JDubbTX, Apache-2.0): imported; its unit tests
+#   (pkgtest.test.sqlrpgle: PACK and UNPACK of a test library) made with
+#   RUCRTRPG as its Makefile's test target does and run with RUCALLTST.
 # - IBMi-topics (MarcoDeSenas, GPL-3.0): imported (a TOBi-like project:
 #   sources built from the IFS, relative INCLUDE SRCSTMF paths, commands
 #   with validity checkers that look for QCATRS on the call stack,
@@ -80,6 +83,7 @@ clone https://github.com/OSSILE/OSSILE.git ossile
 clone https://github.com/danlong005/IBMiMock.git imoq
 clone https://github.com/MarinaSchwenk/IBMiUnit.git ibmiunit
 clone https://github.com/IBM/tobi-example.git tobi
+clone https://github.com/JDubbTX/ibm-i-packager.git pkg
 
 step() {
   echo "== $*"
@@ -355,6 +359,25 @@ for t in vat300 cus300; do
     grep -a -E "^(Test program|CPF9897)"
   tb "IRPGUNIT/RUCALLTST TSTPGM(TOBI/$u)" | grep -a -E "^ *(Success|FAILURE|ERROR)\.|CPF124[01]"
 done
+
+step "IBM i Packager (import, then its unit tests with iRPGUnit: RUCRTRPG as its Makefile's test target, RUCALLTST)"
+# JDubbTX/ibm-i-packager (Apache-2.0): PACK and UNPACK commands that
+# stamp objects with a version (QLICOBJD), save them to a save file or
+# stream file, list it (QSRLSAVF) and restore it into libraries mapped
+# by type (a JSON file read with JSON_TABLE), keeping authorities
+# (GRTOBJAUT REFOBJ) and records (RNMOBJ, CPYF). Its test source binds
+# RPGUNIT/IRPGUNIT: here RPGUnit has library RPGUNIT, so iRPGUnit's
+# binding directory is duplicated there (its entries name IRPGUNIT).
+# Its Makefile compiles in the clone (the current directory, where the
+# test's include 'src/qrpglesrc/PKGTYPES.rpgleinc' is found): that
+# directory is first in INCDIR here, then the Makefile's INC_DIR.
+"$bin" import "$work/pkg" --lib PACKAGER 2>/dev/null | tail -1
+"$bin" put "$work/pkg" "$work/pkg" >/dev/null
+run "CRTDUPOBJ OBJ(IRPGUNIT) FROMLIB(IRPGUNIT) OBJTYPE(*BNDDIR) TOLIB(RPGUNIT)" | tail -1
+pk() { "$bin" --libl PACKAGER,IRPGUNIT,QGPL --curlib PACKAGER batch "$1" 2>&1; }
+pk "IRPGUNIT/RUCRTRPG TSTPGM(PACKAGER/TPKGTEST) SRCSTMF('$work/pkg/test/qrpglesrc/pkgtest.test.sqlrpgle') INCDIR('$work/pkg' '$work/pkg/src/qrpglesrc') RPGPPOPT(*LVL2) DBGVIEW(*SOURCE) COPTION(*EVENTF *SRCSTMT *NODEBUGIO)" |
+  grep -a -E "^(Test program|CPF9897)"
+pk "IRPGUNIT/RUCALLTST TSTPGM(PACKAGER/TPKGTEST) TSTPRC(*ALL) DETAIL(*ALL)" | grep -a -E "^ *(Success|FAILURE|ERROR)\.|CPF9897: FAILURE|CPF124[01]"
 
 step "IBMi-topics (import, then SPLFDLT *LOGONLY and *BOTH in batch jobs)"
 "$bin" import "$work/topics" --lib TOPICS 2>/dev/null | tail -1

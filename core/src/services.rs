@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 39";
+const VERSION: &str = "as4tainr services 40";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -1228,6 +1228,33 @@ BEGIN
     END LOOP;
   END LOOP;
 END $as4tainr$;
+
+-- QSYS2.STACK_INFO(job [, thread]): the call stack of the statement's
+-- own job ('*'), oldest entry first, as the program running the
+-- statement left it in as4tainr.stack; other jobs: no rows.
+DROP FUNCTION IF EXISTS qsys2.stack_info(varchar, varchar);
+CREATE FUNCTION qsys2.stack_info(job_name varchar DEFAULT '*', thread varchar DEFAULT 'ALL')
+RETURNS TABLE (thread_id bigint, ordinal_position integer, entry_type varchar(10),
+    program_name varchar(10), program_library_name varchar(10),
+    statement_identifiers varchar(109), control_boundary varchar(3),
+    module_name varchar(10), module_library_name varchar(10),
+    procedure_name varchar(4096), activation_group_name varchar(10))
+LANGUAGE sql STABLE AS $as4tainr$
+  SELECT CAST(1 AS bigint), CAST(e.n AS integer),
+         CAST(CASE WHEN coalesce(e.v ->> 'module', '') = '' THEN 'OPM' ELSE 'ILE' END AS varchar(10)),
+         CAST(e.v ->> 'pgm' AS varchar(10)), CAST(e.v ->> 'lib' AS varchar(10)),
+         CAST(nullif(e.v ->> 'line', '0') AS varchar(109)),
+         CAST(CASE WHEN e.v ->> 'actgrp' IS DISTINCT FROM lag(e.v ->> 'actgrp') OVER (ORDER BY e.n)
+                   THEN 'YES' ELSE 'NO' END AS varchar(3)),
+         CAST(nullif(e.v ->> 'module', '') AS varchar(10)),
+         CAST(CASE WHEN coalesce(e.v ->> 'module', '') = '' THEN NULL ELSE e.v ->> 'lib' END AS varchar(10)),
+         CAST(nullif(e.v ->> 'proc', '') AS varchar(4096)),
+         CAST(e.v ->> 'actgrp' AS varchar(10))
+    FROM jsonb_array_elements(
+           CASE WHEN upper(trim(coalesce(job_name, '*'))) = '*'
+                THEN coalesce(nullif(current_setting('as4tainr.stack', true), ''), '[]')::jsonb
+                ELSE '[]'::jsonb END) WITH ORDINALITY AS e(v, n)
+$as4tainr$;
 
 DROP FUNCTION IF EXISTS qsys2.ifs_object_statistics(varchar, varchar, varchar, varchar, varchar);
 CREATE FUNCTION qsys2.ifs_object_statistics(start_path_name varchar,

@@ -1815,6 +1815,10 @@ impl Job<'_> {
                 }
             }
         }
+        let print = match &img {
+            Some(img) => self.dspsavf_print(&lib, &name, img).await?,
+            None => Vec::new(),
+        };
         Ok(Outcome::Display(ListDisplay {
             title: "Display Saved Objects - Save File".into(),
             info,
@@ -1823,8 +1827,142 @@ impl Job<'_> {
                 "Object", "Library", "Type", "Attribute", "Owner", "Text"
             ),
             rows: lines,
+            print,
             ..Default::default()
         }))
+    }
+
+    /// DSPSAVF OUTPUT(*PRINT) as IBM i 7.5 prints it (PUB400 2026-10-31,
+    /// tools/golden/verify31.txt x31_dsp): the save file, the save
+    /// operation (command, date and time, save while active, compression,
+    /// release), per library the data saved (library, ASP, system name
+    /// and serial number, private authorities), its objects (name, type,
+    /// attribute, owner, size in K, data saved, text) and a summary.
+    /// Records and sizes are what this system stores (fidelity-gaps.md).
+    async fn dspsavf_print(&self, lib: &str, name: &str, img: &SaveImage) -> Result<Vec<String>> {
+        use crate::report::at;
+        let [h1, h2] = crate::report::header_b(
+            47,
+            "Saved Object Information",
+            &crate::report::system_name(),
+            &crate::report::Stamp::now(),
+            1,
+        );
+        let bytes: i64 = self
+            .client
+            .query_one(
+                "SELECT coalesce(octet_length(data), 0)::bigint FROM as4tainr.save_files WHERE library=$1 AND name=$2",
+                &[&lib, &name],
+            )
+            .await?
+            .get(0);
+        let records = (bytes + 527) / 528;
+        // The save time, from the image's timestamp (UTC).
+        let num = |a: usize, b: usize| {
+            img.saved
+                .get(a..b)
+                .and_then(|x| x.parse::<u32>().ok())
+                .unwrap_or(0)
+        };
+        let stamp = crate::report::Stamp::of(
+            (num(0, 4) as i32, num(5, 7), num(8, 10)),
+            (num(11, 13), num(14, 16), num(17, 19)),
+        );
+        let serial = match crate::clpgm::system_value_text("QSRLNBR") {
+            Some(Ok(v)) => v,
+            _ => String::new(),
+        };
+        let row = |text: &str, value: &str, indent: usize| at(&[(indent, text), (45, value)]);
+        let mut out = vec![
+            h1,
+            h2,
+            row(" Save file  . . . . . . . . . . . . . . :", name, 1),
+            at(&[
+                (4, "Library  . . . . . . . . . . . . . . :"),
+                (47, &crate::qtemp::logical(lib)),
+            ]),
+            at(&[
+                (4, "Records  . . . . . . . . . . . . . . :"),
+                (47, &records.to_string()),
+            ]),
+            at(&[(2, "Save operation:")]),
+            row("   Save command . . . . . . . . . . . . :", &img.command, 1),
+            row(
+                "   Save date/time . . . . . . . . . . . :",
+                &format!("{}  {}", stamp.date, stamp.time),
+                1,
+            ),
+            row("   Save while active  . . . . . . . . . :", "*NO", 1),
+            row("   Data compressed  . . . . . . . . . . :", "No", 1),
+            row("   Release level  . . . . . . . . . . . :", "V7R5M0", 1),
+        ];
+        let (mut objects, mut members) = (0usize, 0i64);
+        for l in &img.libraries {
+            out.push(at(&[(2, "Data saved:")]));
+            out.push(row("   Library  . . . . . . . . . . . . . . :", &l.name, 1));
+            out.push(row("   ASP  . . . . . . . . . . . . . . . . :", "1", 1));
+            out.push(row(
+                "   System name  . . . . . . . . . . . . :",
+                &crate::report::system_name(),
+                1,
+            ));
+            out.push(row("   System serial number . . . . . . . . :", &serial, 1));
+            out.push(row("   Private authorities  . . . . . . . . :", "No", 1));
+            out.push(at(&[(63, "Objects")]));
+            out.push(at(&[
+                (2, "Object"),
+                (15, "Type"),
+                (26, "Attribute"),
+                (39, "Owner"),
+                (55, "Size (K)"),
+                (66, "Data"),
+                (77, "Text"),
+            ]));
+            for o in &l.objects {
+                let size = l
+                    .catalog
+                    .iter()
+                    .find(|(t, _)| t == "save_files")
+                    .and_then(|(_, rows)| {
+                        rows.iter()
+                            .find(|r| r.get("name").and_then(|v| v.as_str()) == Some(&o.name))
+                    })
+                    .and_then(|r| r.get("data").and_then(|v| v.as_str()))
+                    .map(|hex| (hex.len() as i64 / 2 + 1023) / 1024)
+                    .unwrap_or(0);
+                out.push(at(&[
+                    (2, &o.name),
+                    (15, &o.objtype),
+                    (26, &o.attribute),
+                    (39, &o.owner),
+                    (52, &format!("{size:>11}")),
+                    (66, "YES"),
+                    (77, &o.text),
+                ]));
+            }
+            objects += l.objects.len();
+            members += l
+                .catalog
+                .iter()
+                .filter(|(t, _)| t == "source_members")
+                .map(|(_, rows)| rows.len() as i64)
+                .sum::<i64>();
+        }
+        out.push(at(&[(63, "Summary")]));
+        out.push(row(
+            " Number of objects saved  . . . . . . . :",
+            &objects.to_string(),
+            1,
+        ));
+        out.push(row(
+            " Members  . . . . . . . . . . . . . . . :",
+            &members.to_string(),
+            1,
+        ));
+        out.push(row(" Access paths . . . . . . . . . . . . . :", "0", 1));
+        out.push(row(" Spooled files  . . . . . . . . . . . . :", "0", 1));
+        out.push(crate::report::END_OBJD.into());
+        Ok(out)
     }
 
     /// SAVOBJ OBJ(...) LIB(...) DEV(*SAVF) OBJTYPE(...) SAVF(...), SAVLIB
@@ -2418,14 +2556,15 @@ impl Job<'_> {
                 "Object {name} in {shown} type {objtype} not renamed: it could not be replaced."
             )));
         }
+        // CPC2192 (PUB400 2026-10-31, verify31 x31_rnm).
         Ok(vec![format!(
-            "Object {name} in {shown} type {objtype} renamed {new}."
+            "CPC2192: {shown}/{name} type {objtype} is now named {new}."
         )])
     }
 
     /// DLTOBJ (CL reference): an object, or the objects a generic name
     /// matches, of one type, deleted by the type's own delete command
-    /// (DLTF, DLTPGM...), whose messages it sends.
+    /// (DLTF, DLTPGM...), whose escape message it sends.
     async fn dltobj(&mut self, cmd: &Command) -> Result<Vec<String>> {
         let objtype = cmd.get("OBJTYPE").trim().to_ascii_uppercase();
         let (kw, verb) = match objtype.as_str() {
@@ -2461,10 +2600,10 @@ impl Job<'_> {
         } else {
             format!("{verb} {kw}({lib}/{name})")
         };
-        match Box::pin(self.run(&line)).await? {
-            Outcome::Messages(m) => Ok(m),
-            _ => Ok(Vec::new()),
-        }
+        // Deleted: no message (PUB400 2026-10-31, verify31 x31_dlt);
+        // not there: the delete command's escape message.
+        Box::pin(self.run(&line)).await?;
+        Ok(Vec::new())
     }
 
     /// RSTOBJ OBJ(...) SAVLIB(lib) DEV(*SAVF) OBJTYPE(...) SAVF(...)

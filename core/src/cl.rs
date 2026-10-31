@@ -1686,7 +1686,7 @@ pub static COMMANDS: &[CommandDef] = &[
             p("REFOBJ", Kind::Qualified, false, Some("*NONE"), "Reference object").ch("Name, *NONE").keyword_only(),
             p("REFOBJTYPE", Kind::Name, false, Some("*OBJTYPE"), "Reference object type").ch("*OBJTYPE, *FILE, *PGM...").keyword_only(),
             p("REFASPDEV", Kind::Name, false, Some("*"), "Reference ASP device").keyword_only(),
-            p("REPLACE", Kind::Name, false, Some("*NO"), "Replace authority").ch("*NO, *YES").keyword_only(),
+            p("REPLACE", Kind::Name, false, None, "Replace authority").ch("*NO, *YES").keyword_only(),
         ],
     },
     CommandDef {
@@ -1707,6 +1707,7 @@ pub static COMMANDS: &[CommandDef] = &[
             p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
             p("OBJTYPE", Kind::Name, true, None, "Object type")
                 .ch("*FILE, *PGM, *DTAARA, *MENU, *LIB"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
         ],
     },
     CommandDef {
@@ -3936,7 +3937,10 @@ pub static COMMANDS: &[CommandDef] = &[
     CommandDef {
         name: "DSPSAVF",
         description: "Display Save File",
-        params: &[p("FILE", Kind::Qualified, true, None, "Save file").ch("Name")],
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "Save file").ch("Name"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
     },
     CommandDef {
         name: "SAVOBJ",

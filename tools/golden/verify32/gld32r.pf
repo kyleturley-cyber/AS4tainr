@@ -1,0 +1,5 @@
+     A* verify32: a field reference file
+     A          R GLD32RR
+     A            NAME          10A         TEXT('Name')
+     A            AMT            7P 2       TEXT('Amount')
+     A                                      EDTCDE(1)

@@ -599,7 +599,13 @@ async fn write_list(
         &format!("{:02}{mo:02}{d:02}{h:02}{mi:02}{sec:02}", y % 100),
     );
     let mut g = Vec::with_capacity(GENERIC);
-    g.extend_from_slice(&(GENERIC as i32).to_be_bytes()); // size of generic header
+    // QSRLSAVF on IBM i 7.5 reports a generic header of 128 bytes, entries
+    // in CCSID 0 and binary zeros after them (PUB400 2026-10-31,
+    // tools/golden/verify31.txt x31_list); the other list APIs as
+    // before.
+    let qsrl = api == "QSRLSAVF";
+    let reported = if qsrl { 128 } else { GENERIC as i32 };
+    g.extend_from_slice(&reported.to_be_bytes()); // size of generic header
     g.extend(field("0100", 4)); // structure release and level
     g.extend(field(format, 8));
     g.extend(field(api, 10));
@@ -618,10 +624,14 @@ async fn write_list(
     ] {
         g.extend_from_slice(&(n as i32).to_be_bytes());
     }
-    g.extend_from_slice(&37i32.to_be_bytes()); // CCSID of the entries
-    g.extend(field("", 2)); // country or region ID
-    g.extend(field("", 3)); // language ID
-    g.extend(e("0")); // not a subsetted list
+    if qsrl {
+        g.extend_from_slice(&[0u8; 10]);
+    } else {
+        g.extend_from_slice(&37i32.to_be_bytes()); // CCSID of the entries
+        g.extend(field("", 2)); // country or region ID
+        g.extend(field("", 3)); // language ID
+        g.extend(e("0")); // not a subsetted list
+    }
     g.resize(GENERIC - 64, 0x00);
     let mut bytes = contents(client, &s).await?;
     if bytes.len() < used {
@@ -913,18 +923,31 @@ async fn list_objects(client: &Client, caller: &Caller, args: &mut dyn ApiArgs) 
 
 /// QSRLSAVF (qualified user space, format, qualified save file, object
 /// name filter (a name, generic* or *ALL), object type filter (*ALL or a
-/// type), continuation handle, error code). Format SAVF0200: one entry
-/// per object the save file holds: object name, library saved, object
-/// type, extended attribute, save date and time (*DTS), object size and
-/// its multiplier, ASP, data saved, owner, DLO name, folder, text and ASP
-/// device name (214 bytes).
+/// type), continuation handle, error code), as IBM i 7.5 fills the space
+/// (PUB400 2026-10-31, tools/golden/verify31.txt x31_list):
+/// - the input section (104 bytes): the space, format, save file, object
+///   name and type as given, the continuation handle;
+/// - the header section (76 bytes): the space and the save file used
+///   (QTEMP as QTEMP), a blank continuation handle;
+/// - SAVF0100, one entry (102 bytes) per library saved: library, save
+///   command, save date and time (*DTS), ASP 1, records, objects saved,
+///   access paths, save active *NO, release, data compressed '0', serial
+///   number, private authorities '0', ASP device *SYSBAS, two counts (0),
+///   *NONE;
+/// - SAVF0200, one entry (214 bytes) per object: name, library saved,
+///   type, extended attribute, save date and time, size and multiplier,
+///   ASP 1, data saved '1', owner, DLO name, folder, text, ASP device
+///   *SYSBAS.
 async fn list_save_file(client: &Client, caller: &Caller, args: &mut dyn ApiArgs) -> Result<()> {
     need(args, 5)?;
     let format = text(args, 1);
-    if format != "SAVF0200" {
-        bail!("CPF3C21: Format name {format} is not valid.");
-    }
-    let (savf, slib) = qualified(&args.bytes(2));
+    let size = match format.as_str() {
+        "SAVF0100" => 102,
+        "SAVF0200" => 214,
+        f => bail!("CPF3C21: Format name {f} is not valid."),
+    };
+    let savf_arg = args.bytes(2);
+    let (savf, slib) = qualified(&savf_arg);
     let obj = text(args, 3);
     let obj = if obj.is_empty() {
         "*ALL".to_string()
@@ -965,8 +988,52 @@ async fn list_save_file(client: &Client, caller: &Caller, args: &mut dyn ApiArgs
     };
     authority::check(client, &caller.user, &lib, &savf, "*FILE", Aut::Use).await?;
     let image = data.map(|d| crate::save::unpack(&d)).transpose()?;
+    // The save date and time as a system timestamp (*DTS): microseconds
+    // since 1928-08-23 12:03:06.314752 UTC, shifted left 12 bits (the
+    // captured entries' timestamp decodes to their save time this way).
+    let dts: [u8; 8] = match &image {
+        Some(img) => {
+            let us: i64 = client
+                .query_one(
+                    "SELECT (EXTRACT(EPOCH FROM ($1::text::timestamptz
+                             - timestamptz '1928-08-23 12:03:06.314752+00')) * 1000000)::bigint",
+                    &[&img.saved],
+                )
+                .await?
+                .get(0);
+            ((us as u64) << 12).to_be_bytes()
+        }
+        None => [0u8; 8],
+    };
+    // The serial number right-aligned in 8 (' 78EA841' on PUB400).
+    let serial = match crate::clpgm::system_value_text("QSRLNBR") {
+        Some(Ok(v)) => format!("{:>8}", v.trim()),
+        _ => String::new(),
+    };
     let mut entries = Vec::new();
     for l in image.iter().flat_map(|i| i.libraries.iter()) {
+        if size == 102 {
+            let img = image.as_ref().expect("an image");
+            let mut en = field(&l.name, 10);
+            en.extend(field(&img.command, 10));
+            en.extend(dts);
+            en.extend_from_slice(&1i32.to_be_bytes()); // ASP
+            en.extend_from_slice(&0i32.to_be_bytes()); // records (not kept)
+            en.extend_from_slice(&(l.objects.len() as i32).to_be_bytes());
+            en.extend_from_slice(&0i32.to_be_bytes()); // access paths
+            en.extend(field("*NO", 10)); // save active
+            en.extend(field("V7R5M0", 6)); // release level
+            en.extend(e("0")); // data compressed
+            en.extend(field(&serial, 8));
+            en.extend(e("0")); // private authorities
+            en.extend(field("", 2));
+            en.extend(field("*SYSBAS", 10));
+            en.extend(field("", 2));
+            en.extend_from_slice(&[0u8; 8]);
+            en.extend(field("*NONE", 10));
+            entries.push(en);
+            continue;
+        }
         for o in &l.objects {
             if !crate::catalog::name_matches(&obj, &o.name)
                 || !(objtype == "*ALL" || objtype == o.objtype)
@@ -977,8 +1044,8 @@ async fn list_save_file(client: &Client, caller: &Caller, args: &mut dyn ApiArgs
             en.extend(field(&l.name, 10));
             en.extend(field(&o.objtype, 10));
             en.extend(field(&o.attribute, 10));
-            en.extend([0u8; 8]); // save date and time: not kept as *DTS
-            en.extend_from_slice(&0i32.to_be_bytes()); // object size
+            en.extend(dts);
+            en.extend_from_slice(&0i32.to_be_bytes()); // object size (not kept)
             en.extend_from_slice(&1i32.to_be_bytes()); // size multiplier
             en.extend_from_slice(&1i32.to_be_bytes()); // ASP: the system ASP
             en.extend(e("1")); // data saved
@@ -986,19 +1053,27 @@ async fn list_save_file(client: &Client, caller: &Caller, args: &mut dyn ApiArgs
             en.extend(field("", 20)); // DLO name
             en.extend(field("", 63)); // folder
             en.extend(field(&o.text, 50));
-            en.extend(field("", 10)); // ASP device name
+            en.extend(field("*SYSBAS", 10));
             entries.push(en);
         }
     }
     let mut input = args.bytes(0);
     input.resize(20, 0x40);
     input.extend(field(&format, 8));
-    input.extend(field(&savf, 10));
-    input.extend(field(&slib, 10));
+    let mut q = savf_arg.clone();
+    q.resize(20, 0x40);
+    input.extend(q);
     input.extend(field(&obj, 10));
     input.extend(field(&objtype, 10));
-    let mut header = field(&savf, 10);
-    header.extend(field(&lib, 10));
+    let mut handle = args.bytes(5);
+    handle.resize(36, 0x40);
+    input.extend(handle);
+    let (sname, slib_used) = qualified(&args.bytes(0));
+    let mut header = field(&sname, 10);
+    header.extend(field(&crate::qtemp::logical(&slib_used), 10));
+    header.extend(field(&savf, 10));
+    header.extend(field(&crate::qtemp::logical(&lib), 10));
+    header.extend(field("", 36)); // continuation handle
     write_list(
         client,
         caller,
@@ -1008,7 +1083,7 @@ async fn list_save_file(client: &Client, caller: &Caller, args: &mut dyn ApiArgs
         &input,
         &header,
         &entries,
-        214,
+        size,
     )
     .await
 }

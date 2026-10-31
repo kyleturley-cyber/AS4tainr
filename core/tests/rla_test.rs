@@ -9997,9 +9997,13 @@ ENDPGM"
             "CPF9801",
         ]
     );
-    assert!(m
-        .iter()
-        .any(|x| x == &format!("Data queue KEYQ was created in library {lib}.")));
+    // CRTDTAQ's completion message is CPC9801 (PUB400 2026-10-31,
+    // tools/golden/verify31.txt x31_dtq; it had no message ID here).
+    assert!(
+        m.iter()
+            .any(|x| x
+                == &format!("CPC9801: Object KEYQ of type *DTAQ was created in library {lib}."))
+    );
     assert!(m.iter().any(
         |x| x == &format!("CPC2191: Object LIFOQ of type *DTAQ in library {lib} was deleted.")
     ));
@@ -21428,9 +21432,13 @@ async fn verify30_display_file_ffd_and_global_variables() {
 ///   restore (an object's description travels with it);
 /// - RNMOBJ: the object under its new name with its records and
 ///   description; DLTOBJ: the object deleted;
-/// - GRTOBJAUT REPLACE(*NO) adds the authority to what the user has,
-///   REPLACE(*YES) replaces it, REFOBJ gives the reference object's
-///   authorities; CHGOBJOWN CUROWNAUT(*SAME) leaves the old owner *ALL.
+/// - GRTOBJAUT REPLACE(*NO) adds the authority to what the user has
+///   (*PUBLIC *ALL stays *ALL after *USE: PUB400 2026-10-31,
+///   tools/golden/verify31.txt x31_grt2/x31_aut2), REPLACE(*YES) replaces
+///   it (x31_aut3), CPC2201 when granted (x31_grt1), REFOBJ gives the
+///   reference object's authorities and takes no REPLACE (CPD2215,
+///   x31_ref); RNMOBJ's CPC2192 (x31_rnm), DLTOBJ without a message
+///   (x31_dlt); CHGOBJOWN CUROWNAUT(*SAME) leaves the old owner *ALL.
 #[tokio::test]
 async fn save_file_lists_descriptions_and_object_commands() {
     use as4tainr_core::authority::{self, Aut};
@@ -21530,6 +21538,7 @@ dcl-ds ent based(e);
   dlo char(20);
   folder char(63);
   text char(50);
+  aspdev char(10);
 end-ds;
 dcl-s err char(8) inz(x'0000000000000000');
 dcl-s i int(10);
@@ -21542,8 +21551,12 @@ p3 = p + 136;
 dsply (%char(count) + ' ' + %char(entsize));
 for i = 0 to count - 1;
   e = p + listoff + i * entsize;
-  dsply (%trim(oname) + ' ' + %trim(otype) + ' ' + %trim(owner) + ' ' + %trim(text) + ' ' + data);
+  dsply (%trim(oname) + ' ' + %trim(otype) + ' ' + %trim(owner) + ' ' + %trim(text) + ' ' + data + ' ' + aspdev);
 endfor;
+p1 = p + 64;
+p2 = p + 112;
+p3 = p + 120;
+dsply (%char(listoff) + ' ' + %char(count) + ' ' + %char(entsize));
 *inlr = *on;
 "
         )
@@ -21563,9 +21576,12 @@ endfor;
         r.messages,
         [
             "3 214",
-            "PKD1 *DTAARA QSECOFR First 1",
-            "PKD2 *DTAARA QSECOFR  1",
-            "PKQ1 *DTAQ QSECOFR  1",
+            "PKD1 *DTAARA QSECOFR First 1 *SYSBAS",
+            "PKD2 *DTAARA QSECOFR  1 *SYSBAS",
+            "PKQ1 *DTAQ QSECOFR  1 *SYSBAS",
+            // The generic header's size, the input and header sections'
+            // sizes (x31_list).
+            "128 104 76",
         ]
     );
     let r = run_rpg(
@@ -21590,7 +21606,10 @@ endfor;
         None,
     )
     .await;
-    assert_eq!(r.messages, ["1 214", "PKQ1 *DTAQ QSECOFR  1"]);
+    assert_eq!(
+        r.messages,
+        ["1 214", "PKQ1 *DTAQ QSECOFR  1 *SYSBAS", "128 104 76"]
+    );
     // A save file saved in another one, with its contents.
     cl_cmd(
         &mut job,
@@ -21598,6 +21617,37 @@ endfor;
     )
     .await
     .unwrap();
+    // DSPSAVF printed (x31_dsp's layout).
+    let print = match job
+        .run(&format!("DSPSAVF FILE({lib}/PKS2) OUTPUT(*PRINT)"))
+        .await
+        .unwrap()
+    {
+        as4tainr_core::commands::Outcome::Display(d) => d.print,
+        other => panic!("{other:?}"),
+    };
+    for l in [
+        "                                              Saved Object Information                                                  Page     1".to_string(),
+        " Save file  . . . . . . . . . . . . . . :   PKS2".to_string(),
+        format!("   Library  . . . . . . . . . . . . . . :     {lib}"),
+        " Save operation:".to_string(),
+        "   Save command . . . . . . . . . . . . :   SAVOBJ".to_string(),
+        "   Save while active  . . . . . . . . . :   *NO".to_string(),
+        " Data saved:".to_string(),
+        format!("   Library  . . . . . . . . . . . . . . :   {lib}"),
+        "                                                              Objects".to_string(),
+        " Object       Type       Attribute    Owner           Size (K)   Data       Text".to_string(),
+        " Number of objects saved  . . . . . . . :   1".to_string(),
+    ] {
+        assert!(print.contains(&l), "{l}\n{print:#?}");
+    }
+    assert!(
+        print.iter().any(
+            |l| l.starts_with(" PKS1         *FILE      SAVF         QSECOFR ")
+                && l.contains("   YES")
+        ),
+        "{print:#?}"
+    );
     for c in [
         format!("DLTF FILE({lib}/PKS1)"),
         format!("DLTDTAARA DTAARA({lib}/PKD1)"),
@@ -21629,10 +21679,16 @@ endfor;
         )),
         sql(&format!("INSERT INTO {lib}.PKT1 VALUES (1, 'A'), (2, 'B')")),
         format!("RNMOBJ OBJ({lib}/PKT1) OBJTYPE(*FILE) NEWOBJ(PKT9)"),
-        format!("RNMOBJ OBJ({lib}/PKD1) OBJTYPE(*DTAARA) NEWOBJ(PKD9)"),
     ] {
         cl_cmd(&mut job, c).await.unwrap();
     }
+    let m = cl_cmd(
+        &mut job,
+        format!("RNMOBJ OBJ({lib}/PKD1) OBJTYPE(*DTAARA) NEWOBJ(PKD9)"),
+    )
+    .await
+    .unwrap();
+    assert!(m.len() == 1 && m[0].starts_with("CPC2192: "), "{m:?}");
     assert_eq!(
         sql_rows(
             &client,
@@ -21649,10 +21705,15 @@ endfor;
     };
     assert!(!exists("PKT1", "*FILE").await.unwrap());
     assert!(!exists("PKD1", "*DTAARA").await.unwrap());
-    cl_cmd(&mut job, format!("DLTOBJ OBJ({lib}/PKD9) OBJTYPE(*DTAARA)"))
+    let m = cl_cmd(&mut job, format!("DLTOBJ OBJ({lib}/PKD9) OBJTYPE(*DTAARA)"))
         .await
         .unwrap();
+    assert!(m.is_empty(), "{m:?}");
     assert!(!exists("PKD9", "*DTAARA").await.unwrap());
+    let e = cl_cmd(&mut job, format!("DLTOBJ OBJ({lib}/PKD9) OBJTYPE(*DTAARA)"))
+        .await
+        .unwrap_err();
+    assert!(e.contains("CPF2105: "), "{e}");
     // GRTOBJAUT REPLACE and REFOBJ, CHGOBJOWN CUROWNAUT.
     let public = |n: &'static str| {
         let client = &client;
@@ -21685,18 +21746,58 @@ endfor;
     .await
     .unwrap();
     assert_eq!(public("PKD2").await, Aut::Use);
+    // DSPOBJAUT printed (x31_aut3's lines: *PUBLIC *USE, the owner *ALL).
+    let print = match job
+        .run(&format!(
+            "DSPOBJAUT OBJ({lib}/PKD2) OBJTYPE(*DTAARA) OUTPUT(*PRINT)"
+        ))
+        .await
+        .unwrap()
+    {
+        as4tainr_core::commands::Outcome::Display(d) => d.print,
+        other => panic!("{other:?}"),
+    };
+    let want = [
+        "                                              Display Object Authority                                                  Page     1".to_string(),
+        format!("   Library  . . . . . :     {lib:<10}                              Primary group  . . . :   *NONE"),
+        " Object type  . . . . :   *DTAARA                                   ASP device . . . . . :   *SYSBAS".to_string(),
+        " Object secured by authorization list  . . . . . . . . . . . . :   *NONE".to_string(),
+        "                              Object      --------------Object---------------    -------------------Data-------------------".to_string(),
+        " User          Group         Authority    Opr    Mgt    Exist    Alter    Ref    Read    Add    Update    Delete    Execute".to_string(),
+        " *PUBLIC                     *USE          X                                      X                                    X".to_string(),
+        " QSECOFR                     *ALL          X      X       X        X       X      X       X       X         X          X".to_string(),
+    ];
+    for l in want {
+        assert!(print.contains(&l), "{l}\n{print:#?}");
+    }
     cl_cmd(
         &mut job,
         format!("CRTDTAARA DTAARA({lib}/PKD3) TYPE(*CHAR) LEN(1)"),
     )
     .await
     .unwrap();
-    cl_cmd(
+    // REPLACE does not go with REFOBJ: CPD2215 (PUB400, verify31 x31_ref).
+    let e = cl_cmd(
         &mut job,
         format!("GRTOBJAUT OBJ({lib}/PKD3) OBJTYPE(*DTAARA) REFOBJ({lib}/PKD2) REPLACE(*YES)"),
     )
     .await
+    .unwrap_err();
+    assert!(e.contains("CPD2215: ") && e.contains("CPF0006: "), "{e}");
+    // From *EXCLUDE, *PUBLIC gets the reference object's *USE.
+    cl_cmd(
+        &mut job,
+        format!("RVKOBJAUT OBJ({lib}/PKD3) OBJTYPE(*DTAARA) USER(*PUBLIC) AUT(*ALL)"),
+    )
+    .await
     .unwrap();
+    let m = cl_cmd(
+        &mut job,
+        format!("GRTOBJAUT OBJ({lib}/PKD3) OBJTYPE(*DTAARA) REFOBJ({lib}/PKD2)"),
+    )
+    .await
+    .unwrap();
+    assert!(m[0].starts_with("CPC2201: "), "{m:?}");
     assert_eq!(public("PKD3").await, Aut::Use);
     let user = format!("U{}", &lib[1..]);
     cl_cmd(

@@ -38,6 +38,9 @@
 # - IBM i Packager (JDubbTX, Apache-2.0): imported; its unit tests
 #   (pkgtest.test.sqlrpgle: PACK and UNPACK of a test library) made with
 #   RUCRTRPG as its Makefile's test target does and run with RUCALLTST.
+# - CommonLogger (Damian-Pietron, Apache-2.0): its makefile's CL
+#   commands (modules, service program, example program), then its unit
+#   tests (comLog.test.sqlrpgle) made with RUCRTRPG and run with RUCALLTST.
 # - IBMi-topics (MarcoDeSenas, GPL-3.0): imported (a TOBi-like project:
 #   sources built from the IFS, relative INCLUDE SRCSTMF paths, commands
 #   with validity checkers that look for QCATRS on the call stack,
@@ -84,6 +87,7 @@ clone https://github.com/danlong005/IBMiMock.git imoq
 clone https://github.com/MarinaSchwenk/IBMiUnit.git ibmiunit
 clone https://github.com/IBM/tobi-example.git tobi
 clone https://github.com/JDubbTX/ibm-i-packager.git pkg
+clone https://github.com/Damian-Pietron/CommonLogger.git clog
 
 step() {
   echo "== $*"
@@ -378,6 +382,29 @@ pk() { "$bin" --libl PACKAGER,IRPGUNIT,QGPL --curlib PACKAGER batch "$1" 2>&1; }
 pk "IRPGUNIT/RUCRTRPG TSTPGM(PACKAGER/TPKGTEST) SRCSTMF('$work/pkg/test/qrpglesrc/pkgtest.test.sqlrpgle') INCDIR('$work/pkg' '$work/pkg/src/qrpglesrc') RPGPPOPT(*LVL2) DBGVIEW(*SOURCE) COPTION(*EVENTF *SRCSTMT *NODEBUGIO)" |
   grep -a -E "^(Test program|CPF9897)"
 pk "IRPGUNIT/RUCALLTST TSTPGM(PACKAGER/TPKGTEST) TSTPRC(*ALL) DETAIL(*ALL)" | grep -a -E "^ *(Success|FAILURE|ERROR)\.|CPF9897: FAILURE|CPF124[01]"
+
+step "CommonLogger (its makefile's steps as CL commands, then its unit tests with iRPGUnit)"
+# Damian-Pietron/CommonLogger (Apache-2.0): a logging service program
+# (SQLRPGLE modules, a binder source, a log table it creates, the caller
+# found with QSYS2.STACK_INFO). Its makefile runs `system` in Qshell: its
+# commands are run here as they are, with the clone's absolute paths.
+"$bin" put "$work/clog" "$work/clog" >/dev/null
+cl() { "$bin" --libl COMLOG,IRPGUNIT,QGPL --curlib COMLOG system "$1" 2>&1 | grep -E "^(CP[CDF]|RNS|SQL)" | tail -1; }
+cl "CRTLIB LIB(COMLOG) TYPE(*PROD) TEXT('Common Logger Library')"
+cl "CRTBNDDIR BNDDIR(COMLOG/COMLOG) TEXT('Common Logger Binding Directory')"
+cl "ADDBNDDIRE BNDDIR(COMLOG/COMLOG) OBJ((COMLOG/COMLOG))"
+for m in comLog exLog; do
+  cl "CRTSQLRPGI OBJ(COMLOG/$m) SRCSTMF('$work/clog/src/$m.sqlrpgle') OBJTYPE(*MODULE) REPLACE(*YES) DBGVIEW(*SOURCE) CVTCCSID(*JOB) COMPILEOPT('TGTCCSID(*JOB)') RPGPPOPT(*LVL2) TGTRLS(*PRV)"
+done
+cl "CRTSRVPGM SRVPGM(COMLOG/COMLOG) MODULE(COMLOG/COMLOG) SRCSTMF('$work/clog/src/comLog.BND') EXPORT(*SRCFILE) TGTRLS(*PRV) REPLACE(*YES)"
+cl "CRTPGM PGM(COMLOG/EXLOG) MODULE(COMLOG/EXLOG) ENTMOD(COMLOG/EXLOG) ACTGRP(QILE) BNDSRVPGM(COMLOG/COMLOG) TGTRLS(*PRV) REPLACE(*YES)"
+lg() { "$bin" --libl COMLOG,IRPGUNIT,QGPL --curlib COMLOG batch "$1" 2>&1; }
+lg "IRPGUNIT/RUCRTRPG TSTPGM(COMLOG/COMLOGT) SRCSTMF('$work/clog/test/comLog.test.sqlrpgle') RPGPPOPT(*LVL2) DBGVIEW(*SOURCE)" |
+  grep -a -E "^(Test program|CPF9897)"
+lg "IRPGUNIT/RUCALLTST TSTPGM(COMLOG/COMLOGT) DETAIL(*ALL)" | grep -a -E "^ *(Success|FAILURE|ERROR)\.|CPF9897: FAILURE|CPF124[01]"
+# The log: each test's message with the program and procedure that
+# logged it (STACK_INFO's entry before COMLOG's).
+"$bin" sql "SELECT LOGSEVERITY, CAST(LOGBODY AS VARCHAR(30)), LOGPROGRAM, LOGPROCEDURE FROM COMLOG.COMLOG WHERE LOGSEVERITY <> 50 ORDER BY LOGSEVERITY"
 
 step "IBMi-topics (import, then SPLFDLT *LOGONLY and *BOTH in batch jobs)"
 "$bin" import "$work/topics" --lib TOPICS 2>/dev/null | tail -1

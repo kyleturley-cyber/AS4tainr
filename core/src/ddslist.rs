@@ -80,9 +80,20 @@ pub struct Input {
     /// Whether the expanded source shows physical file fields with their
     /// attributes (CRTPF).
     pub physical: bool,
+    /// A display file (CRTDSPF): its source after reference fields were
+    /// expanded (ddsref.rs: attributes made explicit, copied keywords
+    /// after the field's own, an `A*@REF` comment after each reference
+    /// field); the expanded source is made from it.
+    pub display: Option<String>,
+    /// A physical file (CRTPF): its source after reference fields were
+    /// expanded (ddsref.rs, line for line: attributes made explicit,
+    /// copied keywords and `@REF(...)` after the entry's own).
+    pub refs: Option<String>,
 }
 
-const PAGE: usize = 60;
+/// Lines on a page after its header (PUB400 2026-10-30, verify29
+/// v29_crtp: the expanded source's second page holds 50).
+const PAGE: usize = 50;
 
 /// The sequence number a source line is listed with (1-based line n:
 /// n * 100, as records 1.00, 2.00 ... are).
@@ -121,33 +132,94 @@ fn blanked(line: &str) -> String {
 fn expanded(input: &Input, errors: &[usize]) -> Vec<String> {
     let mut out = Vec::new();
     let mut pos = 1u32;
-    for (i, raw) in input.lines.iter().enumerate() {
+    let refs: Vec<String> = input
+        .refs
+        .as_deref()
+        .map(|r| r.lines().map(str::to_string).collect())
+        .unwrap_or_default();
+    let mut in_record = false;
+    let mut record = String::new();
+    let mut i = 0;
+    while i < input.lines.len() {
         let n = i + 1;
-        let line = raw.trim_end();
+        let line = input.lines[i].trim_end();
+        i += 1;
         if line.trim().is_empty() || col(line, 7, 7) == "*" || errors.contains(&n) {
             continue;
         }
         let name_type = col(line, 17, 17).to_ascii_uppercase();
         let name = col(line, 19, 28).to_ascii_uppercase();
         let s = seq(n);
-        if input.physical && name_type.is_empty() && !name.is_empty() {
+        if name_type == "R" {
+            in_record = true;
+            record = name.clone();
+        }
+        // The file-level reference file is not shown (v29_crtp).
+        if !in_record && only_ref_keywords(line) {
+            continue;
+        }
+        let is_field = input.physical && name_type.is_empty() && !name.is_empty();
+        if is_field && col(line, 29, 29).eq_ignore_ascii_case("R") {
+            // The entry: this line and its keyword lines.
+            let mut last = n - 1;
+            while last + 1 < input.lines.len() && keyword_only(&input.lines[last + 1]) {
+                last += 1;
+            }
+            i = last + 1;
+            let Some(exp) = refs.get(n - 1) else { continue };
+            let lines = ReferencedEntry {
+                seq: s,
+                original: &input.lines[n - 1..=last],
+                expanded: &refs[n - 1..=last.min(refs.len() - 1)],
+                record: &record,
+                pos,
+            };
+            let (printed, bytes) = lines.listed(exp);
+            out.extend(printed);
+            pos += bytes;
+            continue;
+        }
+        if is_field {
             let Some(f) = field_of(line) else { continue };
-            let len = if f.data_type.fixed_length().is_some() {
-                String::new()
-            } else {
-                f.length.to_string()
+            // The entry's own keywords: this line's and its keyword lines'
+            // (v29_crtr: COLHDG on the next line shown on the field's).
+            let mut last = n - 1;
+            while last + 1 < input.lines.len() && keyword_only(&input.lines[last + 1]) {
+                last += 1;
+            }
+            i = last + 1;
+            let own: Vec<String> = input.lines[n - 1..=last]
+                .iter()
+                .flat_map(|l| crate::dds::split_keywords(&l.chars().skip(44).collect::<String>()))
+                .collect();
+            let len = match f.data_type.fixed_length() {
+                Some(l) => l.to_string(),
+                None => f.length.to_string(),
             };
             let dec = if f.data_type.is_numeric() {
                 f.decimals.to_string()
             } else {
                 String::new()
             };
-            let mut kw = col(line, 45, 80).to_string();
-            if !kw.to_ascii_uppercase().contains("COLHDG(") {
-                kw = format!("{kw} COLHDG('{}')", f.name).trim().to_string();
+            // No heading of its own: the field's name; on the field's line
+            // when it has no keywords (z_crtpf), else on a line of its own
+            // without a number (v29_crtr, w30_crtr).
+            let default_hdg = (!own.iter().any(|k| crate::dds::keyword_name(k) == "COLHDG"))
+                .then(|| format!("COLHDG('{}')", f.name));
+            let mut kws = own.clone();
+            let mut after = Vec::new();
+            match default_hdg {
+                Some(h) if own.is_empty() => kws.push(h),
+                Some(h) => after.push(h),
+                None => {}
             }
+            let packed = keyword_lines("", &kws);
+            let first = packed
+                .first()
+                .map(|l| l.trim().to_string())
+                .unwrap_or_default();
             let spec = format!(
-                "{:18}{:<10} {len:>5}{}{dec:>2}B{:6}{kw}",
+                "{:18}{:<10} {len:>5}{}{dec:>2}B{:6}{first}",
                 "",
                 f.name,
                 f.data_type.code(),
@@ -155,10 +227,402 @@ fn expanded(input: &Input, errors: &[usize]) -> Vec<String> {
             );
             let bytes = f.buffer_bytes();
             out.push(format!("{s:>7}  {spec:<80}{bytes:>6}{pos:>13}{pos:>8}"));
+            for l in packed.iter().skip(1) {
+                out.push(format!("{s:>7}{}", &l[7..]));
+            }
+            out.extend(keyword_lines("", &after));
             pos += bytes;
         } else {
             out.push(format!("{s:>7}  {}", blanked(line)).trim_end().to_string());
         }
+    }
+    out
+}
+
+/// A line whose keywords are only REF or REFFLD (not shown expanded).
+fn only_ref_keywords(line: &str) -> bool {
+    let kws = crate::dds::split_keywords(&line.chars().skip(44).collect::<String>());
+    !kws.is_empty()
+        && col(line, 17, 44).is_empty()
+        && kws
+            .iter()
+            .all(|k| matches!(crate::dds::keyword_name(k).as_str(), "REF" | "REFFLD"))
+}
+
+/// A line with keywords only (positions 17-44 blank).
+fn keyword_only(line: &str) -> bool {
+    col(line, 7, 7) != "*" && col(line, 17, 44).is_empty() && !col(line, 45, 80).is_empty()
+}
+
+/// A physical file's reference field as its expanded source shows it
+/// (PUB400 2026-10-30, verify29 v29_crtp): the field line with its
+/// attributes, usage B, length and buffer position; where it came from
+/// (*SRC: this record format, file *SRC, no library); its own keyword
+/// lines as written (REFFLD not shown); the keywords taken from the
+/// referenced field (a file field's TEXT padded to 50, the default
+/// COLHDG) under the field's number; a TEXT made from its own COLHDG
+/// without a number.
+struct ReferencedEntry<'a> {
+    seq: usize,
+    original: &'a [String],
+    expanded: &'a [String],
+    record: &'a str,
+    pos: u32,
+}
+
+impl ReferencedEntry<'_> {
+    fn listed(&self, exp: &str) -> (Vec<String>, u32) {
+        let s = self.seq;
+        let kw = |l: &str| l.chars().skip(44).collect::<String>().trim().to_string();
+        let own_last = self.original.last().map(|l| kw(l)).unwrap_or_default();
+        let exp_last = self.expanded.last().map(|l| kw(l)).unwrap_or_default();
+        let added = exp_last
+            .strip_prefix(own_last.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let mut origin: Vec<String> = Vec::new();
+        let mut copied = Vec::new();
+        for k in crate::dds::split_keywords(&added) {
+            if crate::dds::keyword_name(&k) == "@REF" {
+                let inner = k.split_once('(').map(|x| x.1).unwrap_or("");
+                let inner = inner.strip_suffix(')').unwrap_or(inner);
+                origin = inner.split_whitespace().map(str::to_string).collect();
+            } else {
+                copied.push(k);
+            }
+        }
+        let own: Vec<String> = self
+            .original
+            .iter()
+            .flat_map(|l| crate::dds::split_keywords(&kw(l)))
+            .collect();
+        let has = |n: &str| own.iter().any(|k| crate::dds::keyword_name(k) == n);
+        // The field line, from the expanded source's positions 8-37.
+        let ty = col(exp, 35, 35).to_ascii_uppercase();
+        let dec = col(exp, 36, 37).to_string();
+        let dtype = match ty.chars().next() {
+            Some(c) => c,
+            None if !dec.is_empty() => 'P',
+            None => 'A',
+        };
+        let len: String = match dtype {
+            'L' => "10".into(),
+            'T' => "8".into(),
+            'Z' => "26".into(),
+            _ => col(exp, 30, 34).to_string(),
+        };
+        let attrs: String = exp.chars().take(37).collect();
+        let bytes = field_of(&attrs).map(|f| f.buffer_bytes()).unwrap_or(0);
+        let head: String = exp.chars().skip(7).take(21).collect();
+        let spec = format!("{:7}{head:<21} {len:>5}{dtype}{dec:>2}B", "");
+        let p = self.pos;
+        let mut out = vec![format!("{s:>7}  {spec:<80}{bytes:>6}{p:>13}{p:>8}")
+            .trim_end()
+            .to_string()];
+        let src = origin.get(2).is_some_and(|f| f == "*SRC");
+        if origin.len() >= 4 {
+            out.push(format!(
+                " * Referenced Field  . . . . . . . . . . . :   {}",
+                origin[3]
+            ));
+            let (fmt, file, lib) = if src {
+                (self.record.to_string(), "*SRC".to_string(), String::new())
+            } else {
+                (origin[2].clone(), origin[1].clone(), origin[0].clone())
+            };
+            out.push(format!(
+                " *   Format  . . . . . . . . . . . . . . . :   {fmt}"
+            ));
+            out.push(format!(
+                " *   File  . . . . . . . . . . . . . . . . :   {file}"
+            ));
+            out.push(
+                format!(" *   Library . . . . . . . . . . . . . . . :   {lib}")
+                    .trim_end()
+                    .to_string(),
+            );
+        }
+        // Own keyword lines after the field line, as written.
+        for (k, l) in self.original.iter().enumerate().skip(1) {
+            if !only_ref_keywords(l) {
+                out.push(
+                    format!("{:>7}  {}", s + k * 100, blanked(l))
+                        .trim_end()
+                        .to_string(),
+                );
+            }
+        }
+        // Own keywords on the field line (but REFFLD).
+        let mut numbered: Vec<String> = crate::dds::split_keywords(&kw(&self.original[0]))
+            .into_iter()
+            .filter(|k| crate::dds::keyword_name(k) != "REFFLD")
+            .collect();
+        let mut unnumbered = Vec::new();
+        for k in copied {
+            if crate::dds::keyword_name(&k) == "TEXT" {
+                if has("COLHDG") && !has("TEXT") {
+                    unnumbered.push(k);
+                    continue;
+                }
+                if !src {
+                    let inner = k.split_once('(').map(|x| x.1).unwrap_or("");
+                    let inner = inner.strip_suffix(')').unwrap_or(inner);
+                    let t = inner.trim().trim_matches('\'');
+                    numbered.push(format!("TEXT('{t:<50}')"));
+                    continue;
+                }
+            }
+            numbered.push(k);
+        }
+        out.extend(keyword_lines(&format!("{s:>7}"), &numbered));
+        out.extend(keyword_lines("", &unnumbered));
+        (out, bytes)
+    }
+}
+
+/// Keywords as an expanded listing shows them at positions 45-80: as many
+/// as fit on a line, '+' before the next line; a keyword too long for
+/// the line goes on in pieces of 35 with '-' (PUB400 2026-10-30, verify29
+/// v29_crtp and v29_crtd, verify30 w30_crtd).
+fn keyword_lines(number: &str, keywords: &[String]) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for k in keywords {
+        let cand = if cur.is_empty() {
+            k.clone()
+        } else {
+            format!("{cur} {k}")
+        };
+        if cand.chars().count() <= 36 {
+            cur = cand;
+            continue;
+        }
+        let mut rest = if cur.is_empty() {
+            cand
+        } else {
+            lines.push(format!("{cur} +"));
+            k.clone()
+        };
+        while rest.chars().count() > 36 {
+            let head: String = rest.chars().take(35).collect();
+            lines.push(format!("{head}-"));
+            rest = rest.chars().skip(35).collect();
+        }
+        cur = rest;
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+        .into_iter()
+        .map(|l| format!("{number:>7}{:46}{l}", "").trim_end().to_string())
+        .collect()
+}
+
+/// A display file's expanded source (PUB400 2026-10-30, verify29 v29_crtd
+/// and verify30 w30_crtd): DSPSIZ(*DS3) when the source names none; the
+/// file-level REF is not shown; record lines as written; a constant with
+/// its length; a field with its length, type and decimals made explicit
+/// (a date 10L), its length in bytes and its output and input buffer
+/// positions (output: O, B, H fields; input: I, B, H; each record from 1);
+/// a reference field's origin (referenced field, format, file, library)
+/// on comment lines; then the field's keywords (a referenced TEXT padded
+/// to 50 characters) in pieces at position 45.
+fn display_expanded(input: &Input, expanded_src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let lines: Vec<&str> = expanded_src.lines().collect();
+    let own_lines: Vec<String> = input
+        .lines
+        .iter()
+        .map(|l| l.trim_end().to_string())
+        .collect();
+    let has_dspsiz = expanded_src.to_ascii_uppercase().contains("DSPSIZ(");
+    if !has_dspsiz {
+        out.push(format!("{:53}DSPSIZ(*DS3)", ""));
+    }
+    let mut n = 0usize; // the original line number
+    let mut in_record = false;
+    let (mut outpos, mut inpos) = (1u32, 1u32);
+    // The field being listed: its line, keywords and origin.
+    struct Pending {
+        seq: usize,
+        line: String,
+        keywords: String,
+        origin: Option<Vec<String>>,
+    }
+    let mut pending: Option<Pending> = None;
+    let flush = |p: Pending, out: &mut Vec<String>| {
+        out.push(p.line);
+        if let Some(o) = &p.origin {
+            out.push(format!(
+                " * Referenced Field  . . . . . . . . . . . :   {}",
+                o[3]
+            ));
+            if o.len() >= 4 && o[2] != "*SRC" {
+                out.push(format!(
+                    " *   Format  . . . . . . . . . . . . . . . :   {}",
+                    o[2]
+                ));
+                out.push(format!(
+                    " *   File  . . . . . . . . . . . . . . . . :   {}",
+                    o[1]
+                ));
+                out.push(format!(
+                    " *   Library . . . . . . . . . . . . . . . :   {}",
+                    o[0]
+                ));
+            }
+        }
+        if !p.keywords.trim().is_empty() {
+            let kws = crate::dds::split_keywords(p.keywords.trim());
+            out.extend(keyword_lines(&format!("{:>7}", p.seq), &kws));
+        }
+    };
+    for raw in &lines {
+        let line = raw.trim_end();
+        if let Some(r) = line.trim_start().strip_prefix("A*@REF ") {
+            if let Some(p) = pending.as_mut() {
+                p.origin = Some(r.split_whitespace().map(str::to_string).collect());
+            }
+            continue;
+        }
+        n += 1;
+        if line.trim().is_empty() || col(line, 7, 7) == "*" {
+            continue;
+        }
+        let s = seq(n);
+        let own = own_lines.get(n - 1).cloned().unwrap_or_default();
+        let kw_of = |l: &str| l.chars().skip(44).collect::<String>().trim().to_string();
+        let name_type = col(line, 17, 17).to_ascii_uppercase();
+        let name = col(line, 19, 28).to_ascii_uppercase();
+        let position = col(line, 39, 44);
+        if name_type == "R" {
+            if let Some(p) = pending.take() {
+                flush(p, &mut out);
+            }
+            in_record = true;
+            (outpos, inpos) = (1, 1);
+            out.push(format!("{s:>7}  {}", blanked(line)).trim_end().to_string());
+            continue;
+        }
+        if !in_record {
+            // File-level keywords; the reference file is not shown.
+            let kws = crate::dds::split_keywords(&kw_of(line));
+            if kws
+                .iter()
+                .all(|k| matches!(crate::dds::keyword_name(k).as_str(), "REF" | "REFFLD"))
+            {
+                continue;
+            }
+            out.push(format!("{s:>7}  {}", blanked(line)).trim_end().to_string());
+            continue;
+        }
+        if !name.is_empty() && name_type.is_empty() {
+            if let Some(p) = pending.take() {
+                flush(p, &mut out);
+            }
+            let ty = col(line, 35, 35).to_ascii_uppercase();
+            let dec_txt = col(line, 36, 37).to_string();
+            let dtype = match ty.chars().next() {
+                Some(c) => c,
+                None if !dec_txt.is_empty() => 'S',
+                None => 'A',
+            };
+            let len: u32 = match dtype {
+                'L' => 10,
+                'T' => 8,
+                'Z' => 26,
+                _ => col(line, 30, 34).parse().unwrap_or(0),
+            };
+            let usage = col(line, 38, 38).to_ascii_uppercase();
+            let usage = if usage.is_empty() {
+                "B".to_string()
+            } else {
+                usage
+            };
+            let head: String = line.chars().skip(7).take(21).collect();
+            let spec = format!(
+                "{:7}{head:<21} {len:>5}{dtype}{dec_txt:>2}{usage:1}{:>3}{:>3}",
+                "",
+                col(line, 39, 41),
+                col(line, 42, 44)
+            );
+            let (o, i) = match usage.as_str() {
+                "O" => (Some(outpos), None),
+                "I" => (None, Some(inpos)),
+                _ => (Some(outpos), Some(inpos)),
+            };
+            if o.is_some() {
+                outpos += len;
+            }
+            if i.is_some() {
+                inpos += len;
+            }
+            let o = o.map(|v| v.to_string()).unwrap_or_default();
+            let i = i.map(|v| v.to_string()).unwrap_or_default();
+            // Keywords copied from the referenced field follow the
+            // field's own on the same line here; a copied TEXT is shown
+            // padded to 50.
+            let all = kw_of(line);
+            let mine = kw_of(&own);
+            let copied = all
+                .strip_prefix(mine.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let copied: Vec<String> = crate::dds::split_keywords(&copied)
+                .into_iter()
+                .map(|k| {
+                    if crate::dds::keyword_name(&k) == "TEXT" {
+                        let inner = k.split_once('(').map(|x| x.1).unwrap_or("");
+                        let inner = inner.strip_suffix(')').unwrap_or(inner);
+                        let t = inner.trim().trim_matches('\'');
+                        format!("TEXT('{t:<50}')")
+                    } else {
+                        k
+                    }
+                })
+                .collect();
+            let keywords = format!("{mine} {}", copied.join(" ")).trim().to_string();
+            pending = Some(Pending {
+                seq: s,
+                line: format!("{s:>7}  {spec:<80}{len:>6}{o:>13}{i:>8}")
+                    .trim_end()
+                    .to_string(),
+                keywords,
+                origin: None,
+            });
+            continue;
+        }
+        if name.is_empty() && !position.is_empty() {
+            // A constant: its length.
+            if let Some(p) = pending.take() {
+                flush(p, &mut out);
+            }
+            let kw = kw_of(line);
+            let len = kw
+                .strip_prefix('\'')
+                .and_then(|r| {
+                    r.rfind('\'')
+                        .map(|e| r[..e].replace("''", "'").chars().count())
+                })
+                .map(|n| n.to_string())
+                .unwrap_or_default();
+            let spec = blanked(line);
+            out.push(format!("{s:>7}  {spec:<80}{len:>6}").trim_end().to_string());
+            continue;
+        }
+        // A keyword line: the field's, or the record's.
+        match pending.as_mut() {
+            Some(p) => {
+                p.keywords = format!("{} {}", p.keywords, kw_of(line)).trim().to_string();
+            }
+            None => out.push(format!("{s:>7}  {}", blanked(line)).trim_end().to_string()),
+        }
+    }
+    if let Some(p) = pending.take() {
+        flush(p, &mut out);
     }
     out
 }
@@ -197,7 +661,8 @@ pub fn listing(
             .trim_end()
             .to_string()
     };
-    let mut sections: Vec<Vec<String>> = Vec::new();
+    // Sections, each with the lines repeated at the top of its pages.
+    let mut sections: Vec<(usize, Vec<String>)> = Vec::new();
     let mut first = vec![
         label(2, "File name", &input.name),
         label(4, "Library name", &input.library),
@@ -231,6 +696,10 @@ pub fn listing(
         label(2, "Text", &input.text),
         label(2, "Compiler", "as4tainr Data Description Processor"),
     ];
+    if input.display.is_some() {
+        // CRTDSPF's first page has no file type (w30_crtd).
+        first.retain(|l| !l.starts_with(" File type "));
+    }
     if source {
         first.push(format!("{:38}Data Description Source", ""));
         first.push(
@@ -256,7 +725,7 @@ pub fn listing(
             ""
         ));
     }
-    sections.push(first);
+    sections.push((0, first));
     if list {
         let errors: Vec<usize> = msgs.iter().map(|m| m.line).collect();
         let mut exp = vec![
@@ -264,12 +733,16 @@ pub fn listing(
             format!("{:90}Field       Buffer position", ""),
             " SEQNBR  *...+....1....+....2....+....3....+....4....+....5....+....6....+....7....+....8 length        Out     In".into(),
         ];
-        exp.extend(expanded(input, &errors));
+        match &input.display {
+            Some(d) => exp.extend(display_expanded(input, d)),
+            None => exp.extend(expanded(input, &errors)),
+        }
         exp.push(format!(
             "{:17}* * * * *   E N D   O F   E X P A N D E D   S O U R C E   * * * * *",
             ""
         ));
-        sections.push(exp);
+        // Its three heading lines start each of its pages (v29_crtp).
+        sections.push((3, exp));
     }
     let row = |id: &str, sev: u32, n: &str, text: &str| {
         format!(
@@ -307,7 +780,7 @@ pub fn listing(
                 &m.text,
             ));
         }
-        sections.push(page);
+        sections.push((0, page));
     }
     let count = |lo: u32, hi: u32| msgs.iter().filter(|m| (lo..=hi).contains(&m.sev)).count();
     let mut summary = vec![
@@ -330,13 +803,21 @@ pub fn listing(
         "{:25}* * * * *   E N D   O F   C O M P I L A T I O N   * * * * *",
         ""
     ));
-    sections.push(summary);
+    sections.push((0, summary));
     let mut out = Vec::new();
     let mut page = 0;
-    for section in sections {
-        for chunk in section.chunks(PAGE - 1) {
+    for (heads, section) in sections {
+        let (head, body) = section.split_at(heads);
+        if body.is_empty() {
             page += 1;
             out.push(header(page));
+            out.extend(head.iter().cloned());
+            continue;
+        }
+        for chunk in body.chunks(PAGE - heads) {
+            page += 1;
+            out.push(header(page));
+            out.extend(head.iter().cloned());
             out.extend(chunk.iter().cloned());
         }
     }
@@ -370,6 +851,177 @@ mod tests {
             text: String::new(),
             lines: lines.iter().map(|l| l.to_string()).collect(),
             physical: true,
+            display: None,
+            refs: None,
+        }
+    }
+
+    // PUB400 (IBM i 7.5) CRTPF listings, 2026-10-30, tools/golden/
+    // verify29.txt v29_crtr and v29_crtp: a field's keyword lines shown
+    // on its line, the default heading on a line of its own without a
+    // number when it has keywords; reference fields with where they came
+    // from, the keywords taken (a file field's TEXT padded to 50, '-' and
+    // '+' continuations), *SRC references, a TEXT made from a heading
+    // without a number; the file-level REF not shown; 50 lines a page,
+    // the expanded source's headings again on its next page.
+    #[test]
+    fn physical_file_reference_listing() {
+        let r_src = include_str!("../../tools/golden/verify29/gld29r.pf");
+        let p_src = include_str!("../../tools/golden/verify29/gld29p.pf");
+        let mut i = input(&r_src.lines().collect::<Vec<_>>());
+        i.name = "GLD29R".into();
+        let l = listing(
+            &i,
+            &[],
+            &[("CPC7301".into(), 0, "x".into())],
+            true,
+            &stamp(),
+        );
+        let e = l
+            .iter()
+            .position(|x| x.contains("Expanded Source"))
+            .unwrap();
+        assert_eq!(
+            &l[e + 3..e + 10],
+            [
+                "    200                  R GLD29RR",
+                "    300                    NAME          20A  B      TEXT('Name') COLHDG('Name')             20            1       1",
+                "    500                    AMOUNT         7P 2B      TEXT('Amount') EDTCDE(2)                 4           21      21",
+                "                                                     COLHDG('AMOUNT')",
+                "    700                    WHEN          10L  B      TEXT('When')                            10           25      25",
+                "                                                     COLHDG('WHEN')",
+                "                 * * * * *   E N D   O F   E X P A N D E D   S O U R C E   * * * * *",
+            ]
+        );
+        let pf = crate::dds::parse_pf("GLD29R", r_src).unwrap();
+        let mut files = std::collections::HashMap::new();
+        files.insert("GLD29R".to_string(), ("AS4TRAINR1".to_string(), pf));
+        let refs = crate::ddsref::expand(p_src, crate::ddsref::Kind::Database, &files).unwrap();
+        let mut i = input(&p_src.lines().collect::<Vec<_>>());
+        i.name = "GLD29P".into();
+        i.refs = Some(refs);
+        let l = listing(
+            &i,
+            &[],
+            &[("CPC7301".into(), 0, "x".into())],
+            true,
+            &stamp(),
+        );
+        let e = l
+            .iter()
+            .position(|x| x.contains("Expanded Source"))
+            .unwrap();
+        let want = [
+            "    300                  R GLD29PR",
+            "    400                    NAME          20A  B                                              20            1       1",
+            " * Referenced Field  . . . . . . . . . . . :   NAME",
+            " *   Format  . . . . . . . . . . . . . . . :   GLD29RR",
+            " *   File  . . . . . . . . . . . . . . . . :   GLD29R",
+            " *   Library . . . . . . . . . . . . . . . :   AS4TRAINR1",
+            "    400                                              TEXT('Name                         -",
+            "    400                                                                   ') +",
+            "    400                                              COLHDG('Name')",
+            "    500                    ADDR          20A  B                                              20           21      21",
+            " * Referenced Field  . . . . . . . . . . . :   NAME",
+            " *   Format  . . . . . . . . . . . . . . . :   GLD29RR",
+            " *   File  . . . . . . . . . . . . . . . . :   GLD29R",
+            " *   Library . . . . . . . . . . . . . . . :   AS4TRAINR1",
+            "    600                                              COLHDG('Address')",
+            "                                                     TEXT('Address')",
+            "    700                    CITY          20A  B                                              20           41      41",
+            " * Referenced Field  . . . . . . . . . . . :   ADDR",
+            " *   Format  . . . . . . . . . . . . . . . :   GLD29PR",
+            " *   File  . . . . . . . . . . . . . . . . :   *SRC",
+            " *   Library . . . . . . . . . . . . . . . :",
+            "    700                                              COLHDG('Address') TEXT('Address')",
+            "    800                    AMOUNT         7P 2B                                               4           61      61",
+        ];
+        assert_eq!(&l[e + 3..e + 3 + want.len()], want);
+        assert!(l.contains(
+            &"    800                                                                   ') EDTCDE(2) +".to_string()
+        ));
+        // The next page: the header, the three heading lines, then WHEN's
+        // reference.
+        let p3 = l.iter().position(|x| x.ends_with("Page    3")).unwrap();
+        assert_eq!(l[p3 - 1].trim_start(), "1100                    WHEN          10L  B                                              10           85      85");
+        assert!(l[p3 + 1].contains("Expanded Source"));
+        assert_eq!(
+            l[p3 + 4],
+            " * Referenced Field  . . . . . . . . . . . :   WHEN"
+        );
+    }
+
+    // PUB400 (IBM i 7.5) CRTDSPF listing, 2026-10-30,
+    // tools/golden/verify30.txt w30_crtd: the expanded source of a display
+    // file with reference fields (GLD30R's), its own fields, a constant,
+    // a hidden field; the first page without a file type.
+    #[test]
+    fn display_file_listing() {
+        let pf_src = include_str!("../../tools/golden/verify30/gld30r.pf");
+        let dspf_src = include_str!("../../tools/golden/verify30/gld30d.dspf");
+        let pf = crate::dds::parse_pf("GLD30R", pf_src).unwrap();
+        let mut files = std::collections::HashMap::new();
+        files.insert("GLD30R".to_string(), ("AS4TRAINR1".to_string(), pf));
+        let expanded =
+            crate::ddsref::expand(dspf_src, crate::ddsref::Kind::Device, &files).unwrap();
+        let mut i = input(&dspf_src.lines().collect::<Vec<_>>());
+        i.name = "GLD30D".into();
+        i.attribute = "Display".into();
+        i.replace = "*YES".into();
+        i.display = Some(expanded);
+        let l = listing(
+            &i,
+            &[],
+            &[("CPC7301".into(), 0, "x".into())],
+            true,
+            &stamp(),
+        );
+        assert!(!l.iter().any(|x| x.starts_with(" File type ")), "{l:#?}");
+        assert!(l.contains(
+            &" File attribute  . . . . . . . . . . . . . . . . . . :   Display".to_string()
+        ));
+        let start = l
+            .iter()
+            .position(|x| x.contains("Expanded Source"))
+            .unwrap();
+        let want = [
+            "                                          Expanded Source",
+            "                                                                                          Field       Buffer position",
+            " SEQNBR  *...+....1....+....2....+....3....+....4....+....5....+....6....+....7....+....8 length        Out     In",
+            "                                                     DSPSIZ(*DS3)",
+            "    300                  R GLD30A",
+            "    400                                          1  2'Header'                                 6",
+            "    500                    NAME          10A  B  3  2                                        10            1       1",
+            " * Referenced Field  . . . . . . . . . . . :   NAME",
+            " *   Format  . . . . . . . . . . . . . . . :   GLD30RR",
+            " *   File  . . . . . . . . . . . . . . . . :   GLD30R",
+            " *   Library . . . . . . . . . . . . . . . :   AS4TRAINR1",
+            "    500                                              TEXT('Name                         -",
+            "    500                                                                   ')",
+            "    600                    PK             5S 0O  4  2                                         5           11",
+            " * Referenced Field  . . . . . . . . . . . :   PK",
+            " *   Format  . . . . . . . . . . . . . . . :   GLD30RR",
+            " *   File  . . . . . . . . . . . . . . . . :   GLD30R",
+            " *   Library . . . . . . . . . . . . . . . :   AS4TRAINR1",
+            "    600                                              TEXT('Packed                       -",
+            "    600                                                                   ')",
+            "    700                    BIN            9S 0B  5  2                                         9           16      11",
+        ];
+        for (k, w) in want.iter().enumerate() {
+            assert_eq!(l[start + k], *w, "line {k}");
+        }
+        let rest = &l[start + want.len()..];
+        for w in [
+            "    800                    ZD             7S 2I  6  2                                         7                   20",
+            "    900                    OWNY           5Y 0B  7  2                                         5           25      27",
+            "   1000                    OWNA          10A  I  8  2                                        10                   32",
+            "   1100                    OWNS           3S 1O  9  2                                         3           30",
+            "   1200                  R GLD30B",
+            "   1300                    DT            10L  B  2  2                                        10            1       1",
+            "   1400                    HID           10A  H                                              10           11      11",
+            "                 * * * * *   E N D   O F   E X P A N D E D   S O U R C E   * * * * *",
+        ] {
+            assert!(rest.iter().any(|x| x == w), "{w}\n{rest:#?}");
         }
     }
 

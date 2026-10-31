@@ -1,0 +1,23 @@
+**FREE
+// verify32: the call stack as QSYS2.STACK_INFO('*') lists it, the
+// entries of programs in AS4TRAINR1, into AS4TRAINR1/GLD32OUT.
+ctl-opt dftactgrp(*no) actgrp(*caller);
+exec sql
+  INSERT INTO AS4TRAINR1.GLD32OUT
+    SELECT ORDINAL_POSITION, ENTRY_TYPE CONCAT ' ' CONCAT PROGRAM_NAME
+           CONCAT ' ' CONCAT COALESCE(MODULE_NAME, '-')
+           CONCAT ' ' CONCAT COALESCE(PROCEDURE_NAME, '-')
+           CONCAT ' ' CONCAT COALESCE(CONTROL_BOUNDARY, '-')
+           CONCAT ' ' CONCAT COALESCE(ACTIVATION_GROUP_NAME, '-')
+      FROM TABLE(QSYS2.STACK_INFO('*')) X
+     WHERE PROGRAM_LIBRARY_NAME = 'AS4TRAINR1';
+inner();
+*inlr = *on;
+
+dcl-proc inner;
+  exec sql
+    INSERT INTO AS4TRAINR1.GLD32OUT
+      SELECT 100 + ORDINAL_POSITION, COALESCE(PROCEDURE_NAME, '-')
+        FROM TABLE(QSYS2.STACK_INFO('*')) X
+       WHERE PROGRAM_LIBRARY_NAME = 'AS4TRAINR1';
+end-proc;

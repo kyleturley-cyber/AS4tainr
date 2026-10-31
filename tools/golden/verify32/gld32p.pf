@@ -1,0 +1,8 @@
+     A* verify32: reference fields with keywords of their own
+     A                                      REF(GLD32R)
+     A          R GLD32PR                   TEXT('Record text')
+     A            NAME      R               TEXT('Mine')
+     A            AMT       R               COLHDG('Amt')
+     A                                      EDTCDE(3)
+     A            NOTE          20A         TEXT('A note') COLHDG('Note' 'line two')
+     A                                      ALWNULL

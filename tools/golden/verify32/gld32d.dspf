@@ -1,0 +1,13 @@
+     A* verify32: display fields with keywords of their own, a *SRC
+     A* reference, a date constant, record keywords
+     A                                      REF(GLD32R)
+     A                                      INDARA
+     A          R GLD32A                    CA03(03 'Exit')
+     A                                  1  2'Title'
+     A                                      DSPATR(HI)
+     A            NAME      R        B  3  2COLOR(WHT)
+     A            OWN           10A  O  4  2TEXT('Own text') DSPATR(HI)
+     A            COPY      R        O  5  2REFFLD(OWN *SRC)
+     A            AMT       R        B  6  2EDTCDE(J)
+     A                                  7  2DATE
+     A                                      EDTCDE(Y)

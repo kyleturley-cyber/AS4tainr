@@ -1,0 +1,22 @@
+# Golden: QSYS2.STACK_INFO('*') from an SQLRPGLE program a CL program
+# calls (ordinal positions, entry types, procedures, control boundaries,
+# activation groups of AS4TRAINR1's entries; again from a subprocedure);
+# CRTPF and CRTDSPF listings of reference fields with keywords of their
+# own, a *SRC reference in a display file, record keywords, constants
+# with keywords, ALWNULL and a two-line heading.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify32.txt -Files tools\golden\verify32
+y32_cleanup|!for c in "DLTF FILE(AS4TRAINR1/GLD32D)" "DLTF FILE(AS4TRAINR1/GLD32P)" "DLTF FILE(AS4TRAINR1/GLD32R)" "DLTF FILE(AS4TRAINR1/GLD32X)" "DLTF FILE(AS4TRAINR1/GLD32OUT)" "DLTPGM PGM(AS4TRAINR1/GLD32S)" "DLTPGM PGM(AS4TRAINR1/GLD32C)"; do system -q "$c"; done; echo cleaned
+y32_tag|!for f in gld32r.pf gld32p.pf gld32d.dspf gld32s.sqlrpgle gld32c.clle; do setccsid 819 /home/AS4TRAINR/gld/$f; done; ls /home/AS4TRAINR/gld | grep gld32
+y32_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD32OUT (N INT, LINE VARCHAR(200))') COMMIT(*NONE)
+y32_crts|CRTSQLRPGI OBJ(AS4TRAINR1/GLD32S) SRCSTMF('/home/AS4TRAINR/gld/gld32s.sqlrpgle') COMMIT(*NONE)
+y32_crtc|CRTBNDCL PGM(AS4TRAINR1/GLD32C) SRCSTMF('/home/AS4TRAINR/gld/gld32c.clle')
+y32_call|!system "CALL PGM(AS4TRAINR1/GLD32C)"
+y32_rows|CPYF FROMFILE(AS4TRAINR1/GLD32OUT) TOFILE(*PRINT)
+y32_srcs|CRTSRCPF FILE(AS4TRAINR1/GLD32X) RCDLEN(112)
+y32_rmbr|CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld32r.pf') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD32X.FILE/GLD32R.MBR')
+y32_pmbr|CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld32p.pf') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD32X.FILE/GLD32P.MBR')
+y32_dmbr|CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld32d.dspf') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD32X.FILE/GLD32D.MBR')
+y32_crtr|CRTPF FILE(AS4TRAINR1/GLD32R) SRCFILE(AS4TRAINR1/GLD32X)
+y32_crtp|CRTPF FILE(AS4TRAINR1/GLD32P) SRCFILE(AS4TRAINR1/GLD32X)
+y32_crtd|CRTDSPF FILE(AS4TRAINR1/GLD32D) SRCFILE(AS4TRAINR1/GLD32X)
+y32_end|!for c in "DLTF FILE(AS4TRAINR1/GLD32D)" "DLTF FILE(AS4TRAINR1/GLD32P)" "DLTF FILE(AS4TRAINR1/GLD32R)" "DLTF FILE(AS4TRAINR1/GLD32X)" "DLTF FILE(AS4TRAINR1/GLD32OUT)" "DLTPGM PGM(AS4TRAINR1/GLD32S)" "DLTPGM PGM(AS4TRAINR1/GLD32C)"; do system -q "$c"; done; echo cleaned

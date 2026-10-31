@@ -1,0 +1,4 @@
+/* verify32: a CL program that calls GLD32S.                         */
+PGM
+CALL       PGM(AS4TRAINR1/GLD32S)
+ENDPGM

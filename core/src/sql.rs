@@ -2777,6 +2777,17 @@ impl Session {
         Ok(())
     }
 
+    /// The call stack QSYS2.STACK_INFO('*') lists for the statements (a
+    /// JSON array, oldest entry first): as4tainr.stack.
+    pub async fn set_stack(&self, json: &str) -> Result<()> {
+        let q = "SELECT set_config('as4tainr.stack', $1, false)";
+        self.client.execute(q, &[&json]).await?;
+        if let Some(d) = &self.cmt {
+            d.client.execute(q, &[&json]).await?;
+        }
+        Ok(())
+    }
+
     /// The program the statements run for: its name and library.
     pub async fn set_program(&mut self, name: &str, library: &str) -> Result<()> {
         self.client

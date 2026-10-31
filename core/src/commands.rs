@@ -3365,6 +3365,7 @@ impl Job<'_> {
                     crate::ddsref::Kind::Database,
                 )
                 .await;
+                let refs = expanded.as_ref().ok().cloned();
                 let parsed = expanded.and_then(|src| crate::dds::parse_pf(&name, &src));
                 let mut pf = match parsed {
                     Ok(pf) => pf,
@@ -3380,19 +3381,32 @@ impl Job<'_> {
                 }
                 if let Err(e) = catalog::create_physical_file(&mut c, &lib, &pf).await {
                     if !rcdlen {
-                        self.dds_listing(cmd, &m, &lib, &name, true, &[], &finals_of(&e), false)
-                            .await?;
+                        self.dds_listing_of(
+                            cmd,
+                            &m,
+                            &lib,
+                            &name,
+                            true,
+                            None,
+                            refs.clone(),
+                            &[],
+                            &finals_of(&e),
+                            false,
+                        )
+                        .await?;
                     }
                     return Err(e);
                 }
                 if !rcdlen {
                     let done = format!("File {name} was created in library {lib}.");
-                    self.dds_listing(
+                    self.dds_listing_of(
                         cmd,
                         &m,
                         &lib,
                         &name,
                         true,
+                        None,
+                        refs,
                         &[],
                         &[("CPC7301".into(), 0, done)],
                         true,
@@ -3465,14 +3479,44 @@ impl Job<'_> {
                     crate::ddsref::Kind::Device,
                 )
                 .await?;
-                if cmd.get("REPLACE") == "*NO" {
-                    catalog::create_display_file(&mut c, &lib, &name, &source).await?;
+                let made = if cmd.get("REPLACE") == "*NO" {
+                    catalog::create_display_file(&mut c, &lib, &name, &source).await
                 } else {
-                    catalog::replace_display_file(&mut c, &lib, &name, &source).await?;
+                    catalog::replace_display_file(&mut c, &lib, &name, &source).await
+                };
+                if let Err(e) = made {
+                    self.dds_listing_of(
+                        cmd,
+                        &m,
+                        &lib,
+                        &name,
+                        false,
+                        Some(source.clone()),
+                        None,
+                        &[],
+                        &finals_of(&e),
+                        false,
+                    )
+                    .await?;
+                    return Err(e);
                 }
                 // CPC7301, as for a physical file (PUB400 2026-10-30,
-                // verify29 v29_crtd).
-                format!("CPC7301: File {name} was created in library {lib}.")
+                // verify29 v29_crtd), and the DDS listing (w30_crtd).
+                let done = format!("File {name} was created in library {lib}.");
+                self.dds_listing_of(
+                    cmd,
+                    &m,
+                    &lib,
+                    &name,
+                    false,
+                    Some(source),
+                    None,
+                    &[],
+                    &[("CPC7301".into(), 0, done.clone())],
+                    true,
+                )
+                .await?;
+                format!("CPC7301: {done}")
             }
         };
         authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
@@ -3491,6 +3535,28 @@ impl Job<'_> {
         lib: &str,
         name: &str,
         physical: bool,
+        msgs: &[crate::ddslist::Msg],
+        finals: &[(String, u32, String)],
+        created: bool,
+    ) -> Result<()> {
+        self.dds_listing_of(
+            cmd, m, lib, name, physical, None, None, msgs, finals, created,
+        )
+        .await
+    }
+
+    /// The DDS listing of a physical, logical (`display` None) or display
+    /// file (`display`: its expanded source).
+    #[allow(clippy::too_many_arguments)]
+    async fn dds_listing_of(
+        &mut self,
+        cmd: &Command,
+        m: &crate::source::Member,
+        lib: &str,
+        name: &str,
+        physical: bool,
+        display: Option<String>,
+        refs: Option<String>,
         msgs: &[crate::ddslist::Msg],
         finals: &[(String, u32, String)],
         created: bool,
@@ -3539,7 +3605,14 @@ impl Job<'_> {
         let input = crate::ddslist::Input {
             name: name.to_string(),
             library: lib.to_string(),
-            attribute: if physical { "Physical" } else { "Logical" }.into(),
+            attribute: if display.is_some() {
+                "Display"
+            } else if physical {
+                "Physical"
+            } else {
+                "Logical"
+            }
+            .into(),
             srcfile: (m.library.clone(), m.file.clone()),
             member: m.name.clone(),
             changed: m.changed_us.map(stamp_of_us),
@@ -3548,10 +3621,18 @@ impl Job<'_> {
             flag: "00".into(),
             filetype: "*DATA".into(),
             aut: "*LIBCRTAUT".into(),
-            replace: "*NO".into(),
+            // CRTDSPF's REPLACE (default *YES: w30_crtd); CRTPF and
+            // CRTLF show *NO.
+            replace: if display.is_some() {
+                cmd.get("REPLACE").to_string()
+            } else {
+                "*NO".into()
+            },
             text,
             lines: m.source.lines().map(str::to_string).collect(),
             physical,
+            display,
+            refs,
         };
         let printed =
             crate::ddslist::listing(&input, msgs, finals, created, &crate::report::Stamp::now());
@@ -6962,6 +7043,14 @@ impl Job<'_> {
         let refobj = cmd.get("REFOBJ").to_ascii_uppercase();
         let users_given = cmd.list("USER");
         if grant && !refobj.is_empty() && refobj != "*NONE" {
+            // REPLACE goes with USER, not with REFOBJ (CPD2215 on IBM i
+            // 7.5, PUB400 2026-10-31, tools/golden/verify31.txt x31_ref).
+            if !cmd.get("REPLACE").is_empty() {
+                bail!(
+                    "CPD2215: REPLACE is not allowed together with REFOBJ or AUTL.\n{}",
+                    crate::cl::CPF0006
+                );
+            }
             let reftype = match cmd.get("REFOBJTYPE").to_ascii_uppercase().as_str() {
                 "" | "*OBJTYPE" => objtype.clone(),
                 t => t.to_string(),
@@ -7002,7 +7091,7 @@ impl Job<'_> {
                 authority::grant(self.client, &lib, &name, &objtype, &u, aut).await?;
             }
             return Ok(Outcome::Messages(vec![format!(
-                "Authorities of {}/{rname} {reftype} given to {}/{name} {objtype}.",
+                "CPC2201: Authorities of {}/{rname} {reftype} given to {}/{name} {objtype}.",
                 crate::qtemp::logical(&rlib),
                 crate::qtemp::logical(&lib)
             )]));
@@ -7030,10 +7119,7 @@ impl Job<'_> {
                     )
                 };
                 authority::grant(self.client, &lib, &name, &objtype, &user, aut).await?;
-                done.push(format!(
-                    "{user} has authority {} to {lib}/{name} {objtype}.",
-                    aut.code()
-                ));
+                done.push(format!("{user} has authority {}", aut.code()));
             } else {
                 authority::revoke(self.client, &lib, &name, &objtype, &user).await?;
                 done.push(if user == "*PUBLIC" {
@@ -7042,6 +7128,14 @@ impl Job<'_> {
                     format!("Private authority of {user} to {lib}/{name} {objtype} revoked.")
                 });
             }
+        }
+        // GRTOBJAUT: one completion message, CPC2201 (PUB400 2026-10-31,
+        // verify31 x31_grt1).
+        if grant {
+            return Ok(Outcome::Messages(vec![format!(
+                "CPC2201: {} to {lib}/{name} {objtype}.",
+                done.join(", ")
+            )]));
         }
         Ok(Outcome::Messages(done))
     }
@@ -7097,6 +7191,7 @@ impl Job<'_> {
             rows.push(format!("{u:<10}  {}", aut.code()));
         }
         rows.push(format!("{:<10}  {}", "*PUBLIC", a.public.code()));
+        let print = objaut_print(&lib, &name, &objtype, &a);
         Ok(Outcome::Display(ListDisplay {
             title: "Display Object Authority".into(),
             info: vec![
@@ -7107,6 +7202,7 @@ impl Job<'_> {
             ],
             heading: format!("{:<10}  {}", "User", "Authority"),
             rows,
+            print,
             ..Default::default()
         }))
     }
@@ -8184,8 +8280,10 @@ impl Job<'_> {
         .await?;
         let name = name.to_ascii_uppercase();
         authority::set_owner(self.client, &lib, &name, "*DTAQ", &self.user).await?;
+        // CPC9801 (PUB400 2026-10-31, tools/golden/verify31.txt x31_dtq).
         Ok(Outcome::Messages(vec![format!(
-            "Data queue {name} was created in library {lib}."
+            "CPC9801: Object {name} of type *DTAQ was created in library {}.",
+            crate::qtemp::logical(&lib)
         )]))
     }
 
@@ -8503,6 +8601,106 @@ impl Job<'_> {
         Ok(Outcome::Messages(msgs))
     }
 }
+/// DSPOBJAUT's printed report, as IBM i 7.5 prints it (PUB400
+/// 2026-10-22 and 2026-10-31, tools/golden/messages.txt a_dspobjaut,
+/// verify31.txt x31_aut2, x31_aut3): the object, owner, primary group,
+/// type, ASP device, authorization list; then *PUBLIC, the owner and the
+/// private authorities, each with its system-defined authority and an X
+/// under each object and data authority it holds.
+fn objaut_print(
+    lib: &str,
+    name: &str,
+    objtype: &str,
+    a: &authority::ObjectAuthority,
+) -> Vec<String> {
+    use crate::report::at;
+    let [h1, h2] = crate::report::header_b(
+        47,
+        "Display Object Authority",
+        &crate::report::system_name(),
+        &crate::report::Stamp::now(),
+        1,
+    );
+    let lib = crate::qtemp::logical(lib);
+    let mut out = vec![
+        h1,
+        h2,
+        at(&[
+            (2, "Object . . . . . . . :"),
+            (27, name),
+            (69, "Owner  . . . . . . . :"),
+            (94, &a.owner),
+        ]),
+        at(&[
+            (4, "Library  . . . . . :"),
+            (29, &lib),
+            (69, "Primary group  . . . :"),
+            (94, "*NONE"),
+        ]),
+        at(&[
+            (2, "Object type  . . . . :"),
+            (27, objtype),
+            (69, "ASP device . . . . . :"),
+            (94, "*SYSBAS"),
+        ]),
+        at(&[
+            (
+                2,
+                "Object secured by authorization list  . . . . . . . . . . . . :",
+            ),
+            (68, "*NONE"),
+        ]),
+        at(&[
+            (31, "Object"),
+            (43, "--------------Object---------------"),
+            (82, "-------------------Data-------------------"),
+        ]),
+        at(&[
+            (2, "User"),
+            (16, "Group"),
+            (30, "Authority"),
+            (43, "Opr"),
+            (50, "Mgt"),
+            (57, "Exist"),
+            (66, "Alter"),
+            (75, "Ref"),
+            (82, "Read"),
+            (90, "Add"),
+            (97, "Update"),
+            (107, "Delete"),
+            (117, "Execute"),
+        ]),
+    ];
+    // Opr, Mgt, Exist, Alter, Ref, Read, Add, Update, Delete, Execute.
+    const COLS: [usize; 10] = [44, 51, 59, 68, 76, 83, 91, 99, 109, 120];
+    let line = |user: &str, aut: Aut| {
+        let held: [bool; 10] = match aut {
+            Aut::All => [true; 10],
+            Aut::Change => [
+                true, false, false, false, false, true, true, true, true, true,
+            ],
+            Aut::Use => [
+                true, false, false, false, false, true, false, false, false, true,
+            ],
+            Aut::Exclude => [false; 10],
+        };
+        let mut f: Vec<(usize, &str)> = vec![(2, user), (30, aut.code())];
+        for (c, h) in COLS.iter().zip(held) {
+            if h {
+                f.push((*c, "X"));
+            }
+        }
+        at(&f)
+    };
+    out.push(line("*PUBLIC", a.public));
+    out.push(line(&a.owner, Aut::All));
+    for (u, x) in &a.private {
+        out.push(line(u, *x));
+    }
+    out.push(crate::report::END_OBJD.into());
+    out
+}
+
 /// A line of texts at screen columns, shown from column 2.
 fn wrk_cols(fields: &[(usize, &str)]) -> String {
     let shifted: Vec<(usize, &str)> = fields.iter().map(|(c, t)| (c - 1, *t)).collect();

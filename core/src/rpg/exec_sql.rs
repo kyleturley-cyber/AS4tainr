@@ -878,6 +878,23 @@ impl Machine<'_> {
     }
 
     fn sql_statement(&mut self, sql: &str) -> Result<Outcome> {
+        // QSYS2.STACK_INFO('*'): the job's call stack as it is now.
+        if sql.to_ascii_uppercase().contains("STACK_INFO") {
+            let entries: Vec<serde_json::Value> = crate::pgmmsg::stack_listed(&self.io.job_key)
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "pgm": e.pgm, "lib": e.lib, "module": e.module,
+                        "proc": e.proc, "actgrp": e.actgrp, "line": e.line,
+                    })
+                })
+                .collect();
+            let json = serde_json::Value::Array(entries).to_string();
+            let rt = self.io.rt.clone();
+            self.session()?;
+            let session = self.sql.session.as_ref().expect("opened above");
+            rt.block_on(session.set_stack(&json))?;
+        }
         let w = words(sql);
         let first = w.first().map(String::as_str).unwrap_or("");
         let second = w.get(1).map(String::as_str).unwrap_or("");

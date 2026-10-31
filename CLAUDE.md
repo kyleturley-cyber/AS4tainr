@@ -18,7 +18,8 @@ An IBM i-compatible runtime for containers. It reimplements IBM i interfaces (ob
 
 | Path | What |
 | --- | --- |
-| `core/src/dds.rs` | DDS parser: physical files (R, K lines with `DESCEND`, fields A/P/S/B/L/T/Z, `UNIQUE`, `TEXT`, `VARLEN`, `ALWNULL`, `DFT`) and logical files (`PFILE`, field subsets, keys, select/omit); a field's PostgreSQL type, default and external text form |
+| `core/src/dds.rs` | DDS parser: physical files (R, K lines with `DESCEND`, fields A/P/S/B/L/T/Z, `UNIQUE`, `TEXT`, `VARLEN`, `ALWNULL`, `DFT`) and logical files (`PFILE`, field subsets, RENAME/CONCAT/SST and field attributes, keys, select/omit, `DYNSLT`); a field's PostgreSQL type, default and external text form |
+| `core/src/lfmap.rs` | A logical file's fields over its physical file (RENAME, CONCAT, SST, length, type, decimal positions and usage of their own): expressions for its view and access path, and the INSTEAD OF trigger that writes records through it to the physical file |
 | `core/src/ddl.rs` | SQL data definition (CREATE SCHEMA/TABLE/INDEX/VIEW/TRIGGER, ALTER TABLE, DROP, LABEL ON, GRANT, SET SCHEMA) parsed into file descriptions, never passed on (a view's query is translated and defined by the restricted SQL login, `sql::create_view`); system names for long SQL names; RUNSQLSTM's statement splitting |
 | `core/src/ile.rs` | ILE objects: modules, service programs, binding directories (`as4tainr.modules`, `as4tainr.service_programs`, `as4tainr.bnddir_entries`), the binder (imports, exports, binder language, signatures), service program activations per job |
 | `core/src/catalog.rs` | Libraries = PostgreSQL schemas; file descriptions in schema `as4tainr`; library list resolution |

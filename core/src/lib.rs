@@ -48,6 +48,7 @@ pub mod jobd;
 pub mod joblog;
 pub mod jobs;
 pub mod journal;
+pub mod lfmap;
 pub mod menus;
 pub mod msgf;
 pub mod objdesc;

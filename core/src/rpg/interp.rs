@@ -4116,12 +4116,13 @@ impl<'a> Machine<'a> {
                         // Where the error happened, for its exception
                         // message's sender (shown as "line N").
                         None => {
-                            let sender = errors::origin(&err)
-                                .map(|a| a.sender)
-                                .unwrap_or_else(|| self.sender());
+                            let first = errors::origin(&err);
+                            let called = first.as_ref().is_some_and(|a| a.called);
+                            let sender = first.map(|a| a.sender).unwrap_or_else(|| self.sender());
                             return Err(err.context(errors::At {
                                 line: i.line,
                                 sender,
+                                called,
                             }));
                         }
                     }
@@ -6433,7 +6434,14 @@ impl<'a> Machine<'a> {
         // Where this entry is, for the call stack (QWVRCSTK).
         crate::pgmmsg::stack_line(&self.io.job_key, self.line);
         let mark = self.temp_strings.len();
-        let r = self.call_named_inner(name, args);
+        // An error the called procedure did not handle comes out of the
+        // call: 00202 here (errors::status_code).
+        let r = self.call_named_inner(name, args).map_err(|mut e| {
+            if let Some(a) = e.downcast_mut::<errors::At>() {
+                a.called = true;
+            }
+            e
+        });
         // The OPTIONS(*STRING) copies last as long as the call.
         for h in self.temp_strings.split_off(mark) {
             if let (Some(f), Some(b)) = (

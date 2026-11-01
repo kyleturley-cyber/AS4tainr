@@ -6332,7 +6332,7 @@ async fn rpg_pssr_infsr_and_return_points() {
     // point field is blank after ENDSR. In a subprocedure, RETURN in
     // *PSSR gives the procedure's value; ENDSR without RETURN makes the
     // procedure fail (ILE RPG Programmer's Guide, "Using a Program Error
-    // Subroutine"). CALLP(E): %ERROR on, %STATUS the error's status.
+    // Subroutine"). CALLP(E): %ERROR on, %STATUS 00202 (the procedure failed).
     let url = require_db!();
     let (_client, lib) = setup(&url).await;
     let run = |name: &'static str, src: &'static str| {
@@ -6350,9 +6350,15 @@ async fn rpg_pssr_infsr_and_return_points() {
     assert_eq!(r.messages, ["1", "2", "3", "4", "skip", "*GETIN"]);
     let r = run("PSSRPROC", include_str!("rpg/pssrproc.rpgle")).await;
     assert!(r.error.is_none(), "{:?}", r.error);
+    // CALLP(E) of a procedure that failed: status 00202, "called program
+    // or procedure failed" (ILE RPG Reference, "Program Status Codes"),
+    // not the 00102 of the divide by zero inside it: PUB400 2026-11-01,
+    // verify33 z33_rows, gives a MONITOR around a call of a procedure
+    // that failed 00202 (this expected 00102 before that capture;
+    // verify34 a34_rows checks CALLP(E) itself).
     assert_eq!(
         r.messages,
-        ["-1", "2", "in pssr", "fails failed", "in pssr", "1 102"]
+        ["-1", "2", "in pssr", "fails failed", "in pssr", "1 202"]
     );
     // ENDSR *CANCL ends the program; ENDSR without a return point after an
     // error: the default error handler (the program ends abnormally).
@@ -22186,4 +22192,76 @@ end-proc;
         .collect();
     assert!(n[..4].windows(2).all(|w| w[0] == w[1] + 1), "{n:?}");
     assert!(n[4..].windows(2).all(|w| w[0] == w[1] + 1), "{n:?}");
+}
+
+/// %STATUS and the PSDS where MONITOR catches an error: 00102 for a
+/// divide by zero in the monitoring procedure, 00202 ("called program or
+/// procedure failed") for one in a procedure it called, through a
+/// prototype or a procedure pointer, the exception ID MCH1211 either way
+/// (PUB400 2026-11-01, verify33 z33_rows).
+#[tokio::test]
+async fn status_of_an_error_in_a_called_procedure() {
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = "**FREE
+dcl-ds psds psds qualified;
+  status zoned(5) pos(11);
+  exceptionId char(7) pos(40);
+end-ds;
+dcl-pr byPtr int(10) extproc(ptr);
+  d int(10) value;
+end-pr;
+dcl-s ptr pointer(*proc);
+dcl-s z int(10) inz(0);
+dcl-s r int(10);
+monitor;
+  r = 10 / z;
+on-error;
+  note('here');
+endmon;
+monitor;
+  r = local(0);
+on-error;
+  note('called');
+endmon;
+ptr = %paddr(local);
+monitor;
+  r = byPtr(0);
+on-error;
+  note('pointer');
+endmon;
+monitor;
+  r = local(0);
+on-error 102;
+  note('102');
+on-error 202;
+  note('202');
+endmon;
+*inlr = *on;
+dcl-proc local;
+  dcl-pi *n int(10);
+    d int(10) value;
+  end-pi;
+  return 10 / d;
+end-proc;
+dcl-proc note;
+  dcl-pi *n;
+    what varchar(10) const;
+  end-pi;
+  dsply (what + ' ' + %char(%status()) + ' ' + %char(psds.status) + ' ' + psds.exceptionId);
+end-proc;
+";
+    let r = run_rpg(&url, &lib, "QSECOFR", "STAT202", src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "here 102 102 MCH1211",
+            "called 202 202 MCH1211",
+            "pointer 202 202 MCH1211",
+            "202 202 202 MCH1211"
+        ],
+        "{:?}",
+        r.messages
+    );
 }

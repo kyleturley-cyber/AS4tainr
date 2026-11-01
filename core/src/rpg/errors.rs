@@ -27,6 +27,9 @@ const MAX_HANDLER_DEPTH: u32 = 20;
 pub struct At {
     pub line: usize,
     pub sender: crate::pgmmsg::Sender,
+    /// It came out of a procedure called here (`call_named`), now or in
+    /// a procedure it passed on the way: status 00202 where it is caught.
+    pub called: bool,
 }
 
 impl std::fmt::Display for At {
@@ -61,6 +64,16 @@ pub(super) fn message_id(err: &anyhow::Error) -> String {
 /// Codes" and "File Status Codes"). Program status codes are 00100-00999,
 /// file status codes 01000-09999 (ON-ERROR *PROGRAM and *FILE).
 pub(super) fn status_code(err: &anyhow::Error) -> u32 {
+    // An error that came out of a procedure this one called (it carries
+    // where it happened there): 00202, "called program or procedure
+    // failed", whatever it was there; its exception ID stays (PUB400
+    // 2026-11-01, verify33 z33_rows: a divide by zero in a subprocedure,
+    // a service program's procedure called by prototype and through a
+    // procedure pointer is status 202 with MCH1211 in the caller's
+    // MONITOR, 102 where it happened).
+    if origin(err).is_some_and(|a| a.called) {
+        return 202;
+    }
     let text = err.root_cause().to_string();
     // A called program that ended in error: 00202.
     if text.trim_end().ends_with("ended abnormally.") {

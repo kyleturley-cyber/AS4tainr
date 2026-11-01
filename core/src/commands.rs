@@ -2429,8 +2429,9 @@ impl Job<'_> {
         let (lib, name) = (lib.to_ascii_uppercase(), name.to_ascii_uppercase());
         crate::ile::create_bnddir(self.client, &lib, &name, cmd.get("TEXT")).await?;
         authority::set_owner(self.client, &lib, &name, "*BNDDIR", &self.user).await?;
+        // CPC5D02 (PUB400 2026-11-01, verify33 z33_crtb).
         Ok(Outcome::Messages(vec![format!(
-            "Binding directory {name} created in library {lib}."
+            "CPC5D02: Binding directory {name} is now in library {lib}."
         )]))
     }
 
@@ -2494,8 +2495,11 @@ impl Job<'_> {
                 }
             }
             let n = crate::ile::add_bnddir_entries(self.client, &lib, &dir, &rows).await?;
+            // CPC5D05 with the entries added and those not added (PUB400
+            // 2026-11-01, verify33 z33_adde).
+            let not = rows.len().saturating_sub(n);
             Ok(Outcome::Messages(vec![format!(
-                "{n} entries added to binding directory {dir} in {lib}."
+                "CPC5D05: Binding directory {dir} in library {lib}: {n} entries added, {not} not added."
             )]))
         } else {
             let n = crate::ile::remove_bnddir_entries(self.client, &lib, &dir, &entries).await?;

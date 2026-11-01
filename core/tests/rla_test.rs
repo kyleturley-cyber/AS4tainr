@@ -3496,6 +3496,63 @@ async fn submitted_jobs_run_in_qbatch() {
         d.rows
     );
 
+    // A batch job's CL program: what it sends to its own queue is in the
+    // job log (IBM i: a job log holds the messages sent to the job's
+    // program message queues), in the order sent, before the request's
+    // own messages; DSPJOBLOG with OUTPUT(*) prints in a batch job (CL
+    // reference, DSPJOBLOG OUTPUT: printed with a batch job's spooled
+    // output), with what was sent so far. IUNIT's I_RUNALL does both.
+    let src = "PGM
+  SNDPGMMSG MSG('first') TOPGMQ(*SAME)
+  SNDPGMMSG MSG('second') TOPGMQ(*SAME)
+  DSPJOBLOG
+  SNDPGMMSG MSG('done') TOPGMQ(*PRV) MSGTYPE(*COMP)
+ENDPGM";
+    as4tainr_core::clpgm::compile_in(&client, std::slice::from_ref(&lib), "BLOG", src)
+        .await
+        .unwrap();
+    let mut c = runtime::connect_db(&url).await.unwrap();
+    catalog::create_cl_program(&mut c, &lib, "BLOG", "", src, true)
+        .await
+        .unwrap();
+    let m = msg(job
+        .run(&format!("SBMJOB CMD(CALL {lib}/BLOG) JOB(BLOG)"))
+        .await
+        .unwrap());
+    let n4 = number_in(&m);
+    let done = run(n4).await;
+    assert_eq!(done.end_code, "NORMAL");
+    let texts: Vec<String> = jobs::job_log(&client, n4)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.text)
+        .collect();
+    let at = |t: &str| texts.iter().position(|x| x == t);
+    assert!(at("first") < at("second"), "{texts:?}");
+    assert!(at("second") < at("done"), "{texts:?}");
+    assert_eq!(
+        texts.iter().filter(|t| *t == "done").count(),
+        1,
+        "{texts:?}"
+    );
+    let printed: Vec<String> = client
+        .query(
+            "SELECT l.text FROM as4tainr.spool_lines l JOIN as4tainr.spooled_files f ON f.id = l.spl
+              WHERE f.job = $1 AND f.file = 'QPJOBLOG' ORDER BY l.seq",
+            &[&n4],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let joined = printed.join("\n");
+    assert!(
+        joined.contains("second") && !joined.contains("done"),
+        "{joined}"
+    );
+
     // WRKACTJOB shows this interactive job under QINTER.
     let Outcome::Display(d) = job.run("WRKACTJOB").await.unwrap() else {
         panic!()
@@ -15228,6 +15285,7 @@ end-pr;
 dcl-s stmt varchar(200);
 dcl-s n int(10);
 dcl-s line varchar(80);
+dcl-s ts timestamp;
 stmt = 'CREATE ALIAS {lib}.NOTEAL FOR {lib}.NOTES (N1)';
 exec sql prepare s1 from :stmt;
 exec sql execute s1;
@@ -15237,6 +15295,19 @@ qcmdexc('OVRDBF FILE(MYNOTES) TOFILE({lib}/NOTES) MBR(N1)': 200);
 exec sql select count(*), max(srcdta) into :n, :line from mynotes;
 show(n);
 dsply line;
+// A timestamp host variable is a TIMESTAMP value (Db2 for i SQL
+// Programming, "Host variables in ILE RPG": Z is TIMESTAMP), also given
+// to a parameter marker of EXECUTE USING (the IBM i Unit test runner's
+// insert of each result's start time).
+stmt = 'CREATE TABLE {lib}.TSTAMPS (T TIMESTAMP NOT NULL)';
+exec sql execute immediate :stmt;
+ts = z'2026-10-31-20.43.10.123456';
+stmt = 'INSERT INTO {lib}.TSTAMPS VALUES (?)';
+exec sql prepare s2 from :stmt;
+exec sql execute s2 using :ts;
+exec sql insert into {lib}.tstamps values (:ts + 1 day);
+exec sql select count(*), max(t) into :n, :ts from {lib}.tstamps where t >= :ts;
+dsply ('ts=' + %char(n) + ' ' + %char(ts));
 *inlr = *on;
 dcl-proc show;
   dcl-pi *n;
@@ -15272,6 +15343,7 @@ end-proc;
         text.contains("n=1") && text.contains("first note"),
         "{text}"
     );
+    assert!(text.contains("ts=2 2026-11-01-20.43.10.123456"), "{text}");
 }
 
 /// SYSTOOLS.SPOOLED_FILE_DATA (Db2 for i services): the lines of a job's

@@ -797,6 +797,7 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
         id: Some(id.clone()),
         calls: Default::default(),
     };
+    job.calls.batch = true;
     let first = info
         .command
         .split_whitespace()
@@ -807,9 +808,23 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
     // The job's own QTEMP, deleted when it ends.
     let key = id.to_string();
     let user = job.user.clone();
-    let normal = match crate::qtemp::scope(&client, &key, &user, job.run(&info.command)).await {
+    let outcome = crate::qtemp::scope(&client, &key, &user, job.run(&info.command)).await;
+    // What the job's programs left on their message queues is in its job
+    // log too, in the order sent (CL programs' SNDPGMMSG to *SAME, the
+    // commands they ran): IUNIT's I_RUNALL logs each test that way. The
+    // request's own messages that are among them are not logged twice.
+    job.flush_log().await;
+    let mut already: Vec<String> = std::mem::take(&mut job.calls.flushed_lines);
+    let mut first_time = |line: &str| match already.iter().position(|a| a == line.trim_end()) {
+        Some(i) => {
+            already.remove(i);
+            false
+        }
+        None => true,
+    };
+    let normal = match outcome {
         Ok(crate::commands::Outcome::Messages(m)) => {
-            for line in m {
+            for line in m.into_iter().filter(|l| first_time(l)) {
                 log(
                     &client,
                     &id,
@@ -828,18 +843,7 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
             // A display command in batch prints what it would show, as on
             // IBM i (spooled file QSYSPRT).
             // Commands with IBM's report layout print it (report.rs).
-            let lines = if d.print.is_empty() {
-                let mut lines = vec![d.title.clone(), String::new()];
-                lines.extend(d.info.iter().map(|(k, v)| format!("{k}: {v}")));
-                if !d.info.is_empty() {
-                    lines.push(String::new());
-                }
-                lines.push(d.heading.clone());
-                lines.extend(d.rows.iter().cloned());
-                lines
-            } else {
-                d.print.clone()
-            };
+            let lines = printed_display(&d);
             // The command's own printer file (report.rs printer_file;
             // verify9 d9_prt_rows).
             let file = crate::report::printer_file(first.as_str());
@@ -867,7 +871,7 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
             false
         }
         Err(e) => {
-            for line in format!("{e:#}").lines() {
+            for line in format!("{e:#}").lines().filter(|l| first_time(l)) {
                 log(&client, &id, "*ESCAPE", line).await;
             }
             false
@@ -929,6 +933,23 @@ pub async fn run_subsystem(env: crate::commands::Environment, max_active: usize)
             }
         }
     }
+}
+
+/// What a display command prints in a batch job instead of showing it:
+/// its report in IBM's layout when it has one, otherwise the display's
+/// title, information and rows.
+pub(crate) fn printed_display(d: &crate::commands::ListDisplay) -> Vec<String> {
+    if !d.print.is_empty() {
+        return d.print.clone();
+    }
+    let mut lines = vec![d.title.clone(), String::new()];
+    lines.extend(d.info.iter().map(|(k, v)| format!("{k}: {v}")));
+    if !d.info.is_empty() {
+        lines.push(String::new());
+    }
+    lines.push(d.heading.clone());
+    lines.extend(d.rows.iter().cloned());
+    lines
 }
 
 #[cfg(test)]

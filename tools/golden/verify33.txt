@@ -1,0 +1,16 @@
+# Golden: what a MONITOR sees of a divide by zero (%STATUS, the PSDS
+# status and exception ID) when it happens in the monitoring procedure,
+# in a subprocedure, in a service program's procedure called by
+# prototype and through a procedure pointer (the IBM i Unit test runner reports a test's runtime error with them).
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify33.txt -Files tools\golden\verify33
+z33_cleanup|!for c in "DLTF FILE(AS4TRAINR1/GLD33OUT)" "DLTPGM PGM(AS4TRAINR1/GLD33S)" "DLTSRVPGM SRVPGM(AS4TRAINR1/GLD33V)" "DLTMOD MODULE(AS4TRAINR1/GLD33V)" "DLTBNDDIR BNDDIR(AS4TRAINR1/GLD33B)"; do system -q "$c"; done; echo cleaned
+z33_tag|!for f in gld33v.rpgle gld33s.sqlrpgle; do setccsid 819 /home/AS4TRAINR/gld/$f; done; ls /home/AS4TRAINR/gld | grep gld33
+z33_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD33OUT (N INT, LINE VARCHAR(200))') COMMIT(*NONE)
+z33_crtm|CRTRPGMOD MODULE(AS4TRAINR1/GLD33V) SRCSTMF('/home/AS4TRAINR/gld/gld33v.rpgle')
+z33_crtv|CRTSRVPGM SRVPGM(AS4TRAINR1/GLD33V) MODULE(AS4TRAINR1/GLD33V) EXPORT(*ALL)
+z33_crtb|CRTBNDDIR BNDDIR(AS4TRAINR1/GLD33B)
+z33_adde|ADDBNDDIRE BNDDIR(AS4TRAINR1/GLD33B) OBJ((AS4TRAINR1/GLD33V *SRVPGM))
+z33_crts|CRTSQLRPGI OBJ(AS4TRAINR1/GLD33S) SRCSTMF('/home/AS4TRAINR/gld/gld33s.sqlrpgle') COMMIT(*NONE)
+z33_call|!system "CALL PGM(AS4TRAINR1/GLD33S)"
+z33_rows|CPYF FROMFILE(AS4TRAINR1/GLD33OUT) TOFILE(*PRINT)
+z33_end|!for c in "DLTF FILE(AS4TRAINR1/GLD33OUT)" "DLTPGM PGM(AS4TRAINR1/GLD33S)" "DLTSRVPGM SRVPGM(AS4TRAINR1/GLD33V)" "DLTMOD MODULE(AS4TRAINR1/GLD33V)" "DLTBNDDIR BNDDIR(AS4TRAINR1/GLD33B)"; do system -q "$c"; done; echo cleaned

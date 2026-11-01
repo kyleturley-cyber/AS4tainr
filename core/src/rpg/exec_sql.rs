@@ -674,6 +674,15 @@ impl Machine<'_> {
                 {
                     parts.push(format!("CAST({} AS char({n}))", literal(&v)?))
                 }
+                // A timestamp host variable is a TIMESTAMP value (Db2 for
+                // i SQL Programming, "Host variables in ILE RPG": Z maps
+                // to TIMESTAMP), whatever form its text has
+                // ('2026-10-31-20.43.10.123456'): the IBM i Unit test
+                // runner inserts one into a TIMESTAMP column.
+                (Some(super::data::DType::Timestamp(_)), Value::Char(c)) => {
+                    let t = iso_timestamp(a(c).replace('\0', "").trim());
+                    parts.push(format!("CAST('{}' AS timestamp)", t.replace('\'', "''")))
+                }
                 _ => parts.push(literal(&v)?),
             }
         }
@@ -1534,6 +1543,26 @@ impl Machine<'_> {
         }
         Ok(out)
     }
+}
+
+/// An RPG timestamp's text ('2026-10-23-13.38.38.840000') in the form
+/// PostgreSQL reads ('2026-10-23 13:38:38.840000'); other text as it is.
+fn iso_timestamp(t: &str) -> String {
+    let b = t.as_bytes();
+    let db2 = b.len() >= 19
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'-'
+        && b[13] == b'.'
+        && b[16] == b'.'
+        && t[..19]
+            .chars()
+            .enumerate()
+            .all(|(i, c)| [4, 7, 10, 13, 16].contains(&i) || c.is_ascii_digit());
+    if !db2 {
+        return t.to_string();
+    }
+    format!("{} {}{}", &t[..10], t[11..19].replace('.', ":"), &t[19..])
 }
 
 /// A timestamp as PostgreSQL gives it ('2026-10-23 13:38:38.84'), in the

@@ -6302,7 +6302,14 @@ impl Job<'_> {
             return Ok(Outcome::Messages(vec![]));
         }
         let job = self.job_named(cmd.get("JOB")).await?;
-        if cmd.get("OUTPUT") == "*PRINT" {
+        // OUTPUT(*) in a batch job prints (CL reference, DSPJOBLOG OUTPUT:
+        // shown for an interactive job, printed with a batch job's spooled
+        // output): IUNIT's I_RUNALL ends with DSPJOBLOG.
+        let batch = self.calls.batch && matches!(cmd.get("OUTPUT"), "*" | "");
+        if cmd.get("OUTPUT") == "*PRINT" || batch {
+            if job.id == *self.id.as_ref().unwrap_or(&job.id) {
+                self.flush_log().await;
+            }
             let me = self
                 .id
                 .clone()
@@ -6463,6 +6470,28 @@ impl Job<'_> {
             "Job {number}/QUSER/QP0ZSPWT began running in subsystem QUSRWRK in QSYS on {} at {}; it came into the system on {} at {}.",
             started.date, started.time, started.date, started.time
         )
+    }
+
+    /// A batch job's programs' messages (`CallStack::logged`) written to
+    /// its job log in the catalog, those not written yet: when its request
+    /// ends (jobs.rs `run_batch_job`) and before DSPJOBLOG prints it.
+    pub async fn flush_log(&mut self) {
+        let Some(id) = self.id.clone() else {
+            return;
+        };
+        for m in self.calls.logged() {
+            if m.ty == "*RQS" || self.calls.flushed.contains(&m.key) {
+                continue;
+            }
+            let line = if m.msgid.is_empty() {
+                m.text.clone()
+            } else {
+                format!("{}: {}", m.msgid, m.text)
+            };
+            jobs::log(self.client, &id, &m.ty, &line).await;
+            self.calls.flushed.push(m.key);
+            self.calls.flushed_lines.push(line.trim_end().to_string());
+        }
     }
 
     fn system_job_log(&self) -> Vec<String> {

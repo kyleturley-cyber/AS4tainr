@@ -38,9 +38,19 @@
 # - IBM i Packager (JDubbTX, Apache-2.0): imported; its unit tests
 #   (pkgtest.test.sqlrpgle: PACK and UNPACK of a test library) made with
 #   RUCRTRPG as its Makefile's test target does and run with RUCALLTST.
+# - IUNIT (i-unit/iunit, MIT): its build.sh's steps (source files and
+#   members from the clone, CRTBNDCL and CALL of its I_BUILD), then its
+#   README's tests RUNONE IUNIT PASS and RUNALL IUNIT in batch jobs (FAIL
+#   is its example of a failing test: 3 run, 1 failed, the job ends
+#   abnormally); the job log shows each test as I_RUNALL logs it.
 # - CommonLogger (Damian-Pietron, Apache-2.0): its makefile's CL
 #   commands (modules, service program, example program), then its unit
 #   tests (comLog.test.sqlrpgle) made with RUCRTRPG and run with RUCALLTST.
+# - IBM i Unit (ZodandSons VSCode-IBM-i-RPGLE-Unit-Tester-Extension,
+#   GPL-3.0): the extension's framework install and sample build
+#   (setup.ts's commands), then each sample suite as its runner.ts runs it
+#   (CRTRPGMOD, CRTSRVPGM, CALL RUNTEST with the exported test names,
+#   the results read from IUNITRES); demo_failures fails on purpose.
 # - IBMi-topics (MarcoDeSenas, GPL-3.0): imported (a TOBi-like project:
 #   sources built from the IFS, relative INCLUDE SRCSTMF paths, commands
 #   with validity checkers that look for QCATRS on the call stack,
@@ -88,6 +98,8 @@ clone https://github.com/MarinaSchwenk/IBMiUnit.git ibmiunit
 clone https://github.com/IBM/tobi-example.git tobi
 clone https://github.com/JDubbTX/ibm-i-packager.git pkg
 clone https://github.com/Damian-Pietron/CommonLogger.git clog
+clone https://github.com/i-unit/iunit.git iunit
+clone https://github.com/ZodandSons/VSCode-IBM-i-RPGLE-Unit-Tester-Extension.git zunit
 
 step() {
   echo "== $*"
@@ -405,6 +417,65 @@ lg "IRPGUNIT/RUCALLTST TSTPGM(COMLOG/COMLOGT) DETAIL(*ALL)" | grep -a -E "^ *(Su
 # The log: each test's message with the program and procedure that
 # logged it (STACK_INFO's entry before COMLOG's).
 "$bin" sql "SELECT LOGSEVERITY, CAST(LOGBODY AS VARCHAR(30)), LOGPROGRAM, LOGPROCEDURE FROM COMLOG.COMLOG WHERE LOGSEVERITY <> 50 ORDER BY LOGSEVERITY"
+
+step "IUNIT (its build.sh's steps, then RUNONE and RUNALL as its README says)"
+# i-unit/iunit (MIT): a CL unit test framework. build.sh (bash) makes a
+# source file for each folder, copies each file to a member (its
+# extension the source type) and calls I_BUILD, which compiles the rest;
+# its `system` calls are run here as they are.
+"$bin" put "$work/iunit" /home/iunit >/dev/null
+iu1() { "$bin" --libl QGPL system "$1" 2>&1 | grep -E "^(CP[CDF])" | tail -1; }
+iu1 "CRTLIB LIB(IUNIT) TEXT('IBM i Unit Testing Framework')"
+for d in QCLLESRC QCMDSRC; do
+  iu1 "CRTSRCPF FILE(IUNIT/$d) RCDLEN(240) TEXT('IBM i Unit Testing Framework $d Sources')" >/dev/null
+  for f in "$work/iunit/$d"/*; do
+    e=$(basename "$f"); atr=${e##*.}; mbr=${e%.*}
+    iu1 "CPYFRMSTMF FROMSTMF('/home/iunit/$d/$e') TOMBR('/QSYS.LIB/IUNIT.LIB/$d.FILE/$mbr.MBR') MBROPT(*ADD) CVTDTA(*AUTO) STMFCCSID(*STMF) DBFCCSID(*FILE)" >/dev/null
+    iu1 "CHGPFM FILE(IUNIT/$d) MBR($mbr) SRCTYPE($atr) TEXT('Created by Remain Software')" >/dev/null
+  done
+done
+iu1 "CRTBNDCL PGM(IUNIT/I_BUILD) SRCFILE(IUNIT/QCLLESRC) SRCMBR(I_BUILD)"
+"$bin" --libl QGPL system "CALL IUNIT/I_BUILD PARM(IUNIT)" >/dev/null 2>&1
+"$bin" sql "SELECT OBJNAME, OBJTYPE FROM TABLE(QSYS2.OBJECT_STATISTICS('IUNIT','*PGM *CMD *MSGF')) ORDER BY 2, 1"
+iut() { "$bin" --libl IUNIT,QGPL batch "$1" 2>&1 | grep -E "^(UTE|CPF9898|CPF124)" | sed -E 's/[0-9]{8}/HHMMSSmm/; s/^(CPF124[01]: Job )[0-9]{6}/\1nnnnnn/'; }
+iut "RUNONE IUNIT PASS"
+iut "RUNALL IUNIT"
+
+step "IBM i Unit (its framework and samples as the extension installs them, then its sample suites)"
+# Its library setting (ibmiUnit.library) is IBMIUT here: IUNIT is the
+# IUNIT framework's library above; the user makes both libraries, as its
+# README says. The extension (TypeScript) runs these CL commands over
+# SSH; they are run here as they are. Test names: the EXPORT procedures whose names start
+# with TEST (discovery.ts), the suite's object 'T' + its file name.
+zs="$work/zunit/ibmi-unit-source-0.1.3"
+"$bin" put "$zs/framework" /home/ibmiunit/framework >/dev/null
+"$bin" put "$zs/samples/qrpglesrc" /home/ibmiunit/samples >/dev/null
+zu() { "$bin" --libl IUNITSAMP,IBMIUT,QGPL --curlib IBMIUT system "$1" 2>&1 | grep -E "^(CP[CDF]|RNS|SQL)" | tail -1; }
+zu "CRTLIB IBMIUT"
+zu "CRTLIB IUNITSAMP"
+zu "RUNSQL SQL('$(grep -v '^\s*--' "$zs/framework/iunitres.sql" | tr '\n' ' ' | sed 's/{LIB}/IBMIUT/g; s/  */ /g; s/^ //; s/ $//')') COMMIT(*NONE) NAMING(*SQL)"
+zu "RUNSQL SQL('CREATE INDEX IBMIUT.IUNITRES1 ON IBMIUT.IUNITRES (RUNID, TESTOBJ, SEQ)') COMMIT(*NONE) NAMING(*SQL)"
+zf=/home/ibmiunit/framework; zp=/home/ibmiunit/samples
+zu "CRTRPGMOD MODULE(IBMIUT/TESTASSERT) SRCSTMF('$zf/testassert.rpgle') INCDIR('$zf') DBGVIEW(*SOURCE) TGTCCSID(*JOB) REPLACE(*YES)"
+zu "CRTSRVPGM SRVPGM(IBMIUT/TESTASSERT) MODULE(IBMIUT/TESTASSERT) EXPORT(*ALL) ACTGRP(*CALLER) REPLACE(*YES) TEXT('IBM i Unit assertions')"
+zu "CRTSQLRPGI OBJ(IBMIUT/RUNTEST) SRCSTMF('$zf/runtest.sqlrpgle') OBJTYPE(*MODULE) COMMIT(*NONE) DBGVIEW(*SOURCE) RPGPPOPT(*LVL2) REPLACE(*YES) COMPILEOPT('INCDIR(''$zf'') TGTCCSID(*JOB)')"
+zu "CRTPGM PGM(IBMIUT/RUNTEST) MODULE(IBMIUT/RUNTEST) BNDSRVPGM((IBMIUT/TESTASSERT)) BNDDIR(QC2LE) ACTGRP(*NEW) REPLACE(*YES) TEXT('IBM i Unit test runner')"
+zu "CRTRPGMOD MODULE(IUNITSAMP/MATHUTIL) SRCSTMF('$zp/mathutil.rpgle') INCDIR('$zp') DBGVIEW(*SOURCE) TGTCCSID(*JOB) REPLACE(*YES)"
+zu "CRTSRVPGM SRVPGM(IUNITSAMP/MATHUTIL) MODULE(IUNITSAMP/MATHUTIL) EXPORT(*ALL) REPLACE(*YES) TEXT('Sample math utilities')"
+zu "CRTRPGMOD MODULE(IUNITSAMP/STRUTIL) SRCSTMF('$zp/strutil.rpgle') INCDIR('$zp') DBGVIEW(*SOURCE) TGTCCSID(*JOB) REPLACE(*YES)"
+zu "CRTSRVPGM SRVPGM(IUNITSAMP/STRUTIL) MODULE(IUNITSAMP/STRUTIL) EXPORT(*ALL) REPLACE(*YES) TEXT('Sample string utilities')"
+zu "CRTBNDRPG PGM(IUNITSAMP/CALCTAX) SRCSTMF('$zp/calctax.rpgle') DBGVIEW(*SOURCE) TGTCCSID(*JOB) REPLACE(*YES) TEXT('Sample sales tax program')"
+for t in mathutil strutil calctax demo_failures; do
+  f="$zs/samples/qrpglesrc/$t.test.rpgle"
+  obj=$(echo "T${t^^}" | tr -cd 'A-Z0-9_' | cut -c1-10)
+  bnd=$(grep -i '^//#BNDSRVPGM:' "$f" | sed 's/^[^:]*: *//' | tr 'a-z' 'A-Z')
+  tests=$(grep -i -E '^\s*dcl-proc\s+test\w*\s.*export' "$f" | sed -E 's/^\s*dcl-proc\s+(\w+).*/\1/I' | tr 'a-z' 'A-Z' | paste -sd,)
+  srvs="(IBMIUT/TESTASSERT)"; [ -n "$bnd" ] && srvs="$srvs ($bnd)"
+  zu "CRTRPGMOD MODULE(IBMIUT/$obj) SRCSTMF('$zp/$t.test.rpgle') INCDIR('$zf' '$zp') OPTION(*EVENTF *SRCSTMT) DBGVIEW(*SOURCE) TGTCCSID(*JOB) REPLACE(*YES)"
+  zu "CRTSRVPGM SRVPGM(IBMIUT/$obj) MODULE(IBMIUT/$obj) EXPORT(*ALL) BNDSRVPGM($srvs) ACTGRP(*CALLER) REPLACE(*YES) TEXT('IBM i Unit test suite')"
+  "$bin" --libl IUNITSAMP,IBMIUT,QGPL --curlib IBMIUT system "CALL PGM(IBMIUT/RUNTEST) PARM('20261031000000000LEGACY001' 'IBMIUT' '$obj' '$tests')" >/dev/null 2>&1
+done
+"$bin" sql "SELECT TESTOBJ, TESTNAME, STATUS, ASSERTS, CAST(MESSAGE AS VARCHAR(60)) FROM IBMIUT.IUNITRES ORDER BY TESTOBJ, SEQ"
 
 step "IBMi-topics (import, then SPLFDLT *LOGONLY and *BOTH in batch jobs)"
 "$bin" import "$work/topics" --lib TOPICS 2>/dev/null | tail -1

@@ -5092,6 +5092,18 @@ async fn command(
                         job.calls.printed.extend(d.print.iter().cloned());
                     }
                 }
+                // A batch job (no display): the command prints what it
+                // would show, as it does run as the job's own request
+                // (jobs.rs; CL reference, OUTPUT(*): "printed with the
+                // job's spooled output" for a batch job).
+                Outcome::Display(d) if job.calls.batch => {
+                    let Some(id) = job.id.clone() else {
+                        return Ok(None);
+                    };
+                    let lines = crate::jobs::printed_display(&d);
+                    let file = crate::report::printer_file(&st.name);
+                    crate::spool::print_lines(job.client, &id, file, &st.name, &lines).await?;
+                }
                 Outcome::Display(_)
                 | Outcome::ChangePassword
                 | Outcome::StartSql

@@ -56,6 +56,15 @@ pub struct QMsg {
 pub struct CallStack {
     /// One program message queue per CL program running, innermost last.
     stack: Vec<Vec<QMsg>>,
+    /// A batch job's (jobs.rs `run_batch_job`): display commands print
+    /// what they would show.
+    pub batch: bool,
+    /// The keys of the logged messages a batch job has written to its job
+    /// log in the catalog (`Job::flush_log`).
+    pub flushed: Vec<u32>,
+    /// Their lines ("ID: text"), for the request's own messages that are
+    /// among them.
+    pub flushed_lines: Vec<String>,
     /// The escape message being raised, for the caller's MONMSG and
     /// RCVMSG MSGTYPE(*EXCP).
     pub escape: Option<QMsg>,

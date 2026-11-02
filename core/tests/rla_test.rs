@@ -14594,6 +14594,115 @@ end-proc;
     );
 }
 
+/// The same with the two modules in a service program (ILE Concepts:
+/// one static storage per module in the activation): the first module,
+/// running, is called back through the service program's exports, the
+/// call back sees its storage as it is (also after the module called a
+/// program in between: IBMiUnit's assertions saw an older copy) and what
+/// it changes the first module sees after (XMLSERVICE's modules call one
+/// another so).
+#[tokio::test]
+async fn call_back_into_running_service_program_module() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    source::create_file(&client, &lib, "QRPGLESRC", "")
+        .await
+        .unwrap();
+    let put = |name: &str, text: &str| source::Member {
+        library: lib.clone(),
+        file: "QRPGLESRC".into(),
+        name: name.into(),
+        srctype: "RPGLE".into(),
+        text: String::new(),
+        source: text.into(),
+        ..Default::default()
+    };
+    let main = "**FREE
+dcl-pr run end-pr;
+dcl-pr getMode int(10) end-pr;
+run();
+dsply ('main ' + %char(getMode()));
+*inlr = *on;
+";
+    let first = "**FREE
+ctl-opt nomain;
+dcl-s mode int(10) inz(1);
+dcl-pr report end-pr;
+dcl-pr qcmdexc extpgm('QCMDEXC');
+  cmd char(20) const;
+  len packed(15:5) const;
+end-pr;
+dcl-proc run export;
+  mode = 3;
+  qcmdexc('DLYJOB DLY(0)': 13);
+  mode = 5;
+  report();
+  dsply ('after ' + %char(mode));
+  mode += 1;
+end-proc;
+dcl-proc getMode export;
+  dcl-pi *n int(10) end-pi;
+  return mode;
+end-proc;
+dcl-proc setMode export;
+  dcl-pi *n;
+    m int(10) const;
+  end-pi;
+  mode = m;
+end-proc;
+";
+    let second = "**FREE
+ctl-opt nomain;
+dcl-pr getMode int(10) end-pr;
+dcl-pr setMode;
+  m int(10) const;
+end-pr;
+dcl-proc report export;
+  dsply ('mode ' + %char(getMode()));
+  setMode(9);
+end-proc;
+";
+    for m in [
+        put("CBMAIN4", main),
+        put("FIRSTSRV", first),
+        put("SECONDSRV", second),
+    ] {
+        source::put_member(&client, &m, false).await.unwrap();
+    }
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/CBMAIN4)"),
+        format!("CRTRPGMOD MODULE({lib}/FIRSTSRV)"),
+        format!("CRTRPGMOD MODULE({lib}/SECONDSRV)"),
+        format!(
+            "CRTSRVPGM SRVPGM({lib}/CBSRV) MODULE({lib}/FIRSTSRV {lib}/SECONDSRV) EXPORT(*ALL)"
+        ),
+        format!("CRTPGM PGM({lib}/CBMAIN4) MODULE({lib}/CBMAIN4) BNDSRVPGM(({lib}/CBSRV))"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    assert_eq!(
+        cl_cmd(&mut job, format!("CALL PGM({lib}/CBMAIN4)"))
+            .await
+            .unwrap(),
+        ["DSPLY  mode 5", "DSPLY  after 9", "DSPLY  main 10"]
+    );
+}
+
 /// INZ(*LIKEDS) on a LIKEDS subfield: the subfield starts with the
 /// template's initial values (ILE RPG Reference, INZ keyword, "*LIKEDS"),
 /// also when the data structure is itself a template copied by another
@@ -22198,7 +22307,9 @@ end-proc;
 /// divide by zero in the monitoring procedure, 00202 ("called program or
 /// procedure failed") for one in a procedure it called, through a
 /// prototype or a procedure pointer, the exception ID MCH1211 either way
-/// (PUB400 2026-11-01, verify33 z33_rows).
+/// (PUB400 2026-11-01, verify33 z33_rows). A call that ends normally
+/// after that leaves %STATUS and the PSDS status 0, the exception ID as
+/// it was (verify34 a34_rows).
 #[tokio::test]
 async fn status_of_an_error_in_a_called_procedure() {
     let url = require_db!();
@@ -22237,6 +22348,12 @@ on-error 102;
 on-error 202;
   note('202');
 endmon;
+monitor;
+  r = local(0);
+on-error;
+  r = local(1);
+  note('after');
+endmon;
 *inlr = *on;
 dcl-proc local;
   dcl-pi *n int(10);
@@ -22259,9 +22376,683 @@ end-proc;
             "here 102 102 MCH1211",
             "called 202 202 MCH1211",
             "pointer 202 202 MCH1211",
-            "202 202 202 MCH1211"
+            "202 202 202 MCH1211",
+            "after 0 0 MCH1211"
         ],
         "{:?}",
         r.messages
+    );
+}
+
+/// Static storage of one module of a service program reached through a
+/// pointer another module got from it (ILE Concepts: a module's static
+/// storage belongs to its activation and lasts as long as it; XMLSERVICE
+/// hands its control block from module to module this way): PTRMOD
+/// returns %ADDR of its global, the main program passes the pointer to
+/// READMOD's procedure, which reads and changes the storage through it;
+/// PTRMOD sees the change at its next call. A program called after that,
+/// which activates another service program's module, gives the caller
+/// its own storage back (not that activation's).
+#[tokio::test]
+async fn pointer_to_another_modules_static_storage() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    source::create_file(&client, &lib, "QRPGLESRC", "")
+        .await
+        .unwrap();
+    for (name, text) in [
+        ("PTRMOD", "**FREE\nctl-opt nomain;\ndcl-ds ctl qualified;\n  count int(10) inz(7);\n  name char(10) inz('first');\nend-ds;\ndcl-proc getCtl export;\n  dcl-pi *n pointer;\n  end-pi;\n  return %addr(ctl);\nend-proc;\ndcl-proc ctlName export;\n  dcl-pi *n char(10);\n  end-pi;\n  return ctl.name;\nend-proc;\n"),
+        ("READMOD", "**FREE\nctl-opt nomain;\ndcl-ds ctl_t qualified template;\n  count int(10);\n  name char(10);\nend-ds;\ndcl-proc bump export;\n  dcl-pi *n int(10);\n    p pointer value;\n  end-pi;\n  dcl-ds c likeds(ctl_t) based(p);\n  c.count += 1;\n  c.name = 'changed';\n  return c.count;\nend-proc;\n"),
+        ("PTRMAIN", "**FREE\ndcl-pr getCtl pointer end-pr;\ndcl-pr ctlName char(10) end-pr;\ndcl-pr bump int(10);\n  p pointer value;\nend-pr;\ndcl-pr callOther extpgm('PTROTHER');\nend-pr;\ndcl-s p pointer;\ndcl-s mine char(10) inz('mine');\np = getCtl();\ndsply %char(bump(p));\ndsply %char(bump(p));\ndsply %trim(ctlName());\ncallOther();\ndsply mine;\n*inlr = *on;\n"),
+        ("PTROTHER", "**FREE\ndcl-pr hello char(10) end-pr;\ndsply hello();\n*inlr = *on;\n"),
+        ("OTHMOD", "**FREE\nctl-opt nomain;\ndcl-s greeting char(10) inz('other');\ndcl-proc hello export;\n  dcl-pi *n char(10);\n  end-pi;\n  return greeting;\nend-proc;\n"),
+    ] {
+        source::put_member(
+            &client,
+            &source::Member {
+                library: lib.clone(),
+                file: "QRPGLESRC".into(),
+                name: name.into(),
+                srctype: "RPGLE".into(),
+                text: String::new(),
+                source: text.into(),
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/PTRMOD)"),
+        format!("CRTRPGMOD MODULE({lib}/READMOD)"),
+        format!("CRTRPGMOD MODULE({lib}/PTRMAIN)"),
+        format!("CRTSRVPGM SRVPGM({lib}/PTRSRV) MODULE({lib}/PTRMOD {lib}/READMOD) EXPORT(*ALL)"),
+        format!("CRTPGM PGM({lib}/PTRMAIN) MODULE({lib}/PTRMAIN) BNDSRVPGM({lib}/PTRSRV)"),
+        format!("CRTRPGMOD MODULE({lib}/OTHMOD)"),
+        format!("CRTSRVPGM SRVPGM({lib}/OTHSRV) MODULE({lib}/OTHMOD) EXPORT(*ALL)"),
+        format!("CRTRPGMOD MODULE({lib}/PTROTHER)"),
+        format!("CRTPGM PGM({lib}/PTROTHER) MODULE({lib}/PTROTHER) BNDSRVPGM({lib}/OTHSRV)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    assert_eq!(
+        cl_cmd(&mut job, format!("CALL PGM({lib}/PTRMAIN)"))
+            .await
+            .unwrap(),
+        [
+            "DSPLY  8",
+            "DSPLY  9",
+            "DSPLY  changed",
+            "DSPLY  other",
+            "DSPLY  mine"
+        ]
+    );
+}
+
+/// Named constants in fixed form (ILE RPG Reference, "Named Constants"
+/// and "Continuation Rules"): a literal keeps its case and blanks; one
+/// ending in '-' goes on with position 44 of the next line, one ending
+/// in '+' with its first nonblank character; %DIV and %SIZE of defined
+/// items in a constant; %SIZE(array:*ALL) is the whole array; INZ of a
+/// numeric field with a hexadecimal literal of its size gives its bytes;
+/// INZ(%UCS2('<')) of a UCS-2 field. All as XMLSERVICE's sources use them.
+#[tokio::test]
+async fn fixed_form_constants_and_initial_values() {
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = "     D one             S             10A
+     D arr             S             10A   DIM(4)
+     D NBR             c                   %div(%size(arr:*ALL):%size(one))
+     D GREET           c                   'Hello World'
+     D LONG            c                   'First part, -
+     D                                     second part'
+     D LONG2           c                   'Alpha +
+     D                                       beta'
+     D allones         S             10U 0 inz(X'FFFFFFFF')
+     D lt              S              1C   inz(%UCS2('<'))
+      /free
+        dsply %char(NBR);
+        dsply GREET;
+        dsply LONG;
+        dsply LONG2;
+        dsply %char(allones);
+        dsply %char(lt);
+        *inlr = *on;
+      /end-free
+";
+    let r = run_rpg(&url, &lib, "QSECOFR", "CONSTS", src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "4",
+            "Hello World",
+            "First part, second part",
+            "Alpha beta",
+            "4294967295",
+            "<"
+        ]
+    );
+}
+
+/// An external procedure that is a service program's procedure (Db2 for
+/// i SQL Reference, CREATE PROCEDURE (external): EXTERNAL NAME
+/// 'lib/srvpgm(entry)'), PARAMETER STYLE GENERAL: parameters by
+/// reference, a CLOB as its 4-byte length and its data (Db2 for i SQL
+/// Programming, "Parameter passing": LOB host variables). XMLSERVICE's
+/// iPLUG procedures are this kind; the procedure here copies its input
+/// CLOB to the output one after the CHAR parameter.
+#[tokio::test]
+async fn sql_external_procedure_in_a_service_program() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    use as4tainr_core::sql::Outcome as SqlOut;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    source::create_file(&client, &lib, "QRPGLESRC", "")
+        .await
+        .unwrap();
+    let text = "**FREE
+ctl-opt nomain;
+dcl-proc echo export;
+  dcl-pi *n;
+    tag char(10);
+    clobIn pointer;
+    clobOut pointer;
+  end-pi;
+  dcl-s pIn pointer;
+  dcl-s pOut pointer;
+  dcl-ds lobIn based(pIn) qualified;
+    len uns(10);
+    data char(100);
+  end-ds;
+  dcl-ds lobOut based(pOut) qualified;
+    len uns(10);
+    data char(100);
+  end-ds;
+  dcl-s s varchar(200);
+  pIn = %addr(clobIn);
+  pOut = %addr(clobOut);
+  s = %trim(tag) + ':' + %subst(lobIn.data: 1: lobIn.len);
+  lobOut.len = %len(s);
+  %subst(lobOut.data: 1: %len(s)) = s;
+  tag = 'done';
+end-proc;
+";
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QRPGLESRC".into(),
+            name: "ECHOMOD".into(),
+            srctype: "RPGLE".into(),
+            text: String::new(),
+            source: text.into(),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/ECHOMOD)"),
+        format!("CRTSRVPGM SRVPGM({lib}/ECHOSRV) MODULE({lib}/ECHOMOD) EXPORT(*ALL)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    let libl = vec![lib.clone()];
+    as4tainr_core::ddl::try_run(
+        &url,
+        "QSECOFR",
+        &libl,
+        Some(lib.clone()),
+        &mut None,
+        &format!(
+            "CREATE PROCEDURE {lib}.ECHO (INOUT T CHAR(10), IN CI CLOB(1K), OUT CO CLOB(1K)) \
+             LANGUAGE RPGLE EXTERNAL NAME '{lib}/ECHOSRV(ECHO)' PARAMETER STYLE GENERAL"
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let r = as4tainr_core::sql::run_as(
+        &client,
+        &url,
+        &libl,
+        "QSECOFR",
+        Some(lib.clone()),
+        None,
+        "CALL ECHO('abc', 'hello world', ?)",
+    )
+    .await
+    .unwrap();
+    let SqlOut::Message(m) = r else {
+        panic!("unexpected {r:?}")
+    };
+    assert_eq!(m, "Procedure ECHO ran: T = done, CO = abc:hello world.");
+}
+
+/// C runtime functions XMLSERVICE calls (ILE C/C++ Runtime Library
+/// Functions): vsprintf with a va_list built in RPG the way XMLSERVICE's
+/// cpyOutFmt builds it (two pointers, the second to the double), %f with
+/// a precision and a width (ISO C, fprintf: "-0003.14" is %08.2f of
+/// -3.14159, the sign counted in the width, zeros after it); iconv from
+/// CCSID 37 to 819 (ISO 8859-1: A B C are x'41' x'42' x'43'); QXXDTOZ
+/// and QXXZTOD (a double to zoned 7,2 and back); isdigit and islower.
+#[tokio::test]
+async fn c_runtime_functions_xmlservice_calls() {
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = "**free
+dcl-pr vsprintf int(10) extproc('vsprintf');
+  target pointer value;
+  format pointer value;
+  args pointer value;
+end-pr;
+dcl-ds code_t qualified template;
+  ccsid int(10);
+  alt int(10);
+  subalt int(10);
+  shift int(10);
+  inlen int(10);
+  err int(10);
+  rsv char(8);
+end-ds;
+dcl-ds iconv_t qualified template;
+  rtn int(10);
+  cd int(10) dim(12);
+end-ds;
+dcl-pr QtqIconvOpen likeds(iconv_t) extproc('QtqIconvOpen');
+  to likeds(code_t);
+  from likeds(code_t);
+end-pr;
+dcl-pr iconv uns(10) extproc('iconv');
+  cd likeds(iconv_t) value;
+  inbuf pointer;
+  inleft uns(10);
+  outbuf pointer;
+  outleft uns(10);
+end-pr;
+dcl-pr iconv_close int(10) extproc('iconv_close');
+  cd likeds(iconv_t) value;
+end-pr;
+dcl-pr QXXDTOZ extproc('QXXDTOZ');
+  target pointer value;
+  digits int(10) value;
+  frac int(10) value;
+  value float(8) value;
+end-pr;
+dcl-pr QXXZTOD float(8) extproc('QXXZTOD');
+  source pointer value;
+  digits int(10) value;
+  frac int(10) value;
+end-pr;
+dcl-pr isdigit int(10) extproc('isdigit');
+  c int(10) value;
+end-pr;
+dcl-pr islower int(10) extproc('islower');
+  c int(10) value;
+end-pr;
+dcl-ds valist qualified;
+  vp1 pointer;
+  vp2 pointer;
+end-ds;
+dcl-s f64 float(8);
+dcl-s fmt char(16);
+dcl-s str char(32);
+dcl-s n int(10);
+dcl-ds from likeds(code_t) inz;
+dcl-ds to likeds(code_t) inz;
+dcl-ds cd likeds(iconv_t);
+dcl-s inText char(3) inz('ABC');
+dcl-s outText char(3);
+dcl-s inP pointer;
+dcl-s outP pointer;
+dcl-s inLeft uns(10);
+dcl-s outLeft uns(10);
+dcl-s zoned zoned(7:2);
+
+f64 = 321.1234;
+fmt = '%1.4f' + x'00';
+valist.vp1 = %addr(fmt);
+valist.vp2 = %addr(f64);
+n = vsprintf(%addr(str): %addr(fmt): %addr(valist));
+dsply (%str(%addr(str)) + ' ' + %char(n));
+f64 = -3.14159;
+fmt = '%08.2f' + x'00';
+n = vsprintf(%addr(str): %addr(fmt): %addr(valist));
+dsply %str(%addr(str));
+
+from.ccsid = 37;
+to.ccsid = 819;
+cd = QtqIconvOpen(to: from);
+dsply %char(cd.rtn);
+inP = %addr(inText);
+outP = %addr(outText);
+inLeft = 3;
+outLeft = 3;
+n = iconv(cd: inP: inLeft: outP: outLeft);
+if outText = x'414243';
+  dsply ('819 ' + %char(n) + ' ' + %char(inLeft) + ' ' + %char(outLeft));
+endif;
+iconv_close(cd);
+
+QXXDTOZ(%addr(zoned): 7: 2: 12.5e0);
+dsply %char(zoned);
+dsply %char(%dech(QXXZTOD(%addr(zoned): 7: 2): 7: 2));
+
+// CCSID 37: '5' x'F5', 'A' x'C1', 'a' x'81'.
+if isdigit(245) <> 0 and isdigit(193) = 0
+   and islower(129) <> 0 and islower(193) = 0;
+  dsply 'ctype';
+endif;
+*inlr = *on;
+";
+    let r = run_rpg(&url, &lib, "QSECOFR", "XSCRT", src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "321.1234 8",
+            "-0003.14",
+            "0",
+            "819 0 0 0",
+            "12.50",
+            "12.50",
+            "ctype"
+        ]
+    );
+}
+
+/// SET RESULT SETS ARRAY (Db2 for i SQL Reference, SET RESULT SETS: "the
+/// result set is the first n rows of the host structure array", a column
+/// for each subfield) in an external procedure of a service program
+/// (CREATE PROCEDURE ... DYNAMIC RESULT SETS 1 ... EXTERNAL NAME): a
+/// data structure array, and a multiple-occurrence data structure as
+/// XMLSERVICE's iPLUGR procedures return theirs.
+#[tokio::test]
+async fn sql_result_set_from_a_host_structure_array() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    use as4tainr_core::sql::Outcome as SqlOut;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    source::create_file(&client, &lib, "QRPGLESRC", "")
+        .await
+        .unwrap();
+    let text = "**FREE
+ctl-opt nomain;
+dcl-proc listarr export;
+  dcl-pi *n;
+    n int(10);
+  end-pi;
+  dcl-ds rows qualified dim(3);
+    name char(5);
+    qty int(10);
+  end-ds;
+  rows(1).name = 'ab';
+  rows(1).qty = 7;
+  rows(2).name = 'cd';
+  rows(2).qty = 8;
+  rows(3).name = 'ef';
+  rows(3).qty = 9;
+  exec sql set result sets array :rows for :n rows;
+end-proc;
+dcl-ds out occurs(4);
+  line char(6);
+end-ds;
+dcl-s count packed(5:0) inz(2);
+dcl-proc listocc export;
+  dcl-pi *n;
+  end-pi;
+  %occur(out) = 1;
+  line = 'first';
+  %occur(out) = 2;
+  line = 'second';
+  exec sql set result sets array :out for :count rows;
+end-proc;
+";
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QRPGLESRC".into(),
+            name: "LISTMOD".into(),
+            srctype: "SQLRPGLE".into(),
+            text: String::new(),
+            source: text.into(),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    for c in [
+        format!("CRTSQLRPGI OBJ({lib}/LISTMOD) OBJTYPE(*MODULE)"),
+        format!("CRTSRVPGM SRVPGM({lib}/LISTSRV) MODULE({lib}/LISTMOD) EXPORT(*ALL)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    let libl = vec![lib.clone()];
+    for (name, parms, entry) in [
+        ("LISTARR", "(IN N INT)", "LISTARR"),
+        ("LISTOCC", "()", "LISTOCC"),
+    ] {
+        as4tainr_core::ddl::try_run(
+            &url,
+            "QSECOFR",
+            &libl,
+            Some(lib.clone()),
+            &mut None,
+            &format!(
+                "CREATE PROCEDURE {lib}.{name} {parms} DYNAMIC RESULT SETS 1 \
+                 LANGUAGE RPGLE EXTERNAL NAME '{lib}/LISTSRV({entry})' PARAMETER STYLE GENERAL"
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    let call = |sql: &'static str| {
+        let (client, url, libl, lib) = (&client, &url, &libl, lib.clone());
+        async move {
+            as4tainr_core::sql::run_as(client, url, libl, "QSECOFR", Some(lib), None, sql)
+                .await
+                .unwrap()
+        }
+    };
+    let SqlOut::Rows { columns, rows, .. } = call("CALL LISTARR(2)").await else {
+        panic!("no result set")
+    };
+    assert_eq!(columns, ["NAME", "QTY"]);
+    assert_eq!(rows, [["ab   ", "7"], ["cd   ", "8"]]);
+    let SqlOut::Rows { columns, rows, .. } = call("CALL LISTOCC").await else {
+        panic!("no result set")
+    };
+    assert_eq!(columns, ["LINE"]);
+    assert_eq!(rows, [["first "], ["second"]]);
+}
+
+/// The SQL call level interface from RPG (DB2 for i SQL CLI, X/Open CLI):
+/// SQLPrepare with a parameter marker, SQLBindParameter of a character
+/// value for a DECIMAL parameter, SQLExecute, SQLNumResultCols,
+/// SQLDescribeCol (SQL_CHAR 1, SQL_DECIMAL 3, IBM i's sqlcli.h codes, with
+/// the column's length or precision and scale), SQLBindCol with
+/// SQL_C_DEFAULT (99: a DECIMAL column as packed decimal, the buffer
+/// length precision * 256 + scale) and SQL_C_CHAR (null-terminated; the
+/// length of a CHAR(30) value is 30, the column being fixed-length),
+/// SQLFetch to SQL_NO_DATA_FOUND (100); a searched UPDATE of no rows
+/// gives SQL_NO_DATA_FOUND; an error leaves its SQLSTATE and SQLCODE for
+/// SQLGetDiagRec.
+#[tokio::test]
+async fn sql_cli_from_rpg() {
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = "**free
+dcl-pr SQLAllocEnv int(10) extproc('SQLAllocEnv');
+  h int(10);
+end-pr;
+dcl-pr SQLAllocConnect int(10) extproc('SQLAllocConnect');
+  henv int(10) value;
+  h int(10);
+end-pr;
+dcl-pr SQLConnect int(10) extproc('SQLConnect');
+  h int(10) value;
+  db pointer value;
+  dblen int(5) value;
+  uid pointer value;
+  uidlen int(5) value;
+  pwd pointer value;
+  pwdlen int(5) value;
+end-pr;
+dcl-pr SQLAllocStmt int(10) extproc('SQLAllocStmt');
+  hdbc int(10) value;
+  h int(10);
+end-pr;
+dcl-pr SQLPrepare int(10) extproc('SQLPrepare');
+  h int(10) value;
+  text pointer value;
+  len int(10) value;
+end-pr;
+dcl-pr SQLExecDirect int(10) extproc('SQLExecDirect');
+  h int(10) value;
+  text pointer value;
+  len int(10) value;
+end-pr;
+dcl-pr SQLBindParameter int(10) extproc('SQLBindParameter');
+  h int(10) value;
+  n int(5) value;
+  io int(5) value;
+  ctype int(5) value;
+  stype int(5) value;
+  size int(10) value;
+  scale int(5) value;
+  data pointer value;
+  buflen int(10) value;
+  ind pointer value;
+end-pr;
+dcl-pr SQLExecute int(10) extproc('SQLExecute');
+  h int(10) value;
+end-pr;
+dcl-pr SQLNumResultCols int(10) extproc('SQLNumResultCols');
+  h int(10) value;
+  n pointer value;
+end-pr;
+dcl-pr SQLDescribeCol int(10) extproc('SQLDescribeCol');
+  h int(10) value;
+  n int(5) value;
+  name pointer value;
+  max int(5) value;
+  namelen pointer value;
+  type pointer value;
+  size pointer value;
+  scale pointer value;
+  nullable pointer value;
+end-pr;
+dcl-pr SQLBindCol int(10) extproc('SQLBindCol');
+  h int(10) value;
+  n int(5) value;
+  ctype int(5) value;
+  data pointer value;
+  buflen int(10) value;
+  ind pointer value;
+end-pr;
+dcl-pr SQLFetch int(10) extproc('SQLFetch');
+  h int(10) value;
+end-pr;
+dcl-pr SQLGetDiagRec int(10) extproc('SQLGetDiagRec');
+  type int(5) value;
+  h int(10) value;
+  rec int(5) value;
+  state pointer value;
+  native pointer value;
+  msg pointer value;
+  max int(5) value;
+  len pointer value;
+end-pr;
+dcl-s henv int(10);
+dcl-s hdbc int(10);
+dcl-s hstmt int(10);
+dcl-s rc int(10);
+dcl-s text varchar(200);
+dcl-s sqltext char(200);
+dcl-s minbal char(10) inz('300');
+dcl-s nts int(10) inz(-3);
+dcl-s ncols int(5);
+dcl-s colname char(30);
+dcl-s namelen int(5);
+dcl-s coltype int(5);
+dcl-s colsize int(10);
+dcl-s colscale int(5);
+dcl-s nullable int(5);
+dcl-s cusno packed(5:0);
+dcl-s cusnam char(31);
+dcl-s cusbal packed(9:2);
+dcl-s ind1 int(10);
+dcl-s ind2 int(10);
+dcl-s ind3 int(10);
+dcl-s state char(6);
+dcl-s native int(10);
+dcl-s msg char(100);
+dcl-s msglen int(5);
+
+rc = SQLAllocEnv(henv);
+rc = SQLAllocConnect(henv: hdbc);
+rc = SQLConnect(hdbc: *null: 0: *null: 0: *null: 0);
+rc = SQLAllocStmt(hdbc: hstmt);
+sqltext = 'SELECT CUSNO, CUSNAM, CUSBAL FROM CUSTMAST WHERE CUSBAL > ? ORDER BY CUSNO' + x'00';
+rc = SQLPrepare(hstmt: %addr(sqltext): -3);
+rc = SQLBindParameter(hstmt: 1: 1: 1: 3: 9: 2: %addr(minbal): 10: %addr(nts));
+rc = SQLExecute(hstmt);
+dsply ('execute ' + %char(rc));
+rc = SQLNumResultCols(hstmt: %addr(ncols));
+dsply ('columns ' + %char(ncols));
+rc = SQLDescribeCol(hstmt: 2: %addr(colname): %size(colname): %addr(namelen):
+                    %addr(coltype): %addr(colsize): %addr(colscale): %addr(nullable));
+dsply (%str(%addr(colname)) + ' ' + %char(coltype) + ' ' + %char(colsize));
+rc = SQLDescribeCol(hstmt: 3: %addr(colname): %size(colname): %addr(namelen):
+                    %addr(coltype): %addr(colsize): %addr(colscale): %addr(nullable));
+dsply (%str(%addr(colname)) + ' ' + %char(coltype) + ' ' + %char(colsize)
+       + ' ' + %char(colscale));
+rc = SQLBindCol(hstmt: 1: 99: %addr(cusno): 5 * 256: %addr(ind1));
+rc = SQLBindCol(hstmt: 2: 1: %addr(cusnam): %size(cusnam): %addr(ind2));
+rc = SQLBindCol(hstmt: 3: 99: %addr(cusbal): 9 * 256 + 2: %addr(ind3));
+rc = SQLFetch(hstmt);
+dow rc = 0;
+  dsply (%char(cusno) + ' ' + %trimr(%str(%addr(cusnam))) + ' ' + %char(cusbal)
+         + ' ' + %char(ind2));
+  rc = SQLFetch(hstmt);
+enddo;
+dsply ('fetch ' + %char(rc));
+sqltext = 'UPDATE CUSTMAST SET CUSBAL = 0 WHERE CUSNO = 99' + x'00';
+rc = SQLExecDirect(hstmt: %addr(sqltext): -3);
+dsply ('update ' + %char(rc));
+sqltext = 'SELECT * FROM NOSUCHFILE' + x'00';
+rc = SQLExecDirect(hstmt: %addr(sqltext): -3);
+dsply ('select ' + %char(rc));
+rc = SQLGetDiagRec(3: hstmt: 1: %addr(state): %addr(native): %addr(msg):
+                   %size(msg): %addr(msglen));
+dsply (%str(%addr(state)) + ' ' + %char(native));
+*inlr = *on;
+";
+    let r = run_rpg(&url, &lib, "QSECOFR", "CLITEST", src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "execute 0",
+            "columns 3",
+            "CUSNAM 1 30",
+            "CUSBAL 3 9 2",
+            "1 Acme Tooling 1250.50 30",
+            "2 Midwest Fasteners 310.00 30",
+            "4 Prairie Freight 9999999.99 30",
+            "fetch 100",
+            "update 100",
+            "select -1",
+            "42704 -204",
+        ]
     );
 }

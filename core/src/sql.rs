@@ -2773,8 +2773,18 @@ pub enum Exec {
     Rows {
         columns: Vec<String>,
         rows: Vec<Vec<Option<String>>>,
+        /// Each column's type (the SQL CLI describes columns by it).
+        types: Vec<ColType>,
     },
     Count(Kind, u64),
+}
+
+/// A result column's type: PostgreSQL's type name, and its modifier when
+/// the column comes from a table (length, precision and scale), else -1.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColType {
+    pub pg: String,
+    pub typmod: i32,
 }
 
 /// The SQL session of a running program (embedded SQL): one connection as
@@ -3041,6 +3051,32 @@ impl Session {
                 .iter()
                 .map(|c| c.type_().name() == "timestamp")
                 .collect();
+            let mut types = Vec::new();
+            for c in stmt
+                .columns()
+                .iter()
+                .zip(&keep)
+                .filter(|(_, k)| **k)
+                .map(|(c, _)| c)
+            {
+                let typmod = match (c.table_oid(), c.column_id()) {
+                    (Some(oid), Some(col)) => client
+                        .query_opt(
+                            "SELECT atttypmod FROM pg_catalog.pg_attribute WHERE attrelid = $1 AND attnum = $2",
+                            &[&oid, &col],
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|r| r.get::<_, i32>(0))
+                        .unwrap_or(-1),
+                    _ => -1,
+                };
+                types.push(ColType {
+                    pg: c.type_().name().to_string(),
+                    typmod,
+                });
+            }
             let mut rows = Vec::new();
             for m in client
                 .simple_query(&text)
@@ -3064,7 +3100,11 @@ impl Session {
                     );
                 }
             }
-            Ok(Exec::Rows { columns, rows })
+            Ok(Exec::Rows {
+                columns,
+                rows,
+                types,
+            })
         } else {
             let n = client
                 .execute(&text, &[])

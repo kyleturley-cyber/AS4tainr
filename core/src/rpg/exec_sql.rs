@@ -42,6 +42,19 @@ pub(super) struct KeptSql {
 }
 
 type Key = (String, String, String);
+thread_local! {
+    /// The result sets SET RESULT SETS named, returned to the caller of
+    /// the procedure (an external SQL procedure) when it ends.
+    static RESULT_SETS: std::cell::RefCell<Vec<crate::sqlpl::ResultSet>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The result sets the procedure that ran on this thread left (none from
+/// now on).
+pub fn take_result_sets() -> Vec<crate::sqlpl::ResultSet> {
+    RESULT_SETS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
 static KEPT: std::sync::Mutex<Option<HashMap<Key, KeptSql>>> = std::sync::Mutex::new(None);
 
 /// The activation group ends: its modules' cursors close.
@@ -208,7 +221,7 @@ impl Outcome {
 }
 
 /// SQLSTATE for an SQLCODE, as DB2 for i reports them.
-fn sqlstate(code: i64) -> &'static str {
+pub(super) fn sqlstate(code: i64) -> &'static str {
     match code {
         0 => "00000",
         100 => "02000",
@@ -328,7 +341,7 @@ fn literal(v: &Value) -> Result<String> {
 }
 
 /// Replace `?` parameter markers (outside literals) with values.
-fn fill_markers(sql: &str, values: &[String]) -> Result<String> {
+pub(super) fn fill_markers(sql: &str, values: &[String]) -> Result<String> {
     let mut out = String::new();
     let mut quote = None;
     let mut n = 0;
@@ -983,6 +996,7 @@ impl Machine<'_> {
                 }
                 return self.sql_change(&text);
             }
+            "SET" if second == "RESULT" => return self.sql_set_result_sets(sql),
             "SET" if second.starts_with(':') => {
                 // SET :host = expression.
                 let eq = sql
@@ -1149,6 +1163,91 @@ impl Machine<'_> {
         }
         let text = format!("{} VALUES {}", self.bind_host(target)?, rows.join(", "));
         self.sql_change(&text)
+    }
+
+    /// SET RESULT SETS [WITH RETURN TO CALLER | CLIENT] ARRAY
+    /// :host-structure-array FOR n ROWS (Db2 for i SQL Reference, SET
+    /// RESULT SETS): the result set the procedure returns, a row for each
+    /// of the first n elements (or occurrences) of the structure, a
+    /// column for each subfield. NONE: no result set.
+    fn sql_set_result_sets(&mut self, sql: &str) -> Result<Outcome> {
+        let w = words(sql);
+        if w.iter().any(|x| x == "NONE") {
+            RESULT_SETS.with(|r| r.borrow_mut().clear());
+            return Ok(Outcome::ok(0));
+        }
+        let Some(k) = w.iter().position(|x| x == "ARRAY") else {
+            return Ok(Outcome::error(
+                -84,
+                "SQL0084: SET RESULT SETS CURSOR is not available in as4tainr yet.",
+            ));
+        };
+        let host = w
+            .get(k + 1)
+            .ok_or_else(|| anyhow!("SQL0104: a host structure is expected after ARRAY"))?
+            .trim_start_matches(':')
+            .to_ascii_uppercase();
+        let count = w
+            .get(k + 3)
+            .filter(|_| w.get(k + 2).map(String::as_str) == Some("FOR"))
+            .ok_or_else(|| anyhow!("SQL0104: FOR n ROWS is expected"))?;
+        let n = match count.strip_prefix(':') {
+            Some(h) => self.eval(&crate::rpg::expr::parse(h)?)?.num()?,
+            None => crate::rpg::dec::Dec::parse(count)?,
+        }
+        .to_i128()?
+        .max(0) as usize;
+        let Some(Sym::Ds(d)) = self.sym(&host) else {
+            bail!("SQL0312: {host} must be a host structure array");
+        };
+        let ds = crate::rpg::expr::parse(&host)?;
+        let occurs = self.prog.occurs.iter().any(|o| o.name == host);
+        let reps = if occurs {
+            self.prog
+                .occurs
+                .iter()
+                .find(|o| o.name == host)
+                .map(|o| o.count as usize)
+                .unwrap_or(1)
+        } else {
+            d.dim.max(1) as usize
+        };
+        let n = n.min(reps);
+        let was = if occurs {
+            Some(self.occurrence(&ds)?)
+        } else {
+            None
+        };
+        let mut rows = Vec::new();
+        for i in 1..=n {
+            if occurs {
+                self.set_occurrence(&ds, i as i128)?;
+            }
+            let mut row = Vec::new();
+            for sf in &d.subfields {
+                let e = if occurs {
+                    crate::rpg::expr::parse(&format!("{host}.{sf}"))
+                        .or_else(|_| crate::rpg::expr::parse(sf))?
+                } else {
+                    crate::rpg::expr::parse(&format!("{host}({i}).{sf}"))?
+                };
+                let v = match self.eval(&e) {
+                    Ok(v) => v,
+                    Err(_) => self.eval(&crate::rpg::expr::parse(sf)?)?,
+                };
+                row.push(Some(match v {
+                    Value::Char(c) => super::data::a(&c),
+                    other => other.num().map(|d| d.to_string()).unwrap_or_default(),
+                }));
+            }
+            rows.push(row);
+        }
+        if let Some(o) = was {
+            self.set_occurrence(&ds, o as i128)?;
+        }
+        let columns = d.subfields.clone();
+        RESULT_SETS.with(|r| *r.borrow_mut() = vec![(columns, rows)]);
+        Ok(Outcome::ok(0))
     }
 
     /// INSERT, UPDATE, DELETE (or a query run for nothing).

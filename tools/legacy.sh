@@ -51,6 +51,12 @@
 #   (setup.ts's commands), then each sample suite as its runner.ts runs it
 #   (CRTRPGMOD, CRTSRVPGM, CALL RUNTEST with the exported test names,
 #   the results read from IUNITRES); demo_failures fails on purpose.
+# - XMLSERVICE (IBM, BSD-3-Clause): its Makefile's build-procedure target
+#   (configure's defaults: library XMLSERVICE; the modules, service
+#   program XMLSTOREDP, the SQL procedures of xmlstoredp.sql) and its
+#   build-test target's RPG programs, then a command through iPLUG4K and
+#   the XML of its PHP tests (tools/xmlservice_tests.py: the tests read as
+#   data, in stateless mode).
 # - IBMi-topics (MarcoDeSenas, GPL-3.0): imported (a TOBi-like project:
 #   sources built from the IFS, relative INCLUDE SRCSTMF paths, commands
 #   with validity checkers that look for QCATRS on the call stack,
@@ -75,7 +81,8 @@
 #   tools/legacy.sh
 #
 # Env: AS4TAINR_BIN (default target/debug/as4tainr), AS4TAINR_DATABASE_URL,
-# LEGACY_DIR (where the clones go; default a new temporary directory).
+# LEGACY_DIR (where the clones go; default a new temporary directory),
+# XMLSERVICE_TESTS=0 (XMLSERVICE's tests left out).
 set -uo pipefail
 bin="${AS4TAINR_BIN:-target/debug/as4tainr}"
 work="${LEGACY_DIR:-$(mktemp -d)}"
@@ -100,6 +107,7 @@ clone https://github.com/JDubbTX/ibm-i-packager.git pkg
 clone https://github.com/Damian-Pietron/CommonLogger.git clog
 clone https://github.com/i-unit/iunit.git iunit
 clone https://github.com/ZodandSons/VSCode-IBM-i-RPGLE-Unit-Tester-Extension.git zunit
+clone https://github.com/IBM/xmlservice.git xmlservice
 
 step() {
   echo "== $*"
@@ -401,7 +409,7 @@ step "CommonLogger (its makefile's steps as CL commands, then its unit tests wit
 # found with QSYS2.STACK_INFO). Its makefile runs `system` in Qshell: its
 # commands are run here as they are, with the clone's absolute paths.
 "$bin" put "$work/clog" "$work/clog" >/dev/null
-cl() { "$bin" --libl COMLOG,IRPGUNIT,QGPL --curlib COMLOG system "$1" 2>&1 | grep -E "^(CP[CDF]|RNS|SQL)" | tail -1; }
+cl() { "$bin" --libl COMLOG,IRPGUNIT,QGPL --curlib COMLOG system "$1" 2>&1 | grep -E "^(CP[CDF]|RNS|SQL[0-9])" | tail -1; }
 cl "CRTLIB LIB(COMLOG) TYPE(*PROD) TEXT('Common Logger Library')"
 cl "CRTBNDDIR BNDDIR(COMLOG/COMLOG) TEXT('Common Logger Binding Directory')"
 cl "ADDBNDDIRE BNDDIR(COMLOG/COMLOG) OBJ((COMLOG/COMLOG))"
@@ -450,7 +458,7 @@ step "IBM i Unit (its framework and samples as the extension installs them, then
 zs="$work/zunit/ibmi-unit-source-0.1.3"
 "$bin" put "$zs/framework" /home/ibmiunit/framework >/dev/null
 "$bin" put "$zs/samples/qrpglesrc" /home/ibmiunit/samples >/dev/null
-zu() { "$bin" --libl IUNITSAMP,IBMIUT,QGPL --curlib IBMIUT system "$1" 2>&1 | grep -E "^(CP[CDF]|RNS|SQL)" | tail -1; }
+zu() { "$bin" --libl IUNITSAMP,IBMIUT,QGPL --curlib IBMIUT system "$1" 2>&1 | grep -E "^(CP[CDF]|RNS|SQL[0-9])" | tail -1; }
 zu "CRTLIB IBMIUT"
 zu "CRTLIB IUNITSAMP"
 zu "RUNSQL SQL('$(grep -v '^\s*--' "$zs/framework/iunitres.sql" | tr '\n' ' ' | sed 's/{LIB}/IBMIUT/g; s/  */ /g; s/^ //; s/ $//')') COMMIT(*NONE) NAMING(*SQL)"
@@ -476,6 +484,47 @@ for t in mathutil strutil calctax demo_failures; do
   "$bin" --libl IUNITSAMP,IBMIUT,QGPL --curlib IBMIUT system "CALL PGM(IBMIUT/RUNTEST) PARM('20261031000000000LEGACY001' 'IBMIUT' '$obj' '$tests')" >/dev/null 2>&1
 done
 "$bin" sql "SELECT TESTOBJ, TESTNAME, STATUS, ASSERTS, CAST(MESSAGE AS VARCHAR(60)) FROM IBMIUT.IUNITRES ORDER BY TESTOBJ, SEQ"
+
+step "XMLSERVICE (its Makefile's build-procedure and build-test targets, a command through iPLUG4K, then its PHP tests' XML)"
+# configure (Python) only puts its defaults into three .in files: done
+# here with sed, as it does. The Makefile's rules are run as they are.
+xd="$work/xmlservice"
+for f in src/plugconf.rpgle src/xmlstoredp.sql; do
+  sed 's/@LIBRARY@/XMLSERVICE/g; s/@DEBUG@/*ALL/g; s/@TARGET_RELEASE@/*CURRENT/g' "$xd/$f.in" > "$xd/$f"
+done
+"$bin" put "$xd" /home/xmlservice >/dev/null
+xs() { "$bin" --libl XMLSERVICE,QGPL --curlib XMLSERVICE system "$1" 2>&1; }
+xs "CRTLIB XMLSERVICE" | tail -1
+xmods="plugconf plugbug plugipc plugrun plugperf plugcach plugerr plugsql plugdb2 plugpase pluglic plugsig plugconv plugxml plugile"
+for m in $xmods; do
+  xs "CRTRPGMOD MODULE(XMLSERVICE/$m) SRCSTMF('/home/xmlservice/src/$m.rpgle') DBGVIEW(*ALL) REPLACE(*YES) TGTCCSID(37) TGTRLS(*CURRENT)" | grep -E "^RNS93" | tail -1
+done
+xs "CRTSQLRPGI OBJ(XMLSERVICE/XMLSTOREDP) SRCSTMF('/home/xmlservice/src/xmlstoredp.sqlrpgle') OBJTYPE(*MODULE) REPLACE(*YES) RPGPPOPT(*LVL2) COMPILEOPT('INCDIR(''/home/xmlservice/src/'') TGTCCSID(37)') TGTRLS(*CURRENT)" | grep -E "^RNS93" | tail -1
+xs "CRTSRCPF XMLSERVICE/QSRVSRC" | tail -1
+xs "CPYFRMSTMF FROMSTMF('/home/xmlservice/src/xmlstoredp.bnd') TOMBR('/qsys.lib/XMLSERVICE.lib/qsrvsrc.file/xmlstoredp.mbr') MBROPT(*REPLACE)" | tail -1
+xlist=""
+for m in xmlstoredp $xmods; do xlist="$xlist XMLSERVICE/$(echo $m | tr 'a-z' 'A-Z')"; done
+xs "CRTSRVPGM SRVPGM(XMLSERVICE/XMLSTOREDP) MODULE($xlist) EXPORT(*SRCFILE) SRCFILE(XMLSERVICE/QSRVSRC) ACTGRP(*CALLER) TGTRLS(*CURRENT)" | tail -1
+xs "RUNSQLSTM SRCSTMF('/home/xmlservice/src/xmlstoredp.sql')" | grep -E "^SQL79" | tail -1
+"$bin" --libl XMLSERVICE,QGPL sql "CALL XMLSERVICE.IPLUG4K('*NA', '*here', '<?xml version=''1.0''?><xmlservice><cmd>CHGLIBL LIBL(QGPL)</cmd></xmlservice>', ?)" 2>&1 | tr -d '\n'; echo
+# The Makefile's build-test target: the ZZ test programs and service
+# programs its tests call (zzjava needs Java: not built).
+for p in zzbigboy zzcall zzcust zzdeep zzerich zzmore zznone zzsimp zzvlad zzvlad2 zzvlad3; do
+  xs "CRTRPGMOD MODULE(XMLSERVICE/$p) SRCSTMF('/home/xmlservice/src/$p.rpgle') DBGVIEW(*ALL) REPLACE(*YES) TGTCCSID(37)" | grep -E "^RNS93" | grep -v RNS9305
+  xs "CRTPGM PGM(XMLSERVICE/$p) MODULE(XMLSERVICE/$p)" | grep -v CPC5D07
+done
+for p in zzsrv zzsrv6; do
+  xs "CRTRPGMOD MODULE(XMLSERVICE/$p) SRCSTMF('/home/xmlservice/src/$p.rpgle') DBGVIEW(*ALL) REPLACE(*YES) TGTCCSID(37)" | grep -E "^RNS93" | grep -v RNS9305
+  xs "CRTSRVPGM SRVPGM(XMLSERVICE/$p) MODULE(XMLSERVICE/$p) EXPORT(*ALL) ACTGRP(*CALLER)" | grep -v CPC5D0B
+done
+xs "CRTSRCPF XMLSERVICE/QCLSRC" >/dev/null
+xs "CPYFRMSTMF FROMSTMF('/home/xmlservice/src/zzshlomo.clp') TOMBR('/qsys.lib/XMLSERVICE.lib/qclsrc.file/zzshlomo.mbr') MBROPT(*REPLACE)" >/dev/null
+xs "CRTCLPGM PGM(XMLSERVICE/ZZSHLOMO) SRCFILE(XMLSERVICE/QCLSRC)" | grep -E "^CPF"
+# Its PHP tests' XML, through the iPLUG procedures (tools/xmlservice_tests.py;
+# about 15 minutes with a release binary; XMLSERVICE_TESTS=0 leaves it out).
+if [ "${XMLSERVICE_TESTS:-1}" != 0 ]; then
+  AS4TAINR_BIN="$bin" python3 tools/xmlservice_tests.py "$xd" | tail -1
+fi
 
 step "IBMi-topics (import, then SPLFDLT *LOGONLY and *BOTH in batch jobs)"
 "$bin" import "$work/topics" --lib TOPICS 2>/dev/null | tail -1

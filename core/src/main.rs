@@ -88,8 +88,14 @@ enum Cmd {
     },
     /// Run one SQL statement (DB2 for i dialect) with the library list.
     Sql {
-        /// The statement, e.g. "SELECT * FROM CUSTMAST".
+        /// The statement, e.g. "SELECT * FROM CUSTMAST"; - reads it from
+        /// standard input (a statement longer than a command line takes).
         statement: String,
+        /// Rows as JSON ({"columns": [...], "rows": [[...]...]}), each
+        /// value as it is (no column alignment, trailing blanks kept);
+        /// a message as {"message": "..."}.
+        #[arg(long)]
+        json: bool,
     },
     /// CRTDSPF: create a display file from DDS source.
     Crtdspf {
@@ -283,7 +289,14 @@ async fn run(cli: Cli) -> Result<u8> {
                 pgm.decls.len()
             );
         }
-        Cmd::Sql { statement } => {
+        Cmd::Sql { statement, json } => {
+            let statement = if statement == "-" {
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+                text
+            } else {
+                statement
+            };
             let client = runtime::connect_db(&cli.database_url).await?;
             if let Some(msg) = as4tainr_core::ddl::try_run(
                 &cli.database_url,
@@ -295,10 +308,29 @@ async fn run(cli: Cli) -> Result<u8> {
             )
             .await?
             {
-                println!("{msg}");
+                if json {
+                    println!("{}", serde_json::json!({ "message": msg }));
+                } else {
+                    println!("{msg}");
+                }
                 return Ok(0);
             }
-            match as4tainr_core::sql::run(&client, &cli.database_url, &libl, &statement).await? {
+            let out =
+                as4tainr_core::sql::run(&client, &cli.database_url, &libl, &statement).await?;
+            if json {
+                let v = match out {
+                    as4tainr_core::sql::Outcome::Rows { columns, rows, .. } => {
+                        serde_json::json!({ "columns": columns, "rows": rows })
+                    }
+                    as4tainr_core::sql::Outcome::Count(kind, n) => {
+                        serde_json::json!({ "message": as4tainr_core::sql::count_message(kind, n) })
+                    }
+                    as4tainr_core::sql::Outcome::Message(m) => serde_json::json!({ "message": m }),
+                };
+                println!("{v}");
+                return Ok(0);
+            }
+            match out {
                 as4tainr_core::sql::Outcome::Rows {
                     columns,
                     numeric,

@@ -159,6 +159,24 @@ pub struct Lent {
     pub act: u32,
     pub globals: usize,
     pub bufs: Vec<Vec<u8>>,
+    /// Another module's activation storage taken from the activation
+    /// group for this call (its group and unit): a pointer one module got to
+    /// another's static storage reaches it in a third (`pull_activations`).
+    pub pulled: Option<(String, String)>,
+}
+
+/// After a call: the caller's own storage (the last lent entry that is
+/// not another module's activation taken for calls) and the lent storage
+/// it goes on with, those activations kept (`Lent::pulled`).
+pub fn give_back(mut lent: Vec<Lent>) -> (Vec<Vec<u8>>, Vec<Lent>) {
+    let mut pulled = Vec::new();
+    while lent.last().is_some_and(|l| l.pulled.is_some()) {
+        pulled.extend(lent.pop());
+    }
+    pulled.reverse();
+    let own = lent.pop().map(|l| l.bufs).unwrap_or_default();
+    lent.extend(pulled);
+    (own, lent)
 }
 
 /// A program's storage.
@@ -168,7 +186,26 @@ pub struct Mem {
     pub heap: Heap,
     /// Storage of callers, lent for a bound call.
     pub lent: Vec<Lent>,
+    /// Scratch storage, made at the first write through a fault (until
+    /// then reads see `zeros`).
     scratch: Vec<u8>,
+    scratch_len: usize,
+}
+
+/// Zero bytes, at least `n`, shared by every machine for reads through
+/// a pointer fault (a module's largest based variable may be megabytes:
+/// made once, not for each call).
+fn zeros(n: usize) -> &'static Vec<u8> {
+    static ZEROS: std::sync::Mutex<Option<&'static Vec<u8>>> = std::sync::Mutex::new(None);
+    let mut g = ZEROS.lock().unwrap_or_else(|e| e.into_inner());
+    match *g {
+        Some(z) if z.len() >= n => z,
+        _ => {
+            let z: &'static Vec<u8> = Box::leak(Box::new(vec![0; n.max(16)]));
+            *g = Some(z);
+            z
+        }
+    }
 }
 
 /// Bytes after each of a program's own variables that a pointer may
@@ -192,6 +229,7 @@ impl Mem {
             heap: Heap::default(),
             lent: Vec::new(),
             scratch: Vec::new(),
+            scratch_len: 0,
         }
     }
 
@@ -247,9 +285,7 @@ impl Mem {
 
     /// Scratch storage of at least `n` bytes, for a pointer fault.
     pub fn scratch(&mut self, n: usize) {
-        if self.scratch.len() < n {
-            self.scratch.resize(n, 0);
-        }
+        self.scratch_len = self.scratch_len.max(n);
     }
 }
 
@@ -258,7 +294,8 @@ impl Index<usize> for Mem {
     fn index(&self, i: usize) -> &Vec<u8> {
         match self.get(i) {
             Some(b) => b,
-            None => &self.scratch,
+            None if self.scratch.len() >= self.scratch_len => &self.scratch,
+            None => zeros(self.scratch_len),
         }
     }
 }
@@ -268,6 +305,9 @@ impl IndexMut<usize> for Mem {
         if self.get(i).is_some() {
             self.get_mut(i).unwrap()
         } else {
+            if self.scratch.len() < self.scratch_len {
+                self.scratch = vec![0; self.scratch_len];
+            }
             &mut self.scratch
         }
     }
@@ -302,6 +342,7 @@ mod tests {
             act: 9,
             globals: 1,
             bufs: vec![vec![5, 6, 7]],
+            pulled: None,
         });
         assert_eq!(m[1], vec![3]);
         m[HEAP_BASE + h][2] = 8;

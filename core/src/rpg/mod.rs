@@ -894,9 +894,20 @@ async fn call_any(
     .await?
 }
 
-/// CALLPRC from a CL procedure: an RPG procedure the CL program is bound
-/// to (a module bound into it, or a service program), with values;
-/// returns the parameters' values after the call and the return value.
+/// What a bound call from outside RPG gives back: the parameters, the
+/// return value, the messages, and the result sets the procedure left
+/// (SET RESULT SETS).
+pub type CallOutput = (
+    Vec<data::Value>,
+    Option<data::Value>,
+    Vec<String>,
+    Vec<crate::sqlpl::ResultSet>,
+);
+
+/// CALLPRC from a CL procedure (and an external SQL procedure): an RPG
+/// procedure the CL program is bound to (a module bound into it, or a
+/// service program), with values; returns the parameters' values after
+/// the call and the return value.
 #[allow(clippy::too_many_arguments)]
 pub async fn call_procedure(
     database_url: &str,
@@ -908,7 +919,8 @@ pub async fn call_procedure(
     group: String,
     sym: String,
     args: Vec<data::Value>,
-) -> Result<(Vec<data::Value>, Option<data::Value>, Vec<String>)> {
+    cl: Option<ClContext>,
+) -> Result<CallOutput> {
     use crate::ile::Target;
     let rt = tokio::runtime::Handle::current();
     let url = database_url.to_string();
@@ -983,7 +995,7 @@ pub async fn call_procedure(
                 libl: libl.clone(),
                 job: job_id,
                 display: None,
-                cl: None,
+                cl,
                 callers: vec![],
                 database_url: url.clone(),
                 job_key: job_key.clone(),
@@ -1004,9 +1016,10 @@ pub async fn call_procedure(
             m.psds_start();
         }
         let globals = prog.globals.len();
+        interp::take_result_sets();
         let (back, ret) = m.call_exported(&sym, args)?;
         crate::ile::keep_activation(&job_key, &group, &unit, m.storage(globals));
-        Ok((back, ret, std::mem::take(&mut m.messages)))
+        Ok((back, ret, std::mem::take(&mut m.messages), interp::take_result_sets()))
     })
     .await?
 }

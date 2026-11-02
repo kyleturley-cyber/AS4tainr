@@ -228,7 +228,7 @@ impl<'a> Machine<'a> {
         self.ds_put(ds, from - 1, &b);
     }
 
-    fn ds_zoned(&mut self, ds: &str, from: usize, digits: u32, v: i64) {
+    pub(super) fn ds_zoned(&mut self, ds: &str, from: usize, digits: u32, v: i64) {
         let t = DType::Zoned(digits, 0);
         let mut b = t.initial();
         let v = v.rem_euclid(10i64.pow(digits));
@@ -785,7 +785,10 @@ impl<'a> Machine<'a> {
     /// the operation left them; the PSDS shows the exception.
     pub(super) fn note_error(&mut self, err: &anyhow::Error) -> u32 {
         if std::env::var("AS4TAINR_TRACE_ERRORS").is_ok() {
-            eprintln!("[handled in {}] {err:#}", self.prog.name);
+            eprintln!(
+                "[handled in {} at line {}] {err:#}",
+                self.prog.name, self.line
+            );
         }
         let code = status_code(err);
         if code < 1000 {

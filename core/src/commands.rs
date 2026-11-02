@@ -3705,7 +3705,12 @@ impl Job<'_> {
                 .to_string();
             let snap = crate::rpg::snapshot_option(self.client, &libl, &m.source, &options).await?;
             let options = format!("{options} {snap}").trim().to_string();
-            crate::rpg::compile_with(self.client, &libl, &name, &m.source, &options).await?;
+            // The ILE RPG compiler's listing and RNS9305, as CRTRPGMOD's
+            // (PUB400 2026-11-01, verify34 a34_crtsm).
+            let severity = self
+                .compile_rpg(cmd, &lib, &name, &m, &libl, &options, true)
+                .await?
+                .1;
             let text = match cmd.get("TEXT") {
                 "*SRCMBRTXT" => m.text.clone(),
                 "*BLANK" => String::new(),
@@ -3718,8 +3723,16 @@ impl Job<'_> {
             .await?;
             crate::ile::set_source(self.client, &lib, &name, "*MODULE", &m).await?;
             authority::set_owner(self.client, &lib, &name, "*MODULE", &self.user).await?;
+            let shown = if crate::qtemp::is_qtemp(&lib) {
+                "QTEMP".to_string()
+            } else {
+                lib.clone()
+            };
+            let mut data = crate::rpg::data::e(&format!("{name:<10}{shown:<10}"));
+            data.truncate(20);
+            self.calls.message_data = Some(data);
             return Ok(Outcome::Messages(vec![format!(
-                "Module {name} created in library {lib}."
+                "RNS9305: Module {name} was created in library {lib}; highest severity {severity:02}."
             )]));
         }
         if sql && cmd.get("OBJTYPE") != "*PGM" {

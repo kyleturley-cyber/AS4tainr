@@ -4892,7 +4892,7 @@ async fn command(
                 }
             }
             let job_name = job.id.as_ref().map(|i| i.to_string());
-            let (back, ret, messages) = crate::rpg::call_procedure(
+            let (back, ret, messages, _) = crate::rpg::call_procedure(
                 &job.env.database_url,
                 job.library_list(),
                 job.user.clone(),
@@ -4902,6 +4902,13 @@ async fn command(
                 pgm.actgrp.clone(),
                 prc,
                 args,
+                Some(crate::rpg::ClContext {
+                    env: job.env.clone(),
+                    curlib: job.curlib.clone(),
+                    user_libl: job.libl.clone(),
+                    overrides: job.calls.overrides.clone(),
+                    caller_group: Some(pgm.actgrp.clone()),
+                }),
             )
             .await?;
             msgs.extend(messages);

@@ -643,7 +643,14 @@ fn const_value(e: &Expr, syms: &HashMap<String, Sym>) -> Result<Value> {
         // compiled (ILE RPG Reference: both are allowed in definition
         // keywords such as INZ and DIM). %SIZE of an array is the size of
         // one element.
-        Expr::Bif(f, a) if (f == "SIZE" || f == "ELEM") && a.len() == 1 => {
+        // %SIZE(array:*ALL): the whole array.
+        Expr::Bif(f, a)
+            if (f == "SIZE" || f == "ELEM")
+                && (a.len() == 1
+                    || f == "SIZE"
+                        && a.len() == 2
+                        && matches!(&a[1], Expr::Name { parts, .. } if parts[0] == "*ALL")) =>
+        {
             let Expr::Name { parts, args: None } = &a[0] else {
                 bail!("%{f} needs the name of a defined item");
             };
@@ -654,7 +661,11 @@ fn const_value(e: &Expr, syms: &HashMap<String, Sym>) -> Result<Value> {
                 Some(Sym::Const(Value::Char(c))) if f == "SIZE" => (c.len(), 0),
                 _ => bail!("%{f}({name}): {name} is not defined before it is used"),
             };
-            let n = if f == "SIZE" { size as i64 } else { dim as i64 };
+            let n = match (f.as_str(), a.len()) {
+                ("SIZE", 2) => (size * dim.max(1) as usize) as i64,
+                ("SIZE", _) => size as i64,
+                _ => dim as i64,
+            };
             Value::Num(Dec::from_i64(n))
         }
         // %LEN of a defined item of fixed length: its length in
@@ -704,6 +715,26 @@ fn const_value(e: &Expr, syms: &HashMap<String, Sym>) -> Result<Value> {
                 }
                 _ => bail!("%DECPOS({name}): it is not a numeric item defined before it is used"),
             }
+        }
+        // %DIV and %REM of constants (ILE RPG Reference: both are allowed
+        // in definitions; XMLSERVICE's SBMNBR is %DIV(%SIZE(..):%SIZE(..))).
+        Expr::Bif(f, a) if (f == "DIV" || f == "REM") && a.len() == 2 => {
+            let (l, r) = (
+                const_value(&a[0], syms)?.num()?,
+                const_value(&a[1], syms)?.num()?,
+            );
+            Value::Num(if f == "DIV" {
+                l.trunc().div_scale(&r.trunc(), 0)?
+            } else {
+                l.trunc().rem(&r.trunc())?
+            })
+        }
+        // %UCS2 or %CHAR of a literal: the literal, converted when it is
+        // stored in the field it initializes.
+        Expr::Bif(f, a)
+            if (f == "UCS2" || f == "CHAR") && a.len() == 1 && matches!(a[0], Expr::Str(_)) =>
+        {
+            const_value(&a[0], syms)?
         }
         Expr::Bin(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), l, r) => {
             let (l, r) = (const_value(l, syms)?.num()?, const_value(r, syms)?.num()?);
@@ -1412,6 +1443,22 @@ impl Binder<'_> {
             if matches!(&v, Err(t) if t.trim().eq_ignore_ascii_case("*LIKEDS")) {
                 continue;
             }
+            // A hexadecimal literal for a numeric field of its size: its
+            // bytes (XMLSERVICE's INZ(X'FFFFFFFF') on a 10U 0 field).
+            if let (Err(text), Some(Sym::Var(var))) = (&v, self.syms.get(&name).cloned()) {
+                let t = text.trim();
+                if var.dtype.is_numeric() && (t.starts_with("X'") || t.starts_with("x'")) {
+                    if let Ok(Value::Char(bytes)) = literal_value(t, &self.syms) {
+                        if bytes.len() == var.dtype.size() {
+                            for k in 0..var.dim.max(1) as usize {
+                                let at = var.off + k * var.stride;
+                                self.bufs[var.buf][at..at + bytes.len()].copy_from_slice(&bytes);
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
             let v = match v {
                 Ok(v) => v,
                 Err(text) => literal_value(&text, &self.syms)?,
@@ -1426,7 +1473,8 @@ impl Binder<'_> {
                         out,
                         data::Fit::Strict { half_adjust: false },
                         false,
-                    )?;
+                    )
+                    .map_err(|e| anyhow!("INZ of {name}: {e}"))?;
                 }
             }
         }
@@ -1585,8 +1633,17 @@ impl Binder<'_> {
             }
             if let Some(a) = k.args.first().filter(|a| !a.is_empty()) {
                 // A value that names something not defined yet is worked
-                // out once all definitions are in.
-                let v = literal_value(a, &self.syms).map_err(|_| a.clone());
+                // out once all definitions are in (a hexadecimal literal
+                // too: for a numeric field it gives the bytes).
+                let hex = a
+                    .trim_start()
+                    .get(..2)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("X'"));
+                let v = if hex {
+                    Err(a.clone())
+                } else {
+                    literal_value(a, &self.syms).map_err(|_| a.clone())
+                };
                 self.inz.push((name.to_string(), v));
             }
         }
@@ -2887,6 +2944,9 @@ pub fn bind(
         .filter(|p| called(&p.name) || via_overload.contains(&p.name))
         .filter_map(|p| p.extproc.clone())
         .map(|t| t.to_ascii_uppercase())
+        // A Java method (EXTPROC(*JAVA:class:method)) is no import: the
+        // JVM finds it when it is called (there is none here).
+        .filter(|t| !t.starts_with('*'))
         .filter(|t| !procs.contains_key(t) && !SYSTEM_PROCEDURES.contains(&t.as_str()))
         .collect();
     imports.sort();

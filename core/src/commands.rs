@@ -543,6 +543,8 @@ impl Job<'_> {
         if let Some(o) = Box::pin(self.objdesc_command(&cmd)).await? {
             return Ok(o);
         }
+        // The commands' futures are boxed too (see above).
+        Box::pin(async {
         match cmd.def.name {
             "CRTLIB" => self.crtlib(&cmd).await,
             "CHGLIB" => self.chglib(&cmd).await,
@@ -706,6 +708,8 @@ impl Job<'_> {
             }
             "WRKSYSSTS" => self.wrksyssts().await,
             "PWRDWNSYS" => self.pwrdwnsys(&cmd).await,
+            "SNDBRKMSG" => self.sndbrkmsg(&cmd).await,
+            "DSPRCDLCK" => self.dsprcdlck(&cmd).await,
             "DSPLOG" => self.dsplog(&cmd).await,
             "EDTLIBL" => {
                 if self.display.is_none() {
@@ -746,6 +750,8 @@ impl Job<'_> {
             "CPYSPLF" => self.cpysplf(&cmd).await,
             other => bail!("CPD0030: Command {other} is not implemented yet."),
         }
+        })
+        .await
     }
 
     async fn crtlib(&mut self, cmd: &Command) -> Result<Outcome> {
@@ -7208,6 +7214,107 @@ impl Job<'_> {
             refresh: Some("WRKSYSSTS".into()),
             ..Default::default()
         }))
+    }
+
+    /// DSPRCDLCK (CL reference): the record locks on a physical file's
+    /// member (of a logical file, its physical file's): each record
+    /// locked or waited for, the job, its status (HELD or WAIT) and the
+    /// lock (*UPDATE: a read for update). as4tainr's own layout.
+    async fn dsprcdlck(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (libs, name) = self.search(cmd.get("FILE"));
+        let f = catalog::resolve_file(self.client, &libs, &name).await?;
+        let (l, pf) = catalog::physical_file_of(self.client, &f.library, &f.file.name).await?;
+        let only = match cmd.get("RCDNBR").trim().to_ascii_uppercase().as_str() {
+            "*ALL" | "" => None,
+            n => Some(
+                n.parse::<i64>()
+                    .map_err(|_| anyhow!("CPD0084: RCDNBR({n}) is not a record number."))?,
+            ),
+        };
+        let locks = crate::rla::record_locks(self.client, &format!("{l}/{pf}")).await?;
+        let fmt = |r: &str, j: &str, st: &str, ty: &str| format!("{r:>10}  {j:<28}  {st:<6}  {ty}");
+        let rows: Vec<String> = locks
+            .iter()
+            .filter(|(r, _, _)| only.is_none_or(|n| n == *r))
+            .map(|(r, j, held)| {
+                fmt(
+                    &r.to_string(),
+                    j,
+                    if *held { "HELD" } else { "WAIT" },
+                    "*UPDATE",
+                )
+            })
+            .collect();
+        let rows = if rows.is_empty() {
+            vec!["(No record locks.)".to_string()]
+        } else {
+            rows
+        };
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display Member Record Locks".into(),
+            info: vec![
+                ("File".into(), pf.clone()),
+                ("Library".into(), crate::qtemp::logical(&l)),
+                ("Member".into(), pf.clone()),
+            ],
+            heading: fmt("Record", "Job", "Status", "Lock"),
+            rows,
+            refresh: Some(format!(
+                "DSPRCDLCK FILE({}/{})",
+                crate::qtemp::logical(&l),
+                pf
+            )),
+            ..Default::default()
+        }))
+    }
+
+    /// SNDBRKMSG (CL reference): a message shown at once on display
+    /// stations, over what they show: *ALLWS or the devices named
+    /// (QPADEV0001...). Sent to the server's sessions through the database
+    /// (as PWRDWNSYS is); not kept on a workstation message queue.
+    async fn sndbrkmsg(&mut self, cmd: &Command) -> Result<Outcome> {
+        if !cmd.get("MSGTYPE").trim().eq_ignore_ascii_case("*INFO")
+            && !cmd.get("MSGTYPE").trim().is_empty()
+        {
+            bail!(
+                "MSGTYPE({}) is not supported yet: break messages are *INFO here.",
+                cmd.get("MSGTYPE")
+            );
+        }
+        let to: Vec<String> = cmd
+            .list("TOMSGQ")
+            .iter()
+            .map(|q| {
+                let q = q.trim().to_ascii_uppercase();
+                q.rsplit('/').next().unwrap_or(&q).to_string()
+            })
+            .filter(|q| !q.is_empty())
+            .collect();
+        let to = if to.is_empty() {
+            vec!["*ALLWS".to_string()]
+        } else {
+            to
+        };
+        let text = cmd.get("MSG").trim().trim_matches('\'').replace("''", "'");
+        let st = crate::report::Stamp::now();
+        let m = jobs::BreakMessage {
+            to,
+            from: self.user.clone(),
+            sent: format!("{} {}", st.date, st.time),
+            text,
+        };
+        if jobs::power_down_listeners(self.client).await? == 0 {
+            // No server of this database: this process's sessions only.
+            jobs::deliver_break(m);
+        } else {
+            self.client
+                .execute(
+                    "SELECT pg_notify($1, $2)",
+                    &[&jobs::BREAK_CHANNEL, &serde_json::to_string(&m)?],
+                )
+                .await?;
+        }
+        Ok(Outcome::Messages(vec!["Break message sent.".into()]))
     }
 
     /// PWRDWNSYS (CL reference): end the system. The system here is the

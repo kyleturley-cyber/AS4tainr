@@ -1028,8 +1028,49 @@ impl PowerDown {
     }
 }
 
+/// The notification channel SNDBRKMSG sends on.
+pub const BREAK_CHANNEL: &str = "as4tainr_brkmsg";
+
+/// A break message (SNDBRKMSG): shown at once on the display sessions it
+/// is for, over what they show.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BreakMessage {
+    /// *ALLWS, or the display devices' names.
+    pub to: Vec<String>,
+    pub from: String,
+    pub sent: String,
+    pub text: String,
+}
+
+impl BreakMessage {
+    /// Is it for the display device `device`?
+    pub fn is_for(&self, device: &str) -> bool {
+        self.to
+            .iter()
+            .any(|t| t == "*ALLWS" || t.eq_ignore_ascii_case(device))
+    }
+}
+
+static BREAKS: std::sync::OnceLock<tokio::sync::broadcast::Sender<BreakMessage>> =
+    std::sync::OnceLock::new();
+
+fn breaks() -> &'static tokio::sync::broadcast::Sender<BreakMessage> {
+    BREAKS.get_or_init(|| tokio::sync::broadcast::channel(64).0)
+}
+
+/// A display session's receiver of break messages.
+pub fn break_receiver() -> tokio::sync::broadcast::Receiver<BreakMessage> {
+    breaks().subscribe()
+}
+
+/// Give a break message to this process's display sessions.
+pub fn deliver_break(m: BreakMessage) {
+    let _ = breaks().send(m);
+}
+
 /// The server waits here for PWRDWNSYS (a PostgreSQL notification, so a
-/// PWRDWNSYS from any process of the system reaches it).
+/// PWRDWNSYS from any process of the system reaches it); break messages
+/// (SNDBRKMSG) on the same connection go to the display sessions.
 pub async fn wait_for_power_down(database_url: &str) -> Result<PowerDown> {
     use futures_util::StreamExt;
     let (client, mut conn) = tokio_postgres::connect(database_url, tokio_postgres::NoTls).await?;
@@ -1039,7 +1080,13 @@ pub async fn wait_for_power_down(database_url: &str) -> Result<PowerDown> {
         while let Some(m) = stream.next().await {
             match m {
                 Ok(tokio_postgres::AsyncMessage::Notification(n)) => {
-                    let _ = tx.send(n.payload().to_string());
+                    if n.channel() == BREAK_CHANNEL {
+                        if let Ok(m) = serde_json::from_str::<BreakMessage>(n.payload()) {
+                            deliver_break(m);
+                        }
+                    } else {
+                        let _ = tx.send(n.payload().to_string());
+                    }
                 }
                 Ok(_) => {}
                 Err(_) => break,
@@ -1048,7 +1095,7 @@ pub async fn wait_for_power_down(database_url: &str) -> Result<PowerDown> {
     });
     client
         .batch_execute(&format!(
-            "SET application_name = '{POWER_DOWN_LISTENER}'; LISTEN {POWER_DOWN_CHANNEL}"
+            "SET application_name = '{POWER_DOWN_LISTENER}'; LISTEN {POWER_DOWN_CHANNEL}; LISTEN {BREAK_CHANNEL}"
         ))
         .await?;
     loop {

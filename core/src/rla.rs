@@ -124,6 +124,25 @@ async fn lock_holder(client: &Client, lock_name: &str, rrn: i64) -> Option<Strin
     }
 }
 
+/// The record locks on a physical file (DSPRCDLCK): record number, the
+/// job's name (its session's application_name), and whether it holds
+/// the lock (false: it waits for it), by record number.
+pub async fn record_locks(client: &Client, lock_name: &str) -> Result<Vec<(i64, String, bool)>> {
+    Ok(client
+        .query(
+            "SELECT l.objid::bigint, a.application_name, l.granted
+               FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+              WHERE l.locktype = 'advisory' AND l.objsubid = 2
+                AND l.classid = (hashtext($1)::bigint & 4294967295)::oid
+              ORDER BY 1, 3 DESC, 2",
+            &[&lock_name],
+        )
+        .await?
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect())
+}
+
 enum Dir {
     Forward,
     Backward,

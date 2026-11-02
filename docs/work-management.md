@@ -46,6 +46,7 @@ Batch programs run without a display: `EXFMT` in a batch job fails, as it does o
 | `DSPJOBLOG JOB(*)` or `JOB(number/user/name)` | A job's log: the commands it ran (`>`) and the messages they sent |
 | `ENDJOB JOB(number/user/name)` | Ends a job that is still on the job queue |
 | `SNDMSG MSG('...') TOUSR(user)` | Sends a message to a user's message queue (`*SYSOPR` goes to `QSYSOPR`) |
+| `SNDBRKMSG MSG('...') TOMSGQ(*ALLWS)` | A message shown at once on every display station (or those named: QPADEV0001...), over what they show; Enter goes back |
 | `DSPMSG` or `DSPMSG MSGQ(lib/queue)` | Shows your messages (or a message queue's), and marks your own as read |
 | `RTVJOBA JOB(&j) NBR(&n) USER(&u) SWS(&s) DATFMT(&f) ...` | In CL programs: the job's name, number and user, and its attributes as DSPJOB shows them (with CHGJOB's changes): every return variable of the CL reference |
 | `CHGJOB JOB(*) SWS(10XXXXX1) DATFMT(*YMD) INQMSGRPY(*DFT) LOG(...) ...` | Changes this job's attributes (`jobattr.rs`, kept in the process by job); values checked as the CL reference lists them (a value that is not valid: a diagnostic and CPF0006, nothing changed), *SYSVAL resolved when the command runs, X in SWS leaving a switch as it is; DEVRCYACN and TSEPOOL only for an interactive job (CPF1334), RUNPTY and the other run attributes only with *JOBCTL (CPF1337). DSPJOB and RTVJOBA show the changes. `%SWITCH(mask)` in CL tests the job switches; an RPG program's U1-U8 are the switches when it starts and become them when it ends with LR on |

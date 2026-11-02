@@ -1954,6 +1954,25 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[],
     },
     CommandDef {
+        name: "SNDBRKMSG",
+        description: "Send Break Message",
+        params: &[
+            p("MSG", Kind::Text, true, None, "Message text").ch("Text"),
+            p("TOMSGQ", Kind::List, false, Some("*ALLWS"), "To work station message queue")
+                .ch("Name, *ALLWS"),
+            p("MSGTYPE", Kind::Name, false, Some("*INFO"), "Message type").ch("*INFO"),
+        ],
+    },
+    CommandDef {
+        name: "DSPRCDLCK",
+        description: "Display Record Locks",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "Physical file").ch("Name"),
+            p("MBR", Kind::Name, false, Some("*FIRST"), "Member").ch("Name, *FIRST"),
+            p("RCDNBR", Kind::Text, false, Some("*ALL"), "Record number").ch("Number, *ALL"),
+        ],
+    },
+    CommandDef {
         name: "PWRDWNSYS",
         description: "Power Down System",
         params: &[
@@ -4595,6 +4614,8 @@ pub static GROUPS: &[Group] = &[
             "DSPJOBLOG",
             "ENDJOB",
             "SNDMSG",
+            "SNDBRKMSG",
+            "DSPRCDLCK",
             "DSPMSG",
             "CRTMSGQ",
             "DLTMSGQ",

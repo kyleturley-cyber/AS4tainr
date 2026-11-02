@@ -51,6 +51,10 @@ mod seu_screen;
 
 struct Term {
     conn: Connection,
+    /// The display device's name (QPADEV0001...).
+    device: String,
+    /// Break messages (SNDBRKMSG, PWRDWNSYS) for this process's sessions.
+    breaks: tokio::sync::broadcast::Receiver<crate::jobs::BreakMessage>,
 }
 
 impl Term {
@@ -58,8 +62,53 @@ impl Term {
         self.conn
             .send_record(opcode::PUT_GET, &s.to_stream())
             .await?;
-        let data = self.conn.read_record().await?;
-        Ok(ds::parse_input(&data, s))
+        loop {
+            tokio::select! {
+                data = self.conn.read_record() => return Ok(ds::parse_input(&data?, s)),
+                m = self.breaks.recv() => {
+                    let Ok(m) = m else { continue };
+                    if !m.is_for(&self.device) {
+                        continue;
+                    }
+                    // A break message interrupts the display: shown over
+                    // it until Enter, then the display again (what was
+                    // typed on it before is gone).
+                    self.break_message(&m).await?;
+                    self.conn
+                        .send_record(opcode::PUT_GET, &s.to_stream())
+                        .await?;
+                }
+            }
+        }
+    }
+
+    /// A break message on its own display (as4tainr's layout).
+    async fn break_message(&mut self, m: &crate::jobs::BreakMessage) -> Result<()> {
+        let mut s = Screen::new();
+        centered(&mut s, 1, "Break Message");
+        s.put(3, 2, &format!("From . . . :   {:<10}  {}", m.from, m.sent));
+        let mut row = 5u8;
+        let mut line = String::new();
+        for w in m.text.split(' ') {
+            if !line.is_empty() && line.len() + 1 + w.len() > 76 {
+                s.put(row, 4, &line);
+                row += 1;
+                line.clear();
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(w);
+        }
+        if !line.is_empty() && row < 20 {
+            s.put(row, 4, &line);
+        }
+        s.text(22, 2, attr::HIGH, "Press Enter to continue.");
+        self.conn
+            .send_record(opcode::PUT_GET, &s.to_stream())
+            .await?;
+        self.conn.read_record().await?;
+        Ok(())
     }
 }
 
@@ -126,7 +175,11 @@ pub async fn run(stream: tokio::net::TcpStream, cfg: &ServerConfig, device: &str
     let mut conn = Connection::new(stream);
     conn.negotiate().await?;
     eprintln!("as4tainr: {device}: terminal type {}", conn.terminal_type);
-    let mut term = Term { conn };
+    let mut term = Term {
+        conn,
+        device: device.to_string(),
+        breaks: crate::jobs::break_receiver(),
+    };
     let client = runtime::connect_db(&cfg.env.database_url).await?;
     let mut message = String::new();
     let mut attempts = 0;

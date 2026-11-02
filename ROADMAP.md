@@ -258,6 +258,7 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] verify37: CPYFRMIMPF's RCDDLM(*EOR) default with a stream file is CPF2845 reason code 11
 - [x] CHGSYSVAL (date and time formats, decimal format, currency sign, printer, sign-on and password values), kept across processes; CPYFRMIMPF completion CPC2959 (verify38)
 - [x] PWRDWNSYS (*CNTRLD/*IMMED, DELAY, RESTART) ends or restarts the server; GO LICPGM with IBM's option numbers, RSTLICPGM/DLTLICPGM/SAVLICPGM explain, DSPSFWRSC lists the products as4tainr provides
+- [x] SNDBRKMSG (break messages over the display), PWRDWNSYS warns signed-on users, DSPRCDLCK
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).
 - [x] Journals and trigger programs: COM's SETUPJRN, ORDAUDJV (QSYS2.DISPLAY_JOURNAL) and ORDTRG (ADDPFTRG) run (docs/journals.md).

@@ -724,6 +724,19 @@ async fn power_down(database_url: &str, pd: &as4tainr_core::jobs::PowerDown) -> 
     use as4tainr_core::jobs;
     println!("as4tainr: PWRDWNSYS {}: the system is ending", pd.payload());
     jobs::ENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+    // The signed-on users are told (a break message on every display).
+    let st = as4tainr_core::report::Stamp::now();
+    jobs::deliver_break(jobs::BreakMessage {
+        to: vec!["*ALLWS".into()],
+        from: "QSYS".into(),
+        sent: format!("{} {}", st.date, st.time),
+        text: if pd.restart {
+            "The system is ending and will start again. Sign off now; you can sign on again when it is back.".into()
+        } else {
+            "The system is ending. Sign off now.".into()
+        },
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     if !pd.immediate {
         let client = runtime::connect_db(database_url).await?;
         if !jobs::wait_for_batch_jobs(&client, pd.delay).await? {

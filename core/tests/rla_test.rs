@@ -23923,3 +23923,109 @@ async fn power_down_system_reaches_the_server() {
         }
     );
 }
+
+/// SNDBRKMSG (IBM i CL reference): a break message for display stations,
+/// all (*ALLWS) or those named, from the user who sent it.
+#[tokio::test]
+async fn break_message_to_display_stations() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::jobs;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let mut rx = jobs::break_receiver();
+    let text = format!("Back up {lib} now");
+    job.run(&format!("SNDBRKMSG MSG('{text}') TOMSGQ(QPADEV0042)"))
+        .await
+        .unwrap();
+    let m = loop {
+        let m = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if m.text == text {
+            break m;
+        }
+    };
+    assert_eq!(m.from, "QSECOFR");
+    assert!(m.is_for("QPADEV0042") && !m.is_for("QPADEV0001"));
+    let all = jobs::BreakMessage {
+        to: vec!["*ALLWS".into()],
+        ..m
+    };
+    assert!(all.is_for("QPADEV0001"));
+}
+
+/// DSPRCDLCK (IBM i CL reference): the records of a file locked by a
+/// read for update, with the job holding each (here the job name a
+/// program's database session carries, as CPF5027 names it).
+#[tokio::test]
+async fn display_record_locks() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let holder = format!("000077/QSECOFR/K{}", &lib[1..]);
+    let a = runtime::connect_db(&url).await.unwrap();
+    runtime::job_session(&a, Some(&holder), std::time::Duration::from_millis(500))
+        .await
+        .unwrap();
+    let f = catalog::resolve_file(&a, std::slice::from_ref(&lib), "CUSTMAST")
+        .await
+        .unwrap();
+    let mut fa = rla::OpenFile::new(f).for_update(format!("{lib}/CUSTMAST"));
+    let r = fa.chain(&a, &["2".to_string()]).await.unwrap();
+    let r = fa.lock_after_read(&a, r, true, None).await.unwrap();
+    let rrn = r.rrn.unwrap();
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    match job
+        .run(&format!("DSPRCDLCK FILE({lib}/CUSTMAST)"))
+        .await
+        .unwrap()
+    {
+        Outcome::Display(d) => {
+            assert!(
+                d.rows
+                    .iter()
+                    .any(|r| r.trim_start().starts_with(&rrn.to_string())
+                        && r.contains(&holder)
+                        && r.contains("HELD")),
+                "{:?}",
+                d.rows
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    fa.release(&a).await.unwrap();
+    match job
+        .run(&format!("DSPRCDLCK FILE({lib}/CUSTMAST)"))
+        .await
+        .unwrap()
+    {
+        Outcome::Display(d) => assert!(!d.rows.iter().any(|r| r.contains(&holder)), "{:?}", d.rows),
+        other => panic!("{other:?}"),
+    }
+}

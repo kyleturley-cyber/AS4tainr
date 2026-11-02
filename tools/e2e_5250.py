@@ -493,6 +493,16 @@ with Tn5250(HOST) as t:
         command(t, "dspmsg", "Display Messages")
         check("Report is ready" in t.text() and "From  . . . :   BOB" in t.text(), "DSPMSG shows BOB's message", t)
         t.fkey(3); t.wait_for("Command Entry")
+        # SNDBRKMSG (CL reference): a break message is shown at once on
+        # the display stations (*ALLWS), over what they show; Enter goes
+        # back to it.
+        command(t, "sndbrkmsg msg('Lunch in the break room') tomsgq(*allws)", "Lunch in the break room")
+        t2.wait_for("Lunch in the break room")
+        check("QSECOFR" in t2.text() and "Command Entry" not in t2.text(),
+              "SNDBRKMSG interrupts another session's display with the message", t2)
+        t2.enter(); t2.wait_for("Command Entry")
+        t.enter(); t.wait_for("Command Entry")
+        check("Break message sent." in t.text(), "the sender's display comes back after the message", t)
         # Record locks: QSECOFR changes customer 3, which locks its record
         # until the change is made; BOB's CHAIN of it waits.
         command(t, "call custmnt", "Change Customer", timeout=90)

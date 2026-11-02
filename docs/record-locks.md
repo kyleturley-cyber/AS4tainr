@@ -39,4 +39,6 @@ Sign on twice and `CALL CUSTMNT` in both sessions. When the second session asks 
 
 - SQL statements (`STRSQL`, `RUNSQL`) and CL commands do not wait for record locks, and they do not take any.
 - In free-form RPG, the `N` and `E` extenders and `UNLOCK` are not seen yet: free-form reads of update files always lock and never set an error indicator.
-- Commitment control (locks held to `COMMIT`), `WAITRCD` per file (OVRDBF WAITRCD is accepted and ignored), and `DSPRCDLCK`/`WRKOBJLCK`.
+- Commitment control (locks held to `COMMIT`), `WAITRCD` per file (OVRDBF WAITRCD is accepted and ignored), and `WRKOBJLCK`.
+
+`DSPRCDLCK FILE(lib/file)` lists the records locked (and waited for) with the job of each, its status (HELD or WAIT) and the lock (*UPDATE).

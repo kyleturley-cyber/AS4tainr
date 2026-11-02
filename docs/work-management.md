@@ -37,10 +37,15 @@ Batch programs run without a display: `EXFMT` in a batch job fails, as it does o
 | `DSPJOB` | The job's definition, status and run attributes, call stack, library list, activation groups and environment variables (OPTION `*DFNA`, `*STSA`, `*RUNA`, `*PGMSTK`, `*LIBL`, `*ACTGRP`, `*ENVVAR`; `*SELECT` and `*ALL` give them all), printed in IBM i 7.5's layout with OUTPUT(*PRINT) (spooled file QPDSPJOB; under PASE `system` written out), or listed on the display |
 | `WRKACTJOB` | Active jobs by subsystem, with what each is doing: `CMD-WRKACTJOB`, `PGM-ORDENT`, status `RUN`, `DSPW` (waiting at the display) or `LCKW` (waiting for a record lock, see [record-locks.md](record-locks.md)). Option 5 shows the job log, and F5 refreshes |
 | `WRKSBMJOB` | Jobs you submitted: `JOBQ` (waiting), `ACTIVE`, `OUTQ` (ended). Option 4 ends a job that has not started, option 5 shows its log, F5 refreshes |
+| `WRKJOB JOB(*) OPTION(*SELECT)` | On a display, a menu of what can be shown about your job (1 status, 2 definition, 3 run attributes, 4 spooled files, 10 job log, 11 call stack, 13 library list, 18 activation groups); another OPTION shows that display; another job or OUTPUT(*PRINT) shows all of DSPJOB |
+| `HLDJOB JOB(...)`, `RLSJOB JOB(...)`, `SBMJOB ... HOLD(*YES)` | Hold a job on its job queue (QBATCH passes it by) and release it; WRKSBMJOB options 3 and 6 |
+| `WRKSYSSTS`, `DSPLOG` | The system's status (jobs, processor use, database size) and the history log: each job's start and end |
+| `WRKUSRJOB USER(*) STATUS(*ALL)` | A user's jobs (`*JOBQ`, `*ACTIVE`, `*OUTQ` or all); option 4 ends, 5 works with the job, 10 shows its log |
+| `WRKMSGQ MSGQ(*ALL)` | Message queues on the library list or in a library, by name or generic name: queues made with CRTMSGQ and the user profiles' queues; option 5 shows the messages, 4 deletes a queue |
 | `DSPJOBLOG JOB(*)` or `JOB(number/user/name)` | A job's log: the commands it ran (`>`) and the messages they sent |
 | `ENDJOB JOB(number/user/name)` | Ends a job that is still on the job queue |
 | `SNDMSG MSG('...') TOUSR(user)` | Sends a message to a user's message queue (`*SYSOPR` goes to `QSYSOPR`) |
-| `DSPMSG` | Shows your messages, newest first, and marks them as read |
+| `DSPMSG` or `DSPMSG MSGQ(lib/queue)` | Shows your messages (or a message queue's), and marks your own as read |
 | `RTVJOBA JOB(&j) NBR(&n) USER(&u) SWS(&s) DATFMT(&f) ...` | In CL programs: the job's name, number and user, and its attributes as DSPJOB shows them (with CHGJOB's changes): every return variable of the CL reference |
 | `CHGJOB JOB(*) SWS(10XXXXX1) DATFMT(*YMD) INQMSGRPY(*DFT) LOG(...) ...` | Changes this job's attributes (`jobattr.rs`, kept in the process by job); values checked as the CL reference lists them (a value that is not valid: a diagnostic and CPF0006, nothing changed), *SYSVAL resolved when the command runs, X in SWS leaving a switch as it is; DEVRCYACN and TSEPOOL only for an interactive job (CPF1334), RUNPTY and the other run attributes only with *JOBCTL (CPF1337). DSPJOB and RTVJOBA show the changes. `%SWITCH(mask)` in CL tests the job switches; an RPG program's U1-U8 are the switches when it starts and become them when it ends with LR on |
 

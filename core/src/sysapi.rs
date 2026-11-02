@@ -49,6 +49,7 @@ pub fn is_api(name: &str) -> bool {
                 | "QUSRJOBI"
                 | "QSZRTVPR"
                 | "QWDRJOBD"
+                | "QWCRSSTS"
         )
 }
 
@@ -68,6 +69,7 @@ pub fn receiver_first(name: &str) -> bool {
             | "QUSRJOBI"
             | "QSZRTVPR"
             | "QWDRJOBD"
+            | "QWCRSSTS"
     )
 }
 
@@ -97,6 +99,7 @@ pub async fn call_api(
         "QUSRJOBI" => (job_information(caller, args), 5),
         "QSZRTVPR" => (product_information(args), 4),
         "QWDRJOBD" => (job_description(client, caller, args).await, 4),
+        "QWCRSSTS" => (system_status(client, args).await, 4),
         _ => bail!("{name} is not a system API done here."),
     };
     crate::dtaq::error_code(args, Some(ec), r)
@@ -156,6 +159,18 @@ fn give(args: &mut dyn ApiArgs, mut r: Vec<u8>) -> Result<()> {
 /// value. as4tainr knows SYSNAME, LCLCPNAME and LCLLOCNAME (the system's
 /// name), LCLNETID (APPN), PNDSYSNAME (blanks) and DFTMODE (BLANK); other
 /// attributes come back with no data (docs/fidelity-gaps.md).
+/// The network attributes as4tainr has (QWCRNETA, DSPNETA), as 8
+/// characters; None for the others.
+pub fn network_attribute(name: &str, sys: &str) -> Option<String> {
+    match name {
+        "SYSNAME" | "LCLCPNAME" | "LCLLOCNAME" => Some(format!("{sys:<8}")),
+        "PNDSYSNAME" => Some(" ".repeat(8)),
+        "LCLNETID" => Some(format!("{:<8}", "APPN")),
+        "DFTMODE" => Some(format!("{:<8}", "BLANK")),
+        _ => None,
+    }
+}
+
 fn network_attributes(args: &mut dyn ApiArgs) -> Result<()> {
     need(args, 5)?;
     let len = args.num(1)?.max(0) as usize;
@@ -167,13 +182,7 @@ fn network_attributes(args: &mut dyn ApiArgs) -> Result<()> {
         let nm = a(names.get(k * 10..k * 10 + 10).unwrap_or(&[]))
             .trim()
             .to_ascii_uppercase();
-        let value: Option<String> = match nm.as_str() {
-            "SYSNAME" | "LCLCPNAME" | "LCLLOCNAME" => Some(format!("{sys:<8}")),
-            "PNDSYSNAME" => Some(" ".repeat(8)),
-            "LCLNETID" => Some(format!("{:<8}", "APPN")),
-            "DFTMODE" => Some(format!("{:<8}", "BLANK")),
-            _ => None,
-        };
+        let value = network_attribute(&nm, &sys);
         let data = value.map(|v| e(&v)).unwrap_or_default();
         let mut entry = field(&nm, 10);
         entry.extend_from_slice(&e("C "));
@@ -986,7 +995,8 @@ async fn file_description(client: &Client, caller: &Caller, args: &mut dyn ApiAr
 /// wait 30, purge *YES. JOBI0700: the same name part, then the number of
 /// system, product, current and user libraries and the library list
 /// (CHAR(11) each), as DSPLIBL shows it. JOBI0400: the job's
-/// attributes (decimal format, date format and separators...). Other
+/// attributes (decimal format, date format and separators...). JOBI0600:
+/// the current user, no subsystem, switches and return codes zero. Other
 /// formats are CPF3C21.
 fn job_information(caller: &Caller, args: &mut dyn ApiArgs) -> Result<()> {
     need(args, 5)?;
@@ -1113,7 +1123,86 @@ fn job_information(caller: &Caller, args: &mut dyn ApiArgs) -> Result<()> {
             o.extend(field("*PND", 10)); // job log output (t13)
             o.extend(field("*SYSBAS", 10)); // job description library ASP group (t13)
         }
+        "JOBI0600" => {
+            // From offset 62: job switches, end status, subsystem, current
+            // user, keys, return codes, special environment, device, group
+            // profiles, job user identity, client IP address, time zone.
+            o.truncate(62);
+            o.extend(field("00000000", 8)); // job switches
+            o.extend(field("0", 1)); // end status: not ending
+            o.extend(field("", 10)); // subsystem description
+            o.extend(field("", 10)); // its library
+            o.extend(field(&caller.user, 10)); // current user profile
+            o.extend(field("0", 1)); // DBCS-capable
+            o.extend(field("0", 1)); // exit key
+            o.extend(field("0", 1)); // cancel key
+            o.extend_from_slice(&bin4(0)); // product return code
+            o.extend_from_slice(&bin4(0)); // user return code
+            o.extend_from_slice(&bin4(0)); // program return code
+            o.extend(field("*NONE", 10)); // special environment
+            o.extend(field("", 10)); // device name
+            o.extend(field("*NONE", 10)); // group profile
+            o.extend(field("", 150)); // supplemental group profiles
+            o.extend(field(&caller.user, 10)); // job user identity
+            o.extend(field("", 1)); // job user identity setting
+            o.extend(field("", 15)); // client IP address
+            o.extend(field("", 2)); // reserved
+            o.extend_from_slice(&bin4(0)); // offset to time zone information
+            o.extend_from_slice(&bin4(0)); // its length
+        }
         f => bail!("CPF3C21: Format name {f} is not valid."),
+    }
+    give(args, o)
+}
+
+/// QWCRSSTS (receiver, length, SSTS0100, reset status statistics, error
+/// code) (Retrieve System Status API): SSTS0100's 80 bytes: the current
+/// date and time as a system timestamp (*DTS), the system name, then
+/// fourteen counts of jobs. Counted from as4tainr's jobs: users signed
+/// on (active interactive jobs), batch jobs running, batch jobs waiting
+/// to run (on a job queue); the counts as4tainr has no such jobs for
+/// (users signed off or suspended, jobs held or waiting for messages,
+/// jobs on held or unassigned job queues, printer output waiting) are 0.
+/// Other formats (SSTS0200-0500) are CPF3C21; the reset is accepted.
+async fn system_status(client: &Client, args: &mut dyn ApiArgs) -> Result<()> {
+    need(args, 4)?;
+    let format = text(args, 2);
+    if format != "SSTS0100" {
+        bail!("CPF3C21: Format name {format} is not valid.");
+    }
+    // *DTS: microseconds since 1928-08-23 12:03:06.314752 UTC, shifted
+    // left 12 bits (as usrspc.rs's save timestamps).
+    let row = client
+        .query_one(
+            "SELECT (EXTRACT(EPOCH FROM (now()
+                     - timestamptz '1928-08-23 12:03:06.314752+00')) * 1000000)::bigint,
+                    count(*) FILTER (WHERE type = 'INT' AND status = 'ACTIVE'),
+                    count(*) FILTER (WHERE type = 'BCH' AND status = 'ACTIVE'),
+                    count(*) FILTER (WHERE type = 'BCH' AND status = 'JOBQ')
+               FROM as4tainr.jobs",
+            &[],
+        )
+        .await?;
+    let us: i64 = row.get(0);
+    let (users, running, waiting): (i64, i64, i64) = (row.get(1), row.get(2), row.get(3));
+    let mut o = vec![0u8; 8];
+    o.extend_from_slice(&((us as u64) << 12).to_be_bytes());
+    o.extend(field(&crate::report::system_name(), 8));
+    o.extend_from_slice(&bin4(users)); // users currently signed on
+    for _ in 0..5 {
+        // signed off temporarily, suspended by system request or group
+        // jobs, signed off with printer output waiting, batch jobs
+        // waiting for messages
+        o.extend_from_slice(&bin4(0));
+    }
+    o.extend_from_slice(&bin4(running)); // batch jobs running
+    o.extend_from_slice(&bin4(0)); // held while running
+    o.extend_from_slice(&bin4(0)); // ending
+    o.extend_from_slice(&bin4(waiting)); // waiting to run or scheduled
+    for _ in 0..4 {
+        // held on a job queue, on a held job queue, on an unassigned
+        // job queue, ended with printer output waiting
+        o.extend_from_slice(&bin4(0));
     }
     give(args, o)
 }

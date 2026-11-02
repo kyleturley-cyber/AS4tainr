@@ -791,6 +791,21 @@ pub async fn object_size(client: &Client, library: &str, name: &str, objtype: &s
     Ok(row.get(0))
 }
 
+/// Clear a physical file's records for MBROPT(*REPLACE): the member is
+/// cleared, so the records copied in are numbered from 1 again (as after
+/// CLRPFM). `table` is the file's quoted `schema.table`. Row by row (not
+/// TRUNCATE), so journaling and triggers see the deletes.
+pub async fn replace_records(client: &Client, table: &str) -> Result<()> {
+    client.execute(&format!("DELETE FROM {table}"), &[]).await?;
+    client
+        .execute(
+            "SELECT setval(pg_get_serial_sequence($1, 'rrn'), 1, false)",
+            &[&table],
+        )
+        .await?;
+    Ok(())
+}
+
 /// All libraries, by name.
 pub async fn list_libraries(client: &Client) -> Result<Vec<String>> {
     let co = crate::collate::clause(client).await?;

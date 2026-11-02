@@ -251,6 +251,20 @@ pub enum Outcome {
     Menu(crate::menus::Menu),
     /// CALL QCMD: show the Command Entry display.
     CommandEntry,
+    /// STRSEU: the source editor on a member.
+    Edit(EditTarget),
+    /// EDTLIBL: the display to change the user part of the library list.
+    EditLibraryList,
+}
+
+/// The member STRSEU edits or browses.
+#[derive(Debug, Clone)]
+pub struct EditTarget {
+    pub library: String,
+    pub file: String,
+    pub member: String,
+    /// OPTION(5): look only.
+    pub browse: bool,
 }
 
 /// DSPPFM shows at most this many records.
@@ -499,31 +513,34 @@ impl Job<'_> {
             ));
         }
         let cmd = cl::parse(line)?;
-        if let Some(o) = self.ifs_command(&cmd).await? {
+        // The command groups' futures are boxed: inline, they would make
+        // this function's future (on the stack of every nested command:
+        // CL programs, QCMDEXC) too large for a thread's stack.
+        if let Some(o) = Box::pin(self.ifs_command(&cmd)).await? {
             return Ok(o);
         }
-        if let Some(o) = self.journal_command(&cmd).await? {
+        if let Some(o) = Box::pin(self.journal_command(&cmd)).await? {
             return Ok(o);
         }
-        if let Some(o) = self.pftrg_command(&cmd).await? {
+        if let Some(o) = Box::pin(self.pftrg_command(&cmd)).await? {
             return Ok(o);
         }
-        if let Some(o) = self.save_command(&cmd).await? {
+        if let Some(o) = Box::pin(self.save_command(&cmd)).await? {
             return Ok(o);
         }
-        if let Some(o) = self.outq_command(&cmd).await? {
+        if let Some(o) = Box::pin(self.outq_command(&cmd)).await? {
             return Ok(o);
         }
-        if let Some(o) = self.qsh_command(&cmd).await? {
+        if let Some(o) = Box::pin(self.qsh_command(&cmd)).await? {
             return Ok(o);
         }
-        if let Some(o) = self.jobd_command(&cmd).await? {
+        if let Some(o) = Box::pin(self.jobd_command(&cmd)).await? {
             return Ok(o);
         }
-        if let Some(o) = self.pdm_command(&cmd).await? {
+        if let Some(o) = Box::pin(self.pdm_command(&cmd)).await? {
             return Ok(o);
         }
-        if let Some(o) = self.objdesc_command(&cmd).await? {
+        if let Some(o) = Box::pin(self.objdesc_command(&cmd)).await? {
             return Ok(o);
         }
         match cmd.def.name {
@@ -531,6 +548,7 @@ impl Job<'_> {
             "CHGLIB" => self.chglib(&cmd).await,
             "DSPLIB" => self.dsplib(&cmd).await,
             "DSPLIBL" => self.dsplibl().await,
+            "DSPSFWRSC" => self.dspsfwrsc(),
             "ADDLIBLE" => self.addlible(&cmd).await,
             "RMVLIBLE" => self.rmvlible(&cmd).await,
             "CHGCURLIB" => self.chgcurlib(&cmd).await,
@@ -625,6 +643,7 @@ impl Job<'_> {
             "DLTF" => self.dltf(&cmd).await,
             "WRKOBJ" => self.wrkobj(&cmd).await,
             "DSPPFM" => self.dsppfm(&cmd).await,
+            "STRSEU" => self.strseu(&cmd).await,
             "CRTDTAARA" => self.crtdtaara(&cmd).await,
             "CHGDTAARA" => self.chgdtaara(&cmd).await,
             "DSPDTAARA" => self.dspdtaara(&cmd).await,
@@ -654,6 +673,24 @@ impl Job<'_> {
             "WRKSBMJOB" => self.wrksbmjob().await,
             "DSPJOBLOG" => self.dspjoblog(&cmd).await,
             "DSPJOB" => self.dspjob(&cmd).await,
+            "HLDJOB" => self.hold_job(&cmd, true).await,
+            "RLSJOB" => self.hold_job(&cmd, false).await,
+            "WRKJOB" => self.wrkjob(&cmd).await,
+            "WRKUSRJOB" => self.wrkusrjob(&cmd).await,
+            "WRKMSGQ" => self.wrkmsgq(&cmd).await,
+            "WRKSYSVAL" => self.wrksysval(&cmd),
+            "WRKSYSSTS" => self.wrksyssts().await,
+            "DSPLOG" => self.dsplog(&cmd).await,
+            "EDTLIBL" => {
+                if self.display.is_none() {
+                    bail!("EDTLIBL needs a display; use CHGLIBL in a batch job.");
+                }
+                Ok(Outcome::EditLibraryList)
+            }
+            "DSPNETA" => self.dspneta(),
+            "WRKSBS" => self.wrksbs().await,
+            "WRKJOBQ" => self.wrkjobq(&cmd).await,
+            "WRKUSRPRF" => self.wrkusrprf(&cmd).await,
             "CHGJOB" => self.chgjob(&cmd).await,
             "ENDJOB" => self.endjob(&cmd).await,
             "SNDMSG" => self.sndmsg(&cmd).await,
@@ -859,6 +896,43 @@ impl Job<'_> {
                 heading2: format!("{:22}ASP", ""),
                 ..Default::default()
             }),
+            print_msg: None,
+            spool: None,
+            member: None,
+        }))
+    }
+
+    /// DSPSFWRSC: the licensed programs installed. as4tainr provides the
+    /// operating system's interfaces, as the product QSZRTVPR reports
+    /// (5770SS1, its release); compilers, SQL and the rest are built in,
+    /// with no products of their own. The layout is as4tainr's own (no
+    /// capture of IBM i's yet).
+    fn dspsfwrsc(&mut self) -> Result<Outcome> {
+        let release = crate::sysapi::RELEASE;
+        let heading = format!(
+            "{:<11}  {:<6}  {:<8}  {}",
+            "Resource ID", "Option", "Release", "Description"
+        );
+        let row = format!(
+            "{:<11}  {:<6}  {:<8}  {}",
+            "5770SS1", "*BASE", release, "as4tainr: IBM i interfaces (CL, RPG, SQL, DDS, 5250)"
+        );
+        let mut print = vec![
+            format!("Display Software Resources"),
+            String::new(),
+            heading.clone(),
+        ];
+        print.push(row.clone());
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display Software Resources".into(),
+            info: vec![],
+            heading,
+            rows: vec![row],
+            options: vec![],
+            keys: vec![String::new()],
+            refresh: None,
+            print,
+            ibm: None,
             print_msg: None,
             spool: None,
             member: None,
@@ -6133,8 +6207,49 @@ impl Job<'_> {
             },
         )
         .await?;
+        // HOLD(*YES): the job waits on the queue until RLSJOB (QDFTJOBD
+        // has HOLD(*NO), so *JOBD does not hold).
+        if cmd.get("HOLD").trim().eq_ignore_ascii_case("*YES") {
+            jobs::set_held(self.client, id.number, true).await?;
+        }
         Ok(Outcome::Messages(vec![format!(
             "CPC1221: Job {id} was put on job queue {jobq} in library QGPL."
+        )]))
+    }
+
+    /// HLDJOB and RLSJOB of a job on its job queue (an active job cannot
+    /// be held here: docs/fidelity-gaps.md).
+    async fn hold_job(&mut self, cmd: &Command, hold: bool) -> Result<Outcome> {
+        let job = self.job_named(cmd.get("JOB")).await?;
+        if job.id.user != self.user {
+            self.require_secadm("hold or release other users' jobs")
+                .await?;
+        }
+        if job.status != "JOBQ" {
+            bail!(
+                "Job {} is {}: only a job on a job queue can be {} here.",
+                job.id,
+                if job.status == "ACTIVE" {
+                    "active"
+                } else {
+                    "ended"
+                },
+                if hold { "held" } else { "released" }
+            );
+        }
+        let was = jobs::is_held(self.client, job.id.number).await?;
+        if was == hold {
+            bail!(
+                "Job {} is {} held.",
+                job.id,
+                if hold { "already" } else { "not" }
+            );
+        }
+        jobs::set_held(self.client, job.id.number, hold).await?;
+        Ok(Outcome::Messages(vec![format!(
+            "Job {} was {}.",
+            job.id,
+            if hold { "held" } else { "released" }
         )]))
     }
 
@@ -6198,6 +6313,12 @@ impl Job<'_> {
 
     async fn wrksbmjob(&mut self) -> Result<Outcome> {
         let list = jobs::submitted_by(self.client, &self.user).await?;
+        let mut held = Vec::new();
+        for j in list.iter().filter(|j| j.status == "JOBQ") {
+            if jobs::is_held(self.client, j.id.number).await? {
+                held.push(j.id.number);
+            }
+        }
         // IBM i 7.5's WRKSBMJOB (PUB400): job, user, type, status, function.
         let fmt = |job: &str, user: &str, ty: &str, status: &str, func: &str| {
             format!("{job:<10}  {user:<10}  {ty:<7}  {status:<16}  {func}")
@@ -6207,6 +6328,8 @@ impl Job<'_> {
             .map(|j| {
                 let status = if j.status == "OUTQ" && j.end_code == "ABNORMAL" {
                     "OUTQ  (ended abnormally)".to_string()
+                } else if j.status == "JOBQ" && held.contains(&j.id.number) {
+                    "JOBQ  HLD".to_string()
                 } else {
                     j.status.clone()
                 };
@@ -6219,8 +6342,10 @@ impl Job<'_> {
             heading: fmt("Job", "User", "Type", "-----Status-----", "Function"),
             rows,
             options: vec![
+                (3, "Hold".into(), "HLDJOB JOB({})".into()),
                 (4, "End".into(), "ENDJOB JOB({})".into()),
                 (5, "Display job log".into(), "DSPJOBLOG JOB({})".into()),
+                (6, "Release".into(), "RLSJOB JOB({})".into()),
             ],
             keys: list.iter().map(|j| j.id.to_string()).collect(),
             refresh: Some("WRKSBMJOB".into()),
@@ -6793,6 +6918,554 @@ impl Job<'_> {
         }))
     }
 
+    /// WRKJOB (CL reference): OPTION(*SELECT) on a display is the menu
+    /// of what can be shown about the job (`menus::WRKJOB`, for this
+    /// job); another job, or printed, shows all of DSPJOB's sections.
+    /// *SPLF is WRKSPLF, *JOBLOG is DSPJOBLOG, the other options DSPJOB's.
+    async fn wrkjob(&mut self, cmd: &Command) -> Result<Outcome> {
+        let job = cmd.get("JOB").trim().to_string();
+        let job = if job.is_empty() { "*".to_string() } else { job };
+        let output = cmd.get("OUTPUT").trim().to_ascii_uppercase();
+        let option = cmd.get("OPTION").trim().to_ascii_uppercase();
+        let line = match option.as_str() {
+            "*SELECT" | "" if job == "*" && output != "*PRINT" && self.display.is_some() => {
+                return Ok(Outcome::Menu(crate::menus::Menu::Builtin(
+                    &crate::menus::WRKJOB,
+                )));
+            }
+            "*SELECT" | "" | "*ALL" => format!("DSPJOB JOB({job}) OUTPUT({output}) OPTION(*ALL)"),
+            "*SPLF" => "WRKSPLF".to_string(),
+            "*JOBLOG" => format!("DSPJOBLOG JOB({job}) OUTPUT({output})"),
+            o => format!("DSPJOB JOB({job}) OUTPUT({output}) OPTION({o})"),
+        };
+        self.run_boxed(&line).await
+    }
+
+    /// WRKUSRJOB: a user's jobs (USER(*): this user's), all or those of
+    /// one status, with options to work with, end, or show the job log of
+    /// each.
+    async fn wrkusrjob(&mut self, cmd: &Command) -> Result<Outcome> {
+        let user = match cmd.get("USER").trim().to_ascii_uppercase().as_str() {
+            "*" | "" => self.user.clone(),
+            u => {
+                if u != self.user {
+                    self.require_secadm("work with other users' jobs").await?;
+                }
+                u.to_string()
+            }
+        };
+        let status = match cmd.get("STATUS").trim().to_ascii_uppercase().as_str() {
+            "*ALL" | "" => None,
+            "*ACTIVE" => Some("ACTIVE"),
+            "*JOBQ" => Some("JOBQ"),
+            "*OUTQ" => Some("OUTQ"),
+            s => bail!("CPD0084: Status {s} is not valid; use *ALL, *ACTIVE, *JOBQ or *OUTQ."),
+        };
+        let list = jobs::of_user(self.client, &user, status).await?;
+        let fmt = |job: &str, user: &str, number: &str, ty: &str, status: &str| {
+            format!("{job:<10}  {user:<10}  {number:<6}  {ty:<5}  {status}")
+        };
+        let rows = list
+            .iter()
+            .map(|j| {
+                let ty = if j.job_type == "BCH" {
+                    "BATCH"
+                } else {
+                    "INTER"
+                };
+                fmt(
+                    &j.id.name,
+                    &j.id.user,
+                    &format!("{:06}", j.id.number),
+                    ty,
+                    &j.status,
+                )
+            })
+            .collect();
+        Ok(Outcome::Display(ListDisplay {
+            title: "Work with User Jobs".into(),
+            info: vec![("User".into(), user.clone())],
+            heading: fmt("Job", "User", "Number", "Type", "Status"),
+            rows,
+            options: vec![
+                (4, "End".into(), "ENDJOB JOB({})".into()),
+                (5, "Work with".into(), "WRKJOB JOB({}) OPTION(*ALL)".into()),
+                (10, "Display job log".into(), "DSPJOBLOG JOB({})".into()),
+            ],
+            keys: list.iter().map(|j| j.id.to_string()).collect(),
+            refresh: Some(format!(
+                "WRKUSRJOB USER({user}) STATUS({})",
+                cmd.get("STATUS")
+            )),
+            ..Default::default()
+        }))
+    }
+
+    /// WRKMSGQ: the message queues on the library list (or in a library),
+    /// all of them, by name or generic name: the *MSGQ objects, and the
+    /// user profiles' queues (QUSRSYS; QSYSOPR in QSYS), only the user's
+    /// own for a user without *SECADM. Options: display the messages
+    /// (DSPMSG), delete a *MSGQ object.
+    async fn wrkmsgq(&mut self, cmd: &Command) -> Result<Outcome> {
+        let spec = cmd.get("MSGQ").trim().to_ascii_uppercase();
+        let (lib, name) = match spec.split_once('/') {
+            Some((l, n)) => (l.to_string(), n.to_string()),
+            None => ("*LIBL".to_string(), spec.clone()),
+        };
+        let libs = match lib.as_str() {
+            "*LIBL" => self.library_list(),
+            "*CURLIB" => vec![self.current_library()],
+            l => vec![crate::qtemp::real(l)],
+        };
+        let matches = |n: &str| match name.as_str() {
+            "*ALL" | "" => true,
+            g if g.ends_with('*') => n.starts_with(g.trim_end_matches('*')),
+            g => n == g,
+        };
+        let mut found: Vec<(String, String, String)> = Vec::new();
+        for l in &libs {
+            for r in self
+                .client
+                .query(
+                    "SELECT name, text FROM as4tainr.objects WHERE library=$1 AND objtype='*MSGQ' ORDER BY name",
+                    &[l],
+                )
+                .await?
+            {
+                let n: String = r.get(0);
+                if matches(&n) {
+                    found.push((crate::qtemp::logical(l), n, r.get(1)));
+                }
+            }
+        }
+        // The user profiles' queues.
+        let secadm = self.require_secadm("").await.is_ok();
+        if libs.iter().any(|l| l == "QSYS") && matches("QSYSOPR") && secadm {
+            found.push(("QSYS".into(), "QSYSOPR".into(), String::new()));
+        }
+        if libs.iter().any(|l| l == "QUSRSYS") {
+            let users: Vec<String> = if secadm {
+                self.client
+                    .query("SELECT name FROM as4tainr.user_profiles ORDER BY name", &[])
+                    .await?
+                    .iter()
+                    .map(|r| r.get(0))
+                    .collect()
+            } else {
+                vec![self.user.clone()]
+            };
+            for u in users {
+                if matches(&u) {
+                    found.push(("QUSRSYS".into(), u, String::new()));
+                }
+            }
+        }
+        if found.is_empty() {
+            bail!("No message queues match {spec}.");
+        }
+        let fmt = |q: &str, l: &str, t: &str| format!("{q:<10}  {l:<10}  {t}");
+        Ok(Outcome::Display(ListDisplay {
+            title: "Work with Message Queues".into(),
+            info: vec![],
+            heading: fmt("Queue", "Library", "Text"),
+            rows: found.iter().map(|(l, q, t)| fmt(q, l, t)).collect(),
+            options: vec![
+                (4, "Delete".into(), "DLTMSGQ MSGQ({})".into()),
+                (5, "Display messages".into(), "DSPMSG MSGQ({})".into()),
+            ],
+            keys: found.iter().map(|(l, q, _)| format!("{l}/{q}")).collect(),
+            refresh: Some(format!("WRKMSGQ MSGQ({spec})")),
+            ..Default::default()
+        }))
+    }
+
+    /// WRKSYSVAL: the system values as4tainr has (all, by name or
+    /// generic name), each with its value; option 5 shows one (DSPSYSVAL).
+    /// They cannot be changed yet (no CHGSYSVAL).
+    fn wrksysval(&mut self, cmd: &Command) -> Result<Outcome> {
+        let spec = cmd.get("SYSVAL").trim().to_ascii_uppercase();
+        let names: Vec<&str> = crate::clpgm::SYSTEM_VALUE_NAMES
+            .iter()
+            .copied()
+            .filter(|n| match spec.as_str() {
+                "*ALL" | "" => true,
+                g if g.ends_with('*') => n.starts_with(g.trim_end_matches('*')),
+                g => *n == g,
+            })
+            .collect();
+        if names.is_empty() {
+            bail!("CPF1028: System value {spec} not found.");
+        }
+        let fmt = |n: &str, d: &str, v: &str| format!("{n:<10}  {d:<44}  {v}");
+        let rows = names
+            .iter()
+            .map(|n| {
+                let v = match crate::clpgm::system_value_text(n) {
+                    Some(Ok(t)) => t.split_whitespace().collect::<Vec<_>>().join(" "),
+                    Some(Err(k)) => k.to_string(),
+                    None => String::new(),
+                };
+                fmt(
+                    n,
+                    crate::clpgm::system_value_description(n).unwrap_or(""),
+                    &v,
+                )
+            })
+            .collect();
+        Ok(Outcome::Display(ListDisplay {
+            title: "Work with System Values".into(),
+            heading: fmt("Name", "Description", "Value"),
+            rows,
+            options: vec![(5, "Display".into(), "DSPSYSVAL SYSVAL({})".into())],
+            keys: names.iter().map(|n| n.to_string()).collect(),
+            ..Default::default()
+        }))
+    }
+
+    /// WRKSYSSTS: the system's status as as4tainr can tell it: when the
+    /// database started (the elapsed time is since then), the processor
+    /// use over a moment, the jobs in the system and active, the
+    /// database's size. as4tainr's own layout (no storage pools).
+    async fn wrksyssts(&mut self) -> Result<Outcome> {
+        // Processor use: /proc/stat over 200 ms (Linux).
+        fn cpu() -> Option<(u64, u64)> {
+            let s = std::fs::read_to_string("/proc/stat").ok()?;
+            let line = s.lines().next()?;
+            let v: Vec<u64> = line
+                .split_whitespace()
+                .skip(1)
+                .filter_map(|x| x.parse().ok())
+                .collect();
+            let idle = v.get(3)? + v.get(4).copied().unwrap_or(0);
+            Some((v.iter().sum(), idle))
+        }
+        let a = cpu();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let b = cpu();
+        let cpu_pct = match (a, b) {
+            (Some((t0, i0)), Some((t1, i1))) if t1 > t0 => {
+                let busy = (t1 - t0).saturating_sub(i1.saturating_sub(i0));
+                format!("{:.1}", busy as f64 * 100.0 / (t1 - t0) as f64)
+            }
+            _ => "?".into(),
+        };
+        let r = self
+            .client
+            .query_one(
+                "SELECT to_char(pg_postmaster_start_time(), 'MM/DD/YY HH24:MI:SS'),
+                        to_char(now() - pg_postmaster_start_time(), 'FMDDD \"days\" HH24:MI:SS'),
+                        pg_size_pretty(pg_database_size(current_database())),
+                        (SELECT count(*) FROM as4tainr.jobs),
+                        (SELECT count(*) FROM as4tainr.jobs WHERE status='ACTIVE'),
+                        (SELECT count(*) FROM as4tainr.jobs WHERE status='JOBQ')",
+                &[],
+            )
+            .await?;
+        let n = |i: usize| r.get::<_, i64>(i).to_string();
+        let info = vec![
+            ("System".to_string(), crate::report::system_name()),
+            ("Started".into(), r.get::<_, String>(0)),
+            ("Elapsed time".into(), r.get::<_, String>(1)),
+            ("% CPU used".into(), cpu_pct),
+            ("Jobs in system".into(), n(3)),
+            ("Active jobs".into(), n(4)),
+            ("Jobs on job queues".into(), n(5)),
+            ("Database size".into(), r.get::<_, String>(2)),
+        ];
+        Ok(Outcome::Display(ListDisplay {
+            title: "Work with System Status".into(),
+            info,
+            refresh: Some("WRKSYSSTS".into()),
+            ..Default::default()
+        }))
+    }
+
+    /// DSPLOG (QHST): the history of jobs as as4tainr keeps it: each
+    /// job's start and end (normal or abnormal), for a period (today by
+    /// default) and optionally one job. as4tainr's own texts and layout.
+    async fn dsplog(&mut self, cmd: &Command) -> Result<Outcome> {
+        if !cmd.get("LOG").eq_ignore_ascii_case("QHST") {
+            bail!("Log {} is not one as4tainr keeps; QHST is.", cmd.get("LOG"));
+        }
+        let period = cmd.list("PERIOD");
+        let from_today =
+            period.is_empty() || period.iter().any(|p| p.eq_ignore_ascii_case("*CURRENT"));
+        let job = match cmd.get("JOB").trim() {
+            "" | "*NONE" => None,
+            j => Some(jobs::parse_spec(j)?),
+        };
+        let rows = self
+            .client
+            .query(
+                "SELECT to_char(t, 'MM/DD/YY HH24:MI:SS'), kind, number, user_name, name, end_code FROM (
+                   SELECT started AS t, 'S' AS kind, number, user_name, name, end_code FROM as4tainr.jobs WHERE started IS NOT NULL
+                   UNION ALL
+                   SELECT ended, 'E', number, user_name, name, end_code FROM as4tainr.jobs WHERE ended IS NOT NULL) h
+                 WHERE (NOT $1 OR t >= date_trunc('day', now()))
+                   AND ($2::text IS NULL OR name = $2) AND ($3::text IS NULL OR user_name = $3)
+                   AND ($4::bigint IS NULL OR number = $4)
+                 ORDER BY t, number, kind DESC",
+                &[
+                    &from_today,
+                    &job.as_ref().map(|j| j.name.clone()),
+                    &job.as_ref().and_then(|j| j.user.clone()),
+                    &job.as_ref().and_then(|j| j.number),
+                ],
+            )
+            .await?;
+        let mut lines = Vec::new();
+        for r in &rows {
+            let when: String = r.get(0);
+            let id = format!(
+                "{:06}/{}/{}",
+                r.get::<_, i64>(2),
+                r.get::<_, String>(3),
+                r.get::<_, String>(4)
+            );
+            let what = match (
+                r.get::<_, String>(1).as_str(),
+                r.get::<_, String>(5).as_str(),
+            ) {
+                ("S", _) => format!("Job {id} started."),
+                (_, "ABNORMAL") => format!("Job {id} ended abnormally."),
+                _ => format!("Job {id} ended."),
+            };
+            lines.push(format!("{when}  {what}"));
+        }
+        if lines.is_empty() {
+            lines.push("(No entries for this period.)".into());
+        }
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display History Log Contents".into(),
+            rows: lines,
+            ..Default::default()
+        }))
+    }
+
+    /// DSPNETA: the network attributes as4tainr has (QWCRNETA's), in
+    /// as4tainr's own layout.
+    fn dspneta(&mut self) -> Result<Outcome> {
+        let sys = crate::report::system_name();
+        let attrs = [
+            ("SYSNAME", "System name"),
+            ("PNDSYSNAME", "Pending system name"),
+            ("LCLNETID", "Local network ID"),
+            ("LCLCPNAME", "Local control point name"),
+            ("LCLLOCNAME", "Default local location"),
+            ("DFTMODE", "Default mode"),
+        ];
+        let info = attrs
+            .iter()
+            .map(|(k, label)| {
+                let v = crate::sysapi::network_attribute(k, &sys).unwrap_or_default();
+                (label.to_string(), v.trim_end().to_string())
+            })
+            .collect();
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display Network Attributes".into(),
+            info,
+            ..Default::default()
+        }))
+    }
+
+    /// WRKSBS: the subsystems as4tainr runs (QINTER for display sessions,
+    /// QBATCH for batch jobs), with the jobs active in each.
+    async fn wrksbs(&mut self) -> Result<Outcome> {
+        let counts: std::collections::HashMap<String, i64> = self
+            .client
+            .query(
+                "SELECT subsystem, count(*) FROM as4tainr.jobs WHERE status='ACTIVE' GROUP BY subsystem",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+            .collect();
+        let fmt = |s: &str, l: &str, n: &str, t: &str| format!("{s:<10}  {l:<10}  {n:>6}  {t}");
+        let subsystems = [
+            ("QINTER", "Interactive (display sessions)"),
+            ("QBATCH", "Batch jobs"),
+        ];
+        let rows = subsystems
+            .iter()
+            .map(|(s, t)| {
+                let n = counts.get(*s).copied().unwrap_or(0);
+                fmt(s, "QSYS", &n.to_string(), t)
+            })
+            .collect();
+        Ok(Outcome::Display(ListDisplay {
+            title: "Work with Subsystems".into(),
+            heading: fmt("Subsystem", "Library", "Jobs", "Text"),
+            rows,
+            refresh: Some("WRKSBS".into()),
+            keys: vec![String::new(); subsystems.len()],
+            ..Default::default()
+        }))
+    }
+
+    /// WRKJOBQ: the job queues (QGPL/QBATCH, and any other a job was
+    /// submitted to), with the jobs waiting on each; option 5 lists them
+    /// (WRKSBMJOB's list of this user's jobs).
+    async fn wrkjobq(&mut self, cmd: &Command) -> Result<Outcome> {
+        let spec = cmd.get("JOBQ").trim().to_ascii_uppercase();
+        let only = spec.rsplit('/').next().unwrap_or("*ALL").to_string();
+        let mut queues: Vec<(String, i64)> = self
+            .client
+            .query(
+                "SELECT jobq, count(*) FILTER (WHERE status='JOBQ') FROM as4tainr.jobs
+                 WHERE jobq <> '' GROUP BY jobq ORDER BY jobq",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+            .collect();
+        if !queues.iter().any(|(q, _)| q.ends_with("QBATCH")) {
+            queues.insert(0, ("QGPL/QBATCH".into(), 0));
+        }
+        let queues: Vec<(String, String, i64)> = queues
+            .into_iter()
+            .map(|(q, n)| match q.split_once('/') {
+                Some((l, nm)) => (nm.to_string(), l.to_string(), n),
+                None => (q, "QGPL".into(), n),
+            })
+            .filter(|(nm, _, _)| only == "*ALL" || only.is_empty() || *nm == only)
+            .collect();
+        if queues.is_empty() {
+            bail!("Job queue {only} not found.");
+        }
+        let fmt = |q: &str, l: &str, n: &str, s: &str| format!("{q:<10}  {l:<10}  {n:>6}  {s}");
+        Ok(Outcome::Display(ListDisplay {
+            title: "Work with All Job Queues".into(),
+            heading: fmt("Queue", "Library", "Jobs", "Subsystem"),
+            rows: queues
+                .iter()
+                .map(|(q, l, n)| fmt(q, l, &n.to_string(), "QBATCH"))
+                .collect(),
+            options: vec![(5, "Work with submitted jobs".into(), "WRKSBMJOB".into())],
+            keys: queues.iter().map(|(q, l, _)| format!("{l}/{q}")).collect(),
+            refresh: Some(format!("WRKJOBQ JOBQ({spec})")),
+            ..Default::default()
+        }))
+    }
+
+    /// WRKUSRPRF: the user profiles (all, by name or generic name), with
+    /// their text; option 5 displays one, 4 deletes it. A user without
+    /// *SECADM sees only his own.
+    async fn wrkusrprf(&mut self, cmd: &Command) -> Result<Outcome> {
+        let spec = cmd.get("USRPRF").trim().to_ascii_uppercase();
+        let secadm = self.require_secadm("").await.is_ok();
+        let mut list = Vec::new();
+        for r in self
+            .client
+            .query("SELECT name FROM as4tainr.user_profiles ORDER BY name", &[])
+            .await?
+        {
+            let n: String = r.get(0);
+            let hit = match spec.as_str() {
+                "*ALL" | "" => true,
+                g if g.ends_with('*') => n.starts_with(g.trim_end_matches('*')),
+                g => n == g,
+            };
+            if hit && (secadm || n == self.user) {
+                if let Some(p) = users::get(self.client, &n).await? {
+                    list.push(p);
+                }
+            }
+        }
+        if list.is_empty() {
+            bail!("CPF2204: User profile {spec} not found.");
+        }
+        let fmt = |n: &str, c: &str, s: &str, t: &str| format!("{n:<10}  {c:<10}  {s:<10}  {t}");
+        Ok(Outcome::Display(ListDisplay {
+            title: "Work with User Profiles".into(),
+            heading: fmt("Profile", "Class", "Status", "Text"),
+            rows: list
+                .iter()
+                .map(|p| fmt(&p.name, &p.usrcls, &p.status, &p.text))
+                .collect(),
+            options: vec![
+                (4, "Delete".into(), "DLTUSRPRF USRPRF({})".into()),
+                (5, "Display".into(), "DSPUSRPRF USRPRF({})".into()),
+            ],
+            keys: list.iter().map(|p| p.name.clone()).collect(),
+            refresh: Some(format!("WRKUSRPRF USRPRF({spec})")),
+            ..Default::default()
+        }))
+    }
+
+    /// STRSEU: edit (OPTION 2) or browse (5) a source member, on a
+    /// display only. A member that is not there is made for editing, with
+    /// TYPE (TXT for *SAME) and TEXT, as SEU does.
+    async fn strseu(&mut self, cmd: &Command) -> Result<Outcome> {
+        if self.display.is_none() {
+            bail!("STRSEU needs a display: it cannot run in a batch job or with `system`.");
+        }
+        let browse = match cmd.get("OPTION").trim() {
+            "2" | "" => false,
+            "5" => true,
+            o => bail!("CPD0084: Option {o} is not valid; use 2 (edit) or 5 (browse)."),
+        };
+        let spec = cmd.get("SRCFILE").trim().to_ascii_uppercase();
+        let (libs, file) = match spec.split_once('/') {
+            Some(_) => self.search(&spec),
+            None => (self.library_list(), spec.clone()),
+        };
+        let member = crate::catalog::validate_name("member", cmd.get("SRCMBR"))?;
+        let mut lib = None;
+        for l in &libs {
+            if crate::source::is_source_file(self.client, l, &file).await? {
+                lib = Some(l.clone());
+                break;
+            }
+        }
+        let Some(lib) = lib else {
+            bail!("CPF9812: File {file} not found, or it is not a source file.");
+        };
+        let aut = if browse { Aut::Use } else { Aut::Change };
+        authority::check(self.client, &self.user, &lib, &file, "*FILE", aut).await?;
+        let exists = self
+            .client
+            .query_opt(
+                "SELECT 1 FROM as4tainr.source_members WHERE library=$1 AND file=$2 AND member=$3",
+                &[&lib, &file, &member],
+            )
+            .await?
+            .is_some();
+        if !exists {
+            if browse {
+                bail!("CPF9815: Member {member} of file {file} in library {lib} does not exist.");
+            }
+            let srctype = match cmd.get("TYPE").trim().to_ascii_uppercase().as_str() {
+                "*SAME" | "" => "TXT".to_string(),
+                t => t.to_string(),
+            };
+            let text = match cmd.get("TEXT") {
+                "*BLANK" => String::new(),
+                t => t.trim_matches('\'').to_string(),
+            };
+            crate::source::put_member(
+                self.client,
+                &crate::source::Member {
+                    library: lib.clone(),
+                    file: file.clone(),
+                    name: member.clone(),
+                    srctype,
+                    text,
+                    ..Default::default()
+                },
+                false,
+            )
+            .await?;
+        }
+        Ok(Outcome::Edit(EditTarget {
+            library: crate::qtemp::logical(&lib),
+            file,
+            member,
+            browse,
+        }))
+    }
+
     async fn endjob(&mut self, cmd: &Command) -> Result<Outcome> {
         let job = self.job_named(cmd.get("JOB")).await?;
         if job.status == "JOBQ" {
@@ -6981,16 +7654,40 @@ impl Job<'_> {
     }
 
     async fn dspmsg(&mut self, cmd: &Command) -> Result<Outcome> {
-        let q = match cmd.get("MSGQ") {
-            "*USRPRF" => self.user.clone(),
-            q => {
-                if q != self.user {
-                    self.require_secadm("display other users' messages").await?;
+        // A user's queue by the user's name (in QUSRSYS), or a queue made
+        // with CRTMSGQ (LIB/NAME or found on the library list).
+        let spec = cmd.get("MSGQ").trim().to_ascii_uppercase();
+        let (q, qlib) = match spec.as_str() {
+            "*USRPRF" | "" => (self.user.clone(), "QUSRSYS".to_string()),
+            s => {
+                let (libs, name) = match s.split_once('/') {
+                    Some(_) => self.search(s),
+                    None => (self.library_list(), s.to_string()),
+                };
+                let mut libs = libs;
+                if !s.contains('/') || s.starts_with("*LIBL/") {
+                    libs.push("QUSRSYS".into());
                 }
-                q.to_string()
+                let key = crate::jobs::msgq_key(self.client, &libs, &name)
+                    .await?
+                    .ok_or_else(|| anyhow!("CPF2403: Message queue {name} not found."))?;
+                match key.split_once('/') {
+                    Some((l, n)) => {
+                        authority::check(self.client, &self.user, l, n, "*MSGQ", Aut::Use).await?;
+                        (key.clone(), crate::qtemp::logical(l))
+                    }
+                    None => {
+                        if key != self.user {
+                            self.require_secadm("display other users' messages").await?;
+                        }
+                        let lib = if key == "QSYSOPR" { "QSYS" } else { "QUSRSYS" };
+                        (key.clone(), lib.to_string())
+                    }
+                }
             }
         };
         let msgs = jobs::messages(self.client, &q, q == self.user).await?;
+        let shown_q = q.rsplit('/').next().unwrap_or(&q).to_string();
         // IBM i 7.5's DSPMSG display (PUB400): the queue's attributes, then
         // each message, oldest first, under a "From" line with the sender,
         // date and time; texts without message IDs.
@@ -7027,12 +7724,12 @@ impl Job<'_> {
                 lines: vec![
                     format!(
                         "{}{}   *DSPMSG",
-                        left("Queue", &q),
+                        left("Queue", &shown_q),
                         dsp_label("Program", 14)
                     ),
                     format!(
                         "{}{}",
-                        left("  Library", "  QUSRSYS"),
+                        left("  Library", &format!("  {qlib}")),
                         dsp_label("  Library", 14)
                     ),
                     format!(

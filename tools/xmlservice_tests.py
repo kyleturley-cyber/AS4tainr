@@ -10,15 +10,19 @@ A test passes when what comes back meets the test's own checks of the
 text: XML that parses when the test parses it (simplexml_load_string),
 none of the strings whose presence fails it (strpos(...)>0: die; when it
 has none, XMLSERVICE's <error> elements, but for a DLTxxx command's: a
-script deletes first what an earlier run made), all of those whose absence
+script deletes first what an earlier run made, nor for a test of errors
+(named so); a test that reads an error report through XPath (/report/...)
+wants a <report> with an <error> in it), all of those whose absence
 fails it (strpos(...)<1: die). The values the tests then check through
 XPath are not checked here. Result-set procedures (iPLUGR*) give their
 rows joined (as4tainr sql --json), cut at the first null character, and
 with *hack at the first </hack> (xmlservice_junk_away.php's
-driverJunkAway). A test that builds its XML with code is left out, but
+driverJunkAway). A *hex test's document goes in and comes back as
+hexadecimal (its bin2hex and pack("H*")). A test that builds its XML with code is left out, but
 for bin2hex() replacements of literals, and so is one that calls more
-than once, and so are those that read the QTEMP table test_90000 made
-in its job. The SQL tests' tables and procedures are made first as
+than once (or sends several documents), and so are those that read
+the QTEMP table test_90000 made in its job. Lines commented out
+(// ...) set no control flags. The SQL tests' tables and procedures are made first as
 test_90000 makes them (in schema XMLSERVTST), and the SQL tests run with
 XMLSERVTST in the library list (test_90000's CHGLIBL).
 
@@ -40,6 +44,9 @@ def tests(clone):
         # calls on one connection (iPLUGRC*'s accumulation) is left out.
         if len(re.findall(r'db2_execute\(', t)) > 1:
             continue
+        # Nor one that sends several documents (one call each, in a loop).
+        if t.count('<<<ENDPROC') > 1:
+            continue
         m = re.search(r'call \$procLib\.(iPLUG\w+)\(', t)
         x = re.search(r'<<<ENDPROC\n(.*?)\nENDPROC;', t, re.S)
         if not m or not x:
@@ -59,7 +66,13 @@ def tests(clone):
             if xml is None:
                 continue
         ctl = '*here'
-        for op, val in re.findall(r'\$ctl\s*(\.?=)\s*"([^"]*)"', t):
+        # Lines commented out (// ...) set nothing.
+        code = re.sub(r'(?m)^\s*//.*$', '', t)
+        # Control flags set under a condition change between calls (the
+        # IPC server started, then ended with *immed): several calls.
+        if re.search(r'(?m)^\s*(if\b|else\b).*\$ctl\s*\.?=', code):
+            continue
+        for op, val in re.findall(r'\$ctl\s*(\.?=)\s*"([^"]*)"', code):
             ctl = val if op == '=' else ctl + val
         # The test's own checks of the text that came back:
         # strpos($clobOut,"x")>0 fails, strpos($clobOut,"x")<1 fails.
@@ -67,8 +80,20 @@ def tests(clone):
         checks = {
             'parse': 'simplexml_load_string' in t,
             'absent': re.findall(lit + r'>\s*0\)\s*die', t),
-            'present': re.findall(lit + r'<\s*1\)\s*die', t),
+            'present': re.findall(lit + r'<\s*1\)\s*die', t)
+            # $expect = "..." looked for in what came back.
+            + (re.findall(r'\$expect\s*=\s*"([^"$]+)"', t) if re.search(r'strpos\(.{0,80}?\$expect\)', t) else []),
+            # An error report the test reads through XPath (/report/...).
+            'report': "'/report" in t or '"/report' in t,
+            # A test of errors (its name says so) that checks only what it
+            # checks: no <error> proxy.
+            'errors': 'error' in f.lower(),
+            # *hex: the document goes in as hexadecimal (bin2hex) and
+            # comes back so (pack("H*", ...)).
+            'hex': 'bin2hex(getxml())' in t and 'pack("H*", $clobOut)' in t,
         }
+        if checks['hex']:
+            xml = xml.encode('latin-1').hex().upper()
         yield f, m.group(1).upper(), xml, ctl.strip(), checks
 
 
@@ -166,6 +191,11 @@ def verdict(out, checks):
     if out == 'TIMEOUT' or 'as4tainr:' in out:
         return 'fail', out.splitlines()[-1][:200] if out else ''
     x = xml_of(out)
+    if checks.get('hex'):
+        try:
+            x = bytes.fromhex(x.strip()).decode('latin-1')
+        except ValueError:
+            return 'fail', 'not hexadecimal: ' + x[:80]
     if '</hack>' in x:
         x = x[:x.find('</hack>')]
     x = x.strip()
@@ -177,12 +207,17 @@ def verdict(out, checks):
         except ET.ParseError as e:
             return 'fail', f'XML does not parse: {e}'
     absent = checks['absent']
-    if not absent:
+    if checks.get('report'):
+        # The test wants XMLSERVICE's error report: <report> with <error>.
+        if '<report>' not in x or '<error>' not in x:
+            return 'fail', 'no error report'
+    elif not absent and not checks['errors'] and not any('error' in p for p in checks['present']):
         # No check of its own: XMLSERVICE's <error> elements stand for the
         # values the test checks through XPath; a delete the script does
         # first (of what an earlier run made) may fail.
         absent = ['<error']
-        x = re.sub(r"<cmd[^>]*>\s*<error>[^<]*\bDLT\w+ [^<]*</error>\s*<error>[^<]*</error>\s*</cmd>", '', x)
+        # (its <error> elements and the error report that follows them).
+        x = re.sub(r"<cmd[^>]*>\s*<error>[^<]*\bDLT\w+ [^<]*</error>.*?</cmd>", '', x, flags=re.S)
     for a in absent:
         if a in x:
             m = re.search(r'<xmlerrmsg><!\[CDATA\[(.*?)\]\]>', x)

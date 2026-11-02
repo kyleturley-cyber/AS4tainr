@@ -954,17 +954,18 @@ impl<'a> Machine<'a> {
                 _ => bail!("{} is not a field", parts.join(".")),
             },
             Expr::Name { parts, args } => {
-                let name = parts.join(".");
-                match self.sym(&name) {
+                let name = joined(parts);
+                let name = name.as_ref();
+                match self.sym(name) {
                     Some(Sym::Var(v)) => {
                         let i = self.index_of(args)?;
-                        let i = self.table_index(&name, &v, i);
+                        let i = self.table_index(name, &v, i);
                         if i.is_none() && v.dim > 0 {
                             bail!("{name} is an array: an index is needed here");
                         }
                         if let Some(k) = i {
-                            if self.prog.varying.contains_key(&name) {
-                                let n = self.elems_in_use(&name, &v);
+                            if self.prog.varying.contains_key(name) {
+                                let n = self.elems_in_use(name, &v);
                                 if k < 1 || k > n as i128 {
                                     bail!("RNQ0121: An array index is out of range (index {k}, {n} elements in use).");
                                 }
@@ -979,15 +980,15 @@ impl<'a> Machine<'a> {
                         Value::Char(self.bufs[d.buf][off..off + d.size].to_vec())
                     }
                     Some(Sym::Klist(_)) => bail!("{name} is a key list, not a value"),
-                    None => match name.as_str() {
-                        "*DATE" | "UDATE" => Value::Num(Dec::from_i64(today_num(&name))),
+                    None => match name {
+                        "*DATE" | "UDATE" => Value::Num(Dec::from_i64(today_num(name))),
                         "*DAY" | "UDAY" => Value::Num(Dec::from_i64(today().2 as i64)),
                         "*MONTH" | "UMONTH" => Value::Num(Dec::from_i64(today().1 as i64)),
                         "*YEAR" => Value::Num(Dec::from_i64(today().0 as i64)),
                         "UYEAR" => Value::Num(Dec::from_i64((today().0 % 100) as i64)),
-                        _ if args.is_some() && self.callable(&name) => {
+                        _ if args.is_some() && self.callable(name) => {
                             let args = args.clone().unwrap_or_default();
-                            self.call_named(&name, &args)?.ok_or_else(|| {
+                            self.call_named(name, &args)?.ok_or_else(|| {
                                 anyhow!("procedure {name} returns no value; it cannot be used in an expression")
                             })?
                         }
@@ -1265,13 +1266,11 @@ impl<'a> Machine<'a> {
 
     fn type_of(&self, ex: &Expr) -> Option<DType> {
         match ex {
-            Expr::Name { parts, .. } | Expr::Path { parts, .. } => {
-                match self.sym(&parts.join(".")) {
-                    Some(Sym::Var(v)) => Some(v.dtype),
-                    Some(Sym::Ds(d)) => Some(DType::Char(d.size as u32)),
-                    _ => None,
-                }
-            }
+            Expr::Name { parts, .. } | Expr::Path { parts, .. } => match self.sym(&joined(parts)) {
+                Some(Sym::Var(v)) => Some(v.dtype),
+                Some(Sym::Ds(d)) => Some(DType::Char(d.size as u32)),
+                _ => None,
+            },
             Expr::Ind(_) => Some(DType::Ind),
             _ => None,
         }
@@ -4760,6 +4759,15 @@ const SYSTEM_PROGRAMS: &[&str] = &[
 ];
 
 /// Is NAME a program of QSYS that as4tainr does itself?
+/// A qualified name's parts joined with periods, borrowed when it has
+/// only one (the usual case: no string made for each use of a name).
+fn joined(parts: &[String]) -> std::borrow::Cow<'_, str> {
+    match parts {
+        [one] => std::borrow::Cow::Borrowed(one.as_str()),
+        _ => std::borrow::Cow::Owned(parts.join(".")),
+    }
+}
+
 pub fn is_system_program(name: &str) -> bool {
     let n = name.trim().to_ascii_uppercase();
     SYSTEM_PROGRAMS.contains(&n.as_str()) || crate::sysapi::is_api(&n)
@@ -6420,7 +6428,7 @@ impl<'a> Machine<'a> {
         } else {
             String::new()
         };
-        for sf in &d.subfields {
+        for sf in d.subfields.iter() {
             let full = format!("{prefix}{sf}");
             match self.sym(&full) {
                 Some(Sym::Var(v)) => {

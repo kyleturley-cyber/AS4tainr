@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS as4tainr.jobs (
 -- The last spooled file number the job gave (numbers are not reused
 -- within a job when files are deleted).
 ALTER TABLE as4tainr.jobs ADD COLUMN IF NOT EXISTS last_splf integer NOT NULL DEFAULT 0;
+-- HLDJOB of a job on a job queue: the subsystem passes it by until RLSJOB.
+ALTER TABLE as4tainr.jobs ADD COLUMN IF NOT EXISTS held boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS as4tainr.job_log (
     seq    bigserial PRIMARY KEY,
     job    bigint NOT NULL,
@@ -418,7 +420,7 @@ pub async fn claim_next(client: &Client, jobq: &str) -> Result<Option<JobInfo>> 
         .query_opt(
             &format!(
                 "UPDATE as4tainr.jobs SET status='ACTIVE', activity='RUN', started=now()
-                 WHERE number = (SELECT number FROM as4tainr.jobs WHERE status='JOBQ' AND jobq=$1
+                 WHERE number = (SELECT number FROM as4tainr.jobs WHERE status='JOBQ' AND jobq=$1 AND NOT held
                                  ORDER BY entered, number LIMIT 1 FOR UPDATE SKIP LOCKED)
                  RETURNING {JOB_COLS}"
             ),
@@ -472,6 +474,23 @@ pub async fn submitted_by(client: &Client, user: &str) -> Result<Vec<JobInfo>> {
         .collect())
 }
 
+/// A user's jobs (WRKUSRJOB): all of them, or those with one status
+/// (JOBQ, ACTIVE, OUTQ), oldest first.
+pub async fn of_user(client: &Client, user: &str, status: Option<&str>) -> Result<Vec<JobInfo>> {
+    Ok(client
+        .query(
+            &format!(
+                "SELECT {JOB_COLS} FROM as4tainr.jobs
+                 WHERE user_name=$1 AND ($2::text IS NULL OR status=$2) ORDER BY number"
+            ),
+            &[&user, &status],
+        )
+        .await?
+        .iter()
+        .map(job_row)
+        .collect())
+}
+
 /// Find one job. Without a number, the newest job of that name (and user)
 /// is taken, as on IBM i when the name is unique.
 pub async fn find(client: &Client, spec: &JobSpec) -> Result<JobInfo> {
@@ -509,6 +528,28 @@ pub async fn get(client: &Client, number: i64) -> Result<JobInfo> {
         .await?
         .map(|r| job_row(&r))
         .ok_or_else(|| anyhow!("Job number {number:06} not found."))
+}
+
+/// HLDJOB (true) or RLSJOB (false) of a job on its job queue: a held job
+/// stays there, passed by, until it is released. False when the job is
+/// not on a job queue (any more).
+pub async fn set_held(client: &Client, number: i64, held: bool) -> Result<bool> {
+    Ok(client
+        .execute(
+            "UPDATE as4tainr.jobs SET held=$2 WHERE number=$1 AND status='JOBQ'",
+            &[&number, &held],
+        )
+        .await?
+        == 1)
+}
+
+/// Whether a job is held on its job queue.
+pub async fn is_held(client: &Client, number: i64) -> Result<bool> {
+    Ok(client
+        .query_opt("SELECT held FROM as4tainr.jobs WHERE number=$1", &[&number])
+        .await?
+        .map(|r| r.get(0))
+        .unwrap_or(false))
 }
 
 /// ENDJOB of a job still on its job queue: it is taken off and never runs.

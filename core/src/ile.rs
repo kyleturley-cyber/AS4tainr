@@ -315,7 +315,6 @@ pub const UNAVAILABLE_PROCEDURES: &[&str] = &[
     "FPUTS",
     "ALARM",
     "FSYNC",
-    "FTOK",
     "GETITIMER",
     "GETPID",
     "GETTIMEOFDAY",

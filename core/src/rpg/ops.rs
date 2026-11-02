@@ -506,8 +506,9 @@ impl Machine<'_> {
             DType::Pointer => 7,
             _ => 0,
         };
-        for name in td.subfields.clone() {
-            let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+        let names = td.subfields.clone();
+        for name in names.iter() {
+            let short = name.rsplit('.').next().unwrap_or(name).to_string();
             if !sd
                 .subfields
                 .iter()

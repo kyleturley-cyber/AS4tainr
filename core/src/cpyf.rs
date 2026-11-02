@@ -461,9 +461,7 @@ impl Job<'_> {
             .get(0);
         match cmd.get("MBROPT").to_ascii_uppercase().as_str() {
             "*REPLACE" => {
-                self.client
-                    .batch_execute(&format!("DELETE FROM {table}"))
-                    .await?;
+                crate::catalog::replace_records(self.client, &table).await?;
             }
             "*ADD" => {}
             // MBROPT(*NONE): only into a to-file this copy creates.

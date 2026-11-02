@@ -5114,6 +5114,8 @@ async fn command(
                 Outcome::Display(_)
                 | Outcome::ChangePassword
                 | Outcome::StartSql
+                | Outcome::Edit(_)
+                | Outcome::EditLibraryList
                 | Outcome::Menu(_)
                 | Outcome::CommandEntry => {
                     bail!(

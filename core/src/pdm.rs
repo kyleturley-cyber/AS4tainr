@@ -109,10 +109,72 @@ impl Job<'_> {
         Ok(Some(match cmd.def.name {
             "WRKMBRPDM" => self.wrkmbrpdm(cmd).await?,
             "WRKOBJPDM" => self.wrkobjpdm(cmd).await?,
+            "WRKLIBPDM" => self.wrklibpdm(cmd).await?,
+            "STRPDM" => {
+                if self.display.is_none() {
+                    bail!("STRPDM needs a display.");
+                }
+                Outcome::Menu(crate::menus::Menu::Builtin(&crate::menus::PDM))
+            }
             "WRKMSGD" => self.wrkmsgd(cmd).await?,
             "RMVM" => self.rmvm(cmd).await?,
             "ADDPFM" => self.addpfm(cmd).await?,
             _ => return Ok(None),
+        }))
+    }
+
+    /// WRKLIBPDM: libraries (the library list, its user part, all, or
+    /// by name or generic name) with their type and text; option 5
+    /// displays a library (DSPLIB), 12 works with its objects (WRKOBJPDM).
+    async fn wrklibpdm(&mut self, cmd: &Command) -> Result<Outcome> {
+        let spec = cmd.get("LIB").trim().to_ascii_uppercase();
+        let entries: Vec<(String, String)> = self
+            .library_list_entries()
+            .into_iter()
+            .map(|(l, k)| (l, k.to_string()))
+            .collect();
+        let libs: Vec<(String, String)> = match spec.as_str() {
+            "*LIBL" | "" => entries,
+            "*USRLIBL" => entries.into_iter().filter(|(_, k)| k == "USR").collect(),
+            pattern => catalog::list_libraries(self.client)
+                .await?
+                .into_iter()
+                .filter(|l| pattern == "*ALL" || catalog::name_matches(pattern, l))
+                .map(|l| {
+                    let kind = if crate::commands::SYSTEM_LIBRARY_LIST.contains(&l.as_str()) {
+                        "SYS"
+                    } else {
+                        "USR"
+                    };
+                    (l, kind.to_string())
+                })
+                .collect(),
+        };
+        if libs.is_empty() {
+            bail!("No libraries match {spec}.");
+        }
+        let mut rows = Vec::new();
+        for (l, k) in &libs {
+            let text = catalog::library_text(self.client, l)
+                .await
+                .unwrap_or_default();
+            rows.push(
+                format!("{:<10}  {:<4}  {text}", crate::qtemp::logical(l), k)
+                    .trim_end()
+                    .to_string(),
+            );
+        }
+        Ok(Outcome::Display(ListDisplay {
+            title: "Work with Libraries Using PDM".into(),
+            heading: format!("{:<10}  {:<4}  {}", "Library", "Type", "Text"),
+            rows,
+            options: vec![
+                (5, "Display".into(), "DSPLIB LIB({})".into()),
+                (12, "Work with".into(), "WRKOBJPDM LIB({})".into()),
+            ],
+            keys: libs.iter().map(|(l, _)| crate::qtemp::logical(l)).collect(),
+            refresh: Some(format!("WRKLIBPDM LIB({spec})")),
+            ..Default::default()
         }))
     }
 
@@ -235,6 +297,7 @@ impl Job<'_> {
             keys.push(m.clone());
             let mut o = Vec::new();
             if source {
+                o.push((2, format!("STRSEU SRCFILE({lib}/{file}) SRCMBR({m})")));
                 o.push((4, format!("RMVM FILE({lib}/{file}) MBR({m})")));
             }
             o.push((5, format!("DSPPFM FILE({lib}/{file}) MBR({m})")));
@@ -256,6 +319,8 @@ impl Job<'_> {
         if source {
             options.insert(0, (4, "Delete".into(), String::new()));
             first.insert(0, (26, "4=Delete"));
+            options.insert(0, (2, "Edit".into(), String::new()));
+            first.insert(0, (3, "2=Edit"));
         }
         Ok(Outcome::Display(ListDisplay {
             title: "Work with Members Using PDM".into(),

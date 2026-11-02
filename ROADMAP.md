@@ -245,6 +245,15 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] XMLSERVICE (IBM) builds and runs its PHP tests' XML (tools/xmlservice_tests.py, 92 of 178): program and service program calls through PASE emulation (Qp2CallPase of _RSLOBJ2, _PGMCALL, _ILELOAD, _ILESYM, _ILECALL), _CALLPGMV, iconv, QXX functions, vsprintf, SET RESULT SETS ARRAY
 - [x] Bound calls without copying a service program module's static storage (XMLSERVICE's largest test 92 s to 1.4 s)
 - [x] The SQL call level interface (SQLAllocEnv ... SQLFetch, SQLEndTran, SQLGetDiagRec) for ILE programs; XMLSERVICE's <sql> tests pass (its tests 108 of 170)
+- [x] GO LICPGM (Work with Licensed Programs) and DSPSFWRSC; QWCRSSTS SSTS0100, QUSRJOBI JOBI0600, ftok
+- [x] XMLSERVICE: 134 of its 163 single-call tests pass (*hex documents, error reports); RPG interpreter about 2.7 times faster on XMLSERVICE's parser
+- [x] Record locks: a record read for update is read again once locked (a lost update in the three-clerk gate)
+- [x] WRKJOB, WRKUSRJOB, WRKMSGQ, WRKUSRPRF, WRKSYSVAL, WRKSBS, WRKJOBQ, DSPNETA; DSPMSG of any message queue
+- [x] Source editor: STRSEU (edit/browse), WRKMBRPDM option 2; SEU line commands I, D, C, M, A, B, R and blocks
+- [x] Upgrade check: a database made by an earlier version (2026-10-22) works with the current one
+- [x] CPYTOIMPF and CPYFRMIMPF (delimited text); MBROPT(*REPLACE) numbers records from 1 again (CPYF, CPYFRMSTMF)
+- [x] HLDJOB, RLSJOB, SBMJOB HOLD(*YES); STRPDM and WRKLIBPDM
+- [x] WRKSYSSTS, DSPLOG (QHST job history), EDTLIBL
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).
 - [x] Journals and trigger programs: COM's SETUPJRN, ORDAUDJV (QSYS2.DISPLAY_JOURNAL) and ORDTRG (ADDPFTRG) run (docs/journals.md).

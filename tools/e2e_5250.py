@@ -729,6 +729,47 @@ with Tn5250(HOST) as t:
     check("USR0001" not in t.text(), "WRKMSGD option 4 removes the description after the confirmation", t)
     t.fkey(3); t.wait_for("Command Entry")
     command(t, "dltmsgf contacts/e2emsgf", "deleted")
+    # The source editor (STRSEU). Line commands from IBM's SEU User's
+    # Guide: I inserts a line after the one it is typed on, numbered
+    # between its neighbors (1.50 between 1.00 and 2.00); a changed member
+    # is saved on F3 when the exit display's choice is Y.
+    command(t, "strseu contacts/qrpglesrc e2enew type(txt)", "Source Entry: Edit")
+    check("0001.00" in t.text() and "Beginning of data" in t.text(),
+          "STRSEU of a new member shows lines to type on", t)
+    t.tab(); t.tab(); t.type("first line"); t.tab(); t.tab(); t.type("second line"); t.enter()
+    t.wait_for("(changed)")
+    check("End of data" in t.text() and "0003.00" not in t.text(),
+          "the lines typed stay, the blank ones go at Enter", t)
+    t.tab(); t.type("i"); t.enter(); t.wait_for("0001.50")
+    t.tab(); t.tab(); t.tab(); t.tab(); t.type("middle"); t.enter(); t.wait_for("middle")
+    check(" 0001.50 middle" in t.text(), "line command I inserts a line numbered between its neighbors", t)
+    t.fkey(3); t.wait_for("Save the changed member")
+    t.enter(); t.wait_for("Command Entry")
+    check("Member E2ENEW in file CONTACTS/QRPGLESRC was changed." in t.text(), "F3 and Y save the member", t)
+    command(t, "dsppfm contacts/qrpglesrc e2enew", "Display Physical File Member")
+    rows = [r.strip() for r in t.text().split("\n")]
+    i = next(k for k, r in enumerate(rows) if r.endswith("first line"))
+    check(rows[i + 1].startswith("000150") and rows[i + 1].endswith("middle") and rows[i + 2].endswith("second line"),
+          "the saved member has the lines in order with their sequence numbers", t)
+    t.fkey(3); t.wait_for("Command Entry")
+    command(t, "wrkmbrpdm contacts/qrpglesrc e2e*", "Work with Members Using PDM")
+    t.type("2"); t.enter(); t.wait_for("Source Entry: Edit")
+    check("middle" in t.text(), "PDM option 2 edits the member", t)
+    t.fkey(3); t.wait_for("Work with Members Using PDM")
+    t.fkey(3); t.wait_for("Command Entry")
+    command(t, "rmvm contacts/qrpglesrc e2enew", "removed")
+    # EDTLIBL (CL reference: the user part of the library list, changed on
+    # a display): a library typed over another one replaces it.
+    command(t, "edtlibl", "Edit Library List")
+    check(" 010   CONTACTS" in t.text() and "QGPL" in t.text(),
+          "EDTLIBL shows the user part of the library list", t)
+    t.type("menulib   "); t.enter(); t.wait_for("Library list changed.")
+    command(t, "dsplibl", "Display Library List")
+    check("MENULIB" in t.text() and "CONTACTS" not in t.text(),
+          "the library typed in EDTLIBL replaced CONTACTS in the library list", t)
+    t.fkey(3); t.wait_for("Command Entry")
+    command(t, "edtlibl", "Edit Library List")
+    t.type("contacts  "); t.enter(); t.wait_for("Library list changed.")
     command(t, "rmvlible contacts", "removed from library list")
     command(t, "signoff", "Sign On")
 

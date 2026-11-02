@@ -706,7 +706,7 @@ impl Machine<'_> {
     fn lob(&self, name: &str) -> Option<(Expr, Expr)> {
         let up = name.to_ascii_uppercase();
         match self.sym(&up) {
-            Some(Sym::Ds(d)) if d.subfields == [format!("{up}_LEN"), format!("{up}_DATA")] => {
+            Some(Sym::Ds(d)) if *d.subfields == [format!("{up}_LEN"), format!("{up}_DATA")] => {
                 Some((
                     Expr::name(&format!("{up}_LEN")),
                     Expr::name(&format!("{up}_DATA")),
@@ -1149,7 +1149,7 @@ impl Machine<'_> {
         let mut rows = Vec::new();
         for i in 1..=n {
             let mut parts = Vec::new();
-            for sf in &d.subfields {
+            for sf in d.subfields.iter() {
                 let e = crate::rpg::expr::parse(&format!("{host}({i}).{sf}"))?;
                 let v = self.eval(&e)?;
                 match (self.type_of(&e), &v) {
@@ -1224,7 +1224,7 @@ impl Machine<'_> {
                 self.set_occurrence(&ds, i as i128)?;
             }
             let mut row = Vec::new();
-            for sf in &d.subfields {
+            for sf in d.subfields.iter() {
                 let e = if occurs {
                     crate::rpg::expr::parse(&format!("{host}.{sf}"))
                         .or_else(|_| crate::rpg::expr::parse(sf))?
@@ -1245,7 +1245,7 @@ impl Machine<'_> {
         if let Some(o) = was {
             self.set_occurrence(&ds, o as i128)?;
         }
-        let columns = d.subfields.clone();
+        let columns = d.subfields.to_vec();
         RESULT_SETS.with(|r| *r.borrow_mut() = vec![(columns, rows)]);
         Ok(Outcome::ok(0))
     }

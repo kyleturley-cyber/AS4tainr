@@ -189,6 +189,8 @@ impl Job<'_> {
                 };
                 Ok(Some(self.link_list(obj).await?))
             }
+            "CPYTOIMPF" => Ok(Some(self.cpytoimpf(cmd).await?)),
+            "CPYFRMIMPF" => Ok(Some(self.cpyfrmimpf(cmd).await?)),
             "CPYTOSTMF" if savf_path(cmd.get("FROMMBR")).is_some() => {
                 // A save file is copied as it is (binary, CCSID 65535).
                 let (lib, name) = savf_path(cmd.get("FROMMBR")).unwrap_or_default();
@@ -353,6 +355,222 @@ impl Job<'_> {
     /// CPYFRMSTMF into a database file's member: a record per line, the
     /// line padded or cut to the record (a file with one character
     /// field, as CRTPF RCDLEN makes).
+    /// The database file of FROMFILE/TOFILE (file and member elements):
+    /// the file, and the member name it was given (the file's own).
+    async fn impf_file(&self, list: &[String]) -> Result<(crate::catalog::FileRef, String)> {
+        let q = list
+            .first()
+            .map(|s| s.to_ascii_uppercase())
+            .unwrap_or_default();
+        let (libs, name) = self.search(&q);
+        let f = crate::catalog::resolve_file(self.client, &libs, &name).await?;
+        if f.file.source.is_some() {
+            bail!(
+                "File {}/{} is a source file: CPYTOIMPF and CPYFRMIMPF copy database files.",
+                f.library,
+                f.file.name
+            );
+        }
+        let mbr = match list.get(1).map(|m| m.to_ascii_uppercase()) {
+            None => f.file.name.clone(),
+            Some(m) if m == "*FIRST" || m == f.file.name => f.file.name.clone(),
+            Some(m) => bail!(
+                "CPF9815: Member {m} of file {} in library {} does not exist.",
+                f.file.name,
+                f.library
+            ),
+        };
+        Ok((f, mbr))
+    }
+
+    /// CPYTOIMPF: a database file's records as delimited text in a
+    /// stream file (`impf.rs`).
+    async fn cpytoimpf(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (f, mbr) = self.impf_file(&cmd.list("FROMFILE")).await?;
+        crate::authority::check(
+            self.client,
+            &self.user,
+            &f.library,
+            &f.file.name,
+            "*FILE",
+            crate::authority::Aut::Use,
+        )
+        .await?;
+        if !cmd.get("DTAFMT").eq_ignore_ascii_case("*DLM") {
+            bail!(
+                "DTAFMT({}) is not supported yet; *DLM is.",
+                cmd.get("DTAFMT")
+            );
+        }
+        let form = impf_form(cmd)?;
+        let eol = match cmd.get("RCDDLM").trim().to_ascii_uppercase().as_str() {
+            "" | "*EOR" | "*CRLF" => "\r\n",
+            "*LF" => "\n",
+            "*CR" => "\r",
+            "*LFCR" => "\n\r",
+            o => bail!("RCDDLM({o}) is not supported."),
+        };
+        let to = cmd.get("TOSTMF").trim().trim_matches('\'').to_string();
+        let mut text = String::new();
+        let names = match cmd.get("ADDCOLNAM").trim().to_ascii_uppercase().as_str() {
+            "*SYS" => Some(false),
+            "*SQL" => Some(true),
+            _ => None,
+        };
+        if let Some(sql) = names {
+            text.push_str(&crate::impf::header(&f.file.fields, sql, &form));
+            text.push_str(eol);
+        }
+        let fields = f.file.fields.clone();
+        let mut of = crate::rla::OpenFile::new(f.clone());
+        let mut n = 0usize;
+        loop {
+            let r = of.read(self.client).await?;
+            let Some(rec) = r.record else { break };
+            if r.eof {
+                break;
+            }
+            let nulls = crate::rla::null_fields(&rec);
+            let values: Vec<Option<String>> = fields
+                .iter()
+                .map(|fd| {
+                    if nulls.iter().any(|x| x == &fd.name) {
+                        None
+                    } else {
+                        rec.get(&fd.name).cloned()
+                    }
+                })
+                .collect();
+            text.push_str(&crate::impf::format_record(&fields, &values, &form));
+            text.push_str(eol);
+            n += 1;
+        }
+        let existing = ifs::stat(self.client, &to).await?;
+        // STMFCCSID(*FILE): a new stream file gets the database file's
+        // CCSID (37); an existing one keeps its own.
+        let ccsid = match &existing {
+            Some(e) => e.ccsid,
+            None => ccsid_param(cmd.get("STMFCCSID"), 37)?,
+        };
+        let mut bytes = Vec::new();
+        if cmd.get("MBROPT").eq_ignore_ascii_case("*ADD") && existing.is_some() {
+            if let Ok((old, _)) = ifs::read_file(self.client, &to).await {
+                bytes = old;
+            }
+        }
+        for c in text.chars() {
+            codec::encode_char(ccsid, c, &mut bytes);
+        }
+        ifs::write_file(self.client, &to, &bytes, ccsid, 0o644, &self.user)
+            .await
+            .map_err(|e| cl_error(e, &to))?;
+        Ok(Outcome::Messages(vec![format!(
+            "{n} records of member {mbr} of file {}/{} were copied to stream file {to}.",
+            crate::qtemp::logical(&f.library),
+            f.file.name
+        )]))
+    }
+
+    /// CPYFRMIMPF: delimited text in a stream file as a database file's
+    /// records (`impf.rs`). A value that does not fit its field stops the
+    /// copy with the records before it written.
+    async fn cpyfrmimpf(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (f, mbr) = self.impf_file(&cmd.list("TOFILE")).await?;
+        crate::authority::check(
+            self.client,
+            &self.user,
+            &f.library,
+            &f.file.name,
+            "*FILE",
+            crate::authority::Aut::Change,
+        )
+        .await?;
+        if !cmd.get("DTAFMT").eq_ignore_ascii_case("*DLM") {
+            bail!(
+                "DTAFMT({}) is not supported yet; *DLM is.",
+                cmd.get("DTAFMT")
+            );
+        }
+        let form = impf_form(cmd)?;
+        let from = cmd.get("FROMSTMF").trim().trim_matches('\'').to_string();
+        let (bytes, ccsid) = ifs::read_file(self.client, &from).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Stream file {from} cannot be read: {}",
+                ifs::errno_text(errno_of(&e))
+            )
+        })?;
+        let text = codec::text(ccsid, &bytes);
+        let lines: Vec<&str> = match cmd.get("RCDDLM").trim().to_ascii_uppercase().as_str() {
+            "*LF" => text.split('\n').collect(),
+            "*CR" => text.split('\r').collect(),
+            "*CRLF" => text.split("\r\n").collect(),
+            "*LFCR" => text.split("\n\r").collect(),
+            _ => text.split(['\n', '\r']).collect(),
+        };
+        let lines: Vec<&str> = lines.into_iter().filter(|l| !l.is_empty()).collect();
+        let from_rcd = cmd.list("FROMRCD");
+        let mut start = match from_rcd.first().map(|s| s.trim().to_ascii_uppercase()) {
+            None => 1,
+            Some(s) if s.is_empty() => 1,
+            Some(s) => s
+                .parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("FROMRCD({s}) is not a record number."))?
+                .max(1),
+        };
+        if cmd.get("RMVCOLNAM").eq_ignore_ascii_case("*YES") {
+            start = start.max(2);
+        }
+        let end = match from_rcd.get(1).map(|s| s.trim().to_ascii_uppercase()) {
+            Some(s) if s != "*END" && !s.is_empty() => s.parse::<usize>().unwrap_or(usize::MAX),
+            _ => usize::MAX,
+        };
+        let table = format!(
+            "{}.{}",
+            crate::catalog::ident(&f.library),
+            crate::catalog::ident(&f.file.name)
+        );
+        if cmd.get("MBROPT").eq_ignore_ascii_case("*REPLACE") {
+            crate::catalog::replace_records(self.client, &table).await?;
+        }
+        let dft = cmd.get("RPLNULLVAL").eq_ignore_ascii_case("*FLDDFT");
+        let fields = f.file.fields.clone();
+        let mut of = crate::rla::OpenFile::new(f.clone());
+        let mut n = 0usize;
+        for (k, line) in lines.iter().enumerate() {
+            let number = k + 1;
+            if number < start || number > end {
+                continue;
+            }
+            let values = crate::impf::parse_line(line, &form);
+            let mut rec = crate::rla::Record::new();
+            let mut nulls = Vec::new();
+            for (i, fd) in fields.iter().enumerate() {
+                match values.get(i).cloned().flatten() {
+                    Some(v) => {
+                        let v = crate::impf::field_value(fd, &v, &form).map_err(|e| {
+                            anyhow::anyhow!("Record {number} of stream file {from} was not copied: {e} {n} records were copied before it.")
+                        })?;
+                        rec.insert(fd.name.clone(), v);
+                    }
+                    None if fd.null_capable && !dft => nulls.push(fd.name.clone()),
+                    None => {}
+                }
+            }
+            if !nulls.is_empty() {
+                rec.insert(crate::rla::NULLS.to_string(), nulls.join(","));
+            }
+            of.write(self.client, &rec).await.map_err(|e| {
+                anyhow::anyhow!("Record {number} of stream file {from} was not copied: {e} {n} records were copied before it.")
+            })?;
+            n += 1;
+        }
+        Ok(Outcome::Messages(vec![format!(
+            "{n} records of stream file {from} were copied to member {mbr} of file {}/{}.",
+            crate::qtemp::logical(&f.library),
+            f.file.name
+        )]))
+    }
+
     async fn stmf_to_data(
         &mut self,
         f: &crate::catalog::FileRef,
@@ -380,7 +598,7 @@ impl Job<'_> {
             .get(0);
         match opt {
             "*REPLACE" => {
-                self.client.execute(&format!("DELETE FROM {table}"), &[]).await?;
+                crate::catalog::replace_records(self.client, &table).await?;
             }
             "*ADD" => {}
             _ if count > 0 => bail!(
@@ -503,6 +721,74 @@ impl Job<'_> {
 
 /// STMFCCSID, or the code page of the old keyword STMFCODPAG when only
 /// that one is given.
+/// CPYTOIMPF's and CPYFRMIMPF's delimiters.
+fn impf_form(cmd: &crate::cl::Command) -> Result<crate::impf::Form> {
+    use crate::impf::{Blanks, Form};
+    let ch = |v: &str| -> Option<char> {
+        let v = v.trim();
+        let v = v
+            .strip_prefix('\'')
+            .and_then(|x| x.strip_suffix('\''))
+            .unwrap_or(v);
+        let v = v.replace("''", "'");
+        let mut cs = v.chars();
+        match (cs.next(), cs.next()) {
+            (Some(c), None) => Some(c),
+            _ => None,
+        }
+    };
+    let strdlm = match cmd.get("STRDLM").trim().to_ascii_uppercase().as_str() {
+        "" | "*DBLQUOTE" => Some('"'),
+        "*NONE" => None,
+        _ => Some(
+            ch(cmd.get("STRDLM"))
+                .ok_or_else(|| anyhow::anyhow!("STRDLM must be one character."))?,
+        ),
+    };
+    let escape = match cmd.get("STRESCCHR").trim().to_ascii_uppercase().as_str() {
+        "" | "*STRDLM" => strdlm,
+        "*NONE" => None,
+        _ => Some(
+            ch(cmd.get("STRESCCHR"))
+                .ok_or_else(|| anyhow::anyhow!("STRESCCHR must be one character."))?,
+        ),
+    };
+    let flddlm = match cmd.get("FLDDLM").trim() {
+        "" => ",".to_string(),
+        v => {
+            let v = v
+                .strip_prefix('\'')
+                .and_then(|x| x.strip_suffix('\''))
+                .unwrap_or(v);
+            match v.to_ascii_uppercase().as_str() {
+                "*TAB" => "\t".to_string(),
+                _ => v.replace("''", "'"),
+            }
+        }
+    };
+    let decpnt = if cmd.get("DECPNT").eq_ignore_ascii_case("*COMMA") {
+        ','
+    } else {
+        '.'
+    };
+    let blanks = match cmd.get("RMVBLANK").trim().to_ascii_uppercase().as_str() {
+        "*LEADING" => Blanks::Leading,
+        "*TRAILING" => Blanks::Trailing,
+        "*BOTH" => Blanks::Both,
+        _ => Blanks::None,
+    };
+    if flddlm.is_empty() || Some(flddlm.as_str()) == strdlm.map(|c| c.to_string()).as_deref() {
+        bail!("The field delimiter must be one character other than the string delimiter.");
+    }
+    Ok(Form {
+        strdlm,
+        escape,
+        flddlm,
+        decpnt,
+        blanks,
+    })
+}
+
 fn stmf_ccsid(cmd: &crate::cl::Command) -> &str {
     let c = cmd.get("STMFCCSID");
     let old = cmd.get("STMFCODPAG");

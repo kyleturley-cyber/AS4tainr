@@ -233,27 +233,30 @@ impl OpenFile {
                 }
                 return Err(e.into());
             }
-            // Another job may have changed or deleted it meanwhile.
-            match self
-                .fetch_one(
-                    client,
-                    "t.rrn = CAST($1::text AS bigint)",
-                    "t.rrn",
-                    &[rrn.to_string()],
-                )
-                .await?
-            {
-                Some((rec, _)) => r.record = Some(rec),
-                None => {
-                    client
-                        .execute(RECORD_UNLOCK_SQL, &[&self.lock_name, &rrn])
-                        .await?;
-                    self.current_rrn = None;
-                    bail!(
-                        "CPF5013: Record {rrn} in file {} was deleted by another job.",
-                        self.lock_name
-                    );
-                }
+        }
+        // The record as it is now that it is locked: another job may have
+        // changed or deleted it since it was read, also when the lock came
+        // at once (that job's UPDATE and release came between the read and
+        // the lock); the old image would undo its change at UPDATE.
+        match self
+            .fetch_one(
+                client,
+                "t.rrn = CAST($1::text AS bigint)",
+                "t.rrn",
+                &[rrn.to_string()],
+            )
+            .await?
+        {
+            Some((rec, _)) => r.record = Some(rec),
+            None => {
+                client
+                    .execute(RECORD_UNLOCK_SQL, &[&self.lock_name, &rrn])
+                    .await?;
+                self.current_rrn = None;
+                bail!(
+                    "CPF5013: Record {rrn} in file {} was deleted by another job.",
+                    self.lock_name
+                );
             }
         }
         self.locked = Some(rrn);

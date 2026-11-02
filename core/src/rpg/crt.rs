@@ -182,6 +182,7 @@ pub const C_FUNCTIONS: &[&str] = &[
     "QXXZTOD",
     "VSPRINTF",
     "_CALLPGMV",
+    "FTOK",
     "SQLALLOCENV",
     "SQLALLOCCONNECT",
     "SQLALLOCSTMT",
@@ -320,6 +321,23 @@ impl<'a> Machine<'a> {
             }
             "LSEEK" | "LSEEK64" => {
                 let r = self.c_lseek(int(0) as i32, int(1), int(2));
+                self.c_result(r)
+            }
+            // ftok(path, id) (UNIX-type APIs, Generate IPC Key from File
+            // Name): a key from the file and the low 8 bits of id; -1 and
+            // ENOENT when there is no such file.
+            "FTOK" => {
+                let path = self.c_string(&val(0))?;
+                let client = self.io.client;
+                let r = self.block(ifs::stat(client, &path)).and_then(|e| match e {
+                    Some(_) => {
+                        let h = path.bytes().fold(0x811c9dc5u32, |h, b| {
+                            (h ^ b as u32).wrapping_mul(0x01000193)
+                        });
+                        Ok(((int(1) & 0xFF) << 24) | (h & 0xFF_FFFF) as i64)
+                    }
+                    None => Err(ifs::Errno(errno::ENOENT).into()),
+                });
                 self.c_result(r)
             }
             "UNLINK" | "RMDIR" | "MKDIR" | "ACCESS" => {

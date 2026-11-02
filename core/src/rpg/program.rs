@@ -15,6 +15,35 @@ use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// A table of names: looked up for every use of a name as a program
+/// runs, with a quick hash (FxHash's multiply-rotate: names come from
+/// the program's own source, not from outside it).
+pub type SymMap = HashMap<String, Sym, std::hash::BuildHasherDefault<NameHasher>>;
+
+/// FxHash (as in rustc): one multiply and rotate per word.
+#[derive(Default, Clone, Copy)]
+pub struct NameHasher(u64);
+
+impl std::hash::Hasher for NameHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let w = u64::from_le_bytes(c.try_into().unwrap_or([0; 8]));
+            self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(K);
+        }
+        for &b in chunks.remainder() {
+            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(K);
+        }
+    }
+    fn write_u8(&mut self, b: u8) {
+        self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 /// Where a variable's bytes are: a storage buffer and an offset.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VarInfo {
@@ -40,7 +69,7 @@ pub struct DsInfo {
     pub size: usize,
     pub dim: u32,
     pub qualified: bool,
-    pub subfields: Vec<String>,
+    pub subfields: std::sync::Arc<[String]>,
     pub local: bool,
 }
 
@@ -223,7 +252,7 @@ pub struct ProcInfo {
     pub written: Option<String>,
     /// Local names (variables with `local` set: their buffers are the
     /// frame's), constants and key lists.
-    pub syms: HashMap<String, Sym>,
+    pub syms: SymMap,
     /// Initial contents of the frame buffers of a call.
     pub frame: Vec<Vec<u8>>,
     pub params: Vec<ParamInfo>,
@@ -247,7 +276,7 @@ pub struct ProcInfo {
 #[derive(Clone, Debug)]
 pub struct Program {
     pub name: String,
-    pub syms: HashMap<String, Sym>,
+    pub syms: SymMap,
     /// Initial contents of the global storage buffers.
     pub globals: Vec<Vec<u8>>,
     pub files: Vec<FileInfo>,
@@ -623,12 +652,12 @@ fn display_type(f: &crate::dspf::Field) -> DType {
     }
 }
 
-fn literal_value(text: &str, syms: &HashMap<String, Sym>) -> Result<Value> {
+fn literal_value(text: &str, syms: &SymMap) -> Result<Value> {
     let e = expr::parse(text)?;
     const_value(&e, syms)
 }
 
-fn const_value(e: &Expr, syms: &HashMap<String, Sym>) -> Result<Value> {
+fn const_value(e: &Expr, syms: &SymMap) -> Result<Value> {
     Ok(match e {
         Expr::Num(d) => Value::Num(*d),
         Expr::Str(s) | Expr::Hex(s) => Value::Char(s.clone()),
@@ -748,7 +777,7 @@ fn const_value(e: &Expr, syms: &HashMap<String, Sym>) -> Result<Value> {
     })
 }
 
-fn num_arg(a: &str, syms: &HashMap<String, Sym>) -> Result<u32> {
+fn num_arg(a: &str, syms: &SymMap) -> Result<u32> {
     if let Ok(n) = a.trim().parse() {
         return Ok(n);
     }
@@ -825,7 +854,7 @@ pub fn program_type(f: &crate::dds::FieldDef, in_ds: bool, extbinint: bool) -> O
 type RecordFormat = (Vec<(String, DType)>, Vec<String>);
 
 struct Binder<'a> {
-    syms: HashMap<String, Sym>,
+    syms: SymMap,
     bufs: Vec<Vec<u8>>,
     externals: &'a HashMap<String, FileRef>,
     /// Types of external file fields, by name.
@@ -1787,7 +1816,7 @@ impl Binder<'_> {
             };
             let other = &tname;
             template = Some((other.clone(), o.clone()));
-            for sf in &o.subfields {
+            for sf in o.subfields.iter() {
                 let key = if o.qualified {
                     format!("{other}.{sf}")
                 } else {
@@ -2206,7 +2235,7 @@ impl Binder<'_> {
                 size,
                 dim,
                 qualified: qualified || likeds.is_some() || likerec.is_some(),
-                subfields: names,
+                subfields: names.into(),
                 local: self.local,
             }),
         );
@@ -2305,7 +2334,7 @@ pub fn bind(
     printers: &HashMap<String, PrinterInfo>,
 ) -> Result<Program> {
     let mut b = Binder {
-        syms: HashMap::new(),
+        syms: SymMap::default(),
         bufs: vec![],
         externals,
         file_fields: HashMap::new(),
@@ -2798,7 +2827,7 @@ pub fn bind(
             b.bufs.push(pb.bufs[lb].clone());
             moved.insert(lb, b.bufs.len() - 1);
         }
-        let mut syms = HashMap::new();
+        let mut syms = SymMap::default();
         for (k, v) in pb.syms {
             let keep = match &v {
                 Sym::Var(x) => x.local,

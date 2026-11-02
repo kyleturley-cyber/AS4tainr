@@ -32,7 +32,7 @@ Sign on twice and `CALL CUSTMNT` in both sessions. When the second session asks 
 
 ## How it works
 
-- **Locks:** the record lock is a PostgreSQL advisory lock on the job's database session. The key is the physical file's name and the record number. The wait is the session's `lock_timeout`. The session's `application_name` is the job name, which is how `CPF5027` names the job that holds the record.
+- **Locks:** the record lock is a PostgreSQL advisory lock on the job's database session. A record is read, then locked by its record number, then read again: what the program gets is the record as it is under the lock, also when another job changed it between the read and the lock (otherwise the program's UPDATE would write the old values back over that change). The key is the physical file's name and the record number. The wait is the session's `lock_timeout`. The session's `application_name` is the job name, which is how `CPF5027` names the job that holds the record.
 - **The RPG engine:** a file opened for update (`U` in position 17) locks each record it reads, unless the read has the `N` extender. `UPDATE`, `DELETE`, the next read, `UNLOCK` and closing the file release it. An error indicator in positions 73-74 (or `(E)`) catches CPF5027 instead of ending the program. Each program call has its own database session, named after the job (`runtime::job_session`).
 
 ## Not yet

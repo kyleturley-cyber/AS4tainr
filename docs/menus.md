@@ -52,6 +52,7 @@ These menus are built into as4tainr and belong to QSYS. Their texts are as4tainr
 | FILE | Files, Libraries and Objects (named FILE like IBM i's file menu) | DSPLIBL, DSPLIB, CRTLIB, WRKOBJ, DSPPFM, DSPDTAARA, STRSQL |
 | PROGRAM | Programming | Command Entry, CALL, STRSQL, CRTMNU, CRTDTAARA |
 | SECURITY | Security | CRTUSRPRF, CHGUSRPRF, DSPUSRPRF, DLTUSRPRF, DSPOBJAUT, GRTOBJAUT, RVKOBJAUT, CHGOBJOWN |
+| LICPGM | Work with Licensed Programs | 10 is DSPSFWRSC, the licensed programs installed (as4tainr is not installed product by product, so there are no install, delete or save options) |
 
 Every system menu has option 90, Sign off. `GO MAIN` (or any of the names above) shows a menu from anywhere.
 

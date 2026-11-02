@@ -1327,6 +1327,26 @@ async fn job_description(client: &Client, caller: &Caller, args: &mut dyn ApiArg
 /// IBM i 7.5).
 pub const RELEASE: &str = "V7R5M0";
 
+/// The licensed programs as4tainr provides the functions of (DSPSFWRSC,
+/// QSZRTVPR): product, option ("0000" is *BASE) and as4tainr's
+/// description. The product IDs and options are IBM i's.
+pub const PRODUCTS: &[(&str, &str, &str)] = &[
+    (
+        "5770SS1",
+        "0000",
+        "Operating system: objects, CL, jobs, 5250, DB2",
+    ),
+    ("5770SS1", "0013", "System openness includes (QSYSINC)"),
+    ("5770SS1", "0030", "Qshell (QSH, STRQSH)"),
+    ("5770SS1", "0033", "PASE: the system utility and PASE APIs"),
+    ("5770ST1", "0000", "SQL development kit (STRSQL)"),
+    (
+        "5770WDS",
+        "0000",
+        "Development: ILE RPG, CL compilers, PDM, SEU",
+    ),
+];
+
 /// QSZRTVPR (receiver, length, PRDR0100, product information, error
 /// code) (Retrieve Product Information API) for the operating system
 /// (*OPSYS or 5770SS1, *CUR or its release, option 0000, *CODE): product
@@ -1345,15 +1365,25 @@ fn product_information(args: &mut dyn ApiArgs) -> Result<()> {
     let product = info[0..7].trim().to_ascii_uppercase();
     let release = info[7..13].trim().to_ascii_uppercase();
     let option = info[13..17].trim().to_string();
-    if !matches!(product.as_str(), "*OPSYS" | "5770SS1")
+    let id = if product == "*OPSYS" {
+        "5770SS1".to_string()
+    } else {
+        product.clone()
+    };
+    let opt = if option.is_empty() || option.eq_ignore_ascii_case("*BASE") {
+        "0000"
+    } else {
+        option.as_str()
+    };
+    if !PRODUCTS.iter().any(|(p, o, _)| *p == id && *o == opt)
         || !matches!(release.as_str(), "*CUR" | "*ONLY" | RELEASE)
     {
         bail!("CPF0C1F: Product {product} {release} is not installed.");
     }
     let mut o = vec![0u8; 12];
-    o.extend(field("5770SS1", 7));
+    o.extend(field(&id, 7));
     o.extend(field(RELEASE, 6));
-    o.extend(field(if option.is_empty() { "0000" } else { &option }, 4));
+    o.extend(field(opt, 4));
     o.extend(field("*CODE", 4));
     o.extend(field("*CODE", 10));
     o.extend(field("*INSTALLED", 10));

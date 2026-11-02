@@ -952,6 +952,11 @@ pub async fn run_subsystem(env: crate::commands::Environment, max_active: usize)
     let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(max_active));
     let env = std::sync::Arc::new(env);
     loop {
+        // PWRDWNSYS *CNTRLD: no new jobs start; those running end.
+        if ENDING.load(std::sync::atomic::Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
         let permit = slots.clone().acquire_owned().await?;
         match claim_next(&client, BATCH_QUEUE).await {
             Ok(Some(info)) => {
@@ -973,6 +978,121 @@ pub async fn run_subsystem(env: crate::commands::Environment, max_active: usize)
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
+    }
+}
+
+/// The system is ending (PWRDWNSYS): the subsystems start no more jobs.
+pub static ENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The notification channel PWRDWNSYS sends on, and the application name
+/// of the server's session that listens to it.
+pub const POWER_DOWN_CHANNEL: &str = "as4tainr_pwrdwnsys";
+pub const POWER_DOWN_LISTENER: &str = "as4tainr power-down listener";
+
+/// What PWRDWNSYS asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PowerDown {
+    /// OPTION(*IMMED): end at once; *CNTRLD: let batch jobs finish first.
+    pub immediate: bool,
+    /// DELAY for *CNTRLD, in seconds (None: *NOLIMIT).
+    pub delay: Option<u64>,
+    /// RESTART(*YES): start again (the server runs itself anew).
+    pub restart: bool,
+}
+
+impl PowerDown {
+    pub fn payload(&self) -> String {
+        format!(
+            "{} {} {}",
+            if self.immediate { "*IMMED" } else { "*CNTRLD" },
+            self.delay
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "*NOLIMIT".into()),
+            if self.restart { "*YES" } else { "*NO" }
+        )
+    }
+
+    pub fn parse(s: &str) -> Option<PowerDown> {
+        let mut w = s.split_whitespace();
+        let immediate = w.next()? == "*IMMED";
+        let delay = match w.next()? {
+            "*NOLIMIT" => None,
+            d => Some(d.parse().ok()?),
+        };
+        let restart = w.next()? == "*YES";
+        Some(PowerDown {
+            immediate,
+            delay,
+            restart,
+        })
+    }
+}
+
+/// The server waits here for PWRDWNSYS (a PostgreSQL notification, so a
+/// PWRDWNSYS from any process of the system reaches it).
+pub async fn wait_for_power_down(database_url: &str) -> Result<PowerDown> {
+    use futures_util::StreamExt;
+    let (client, mut conn) = tokio_postgres::connect(database_url, tokio_postgres::NoTls).await?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut stream = futures_util::stream::poll_fn(move |cx| conn.poll_message(cx));
+        while let Some(m) = stream.next().await {
+            match m {
+                Ok(tokio_postgres::AsyncMessage::Notification(n)) => {
+                    let _ = tx.send(n.payload().to_string());
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+    client
+        .batch_execute(&format!(
+            "SET application_name = '{POWER_DOWN_LISTENER}'; LISTEN {POWER_DOWN_CHANNEL}"
+        ))
+        .await?;
+    loop {
+        let Some(p) = rx.recv().await else {
+            bail!("the power-down listener lost its database connection");
+        };
+        if let Some(pd) = PowerDown::parse(&p) {
+            // Keep the session (and its LISTEN) until the end.
+            std::mem::forget(client);
+            return Ok(pd);
+        }
+    }
+}
+
+/// Is a server listening for PWRDWNSYS?
+pub async fn power_down_listeners(client: &Client) -> Result<i64> {
+    Ok(client
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1 AND datname = current_database()",
+            &[&POWER_DOWN_LISTENER],
+        )
+        .await?
+        .get(0))
+}
+
+/// PWRDWNSYS *CNTRLD: wait for the active batch jobs to end, up to the
+/// delay; true when they all ended.
+pub async fn wait_for_batch_jobs(client: &Client, delay: Option<u64>) -> Result<bool> {
+    let start = std::time::Instant::now();
+    loop {
+        let n: i64 = client
+            .query_one(
+                "SELECT count(*) FROM as4tainr.jobs WHERE status='ACTIVE' AND type='BCH'",
+                &[],
+            )
+            .await?
+            .get(0);
+        if n == 0 {
+            return Ok(true);
+        }
+        if delay.is_some_and(|d| start.elapsed().as_secs() >= d) {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 

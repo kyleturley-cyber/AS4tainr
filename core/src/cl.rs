@@ -414,6 +414,32 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT")],
     },
     CommandDef {
+        name: "RSTLICPGM",
+        description: "Restore Licensed Program",
+        params: &[
+            p("LICPGM", Kind::Text, false, None, "Product").ch("Product ID"),
+            p("DEV", Kind::Name, false, None, "Device").ch("Name, *SAVF"),
+            p("OPTION", Kind::Text, false, Some("*BASE"), "Optional part to be restored").ch("*BASE, 1-99"),
+        ],
+    },
+    CommandDef {
+        name: "DLTLICPGM",
+        description: "Delete Licensed Program",
+        params: &[
+            p("LICPGM", Kind::Text, true, None, "Product").ch("Product ID"),
+            p("OPTION", Kind::Text, false, Some("*ALL"), "Optional part to be deleted").ch("*ALL, *BASE, 1-99"),
+        ],
+    },
+    CommandDef {
+        name: "SAVLICPGM",
+        description: "Save Licensed Program",
+        params: &[
+            p("LICPGM", Kind::Text, true, None, "Product").ch("Product ID"),
+            p("DEV", Kind::Name, false, None, "Device").ch("Name, *SAVF"),
+            p("OPTION", Kind::Text, false, Some("*BASE"), "Optional part to be saved").ch("*BASE, 1-99"),
+        ],
+    },
+    CommandDef {
         name: "GO",
         description: "Go to Menu",
         params: &[p("MENU", Kind::Qualified, true, None, "Menu").ch("Name, MAIN")],
@@ -1928,6 +1954,15 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[],
     },
     CommandDef {
+        name: "PWRDWNSYS",
+        description: "Power Down System",
+        params: &[
+            p("OPTION", Kind::Name, false, Some("*CNTRLD"), "How to end").ch("*CNTRLD, *IMMED"),
+            p("DELAY", Kind::Text, false, Some("3600"), "Controlled end delay time").ch("Seconds, *NOLIMIT"),
+            p("RESTART", Kind::List, false, Some("*NO"), "Restart options").ch("*NO, *YES"),
+        ],
+    },
+    CommandDef {
         name: "WRKSBS",
         description: "Work with Subsystems",
         params: &[],
@@ -1941,6 +1976,14 @@ pub static COMMANDS: &[CommandDef] = &[
         name: "WRKUSRPRF",
         description: "Work with User Profiles",
         params: &[p("USRPRF", Kind::Name, false, Some("*ALL"), "User profile").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "CHGSYSVAL",
+        description: "Change System Value",
+        params: &[
+            p("SYSVAL", Kind::Name, true, None, "System value").ch("QDATFMT, QDATSEP, QTIMSEP, ..."),
+            p("VALUE", Kind::Text, true, None, "New value").ch("Value"),
+        ],
     },
     CommandDef {
         name: "DSPSYSVAL",
@@ -4557,7 +4600,11 @@ pub static GROUPS: &[Group] = &[
             "DLTMSGQ",
             "DLYJOB",
             "DSPSYSVAL",
+            "CHGSYSVAL",
             "DSPSFWRSC",
+            "RSTLICPGM",
+            "DLTLICPGM",
+            "SAVLICPGM",
             "HLDJOB",
             "RLSJOB",
             "WRKJOB",
@@ -4565,6 +4612,7 @@ pub static GROUPS: &[Group] = &[
             "WRKMSGQ",
             "WRKSYSVAL",
             "WRKSYSSTS",
+            "PWRDWNSYS",
             "DSPLOG",
             "DSPNETA",
             "WRKSBS",

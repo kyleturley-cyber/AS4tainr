@@ -524,7 +524,9 @@ pub async fn init(client: &Client) -> Result<()> {
     client
         .execute("SELECT pg_advisory_unlock($1)", &[&INIT_LOCK_KEY])
         .await?;
-    result
+    result?;
+    // The system values CHGSYSVAL changed, for this process.
+    crate::clpgm::load_system_values(client).await
 }
 
 /// CRTLIB: like `create_library`, but fails with CPF2111 when the library exists.

@@ -140,14 +140,20 @@ pub const BUILTIN: &[BuiltinMenu] = &[
             SIGN_OFF,
         ],
     },
-    // GO LICPGM: work with licensed programs. as4tainr is not installed
-    // product by product (its functions are built in), so the options
-    // that install, delete or save licensed programs are not here.
+    // GO LICPGM: work with licensed programs (option numbers as IBM i's
+    // LICPGM menu numbers them, texts as4tainr's). as4tainr's functions
+    // are built in: the install, delete and save options say so
+    // (RSTLICPGM, DLTLICPGM, SAVLICPGM).
     BuiltinMenu {
         name: "LICPGM",
         title: "Work with Licensed Programs",
         options: &[
+            o(1, "Install licensed programs from media", "RSTLICPGM"),
             o(10, "Display installed licensed programs", "DSPSFWRSC"),
+            o(11, "Install a licensed program", "RSTLICPGM"),
+            o(12, "Delete a licensed program", "?DLTLICPGM"),
+            o(13, "Save a licensed program", "?SAVLICPGM"),
+            o(50, "Display the history log", "DSPLOG"),
             SIGN_OFF,
         ],
     },

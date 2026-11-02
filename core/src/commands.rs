@@ -549,6 +549,22 @@ impl Job<'_> {
             "DSPLIB" => self.dsplib(&cmd).await,
             "DSPLIBL" => self.dsplibl().await,
             "DSPSFWRSC" => self.dspsfwrsc(),
+            "RSTLICPGM" | "DLTLICPGM" | "SAVLICPGM" => {
+                // as4tainr's functions are built into its program, not
+                // installed product by product (DSPSFWRSC lists them).
+                let what = match cmd.def.name {
+                    "RSTLICPGM" => "installed from media",
+                    "DLTLICPGM" => "deleted",
+                    _ => "saved",
+                };
+                let p = cmd.get("LICPGM").trim().to_ascii_uppercase();
+                let p = if p.is_empty() {
+                    "Licensed programs".to_string()
+                } else {
+                    format!("Licensed program {p}")
+                };
+                bail!("{p} cannot be {what} on as4tainr: its functions are part of as4tainr itself (DSPSFWRSC lists them; a new as4tainr version brings new ones).")
+            }
             "ADDLIBLE" => self.addlible(&cmd).await,
             "RMVLIBLE" => self.rmvlible(&cmd).await,
             "CHGCURLIB" => self.chgcurlib(&cmd).await,
@@ -679,7 +695,17 @@ impl Job<'_> {
             "WRKUSRJOB" => self.wrkusrjob(&cmd).await,
             "WRKMSGQ" => self.wrkmsgq(&cmd).await,
             "WRKSYSVAL" => self.wrksysval(&cmd),
+            "CHGSYSVAL" => {
+                self.require_secadm("change system values").await?;
+                crate::clpgm::change_system_value(self.client, cmd.get("SYSVAL"), cmd.get("VALUE"))
+                    .await?;
+                Ok(Outcome::Messages(vec![format!(
+                    "System value {} was changed.",
+                    cmd.get("SYSVAL").trim().to_ascii_uppercase()
+                )]))
+            }
             "WRKSYSSTS" => self.wrksyssts().await,
+            "PWRDWNSYS" => self.pwrdwnsys(&cmd).await,
             "DSPLOG" => self.dsplog(&cmd).await,
             "EDTLIBL" => {
                 if self.display.is_none() {
@@ -909,33 +935,37 @@ impl Job<'_> {
     /// capture of IBM i's yet).
     fn dspsfwrsc(&mut self) -> Result<Outcome> {
         let release = crate::sysapi::RELEASE;
-        let heading = format!(
-            "{:<11}  {:<6}  {:<8}  {}",
-            "Resource ID", "Option", "Release", "Description"
-        );
-        let row = format!(
-            "{:<11}  {:<6}  {:<8}  {}",
-            "5770SS1", "*BASE", release, "as4tainr: IBM i interfaces (CL, RPG, SQL, DDS, 5250)"
-        );
+        let fmt =
+            |id: &str, opt: &str, rel: &str, d: &str| format!("{id:<11}  {opt:<6}  {rel:<8}  {d}");
+        let heading = fmt("Resource ID", "Option", "Release", "Description");
+        let rows: Vec<String> = crate::sysapi::PRODUCTS
+            .iter()
+            .map(|(p, o, d)| {
+                fmt(
+                    p,
+                    if *o == "0000" {
+                        "*BASE"
+                    } else {
+                        o.trim_start_matches('0')
+                    },
+                    release,
+                    d,
+                )
+            })
+            .collect();
         let mut print = vec![
-            format!("Display Software Resources"),
+            "Display Software Resources".to_string(),
             String::new(),
             heading.clone(),
         ];
-        print.push(row.clone());
+        print.extend(rows.iter().cloned());
         Ok(Outcome::Display(ListDisplay {
             title: "Display Software Resources".into(),
-            info: vec![],
             heading,
-            rows: vec![row],
-            options: vec![],
-            keys: vec![String::new()],
-            refresh: None,
+            keys: vec![String::new(); rows.len()],
+            rows,
             print,
-            ibm: None,
-            print_msg: None,
-            spool: None,
-            member: None,
+            ..Default::default()
         }))
     }
 
@@ -7178,6 +7208,54 @@ impl Job<'_> {
             refresh: Some("WRKSYSSTS".into()),
             ..Default::default()
         }))
+    }
+
+    /// PWRDWNSYS (CL reference): end the system. The system here is the
+    /// as4tainr server (`as4tainr tn5250`: display sessions and QBATCH):
+    /// it is told through the database, so PWRDWNSYS from any job or
+    /// `system` reaches it. *IMMED ends it at once; *CNTRLD lets the
+    /// active batch jobs end first (DELAY seconds at most) and starts no
+    /// new ones; RESTART(*YES) starts the server again. Needs *JOBCTL.
+    async fn pwrdwnsys(&mut self, cmd: &Command) -> Result<Outcome> {
+        if !users::has_special(self.client, &self.user, "*JOBCTL").await? {
+            bail!("Not authorized to end the system: PWRDWNSYS needs *JOBCTL special authority.");
+        }
+        let immediate = match cmd.get("OPTION").trim().to_ascii_uppercase().as_str() {
+            "*CNTRLD" | "" => false,
+            "*IMMED" => true,
+            o => bail!("CPD0084: OPTION({o}) is not valid; use *CNTRLD or *IMMED."),
+        };
+        let delay = match cmd.get("DELAY").trim().to_ascii_uppercase().as_str() {
+            "*NOLIMIT" => None,
+            "" => Some(3600),
+            d => match d.parse::<u64>() {
+                Ok(n) if (1..=99999).contains(&n) => Some(n),
+                _ => bail!("CPD0084: DELAY({d}) is not valid; use 1-99999 seconds or *NOLIMIT."),
+            },
+        };
+        let restart = cmd
+            .list("RESTART")
+            .first()
+            .is_some_and(|r| r.eq_ignore_ascii_case("*YES"));
+        if jobs::power_down_listeners(self.client).await? == 0 {
+            bail!("No as4tainr server is running on this database to end (start one with `as4tainr tn5250`).");
+        }
+        let pd = jobs::PowerDown {
+            immediate,
+            delay,
+            restart,
+        };
+        self.client
+            .execute(
+                "SELECT pg_notify($1, $2)",
+                &[&jobs::POWER_DOWN_CHANNEL, &pd.payload()],
+            )
+            .await?;
+        Ok(Outcome::Messages(vec![format!(
+            "The system is ending ({}{}).",
+            if immediate { "*IMMED" } else { "*CNTRLD" },
+            if restart { ", then starting again" } else { "" }
+        )]))
     }
 
     /// DSPLOG (QHST): the history of jobs as as4tainr keeps it: each

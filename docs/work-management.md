@@ -39,6 +39,7 @@ Batch programs run without a display: `EXFMT` in a batch job fails, as it does o
 | `WRKSBMJOB` | Jobs you submitted: `JOBQ` (waiting), `ACTIVE`, `OUTQ` (ended). Option 4 ends a job that has not started, option 5 shows its log, F5 refreshes |
 | `WRKJOB JOB(*) OPTION(*SELECT)` | On a display, a menu of what can be shown about your job (1 status, 2 definition, 3 run attributes, 4 spooled files, 10 job log, 11 call stack, 13 library list, 18 activation groups); another OPTION shows that display; another job or OUTPUT(*PRINT) shows all of DSPJOB |
 | `HLDJOB JOB(...)`, `RLSJOB JOB(...)`, `SBMJOB ... HOLD(*YES)` | Hold a job on its job queue (QBATCH passes it by) and release it; WRKSBMJOB options 3 and 6 |
+| `PWRDWNSYS OPTION(*CNTRLD) DELAY(3600) RESTART(*NO)` | Ends the as4tainr server: *CNTRLD lets the active batch jobs finish (up to DELAY seconds) and starts no new ones, *IMMED ends at once; RESTART(*YES) starts the server again (in Docker the container keeps running; with *NO it stops). Needs *JOBCTL |
 | `WRKSYSSTS`, `DSPLOG` | The system's status (jobs, processor use, database size) and the history log: each job's start and end |
 | `WRKUSRJOB USER(*) STATUS(*ALL)` | A user's jobs (`*JOBQ`, `*ACTIVE`, `*OUTQ` or all); option 4 ends, 5 works with the job, 10 shows its log |
 | `WRKMSGQ MSGQ(*ALL)` | Message queues on the library list or in a library, by name or generic name: queues made with CRTMSGQ and the user profiles' queues; option 5 shows the messages, 4 deletes a queue |

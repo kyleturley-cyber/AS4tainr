@@ -568,8 +568,9 @@ impl Job<'_> {
             })?;
             n += 1;
         }
+        // CPC2959 (PUB400, IBM i 7.5, verify38 g38_impa).
         Ok(Outcome::Messages(vec![format!(
-            "{n} records of stream file {from} were copied to member {mbr} of file {}/{}.",
+            "CPC2959: {n} records from stream file {from} were put in member {mbr} of file {}/{}.",
             crate::qtemp::logical(&f.library),
             f.file.name
         )]))

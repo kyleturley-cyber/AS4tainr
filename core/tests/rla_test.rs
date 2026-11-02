@@ -4150,6 +4150,10 @@ async fn menus_and_initial_menu() {
         Outcome::Menu(menus::Menu::Builtin(m)) => {
             assert_eq!(m.name, "LICPGM");
             assert!(m.options.iter().any(|o| o.command == "DSPSFWRSC"));
+            // IBM i's LICPGM option numbers: 1 install, 10 display,
+            // 11 install, 12 delete, 13 save, 50 the log.
+            let numbers: Vec<u8> = m.options.iter().map(|o| o.number).collect();
+            assert_eq!(numbers, [1, 10, 11, 12, 13, 50, 90]);
         }
         _ => panic!("GO LICPGM should show the licensed programs menu"),
     }
@@ -4165,6 +4169,13 @@ async fn menus_and_initial_menu() {
         }
         _ => panic!("DSPSFWRSC shows a list"),
     }
+    // Licensed programs are not installed, deleted or saved one by one.
+    let e = sec
+        .run("RSTLICPGM LICPGM(5770WDS) DEV(*SAVF)")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("cannot be installed"), "{e}");
     assert!(matches!(
         sec.run("CALL QCMD").await.unwrap(),
         Outcome::CommandEntry
@@ -23654,8 +23665,9 @@ async fn copy_to_and_from_import_file() {
         Outcome::Messages(m) => m.join(" "),
         other => panic!("{other:?}"),
     };
+    // Completion CPC2959 (PUB400, IBM i 7.5, verify38 g38_impa).
     assert!(
-        m.starts_with(&format!("{} records", lines.len() - 1)),
+        m.starts_with(&format!("CPC2959: {} records", lines.len() - 1)),
         "{m}"
     );
     let q = |t: &str| {
@@ -23793,4 +23805,121 @@ async fn system_status_history_log_and_edit_library_list() {
         job.run("EDTLIBL").await.unwrap(),
         Outcome::EditLibraryList
     ));
+}
+
+/// CHGSYSVAL (IBM i CL reference; system values documentation:
+/// QPWDEXPITV is *NOMAX as shipped, or 1-366 days): a new value is kept
+/// (DSPSYSVAL shows it, with the shipped value beside it, also after the
+/// values are loaded again as a new process does), a value out of range
+/// is refused.
+#[tokio::test]
+async fn change_a_system_value() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let shown = |o: Outcome| match o {
+        Outcome::Display(d) => d.info,
+        other => panic!("{other:?}"),
+    };
+    assert!(job
+        .run("CHGSYSVAL SYSVAL(QPWDEXPITV) VALUE('400')")
+        .await
+        .is_err());
+    assert!(job
+        .run("CHGSYSVAL SYSVAL(QNOSUCH) VALUE('1')")
+        .await
+        .unwrap_err()
+        .to_string()
+        .starts_with("CPF1028"));
+    job.run("CHGSYSVAL SYSVAL(QPWDEXPITV) VALUE('90')")
+        .await
+        .unwrap();
+    as4tainr_core::clpgm::load_system_values(&client)
+        .await
+        .unwrap();
+    let info = shown(job.run("DSPSYSVAL QPWDEXPITV").await.unwrap());
+    assert!(
+        info.contains(&("Value".to_string(), "90".to_string())),
+        "{info:?}"
+    );
+    assert!(
+        info.contains(&("Shipped value".to_string(), "*NOMAX".to_string())),
+        "{info:?}"
+    );
+    job.run("CHGSYSVAL SYSVAL(QPWDEXPITV) VALUE(*NOMAX)")
+        .await
+        .unwrap();
+    let info = shown(job.run("DSPSYSVAL QPWDEXPITV").await.unwrap());
+    assert!(
+        info.contains(&("Value".to_string(), "*NOMAX".to_string())),
+        "{info:?}"
+    );
+}
+
+/// PWRDWNSYS (IBM i CL reference: OPTION *CNTRLD or *IMMED, DELAY in
+/// seconds, RESTART *NO or *YES; *JOBCTL special authority): the
+/// server listening for it gets what was asked; with no server running,
+/// it is an error; a delay out of range is refused.
+#[tokio::test]
+async fn power_down_system_reaches_the_server() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::jobs;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    assert!(job.run("PWRDWNSYS DELAY(0)").await.is_err());
+    if jobs::power_down_listeners(&client).await.unwrap() == 0 {
+        let e = job.run("PWRDWNSYS").await.unwrap_err().to_string();
+        assert!(e.contains("No as4tainr server"), "{e}");
+    }
+    // A listener as the server has (`as4tainr tn5250`).
+    let u = url.clone();
+    let listener = tokio::spawn(async move { jobs::wait_for_power_down(&u).await });
+    for _ in 0..50 {
+        if jobs::power_down_listeners(&client).await.unwrap() > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    job.run("PWRDWNSYS OPTION(*IMMED) DELAY(60) RESTART(*YES)")
+        .await
+        .unwrap();
+    let pd = tokio::time::timeout(std::time::Duration::from_secs(10), listener)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pd,
+        jobs::PowerDown {
+            immediate: true,
+            delay: Some(60),
+            restart: true
+        }
+    );
 }

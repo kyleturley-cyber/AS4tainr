@@ -593,10 +593,16 @@ async fn run(cli: Cli) -> Result<u8> {
             let maxact = as4tainr_core::jobs::batch_max_active();
             println!("as4tainr: subsystem QBATCH started (MAXACT {maxact})");
             let qbatch = tokio::spawn(as4tainr_core::jobs::run_subsystem(cfg.env.clone(), maxact));
+            let db_url = cfg.env.database_url.clone();
+            let power = as4tainr_core::jobs::wait_for_power_down(&db_url);
             tokio::select! {
                 r = tn5250::serve(listener, cfg) => r?,
                 r = qbatch => r??,
                 r = web => r?,
+                pd = power => {
+                    let pd = pd?;
+                    power_down(&db_url, &pd).await?;
+                }
             }
         }
         Cmd::Batch { command, user } => {
@@ -706,4 +712,33 @@ async fn run(cli: Cli) -> Result<u8> {
         }
     }
     Ok(0)
+}
+
+/// PWRDWNSYS reached the server: *CNTRLD lets the active batch jobs end
+/// (no new ones start), then the server ends; the jobs still active are
+/// marked ended when it starts again (`jobs::recover`). RESTART(*YES)
+/// runs the server anew in this process (the same process ID, so a
+/// container keeps running); otherwise the process ends (a container
+/// stops).
+async fn power_down(database_url: &str, pd: &as4tainr_core::jobs::PowerDown) -> anyhow::Result<()> {
+    use as4tainr_core::jobs;
+    println!("as4tainr: PWRDWNSYS {}: the system is ending", pd.payload());
+    jobs::ENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+    if !pd.immediate {
+        let client = runtime::connect_db(database_url).await?;
+        if !jobs::wait_for_batch_jobs(&client, pd.delay).await? {
+            println!("as4tainr: PWRDWNSYS: the delay ended with batch jobs still active");
+        }
+    }
+    if pd.restart {
+        println!("as4tainr: PWRDWNSYS: starting again");
+        use std::os::unix::process::CommandExt;
+        let exe = std::env::current_exe()?;
+        let e = std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .exec();
+        anyhow::bail!("PWRDWNSYS RESTART(*YES): the server could not start again: {e}");
+    }
+    println!("as4tainr: PWRDWNSYS: the system has ended");
+    std::process::exit(0);
 }

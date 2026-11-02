@@ -23624,9 +23624,29 @@ async fn copy_to_and_from_import_file() {
     ))
     .await
     .unwrap();
-    let m = match job
+    // RCDDLM's default *EOR is not for a stream file: CPF2845 (reason code
+    // 11) and CPF2817, nothing copied, the file not cleared (PUB400,
+    // IBM i 7.5, tools/golden/verify37.txt f37_impa, f37_rowsa).
+    let e = job
         .run(&format!(
             "CPYFRMIMPF FROMSTMF('{csv}') TOFILE({lib}/CUSTCOPY) MBROPT(*REPLACE) RMVCOLNAM(*YES)"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF2845") && e.contains("\nCPF2817"), "{e}");
+    let kept: i64 = client
+        .query_one(
+            &format!("SELECT count(*) FROM {}.custcopy", lib.to_lowercase()),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(kept, 5);
+    let m = match job
+        .run(&format!(
+            "CPYFRMIMPF FROMSTMF('{csv}') TOFILE({lib}/CUSTCOPY) MBROPT(*REPLACE) RMVCOLNAM(*YES) RCDDLM(*LF)"
         ))
         .await
         .unwrap()
@@ -23688,7 +23708,7 @@ async fn copy_to_and_from_import_file() {
     .unwrap();
     let e = job
         .run(&format!(
-            "CPYFRMIMPF FROMSTMF('{dir}/bad.csv') TOFILE({lib}/CUSTCOPY)"
+            "CPYFRMIMPF FROMSTMF('{dir}/bad.csv') TOFILE({lib}/CUSTCOPY) RCDDLM(*LF)"
         ))
         .await
         .unwrap_err()

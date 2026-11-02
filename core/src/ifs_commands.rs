@@ -404,7 +404,8 @@ impl Job<'_> {
         }
         let form = impf_form(cmd)?;
         let eol = match cmd.get("RCDDLM").trim().to_ascii_uppercase().as_str() {
-            "" | "*EOR" | "*CRLF" => "\r\n",
+            "" | "*EOR" => return Err(eor_stream_file()),
+            "*CRLF" => "\r\n",
             "*LF" => "\n",
             "*CR" => "\r",
             "*LFCR" => "\n\r",
@@ -507,7 +508,8 @@ impl Job<'_> {
             "*CR" => text.split('\r').collect(),
             "*CRLF" => text.split("\r\n").collect(),
             "*LFCR" => text.split("\n\r").collect(),
-            _ => text.split(['\n', '\r']).collect(),
+            "" | "*EOR" => return Err(eor_stream_file()),
+            o => bail!("RCDDLM({o}) is not valid for a stream file: use *CRLF, *LF, *CR or *LFCR."),
         };
         let lines: Vec<&str> = lines.into_iter().filter(|l| !l.is_empty()).collect();
         let from_rcd = cmd.list("FROMRCD");
@@ -723,6 +725,16 @@ impl Job<'_> {
 
 /// STMFCCSID, or the code page of the old keyword STMFCODPAG when only
 /// that one is given.
+/// RCDDLM(*EOR), the default, with a stream file: CPYTOIMPF and
+/// CPYFRMIMPF end before copying anything with CPF2845 reason code 11
+/// and CPF2817 (PUB400, IBM i 7.5, tools/golden/verify37.txt: every
+/// import without RCDDLM; *EOR is for database files).
+fn eor_stream_file() -> anyhow::Error {
+    anyhow::anyhow!(
+        "CPF2845: Reason code 11: record delimiter *EOR cannot be used with a stream file; give RCDDLM(*CRLF), *LF, *CR or *LFCR.\nCPF2817: Nothing was copied."
+    )
+}
+
 /// CPYTOIMPF's and CPYFRMIMPF's delimiters.
 fn impf_form(cmd: &crate::cl::Command) -> Result<crate::impf::Form> {
     use crate::impf::{Blanks, Form};

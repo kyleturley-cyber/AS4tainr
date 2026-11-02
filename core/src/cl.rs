@@ -3566,8 +3566,8 @@ pub static COMMANDS: &[CommandDef] = &[
             p("FROMSTMF", Kind::Text, true, None, "From stream file").ch("Path name"),
             p("TOFILE", Kind::List, true, None, "To data base file").ch("Name, member"),
             p("MBROPT", Kind::Name, false, Some("*ADD"), "Replace or add records").ch("*ADD, *REPLACE"),
-            p("RCDDLM", Kind::Text, false, Some("*ALL"), "Record delimiter")
-                .ch("*ALL, *CRLF, *LF, *CR, *LFCR")
+            p("RCDDLM", Kind::Text, false, Some("*EOR"), "Record delimiter")
+                .ch("*EOR, *CRLF, *LF, *CR, *LFCR")
                 .keyword_only(),
             p("DTAFMT", Kind::Name, false, Some("*DLM"), "Record format of import file")
                 .ch("*DLM")

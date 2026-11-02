@@ -23608,9 +23608,16 @@ async fn copy_to_and_from_import_file() {
     assert_eq!(ccsid, 1208);
     let text = String::from_utf8(bytes).unwrap();
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines[0], "\"CUSNO\",\"CUSNAM\",\"CUSCTY\",\"CUSBAL\"");
-    assert!(lines[1].starts_with("1,\"Acme Tooling "), "{}", lines[1]);
-    assert!(lines[1].ends_with(",1250.50"), "{}", lines[1]);
+    // Column names without delimiters; a number left-aligned in its
+    // length plus two (PUB400, IBM i 7.5, tools/golden/verify36.txt
+    // b36_rows1 and b36_rows2). CUSNO is zoned 5,0, CUSBAL packed 9,2.
+    assert_eq!(lines[0], "CUSNO,CUSNAM,CUSCTY,CUSBAL");
+    assert!(
+        lines[1].starts_with("1      ,\"Acme Tooling "),
+        "{}",
+        lines[1]
+    );
+    assert!(lines[1].ends_with(",1250.50    "), "{}", lines[1]);
     // The same records back into a copy of the file.
     job.run(&format!(
         "CPYF FROMFILE({lib}/CUSTMAST) TOFILE({lib}/CUSTCOPY) CRTFILE(*YES)"

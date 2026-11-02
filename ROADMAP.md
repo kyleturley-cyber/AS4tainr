@@ -254,6 +254,7 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] CPYTOIMPF and CPYFRMIMPF (delimited text); MBROPT(*REPLACE) numbers records from 1 again (CPYF, CPYFRMSTMF)
 - [x] HLDJOB, RLSJOB, SBMJOB HOLD(*YES); STRPDM and WRKLIBPDM
 - [x] WRKSYSSTS, DSPLOG (QHST job history), EDTLIBL
+- [x] verify35 and verify36 captured: CPYTOIMPF writes numbers, dates and column names as PUB400 does
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).
 - [x] Journals and trigger programs: COM's SETUPJRN, ORDAUDJV (QSYS2.DISPLAY_JOURNAL) and ORDTRG (ADDPFTRG) run (docs/journals.md).

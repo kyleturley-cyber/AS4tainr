@@ -464,10 +464,12 @@ impl Job<'_> {
         ifs::write_file(self.client, &to, &bytes, ccsid, 0o644, &self.user)
             .await
             .map_err(|e| cl_error(e, &to))?;
+        // CPC2958 (PUB400, IBM i 7.5, verify36 b36_exp1).
+        let _ = (n, mbr);
         Ok(Outcome::Messages(vec![format!(
-            "{n} records of member {mbr} of file {}/{} were copied to stream file {to}.",
-            crate::qtemp::logical(&f.library),
-            f.file.name
+            "CPC2958: The records of file {} in {} were copied to stream file {to}.",
+            f.file.name,
+            crate::qtemp::logical(&f.library)
         )]))
     }
 

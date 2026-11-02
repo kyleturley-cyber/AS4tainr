@@ -100,33 +100,64 @@ pub fn format_record(fields: &[FieldDef], values: &[Option<String>], form: &Form
                 | DataType::Float
                 | DataType::Decfloat
         ) {
-            let n = v.trim();
-            out.push(if form.decpnt == '.' {
-                n.to_string()
-            } else {
-                n.replace('.', &form.decpnt.to_string())
-            });
+            out.push(number(f, v, form));
         } else {
-            out.push(v.trim_end().to_string());
+            // Dates, times and timestamps between string delimiters
+            // (verify36 b36_rows1: "2026-01-02","13.14.15").
+            let v = v.trim_end();
+            out.push(match form.strdlm {
+                Some(d)
+                    if matches!(
+                        f.data_type,
+                        DataType::Date | DataType::Time | DataType::Timestamp
+                    ) =>
+                {
+                    format!("{d}{v}{d}")
+                }
+                _ => v.to_string(),
+            });
         }
     }
     out.join(&form.flddlm)
 }
 
+/// A number as CPYTOIMPF writes it (PUB400, IBM i 7.5, verify36
+/// b36_rows1 and b36_rows2): no leading zero before the decimal point
+/// (.05, -1.50), DECPNT's character, and blanks after it to the field's
+/// length plus two (a sign and the decimal point: DECIMAL(9,2) and
+/// INTEGER take 11 positions), unless RMVBLANK takes trailing blanks off.
+fn number(f: &FieldDef, v: &str, form: &Form) -> String {
+    let n = v.trim();
+    let (sign, body) = match n.strip_prefix('-') {
+        Some(b) => ("-", b),
+        None => ("", n),
+    };
+    let body = match body.strip_prefix('0') {
+        Some(rest) if rest.starts_with('.') => rest,
+        _ => body,
+    };
+    let mut t = format!("{sign}{body}");
+    if form.decpnt != '.' {
+        t = t.replace('.', &form.decpnt.to_string());
+    }
+    if matches!(form.blanks, Blanks::Trailing | Blanks::Both) {
+        return t;
+    }
+    let width = f.length as usize + 2;
+    format!("{t:<width$}")
+}
+
 /// The field names as a first record (ADDCOLNAM): system names or SQL
-/// names, each between string delimiters.
+/// names, without string delimiters (verify36 b36_rows2:
+/// NAME;DESCR;AMT;...).
 pub fn header(fields: &[FieldDef], sql: bool, form: &Form) -> String {
     fields
         .iter()
         .map(|f| {
-            let n = if sql {
+            if sql {
                 f.alias.clone().unwrap_or_else(|| f.name.clone())
             } else {
                 f.name.clone()
-            };
-            match form.strdlm {
-                Some(d) => format!("{d}{n}{d}"),
-                None => n,
             }
         })
         .collect::<Vec<_>>()
@@ -235,7 +266,9 @@ mod tests {
     }
 
     // CL reference, CPYTOIMPF/CPYFRMIMPF: comma between fields, quotation
-    // marks around character fields (one inside doubled), null as nothing.
+    // marks around character fields (one inside doubled), null as nothing;
+    // the form of numbers, dates and column names as PUB400 wrote them
+    // (IBM i 7.5, tools/golden/verify36.txt b36_rows1, b36_rows2).
     #[test]
     fn records_to_text_and_back() {
         let fields = vec![
@@ -243,29 +276,43 @@ mod tests {
             field("BAL", DataType::Packed, 9, 2),
             field("SINCE", DataType::Date, 10, 0),
             field("NOTE", DataType::Char, 12, 0),
+            field("QTY", DataType::Binary, 9, 0),
         ];
         let form = Form::default();
         let line = format_record(
             &fields,
             &[
                 Some("Say \"hi\"  ".into()),
-                Some("-65.00".into()),
-                Some("2026-11-02".into()),
+                Some("-1.50".into()),
+                Some("2026-01-02".into()),
                 None,
+                Some("-7".into()),
             ],
             &form,
         );
-        assert_eq!(line, "\"Say \"\"hi\"\"  \",-65.00,2026-11-02,");
+        // b36_rows1: "Ab        ","x""y",-1.50      ,0          ,"2026-01-02",...
+        assert_eq!(
+            line,
+            "\"Say \"\"hi\"\"  \",-1.50      ,\"2026-01-02\",,-7         "
+        );
         let back = parse_line(&line, &form);
         assert_eq!(
             back,
             [
                 Some("Say \"hi\"  ".to_string()),
-                Some("-65.00".into()),
-                Some("2026-11-02".into()),
-                None
+                Some("-1.50      ".into()),
+                Some("2026-01-02".into()),
+                None,
+                Some("-7         ".into()),
             ]
         );
+        // b36_rows1 record 2: .05 (no leading zero).
+        assert_eq!(
+            format_record(&fields[1..2], &[Some("0.05".into())], &form),
+            ".05        "
+        );
+        // b36_rows2: RMVBLANK(*TRAILING) FLDDLM(';') DECPNT(*COMMA): no
+        // blanks after numbers, ,05.
         let trimmed = Form {
             blanks: Blanks::Trailing,
             flddlm: ";".into(),
@@ -275,12 +322,13 @@ mod tests {
         assert_eq!(
             format_record(
                 &fields[..2],
-                &[Some("ab  ".into()), Some("1.50".into())],
+                &[Some("ab  ".into()), Some("0.05".into())],
                 &trimmed
             ),
-            "\"ab\";1,50"
+            "\"ab\";,05"
         );
-        assert_eq!(header(&fields[..2], false, &form), "\"NAME\",\"BAL\"");
+        // b36_rows2: NAME;DESCR;AMT;... (ADDCOLNAM(*SQL): no delimiters).
+        assert_eq!(header(&fields[..2], false, &trimmed), "NAME;BAL");
     }
 
     #[test]

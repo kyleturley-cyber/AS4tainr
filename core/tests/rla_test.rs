@@ -24274,11 +24274,17 @@ async fn allocate_objects_between_jobs() {
         other => panic!("{other:?}"),
     };
     assert!(list.contains("*EXCLRD"), "{list}");
+    // b's job as name, user and number (h39_call's columns).
     assert!(
-        list.contains(&format!("000078/QSECOFR/L{}", &lib[1..])),
+        list.contains(&format!(
+            "{:<10}  QSECOFR     000078  *SHRRD",
+            format!("L{}", &lib[1..])
+        )),
         "{list}"
     );
-    // All or none: the missing second object gives back the first.
+    // All or none: the missing second object gives back the first; the
+    // messages are CPF0939 and CPF1085 (PUB400, verify39 h39_two; this
+    // expected CPF1002 before the capture).
     let e = b
         .run(&format!(
             "ALCOBJ OBJ(({lib}/LCK *DTAARA *SHRRD) ({lib}/NOSUCH *DTAARA *SHRRD)) WAIT(0)"
@@ -24286,7 +24292,26 @@ async fn allocate_objects_between_jobs() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(e.contains("CPF1002"), "{e}");
+    assert!(e.starts_with("CPF0939"), "{e}");
+    assert_eq!(as4tainr_core::jobs::escape_id(&e), "CPF1085", "{e}");
+    // b's *SHRRD from before is still held once, the list's was given back.
+    let n = |list: &str| list.matches("*SHRRD").count();
+    let list = match a
+        .run(&format!("WRKOBJLCK OBJ({lib}/LCK) OBJTYPE(*DTAARA)"))
+        .await
+        .unwrap()
+    {
+        Outcome::Display(d) => d.rows.join("\n"),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(n(&list), 1, "{list}");
+    // A lock state that is not one: CPD0084, CPF0006 (h39_badstate).
+    let e = a
+        .run("ALCOBJ OBJ((LCK *DTAARA *SHARE)) WAIT(0)")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPD0084") && e.contains("CPF0006"), "{e}");
     a.run("DLCOBJ OBJ((LCK *DTAARA *SHRUPD) (LCK *DTAARA *EXCLRD))")
         .await
         .unwrap();
@@ -24307,10 +24332,193 @@ async fn allocate_objects_between_jobs() {
     a.run("ALCOBJ OBJ((LCK *DTAARA *EXCL)) WAIT(0)")
         .await
         .unwrap();
-    // A lock not held: passed by with a message.
+    // A lock not held: passed by without a message (PUB400, verify39
+    // h39_dlcnot; this expected one message before the capture).
     match b.run("DLCOBJ OBJ((LCK *DTAARA *SHRRD))").await.unwrap() {
-        Outcome::Messages(m) => assert_eq!(m.len(), 1),
+        Outcome::Messages(m) => assert!(m.is_empty(), "{m:?}"),
         other => panic!("{other:?}"),
     }
+    // Allocated twice, a lock is listed twice (h39_call).
+    let locks = |out: Outcome| match out {
+        Outcome::Display(d) => d.rows.join("\n"),
+        other => panic!("{other:?}"),
+    };
+    let wrk = format!("WRKOBJLCK OBJ({lib}/LCK) OBJTYPE(*DTAARA)");
+    a.run("ALCOBJ OBJ((LCK *DTAARA *SHRRD)) WAIT(0)")
+        .await
+        .unwrap();
+    let list = locks(a.run(&wrk).await.unwrap());
+    assert_eq!(n(&list), 1, "{list}");
+    assert_eq!(list.matches("*EXCL").count(), 1, "{list}");
+    a.run("ALCOBJ OBJ((LCK *DTAARA *SHRRD)) WAIT(0)")
+        .await
+        .unwrap();
+    let list = locks(a.run(&wrk).await.unwrap());
+    assert_eq!(n(&list), 2, "{list}");
     assert!(a.run("ALCOBJ OBJ((LCK *DTAARA *BAD))").await.is_err());
+}
+
+// RGZPFM: deleted records' numbers are removed and the records numbered
+// again from 1, in arrival order, or in the file's key order with
+// KEYFILE(*FILE) (CL reference, RGZPFM: "the relative record numbers of
+// the records change"); a record written afterwards takes the next number.
+#[tokio::test]
+async fn reorganize_a_physical_file_member() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let t = format!("{}.custmast", catalog::ident(&lib));
+    async fn rows(c: &Client, t: String) -> Vec<(i64, String)> {
+        c.query(
+            &format!("SELECT rrn, cusno::text FROM {t} ORDER BY rrn"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get::<_, i64>(0), r.get::<_, String>(1)))
+        .collect()
+    }
+    let before = rows(&client, t.clone()).await;
+    assert!(before.len() >= 3);
+    client
+        .execute(&format!("DELETE FROM {t} WHERE rrn = 2"), &[])
+        .await
+        .unwrap();
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {t} (cusno, cusnam, cuscty, cusbal) VALUES (0, 'Zero', 'Nowhere', 0)"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    job.run("RGZPFM FILE(CUSTMAST)").await.unwrap();
+    let after = rows(&client, t.clone()).await;
+    let want: Vec<String> = before
+        .iter()
+        .filter(|(r, _)| *r != 2)
+        .map(|(_, k)| k.clone())
+        .chain(["0".to_string()])
+        .collect();
+    assert_eq!(
+        after.iter().map(|(_, k)| k.clone()).collect::<Vec<_>>(),
+        want
+    );
+    assert_eq!(
+        after.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+        (1..=want.len() as i64).collect::<Vec<_>>()
+    );
+    // By key: customer 0 first.
+    job.run(&format!("RGZPFM FILE({lib}/CUSTMAST) KEYFILE(*FILE)"))
+        .await
+        .unwrap();
+    let keyed = rows(&client, t.clone()).await;
+    let mut sorted: Vec<i64> = want.iter().map(|k| k.parse().unwrap()).collect();
+    sorted.sort();
+    assert_eq!(
+        keyed
+            .iter()
+            .map(|(_, k)| k.parse::<i64>().unwrap())
+            .collect::<Vec<_>>(),
+        sorted
+    );
+    // The next record written is number n + 1.
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {t} (cusno, cusnam, cuscty, cusbal) VALUES (99999, 'Last', 'X', 0)"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let last = rows(&client, t.clone()).await;
+    assert_eq!(
+        last.last().unwrap(),
+        &(want.len() as i64 + 1, "99999".into())
+    );
+    assert!(job
+        .run("RGZPFM FILE(CUSTMAST) KEYFILE(OTHERLF)")
+        .await
+        .is_err());
+}
+
+// HLDJOBQ and RLSJOBQ: the subsystem takes no job from a held job queue
+// until it is released (CL reference, HLDJOBQ and RLSJOBQ; *JOBCTL).
+// WRKJOBQ shows the queue HLD, then RLS. A queue of this test's own (no
+// subsystem serves it).
+#[tokio::test]
+async fn hold_and_release_a_job_queue() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::jobs;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let q = format!("H{}", &lib[1..]);
+    let submitted = jobs::submit(
+        &client,
+        &jobs::Submit {
+            name: "HQJOB".into(),
+            user: "QSECOFR".into(),
+            command: "DSPLIBL".into(),
+            jobq: q.clone(),
+            curlib: None,
+            libl: vec!["QGPL".into()],
+            submitted_by: "QSECOFR".into(),
+            submitter: None,
+        },
+    )
+    .await
+    .unwrap();
+    let _ = submitted;
+    assert!(job.run("HLDJOBQ JOBQ(NOSUCHQ)").await.is_err());
+    job.run(&format!("HLDJOBQ JOBQ(QGPL/{q})")).await.unwrap();
+    assert!(job.run(&format!("HLDJOBQ JOBQ({q})")).await.is_err());
+    assert!(jobs::claim_next(&client, &q).await.unwrap().is_none());
+    let list = match job.run(&format!("WRKJOBQ JOBQ({q})")).await.unwrap() {
+        Outcome::Display(d) => d.rows.join("\n"),
+        other => panic!("{other:?}"),
+    };
+    assert!(list.trim_end().ends_with("HLD"), "{list}");
+    let mut plain = Job {
+        user: "QUSER".into(),
+        curlib: None,
+        libl: vec!["QGPL".into()],
+        ..job
+    };
+    assert!(plain.run(&format!("RLSJOBQ JOBQ({q})")).await.is_err());
+    let mut job = Job {
+        user: "QSECOFR".into(),
+        ..plain
+    };
+    job.run(&format!("RLSJOBQ JOBQ({q})")).await.unwrap();
+    let got = jobs::claim_next(&client, &q).await.unwrap().unwrap();
+    assert_eq!(got.id.name, "HQJOB");
 }

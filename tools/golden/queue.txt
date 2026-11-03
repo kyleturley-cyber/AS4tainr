@@ -4,3 +4,4 @@
 # another folder than tools\golden\<name>).
 verify38
 verify39
+verify40

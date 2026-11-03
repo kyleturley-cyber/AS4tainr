@@ -600,6 +600,7 @@ impl Job<'_> {
             "OVRPRTF" => self.override_file(&cmd, crate::ovr::Kind::Printer),
             "DLTOVR" => self.dltovr(&cmd),
             "CLRPFM" => self.clrpfm(&cmd).await,
+            "RGZPFM" => self.rgzpfm(&cmd).await,
             "DLYJOB" => self.dlyjob(&cmd).await,
             "DLTMSGF" => self.dltmsgf(&cmd).await,
             "ADDMSGD" => self.addmsgd(&cmd, false).await,
@@ -722,6 +723,8 @@ impl Job<'_> {
             "DSPNETA" => self.dspneta(),
             "WRKSBS" => self.wrksbs().await,
             "ENDSBS" => self.end_subsystem(&cmd).await,
+            "HLDJOBQ" => self.hold_job_queue(&cmd, true).await,
+            "RLSJOBQ" => self.hold_job_queue(&cmd, false).await,
             "STRSBS" => self.start_subsystem(&cmd).await,
             "WRKJOBQ" => self.wrkjobq(&cmd).await,
             "WRKUSRPRF" => self.wrkusrprf(&cmd).await,
@@ -5577,6 +5580,97 @@ impl Job<'_> {
         )]))
     }
 
+    /// RGZPFM: the records numbered again from 1 with no gaps where
+    /// records were deleted, in arrival order (KEYFILE(*NONE)) or the
+    /// file's key order (KEYFILE(*FILE)) (CL reference, RGZPFM: deleted
+    /// records are removed and the relative record numbers change). The
+    /// file's trigger programs and journal see no changes (the member is
+    /// reorganized, not its records changed); other jobs wait for it.
+    async fn rgzpfm(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (libs, name) = self.search(cmd.get("FILE"));
+        let name = name.to_ascii_uppercase();
+        let lib_label = cmd
+            .get("FILE")
+            .split_once('/')
+            .map(|(l, _)| l.to_ascii_uppercase())
+            .unwrap_or_else(|| "*LIBL".into());
+        let q = match libs.as_slice() {
+            [one] if cmd.get("FILE").contains('/') => format!("{one}/{name}"),
+            _ => name.clone(),
+        };
+        let keyfile = cmd.list("KEYFILE").join(" ").trim().to_ascii_uppercase();
+        let by_key = match keyfile.as_str() {
+            "*NONE" | "" => false,
+            "*FILE" => true,
+            k => bail!("KEYFILE({k}): as4tainr reorganizes in arrival order (*NONE) or the file's own key order (*FILE) only."),
+        };
+        for l in &libs {
+            if crate::source::is_source_file(self.client, l, &name).await? {
+                // A source member's lines have no deleted records between
+                // them: nothing to do.
+                return Ok(Outcome::Messages(vec![format!(
+                    "Member of file {name} in library {} reorganized.",
+                    crate::qtemp::logical(l)
+                )]));
+            }
+        }
+        let fr = crate::catalog::resolve_file(self.client, &self.library_list(), &q)
+            .await
+            .map_err(|_| anyhow!("CPF3142: File {name} in library {lib_label} not found."))?;
+        let lf = self
+            .client
+            .query_opt(
+                "SELECT 1 FROM as4tainr.logical_files WHERE library=$1 AND name=$2",
+                &[&fr.library, &name],
+            )
+            .await?
+            .is_some();
+        if fr.file.view.is_some() || lf {
+            bail!(
+                "File {name} in library {} is not a physical file; RGZPFM reorganizes physical files.",
+                crate::qtemp::logical(&fr.library)
+            );
+        }
+        authority::check(
+            self.client,
+            &self.user,
+            &fr.library,
+            &name,
+            "*FILE",
+            Aut::Change,
+        )
+        .await?;
+        let table = format!("{}.{}", catalog::ident(&fr.library), catalog::ident(&name));
+        let order = if by_key && !fr.file.keys.is_empty() {
+            let mut o: Vec<String> = fr
+                .file
+                .keys
+                .iter()
+                .map(|k| {
+                    let dir = if fr.file.is_descending(k) {
+                        " DESC"
+                    } else {
+                        ""
+                    };
+                    format!("{}{dir}", catalog::ident(&k.to_ascii_lowercase()))
+                })
+                .collect();
+            o.push("rrn".into());
+            o.join(", ")
+        } else {
+            "rrn".into()
+        };
+        let removed = crate::catalog::reorganize(self.client, &table, &order).await?;
+        let mbr = match cmd.get("MBR") {
+            "*FIRST" | "*LAST" | "" => name.clone(),
+            m => m.to_ascii_uppercase(),
+        };
+        Ok(Outcome::Messages(vec![format!(
+            "Member {mbr} of file {name} in library {} reorganized: {removed} deleted record numbers removed.",
+            crate::qtemp::logical(&fr.library)
+        )]))
+    }
+
     /// DLYJOB: wait a number of seconds, or until a time of day (RSMTIME
     /// hhmmss, today or, when that time is past, tomorrow; times in UTC).
     async fn dlyjob(&mut self, cmd: &Command) -> Result<Outcome> {
@@ -7496,19 +7590,44 @@ impl Job<'_> {
     }
 
     /// ALCOBJ: lock each object of OBJ in its state for the job, waiting
-    /// up to WAIT; all or none (CL reference, ALCOBJ). CPF1002 when one
-    /// cannot be had (the message real CL programs monitor for after
-    /// ALCOBJ, e.g. LOADCUST.CLLE in the lennon corpus). objlock.rs.
+    /// up to WAIT; all or none (CL reference, ALCOBJ). objlock.rs.
+    /// Messages as PUB400 gave them (IBM i 7.5, verify39): a lock state
+    /// that is not one is CPD0084 and CPF0006 before anything is done
+    /// (h39_badstate); an object that does not exist CPF0939 then CPF1085,
+    /// also when another in the list was there (h39_nosuch, h39_two).
+    /// Another job's lock in the way is CPF1002, the message CL programs
+    /// monitor for after ALCOBJ (LOADCUST.CLLE in the lennon corpus; not
+    /// captured: PUB400 runs no second job of ours).
     async fn alcobj(&mut self, cmd: &Command) -> Result<Outcome> {
         let wait = crate::objlock::wait_time(cmd.get("WAIT"))?;
-        let mut taken: Vec<(crate::objlock::Target, String)> = Vec::new();
+        let mut wanted = Vec::new();
         for e in object_elements(&cmd.list("OBJ")) {
             let (name, ty, state) = crate::objlock::parse_element(&e)?;
+            if !crate::objlock::STATES.contains(&state.as_str()) {
+                return Err(crate::cl::value_error(&format!(
+                    "Lock state {state} in OBJ is not one of *EXCL, *EXCLRD, *SHRUPD, *SHRNUP, *SHRRD."
+                )));
+            }
+            wanted.push((name, ty, state));
+        }
+        let mut taken: Vec<(crate::objlock::Target, String)> = Vec::new();
+        for (name, ty, state) in wanted {
             let target = match self.lock_target(&name, &ty).await {
                 Ok(t) => t,
+                Err(err) if err.to_string().starts_with("CPF9801") => {
+                    self.release_locks(&taken).await?;
+                    let (lib, obj) = match name.split_once('/') {
+                        Some((l, n)) => (l.to_string(), n.to_string()),
+                        None => ("*LIBL".to_string(), name.clone()),
+                    };
+                    bail!(
+                        "CPF0939: There is no {} {obj} in library {lib}.\nCPF1085: No object was allocated.",
+                        ty.to_ascii_uppercase()
+                    );
+                }
                 Err(err) => {
                     self.release_locks(&taken).await?;
-                    bail!("{err:#}\nCPF1002: Cannot allocate object {name}: it does not exist.");
+                    return Err(err);
                 }
             };
             if !crate::objlock::allocate(self.client, &target, &state, wait).await? {
@@ -7533,55 +7652,71 @@ impl Job<'_> {
     }
 
     /// DLCOBJ: give back one allocation of each object of OBJ in its
-    /// state. One the job does not hold is passed by with a message.
+    /// state. One the job does not hold is passed by without a message
+    /// (PUB400, verify39 h39_dlcnot, and h39_call's third DLCOBJ of a lock
+    /// allocated twice).
     async fn dlcobj(&mut self, cmd: &Command) -> Result<Outcome> {
-        let mut out = Vec::new();
+        let mut wanted = Vec::new();
         for e in object_elements(&cmd.list("OBJ")) {
             let (name, ty, state) = crate::objlock::parse_element(&e)?;
             if !crate::objlock::STATES.contains(&state.as_str()) {
-                bail!("CPD0084: Lock state {state} is not valid; use *EXCL, *EXCLRD, *SHRUPD, *SHRNUP or *SHRRD.");
+                return Err(crate::cl::value_error(&format!(
+                    "Lock state {state} in OBJ is not one of *EXCL, *EXCLRD, *SHRUPD, *SHRNUP, *SHRRD."
+                )));
             }
-            let target = self.lock_target(&name, &ty).await?;
-            if !crate::objlock::deallocate(self.client, &target, &state).await? {
-                out.push(format!(
-                    "Object {name} ({}) was not allocated {state} to this job.",
-                    target.objtype
-                ));
-            }
+            wanted.push((name, ty, state));
         }
-        Ok(Outcome::Messages(out))
+        for (name, ty, state) in wanted {
+            let target = self.lock_target(&name, &ty).await?;
+            crate::objlock::deallocate(self.client, &target, &state).await?;
+        }
+        Ok(Outcome::Messages(Vec::new()))
     }
 
-    /// WRKOBJLCK: the jobs holding locks on an object (ALCOBJ's), with
-    /// their states.
+    /// WRKOBJLCK: the jobs holding locks on an object (ALCOBJ's), one
+    /// line per allocation; printed in IBM i 7.5's layout
+    /// (`objlock::print`).
     async fn wrkobjlck(&mut self, cmd: &Command) -> Result<Outcome> {
         let target = self.lock_target(cmd.get("OBJ"), cmd.get("OBJTYPE")).await?;
         let locks = crate::objlock::held(self.client, &target).await?;
-        let fmt = |j: &str, st: &str, s: &str| format!("{j:<28}  {st:<8}  {s}");
-        let mut rows: Vec<String> = locks
-            .iter()
-            .map(|h| fmt(&h.job, &h.state, "HELD"))
-            .collect();
+        let library = crate::qtemp::logical(&target.library);
+        let fmt = |j: &str, u: &str, n: &str, st: &str, s: &str| {
+            format!("{j:<10}  {u:<10}  {n:<6}  {st:<8}  {s:<6}  *JOB")
+        };
+        let mut last = String::new();
+        let mut rows: Vec<String> = Vec::new();
+        for h in &locks {
+            let (j, u, n) = if h.job == last {
+                Default::default()
+            } else {
+                crate::objlock::job_parts(&h.job)
+            };
+            last = h.job.clone();
+            rows.push(fmt(&j, &u, &n, &h.state, "HELD"));
+        }
         if rows.is_empty() {
-            rows.push("(No locks.)".into());
+            rows.push("(No job holds a lock on this object.)".into());
         }
         let n = rows.len();
+        let print = crate::objlock::print(&target, &library, &locks, &crate::report::Stamp::now());
         Ok(Outcome::Display(ListDisplay {
             title: "Work with Object Locks".into(),
             info: vec![
                 ("Object".into(), target.name.clone()),
-                ("Library".into(), crate::qtemp::logical(&target.library)),
+                ("Library".into(), library.clone()),
                 ("Type".into(), target.objtype.clone()),
             ],
-            heading: fmt("Job", "Lock", "Status"),
+            heading: format!(
+                "{:<10}  {:<10}  {:<6}  {:<8}  {:<6}  Scope",
+                "Job", "User", "Number", "Lock", "Status"
+            ),
             rows,
             refresh: Some(format!(
-                "WRKOBJLCK OBJ({}/{}) OBJTYPE({})",
-                crate::qtemp::logical(&target.library),
-                target.name,
-                target.objtype
+                "WRKOBJLCK OBJ({library}/{}) OBJTYPE({})",
+                target.name, target.objtype
             )),
             keys: vec![String::new(); n],
+            print,
             ..Default::default()
         }))
     }
@@ -7621,6 +7756,47 @@ impl Job<'_> {
         Ok(Outcome::Messages(vec![
             "Subsystem QBATCH ending: jobs on job queue QBATCH stay there until STRSBS QBATCH; jobs already running finish.".into(),
         ]))
+    }
+
+    /// HLDJOBQ and RLSJOBQ: the subsystem takes no jobs from a held job
+    /// queue (they stay on it, and new ones join them) until it is
+    /// released (CL reference, HLDJOBQ: *JOBCTL special authority, or the
+    /// queue's operator controlled authority: not kept here).
+    async fn hold_job_queue(&mut self, cmd: &Command, hold: bool) -> Result<Outcome> {
+        if !users::has_special(self.client, &self.user, "*JOBCTL").await? {
+            bail!(
+                "Not authorized to {} job queues: {} needs *JOBCTL special authority.",
+                if hold { "hold" } else { "release" },
+                cmd.def.name
+            );
+        }
+        let spec = cmd.get("JOBQ").trim().to_ascii_uppercase();
+        let (lib, name) = match spec.rsplit_once('/') {
+            Some((l, n)) => (l.to_string(), n.to_string()),
+            None => ("*LIBL".to_string(), spec.clone()),
+        };
+        let known = name == jobs::BATCH_QUEUE
+            || self
+                .client
+                .query_opt(
+                    "SELECT 1 FROM as4tainr.jobs WHERE jobq = $1 LIMIT 1",
+                    &[&name],
+                )
+                .await?
+                .is_some();
+        if !known || !matches!(lib.as_str(), "*LIBL" | "QGPL" | "QSYS") {
+            bail!("Job queue {name} in library {lib} was not found.");
+        }
+        if !jobs::set_job_queue_held(self.client, &name, hold).await? {
+            bail!(
+                "Job queue {name} is {} held.",
+                if hold { "already" } else { "not" }
+            );
+        }
+        Ok(Outcome::Messages(vec![format!(
+            "Job queue {name} {}.",
+            if hold { "held" } else { "released" }
+        )]))
     }
 
     /// STRSBS: QBATCH starts jobs from its job queue again (the server's
@@ -7721,14 +7897,23 @@ impl Job<'_> {
         if queues.is_empty() {
             bail!("Job queue {only} not found.");
         }
-        let fmt = |q: &str, l: &str, n: &str, s: &str| format!("{q:<10}  {l:<10}  {n:>6}  {s}");
+        let fmt = |q: &str, l: &str, n: &str, s: &str, st: &str| {
+            format!("{q:<10}  {l:<10}  {n:>6}  {s:<10}  {st}")
+        };
+        let mut rows = Vec::new();
+        for (q, l, n) in &queues {
+            // IBM i's WRKJOBQ status of a queue: RLS (released) or HLD.
+            let st = if jobs::job_queue_held(self.client, q).await? {
+                "HLD"
+            } else {
+                "RLS"
+            };
+            rows.push(fmt(q, l, &n.to_string(), "QBATCH", st));
+        }
         Ok(Outcome::Display(ListDisplay {
             title: "Work with All Job Queues".into(),
-            heading: fmt("Queue", "Library", "Jobs", "Subsystem"),
-            rows: queues
-                .iter()
-                .map(|(q, l, n)| fmt(q, l, &n.to_string(), "QBATCH"))
-                .collect(),
+            heading: fmt("Queue", "Library", "Jobs", "Subsystem", "Status"),
+            rows,
             options: vec![(5, "Work with submitted jobs".into(), "WRKSBMJOB".into())],
             keys: queues.iter().map(|(q, l, _)| format!("{l}/{q}")).collect(),
             refresh: Some(format!("WRKJOBQ JOBQ({spec})")),

@@ -1122,6 +1122,15 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "RGZPFM",
+        description: "Reorganize Physical File Member",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "Physical file").ch("Name"),
+            p("MBR", Kind::Name, false, Some("*FIRST"), "Member").ch("Name, *FIRST, *LAST"),
+            p("KEYFILE", Kind::List, false, Some("*NONE"), "Key file").ch("*NONE, *FILE"),
+        ],
+    },
+    CommandDef {
         name: "DLYJOB",
         description: "Delay Job",
         params: &[
@@ -2009,6 +2018,16 @@ pub static COMMANDS: &[CommandDef] = &[
         name: "STRSBS",
         description: "Start Subsystem",
         params: &[p("SBSD", Kind::Qualified, true, None, "Subsystem description").ch("Name")],
+    },
+    CommandDef {
+        name: "HLDJOBQ",
+        description: "Hold Job Queue",
+        params: &[p("JOBQ", Kind::Qualified, true, None, "Job queue").ch("Name")],
+    },
+    CommandDef {
+        name: "RLSJOBQ",
+        description: "Release Job Queue",
+        params: &[p("JOBQ", Kind::Qualified, true, None, "Job queue").ch("Name")],
     },
     CommandDef {
         name: "WRKJOBQ",
@@ -4664,6 +4683,8 @@ pub static GROUPS: &[Group] = &[
             "WRKSBS",
             "ENDSBS",
             "STRSBS",
+            "HLDJOBQ",
+            "RLSJOBQ",
             "WRKJOBQ",
             "ADDENVVAR",
             "CHGENVVAR",
@@ -4741,6 +4762,7 @@ pub static GROUPS: &[Group] = &[
             "OVRPRTF",
             "DLTOVR",
             "CLRPFM",
+            "RGZPFM",
             "STRCMTCTL",
             "ENDCMTCTL",
             "COMMIT",

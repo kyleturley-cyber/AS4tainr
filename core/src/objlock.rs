@@ -99,6 +99,25 @@ async fn conflicting(client: &Client, t: &Target, state: &str) -> Result<bool> {
     Ok(false)
 }
 
+/// Each allocation a job holds, in the order it was made (WRKOBJLCK
+/// lists a lock allocated twice twice, in that order: PUB400, verify39
+/// h39_call): the PostgreSQL backend that holds it and the object's key.
+/// Rows of ended backends are passed by (the lock went with the session)
+/// and cleared at the next allocation.
+pub const DDL: &str = "
+CREATE TABLE IF NOT EXISTS as4tainr.object_locks (
+    seq      bigserial PRIMARY KEY,
+    pid      integer NOT NULL,
+    started  timestamptz NOT NULL,
+    key      text NOT NULL,
+    state    text NOT NULL
+);
+";
+
+/// The backend's identity: its PID and when it started (a PID can be
+/// reused by a later session).
+const ME: &str = "(SELECT pid, backend_start FROM pg_stat_activity WHERE pid = pg_backend_pid())";
+
 /// Allocate one object: keep trying until `wait` has passed. Ok(false)
 /// when another job's lock was in the way.
 pub async fn allocate(
@@ -114,6 +133,22 @@ pub async fn allocate(
     loop {
         take_shared(client, t, state).await?;
         if !conflicting(client, t, state).await? {
+            client
+                .execute(
+                    "DELETE FROM as4tainr.object_locks o WHERE NOT EXISTS
+                       (SELECT 1 FROM pg_stat_activity a WHERE a.pid = o.pid AND a.backend_start = o.started)",
+                    &[],
+                )
+                .await?;
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO as4tainr.object_locks (pid, started, key, state)
+                         SELECT pid, backend_start, $1, $2 FROM {ME} m"
+                    ),
+                    &[&t.key(), &state],
+                )
+                .await?;
             return Ok(true);
         }
         drop_shared(client, t, state).await?;
@@ -124,47 +159,122 @@ pub async fn allocate(
     }
 }
 
-/// Deallocate one lock; false when the job held none in that state.
+/// Deallocate one allocation (the latest); false when the job held none
+/// in that state.
 pub async fn deallocate(client: &Client, t: &Target, state: &str) -> Result<bool> {
-    drop_shared(client, t, state).await
+    if !drop_shared(client, t, state).await? {
+        return Ok(false);
+    }
+    client
+        .execute(
+            &format!(
+                "DELETE FROM as4tainr.object_locks WHERE seq = (
+                   SELECT max(o.seq) FROM as4tainr.object_locks o, {ME} m
+                    WHERE o.pid = m.pid AND o.started = m.backend_start
+                      AND o.key = $1 AND o.state = $2)"
+            ),
+            &[&t.key(), &state],
+        )
+        .await?;
+    Ok(true)
 }
 
-/// A lock someone holds: the job (its connection's application name), the
-/// state, and how many times it is held.
+/// An allocation someone holds: the job (its connection's application
+/// name) and the state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Held {
     pub job: String,
     pub state: String,
-    pub count: i64,
 }
 
-/// The locks held on an object, strongest state first.
+/// The allocations held on an object: by job (in the order the jobs
+/// first allocated it), each job's in the order it made them.
 pub async fn held(client: &Client, t: &Target) -> Result<Vec<Held>> {
-    let mut out = Vec::new();
-    for s in STATES {
-        // A lock held more than once is one pg_locks row: the count is not
-        // shown there, so a held lock counts once.
-        let rows = client
-            .query(
-                "SELECT a.application_name, count(*)
-                   FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
-                  WHERE l.locktype = 'advisory' AND l.objsubid = 2 AND l.granted
-                    AND l.mode = 'ShareLock'
-                    AND l.classid = (hashtext($1)::bigint & 4294967295)::oid
-                    AND l.objid = (hashtext($2)::bigint & 4294967295)::oid
-                  GROUP BY 1 ORDER BY 1",
-                &[&class(s), &t.key()],
-            )
-            .await?;
-        for r in rows {
-            out.push(Held {
-                job: r.get(0),
-                state: s.to_string(),
-                count: r.get(1),
-            });
-        }
+    Ok(client
+        .query(
+            "SELECT a.application_name, o.state
+               FROM as4tainr.object_locks o
+               JOIN pg_stat_activity a ON a.pid = o.pid AND a.backend_start = o.started
+              WHERE o.key = $1
+              ORDER BY min(o.seq) OVER (PARTITION BY o.pid), o.seq",
+            &[&t.key()],
+        )
+        .await?
+        .iter()
+        .map(|r| Held {
+            job: r.get(0),
+            state: r.get(1),
+        })
+        .collect())
+}
+
+/// A job's name, user and number from the name its connection carries
+/// ("number/user/name"); another name is the job's name alone.
+pub fn job_parts(job: &str) -> (String, String, String) {
+    let p: Vec<&str> = job.split('/').collect();
+    match p.as_slice() {
+        [n, u, j] => (j.to_string(), u.to_string(), n.to_string()),
+        _ => (job.to_string(), String::new(), String::new()),
     }
-    Ok(out)
+}
+
+/// WRKOBJLCK OUTPUT(*PRINT) in IBM i 7.5's layout (PUB400, verify39
+/// h39_wrklck and h39_call): style A header with the title at column 39,
+/// the object line, "Object Locks", the column heading, one line per
+/// allocation (the job's name, user and number on its first only), the
+/// end-of-listing line. The line for no locks is as4tainr's own text.
+pub fn print(
+    t: &Target,
+    library: &str,
+    locks: &[Held],
+    stamp: &crate::report::Stamp,
+) -> Vec<String> {
+    use crate::report::at;
+    let mut out = vec![
+        crate::report::header_a(17, 39, "Work with Object Locks", 0, "", stamp, 1),
+        at(&[
+            (1, "Object . . . . :"),
+            (20, &t.name),
+            (35, "Library . . . . :"),
+            (55, library),
+            (70, "Type . . . . :"),
+            (87, &t.objtype),
+            (102, "ASP device . . :"),
+            (121, "*SYSBAS"),
+        ]),
+        at(&[(37, "Object Locks")]),
+        at(&[
+            (4, "Job"),
+            (16, "User"),
+            (28, "Number"),
+            (38, "Lock"),
+            (46, "Status"),
+            (55, "Scope"),
+            (65, "Thread"),
+        ]),
+    ];
+    if locks.is_empty() {
+        out.push(" No job holds a lock on this object.".into());
+    }
+    let mut last = String::new();
+    for h in locks {
+        let (name, user, number) = if h.job == last {
+            Default::default()
+        } else {
+            job_parts(&h.job)
+        };
+        last = h.job.clone();
+        out.push(at(&[
+            (4, &name),
+            (16, &user),
+            (28, &number),
+            (37, &h.state),
+            (47, "HELD"),
+            (55, "*JOB"),
+        ]));
+    }
+    out.push("                        * * * * *   E N D   O F   L I S T I N G   * * * * *".into());
+    out
 }
 
 /// One object of ALCOBJ's or DLCOBJ's OBJ list: "(NAME TYPE STATE MBR)"
@@ -231,5 +341,49 @@ mod tests {
         assert!(parse_element("(X *FILE)").is_err());
         assert_eq!(wait_time("5").unwrap(), Some(Duration::from_secs(5)));
         assert_eq!(wait_time("*NOMAX").unwrap(), None);
+    }
+
+    // WRKOBJLCK OUTPUT(*PRINT): PUB400 (IBM i 7.5), verify39 h39_call (a
+    // job holding *SHRRD twice and *EXCL) and h39_wrklck (no locks), with
+    // IBM's product line swapped for ours (same columns) and the line for
+    // no locks in as4tainr's own words.
+    #[test]
+    fn printed_locks_as_ibm_i_lays_them_out() {
+        let t = Target {
+            library: "AS4TRAINR1".into(),
+            name: "GLD39D".into(),
+            objtype: "*DTAARA".into(),
+        };
+        let stamp = crate::report::Stamp {
+            date: "26-11-03".into(),
+            time: "14:32:15".into(),
+            zone: String::new(),
+        };
+        let job = "094772/QUSER/QP0ZSPWT".to_string();
+        let held = |s: &str| Held {
+            job: job.clone(),
+            state: s.into(),
+        };
+        let lines = print(
+            &t,
+            "AS4TRAINR1",
+            &[held("*SHRRD"), held("*SHRRD"), held("*EXCL")],
+            &stamp,
+        );
+        let want = [
+            " AS4T001 V0R1M0 261021                Work with Object Locks                                    26-11-03 14:32:15        Page    1",
+            "Object . . . . :   GLD39D         Library . . . . :   AS4TRAINR1     Type . . . . :   *DTAARA        ASP device . . :   *SYSBAS",
+            "                                    Object Locks",
+            "   Job         User        Number    Lock    Status   Scope     Thread",
+            "   QP0ZSPWT    QUSER       094772   *SHRRD    HELD    *JOB",
+            "                                    *SHRRD    HELD    *JOB",
+            "                                    *EXCL     HELD    *JOB",
+            "                        * * * * *   E N D   O F   L I S T I N G   * * * * *",
+        ];
+        assert_eq!(lines, want);
+        let none = print(&t, "AS4TRAINR1", &[], &stamp);
+        assert_eq!(none.len(), 6);
+        assert_eq!(none[3], want[3]);
+        assert_eq!(none[5], want[7]);
     }
 }

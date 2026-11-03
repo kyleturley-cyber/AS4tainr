@@ -51,6 +51,9 @@ CREATE TABLE IF NOT EXISTS as4tainr.subsystems (
     name   text PRIMARY KEY,
     active boolean NOT NULL DEFAULT true
 );
+-- HLDJOBQ: a job queue the subsystem takes no jobs from until RLSJOBQ
+-- (by the queue's name, as jobs carry it).
+CREATE TABLE IF NOT EXISTS as4tainr.held_job_queues (name text PRIMARY KEY);
 -- HLDJOB of a job on a job queue: the subsystem passes it by until RLSJOB.
 ALTER TABLE as4tainr.jobs ADD COLUMN IF NOT EXISTS held boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS as4tainr.job_log (
@@ -426,6 +429,7 @@ pub async fn claim_next(client: &Client, jobq: &str) -> Result<Option<JobInfo>> 
             &format!(
                 "UPDATE as4tainr.jobs SET status='ACTIVE', activity='RUN', started=now()
                  WHERE number = (SELECT number FROM as4tainr.jobs WHERE status='JOBQ' AND jobq=$1 AND NOT held
+                                   AND NOT EXISTS (SELECT 1 FROM as4tainr.held_job_queues h WHERE h.name = $1)
                                  ORDER BY entered, number LIMIT 1 FOR UPDATE SKIP LOCKED)
                  RETURNING {JOB_COLS}"
             ),
@@ -988,6 +992,37 @@ pub async fn run_subsystem(env: crate::commands::Environment, max_active: usize)
             }
         }
     }
+}
+
+/// Is a job queue held (HLDJOBQ)?
+pub async fn job_queue_held(client: &Client, name: &str) -> Result<bool> {
+    Ok(client
+        .query_opt(
+            "SELECT 1 FROM as4tainr.held_job_queues WHERE name = $1",
+            &[&name],
+        )
+        .await?
+        .is_some())
+}
+
+/// HLDJOBQ (true) and RLSJOBQ (false); false when it already was so.
+pub async fn set_job_queue_held(client: &Client, name: &str, held: bool) -> Result<bool> {
+    let n = if held {
+        client
+            .execute(
+                "INSERT INTO as4tainr.held_job_queues VALUES ($1) ON CONFLICT DO NOTHING",
+                &[&name],
+            )
+            .await?
+    } else {
+        client
+            .execute(
+                "DELETE FROM as4tainr.held_job_queues WHERE name = $1",
+                &[&name],
+            )
+            .await?
+    };
+    Ok(n == 1)
 }
 
 /// Is a subsystem active (not ended with ENDSBS)?

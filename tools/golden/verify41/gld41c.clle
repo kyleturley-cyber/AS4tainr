@@ -1,0 +1,8 @@
+/* verify41: MOVOBJ into a library that has an object of that name   */
+/* (QTEMP, in one job).                                               */
+PGM
+             CRTDTAARA  DTAARA(QTEMP/GLD41E) TYPE(*CHAR) LEN(3)
+             CRTDTAARA  DTAARA(AS4TRAINR1/GLD41E) TYPE(*CHAR) LEN(3)
+             MOVOBJ     OBJ(AS4TRAINR1/GLD41E) OBJTYPE(*DTAARA) +
+                          TOLIB(QTEMP)
+ENDPGM

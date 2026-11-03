@@ -1122,6 +1122,15 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "RNMM",
+        description: "Rename Member",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "Database file").ch("Name"),
+            p("MBR", Kind::Name, true, None, "Member").ch("Name"),
+            p("NEWMBR", Kind::Name, true, None, "New member").ch("Name"),
+        ],
+    },
+    CommandDef {
         name: "RGZPFM",
         description: "Reorganize Physical File Member",
         params: &[
@@ -1369,6 +1378,74 @@ pub static COMMANDS: &[CommandDef] = &[
             p("OBJ", Kind::Qualified, true, None, "Object").ch("Name, generic*, *ALL"),
             p("OBJTYPE", Kind::Name, false, Some("*ALL"), "Object type")
                 .ch("*ALL, *LIB, *FILE, *PGM, *DTAARA, *MENU"),
+        ],
+    },
+    CommandDef {
+        name: "WRKLIB",
+        description: "Work with Libraries",
+        params: &[p("LIB", Kind::Name, true, None, "Library").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKF",
+        description: "Work with Files",
+        params: &[p("FILE", Kind::Qualified, true, None, "File").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKPGM",
+        description: "Work with Programs",
+        params: &[p("PGM", Kind::Qualified, true, None, "Program").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKSRVPGM",
+        description: "Work with Service Programs",
+        params: &[p("SRVPGM", Kind::Qualified, true, None, "Service program").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKDTAARA",
+        description: "Work with Data Areas",
+        params: &[p("DTAARA", Kind::Qualified, true, None, "Data area").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKDTAQ",
+        description: "Work with Data Queues",
+        params: &[p("DTAQ", Kind::Qualified, true, None, "Data queue").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKJOBD",
+        description: "Work with Job Descriptions",
+        params: &[p("JOBD", Kind::Qualified, true, None, "Job description").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKMSGF",
+        description: "Work with Message Files",
+        params: &[p("MSGF", Kind::Qualified, true, None, "Message file").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKCMD",
+        description: "Work with Commands",
+        params: &[p("CMD", Kind::Qualified, true, None, "Command").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKMNU",
+        description: "Work with Menus",
+        params: &[p("MENU", Kind::Qualified, true, None, "Menu").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKBNDDIR",
+        description: "Work with Binding Directories",
+        params: &[p("BNDDIR", Kind::Qualified, true, None, "Binding directory").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKMOD",
+        description: "Work with Modules",
+        params: &[p("MODULE", Kind::Qualified, true, None, "Module").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "CLRMSGQ",
+        description: "Clear Message Queue",
+        params: &[
+            p("MSGQ", Kind::Qualified, true, None, "Message queue").ch("Name"),
+            p("CLEAR", Kind::Name, false, Some("*ALL"), "Messages to clear").ch("*ALL, *KEEPUNANS"),
         ],
     },
     CommandDef {
@@ -1816,6 +1893,15 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "MOVOBJ",
+        description: "Move Object",
+        params: &[
+            p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
+            p("OBJTYPE", Kind::Name, true, None, "Object type").ch("*FILE, *PGM, *DTAARA, ..."),
+            p("TOLIB", Kind::Name, true, None, "To library").ch("Name"),
+        ],
+    },
+    CommandDef {
         name: "RNMOBJ",
         description: "Rename Object",
         params: &[
@@ -2020,6 +2106,11 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[p("SBSD", Kind::Qualified, true, None, "Subsystem description").ch("Name")],
     },
     CommandDef {
+        name: "CLRJOBQ",
+        description: "Clear Job Queue",
+        params: &[p("JOBQ", Kind::Qualified, true, None, "Job queue").ch("Name")],
+    },
+    CommandDef {
         name: "HLDJOBQ",
         description: "Hold Job Queue",
         params: &[p("JOBQ", Kind::Qualified, true, None, "Job queue").ch("Name")],
@@ -2103,6 +2194,11 @@ pub static COMMANDS: &[CommandDef] = &[
             p("OPTION", Kind::Text, false, Some("2"), "Option").ch("2=Edit, 5=Browse"),
             p("TEXT", Kind::Text, false, Some("*BLANK"), "Text 'description'").keyword_only(),
         ],
+    },
+    CommandDef {
+        name: "DSPF",
+        description: "Display File",
+        params: &[p("STMF", Kind::Text, true, None, "Stream file").ch("Path name")],
     },
     CommandDef {
         name: "EDTF",
@@ -3609,6 +3705,25 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[p("OBJLNK", Kind::Text, true, None, "Object link").ch("Path name, generic*")],
     },
     CommandDef {
+        name: "CPY",
+        description: "Copy Object",
+        params: &[
+            p("OBJ", Kind::Text, true, None, "Object").ch("Path name"),
+            p("TOOBJ", Kind::Text, false, Some("*NONE"), "To object").ch("Path name"),
+            p("TODIR", Kind::Text, false, Some("*NONE"), "To directory").ch("Path name, ."),
+            p("REPLACE", Kind::Name, false, Some("*NO"), "Replace object").ch("*NO, *YES").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "MOV",
+        description: "Move Object",
+        params: &[
+            p("OBJ", Kind::Text, true, None, "Object").ch("Path name"),
+            p("TOOBJ", Kind::Text, false, Some("*NONE"), "To object").ch("Path name"),
+            p("TODIR", Kind::Text, false, Some("*NONE"), "To directory").ch("Path name, ."),
+        ],
+    },
+    CommandDef {
         name: "RNM",
         description: "Rename Object",
         params: &[
@@ -4585,9 +4700,22 @@ pub static GROUPS: &[Group] = &[
         title: "Object Commands",
         commands: &[
             "WRKOBJ",
+            "WRKLIB",
+            "WRKF",
+            "WRKPGM",
+            "WRKSRVPGM",
+            "WRKDTAARA",
+            "WRKDTAQ",
+            "WRKJOBD",
+            "WRKMSGF",
+            "WRKCMD",
+            "WRKMNU",
+            "WRKBNDDIR",
+            "WRKMOD",
             "DSPOBJD",
             "CHGOBJD",
             "RNMOBJ",
+            "MOVOBJ",
             "DLTOBJ",
             "ALCOBJ",
             "DLCOBJ",
@@ -4618,6 +4746,7 @@ pub static GROUPS: &[Group] = &[
             "STRPDM",
             "STRSEU",
             "EDTF",
+            "DSPF",
         ],
     },
     Group {
@@ -4667,6 +4796,7 @@ pub static GROUPS: &[Group] = &[
             "DSPRCDLCK",
             "WRKOBJLCK",
             "DSPMSG",
+            "CLRMSGQ",
             "CRTMSGQ",
             "DLTMSGQ",
             "DLYJOB",
@@ -4690,6 +4820,7 @@ pub static GROUPS: &[Group] = &[
             "ENDSBS",
             "STRSBS",
             "HLDJOBQ",
+            "CLRJOBQ",
             "RLSJOBQ",
             "WRKJOBQ",
             "ADDENVVAR",
@@ -4769,6 +4900,7 @@ pub static GROUPS: &[Group] = &[
             "DLTOVR",
             "CLRPFM",
             "RGZPFM",
+            "RNMM",
             "STRCMTCTL",
             "ENDCMTCTL",
             "COMMIT",
@@ -4817,6 +4949,8 @@ pub static GROUPS: &[Group] = &[
             "DEL",
             "ERASE",
             "RNM",
+            "CPY",
+            "MOV",
             "CHGCURDIR",
             "CD",
             "CPYTOIMPF",

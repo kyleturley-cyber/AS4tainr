@@ -133,7 +133,15 @@ pub(super) async fn edit(term: &mut Term, job: &mut Job<'_>, t: &EditTarget) -> 
                 );
             }
             Source::Stream { path, exists, .. } => {
-                centered(&mut s, 1, "Edit File");
+                centered(
+                    &mut s,
+                    1,
+                    if t.browse {
+                        "Display File"
+                    } else {
+                        "Edit File"
+                    },
+                );
                 let new = if *exists { "" } else { "  (new file)" };
                 let shown: String = path.chars().take(58).collect();
                 s.put(2, 2, &format!("{shown}{new}{changed}"));

@@ -24536,3 +24536,199 @@ async fn hold_and_release_a_job_queue() {
     let got = jobs::claim_next(&client, &q).await.unwrap().unwrap();
     assert_eq!(got.id.name, "HQJOB");
 }
+
+// Common commands testers asked for (CL reference for each): WRKLIB and
+// WRKF are WRKOBJ of one type; MOVOBJ moves an object to TOLIB (CPF2112
+// when TOLIB has one of that name); RNMM renames a source member;
+// CLRMSGQ removes a queue's messages; CLRJOBQ ends the jobs waiting on a
+// job queue; CPY copies a stream file (an existing target only with
+// REPLACE(*YES)), MOV moves one into TODIR.
+#[tokio::test]
+async fn work_with_move_rename_and_clear() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::{ifs, jobs};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let rows = |o: Outcome| match o {
+        Outcome::Display(d) => (d.title, d.rows.join("\n")),
+        other => panic!("{other:?}"),
+    };
+    let (title, list) = rows(job.run(&format!("WRKLIB LIB({lib})")).await.unwrap());
+    assert_eq!(title, "Work with Libraries");
+    assert!(list.contains(&lib) && list.contains("*LIB"), "{list}");
+    let (_, list) = rows(job.run(&format!("WRKF FILE({lib}/CUST*)")).await.unwrap());
+    assert!(
+        list.contains("CUSTMAST") && !list.contains("ORDLIN"),
+        "{list}"
+    );
+    assert!(job.run(&format!("WRKPGM PGM({lib}/NOPGM*)")).await.is_err());
+
+    // MOVOBJ.
+    let other = format!("M{}", &lib[1..]);
+    let _ = job.run(&format!("DLTLIB LIB({other})")).await;
+    job.run(&format!("CRTLIB LIB({other})")).await.unwrap();
+    job.run(&format!(
+        "CRTDTAARA DTAARA({lib}/MOVME) TYPE(*CHAR) LEN(3) VALUE(abc)"
+    ))
+    .await
+    .unwrap();
+    job.run(&format!(
+        "MOVOBJ OBJ({lib}/MOVME) OBJTYPE(*DTAARA) TOLIB({other})"
+    ))
+    .await
+    .unwrap();
+    assert!(
+        !catalog::object_exists(&client, std::slice::from_ref(&lib), "MOVME", "*DTAARA")
+            .await
+            .unwrap()
+    );
+    assert!(
+        catalog::object_exists(&client, std::slice::from_ref(&other), "MOVME", "*DTAARA")
+            .await
+            .unwrap()
+    );
+    job.run(&format!("CRTDTAARA DTAARA({lib}/MOVME) TYPE(*CHAR) LEN(3)"))
+        .await
+        .unwrap();
+    let e = job
+        .run(&format!(
+            "MOVOBJ OBJ({lib}/MOVME) OBJTYPE(*DTAARA) TOLIB({other})"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF2112"), "{e}");
+    job.run(&format!("DLTLIB LIB({other})")).await.unwrap();
+
+    // RNMM.
+    job.run(&format!("CRTSRCPF FILE({lib}/QTXTSRC)"))
+        .await
+        .unwrap();
+    job.run(&format!("ADDPFM FILE({lib}/QTXTSRC) MBR(OLDNAME)"))
+        .await
+        .unwrap();
+    job.run(&format!(
+        "RNMM FILE({lib}/QTXTSRC) MBR(OLDNAME) NEWMBR(NEWNAME)"
+    ))
+    .await
+    .unwrap();
+    let names: Vec<String> = as4tainr_core::source::members(&client, &lib, "QTXTSRC")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.0)
+        .collect();
+    assert_eq!(names, ["NEWNAME"]);
+    assert!(job
+        .run(&format!("RNMM FILE({lib}/QTXTSRC) MBR(OLDNAME) NEWMBR(X)"))
+        .await
+        .unwrap_err()
+        .to_string()
+        .starts_with("CPF3141"));
+
+    // CLRMSGQ.
+    job.run(&format!("CRTMSGQ MSGQ({lib}/MYQ)")).await.unwrap();
+    job.run(&format!("SNDMSG MSG('one') TOMSGQ({lib}/MYQ)"))
+        .await
+        .unwrap();
+    let key = format!("{lib}/MYQ");
+    assert_eq!(jobs::messages(&client, &key, false).await.unwrap().len(), 1);
+    job.run(&format!("CLRMSGQ MSGQ({lib}/MYQ)")).await.unwrap();
+    assert!(jobs::messages(&client, &key, false)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // CLRJOBQ on a queue of this test's own.
+    let q = format!("C{}", &lib[1..]);
+    let mut numbers = Vec::new();
+    for n in ["CQ1", "CQ2"] {
+        let id = jobs::submit(
+            &client,
+            &jobs::Submit {
+                name: n.into(),
+                user: "QSECOFR".into(),
+                command: "DSPLIBL".into(),
+                jobq: q.clone(),
+                curlib: None,
+                libl: vec!["QGPL".into()],
+                submitted_by: "QSECOFR".into(),
+                submitter: None,
+            },
+        )
+        .await
+        .unwrap();
+        numbers.push(id.number);
+    }
+    job.run(&format!("CLRJOBQ JOBQ({q})")).await.unwrap();
+    for n in numbers {
+        let st: String = client
+            .query_one("SELECT status FROM as4tainr.jobs WHERE number = $1", &[&n])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(st, "OUTQ");
+    }
+    assert!(jobs::claim_next(&client, &q).await.unwrap().is_none());
+
+    // CPY and MOV.
+    let dir = format!("/tmp/{lib}");
+    ifs::mkdir(&client, &dir, 0o755, "QSECOFR").await.unwrap();
+    ifs::mkdir(&client, &format!("{dir}/sub"), 0o755, "QSECOFR")
+        .await
+        .unwrap();
+    ifs::write_file(
+        &client,
+        &format!("{dir}/a.txt"),
+        b"hello\n",
+        1208,
+        0o644,
+        "QSECOFR",
+    )
+    .await
+    .unwrap();
+    job.run(&format!("CPY OBJ('{dir}/a.txt') TOOBJ('{dir}/b.txt')"))
+        .await
+        .unwrap();
+    assert_eq!(
+        ifs::read_file(&client, &format!("{dir}/b.txt"))
+            .await
+            .unwrap(),
+        (b"hello\n".to_vec(), 1208)
+    );
+    let e = job
+        .run(&format!("CPY OBJ('{dir}/a.txt') TOOBJ('{dir}/b.txt')"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPFA0A0"), "{e}");
+    job.run(&format!(
+        "CPY OBJ('{dir}/a.txt') TOOBJ('{dir}/b.txt') REPLACE(*YES)"
+    ))
+    .await
+    .unwrap();
+    job.run(&format!("MOV OBJ('{dir}/b.txt') TODIR('{dir}/sub')"))
+        .await
+        .unwrap();
+    assert!(ifs::stat(&client, &format!("{dir}/b.txt"))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(ifs::stat(&client, &format!("{dir}/sub/b.txt"))
+        .await
+        .unwrap()
+        .is_some());
+}

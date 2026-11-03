@@ -781,6 +781,9 @@ with Tn5250(HOST) as t:
     check("alpha" in t.text() and "beta" in t.text() and "(new file)" not in t.text(),
           "EDTF shows the saved file's lines", t)
     t.fkey(3); t.wait_for("Command Entry")
+    command(t, "dspf stmf('/tmp/e2e_edtf.txt')", "Display File")
+    check("beta" in t.text(), "DSPF shows the stream file's lines", t)
+    t.fkey(3); t.wait_for("Command Entry")
     command(t, "rmvlnk objlnk('/tmp/e2e_edtf.txt')", "Command Entry")
     # EDTLIBL (CL reference: the user part of the library list, changed on
     # a display): a library typed over another one replaces it.

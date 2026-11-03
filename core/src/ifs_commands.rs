@@ -121,6 +121,52 @@ impl Job<'_> {
                 let n = self.remove_links(obj).await?;
                 msg(format!("{n} object(s) removed."))
             }
+            // CPY and MOV (CL reference): a stream file copied or moved
+            // to TOOBJ, or into TODIR under its own name; CPY keeps a
+            // target unless REPLACE(*YES). Directories are not copied.
+            "CPY" | "MOV" => {
+                let obj = cmd.get("OBJ");
+                let from = ifs::normalize(obj)?;
+                let leaf = from.rsplit('/').next().unwrap_or("").to_string();
+                let to = match (cmd.get("TOOBJ").trim(), cmd.get("TODIR").trim()) {
+                    (t, _) if !t.is_empty() && t != "*NONE" => ifs::normalize(t)?,
+                    (_, d) if !d.is_empty() && d != "*NONE" && d != "." => {
+                        format!("{}/{leaf}", ifs::normalize(d)?.trim_end_matches('/'))
+                    }
+                    (_, ".") => {
+                        let here = ifs::current_dir();
+                        format!("{}/{leaf}", here.trim_end_matches('/'))
+                    }
+                    _ => bail!("CPD0084: TOOBJ or TODIR is needed.\n{}", crate::cl::CPF0006),
+                };
+                let Some(e) = ifs::stat(self.client, &from)
+                    .await
+                    .map_err(|e| cl_error(e, obj))?
+                else {
+                    return Err(cl_error(ifs::Errno(errno::ENOENT).into(), obj));
+                };
+                let moving = name == "MOV";
+                if moving {
+                    ifs::rename(self.client, &from, &to)
+                        .await
+                        .map_err(|e| cl_error(e, &to))?;
+                    return msg(format!("Object {from} moved to {to}."));
+                }
+                if e.dir {
+                    bail!("CPFA0AB: {from} is a directory: as4tainr's CPY copies stream files.");
+                }
+                let replace = cmd.get("REPLACE").eq_ignore_ascii_case("*YES");
+                if !replace && ifs::stat(self.client, &to).await?.is_some() {
+                    return Err(cl_error(ifs::Errno(errno::EEXIST).into(), &to));
+                }
+                let (bytes, ccsid) = ifs::read_file(self.client, &from)
+                    .await
+                    .map_err(|e| cl_error(e, obj))?;
+                ifs::write_file(self.client, &to, &bytes, ccsid, e.mode, &self.user)
+                    .await
+                    .map_err(|e| cl_error(e, &to))?;
+                msg(format!("Object {from} copied to {to}."))
+            }
             "RNM" => {
                 let obj = cmd.get("OBJ");
                 let new = cmd.get("NEWOBJ");

@@ -1651,6 +1651,7 @@ impl Job<'_> {
             "DLTLIB" | "CLRLIB" => self.dltlib(cmd).await?,
             "CRTDUPOBJ" => self.crtdupobj(cmd).await?,
             "RNMOBJ" => self.rnmobj(cmd).await?,
+            "MOVOBJ" => self.movobj(cmd).await?,
             "DLTOBJ" => self.dltobj(cmd).await?,
             _ => return Ok(None),
         };
@@ -2559,6 +2560,87 @@ impl Job<'_> {
         // CPC2192 (PUB400 2026-10-31, verify31 x31_rnm).
         Ok(vec![format!(
             "CPC2192: {shown}/{name} type {objtype} is now named {new}."
+        )])
+    }
+
+    /// MOVOBJ (CL reference): an object into another library (its owner,
+    /// authorities, description and records kept), the same way RNMOBJ
+    /// renames: a duplicate in TOLIB and the original deleted. A library
+    /// cannot be moved.
+    async fn movobj(&mut self, cmd: &Command) -> Result<Vec<String>> {
+        let objtype = cmd.get("OBJTYPE").trim().to_ascii_uppercase();
+        if objtype == "*LIB" {
+            bail!("CPF9898: A library cannot be moved into another library.");
+        }
+        let tolib = crate::qtemp::real(&cmd.get("TOLIB").trim().to_ascii_uppercase());
+        if !catalog::library_exists(self.client, &tolib).await? {
+            bail!(
+                "CPF2110: There is no library {}.",
+                crate::qtemp::logical(&tolib)
+            );
+        }
+        let (lib, name) = match cmd.get("OBJ").to_ascii_uppercase().split_once('/') {
+            Some(("*CURLIB", n)) => (self.current_library(), n.to_string()),
+            Some(("*LIBL", n)) => ("*LIBL".to_string(), n.to_string()),
+            Some((l, n)) => (crate::qtemp::real(l), n.to_string()),
+            None => ("*LIBL".to_string(), cmd.get("OBJ").to_ascii_uppercase()),
+        };
+        let libs = if lib == "*LIBL" {
+            self.library_list()
+        } else {
+            vec![lib.clone()]
+        };
+        let mut found = None;
+        for l in &libs {
+            if catalog::object_exists(self.client, std::slice::from_ref(l), &name, &objtype).await?
+            {
+                found = Some(l.clone());
+                break;
+            }
+        }
+        let Some(lib) = found else {
+            bail!(
+                "CPF2105: Object {name} of type {objtype} in library {} not found.",
+                crate::qtemp::logical(&lib)
+            );
+        };
+        let shown = crate::qtemp::logical(&lib);
+        let to_shown = crate::qtemp::logical(&tolib);
+        if lib == tolib {
+            bail!("Object {name} type {objtype} is already in library {shown}.");
+        }
+        crate::authority::check(
+            self.client,
+            &self.user,
+            &lib,
+            &name,
+            &objtype,
+            crate::authority::Aut::All,
+        )
+        .await?;
+        if catalog::object_exists(self.client, std::slice::from_ref(&tolib), &name, &objtype)
+            .await?
+        {
+            bail!(
+                "CPF2112: There is already an object {name} of type {objtype} in library {to_shown}."
+            );
+        }
+        let pick = Pick {
+            objects: Some([(name.clone(), objtype.clone())].into_iter().collect()),
+        };
+        let mut c = crate::runtime::connect_db(&self.env.database_url).await?;
+        let saved = save_library(&mut c, &lib, &pick, false).await?;
+        restore_library(&mut c, &saved, &tolib, &|_| true, &self.user).await?;
+        let delete = format!("DLTOBJ OBJ({lib}/{name}) OBJTYPE({objtype})");
+        if let Err(e) = Box::pin(self.run(&delete)).await {
+            let undo = format!("DLTOBJ OBJ({tolib}/{name}) OBJTYPE({objtype})");
+            let _ = Box::pin(self.run(&undo)).await;
+            return Err(e.context(format!(
+                "Object {name} in {shown} type {objtype} not moved: it could not be removed from {shown}."
+            )));
+        }
+        Ok(vec![format!(
+            "Object {name} type {objtype} moved from library {shown} to library {to_shown}."
         )])
     }
 

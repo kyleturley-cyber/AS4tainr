@@ -46,6 +46,11 @@ CREATE TABLE IF NOT EXISTS as4tainr.jobs (
 -- The last spooled file number the job gave (numbers are not reused
 -- within a job when files are deleted).
 ALTER TABLE as4tainr.jobs ADD COLUMN IF NOT EXISTS last_splf integer NOT NULL DEFAULT 0;
+-- ENDSBS and STRSBS: whether a subsystem starts jobs (QBATCH).
+CREATE TABLE IF NOT EXISTS as4tainr.subsystems (
+    name   text PRIMARY KEY,
+    active boolean NOT NULL DEFAULT true
+);
 -- HLDJOB of a job on a job queue: the subsystem passes it by until RLSJOB.
 ALTER TABLE as4tainr.jobs ADD COLUMN IF NOT EXISTS held boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS as4tainr.job_log (
@@ -949,11 +954,15 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
 /// most `max_active` at a time, until the task is dropped.
 pub async fn run_subsystem(env: crate::commands::Environment, max_active: usize) -> Result<()> {
     let client = crate::runtime::connect_db(&env.database_url).await?;
+    set_subsystem_active(&client, BATCH_QUEUE, true).await?;
     let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(max_active));
     let env = std::sync::Arc::new(env);
     loop {
-        // PWRDWNSYS *CNTRLD: no new jobs start; those running end.
-        if ENDING.load(std::sync::atomic::Ordering::Relaxed) {
+        // PWRDWNSYS *CNTRLD or ENDSBS QBATCH: no new jobs start; those
+        // running end.
+        if ENDING.load(std::sync::atomic::Ordering::Relaxed)
+            || !subsystem_active(&client, BATCH_QUEUE).await.unwrap_or(true)
+        {
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
         }
@@ -979,6 +988,30 @@ pub async fn run_subsystem(env: crate::commands::Environment, max_active: usize)
             }
         }
     }
+}
+
+/// Is a subsystem active (not ended with ENDSBS)?
+pub async fn subsystem_active(client: &Client, name: &str) -> Result<bool> {
+    Ok(client
+        .query_opt(
+            "SELECT active FROM as4tainr.subsystems WHERE name = $1",
+            &[&name],
+        )
+        .await?
+        .map(|r| r.get(0))
+        .unwrap_or(true))
+}
+
+/// ENDSBS (false) and STRSBS (true) of a subsystem; the server's start
+/// starts QBATCH again (as an IPL starts the subsystems).
+pub async fn set_subsystem_active(client: &Client, name: &str, active: bool) -> Result<()> {
+    client
+        .execute(
+            "INSERT INTO as4tainr.subsystems VALUES ($1, $2) ON CONFLICT (name) DO UPDATE SET active = EXCLUDED.active",
+            &[&name, &active],
+        )
+        .await?;
+    Ok(())
 }
 
 /// The system is ending (PWRDWNSYS): the subsystems start no more jobs.

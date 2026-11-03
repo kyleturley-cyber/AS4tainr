@@ -685,7 +685,9 @@ impl Job<'_> {
             "CHGOBJD" => self.chgobjd(&cmd).await,
             // ALCOBJ, DLCOBJ: as4tainr has no object locks (database
             // records are locked as PostgreSQL rows): accepted.
-            "ALCOBJ" | "DLCOBJ" => Ok(Outcome::Messages(Vec::new())),
+            "ALCOBJ" => self.alcobj(&cmd).await,
+            "DLCOBJ" => self.dlcobj(&cmd).await,
+            "WRKOBJLCK" => self.wrkobjlck(&cmd).await,
             "SBMJOB" => self.sbmjob(&cmd).await,
             "WRKACTJOB" => self.wrkactjob().await,
             "WRKSBMJOB" => self.wrksbmjob().await,
@@ -719,6 +721,8 @@ impl Job<'_> {
             }
             "DSPNETA" => self.dspneta(),
             "WRKSBS" => self.wrksbs().await,
+            "ENDSBS" => self.end_subsystem(&cmd).await,
+            "STRSBS" => self.start_subsystem(&cmd).await,
             "WRKJOBQ" => self.wrkjobq(&cmd).await,
             "WRKUSRPRF" => self.wrkusrprf(&cmd).await,
             "CHGJOB" => self.chgjob(&cmd).await,
@@ -7453,6 +7457,196 @@ impl Job<'_> {
         }))
     }
 
+    /// The object an object lock is for: OBJ's name (qualified or not)
+    /// found on the library list or in its library.
+    async fn lock_target(&mut self, obj: &str, objtype: &str) -> Result<crate::objlock::Target> {
+        let objtype = objtype.trim().to_ascii_uppercase();
+        if !crate::cl::OBJECT_TYPES.contains(&objtype.as_str()) {
+            return Err(crate::cl::value_error(&format!(
+                "Value '{objtype}' for the object type is not an object type."
+            )));
+        }
+        let obj = obj.trim().to_ascii_uppercase();
+        let (label, name) = match obj.split_once('/') {
+            Some((l, n)) => (l.to_string(), n.to_string()),
+            None => ("*LIBL".to_string(), obj.clone()),
+        };
+        let libs = match label.as_str() {
+            "*LIBL" => self.library_list(),
+            "*CURLIB" => vec![self.current_library()],
+            l => vec![crate::qtemp::real(l)],
+        };
+        let libs = if objtype == "*LIB" {
+            vec!["QSYS".to_string()]
+        } else {
+            libs
+        };
+        for lib in &libs {
+            if catalog::object_exists(self.client, std::slice::from_ref(lib), &name, &objtype)
+                .await?
+            {
+                return Ok(crate::objlock::Target {
+                    library: lib.clone(),
+                    name,
+                    objtype,
+                });
+            }
+        }
+        bail!("CPF9801: Object {name} was not found in library {label}.")
+    }
+
+    /// ALCOBJ: lock each object of OBJ in its state for the job, waiting
+    /// up to WAIT; all or none (CL reference, ALCOBJ). CPF1002 when one
+    /// cannot be had (the message real CL programs monitor for after
+    /// ALCOBJ, e.g. LOADCUST.CLLE in the lennon corpus). objlock.rs.
+    async fn alcobj(&mut self, cmd: &Command) -> Result<Outcome> {
+        let wait = crate::objlock::wait_time(cmd.get("WAIT"))?;
+        let mut taken: Vec<(crate::objlock::Target, String)> = Vec::new();
+        for e in object_elements(&cmd.list("OBJ")) {
+            let (name, ty, state) = crate::objlock::parse_element(&e)?;
+            let target = match self.lock_target(&name, &ty).await {
+                Ok(t) => t,
+                Err(err) => {
+                    self.release_locks(&taken).await?;
+                    bail!("{err:#}\nCPF1002: Cannot allocate object {name}: it does not exist.");
+                }
+            };
+            if !crate::objlock::allocate(self.client, &target, &state, wait).await? {
+                self.release_locks(&taken).await?;
+                bail!(
+                    "CPF1002: Cannot allocate object {} in library {} ({}): another job holds a lock that conflicts with {state}.",
+                    target.name,
+                    crate::qtemp::logical(&target.library),
+                    target.objtype
+                );
+            }
+            taken.push((target, state));
+        }
+        Ok(Outcome::Messages(Vec::new()))
+    }
+
+    async fn release_locks(&mut self, taken: &[(crate::objlock::Target, String)]) -> Result<()> {
+        for (t, s) in taken {
+            crate::objlock::deallocate(self.client, t, s).await?;
+        }
+        Ok(())
+    }
+
+    /// DLCOBJ: give back one allocation of each object of OBJ in its
+    /// state. One the job does not hold is passed by with a message.
+    async fn dlcobj(&mut self, cmd: &Command) -> Result<Outcome> {
+        let mut out = Vec::new();
+        for e in object_elements(&cmd.list("OBJ")) {
+            let (name, ty, state) = crate::objlock::parse_element(&e)?;
+            if !crate::objlock::STATES.contains(&state.as_str()) {
+                bail!("CPD0084: Lock state {state} is not valid; use *EXCL, *EXCLRD, *SHRUPD, *SHRNUP or *SHRRD.");
+            }
+            let target = self.lock_target(&name, &ty).await?;
+            if !crate::objlock::deallocate(self.client, &target, &state).await? {
+                out.push(format!(
+                    "Object {name} ({}) was not allocated {state} to this job.",
+                    target.objtype
+                ));
+            }
+        }
+        Ok(Outcome::Messages(out))
+    }
+
+    /// WRKOBJLCK: the jobs holding locks on an object (ALCOBJ's), with
+    /// their states.
+    async fn wrkobjlck(&mut self, cmd: &Command) -> Result<Outcome> {
+        let target = self.lock_target(cmd.get("OBJ"), cmd.get("OBJTYPE")).await?;
+        let locks = crate::objlock::held(self.client, &target).await?;
+        let fmt = |j: &str, st: &str, s: &str| format!("{j:<28}  {st:<8}  {s}");
+        let mut rows: Vec<String> = locks
+            .iter()
+            .map(|h| fmt(&h.job, &h.state, "HELD"))
+            .collect();
+        if rows.is_empty() {
+            rows.push("(No locks.)".into());
+        }
+        let n = rows.len();
+        Ok(Outcome::Display(ListDisplay {
+            title: "Work with Object Locks".into(),
+            info: vec![
+                ("Object".into(), target.name.clone()),
+                ("Library".into(), crate::qtemp::logical(&target.library)),
+                ("Type".into(), target.objtype.clone()),
+            ],
+            heading: fmt("Job", "Lock", "Status"),
+            rows,
+            refresh: Some(format!(
+                "WRKOBJLCK OBJ({}/{}) OBJTYPE({})",
+                crate::qtemp::logical(&target.library),
+                target.name,
+                target.objtype
+            )),
+            keys: vec![String::new(); n],
+            ..Default::default()
+        }))
+    }
+
+    /// ENDSBS: QBATCH stops starting jobs from its job queue (the jobs
+    /// already running finish: OPTION and DELAY are checked but the end is
+    /// always a controlled one); QINTER and *ALL are refused, the display
+    /// sessions being the server's (PWRDWNSYS ends them). CL reference:
+    /// ENDSBS needs *JOBCTL special authority. docs/fidelity-gaps.md.
+    async fn end_subsystem(&mut self, cmd: &Command) -> Result<Outcome> {
+        if !users::has_special(self.client, &self.user, "*JOBCTL").await? {
+            bail!("Not authorized to end a subsystem: ENDSBS needs *JOBCTL special authority.");
+        }
+        let sbs = cmd.get("SBS").trim().to_ascii_uppercase();
+        match cmd.get("OPTION").trim().to_ascii_uppercase().as_str() {
+            "*CNTRLD" | "*IMMED" | "" => {}
+            o => bail!("CPD0084: OPTION({o}) is not valid; use *CNTRLD or *IMMED."),
+        }
+        let delay = cmd.get("DELAY").trim().to_ascii_uppercase();
+        if !(delay.is_empty()
+            || delay == "*NOLIMIT"
+            || delay.parse::<u64>().is_ok_and(|n| (1..=99999).contains(&n)))
+        {
+            bail!("CPD0084: DELAY({delay}) is not valid; use 1-99999 seconds or *NOLIMIT.");
+        }
+        match sbs.as_str() {
+            "QBATCH" => {}
+            "QINTER" | "*ALL" => bail!(
+                "Subsystem {sbs} cannot be ended here: display sessions belong to the as4tainr server; end the system with PWRDWNSYS."
+            ),
+            _ => bail!("Subsystem {sbs} is not active: as4tainr runs QINTER and QBATCH."),
+        }
+        if !jobs::subsystem_active(self.client, jobs::BATCH_QUEUE).await? {
+            bail!("Subsystem QBATCH is not active.");
+        }
+        jobs::set_subsystem_active(self.client, jobs::BATCH_QUEUE, false).await?;
+        Ok(Outcome::Messages(vec![
+            "Subsystem QBATCH ending: jobs on job queue QBATCH stay there until STRSBS QBATCH; jobs already running finish.".into(),
+        ]))
+    }
+
+    /// STRSBS: QBATCH starts jobs from its job queue again (the server's
+    /// batch loop; as4tainr tn5250 starts it active).
+    async fn start_subsystem(&mut self, cmd: &Command) -> Result<Outcome> {
+        if !users::has_special(self.client, &self.user, "*JOBCTL").await? {
+            bail!("Not authorized to start a subsystem: STRSBS needs *JOBCTL special authority.");
+        }
+        let spec = cmd.get("SBSD").trim().to_ascii_uppercase();
+        let (lib, name) = match spec.rsplit_once('/') {
+            Some((l, n)) => (l.to_string(), n.to_string()),
+            None => ("*LIBL".to_string(), spec.clone()),
+        };
+        if name != "QBATCH" && name != "QINTER" {
+            bail!("Subsystem description {name} was not found: as4tainr runs QINTER and QBATCH.");
+        }
+        if !matches!(lib.as_str(), "*LIBL" | "QSYS" | "QGPL") {
+            bail!("Subsystem description {name} was not found in library {lib}.");
+        }
+        if name == "QINTER" || jobs::subsystem_active(self.client, jobs::BATCH_QUEUE).await? {
+            bail!("Subsystem {name} is already active.");
+        }
+        jobs::set_subsystem_active(self.client, jobs::BATCH_QUEUE, true).await?;
+        Ok(Outcome::Messages(vec!["Subsystem QBATCH started.".into()]))
+    }
+
     /// WRKSBS: the subsystems as4tainr runs (QINTER for display sessions,
     /// QBATCH for batch jobs), with the jobs active in each.
     async fn wrksbs(&mut self) -> Result<Outcome> {
@@ -7466,7 +7660,10 @@ impl Job<'_> {
             .iter()
             .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
             .collect();
-        let fmt = |s: &str, l: &str, n: &str, t: &str| format!("{s:<10}  {l:<10}  {n:>6}  {t}");
+        let batch = jobs::subsystem_active(self.client, jobs::BATCH_QUEUE).await?;
+        let fmt = |s: &str, l: &str, st: &str, n: &str, t: &str| {
+            format!("{s:<10}  {l:<10}  {st:<8}  {n:>6}  {t}")
+        };
         let subsystems = [
             ("QINTER", "Interactive (display sessions)"),
             ("QBATCH", "Batch jobs"),
@@ -7475,12 +7672,17 @@ impl Job<'_> {
             .iter()
             .map(|(s, t)| {
                 let n = counts.get(*s).copied().unwrap_or(0);
-                fmt(s, "QSYS", &n.to_string(), t)
+                let st = if *s == "QBATCH" && !batch {
+                    "INACTIVE"
+                } else {
+                    "ACTIVE"
+                };
+                fmt(s, "QSYS", st, &n.to_string(), t)
             })
             .collect();
         Ok(Outcome::Display(ListDisplay {
             title: "Work with Subsystems".into(),
-            heading: fmt("Subsystem", "Library", "Jobs", "Text"),
+            heading: fmt("Subsystem", "Library", "Status", "Jobs", "Text"),
             rows,
             refresh: Some("WRKSBS".into()),
             keys: vec![String::new(); subsystems.len()],
@@ -9976,6 +10178,16 @@ pub(crate) fn module_control_keywords(source: &str) -> Vec<crate::rpg::check::Di
         }
     }
     out
+}
+
+/// ALCOBJ's and DLCOBJ's OBJ values: each "(NAME TYPE STATE MBR)" group,
+/// or one object written without the inner parentheses.
+fn object_elements(vals: &[String]) -> Vec<String> {
+    if vals.iter().any(|v| v.starts_with('(')) {
+        vals.to_vec()
+    } else {
+        vec![vals.join(" ")]
+    }
 }
 
 #[cfg(test)]

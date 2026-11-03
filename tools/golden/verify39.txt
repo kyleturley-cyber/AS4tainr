@@ -1,0 +1,17 @@
+# Golden: ALCOBJ, DLCOBJ and WRKOBJLCK in one job (PUB400 runs no second
+# job of ours, so conflicts between jobs are not captured): an object
+# that does not exist, a lock state that is not valid, a list with one
+# missing object, DLCOBJ of a lock not held, and WRKOBJLCK's printed
+# report. ENDSBS/STRSBS are not captured (a shared system).
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify39.txt
+h39_cleanup|!for c in "DLTDTAARA DTAARA(AS4TRAINR1/GLD39D)" "DLTPGM PGM(AS4TRAINR1/GLD39C)"; do system -q "$c"; done; echo cleaned
+h39_dtaara|CRTDTAARA DTAARA(AS4TRAINR1/GLD39D) TYPE(*CHAR) LEN(1)
+h39_alc|ALCOBJ OBJ((AS4TRAINR1/GLD39D *DTAARA *EXCL)) WAIT(0)
+h39_nosuch|ALCOBJ OBJ((AS4TRAINR1/GLD39X *DTAARA *SHRRD)) WAIT(0)
+h39_badstate|ALCOBJ OBJ((AS4TRAINR1/GLD39D *DTAARA *SHARE)) WAIT(0)
+h39_two|ALCOBJ OBJ((AS4TRAINR1/GLD39D *DTAARA *SHRRD) (AS4TRAINR1/GLD39X *DTAARA *SHRRD)) WAIT(0)
+h39_dlcnot|DLCOBJ OBJ((AS4TRAINR1/GLD39D *DTAARA *SHRRD))
+h39_wrklck|WRKOBJLCK OBJ(AS4TRAINR1/GLD39D) OBJTYPE(*DTAARA) OUTPUT(*PRINT)
+h39_crtc|CRTBNDCL PGM(AS4TRAINR1/GLD39C) SRCSTMF('/home/AS4TRAINR/gld/gld39c.clle')
+h39_call|CALL PGM(AS4TRAINR1/GLD39C)
+h39_end|!for c in "DLTDTAARA DTAARA(AS4TRAINR1/GLD39D)" "DLTPGM PGM(AS4TRAINR1/GLD39C)"; do system -q "$c"; done; echo cleaned

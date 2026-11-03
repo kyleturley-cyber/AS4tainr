@@ -1973,6 +1973,16 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "WRKOBJLCK",
+        description: "Work with Object Locks",
+        params: &[
+            p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
+            p("OBJTYPE", Kind::Name, true, None, "Object type").ch("*FILE, *DTAARA, *DTAQ, *PGM, ..."),
+            p("MBR", Kind::Name, false, Some("*NONE"), "Member").ch("Name, *NONE").keyword_only(),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
+    },
+    CommandDef {
         name: "PWRDWNSYS",
         description: "Power Down System",
         params: &[
@@ -1985,6 +1995,20 @@ pub static COMMANDS: &[CommandDef] = &[
         name: "WRKSBS",
         description: "Work with Subsystems",
         params: &[],
+    },
+    CommandDef {
+        name: "ENDSBS",
+        description: "End Subsystem",
+        params: &[
+            p("SBS", Kind::Name, true, None, "Subsystem").ch("Name, *ALL"),
+            p("OPTION", Kind::Name, false, Some("*CNTRLD"), "How to end").ch("*CNTRLD, *IMMED"),
+            p("DELAY", Kind::Text, false, Some("*NOLIMIT"), "Controlled end delay time").ch("Seconds, *NOLIMIT"),
+        ],
+    },
+    CommandDef {
+        name: "STRSBS",
+        description: "Start Subsystem",
+        params: &[p("SBSD", Kind::Qualified, true, None, "Subsystem description").ch("Name")],
     },
     CommandDef {
         name: "WRKJOBQ",
@@ -4616,6 +4640,7 @@ pub static GROUPS: &[Group] = &[
             "SNDMSG",
             "SNDBRKMSG",
             "DSPRCDLCK",
+            "WRKOBJLCK",
             "DSPMSG",
             "CRTMSGQ",
             "DLTMSGQ",
@@ -4637,6 +4662,8 @@ pub static GROUPS: &[Group] = &[
             "DSPLOG",
             "DSPNETA",
             "WRKSBS",
+            "ENDSBS",
+            "STRSBS",
             "WRKJOBQ",
             "ADDENVVAR",
             "CHGENVVAR",

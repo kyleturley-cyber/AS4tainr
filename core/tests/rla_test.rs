@@ -23859,9 +23859,57 @@ async fn change_a_system_value() {
         info.contains(&("Shipped value".to_string(), "*NOMAX".to_string())),
         "{info:?}"
     );
+    // With QPWDEXPITV 90, a password changed 100 days ago must be changed
+    // at sign-on (system values documentation, QPWDEXPITV).
+    use as4tainr_core::users;
+    let name = format!("X{}", &lib[1..]);
+    users::delete(&client, &name).await.unwrap();
+    users::create(
+        &client,
+        users::NewProfile {
+            name: name.clone(),
+            password: users::NewPassword::SameAsProfile,
+            expired: false,
+            enabled: true,
+            usrcls: "*USER".into(),
+            special: vec![],
+            curlib: "QGPL".into(),
+            text: String::new(),
+            inlpgm: users::DEFAULT_INLPGM.into(),
+            inlmnu: users::DEFAULT_INLMNU.into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        !users::authenticate(&client, &name, &name)
+            .await
+            .unwrap()
+            .pwd_expired
+    );
+    client
+        .execute(
+            "UPDATE as4tainr.user_profiles SET pwd_changed = now() - interval '100 days' WHERE name = $1",
+            &[&name],
+        )
+        .await
+        .unwrap();
+    assert!(
+        users::authenticate(&client, &name, &name)
+            .await
+            .unwrap()
+            .pwd_expired
+    );
     job.run("CHGSYSVAL SYSVAL(QPWDEXPITV) VALUE(*NOMAX)")
         .await
         .unwrap();
+    assert!(
+        !users::authenticate(&client, &name, &name)
+            .await
+            .unwrap()
+            .pwd_expired
+    );
+    users::delete(&client, &name).await.unwrap();
     let info = shown(job.run("DSPSYSVAL QPWDEXPITV").await.unwrap());
     assert!(
         info.contains(&("Value".to_string(), "*NOMAX".to_string())),
@@ -24028,4 +24076,241 @@ async fn display_record_locks() {
         Outcome::Display(d) => assert!(!d.rows.iter().any(|r| r.contains(&holder)), "{:?}", d.rows),
         other => panic!("{other:?}"),
     }
+}
+
+/// QMAXSIGN (IBM i system values: 3 sign-on attempts that are not valid,
+/// as shipped, disable the user profile; a valid one starts the count
+/// again): the third wrong password disables the profile, then even the
+/// right one cannot sign on, until CHGUSRPRF STATUS(*ENABLED). QSECOFR is
+/// not disabled (docs/fidelity-gaps.md).
+#[tokio::test]
+async fn sign_on_attempts_disable_a_profile() {
+    use as4tainr_core::users;
+    let url = require_db!();
+    let client = runtime::connect_db(&url).await.unwrap();
+    catalog::init(&client).await.unwrap();
+    let name = format!("M{}", std::process::id() % 1_000_000);
+    users::delete(&client, &name).await.unwrap();
+    users::create(
+        &client,
+        users::NewProfile {
+            name: name.clone(),
+            password: users::NewPassword::SameAsProfile,
+            expired: false,
+            enabled: true,
+            usrcls: "*USER".into(),
+            special: vec![],
+            curlib: "QGPL".into(),
+            text: String::new(),
+            inlpgm: users::DEFAULT_INLPGM.into(),
+            inlmnu: users::DEFAULT_INLMNU.into(),
+        },
+    )
+    .await
+    .unwrap();
+    // Two wrong, one right: the count starts again.
+    for _ in 0..2 {
+        assert!(users::authenticate(&client, &name, "wrong").await.is_err());
+    }
+    users::authenticate(&client, &name, &name).await.unwrap();
+    for _ in 0..2 {
+        let e = users::authenticate(&client, &name, "wrong")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("CPF1107") && !e.contains("disabled"), "{e}");
+    }
+    let e = users::authenticate(&client, &name, "wrong")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("disabled"), "{e}");
+    assert_eq!(
+        users::get(&client, &name).await.unwrap().unwrap().status,
+        "*DISABLED"
+    );
+    let e = users::authenticate(&client, &name, &name)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("cannot sign on"), "{e}");
+    users::change(
+        &client,
+        &name,
+        &users::ProfileChanges {
+            enabled: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    users::authenticate(&client, &name, &name).await.unwrap();
+    users::delete(&client, &name).await.unwrap();
+}
+
+// ENDSBS QBATCH: the subsystem starts no more jobs from its job queue
+// until STRSBS QBATCH (CL reference, ENDSBS and STRSBS; both need *JOBCTL
+// special authority). QINTER is the server's: refused here
+// (docs/fidelity-gaps.md, Work with lists).
+#[tokio::test]
+async fn end_and_start_the_batch_subsystem() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::jobs;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let msg = |o: Outcome| match o {
+        Outcome::Messages(m) => m.join(" "),
+        other => panic!("{other:?}"),
+    };
+    let was = jobs::subsystem_active(&client, jobs::BATCH_QUEUE)
+        .await
+        .unwrap();
+    jobs::set_subsystem_active(&client, jobs::BATCH_QUEUE, true)
+        .await
+        .unwrap();
+    assert!(job.run("ENDSBS SBS(QINTER)").await.is_err());
+    assert!(job.run("ENDSBS SBS(QBATCH) OPTION(*SOON)").await.is_err());
+    msg(job.run("ENDSBS SBS(QBATCH) OPTION(*IMMED)").await.unwrap());
+    assert!(!jobs::subsystem_active(&client, jobs::BATCH_QUEUE)
+        .await
+        .unwrap());
+    assert!(job.run("ENDSBS QBATCH").await.is_err());
+    let list = match job.run("WRKSBS").await.unwrap() {
+        Outcome::Display(d) => d.rows.join("\n"),
+        other => panic!("{other:?}"),
+    };
+    assert!(list.contains("QBATCH      QSYS        INACTIVE"), "{list}");
+    assert!(job.run("STRSBS SBSD(QSYS/QINTER)").await.is_err());
+    assert!(job.run("STRSBS SBSD(MYLIB/QBATCH)").await.is_err());
+    msg(job.run("STRSBS SBSD(QSYS/QBATCH)").await.unwrap());
+    assert!(jobs::subsystem_active(&client, jobs::BATCH_QUEUE)
+        .await
+        .unwrap());
+    assert!(job.run("STRSBS QBATCH").await.is_err());
+    // A user without *JOBCTL.
+    let mut plain = Job {
+        user: "QUSER".into(),
+        ..job
+    };
+    assert!(plain.run("ENDSBS QBATCH").await.is_err());
+    jobs::set_subsystem_active(&client, jobs::BATCH_QUEUE, was)
+        .await
+        .unwrap();
+}
+
+// ALCOBJ, DLCOBJ and WRKOBJLCK between two jobs: the lock state table of
+// the CL reference (ALCOBJ: *EXCLRD can be held with *SHRRD only, *SHRUPD
+// with *SHRUPD and *SHRRD, *EXCL with nothing), all or none, WAIT, and
+// CPF1002 when an object cannot be allocated (the message CL programs
+// monitor for after ALCOBJ: LOADCUST.CLLE in the lennon corpus).
+#[tokio::test]
+async fn allocate_objects_between_jobs() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let other = runtime::connect_db(&url).await.unwrap();
+    runtime::job_session(
+        &other,
+        Some(&format!("000078/QSECOFR/L{}", &lib[1..])),
+        std::time::Duration::from_millis(500),
+    )
+    .await
+    .unwrap();
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mk = |c| Job {
+        client: c,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let mut a = mk(&client);
+    let mut b = mk(&other);
+    a.run(&format!("CRTDTAARA DTAARA({lib}/LCK) TYPE(*CHAR) LEN(1)"))
+        .await
+        .unwrap();
+    a.run("ALCOBJ OBJ((LCK *DTAARA *EXCLRD)) WAIT(0)")
+        .await
+        .unwrap();
+    // *SHRRD goes with *EXCLRD; *SHRUPD does not.
+    b.run("ALCOBJ OBJ((LCK *DTAARA *SHRRD)) WAIT(0)")
+        .await
+        .unwrap();
+    let e = b
+        .run("ALCOBJ OBJ((LCK *DTAARA *SHRUPD)) WAIT(1)")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF1002"), "{e}");
+    // The job's own locks do not conflict with each other (*SHRUPD with
+    // a's *EXCLRD; b's *SHRRD goes with both).
+    a.run("ALCOBJ OBJ((LCK *DTAARA *SHRUPD)) WAIT(0)")
+        .await
+        .unwrap();
+    let list = match a
+        .run(&format!("WRKOBJLCK OBJ({lib}/LCK) OBJTYPE(*DTAARA)"))
+        .await
+        .unwrap()
+    {
+        Outcome::Display(d) => d.rows.join("\n"),
+        other => panic!("{other:?}"),
+    };
+    assert!(list.contains("*EXCLRD"), "{list}");
+    assert!(
+        list.contains(&format!("000078/QSECOFR/L{}", &lib[1..])),
+        "{list}"
+    );
+    // All or none: the missing second object gives back the first.
+    let e = b
+        .run(&format!(
+            "ALCOBJ OBJ(({lib}/LCK *DTAARA *SHRRD) ({lib}/NOSUCH *DTAARA *SHRRD)) WAIT(0)"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("CPF1002"), "{e}");
+    a.run("DLCOBJ OBJ((LCK *DTAARA *SHRUPD) (LCK *DTAARA *EXCLRD))")
+        .await
+        .unwrap();
+    // Now only b's *SHRRD (held once) is left: *SHRUPD can be had.
+    b.run("ALCOBJ OBJ((LCK *DTAARA *SHRUPD)) WAIT(0)")
+        .await
+        .unwrap();
+    // *EXCL waits for b's locks and gives up after WAIT.
+    let t = std::time::Instant::now();
+    assert!(a
+        .run("ALCOBJ OBJ((LCK *DTAARA *EXCL)) WAIT(1)")
+        .await
+        .is_err());
+    assert!(t.elapsed() >= std::time::Duration::from_secs(1));
+    b.run("DLCOBJ OBJ((LCK *DTAARA *SHRUPD) (LCK *DTAARA *SHRRD))")
+        .await
+        .unwrap();
+    a.run("ALCOBJ OBJ((LCK *DTAARA *EXCL)) WAIT(0)")
+        .await
+        .unwrap();
+    // A lock not held: passed by with a message.
+    match b.run("DLCOBJ OBJ((LCK *DTAARA *SHRRD))").await.unwrap() {
+        Outcome::Messages(m) => assert_eq!(m.len(), 1),
+        other => panic!("{other:?}"),
+    }
+    assert!(a.run("ALCOBJ OBJ((LCK *DTAARA *BAD))").await.is_err());
 }

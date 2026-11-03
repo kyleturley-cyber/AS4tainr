@@ -2105,6 +2105,11 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "EDTF",
+        description: "Edit File",
+        params: &[p("STMF", Kind::Text, true, None, "Stream file").ch("Path name")],
+    },
+    CommandDef {
         name: "CRTSRCPF",
         description: "Create Source Physical File",
         // IBM i 7.5 CL reference, CRTSRCPF: the parameters in its order
@@ -4612,6 +4617,7 @@ pub static GROUPS: &[Group] = &[
             "WRKLIBPDM",
             "STRPDM",
             "STRSEU",
+            "EDTF",
         ],
     },
     Group {

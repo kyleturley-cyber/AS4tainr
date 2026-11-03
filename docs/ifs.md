@@ -31,6 +31,7 @@ Each job has a current directory, where relative path names start (`SRCSTMF('qrp
 | `RMVLNK` (`DEL`, `ERASE`) `OBJLNK(path)` | A stream file, or the files a generic name (`/dir/*.txt` is not supported; `/dir/abc*` is) matches; CPFA0A9 when nothing is found |
 | `RNM OBJ(path) NEWOBJ(name)` | |
 | `CHGCURDIR` (`CD`) `DIR(path)` | The job's current directory; CPFA0A9 when it does not exist |
+| `EDTF STMF(path)` | Edit a stream file on a display (the source editor's display); a new file is made when saved |
 | `WRKLNK`, `DSPLNK` `OBJ(path)` | The objects in a directory, with options 4 (remove) and 5 (display) |
 | `CPYTOSTMF FROMMBR('/QSYS.LIB/lib.LIB/file.FILE/mbr.MBR') TOSTMF(path)` | A source member's records as lines: trailing blanks removed and ENDLINFMT's line end added (*CRLF by default; *FIXED keeps the records whole); STMFOPT(*NONE, *ADD, *REPLACE); STMFCCSID (a number, *STMF: the existing file's CCSID or 37 for a new file, *PCASCII 1252, *STDASCII 819). CPFA097 when the file exists with STMFOPT(*NONE) |
 | `CPYFRMSTMF FROMSTMF(path) TOMBR('/QSYS.LIB/...')` | Lines into a source member: any combination of CR and LF ends a line, tabs become blanks to the next stop of 8 (TABEXPN(*YES)); MBROPT(*NONE, *ADD, *REPLACE); CPFA095 when it cannot copy |

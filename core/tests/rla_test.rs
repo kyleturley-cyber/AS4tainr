@@ -24407,7 +24407,21 @@ async fn reorganize_a_physical_file_member() {
         )
         .await
         .unwrap();
-    job.run("RGZPFM FILE(CUSTMAST)").await.unwrap();
+    // CPC2983 when done (PUB400, verify40 i40_rgz).
+    match job.run("RGZPFM FILE(CUSTMAST)").await.unwrap() {
+        as4tainr_core::commands::Outcome::Messages(m) => {
+            assert!(m[0].starts_with("CPC2983"), "{m:?}")
+        }
+        other => panic!("{other:?}"),
+    }
+    // A file not found: CPF2991, then CPF2981 (i40_nosuch).
+    let e = job
+        .run("RGZPFM FILE(NOSUCHF)")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF2991"), "{e}");
+    assert_eq!(as4tainr_core::jobs::escape_id(&e), "CPF2981", "{e}");
     let after = rows(&client, t.clone()).await;
     let want: Vec<String> = before
         .iter()

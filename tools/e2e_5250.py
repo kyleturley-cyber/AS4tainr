@@ -768,6 +768,20 @@ with Tn5250(HOST) as t:
     t.fkey(3); t.wait_for("Work with Members Using PDM")
     t.fkey(3); t.wait_for("Command Entry")
     command(t, "rmvm contacts/qrpglesrc e2enew", "removed")
+    # EDTF (CL reference: edits a stream file; one that does not exist is
+    # created). The lines typed are the file's lines when saved.
+    command(t, "edtf stmf('/tmp/e2e_edtf.txt')", "Edit File")
+    check("(new file)" in t.text(), "EDTF of a file that does not exist offers lines to type on", t)
+    t.tab(); t.tab(); t.type("alpha"); t.tab(); t.tab(); t.type("beta"); t.enter()
+    t.wait_for("(changed)")
+    t.fkey(3); t.wait_for("Save the changed member")
+    t.enter(); t.wait_for("Command Entry")
+    check("Stream file /tmp/e2e_edtf.txt was saved." in t.text(), "F3 and Y save the stream file", t)
+    command(t, "edtf stmf('/tmp/e2e_edtf.txt')", "Edit File")
+    check("alpha" in t.text() and "beta" in t.text() and "(new file)" not in t.text(),
+          "EDTF shows the saved file's lines", t)
+    t.fkey(3); t.wait_for("Command Entry")
+    command(t, "rmvlnk objlnk('/tmp/e2e_edtf.txt')", "Command Entry")
     # EDTLIBL (CL reference: the user part of the library list, changed on
     # a display): a library typed over another one replaces it.
     command(t, "edtlibl", "Edit Library List")

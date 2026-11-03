@@ -17,24 +17,91 @@ use crate::seu::{Editor, Typed};
 const PAGE: usize = 17;
 /// Columns of text shown.
 const COLS: usize = 71;
+/// The longest line EDTF keeps (a stream file's lines have no record
+/// length; longer ones are cut).
+const STREAM_WIDTH: usize = 32767;
 
-/// Edit or browse a member; the message to show afterwards.
+/// What is being edited, as loaded: a member, or a stream file (EDTF).
+enum Source {
+    Member {
+        lib: String,
+        member: crate::source::Member,
+    },
+    Stream {
+        path: String,
+        /// The file's CCSID (a new file: 1208) and whether its lines end
+        /// with CR LF (kept when it is written back).
+        ccsid: i32,
+        crlf: bool,
+        exists: bool,
+    },
+}
+
+/// Edit or browse a member, or edit a stream file; the message to show
+/// afterwards.
 pub(super) async fn edit(term: &mut Term, job: &mut Job<'_>, t: &EditTarget) -> Result<String> {
-    let lib = crate::qtemp::real(&t.library);
-    let m = crate::source::find_member(job.client, std::slice::from_ref(&lib), &t.file, &t.member)
-        .await?;
-    let seqdat = crate::source::member_seqdat(job.client, &lib, &t.file, &t.member).await?;
-    let records = crate::source::line_records(&m.source, seqdat.as_deref());
-    let width = crate::source::record_length(job.client, &lib, &t.file)
-        .await
-        .unwrap_or(92)
-        .saturating_sub(12)
-        .max(1) as usize;
     let ((y, mo, d), _, _) = crate::rpg::dates::now();
     let today = (y.rem_euclid(100) as u32) * 10000 + mo * 100 + d;
-    let mut ed = Editor::new(&records, width, today);
+    let (src, mut ed) = match &t.stmf {
+        Some(path) => {
+            let (text, ccsid, crlf, exists) = match crate::ifs::read_file(job.client, path).await {
+                Ok((bytes, ccsid)) => {
+                    let text = crate::ifs::codec::text(ccsid, &bytes);
+                    let crlf = text.contains("\r\n");
+                    (text, ccsid, crlf, true)
+                }
+                Err(e) if crate::ifs::errno_of(&e) == crate::ifs::errno::ENOENT => {
+                    (String::new(), 1208, false, false)
+                }
+                Err(e) => return Err(e),
+            };
+            let mut ed = Editor::new(&[], STREAM_WIDTH, today);
+            let body = text.strip_suffix('\n').unwrap_or(&text);
+            if !body.is_empty() {
+                ed.lines = body
+                    .split('\n')
+                    .enumerate()
+                    .map(|(i, l)| crate::seu::Line {
+                        seq: (i as u32 + 1) * 100,
+                        date: 0,
+                        text: l.trim_end_matches('\r').to_string(),
+                        fresh: false,
+                    })
+                    .collect();
+            }
+            (
+                Source::Stream {
+                    path: path.clone(),
+                    ccsid,
+                    crlf,
+                    exists,
+                },
+                ed,
+            )
+        }
+        None => {
+            let lib = crate::qtemp::real(&t.library);
+            let m = crate::source::find_member(
+                job.client,
+                std::slice::from_ref(&lib),
+                &t.file,
+                &t.member,
+            )
+            .await?;
+            let seqdat = crate::source::member_seqdat(job.client, &lib, &t.file, &t.member).await?;
+            let records = crate::source::line_records(&m.source, seqdat.as_deref());
+            let width = crate::source::record_length(job.client, &lib, &t.file)
+                .await
+                .unwrap_or(92)
+                .saturating_sub(12)
+                .max(1) as usize;
+            let ed = Editor::new(&records, width, today);
+            (Source::Member { lib, member: m }, ed)
+        }
+    };
+    let width = ed.width;
     if ed.lines.is_empty() && !t.browse {
-        // A new or empty member: lines ready to type on.
+        // A new or empty member or file: lines ready to type on.
         ed.lines = (0..PAGE)
             .map(|i| crate::seu::Line {
                 seq: (i as u32 + 1) * 100,
@@ -52,19 +119,26 @@ pub(super) async fn edit(term: &mut Term, job: &mut Job<'_>, t: &EditTarget) -> 
     loop {
         let mut s = Screen::new();
         let mode = if t.browse { "Browse" } else { "Edit" };
-        centered(&mut s, 1, &format!("Source Entry: {mode}"));
-        s.put(
-            2,
-            2,
-            &format!(
-                "{}/{}  {}  {}{}",
-                t.library,
-                t.file,
-                t.member,
-                m.srctype,
-                if ed.changed { "  (changed)" } else { "" }
-            ),
-        );
+        let changed = if ed.changed { "  (changed)" } else { "" };
+        match &src {
+            Source::Member { member: m, .. } => {
+                centered(&mut s, 1, &format!("Source Entry: {mode}"));
+                s.put(
+                    2,
+                    2,
+                    &format!(
+                        "{}/{}  {}  {}{changed}",
+                        t.library, t.file, t.member, m.srctype
+                    ),
+                );
+            }
+            Source::Stream { path, exists, .. } => {
+                centered(&mut s, 1, "Edit File");
+                let new = if *exists { "" } else { "  (new file)" };
+                let shown: String = path.chars().take(58).collect();
+                s.put(2, 2, &format!("{shown}{new}{changed}"));
+            }
+        }
         s.put(2, 62, &format!("Columns {}-{}", left + 1, left + COLS));
         s.text(3, 2, attr::HIGH, "Cmd ===>");
         s.field("CMD", 3, 11, 69, FieldKind::Text, &command);
@@ -166,13 +240,25 @@ pub(super) async fn edit(term: &mut Term, job: &mut Job<'_>, t: &EditTarget) -> 
                 }
                 match exit_choice(term).await? {
                     Some(true) => {
-                        save(job, &lib, t, &m, &ed).await?;
-                        return Ok(format!(
-                            "Member {} in file {}/{} was changed.",
-                            t.member, t.library, t.file
-                        ));
+                        save(job, &src, t, &ed).await?;
+                        return Ok(match &src {
+                            Source::Stream { path, .. } => format!("Stream file {path} was saved."),
+                            Source::Member { .. } => format!(
+                                "Member {} in file {}/{} was changed.",
+                                t.member, t.library, t.file
+                            ),
+                        });
                     }
-                    Some(false) => return Ok(format!("Member {} was not changed.", t.member)),
+                    Some(false) => {
+                        return Ok(match &src {
+                            Source::Stream { path, .. } => {
+                                format!("Stream file {path} was not changed.")
+                            }
+                            Source::Member { .. } => {
+                                format!("Member {} was not changed.", t.member)
+                            }
+                        })
+                    }
                     None => continue,
                 }
             }
@@ -201,9 +287,12 @@ pub(super) async fn edit(term: &mut Term, job: &mut Job<'_>, t: &EditTarget) -> 
             if t.browse {
                 message = "A member being browsed cannot be saved.".into();
             } else {
-                save(job, &lib, t, &m, &ed).await?;
+                save(job, &src, t, &ed).await?;
                 ed.changed = false;
-                message = format!("Member {} saved.", t.member);
+                message = match &src {
+                    Source::Stream { path, .. } => format!("Stream file {path} saved."),
+                    Source::Member { .. } => format!("Member {} saved.", t.member),
+                };
             }
         } else if let Some(what) = upper
             .strip_prefix("FIND ")
@@ -284,31 +373,49 @@ async fn exit_choice(term: &mut Term) -> Result<Option<bool>> {
     }
 }
 
-/// Write the member back with its sequence numbers and dates.
-async fn save(
-    job: &mut Job<'_>,
-    lib: &str,
-    t: &EditTarget,
-    m: &crate::source::Member,
-    ed: &Editor,
-) -> Result<()> {
-    let (source, seqdat) = ed.source();
-    crate::source::put_member(
-        job.client,
-        &crate::source::Member {
-            library: lib.to_string(),
-            file: t.file.clone(),
-            name: t.member.clone(),
-            srctype: m.srctype.clone(),
-            text: m.text.clone(),
-            source,
-            ..Default::default()
-        },
-        true,
-    )
-    .await?;
-    crate::source::set_member_seqdat(job.client, lib, &t.file, &t.member, &seqdat).await?;
-    Ok(())
+/// Write the member back with its sequence numbers and dates, or the
+/// stream file in its CCSID with its line ends.
+async fn save(job: &mut Job<'_>, src: &Source, t: &EditTarget, ed: &Editor) -> Result<()> {
+    match src {
+        Source::Stream {
+            path, ccsid, crlf, ..
+        } => {
+            let text = stream_text(ed, *crlf);
+            let bytes = crate::ifs::codec::convert(1208, *ccsid, text.as_bytes());
+            crate::ifs::write_file(job.client, path, &bytes, *ccsid, 0o644, &job.user).await
+        }
+        Source::Member { lib, member: m } => {
+            let (source, seqdat) = ed.source();
+            crate::source::put_member(
+                job.client,
+                &crate::source::Member {
+                    library: lib.to_string(),
+                    file: t.file.clone(),
+                    name: t.member.clone(),
+                    srctype: m.srctype.clone(),
+                    text: m.text.clone(),
+                    source,
+                    ..Default::default()
+                },
+                true,
+            )
+            .await?;
+            crate::source::set_member_seqdat(job.client, lib, &t.file, &t.member, &seqdat).await?;
+            Ok(())
+        }
+    }
+}
+
+/// A stream file's text from the editor's lines: each line (trailing
+/// blanks taken off) ended by LF, or CR LF when the file had them.
+fn stream_text(ed: &Editor, crlf: bool) -> String {
+    let end = if crlf { "\r\n" } else { "\n" };
+    let mut out = String::new();
+    for l in ed.lines.iter().filter(|l| !l.fresh) {
+        out.push_str(l.text.trim_end());
+        out.push_str(end);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -330,5 +437,20 @@ mod tests {
         assert_eq!(&r[..10], "....+....1");
         assert_eq!(r.len(), COLS);
         assert_eq!(&ruler(40)[..10], "....+....5");
+    }
+
+    #[test]
+    fn stream_file_lines() {
+        let mut ed = Editor::new(&[], STREAM_WIDTH, 0);
+        for (i, t) in ["one  ", "", "three"].iter().enumerate() {
+            ed.lines.push(crate::seu::Line {
+                seq: (i as u32 + 1) * 100,
+                date: 0,
+                text: t.to_string(),
+                fresh: false,
+            });
+        }
+        assert_eq!(stream_text(&ed, false), "one\n\nthree\n");
+        assert_eq!(stream_text(&ed, true), "one\r\n\r\nthree\r\n");
     }
 }

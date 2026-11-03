@@ -257,14 +257,16 @@ pub enum Outcome {
     EditLibraryList,
 }
 
-/// The member STRSEU edits or browses.
-#[derive(Debug, Clone)]
+/// The member STRSEU edits or browses, or the stream file EDTF edits.
+#[derive(Debug, Clone, Default)]
 pub struct EditTarget {
     pub library: String,
     pub file: String,
     pub member: String,
     /// OPTION(5): look only.
     pub browse: bool,
+    /// EDTF: the stream file's path (library, file and member unused).
+    pub stmf: Option<String>,
 }
 
 /// DSPPFM shows at most this many records.
@@ -663,6 +665,7 @@ impl Job<'_> {
             "WRKOBJ" => self.wrkobj(&cmd).await,
             "DSPPFM" => self.dsppfm(&cmd).await,
             "STRSEU" => self.strseu(&cmd).await,
+            "EDTF" => self.edtf(&cmd).await,
             "CRTDTAARA" => self.crtdtaara(&cmd).await,
             "CHGDTAARA" => self.chgdtaara(&cmd).await,
             "DSPDTAARA" => self.dspdtaara(&cmd).await,
@@ -5609,14 +5612,17 @@ impl Job<'_> {
                 // A source member's lines have no deleted records between
                 // them: nothing to do.
                 return Ok(Outcome::Messages(vec![format!(
-                    "Member of file {name} in library {} reorganized.",
-                    crate::qtemp::logical(l)
+                    "CPC2983: The data of member {name} has been reorganized."
                 )]));
             }
         }
         let fr = crate::catalog::resolve_file(self.client, &self.library_list(), &q)
             .await
-            .map_err(|_| anyhow!("CPF3142: File {name} in library {lib_label} not found."))?;
+            .map_err(|_| {
+                anyhow!(
+                    "CPF2991: There is no file {name} in library {lib_label}.\nCPF2981: No member of file {name} in {lib_label} was reorganized."
+                )
+            })?;
         let lf = self
             .client
             .query_opt(
@@ -5626,9 +5632,9 @@ impl Job<'_> {
             .await?
             .is_some();
         if fr.file.view.is_some() || lf {
+            let l = crate::qtemp::logical(&fr.library);
             bail!(
-                "File {name} in library {} is not a physical file; RGZPFM reorganizes physical files.",
-                crate::qtemp::logical(&fr.library)
+                "CPF2980: File {name} in {l} is a logical file or a view; RGZPFM reorganizes physical files.\nCPF2981: No member of file {name} in {l} was reorganized."
             );
         }
         authority::check(
@@ -5660,14 +5666,13 @@ impl Job<'_> {
         } else {
             "rrn".into()
         };
-        let removed = crate::catalog::reorganize(self.client, &table, &order).await?;
+        crate::catalog::reorganize(self.client, &table, &order).await?;
         let mbr = match cmd.get("MBR") {
             "*FIRST" | "*LAST" | "" => name.clone(),
             m => m.to_ascii_uppercase(),
         };
         Ok(Outcome::Messages(vec![format!(
-            "Member {mbr} of file {name} in library {} reorganized: {removed} deleted record numbers removed.",
-            crate::qtemp::logical(&fr.library)
+            "CPC2983: The data of member {mbr} has been reorganized."
         )]))
     }
 
@@ -8035,6 +8040,39 @@ impl Job<'_> {
             file,
             member,
             browse,
+            stmf: None,
+        }))
+    }
+
+    /// EDTF STMF(path): edit a stream file on a display (the source
+    /// editor's display, `tn5250/seu_screen.rs`, its lines numbered 1, 2,
+    /// ...). A file that does not exist yet is made when saved (CL
+    /// reference, EDTF: "If the stream file does not exist, it is
+    /// created"); a directory cannot be edited.
+    async fn edtf(&mut self, cmd: &Command) -> Result<Outcome> {
+        let raw = cmd.get("STMF").trim().to_string();
+        if raw.is_empty() {
+            bail!(
+                "CPD0084: STMF needs the path of a stream file.\n{}",
+                crate::cl::CPF0006
+            );
+        }
+        let path = if raw.starts_with('/') {
+            raw
+        } else {
+            let dir = crate::ifs::current_dir();
+            format!("{}/{raw}", dir.trim_end_matches('/'))
+        };
+        let path = crate::ifs::normalize(&path)?;
+        if let Some(e) = crate::ifs::stat(self.client, &path).await? {
+            if e.dir {
+                bail!("{path} is a directory: EDTF edits stream files (WRKLNK lists a directory).");
+            }
+        }
+        Ok(Outcome::Edit(EditTarget {
+            browse: false,
+            stmf: Some(path),
+            ..Default::default()
         }))
     }
 

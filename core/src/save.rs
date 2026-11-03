@@ -2572,7 +2572,15 @@ impl Job<'_> {
         if objtype == "*LIB" {
             bail!("CPF9898: A library cannot be moved into another library.");
         }
-        let tolib = crate::qtemp::real(&cmd.get("TOLIB").trim().to_ascii_uppercase());
+        let tolib = cmd.get("TOLIB").trim().to_ascii_uppercase();
+        // The command analyzer refuses QTEMP (PUB400, verify41 j41_mov).
+        if crate::qtemp::logical(&tolib) == "QTEMP" {
+            return Err(crate::cl::value_error_id(
+                "CPD0090",
+                "TOLIB cannot be QTEMP: an object is not moved into a job's own library.",
+            ));
+        }
+        let tolib = crate::qtemp::real(&tolib);
         if !catalog::library_exists(self.client, &tolib).await? {
             bail!(
                 "CPF2110: There is no library {}.",

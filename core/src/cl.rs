@@ -1131,6 +1131,21 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "CHGPF",
+        description: "Change Physical File",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "Physical file").ch("Name"),
+            p("SRCFILE", Kind::Qualified, false, Some("*NONE"), "Source file").ch("Name, *NONE"),
+            p("SRCMBR", Kind::Name, false, Some("*FILE"), "Source member").ch("Name, *FILE"),
+            p("TEXT", Kind::Text, false, Some("*SAME"), "Text 'description'").keyword_only(),
+            p("SIZE", Kind::List, false, Some("*SAME"), "Member size").keyword_only(),
+            p("MAXMBRS", Kind::Text, false, Some("*SAME"), "Maximum members").keyword_only(),
+            p("WAITFILE", Kind::Text, false, Some("*SAME"), "Maximum file wait time").keyword_only(),
+            p("WAITRCD", Kind::Text, false, Some("*SAME"), "Maximum record wait time").keyword_only(),
+            p("REUSEDLT", Kind::Name, false, Some("*SAME"), "Reuse deleted records").keyword_only(),
+        ],
+    },
+    CommandDef {
         name: "RGZPFM",
         description: "Reorganize Physical File Member",
         params: &[
@@ -4616,6 +4631,12 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*NONE, *ADD, *REPLACE"),
             p("CRTFILE", Kind::Name, false, Some("*NO"), "Create file").ch("*NO, *YES"),
+            p("FROMRCD", Kind::Text, false, Some("*START"), "Copy from record number")
+                .ch("Number, *START")
+                .keyword_only(),
+            p("TORCD", Kind::Text, false, Some("*END"), "Copy to record number")
+                .ch("Number, *END")
+                .keyword_only(),
             p("PRINT", Kind::List, false, Some("*NONE"), "Print format")
                 .ch("*NONE, *COPIED, *EXCLD")
                 .keyword_only(),
@@ -4665,6 +4686,12 @@ pub const OBJECT_TYPES: &[&str] = &[
 /// CPF0006 (observed on IBM i 7.5: `CRTDTAARA ... TYPE(*BAD)`).
 pub fn value_error(detail: &str) -> anyhow::Error {
     anyhow::anyhow!("CPD0084: {detail}\n{CPF0006}")
+}
+
+/// A value the command analyzer refuses with a diagnostic of its own
+/// (e.g. CPD0090), then CPF0006.
+pub fn value_error_id(id: &str, detail: &str) -> anyhow::Error {
+    anyhow::anyhow!("{id}: {detail}\n{CPF0006}")
 }
 
 /// A group of commands on the F4 menu.
@@ -4900,6 +4927,7 @@ pub static GROUPS: &[Group] = &[
             "DLTOVR",
             "CLRPFM",
             "RGZPFM",
+            "CHGPF",
             "RNMM",
             "STRCMTCTL",
             "ENDCMTCTL",

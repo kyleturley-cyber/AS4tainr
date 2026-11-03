@@ -93,6 +93,12 @@ def printed(lines):
 def shell_for(cmd, sandbox):
     if cmd.startswith("!"):
         line = cmd[1:].replace("/home/", sandbox + "/home/")
+        # A file written into a directory made with MKDIR (in the IFS, not
+        # in the sandbox): make the directory in the sandbox too, so the
+        # file is there to put into the IFS.
+        dirs = sorted({os.path.dirname(t) for t in re.findall(r">\s*(\S+)", line) if t.startswith(sandbox)})
+        if dirs:
+            line = "mkdir -p %s; %s" % (" ".join(dirs), line)
         return (
             "{ %s ; } </dev/null 2>%s/err; echo \"rc=$?\"; sed 's/^/2> /' %s/err"
             % (line, sandbox, sandbox)

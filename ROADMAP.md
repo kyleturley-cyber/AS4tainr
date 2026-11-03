@@ -263,6 +263,7 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] ALCOBJ/DLCOBJ/WRKOBJLCK messages and printed report as IBM i 7.5 gives them (verify39); RGZPFM; HLDJOBQ/RLSJOBQ
 - [x] RGZPFM messages and record numbers as IBM i 7.5 gives them (verify40); EDTF edits stream files
 - [x] WRKLIB, WRKF, WRKPGM and the other WRK-by-type commands; MOVOBJ, RNMM, CLRMSGQ, CLRJOBQ, CPY, MOV, DSPF
+- [x] MOVOBJ, RNMM, CLRMSGQ, CPY, MOV messages as IBM i 7.5 gives them (verify41); CHGPF SRCFILE; CPYF FROMRCD and TORCD
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).
 - [x] Journals and trigger programs: COM's SETUPJRN, ORDAUDJV (QSYS2.DISPLAY_JOURNAL) and ORDTRG (ADDPFTRG) run (docs/journals.md).

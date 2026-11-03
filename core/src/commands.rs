@@ -603,6 +603,7 @@ impl Job<'_> {
             "DLTOVR" => self.dltovr(&cmd),
             "CLRPFM" => self.clrpfm(&cmd).await,
             "RGZPFM" => self.rgzpfm(&cmd).await,
+            "CHGPF" => Box::pin(self.chgpf(&cmd)).await,
             "RNMM" => self.rnmm(&cmd).await,
             "DLYJOB" => self.dlyjob(&cmd).await,
             "DLTMSGF" => self.dltmsgf(&cmd).await,
@@ -5624,7 +5625,11 @@ impl Job<'_> {
                 .await?
                 .is_none()
             {
-                bail!("CPF3141: Member {mbr} not found in file {file} in library {lib_label}.");
+                // PUB400 (IBM i 7.5), verify41 j41_rnmmnone.
+                bail!(
+                    "CPF9815: File {file} in library {} has no member {mbr}.\nCPF3178: Member {mbr} was not renamed to {new}.",
+                    crate::qtemp::logical(l)
+                );
             }
             if self
                 .client
@@ -5644,12 +5649,138 @@ impl Job<'_> {
                     &[l, &file, &mbr, &new],
                 )
                 .await?;
+            // CPC3202 (verify41 j41_rnmm).
             return Ok(Outcome::Messages(vec![format!(
-                "Member {mbr} in file {file} in library {} renamed to {new}.",
+                "CPC3202: Member {mbr} of file {file} in library {} is now named {new}.",
                 crate::qtemp::logical(l)
             )]));
         }
         bail!("CPF9812: There is no file {file} in library {lib_label}.")
+    }
+
+    /// CHGPF: with SRCFILE, the file made again from its changed DDS and
+    /// its records kept, field by field by name (CL reference, CHGPF: the
+    /// file's fields are changed to the new DDS; data is kept where the
+    /// field names match, new fields get their default, dropped fields
+    /// lose theirs). Done as CRTPF into QTEMP, CPYF FMTOPT(*MAP *DROP),
+    /// then the new file in place of the old one (the old one renamed
+    /// aside first, so nothing is lost when a step fails). A file with
+    /// logical files or views over it is not changed here. TEXT changes
+    /// the description; the other attributes are accepted and kept as
+    /// they are (docs/fidelity-gaps.md).
+    async fn chgpf(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (libs, name) = self.search(cmd.get("FILE"));
+        let name = name.to_ascii_uppercase();
+        let q = match libs.as_slice() {
+            [one] if cmd.get("FILE").contains('/') => format!("{one}/{name}"),
+            _ => name.clone(),
+        };
+        let fr = crate::catalog::resolve_file(self.client, &self.library_list(), &q)
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "CPF9812: There is no file {name} in library {}.",
+                    libs.join(",")
+                )
+            })?;
+        let lib = fr.library.clone();
+        let shown = crate::qtemp::logical(&lib);
+        let lf = self
+            .client
+            .query_opt(
+                "SELECT 1 FROM as4tainr.logical_files WHERE library=$1 AND name=$2",
+                &[&lib, &name],
+            )
+            .await?
+            .is_some();
+        if fr.file.view.is_some() || lf {
+            bail!("File {name} in library {shown} is not a physical file; CHGPF changes physical files.");
+        }
+        authority::check(self.client, &self.user, &lib, &name, "*FILE", Aut::All).await?;
+        let mut msgs = Vec::new();
+        let src = cmd.get("SRCFILE").trim().to_ascii_uppercase();
+        if !src.is_empty() && src != "*NONE" {
+            let mbr = match cmd.get("SRCMBR").trim().to_ascii_uppercase().as_str() {
+                "*FILE" | "" => name.clone(),
+                m => m.to_string(),
+            };
+            let records: i64 = self
+                .client
+                .query_one(
+                    &format!(
+                        "SELECT count(*) FROM {}.{}",
+                        catalog::ident(&lib),
+                        catalog::ident(&name)
+                    ),
+                    &[],
+                )
+                .await?
+                .get(0);
+            let _ = Box::pin(self.run(&format!("DLTF FILE(QTEMP/{name})"))).await;
+            Box::pin(self.run(&format!(
+                "CRTPF FILE(QTEMP/{name}) SRCFILE({src}) SRCMBR({mbr})"
+            )))
+            .await
+            .map_err(|e| e.context(format!("File {name} in library {shown} was not changed.")))?;
+            if records > 0 {
+                if let Err(e) = Box::pin(self.run(&format!(
+                    "CPYF FROMFILE({lib}/{name}) TOFILE(QTEMP/{name}) MBROPT(*ADD) FROMRCD(1) FMTOPT(*MAP *DROP)"
+                )))
+                .await
+                {
+                    let _ = Box::pin(self.run(&format!("DLTF FILE(QTEMP/{name})"))).await;
+                    return Err(e.context(format!(
+                        "File {name} in library {shown} was not changed: its records do not fit the new fields."
+                    )));
+                }
+            }
+            // The old file aside under a name of its own, the new one in.
+            let aside = format!("Q{:09}", std::process::id() % 1_000_000_000);
+            if let Err(e) = Box::pin(self.run(&format!(
+                "RNMOBJ OBJ({lib}/{name}) OBJTYPE(*FILE) NEWOBJ({aside})"
+            )))
+            .await
+            {
+                let _ = Box::pin(self.run(&format!("DLTF FILE(QTEMP/{name})"))).await;
+                return Err(e.context(format!(
+                    "File {name} in library {shown} was not changed (logical files or views over it must be deleted first)."
+                )));
+            }
+            if let Err(e) = Box::pin(self.run(&format!(
+                "MOVOBJ OBJ(QTEMP/{name}) OBJTYPE(*FILE) TOLIB({lib})"
+            )))
+            .await
+            {
+                let _ = Box::pin(self.run(&format!(
+                    "RNMOBJ OBJ({lib}/{aside}) OBJTYPE(*FILE) NEWOBJ({name})"
+                )))
+                .await;
+                let _ = Box::pin(self.run(&format!("DLTF FILE(QTEMP/{name})"))).await;
+                return Err(e.context(format!("File {name} in library {shown} was not changed.")));
+            }
+            Box::pin(self.run(&format!("DLTF FILE({lib}/{aside})"))).await?;
+            msgs.push(format!(
+                "File {name} in library {shown} changed from source member {mbr}: {records} record(s) kept."
+            ));
+        }
+        let text = cmd.get("TEXT").trim();
+        if !text.is_empty() && !text.eq_ignore_ascii_case("*SAME") {
+            let text = if text.eq_ignore_ascii_case("*BLANK") {
+                ""
+            } else {
+                text
+            };
+            self.client
+                .execute(
+                    "UPDATE as4tainr.objects SET text=$3 WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+                    &[&lib, &name, &text],
+                )
+                .await?;
+        }
+        if msgs.is_empty() {
+            msgs.push(format!("File {name} in library {shown} changed."));
+        }
+        Ok(Outcome::Messages(msgs))
     }
 
     /// RGZPFM: the records numbered again from 1 with no gaps where
@@ -8476,7 +8607,7 @@ impl Job<'_> {
     /// not keep whether an inquiry was answered, so every inquiry stays)
     /// (CL reference, CLRMSGQ).
     async fn clrmsgq(&mut self, cmd: &Command) -> Result<Outcome> {
-        let (q, _) = self
+        let (q, shown_lib) = self
             .message_queue(cmd.get("MSGQ"), Aut::Change, "clear other users' messages")
             .await?;
         let keep_inq = match cmd.get("CLEAR").trim().to_ascii_uppercase().as_str() {
@@ -8494,7 +8625,11 @@ impl Job<'_> {
                 &[&q, &keep_inq],
             )
             .await?;
-        Ok(Outcome::Messages(Vec::new()))
+        // CPC2353 (PUB400, verify41 j41_clrmsgq).
+        let name = q.rsplit('/').next().unwrap_or(&q);
+        Ok(Outcome::Messages(vec![format!(
+            "CPC2353: The messages of message queue {name} in library {shown_lib} were removed."
+        )]))
     }
 
     async fn dspmsg(&mut self, cmd: &Command) -> Result<Outcome> {

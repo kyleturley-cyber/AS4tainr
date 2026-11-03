@@ -150,7 +150,8 @@ impl Job<'_> {
                     ifs::rename(self.client, &from, &to)
                         .await
                         .map_err(|e| cl_error(e, &to))?;
-                    return msg(format!("Object {from} moved to {to}."));
+                    // CPCA086, CPCA087 (PUB400, verify41 j41_mv, j41_cpy).
+                    return msg(format!("CPCA086: Object {from} moved to {to}."));
                 }
                 if e.dir {
                     bail!("CPFA0AB: {from} is a directory: as4tainr's CPY copies stream files.");
@@ -165,7 +166,7 @@ impl Job<'_> {
                 ifs::write_file(self.client, &to, &bytes, ccsid, e.mode, &self.user)
                     .await
                     .map_err(|e| cl_error(e, &to))?;
-                msg(format!("Object {from} copied to {to}."))
+                msg(format!("CPCA087: Object {from} copied to {to}."))
             }
             "RNM" => {
                 let obj = cmd.get("OBJ");

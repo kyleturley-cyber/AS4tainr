@@ -24632,12 +24632,24 @@ async fn work_with_move_rename_and_clear() {
         .map(|m| m.0)
         .collect();
     assert_eq!(names, ["NEWNAME"]);
-    assert!(job
+    // A member not found: CPF9815, then CPF3178 (PUB400, verify41
+    // j41_rnmmnone; this expected CPF3141 before the capture).
+    let e = job
         .run(&format!("RNMM FILE({lib}/QTXTSRC) MBR(OLDNAME) NEWMBR(X)"))
         .await
         .unwrap_err()
-        .to_string()
-        .starts_with("CPF3141"));
+        .to_string();
+    assert!(e.starts_with("CPF9815"), "{e}");
+    assert_eq!(jobs::escape_id(&e), "CPF3178", "{e}");
+    // MOVOBJ into QTEMP: CPD0090, CPF0006 (j41_mov).
+    let e = job
+        .run(&format!(
+            "MOVOBJ OBJ({lib}/CUSTMAST) OBJTYPE(*FILE) TOLIB(QTEMP)"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPD0090") && e.contains("CPF0006"), "{e}");
 
     // CLRMSGQ.
     job.run(&format!("CRTMSGQ MSGQ({lib}/MYQ)")).await.unwrap();
@@ -24646,7 +24658,11 @@ async fn work_with_move_rename_and_clear() {
         .unwrap();
     let key = format!("{lib}/MYQ");
     assert_eq!(jobs::messages(&client, &key, false).await.unwrap().len(), 1);
-    job.run(&format!("CLRMSGQ MSGQ({lib}/MYQ)")).await.unwrap();
+    // CPC2353 (j41_clrmsgq).
+    match job.run(&format!("CLRMSGQ MSGQ({lib}/MYQ)")).await.unwrap() {
+        Outcome::Messages(m) => assert!(m[0].starts_with("CPC2353"), "{m:?}"),
+        other => panic!("{other:?}"),
+    }
     assert!(jobs::messages(&client, &key, false)
         .await
         .unwrap()
@@ -24700,9 +24716,15 @@ async fn work_with_move_rename_and_clear() {
     )
     .await
     .unwrap();
-    job.run(&format!("CPY OBJ('{dir}/a.txt') TOOBJ('{dir}/b.txt')"))
+    // CPCA087 (j41_cpy).
+    match job
+        .run(&format!("CPY OBJ('{dir}/a.txt') TOOBJ('{dir}/b.txt')"))
         .await
-        .unwrap();
+        .unwrap()
+    {
+        Outcome::Messages(m) => assert!(m[0].starts_with("CPCA087"), "{m:?}"),
+        other => panic!("{other:?}"),
+    }
     assert_eq!(
         ifs::read_file(&client, &format!("{dir}/b.txt"))
             .await
@@ -24731,4 +24753,154 @@ async fn work_with_move_rename_and_clear() {
         .await
         .unwrap()
         .is_some());
+}
+
+// CHGPF SRCFILE: the file made again from its changed DDS with its
+// records kept field by field by name: a longer field keeps its value, a
+// new field gets its default (blanks), a dropped field goes (CL
+// reference, CHGPF); in arrival order (CPYF FROMRCD: "the file is
+// processed in arrival sequence").
+#[tokio::test]
+async fn change_a_physical_file_from_changed_dds() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source::{put_member, Member};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    job.run(&format!("CRTSRCPF FILE({lib}/QDDSSRC)"))
+        .await
+        .unwrap();
+    let dds = |src: &str| Member {
+        library: lib.clone(),
+        file: "QDDSSRC".into(),
+        name: "CHGME".into(),
+        srctype: "PF".into(),
+        source: src.into(),
+        ..Default::default()
+    };
+    let old = "     A          R CHGMER\n     A            K1             5P 0\n     A            NAME          10A\n     A            GONE           3A\n     A          K K1\n";
+    put_member(&client, &dds(old), true).await.unwrap();
+    job.run(&format!("CRTPF FILE({lib}/CHGME) SRCFILE({lib}/QDDSSRC)"))
+        .await
+        .unwrap();
+    let t = format!("{}.chgme", catalog::ident(&lib));
+    client
+        .execute(
+            &format!("INSERT INTO {t} (k1, name, gone) VALUES (2, 'two', 'x'), (1, 'one', 'y')"),
+            &[],
+        )
+        .await
+        .unwrap();
+    let new = "     A          R CHGMER\n     A            K1             5P 0\n     A            NAME          20A\n     A            CITY          10A\n     A          K K1\n";
+    put_member(&client, &dds(new), true).await.unwrap();
+    job.run(&format!(
+        "CHGPF FILE({lib}/CHGME) SRCFILE({lib}/QDDSSRC) TEXT('changed')"
+    ))
+    .await
+    .unwrap();
+    let rows: Vec<(String, String, String)> = client
+        .query(
+            &format!("SELECT k1::text, rtrim(name), city FROM {t} ORDER BY rrn"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("2".to_string(), "two".to_string(), " ".repeat(10)),
+            ("1".to_string(), "one".to_string(), " ".repeat(10))
+        ]
+    );
+    let gone = client
+        .query_opt(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'chgme' AND column_name = 'gone'",
+            &[&lib.to_ascii_lowercase()],
+        )
+        .await
+        .unwrap();
+    assert!(gone.is_none());
+    // Still in its library, with the new description; nothing left aside.
+    let objs = catalog::list_objects(&client, &lib).await.unwrap();
+    let f = objs.iter().find(|o| o.name == "CHGME").unwrap();
+    assert_eq!(f.text, "changed");
+    assert!(
+        !objs.iter().any(|o| o.objtype == "*FILE"
+            && o.name.len() == 10
+            && o.name.starts_with('Q')
+            && o.name[1..].chars().all(|c| c.is_ascii_digit())),
+        "the old file was left aside"
+    );
+}
+
+// CPYF FROMRCD and TORCD: the records from one relative record number to
+// another, in arrival sequence even from a keyed file (CL reference,
+// CPYF FROMRCD).
+#[tokio::test]
+async fn copy_file_from_and_to_record_numbers() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let t = format!("{}.custmast", catalog::ident(&lib));
+    let by_rrn: Vec<String> = client
+        .query(&format!("SELECT cusno::text FROM {t} ORDER BY rrn"), &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert!(by_rrn.len() >= 3);
+    job.run(&format!(
+        "CPYF FROMFILE({lib}/CUSTMAST) TOFILE({lib}/CUSTCOPY) CRTFILE(*YES) FROMRCD(2) TORCD(3)"
+    ))
+    .await
+    .unwrap();
+    let copied: Vec<String> = client
+        .query(
+            &format!(
+                "SELECT cusno::text FROM {}.custcopy ORDER BY rrn",
+                catalog::ident(&lib)
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(copied, by_rrn[1..3]);
+    assert!(job
+        .run(&format!(
+            "CPYF FROMFILE({lib}/CUSTMAST) TOFILE({lib}/CUSTCOPY) MBROPT(*ADD) FROMRCD(X)"
+        ))
+        .await
+        .is_err());
 }

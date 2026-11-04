@@ -194,11 +194,15 @@ impl Job<'_> {
                     return Err(cl_error(ifs::Errno(errno::ENOENT).into(), obj));
                 };
                 let fmt = |u: &str, a: &str| format!("{u:<10}  {a}");
+                // *PUBLIC first, then the owner (PUB400, verify43
+                // l43_dspaut).
                 let rows = vec![
-                    fmt(&e.owner, ifs::data_authority(e.mode >> 6)),
                     fmt("*PUBLIC", ifs::data_authority(e.mode)),
+                    fmt(&e.owner, ifs::data_authority(e.mode >> 6)),
                 ];
+                let print = dspaut_report(&e, &crate::report::Stamp::now());
                 Ok(Some(Outcome::Display(ListDisplay {
+                    print,
                     title: "Display Authority".into(),
                     info: vec![
                         ("Object".into(), e.path.clone()),
@@ -229,6 +233,16 @@ impl Job<'_> {
                         .await?;
                 }
                 let dta = cmd.get("DTAAUT").trim().to_ascii_uppercase();
+                // *EXCLUDE takes no object authorities: OBJAUT(*NONE)
+                // only, CPD2212 and CPF0006 otherwise (verify43 l43_chgaut,
+                // with OBJAUT's default *SAME).
+                let objaut = cmd.list("OBJAUT").join(" ").trim().to_ascii_uppercase();
+                if dta == "*EXCLUDE" && objaut != "*NONE" {
+                    return Err(crate::cl::value_error_id(
+                        "CPD2212",
+                        "With DTAAUT(*EXCLUDE), OBJAUT must be *NONE.",
+                    ));
+                }
                 if dta == "*SAME" || dta.is_empty() {
                     return Ok(Some(Outcome::Messages(Vec::new())));
                 }
@@ -281,7 +295,10 @@ impl Job<'_> {
                 ifs::set_owner(self.client, obj, &new)
                     .await
                     .map_err(|e| cl_error(e, obj))?;
-                Ok(Some(Outcome::Messages(Vec::new())))
+                // CPC221B (verify43 l43_chgown).
+                Ok(Some(Outcome::Messages(vec![format!(
+                    "CPC221B: The owner of {obj} is now {new}."
+                )])))
             }
             // DSPATR (CL reference): an IFS object's attributes, here
             // those the IFS keeps (as4tainr's own layout).
@@ -959,5 +976,114 @@ fn stmf_ccsid(cmd: &crate::cl::Command) -> &str {
         old
     } else {
         c
+    }
+}
+
+/// DSPAUT OUTPUT(*PRINT) in IBM i 7.5's layout (PUB400, verify43
+/// l43_dspaut): a style-B header (title at column 50), the object, its
+/// type without the asterisk, owner, primary group and authorization list
+/// (*NONE: there are none here), the two heading lines, then *PUBLIC and
+/// the owner with their data authority and an X under each authority it
+/// gives (r: *OBJOPR and Read; w: Add, Update, Delete; x: Execute; the
+/// owner also *OBJEXIST, *OBJMGT, *OBJALTER, *OBJREF).
+pub fn dspaut_report(e: &ifs::Entry, stamp: &crate::report::Stamp) -> Vec<String> {
+    use crate::report::at;
+    let [h1, h2] = crate::report::header_b(
+        50,
+        "Display Authority",
+        &crate::report::system_name(),
+        stamp,
+        1,
+    );
+    let label = |l: &str, v: &str| at(&[(2, &crate::commands::dsp_label(l, 29)), (37, v)]);
+    let row = |user: &str, bits: i32, owner: bool| {
+        let r = bits & 4 != 0;
+        let w = bits & 2 != 0;
+        let x = bits & 1 != 0;
+        let mut f: Vec<(usize, &str)> = vec![(2, user), (17, ifs::data_authority(bits))];
+        let marks = [
+            (33, r || w || x),
+            (43, r),
+            (52, w),
+            (61, w),
+            (72, w),
+            (83, x),
+            (95, owner),
+            (104, owner),
+            (113, owner),
+            (122, owner),
+        ];
+        for (c, on) in marks {
+            if on {
+                f.push((c, "X"));
+            }
+        }
+        at(&f)
+    };
+    vec![
+        h1,
+        h2,
+        label("Object", &e.path),
+        label("Type", if e.dir { "DIR" } else { "STMF" }),
+        label("Owner", &e.owner),
+        label("Primary group", "*NONE"),
+        label("Authorization list", "*NONE"),
+        at(&[
+            (19, "Data"),
+            (31, "--------------------Data Authorities---------------------"),
+            (93, "------Object Authorities-------"),
+        ]),
+        at(&[
+            (2, "User"),
+            (17, "Authority"),
+            (31, "Objopr"),
+            (42, "Read"),
+            (51, "Add"),
+            (59, "Update"),
+            (70, "Delete"),
+            (81, "Execute"),
+            (93, "Exist"),
+            (103, "Mgt"),
+            (111, "Alter"),
+            (121, "Ref"),
+        ]),
+        row("*PUBLIC", e.mode & 7, false),
+        row(&e.owner, (e.mode >> 6) & 7, true),
+        "                                        * * * * *   E N D   O F   L I S T I N G   * * * * *".into(),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // DSPAUT OUTPUT(*PRINT): PUB400 (IBM i 7.5), verify43 l43_dspaut (a
+    // stream file with mode 0644 owned by AS4TRAINR; header lines left
+    // to report.rs's own tests).
+    #[test]
+    fn dspaut_report_as_ibm_i_prints_it() {
+        let e = ifs::Entry {
+            path: "/home/AS4TRAINR/gld/g43.txt".into(),
+            dir: false,
+            ccsid: 1208,
+            mode: 0o644,
+            owner: "AS4TRAINR".into(),
+            size: 2,
+            changed_us: 0,
+        };
+        let r = super::dspaut_report(&e, &crate::report::Stamp::default());
+        let want = [
+            " Object . . . . . . . . . . . . :   /home/AS4TRAINR/gld/g43.txt",
+            " Type . . . . . . . . . . . . . :   STMF",
+            " Owner  . . . . . . . . . . . . :   AS4TRAINR",
+            " Primary group  . . . . . . . . :   *NONE",
+            " Authorization list . . . . . . :   *NONE",
+            "                  Data        --------------------Data Authorities---------------------     ------Object Authorities-------",
+            " User           Authority     Objopr     Read     Add     Update     Delete     Execute     Exist     Mgt     Alter     Ref",
+            " *PUBLIC        *R              X         X",
+            " AS4TRAINR      *RW             X         X        X        X          X                      X        X        X        X",
+            "                                        * * * * *   E N D   O F   L I S T I N G   * * * * *",
+        ];
+        assert_eq!(&r[2..], want);
     }
 }

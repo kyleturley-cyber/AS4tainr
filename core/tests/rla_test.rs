@@ -25074,8 +25074,18 @@ async fn ifs_authorities_and_owner() {
     ifs::write_file(&client, &path, b"x", 1208, 0o644, "QSECOFR")
         .await
         .unwrap();
+    // *EXCLUDE with OBJAUT(*SAME), the default: CPD2212, CPF0006 (PUB400,
+    // verify43 l43_chgaut; this test gave no OBJAUT before the capture).
+    let e = job
+        .run(&format!(
+            "CHGAUT OBJ('{path}') USER(*PUBLIC) DTAAUT(*EXCLUDE)"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPD2212") && e.contains("CPF0006"), "{e}");
     job.run(&format!(
-        "CHGAUT OBJ('{path}') USER(*PUBLIC) DTAAUT(*EXCLUDE)"
+        "CHGAUT OBJ('{path}') USER(*PUBLIC) DTAAUT(*EXCLUDE) OBJAUT(*NONE)"
     ))
     .await
     .unwrap();
@@ -25092,8 +25102,9 @@ async fn ifs_authorities_and_owner() {
     );
     match job.run(&format!("DSPAUT OBJ('{path}')")).await.unwrap() {
         Outcome::Display(d) => {
-            assert_eq!(d.rows[0], "QSECOFR     *RWX");
-            assert_eq!(d.rows[1], "*PUBLIC     *EXCLUDE");
+            // *PUBLIC first, then the owner (verify43 l43_dspaut).
+            assert_eq!(d.rows[0], "*PUBLIC     *EXCLUDE");
+            assert_eq!(d.rows[1], "QSECOFR     *RWX");
         }
         other => panic!("{other:?}"),
     }
@@ -25106,9 +25117,15 @@ async fn ifs_authorities_and_owner() {
     job.run(&format!("CRTUSRPRF USRPRF({user}) PASSWORD(*NONE)"))
         .await
         .unwrap();
-    job.run(&format!("CHGOWN OBJ('{path}') NEWOWN({user})"))
+    // CPC221B (verify43 l43_chgown).
+    match job
+        .run(&format!("CHGOWN OBJ('{path}') NEWOWN({user})"))
         .await
-        .unwrap();
+        .unwrap()
+    {
+        Outcome::Messages(m) => assert!(m[0].starts_with("CPC221B"), "{m:?}"),
+        other => panic!("{other:?}"),
+    }
     assert_eq!(
         ifs::stat(&client, &path).await.unwrap().unwrap().owner,
         user

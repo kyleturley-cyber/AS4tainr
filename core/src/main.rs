@@ -261,7 +261,7 @@ async fn run(cli: Cli) -> Result<u8> {
             catalog::init(&client).await?;
             let user = user.to_ascii_uppercase();
             if !users::reset_password(&client, &user).await? {
-                bail!("CPF2204: User profile {user} not found.");
+                bail!("CPF2204: There is no user profile {user}.");
             }
             println!(
                 "Password of {user} reset to {user} (expired: it must be changed at the next sign-on)."

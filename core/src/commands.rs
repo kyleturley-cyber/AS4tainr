@@ -2800,7 +2800,7 @@ impl Job<'_> {
             self.require_secadm("display other user profiles").await?;
         }
         let Some(p) = users::get(self.client, &name).await? else {
-            bail!("CPF2204: User profile {name} not found.");
+            bail!("CPF2204: There is no user profile {name}.");
         };
         let yes_no = |b: bool| if b { "*YES" } else { "*NO" }.to_string();
         // IBM i 7.5's DSPUSRPRF display (PUB400): "Display User Profile -
@@ -2888,7 +2888,7 @@ impl Job<'_> {
             crate::outq::find_queue(self.client, &outq, &self.library_list()).await?;
         }
         if !users::change(self.client, &name, &changes).await? {
-            bail!("CPF2204: User profile {name} not found.");
+            bail!("CPF2204: There is no user profile {name}.");
         }
         if !outq.is_empty() && outq != "*SAME" {
             crate::outq::set_user_outq(self.client, &name, &outq, &self.library_list()).await?;
@@ -5869,6 +5869,29 @@ impl Job<'_> {
             .await
             .map(|n| (n as usize).saturating_sub(12))
             .unwrap_or(crate::rtvclsrc::WIDTH);
+        // The source member's last change (blank for a stream file).
+        let changed = match self
+            .client
+            .query_opt(
+                "SELECT to_char(changed AT TIME ZONE 'UTC', 'YYYY MM DD HH24 MI SS')
+                   FROM as4tainr.source_members WHERE library=$1 AND file=$2 AND member=$3",
+                &[&crate::qtemp::real(&sl), &sf, &sm],
+            )
+            .await?
+        {
+            Some(r) => {
+                let t: String = r.get(0);
+                let n: Vec<u32> = t.split(' ').filter_map(|x| x.parse().ok()).collect();
+                if n.len() == 6 {
+                    let st =
+                        crate::report::Stamp::of((n[0] as i32, n[1], n[2]), (n[3], n[4], n[5]));
+                    format!("{} {}", st.date, st.time)
+                } else {
+                    String::new()
+                }
+            }
+            None => String::new(),
+        };
         let lines = crate::rtvclsrc::retrieve(
             &p.source,
             &crate::rtvclsrc::Header {
@@ -5877,6 +5900,7 @@ impl Job<'_> {
                 source: (&sf, &sl, &sm),
                 text: &text,
                 owner: &owner,
+                changed: &changed,
                 when: &when,
             },
             width,
@@ -6362,7 +6386,7 @@ impl Job<'_> {
             bail!("User profile {name} is signed on in this job and cannot be deleted.");
         }
         if !users::delete(self.client, &name).await? {
-            bail!("CPF2204: User profile {name} not found.");
+            bail!("CPF2204: There is no user profile {name}.");
         }
         Ok(Outcome::Messages(vec![format!(
             "User profile {name} deleted."
@@ -8359,7 +8383,7 @@ impl Job<'_> {
             }
         }
         if list.is_empty() {
-            bail!("CPF2204: User profile {spec} not found.");
+            bail!("CPF2204: There is no user profile {spec}.");
         }
         let fmt = |n: &str, c: &str, s: &str, t: &str| format!("{n:<10}  {c:<10}  {s:<10}  {t}");
         Ok(Outcome::Display(ListDisplay {
@@ -8661,7 +8685,7 @@ impl Job<'_> {
             to
         };
         if to != "QSYSOPR" && users::get(self.client, &to).await?.is_none() {
-            bail!("CPF2204: User profile {to} not found.");
+            bail!("CPF2204: There is no user profile {to}.");
         }
         let from_job = self.id.as_ref().map(|i| i.to_string()).unwrap_or_default();
         jobs::send_message(
@@ -9049,7 +9073,7 @@ impl Job<'_> {
         let mut done = Vec::new();
         for user in users_given {
             if user != "*PUBLIC" && users::get(self.client, &user).await?.is_none() {
-                bail!("CPF2204: User profile {user} not found.");
+                bail!("CPF2204: There is no user profile {user}.");
             }
             if grant {
                 let aut = if replace || aut == Aut::Exclude {
@@ -9155,7 +9179,7 @@ impl Job<'_> {
         authority::check_manage(self.client, &self.user, &lib, &name, &objtype).await?;
         let new = cmd.get("NEWOWN").to_string();
         if users::get(self.client, &new).await?.is_none() {
-            bail!("CPF2204: User profile {new} not found.");
+            bail!("CPF2204: There is no user profile {new}.");
         }
         let old = authority::get(self.client, &lib, &name, &objtype)
             .await?

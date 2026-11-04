@@ -209,6 +209,10 @@ def main():
     )
     subprocess.run([bin_, "system", "CRTLIB LIB(%s)" % a.lib], env=env, capture_output=True)
     subprocess.run([bin_, "system", "MKDIR DIR('/home/%s')" % a.home], env=env, capture_output=True)
+    # The capturing user's profile, for commands that name it (CHGOWN).
+    subprocess.run(
+        [bin_, "system", "CRTUSRPRF USRPRF(%s) PASSWORD(*NONE)" % a.home], env=env, capture_output=True
+    )
     env["AS4TAINR_LIBL"] = "%s,%s" % (a.lib, env["AS4TAINR_LIBL"])
     # The capture's library is the user's current library there too.
     env["AS4TAINR_CURLIB"] = a.lib

@@ -33,6 +33,9 @@ pub struct Header<'a> {
     pub source: (&'a str, &'a str, &'a str),
     pub text: &'a str,
     pub owner: &'a str,
+    /// The source member's last change, as `when` (blank for a stream
+    /// file).
+    pub changed: &'a str,
     /// "YY-MM-DD HH:MM:SS" as the job shows dates.
     pub when: &'a str,
 }
@@ -201,37 +204,35 @@ fn statement(st: &crate::clpgm::Statement) -> Result<String> {
 /// Data columns of QCLSRC's 92-byte records (less SRCSEQ and SRCDAT).
 pub const WIDTH: usize = 80;
 
-/// A long line as several: `+` at the end of each but the last, the
-/// rest ten blanks in.
+/// The longest line RTVCLSRC writes, continuation included: 69 and 63
+/// characters were written where one more word would have made 74 and
+/// 77 (PUB400, verify42/43 l43_rows: a 112-byte member); 71 is taken
+/// here.
+pub const LINE: usize = 71;
+
+/// A long line as several (verify43 l43_rows): broken after a blank, each
+/// part but the last ending with `-` (the blanks before it kept), the
+/// next part from column 1, so the text joins again as it was.
 fn wrap(line: String, width: usize) -> Vec<String> {
-    if line.chars().count() <= width {
+    let max = width.min(LINE);
+    if line.chars().count() <= max {
         return vec![line];
     }
     let mut out = Vec::new();
     let mut rest: Vec<char> = line.chars().collect();
-    let mut first = true;
     loop {
-        let indent = if first { 0 } else { 10 };
-        let room = width - indent;
-        if rest.len() <= room {
-            out.push(format!(
-                "{}{}",
-                " ".repeat(indent),
-                rest.iter().collect::<String>()
-            ));
+        if rest.len() <= max {
+            out.push(rest.iter().collect());
             break;
         }
-        // Break at a blank before the room left for " +".
-        let limit = room - 2;
-        let at = (1..=limit).rev().find(|&i| rest[i] == ' ').unwrap_or(limit);
+        // The most that fits with "-" after it, ending at a blank.
+        let at = (1..max)
+            .rev()
+            .find(|&i| rest[i - 1] == ' ')
+            .unwrap_or(max - 1);
         let head: String = rest[..at].iter().collect();
-        out.push(format!("{}{} +", " ".repeat(indent), head.trim_end()));
-        rest = rest[at..]
-            .iter()
-            .skip_while(|c| **c == ' ')
-            .cloned()
-            .collect();
-        first = false;
+        out.push(format!("{head}-"));
+        rest = rest[at..].to_vec();
     }
     out
 }
@@ -259,7 +260,7 @@ pub fn retrieve(source: &str, h: &Header, width: usize) -> Result<Vec<String>> {
         field("Library name . . . . . . . . . . . . . .", h.source.1, "SL"),
         field("Original source member . . . . . . . . .", h.source.2, "SM"),
         boxed(" Source file change".into()),
-        field("  date/time  . . . . . . . . . . . . . .", "", "SC"),
+        field("  date/time  . . . . . . . . . . . . . .", h.changed, "SC"),
         boxed(format!(" Text . . . :   {:<48}TX", h.text)),
         field("Owner  . . . . . . . . . . . . . . . . .", h.owner, "OW"),
         field("Retrieve included source . . . . . . . .", "*NO", "RI"),
@@ -271,12 +272,17 @@ pub fn retrieve(source: &str, h: &Header, width: usize) -> Result<Vec<String>> {
         if st.name.is_empty() && st.label.is_none() {
             continue;
         }
+        // A label in column 1, then "+" and the statement on the next
+        // line; a label alone is "LABEL:" (verify43 l43_rows).
+        match &st.label {
+            Some(l) if st.name.is_empty() => {
+                out.push(format!("{l}:"));
+                continue;
+            }
+            Some(l) => out.push(format!("{l}: +")),
+            None => {}
+        }
         let body = statement(&st)?;
-        let body = match &st.label {
-            Some(l) if st.name.is_empty() => format!("{l}:"),
-            Some(l) => format!("{l}: {body}"),
-            None => body,
-        };
         out.extend(wrap(format!("     {body}"), width.max(40)));
     }
     Ok(out)
@@ -300,6 +306,7 @@ mod tests {
                 source: ("", "", ""),
                 text: "",
                 owner: "AS4TRAINR",
+                changed: "",
                 when: "26-11-04 00:22:29",
             },
             WIDTH,
@@ -336,12 +343,72 @@ mod tests {
         assert_eq!(lines, want);
     }
 
+    // PUB400 (IBM i 7.5), verify43 l43_rows: RTVCLSRC of
+    // tools/golden/verify43/gld43c.clle into a 112-byte member, the part
+    // after the comment box (labels, a long command, nested commands).
     #[test]
-    fn long_statements_continue() {
-        let l = format!("     CALL PGM(X) PARM({})", "'a' ".repeat(30));
-        let w = wrap(l, WIDTH);
-        assert!(w.len() > 1);
-        assert!(w.iter().all(|x| x.chars().count() <= WIDTH));
-        assert!(w[0].ends_with(" +"));
+    fn labels_long_and_nested_statements() {
+        let src = include_str!("../../tools/golden/verify43/gld43c.clle");
+        let lines = retrieve(
+            src,
+            &Header {
+                program: "GLD43C",
+                library: "AS4TRAINR1",
+                source: ("GLD43S", "AS4TRAINR1", "GLD43C"),
+                text: "",
+                owner: "AS4TRAINR",
+                changed: "26-11-04 04:01:32",
+                when: "26-11-04 04:01:34",
+            },
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            lines[12],
+            "/*   date/time  . . . . . . . . . . . . . . :   26-11-04 04:01:32 SC*/"
+        );
+        assert_eq!(
+            lines[8],
+            "/* Original source file . . . . . . . . . . :   GLD43S            SN*/"
+        );
+        let want = [
+            "     PGM",
+            "     DCLF FILE(QSYS/QADSPOBJ)",
+            "     DCL VAR(&A) TYPE(*CHAR) LEN(10) VALUE('x')",
+            "     DCL VAR(&N) TYPE(*DEC) LEN(5 0)",
+            "START: +",
+            "     CHGVAR VAR(&N) VALUE(&N + 1)",
+            "     IF COND(&N *LT 3) THEN(GOTO CMDLBL(START))",
+            "     ELSE CMD(CHGVAR VAR(&A) VALUE('y'))",
+            "     SNDPGMMSG MSG('A message text that is long enough to need more -",
+            "than one line of source when it is written back by RTVCLSRC') -",
+            "TOPGMQ(*SAME)",
+            "     MONMSG MSGID(CPF0000) EXEC(DO)",
+            "     CHGVAR VAR(&A) VALUE('z')",
+            "     ENDDO",
+            "DONE:",
+            "     ENDPGM",
+        ];
+        assert_eq!(&lines[18..], want);
+        // The retrieved source parses again as the same statements.
+        let back = lines.join("\n");
+        let again = |t: &str| -> Vec<String> {
+            crate::clpgm::logical_lines(t)
+                .unwrap()
+                .into_iter()
+                .map(|(_, l)| canonical(&l))
+                .filter(|l| !l.is_empty())
+                .collect()
+        };
+        let a = again(&back);
+        assert_eq!(a.len(), 13, "{a:?}");
+        assert!(
+            a.contains(&"START: CHGVAR VAR(&N) VALUE(&N + 1)".to_string()),
+            "{a:?}"
+        );
+        assert!(
+            a.iter().any(|l| l.contains("need more than one line")),
+            "{a:?}"
+        );
     }
 }

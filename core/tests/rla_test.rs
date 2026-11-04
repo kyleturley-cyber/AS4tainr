@@ -4037,6 +4037,63 @@ async fn submitted_jobs_run_in_qbatch() {
         d.rows
     );
 
+    // A batch job's CL program: what it sends to its own queue is in the
+    // job log (IBM i: a job log holds the messages sent to the job's
+    // program message queues), in the order sent, before the request's
+    // own messages; DSPJOBLOG with OUTPUT(*) prints in a batch job (CL
+    // reference, DSPJOBLOG OUTPUT: printed with a batch job's spooled
+    // output), with what was sent so far. IUNIT's I_RUNALL does both.
+    let src = "PGM
+  SNDPGMMSG MSG('first') TOPGMQ(*SAME)
+  SNDPGMMSG MSG('second') TOPGMQ(*SAME)
+  DSPJOBLOG
+  SNDPGMMSG MSG('done') TOPGMQ(*PRV) MSGTYPE(*COMP)
+ENDPGM";
+    as4tainr_core::clpgm::compile_in(&client, std::slice::from_ref(&lib), "BLOG", src)
+        .await
+        .unwrap();
+    let mut c = runtime::connect_db(&url).await.unwrap();
+    catalog::create_cl_program(&mut c, &lib, "BLOG", "", src, true)
+        .await
+        .unwrap();
+    let m = msg(job
+        .run(&format!("SBMJOB CMD(CALL {lib}/BLOG) JOB(BLOG)"))
+        .await
+        .unwrap());
+    let n4 = number_in(&m);
+    let done = run(n4).await;
+    assert_eq!(done.end_code, "NORMAL");
+    let texts: Vec<String> = jobs::job_log(&client, n4)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.text)
+        .collect();
+    let at = |t: &str| texts.iter().position(|x| x == t);
+    assert!(at("first") < at("second"), "{texts:?}");
+    assert!(at("second") < at("done"), "{texts:?}");
+    assert_eq!(
+        texts.iter().filter(|t| *t == "done").count(),
+        1,
+        "{texts:?}"
+    );
+    let printed: Vec<String> = client
+        .query(
+            "SELECT l.text FROM as4tainr.spool_lines l JOIN as4tainr.spooled_files f ON f.id = l.spl
+              WHERE f.job = $1 AND f.file = 'QPJOBLOG' ORDER BY l.seq",
+            &[&n4],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let joined = printed.join("\n");
+    assert!(
+        joined.contains("second") && !joined.contains("done"),
+        "{joined}"
+    );
+
     // WRKACTJOB shows this interactive job under QINTER.
     let Outcome::Display(d) = job.run("WRKACTJOB").await.unwrap() else {
         panic!()
@@ -4180,6 +4237,21 @@ async fn record_locks() {
     assert!(chain(&mut fa, &a, "3", true).await.unwrap().found);
     fa.release(&a).await.unwrap();
     assert!(chain(&mut fb, &b, "3", true).await.unwrap().found);
+    fb.release(&b).await.unwrap();
+
+    // A read for update gives the record as it is once it is locked: B
+    // changes customer 4 between A's read and A's lock (B's UPDATE done and
+    // its lock released, so A gets the lock without waiting). A must see
+    // B's change, or A's UPDATE writes the old values back over it (a lost
+    // update: tools/gate3_5250.py's on-hand quantities, 2026-11-01).
+    let r = fa.chain(&a, &["4".to_string()]).await.unwrap();
+    let mut recb = chain(&mut fb, &b, "4", true).await.unwrap().record.unwrap();
+    recb.insert("CUSCTY".into(), "Skokie".into());
+    fb.update(&b, &recb).await.unwrap();
+    fb.release(&b).await.unwrap();
+    let r = fa.lock_after_read(&a, r, true, None).await.unwrap();
+    assert_eq!(field(&r, "CUSCTY").trim(), "Skokie");
+    fa.release(&a).await.unwrap();
 }
 
 /// Spooled files: lines kept by page and line, WRKSPLF/DSPSPLF/DLTSPLF,
@@ -4612,6 +4684,39 @@ async fn menus_and_initial_menu() {
         Outcome::Menu(menus::Menu::Builtin(m)) => assert_eq!(m.name, "MAIN"),
         _ => panic!("GO MAIN should show the main menu"),
     }
+    // GO LICPGM: IBM i's menu for licensed programs (in QSYS; IBM's
+    // installation documentation starts from it), with the display of the
+    // products installed (DSPSFWRSC): IBM i 7.5 is 5770SS1 V7R5M0.
+    match sec.run("GO LICPGM").await.unwrap() {
+        Outcome::Menu(menus::Menu::Builtin(m)) => {
+            assert_eq!(m.name, "LICPGM");
+            assert!(m.options.iter().any(|o| o.command == "DSPSFWRSC"));
+            // IBM i's LICPGM option numbers: 1 install, 10 display,
+            // 11 install, 12 delete, 13 save, 50 the log.
+            let numbers: Vec<u8> = m.options.iter().map(|o| o.number).collect();
+            assert_eq!(numbers, [1, 10, 11, 12, 13, 50, 90]);
+        }
+        _ => panic!("GO LICPGM should show the licensed programs menu"),
+    }
+    match sec.run("DSPSFWRSC").await.unwrap() {
+        Outcome::Display(d) => {
+            assert!(
+                d.rows
+                    .iter()
+                    .any(|r| r.starts_with("5770SS1") && r.contains("V7R5M0")),
+                "{:?}",
+                d.rows
+            )
+        }
+        _ => panic!("DSPSFWRSC shows a list"),
+    }
+    // Licensed programs are not installed, deleted or saved one by one.
+    let e = sec
+        .run("RSTLICPGM LICPGM(5770WDS) DEV(*SAVF)")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("cannot be installed"), "{e}");
     assert!(matches!(
         sec.run("CALL QCMD").await.unwrap(),
         Outcome::CommandEntry
@@ -6816,7 +6921,7 @@ async fn rpg_pssr_infsr_and_return_points() {
     // point field is blank after ENDSR. In a subprocedure, RETURN in
     // *PSSR gives the procedure's value; ENDSR without RETURN makes the
     // procedure fail (ILE RPG Programmer's Guide, "Using a Program Error
-    // Subroutine"). CALLP(E): %ERROR on, %STATUS the error's status.
+    // Subroutine"). CALLP(E): %ERROR on, %STATUS 00202 (the procedure failed).
     let url = require_db!();
     let (_client, lib) = setup(&url).await;
     let run = |name: &'static str, src: &'static str| {
@@ -6834,9 +6939,15 @@ async fn rpg_pssr_infsr_and_return_points() {
     assert_eq!(r.messages, ["1", "2", "3", "4", "skip", "*GETIN"]);
     let r = run("PSSRPROC", include_str!("rpg/pssrproc.rpgle")).await;
     assert!(r.error.is_none(), "{:?}", r.error);
+    // CALLP(E) of a procedure that failed: status 00202, "called program
+    // or procedure failed" (ILE RPG Reference, "Program Status Codes"),
+    // not the 00102 of the divide by zero inside it: PUB400 2026-11-01,
+    // verify33 z33_rows, gives a MONITOR around a call of a procedure
+    // that failed 00202 (this expected 00102 before that capture;
+    // verify34 a34_rows checks CALLP(E) itself).
     assert_eq!(
         r.messages,
-        ["-1", "2", "in pssr", "fails failed", "in pssr", "1 102"]
+        ["-1", "2", "in pssr", "fails failed", "in pssr", "1 202"]
     );
     // ENDSR *CANCL ends the program; ENDSR without a return point after an
     // error: the default error handler (the program ends abnormally).
@@ -15072,6 +15183,115 @@ end-proc;
     );
 }
 
+/// The same with the two modules in a service program (ILE Concepts:
+/// one static storage per module in the activation): the first module,
+/// running, is called back through the service program's exports, the
+/// call back sees its storage as it is (also after the module called a
+/// program in between: IBMiUnit's assertions saw an older copy) and what
+/// it changes the first module sees after (XMLSERVICE's modules call one
+/// another so).
+#[tokio::test]
+async fn call_back_into_running_service_program_module() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    source::create_file(&client, &lib, "QRPGLESRC", "")
+        .await
+        .unwrap();
+    let put = |name: &str, text: &str| source::Member {
+        library: lib.clone(),
+        file: "QRPGLESRC".into(),
+        name: name.into(),
+        srctype: "RPGLE".into(),
+        text: String::new(),
+        source: text.into(),
+        ..Default::default()
+    };
+    let main = "**FREE
+dcl-pr run end-pr;
+dcl-pr getMode int(10) end-pr;
+run();
+dsply ('main ' + %char(getMode()));
+*inlr = *on;
+";
+    let first = "**FREE
+ctl-opt nomain;
+dcl-s mode int(10) inz(1);
+dcl-pr report end-pr;
+dcl-pr qcmdexc extpgm('QCMDEXC');
+  cmd char(20) const;
+  len packed(15:5) const;
+end-pr;
+dcl-proc run export;
+  mode = 3;
+  qcmdexc('DLYJOB DLY(0)': 13);
+  mode = 5;
+  report();
+  dsply ('after ' + %char(mode));
+  mode += 1;
+end-proc;
+dcl-proc getMode export;
+  dcl-pi *n int(10) end-pi;
+  return mode;
+end-proc;
+dcl-proc setMode export;
+  dcl-pi *n;
+    m int(10) const;
+  end-pi;
+  mode = m;
+end-proc;
+";
+    let second = "**FREE
+ctl-opt nomain;
+dcl-pr getMode int(10) end-pr;
+dcl-pr setMode;
+  m int(10) const;
+end-pr;
+dcl-proc report export;
+  dsply ('mode ' + %char(getMode()));
+  setMode(9);
+end-proc;
+";
+    for m in [
+        put("CBMAIN4", main),
+        put("FIRSTSRV", first),
+        put("SECONDSRV", second),
+    ] {
+        source::put_member(&client, &m, false).await.unwrap();
+    }
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/CBMAIN4)"),
+        format!("CRTRPGMOD MODULE({lib}/FIRSTSRV)"),
+        format!("CRTRPGMOD MODULE({lib}/SECONDSRV)"),
+        format!(
+            "CRTSRVPGM SRVPGM({lib}/CBSRV) MODULE({lib}/FIRSTSRV {lib}/SECONDSRV) EXPORT(*ALL)"
+        ),
+        format!("CRTPGM PGM({lib}/CBMAIN4) MODULE({lib}/CBMAIN4) BNDSRVPGM(({lib}/CBSRV))"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    assert_eq!(
+        cl_cmd(&mut job, format!("CALL PGM({lib}/CBMAIN4)"))
+            .await
+            .unwrap(),
+        ["DSPLY  mode 5", "DSPLY  after 9", "DSPLY  main 10"]
+    );
+}
+
 /// INZ(*LIKEDS) on a LIKEDS subfield: the subfield starts with the
 /// template's initial values (ILE RPG Reference, INZ keyword, "*LIKEDS"),
 /// also when the data structure is itself a template copied by another
@@ -15769,6 +15989,7 @@ end-pr;
 dcl-s stmt varchar(200);
 dcl-s n int(10);
 dcl-s line varchar(80);
+dcl-s ts timestamp;
 stmt = 'CREATE ALIAS {lib}.NOTEAL FOR {lib}.NOTES (N1)';
 exec sql prepare s1 from :stmt;
 exec sql execute s1;
@@ -15778,6 +15999,19 @@ qcmdexc('OVRDBF FILE(MYNOTES) TOFILE({lib}/NOTES) MBR(N1)': 200);
 exec sql select count(*), max(srcdta) into :n, :line from mynotes;
 show(n);
 dsply line;
+// A timestamp host variable is a TIMESTAMP value (Db2 for i SQL
+// Programming, "Host variables in ILE RPG": Z is TIMESTAMP), also given
+// to a parameter marker of EXECUTE USING (the IBM i Unit test runner's
+// insert of each result's start time).
+stmt = 'CREATE TABLE {lib}.TSTAMPS (T TIMESTAMP NOT NULL)';
+exec sql execute immediate :stmt;
+ts = z'2026-10-31-20.43.10.123456';
+stmt = 'INSERT INTO {lib}.TSTAMPS VALUES (?)';
+exec sql prepare s2 from :stmt;
+exec sql execute s2 using :ts;
+exec sql insert into {lib}.tstamps values (:ts + 1 day);
+exec sql select count(*), max(t) into :n, :ts from {lib}.tstamps where t >= :ts;
+dsply ('ts=' + %char(n) + ' ' + %char(ts));
 *inlr = *on;
 dcl-proc show;
   dcl-pi *n;
@@ -15813,6 +16047,7 @@ end-proc;
         text.contains("n=1") && text.contains("first note"),
         "{text}"
     );
+    assert!(text.contains("ts=2 2026-11-01-20.43.10.123456"), "{text}");
 }
 
 /// SYSTOOLS.SPOOLED_FILE_DATA (Db2 for i services): the lines of a job's
@@ -22536,4 +22771,2909 @@ return;
         .map(|r| r.get(0))
         .unwrap_or_else(|_| String::new());
     assert_eq!(value.trim(), "1");
+}
+
+/// QSYS2.STACK_INFO('*') from embedded SQL in an RPG program a CL program
+/// calls (PUB400 2026-10-31, tools/golden/verify32.txt y32_rows): the
+/// newest entry first, numbered from the oldest; the RPG program's main
+/// procedure with its program entry procedure _QRNP_PEP_ and its name
+/// below it; the CL program's _CL_PEP a control boundary; a subprocedure
+/// on top when it runs the statement.
+#[tokio::test]
+async fn stack_info_lists_the_call_stack() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    source::create_file(&client, &lib, "QSRC", "")
+        .await
+        .unwrap();
+    let rpg = format!(
+        "**FREE
+ctl-opt dftactgrp(*no) actgrp(*caller);
+exec sql
+  INSERT INTO {lib}.STKOUT
+    SELECT ORDINAL_POSITION, PROGRAM_NAME CONCAT ' ' CONCAT COALESCE(PROCEDURE_NAME, '-')
+           CONCAT ' ' CONCAT CONTROL_BOUNDARY
+      FROM TABLE(QSYS2.STACK_INFO('*')) X
+     WHERE PROGRAM_LIBRARY_NAME = '{lib}';
+inner();
+*inlr = *on;
+
+dcl-proc inner;
+  exec sql
+    INSERT INTO {lib}.STKOUT
+      SELECT 100 + ORDINAL_POSITION, COALESCE(PROCEDURE_NAME, '-')
+        FROM TABLE(QSYS2.STACK_INFO('*')) X
+       WHERE PROGRAM_LIBRARY_NAME = '{lib}';
+end-proc;
+"
+    );
+    for (name, t, text) in [
+        ("STKS", "SQLRPGLE", rpg),
+        (
+            "STKC",
+            "CLLE",
+            format!("PGM\nCALL PGM({lib}/STKS)\nENDPGM\n"),
+        ),
+    ] {
+        source::put_member(
+            &client,
+            &source::Member {
+                library: lib.clone(),
+                file: "QSRC".into(),
+                name: name.into(),
+                srctype: t.into(),
+                source: text,
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    for c in [
+        format!("RUNSQL SQL('CREATE TABLE {lib}.STKOUT (N INT, LINE VARCHAR(200))') COMMIT(*NONE)"),
+        format!("CRTSQLRPGI OBJ({lib}/STKS) SRCFILE({lib}/QSRC) COMMIT(*NONE)"),
+        format!("CRTBNDCL PGM({lib}/STKC) SRCFILE({lib}/QSRC)"),
+    ] {
+        cl_cmd(&mut job, c.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    // In a job of its own: the call stack is the job's (a test's Job
+    // without one shares the process's with the tests running beside it).
+    run_in_own_job(&client, &url, &lib, &format!("CALL PGM({lib}/STKC)"))
+        .await
+        .unwrap();
+    // Rows in the order STACK_INFO gave them (no ORDER BY): RRN order.
+    let rows = sql_rows(
+        &client,
+        &url,
+        &lib,
+        &format!("SELECT N, LINE FROM {lib}.STKOUT ORDER BY RRN(STKOUT)"),
+    )
+    .await;
+    let lines: Vec<&str> = rows.iter().map(|r| r.split_once('|').unwrap().1).collect();
+    assert_eq!(
+        lines,
+        [
+            "STKS STKS NO",
+            "STKS _QRNP_PEP_STKS NO",
+            "STKC STKC NO",
+            "STKC _CL_PEP YES",
+            "INNER",
+            "STKS",
+            "_QRNP_PEP_STKS",
+            "STKC",
+            "_CL_PEP",
+        ]
+    );
+    // Numbered from the oldest: each row's number is one below the one
+    // before it.
+    let n: Vec<i64> = rows
+        .iter()
+        .map(|r| r.split_once('|').unwrap().0.parse().unwrap())
+        .collect();
+    assert!(n[..4].windows(2).all(|w| w[0] == w[1] + 1), "{n:?}");
+    assert!(n[4..].windows(2).all(|w| w[0] == w[1] + 1), "{n:?}");
+}
+
+/// %STATUS and the PSDS where MONITOR catches an error: 00102 for a
+/// divide by zero in the monitoring procedure, 00202 ("called program or
+/// procedure failed") for one in a procedure it called, through a
+/// prototype or a procedure pointer, the exception ID MCH1211 either way
+/// (PUB400 2026-11-01, verify33 z33_rows). A call that ends normally
+/// after that leaves %STATUS and the PSDS status 0, the exception ID as
+/// it was (verify34 a34_rows).
+#[tokio::test]
+async fn status_of_an_error_in_a_called_procedure() {
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = "**FREE
+dcl-ds psds psds qualified;
+  status zoned(5) pos(11);
+  exceptionId char(7) pos(40);
+end-ds;
+dcl-pr byPtr int(10) extproc(ptr);
+  d int(10) value;
+end-pr;
+dcl-s ptr pointer(*proc);
+dcl-s z int(10) inz(0);
+dcl-s r int(10);
+monitor;
+  r = 10 / z;
+on-error;
+  note('here');
+endmon;
+monitor;
+  r = local(0);
+on-error;
+  note('called');
+endmon;
+ptr = %paddr(local);
+monitor;
+  r = byPtr(0);
+on-error;
+  note('pointer');
+endmon;
+monitor;
+  r = local(0);
+on-error 102;
+  note('102');
+on-error 202;
+  note('202');
+endmon;
+monitor;
+  r = local(0);
+on-error;
+  r = local(1);
+  note('after');
+endmon;
+*inlr = *on;
+dcl-proc local;
+  dcl-pi *n int(10);
+    d int(10) value;
+  end-pi;
+  return 10 / d;
+end-proc;
+dcl-proc note;
+  dcl-pi *n;
+    what varchar(10) const;
+  end-pi;
+  dsply (what + ' ' + %char(%status()) + ' ' + %char(psds.status) + ' ' + psds.exceptionId);
+end-proc;
+";
+    let r = run_rpg(&url, &lib, "QSECOFR", "STAT202", src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "here 102 102 MCH1211",
+            "called 202 202 MCH1211",
+            "pointer 202 202 MCH1211",
+            "202 202 202 MCH1211",
+            "after 0 0 MCH1211"
+        ],
+        "{:?}",
+        r.messages
+    );
+}
+
+/// Static storage of one module of a service program reached through a
+/// pointer another module got from it (ILE Concepts: a module's static
+/// storage belongs to its activation and lasts as long as it; XMLSERVICE
+/// hands its control block from module to module this way): PTRMOD
+/// returns %ADDR of its global, the main program passes the pointer to
+/// READMOD's procedure, which reads and changes the storage through it;
+/// PTRMOD sees the change at its next call. A program called after that,
+/// which activates another service program's module, gives the caller
+/// its own storage back (not that activation's).
+#[tokio::test]
+async fn pointer_to_another_modules_static_storage() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    source::create_file(&client, &lib, "QRPGLESRC", "")
+        .await
+        .unwrap();
+    for (name, text) in [
+        ("PTRMOD", "**FREE\nctl-opt nomain;\ndcl-ds ctl qualified;\n  count int(10) inz(7);\n  name char(10) inz('first');\nend-ds;\ndcl-proc getCtl export;\n  dcl-pi *n pointer;\n  end-pi;\n  return %addr(ctl);\nend-proc;\ndcl-proc ctlName export;\n  dcl-pi *n char(10);\n  end-pi;\n  return ctl.name;\nend-proc;\n"),
+        ("READMOD", "**FREE\nctl-opt nomain;\ndcl-ds ctl_t qualified template;\n  count int(10);\n  name char(10);\nend-ds;\ndcl-proc bump export;\n  dcl-pi *n int(10);\n    p pointer value;\n  end-pi;\n  dcl-ds c likeds(ctl_t) based(p);\n  c.count += 1;\n  c.name = 'changed';\n  return c.count;\nend-proc;\n"),
+        ("PTRMAIN", "**FREE\ndcl-pr getCtl pointer end-pr;\ndcl-pr ctlName char(10) end-pr;\ndcl-pr bump int(10);\n  p pointer value;\nend-pr;\ndcl-pr callOther extpgm('PTROTHER');\nend-pr;\ndcl-s p pointer;\ndcl-s mine char(10) inz('mine');\np = getCtl();\ndsply %char(bump(p));\ndsply %char(bump(p));\ndsply %trim(ctlName());\ncallOther();\ndsply mine;\n*inlr = *on;\n"),
+        ("PTROTHER", "**FREE\ndcl-pr hello char(10) end-pr;\ndsply hello();\n*inlr = *on;\n"),
+        ("OTHMOD", "**FREE\nctl-opt nomain;\ndcl-s greeting char(10) inz('other');\ndcl-proc hello export;\n  dcl-pi *n char(10);\n  end-pi;\n  return greeting;\nend-proc;\n"),
+    ] {
+        source::put_member(
+            &client,
+            &source::Member {
+                library: lib.clone(),
+                file: "QRPGLESRC".into(),
+                name: name.into(),
+                srctype: "RPGLE".into(),
+                text: String::new(),
+                source: text.into(),
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/PTRMOD)"),
+        format!("CRTRPGMOD MODULE({lib}/READMOD)"),
+        format!("CRTRPGMOD MODULE({lib}/PTRMAIN)"),
+        format!("CRTSRVPGM SRVPGM({lib}/PTRSRV) MODULE({lib}/PTRMOD {lib}/READMOD) EXPORT(*ALL)"),
+        format!("CRTPGM PGM({lib}/PTRMAIN) MODULE({lib}/PTRMAIN) BNDSRVPGM({lib}/PTRSRV)"),
+        format!("CRTRPGMOD MODULE({lib}/OTHMOD)"),
+        format!("CRTSRVPGM SRVPGM({lib}/OTHSRV) MODULE({lib}/OTHMOD) EXPORT(*ALL)"),
+        format!("CRTRPGMOD MODULE({lib}/PTROTHER)"),
+        format!("CRTPGM PGM({lib}/PTROTHER) MODULE({lib}/PTROTHER) BNDSRVPGM({lib}/OTHSRV)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    assert_eq!(
+        cl_cmd(&mut job, format!("CALL PGM({lib}/PTRMAIN)"))
+            .await
+            .unwrap(),
+        [
+            "DSPLY  8",
+            "DSPLY  9",
+            "DSPLY  changed",
+            "DSPLY  other",
+            "DSPLY  mine"
+        ]
+    );
+}
+
+/// Named constants in fixed form (ILE RPG Reference, "Named Constants"
+/// and "Continuation Rules"): a literal keeps its case and blanks; one
+/// ending in '-' goes on with position 44 of the next line, one ending
+/// in '+' with its first nonblank character; %DIV and %SIZE of defined
+/// items in a constant; %SIZE(array:*ALL) is the whole array; INZ of a
+/// numeric field with a hexadecimal literal of its size gives its bytes;
+/// INZ(%UCS2('<')) of a UCS-2 field. All as XMLSERVICE's sources use them.
+#[tokio::test]
+async fn fixed_form_constants_and_initial_values() {
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = "     D one             S             10A
+     D arr             S             10A   DIM(4)
+     D NBR             c                   %div(%size(arr:*ALL):%size(one))
+     D GREET           c                   'Hello World'
+     D LONG            c                   'First part, -
+     D                                     second part'
+     D LONG2           c                   'Alpha +
+     D                                       beta'
+     D allones         S             10U 0 inz(X'FFFFFFFF')
+     D lt              S              1C   inz(%UCS2('<'))
+      /free
+        dsply %char(NBR);
+        dsply GREET;
+        dsply LONG;
+        dsply LONG2;
+        dsply %char(allones);
+        dsply %char(lt);
+        *inlr = *on;
+      /end-free
+";
+    let r = run_rpg(&url, &lib, "QSECOFR", "CONSTS", src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "4",
+            "Hello World",
+            "First part, second part",
+            "Alpha beta",
+            "4294967295",
+            "<"
+        ]
+    );
+}
+
+/// An external procedure that is a service program's procedure (Db2 for
+/// i SQL Reference, CREATE PROCEDURE (external): EXTERNAL NAME
+/// 'lib/srvpgm(entry)'), PARAMETER STYLE GENERAL: parameters by
+/// reference, a CLOB as its 4-byte length and its data (Db2 for i SQL
+/// Programming, "Parameter passing": LOB host variables). XMLSERVICE's
+/// iPLUG procedures are this kind; the procedure here copies its input
+/// CLOB to the output one after the CHAR parameter.
+#[tokio::test]
+async fn sql_external_procedure_in_a_service_program() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    use as4tainr_core::sql::Outcome as SqlOut;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    source::create_file(&client, &lib, "QRPGLESRC", "")
+        .await
+        .unwrap();
+    let text = "**FREE
+ctl-opt nomain;
+dcl-proc echo export;
+  dcl-pi *n;
+    tag char(10);
+    clobIn pointer;
+    clobOut pointer;
+  end-pi;
+  dcl-s pIn pointer;
+  dcl-s pOut pointer;
+  dcl-ds lobIn based(pIn) qualified;
+    len uns(10);
+    data char(100);
+  end-ds;
+  dcl-ds lobOut based(pOut) qualified;
+    len uns(10);
+    data char(100);
+  end-ds;
+  dcl-s s varchar(200);
+  pIn = %addr(clobIn);
+  pOut = %addr(clobOut);
+  s = %trim(tag) + ':' + %subst(lobIn.data: 1: lobIn.len);
+  lobOut.len = %len(s);
+  %subst(lobOut.data: 1: %len(s)) = s;
+  tag = 'done';
+end-proc;
+";
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QRPGLESRC".into(),
+            name: "ECHOMOD".into(),
+            srctype: "RPGLE".into(),
+            text: String::new(),
+            source: text.into(),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    for c in [
+        format!("CRTRPGMOD MODULE({lib}/ECHOMOD)"),
+        format!("CRTSRVPGM SRVPGM({lib}/ECHOSRV) MODULE({lib}/ECHOMOD) EXPORT(*ALL)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    let libl = vec![lib.clone()];
+    as4tainr_core::ddl::try_run(
+        &url,
+        "QSECOFR",
+        &libl,
+        Some(lib.clone()),
+        &mut None,
+        &format!(
+            "CREATE PROCEDURE {lib}.ECHO (INOUT T CHAR(10), IN CI CLOB(1K), OUT CO CLOB(1K)) \
+             LANGUAGE RPGLE EXTERNAL NAME '{lib}/ECHOSRV(ECHO)' PARAMETER STYLE GENERAL"
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let r = as4tainr_core::sql::run_as(
+        &client,
+        &url,
+        &libl,
+        "QSECOFR",
+        Some(lib.clone()),
+        None,
+        "CALL ECHO('abc', 'hello world', ?)",
+    )
+    .await
+    .unwrap();
+    let SqlOut::Message(m) = r else {
+        panic!("unexpected {r:?}")
+    };
+    assert_eq!(m, "Procedure ECHO ran: T = done, CO = abc:hello world.");
+}
+
+/// C runtime functions XMLSERVICE calls (ILE C/C++ Runtime Library
+/// Functions): vsprintf with a va_list built in RPG the way XMLSERVICE's
+/// cpyOutFmt builds it (two pointers, the second to the double), %f with
+/// a precision and a width (ISO C, fprintf: "-0003.14" is %08.2f of
+/// -3.14159, the sign counted in the width, zeros after it); iconv from
+/// CCSID 37 to 819 (ISO 8859-1: A B C are x'41' x'42' x'43'); QXXDTOZ
+/// and QXXZTOD (a double to zoned 7,2 and back); isdigit and islower.
+#[tokio::test]
+async fn c_runtime_functions_xmlservice_calls() {
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = "**free
+dcl-pr vsprintf int(10) extproc('vsprintf');
+  target pointer value;
+  format pointer value;
+  args pointer value;
+end-pr;
+dcl-ds code_t qualified template;
+  ccsid int(10);
+  alt int(10);
+  subalt int(10);
+  shift int(10);
+  inlen int(10);
+  err int(10);
+  rsv char(8);
+end-ds;
+dcl-ds iconv_t qualified template;
+  rtn int(10);
+  cd int(10) dim(12);
+end-ds;
+dcl-pr QtqIconvOpen likeds(iconv_t) extproc('QtqIconvOpen');
+  to likeds(code_t);
+  from likeds(code_t);
+end-pr;
+dcl-pr iconv uns(10) extproc('iconv');
+  cd likeds(iconv_t) value;
+  inbuf pointer;
+  inleft uns(10);
+  outbuf pointer;
+  outleft uns(10);
+end-pr;
+dcl-pr iconv_close int(10) extproc('iconv_close');
+  cd likeds(iconv_t) value;
+end-pr;
+dcl-pr QXXDTOZ extproc('QXXDTOZ');
+  target pointer value;
+  digits int(10) value;
+  frac int(10) value;
+  value float(8) value;
+end-pr;
+dcl-pr QXXZTOD float(8) extproc('QXXZTOD');
+  source pointer value;
+  digits int(10) value;
+  frac int(10) value;
+end-pr;
+dcl-pr isdigit int(10) extproc('isdigit');
+  c int(10) value;
+end-pr;
+dcl-pr islower int(10) extproc('islower');
+  c int(10) value;
+end-pr;
+dcl-ds valist qualified;
+  vp1 pointer;
+  vp2 pointer;
+end-ds;
+dcl-s f64 float(8);
+dcl-s fmt char(16);
+dcl-s str char(32);
+dcl-s n int(10);
+dcl-ds from likeds(code_t) inz;
+dcl-ds to likeds(code_t) inz;
+dcl-ds cd likeds(iconv_t);
+dcl-s inText char(3) inz('ABC');
+dcl-s outText char(3);
+dcl-s inP pointer;
+dcl-s outP pointer;
+dcl-s inLeft uns(10);
+dcl-s outLeft uns(10);
+dcl-s zoned zoned(7:2);
+
+f64 = 321.1234;
+fmt = '%1.4f' + x'00';
+valist.vp1 = %addr(fmt);
+valist.vp2 = %addr(f64);
+n = vsprintf(%addr(str): %addr(fmt): %addr(valist));
+dsply (%str(%addr(str)) + ' ' + %char(n));
+f64 = -3.14159;
+fmt = '%08.2f' + x'00';
+n = vsprintf(%addr(str): %addr(fmt): %addr(valist));
+dsply %str(%addr(str));
+
+from.ccsid = 37;
+to.ccsid = 819;
+cd = QtqIconvOpen(to: from);
+dsply %char(cd.rtn);
+inP = %addr(inText);
+outP = %addr(outText);
+inLeft = 3;
+outLeft = 3;
+n = iconv(cd: inP: inLeft: outP: outLeft);
+if outText = x'414243';
+  dsply ('819 ' + %char(n) + ' ' + %char(inLeft) + ' ' + %char(outLeft));
+endif;
+iconv_close(cd);
+
+QXXDTOZ(%addr(zoned): 7: 2: 12.5e0);
+dsply %char(zoned);
+dsply %char(%dech(QXXZTOD(%addr(zoned): 7: 2): 7: 2));
+
+// CCSID 37: '5' x'F5', 'A' x'C1', 'a' x'81'.
+if isdigit(245) <> 0 and isdigit(193) = 0
+   and islower(129) <> 0 and islower(193) = 0;
+  dsply 'ctype';
+endif;
+*inlr = *on;
+";
+    let r = run_rpg(&url, &lib, "QSECOFR", "XSCRT", src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "321.1234 8",
+            "-0003.14",
+            "0",
+            "819 0 0 0",
+            "12.50",
+            "12.50",
+            "ctype"
+        ]
+    );
+}
+
+/// SET RESULT SETS ARRAY (Db2 for i SQL Reference, SET RESULT SETS: "the
+/// result set is the first n rows of the host structure array", a column
+/// for each subfield) in an external procedure of a service program
+/// (CREATE PROCEDURE ... DYNAMIC RESULT SETS 1 ... EXTERNAL NAME): a
+/// data structure array, and a multiple-occurrence data structure as
+/// XMLSERVICE's iPLUGR procedures return theirs.
+#[tokio::test]
+async fn sql_result_set_from_a_host_structure_array() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    use as4tainr_core::sql::Outcome as SqlOut;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    source::create_file(&client, &lib, "QRPGLESRC", "")
+        .await
+        .unwrap();
+    let text = "**FREE
+ctl-opt nomain;
+dcl-proc listarr export;
+  dcl-pi *n;
+    n int(10);
+  end-pi;
+  dcl-ds rows qualified dim(3);
+    name char(5);
+    qty int(10);
+  end-ds;
+  rows(1).name = 'ab';
+  rows(1).qty = 7;
+  rows(2).name = 'cd';
+  rows(2).qty = 8;
+  rows(3).name = 'ef';
+  rows(3).qty = 9;
+  exec sql set result sets array :rows for :n rows;
+end-proc;
+dcl-ds out occurs(4);
+  line char(6);
+end-ds;
+dcl-s count packed(5:0) inz(2);
+dcl-proc listocc export;
+  dcl-pi *n;
+  end-pi;
+  %occur(out) = 1;
+  line = 'first';
+  %occur(out) = 2;
+  line = 'second';
+  exec sql set result sets array :out for :count rows;
+end-proc;
+";
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QRPGLESRC".into(),
+            name: "LISTMOD".into(),
+            srctype: "SQLRPGLE".into(),
+            text: String::new(),
+            source: text.into(),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    for c in [
+        format!("CRTSQLRPGI OBJ({lib}/LISTMOD) OBJTYPE(*MODULE)"),
+        format!("CRTSRVPGM SRVPGM({lib}/LISTSRV) MODULE({lib}/LISTMOD) EXPORT(*ALL)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    let libl = vec![lib.clone()];
+    for (name, parms, entry) in [
+        ("LISTARR", "(IN N INT)", "LISTARR"),
+        ("LISTOCC", "()", "LISTOCC"),
+    ] {
+        as4tainr_core::ddl::try_run(
+            &url,
+            "QSECOFR",
+            &libl,
+            Some(lib.clone()),
+            &mut None,
+            &format!(
+                "CREATE PROCEDURE {lib}.{name} {parms} DYNAMIC RESULT SETS 1 \
+                 LANGUAGE RPGLE EXTERNAL NAME '{lib}/LISTSRV({entry})' PARAMETER STYLE GENERAL"
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    let call = |sql: &'static str| {
+        let (client, url, libl, lib) = (&client, &url, &libl, lib.clone());
+        async move {
+            as4tainr_core::sql::run_as(client, url, libl, "QSECOFR", Some(lib), None, sql)
+                .await
+                .unwrap()
+        }
+    };
+    let SqlOut::Rows { columns, rows, .. } = call("CALL LISTARR(2)").await else {
+        panic!("no result set")
+    };
+    assert_eq!(columns, ["NAME", "QTY"]);
+    assert_eq!(rows, [["ab   ", "7"], ["cd   ", "8"]]);
+    let SqlOut::Rows { columns, rows, .. } = call("CALL LISTOCC").await else {
+        panic!("no result set")
+    };
+    assert_eq!(columns, ["LINE"]);
+    assert_eq!(rows, [["first "], ["second"]]);
+}
+
+/// The SQL call level interface from RPG (DB2 for i SQL CLI, X/Open CLI):
+/// SQLPrepare with a parameter marker, SQLBindParameter of a character
+/// value for a DECIMAL parameter, SQLExecute, SQLNumResultCols,
+/// SQLDescribeCol (SQL_CHAR 1, SQL_DECIMAL 3, IBM i's sqlcli.h codes, with
+/// the column's length or precision and scale), SQLBindCol with
+/// SQL_C_DEFAULT (99: a DECIMAL column as packed decimal, the buffer
+/// length precision * 256 + scale) and SQL_C_CHAR (null-terminated; the
+/// length of a CHAR(30) value is 30, the column being fixed-length),
+/// SQLFetch to SQL_NO_DATA_FOUND (100); a searched UPDATE of no rows
+/// gives SQL_NO_DATA_FOUND; an error leaves its SQLSTATE and SQLCODE for
+/// SQLGetDiagRec.
+#[tokio::test]
+async fn sql_cli_from_rpg() {
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = "**free
+dcl-pr SQLAllocEnv int(10) extproc('SQLAllocEnv');
+  h int(10);
+end-pr;
+dcl-pr SQLAllocConnect int(10) extproc('SQLAllocConnect');
+  henv int(10) value;
+  h int(10);
+end-pr;
+dcl-pr SQLConnect int(10) extproc('SQLConnect');
+  h int(10) value;
+  db pointer value;
+  dblen int(5) value;
+  uid pointer value;
+  uidlen int(5) value;
+  pwd pointer value;
+  pwdlen int(5) value;
+end-pr;
+dcl-pr SQLAllocStmt int(10) extproc('SQLAllocStmt');
+  hdbc int(10) value;
+  h int(10);
+end-pr;
+dcl-pr SQLPrepare int(10) extproc('SQLPrepare');
+  h int(10) value;
+  text pointer value;
+  len int(10) value;
+end-pr;
+dcl-pr SQLExecDirect int(10) extproc('SQLExecDirect');
+  h int(10) value;
+  text pointer value;
+  len int(10) value;
+end-pr;
+dcl-pr SQLBindParameter int(10) extproc('SQLBindParameter');
+  h int(10) value;
+  n int(5) value;
+  io int(5) value;
+  ctype int(5) value;
+  stype int(5) value;
+  size int(10) value;
+  scale int(5) value;
+  data pointer value;
+  buflen int(10) value;
+  ind pointer value;
+end-pr;
+dcl-pr SQLExecute int(10) extproc('SQLExecute');
+  h int(10) value;
+end-pr;
+dcl-pr SQLNumResultCols int(10) extproc('SQLNumResultCols');
+  h int(10) value;
+  n pointer value;
+end-pr;
+dcl-pr SQLDescribeCol int(10) extproc('SQLDescribeCol');
+  h int(10) value;
+  n int(5) value;
+  name pointer value;
+  max int(5) value;
+  namelen pointer value;
+  type pointer value;
+  size pointer value;
+  scale pointer value;
+  nullable pointer value;
+end-pr;
+dcl-pr SQLBindCol int(10) extproc('SQLBindCol');
+  h int(10) value;
+  n int(5) value;
+  ctype int(5) value;
+  data pointer value;
+  buflen int(10) value;
+  ind pointer value;
+end-pr;
+dcl-pr SQLFetch int(10) extproc('SQLFetch');
+  h int(10) value;
+end-pr;
+dcl-pr SQLGetDiagRec int(10) extproc('SQLGetDiagRec');
+  type int(5) value;
+  h int(10) value;
+  rec int(5) value;
+  state pointer value;
+  native pointer value;
+  msg pointer value;
+  max int(5) value;
+  len pointer value;
+end-pr;
+dcl-s henv int(10);
+dcl-s hdbc int(10);
+dcl-s hstmt int(10);
+dcl-s rc int(10);
+dcl-s text varchar(200);
+dcl-s sqltext char(200);
+dcl-s minbal char(10) inz('300');
+dcl-s nts int(10) inz(-3);
+dcl-s ncols int(5);
+dcl-s colname char(30);
+dcl-s namelen int(5);
+dcl-s coltype int(5);
+dcl-s colsize int(10);
+dcl-s colscale int(5);
+dcl-s nullable int(5);
+dcl-s cusno packed(5:0);
+dcl-s cusnam char(31);
+dcl-s cusbal packed(9:2);
+dcl-s ind1 int(10);
+dcl-s ind2 int(10);
+dcl-s ind3 int(10);
+dcl-s state char(6);
+dcl-s native int(10);
+dcl-s msg char(100);
+dcl-s msglen int(5);
+
+rc = SQLAllocEnv(henv);
+rc = SQLAllocConnect(henv: hdbc);
+rc = SQLConnect(hdbc: *null: 0: *null: 0: *null: 0);
+rc = SQLAllocStmt(hdbc: hstmt);
+sqltext = 'SELECT CUSNO, CUSNAM, CUSBAL FROM CUSTMAST WHERE CUSBAL > ? ORDER BY CUSNO' + x'00';
+rc = SQLPrepare(hstmt: %addr(sqltext): -3);
+rc = SQLBindParameter(hstmt: 1: 1: 1: 3: 9: 2: %addr(minbal): 10: %addr(nts));
+rc = SQLExecute(hstmt);
+dsply ('execute ' + %char(rc));
+rc = SQLNumResultCols(hstmt: %addr(ncols));
+dsply ('columns ' + %char(ncols));
+rc = SQLDescribeCol(hstmt: 2: %addr(colname): %size(colname): %addr(namelen):
+                    %addr(coltype): %addr(colsize): %addr(colscale): %addr(nullable));
+dsply (%str(%addr(colname)) + ' ' + %char(coltype) + ' ' + %char(colsize));
+rc = SQLDescribeCol(hstmt: 3: %addr(colname): %size(colname): %addr(namelen):
+                    %addr(coltype): %addr(colsize): %addr(colscale): %addr(nullable));
+dsply (%str(%addr(colname)) + ' ' + %char(coltype) + ' ' + %char(colsize)
+       + ' ' + %char(colscale));
+rc = SQLBindCol(hstmt: 1: 99: %addr(cusno): 5 * 256: %addr(ind1));
+rc = SQLBindCol(hstmt: 2: 1: %addr(cusnam): %size(cusnam): %addr(ind2));
+rc = SQLBindCol(hstmt: 3: 99: %addr(cusbal): 9 * 256 + 2: %addr(ind3));
+rc = SQLFetch(hstmt);
+dow rc = 0;
+  dsply (%char(cusno) + ' ' + %trimr(%str(%addr(cusnam))) + ' ' + %char(cusbal)
+         + ' ' + %char(ind2));
+  rc = SQLFetch(hstmt);
+enddo;
+dsply ('fetch ' + %char(rc));
+sqltext = 'UPDATE CUSTMAST SET CUSBAL = 0 WHERE CUSNO = 99' + x'00';
+rc = SQLExecDirect(hstmt: %addr(sqltext): -3);
+dsply ('update ' + %char(rc));
+sqltext = 'SELECT * FROM NOSUCHFILE' + x'00';
+rc = SQLExecDirect(hstmt: %addr(sqltext): -3);
+dsply ('select ' + %char(rc));
+rc = SQLGetDiagRec(3: hstmt: 1: %addr(state): %addr(native): %addr(msg):
+                   %size(msg): %addr(msglen));
+dsply (%str(%addr(state)) + ' ' + %char(native));
+*inlr = *on;
+";
+    let r = run_rpg(&url, &lib, "QSECOFR", "CLITEST", src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "execute 0",
+            "columns 3",
+            "CUSNAM 1 30",
+            "CUSBAL 3 9 2",
+            "1 Acme Tooling 1250.50 30",
+            "2 Midwest Fasteners 310.00 30",
+            "4 Prairie Freight 9999999.99 30",
+            "fetch 100",
+            "update 100",
+            "select -1",
+            "42704 -204",
+        ]
+    );
+}
+
+/// ftok (UNIX-type APIs, Generate IPC Key from File Name): a key for a
+/// file that exists, -1 with errno ENOENT (3025, as the IFS tests above
+/// cite) for one that does not.
+#[tokio::test]
+async fn ftok_key_from_a_file_name() {
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = "**free
+dcl-pr ftok int(10) extproc('ftok');
+  path pointer value options(*string);
+  id int(10) value;
+end-pr;
+dcl-pr getErrno pointer extproc('__errno');
+end-pr;
+dcl-s errno int(10) based(perr);
+dcl-s key int(10);
+key = ftok('/': 7);
+dsply %char(key <> -1);
+key = ftok('/no/such/file/here': 7);
+perr = getErrno();
+dsply (%char(key) + ' ' + %char(errno));
+*inlr = *on;
+";
+    let r = run_rpg(&url, &lib, "QSECOFR", "FTOKT", src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["1", "-1 3025"]);
+}
+
+/// QUSRJOBI JOBI0600 (Retrieve Job Information API, IBM i
+/// documentation): job switches at offset 62, end status at 70, current
+/// user profile at 91, special environment at 116, job user identity at
+/// 296. A job of QDFTJOBD has its switches (SWS, CRTJOBD's default
+/// 00000000), is not ending ('0'), runs as its user, in no special
+/// environment (*NONE), with its user as the job user identity
+/// (XMLSERVICE's error report reads these).
+#[tokio::test]
+async fn job_information_jobi0600() {
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = r#"**free
+dcl-pr qusrjobi extpgm('QUSRJOBI');
+  rcv char(1000) options(*varsize);
+  len int(10) const;
+  fmt char(8) const;
+  job char(26) const;
+  ijob char(16) const;
+  err char(16);
+end-pr;
+dcl-ds j len(1000) qualified;
+  sws char(8) pos(63);
+  endsts char(1) pos(71);
+  curusr char(10) pos(92);
+  spcenv char(10) pos(117);
+  jobusr char(10) pos(297);
+end-ds;
+dcl-s err char(16) inz(x'00000010');
+qusrjobi(j: %size(j): 'JOBI0600': '*': '': err);
+dsply (j.sws + ' ' + j.endsts + ' ' + %trim(j.curusr) + ' ' + %trim(j.spcenv)
+  + ' ' + %trim(j.jobusr));
+*inlr = *on;
+"#;
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        None,
+        "JOBI6".into(),
+        src.into(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["00000000 0 QSECOFR *NONE QSECOFR"]);
+}
+
+/// QWCRSSTS SSTS0100 (Retrieve System Status API, IBM i documentation):
+/// 80 bytes (bytes returned and available, the date and time as a
+/// system timestamp, the system name, fourteen BINARY(4) counts of
+/// jobs), here into a 148-byte receiver as XMLSERVICE's test_12602 asks.
+#[tokio::test]
+async fn system_status_ssts0100() {
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = r#"**free
+dcl-pr qwcrssts extpgm('QWCRSSTS');
+  rcv char(148) options(*varsize);
+  len int(10) const;
+  fmt char(8) const;
+  rst char(10) const;
+  err char(16);
+end-pr;
+dcl-ds s len(148) qualified;
+  ret int(10) pos(1);
+  avail int(10) pos(5);
+  dts char(8) pos(9);
+  sysname char(8) pos(17);
+end-ds;
+dcl-s err char(16) inz(x'00000010');
+qwcrssts(s: %size(s): 'SSTS0100': '*YES': err);
+dsply (%char(s.ret) + ' ' + %char(s.avail) + ' '
+  + %char(s.dts <> *allx'00') + ' ' + %char(s.sysname <> *blanks));
+*inlr = *on;
+"#;
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        None,
+        "SSTS1".into(),
+        src.into(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["80 80 1 1"]);
+}
+
+/// WRKJOB, WRKUSRJOB and WRKMSGQ (IBM i CL reference): WRKJOB with
+/// OPTION(*SELECT) on a display offers what can be shown about the job
+/// (status, definition and run attributes, spooled files, job log, call
+/// stack, library list, activation groups; option numbers as IBM i's
+/// Work with Job display numbers them), another OPTION shows that
+/// display; WRKUSRJOB lists a user's jobs (a submitted one among them);
+/// WRKMSGQ lists message queues by generic name, and DSPMSG of a queue
+/// made with CRTMSGQ shows its messages.
+#[tokio::test]
+async fn work_with_job_user_jobs_and_message_queues() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::menus;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let id = as4tainr_core::jobs::start_interactive(
+        &client,
+        &format!("W{}", &lib[1..]),
+        "QSECOFR",
+        None,
+        &[lib.clone(), "QGPL".into()],
+    )
+    .await
+    .unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: Some(tx),
+        id: Some(id.clone()),
+        calls: Default::default(),
+    };
+    match job.run("WRKJOB").await.unwrap() {
+        Outcome::Menu(menus::Menu::Builtin(m)) => {
+            let numbers: Vec<u8> = m.options.iter().map(|o| o.number).collect();
+            assert_eq!(numbers, [1, 2, 3, 4, 10, 11, 13, 18]);
+            assert_eq!(m.options[0].command, "DSPJOB OPTION(*STSA)");
+        }
+        other => panic!("WRKJOB shows its menu, not {other:?}"),
+    }
+    match job.run("WRKJOB OPTION(*LIBL)").await.unwrap() {
+        Outcome::Display(d) => assert!(d.rows.iter().any(|r| r.contains(&lib)), "{:?}", d.rows),
+        other => panic!("{other:?}"),
+    }
+
+    // A submitted job (on the job queue, or run by a QBATCH elsewhere).
+    let m = match job.run("SBMJOB CMD(DSPLIBL) JOB(WAITING)").await {
+        Ok(Outcome::Messages(m)) => m.join(" "),
+        other => panic!("{other:?}"),
+    };
+    let number = m.split_whitespace().nth(2).unwrap()[..6].to_string();
+    match job.run("WRKUSRJOB").await.unwrap() {
+        Outcome::Display(d) => assert!(
+            d.keys
+                .iter()
+                .any(|k| k == &format!("{number}/QSECOFR/WAITING")),
+            "{:?}",
+            d.keys
+        ),
+        other => panic!("{other:?}"),
+    }
+    let _ = job
+        .run(&format!("ENDJOB JOB({number}/QSECOFR/WAITING)"))
+        .await;
+
+    job.run(&format!("CRTMSGQ {lib}/ORDERSQ TEXT('Orders')"))
+        .await
+        .unwrap();
+    job.run(&format!(
+        "SNDMSG MSG('Order 1004 is late') TOMSGQ({lib}/ORDERSQ)"
+    ))
+    .await
+    .unwrap();
+    match job.run(&format!("WRKMSGQ MSGQ({lib}/ORD*)")).await.unwrap() {
+        Outcome::Display(d) => {
+            assert_eq!(d.keys, [format!("{lib}/ORDERSQ")]);
+            assert!(d.rows[0].contains("Orders"), "{:?}", d.rows);
+        }
+        other => panic!("{other:?}"),
+    }
+    match job.run(&format!("DSPMSG {lib}/ORDERSQ")).await.unwrap() {
+        Outcome::Display(d) => assert!(
+            d.rows.iter().any(|r| r.contains("Order 1004 is late")),
+            "{:?}",
+            d.rows
+        ),
+        other => panic!("{other:?}"),
+    }
+    job.run(&format!("DLTMSGQ {lib}/ORDERSQ")).await.unwrap();
+}
+
+/// WRKSYSVAL, WRKUSRPRF, WRKSBS, WRKJOBQ and DSPNETA (IBM i CL
+/// reference): lists of what the system has, each from IBM's shipped
+/// objects: the system value QDATFMT (MDY as shipped for the US), the
+/// security officer QSECOFR (user class *SECOFR), the subsystems QINTER
+/// and QBATCH in QSYS, the job queue QBATCH in QGPL, the network
+/// attribute SYSNAME (the system's name).
+#[tokio::test]
+async fn work_with_system_values_profiles_subsystems_job_queues() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let list = |o: Outcome| match o {
+        Outcome::Display(d) => d,
+        other => panic!("{other:?}"),
+    };
+    let d = list(job.run("WRKSYSVAL QDAT*").await.unwrap());
+    assert!(d.keys.contains(&"QDATFMT".to_string()), "{:?}", d.keys);
+    assert!(d.keys.iter().all(|k| k.starts_with("QDAT")));
+    assert!(d
+        .rows
+        .iter()
+        .any(|r| r.starts_with("QDATFMT") && r.ends_with("MDY")));
+    let d = list(job.run("WRKUSRPRF QSEC*").await.unwrap());
+    assert!(
+        d.rows
+            .iter()
+            .any(|r| r.starts_with("QSECOFR") && r.contains("*SECOFR")),
+        "{:?}",
+        d.rows
+    );
+    let d = list(job.run("WRKSBS").await.unwrap());
+    assert!(d
+        .rows
+        .iter()
+        .any(|r| r.starts_with("QINTER") && r.contains("QSYS")));
+    assert!(d
+        .rows
+        .iter()
+        .any(|r| r.starts_with("QBATCH") && r.contains("QSYS")));
+    let d = list(job.run("WRKJOBQ").await.unwrap());
+    assert!(d.keys.contains(&"QGPL/QBATCH".to_string()), "{:?}", d.keys);
+    let d = list(job.run("DSPNETA").await.unwrap());
+    let sys = as4tainr_core::report::system_name();
+    assert!(
+        d.info
+            .contains(&("System name".to_string(), sys.trim().to_string())),
+        "{:?}",
+        d.info
+    );
+}
+
+/// STRSEU (IBM i CL reference; SEU User's Guide): on a display it edits
+/// a member (OPTION 2), making one that is not there with the TYPE and
+/// TEXT given, or browses one (OPTION 5: a member that is not there is
+/// an error); without a display it cannot run.
+#[tokio::test]
+async fn strseu_edits_or_browses_a_member() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: Some(tx),
+        id: None,
+        calls: Default::default(),
+    };
+    job.run(&format!("CRTSRCPF {lib}/QRPGLESRC")).await.unwrap();
+    let e = job
+        .run(&format!("STRSEU {lib}/QRPGLESRC NEWMBR OPTION(5)"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF9815"), "{e}");
+    match job
+        .run(&format!(
+            "STRSEU {lib}/QRPGLESRC NEWMBR TYPE(RPGLE) TEXT('Made by SEU')"
+        ))
+        .await
+        .unwrap()
+    {
+        Outcome::Edit(t) => {
+            assert_eq!(
+                (t.file.as_str(), t.member.as_str(), t.browse),
+                ("QRPGLESRC", "NEWMBR", false)
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+    let m = as4tainr_core::source::find_member(
+        &client,
+        std::slice::from_ref(&lib),
+        "QRPGLESRC",
+        "NEWMBR",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (m.srctype.as_str(), m.text.as_str(), m.source.as_str()),
+        ("RPGLE", "Made by SEU", "")
+    );
+    match job
+        .run(&format!("STRSEU {lib}/QRPGLESRC NEWMBR OPTION(5)"))
+        .await
+        .unwrap()
+    {
+        Outcome::Edit(t) => assert!(t.browse),
+        other => panic!("{other:?}"),
+    }
+    job.display = None;
+    assert!(job
+        .run(&format!("STRSEU {lib}/QRPGLESRC NEWMBR"))
+        .await
+        .is_err());
+}
+
+/// HLDJOB and RLSJOB (IBM i CL reference): a held job stays on its job
+/// queue, the subsystem does not start it, until it is released; SBMJOB
+/// HOLD(*YES) puts it there held. Holding a held job, or releasing one
+/// that is not, is an error.
+#[tokio::test]
+async fn hold_and_release_a_job_on_a_job_queue() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::jobs;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let msg = |o: Outcome| match o {
+        Outcome::Messages(m) => m.join(" "),
+        other => panic!("{other:?}"),
+    };
+    let m = msg(job
+        .run("SBMJOB CMD(DSPLIBL) JOB(HELDJOB) HOLD(*YES)")
+        .await
+        .unwrap());
+    let spec = m.split_whitespace().nth(2).unwrap().to_string();
+    let number: i64 = spec[..6].parse().unwrap();
+    assert!(jobs::is_held(&client, number).await.unwrap());
+    assert!(job.run(&format!("HLDJOB JOB({spec})")).await.is_err());
+    msg(job.run(&format!("RLSJOB JOB({spec})")).await.unwrap());
+    assert!(!jobs::is_held(&client, number).await.unwrap());
+    assert!(job.run(&format!("RLSJOB JOB({spec})")).await.is_err());
+    // The subsystem's choice of the next job passes a held one by: a job
+    // on a queue of this test's own (no subsystem serves it).
+    let q = format!("Q{}", &lib[1..]);
+    let own = jobs::submit(
+        &client,
+        &jobs::Submit {
+            name: "OWNQ".into(),
+            user: "QSECOFR".into(),
+            command: "DSPLIBL".into(),
+            jobq: q.clone(),
+            curlib: None,
+            libl: vec!["QGPL".into()],
+            submitted_by: "QSECOFR".into(),
+            submitter: None,
+        },
+    )
+    .await
+    .unwrap();
+    msg(job.run(&format!("HLDJOB JOB({own})")).await.unwrap());
+    assert!(jobs::claim_next(&client, &q).await.unwrap().is_none());
+    msg(job.run(&format!("RLSJOB JOB({own})")).await.unwrap());
+    let started = jobs::claim_next(&client, &q).await.unwrap().unwrap();
+    assert_eq!(started.id.number, own.number);
+    assert!(job.run(&format!("HLDJOB JOB({own})")).await.is_err());
+    jobs::end(&client, &started.id, true).await.unwrap();
+    // Ended: it can no longer be held.
+    job.run(&format!("ENDJOB JOB({spec})")).await.unwrap();
+    assert!(job.run(&format!("HLDJOB JOB({spec})")).await.is_err());
+}
+
+/// STRPDM and WRKLIBPDM (IBM i CL reference, PDM): STRPDM shows PDM's
+/// menu (1 libraries, 2 objects, 3 members, each prompted); WRKLIBPDM
+/// lists the library list (QSYS first, the system part type SYS) or
+/// libraries by generic name, with options to display a library and to
+/// work with its objects.
+#[tokio::test]
+async fn pdm_menu_and_libraries() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::menus;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: Some(tx),
+        id: None,
+        calls: Default::default(),
+    };
+    match job.run("STRPDM").await.unwrap() {
+        Outcome::Menu(menus::Menu::Builtin(m)) => {
+            let cmds: Vec<&str> = m.options.iter().map(|o| o.command).collect();
+            assert_eq!(cmds, ["?WRKLIBPDM", "?WRKOBJPDM", "?WRKMBRPDM"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    match job.run("WRKLIBPDM").await.unwrap() {
+        Outcome::Display(d) => {
+            assert_eq!(d.keys.first().map(String::as_str), Some("QSYS"));
+            assert!(d.rows[0].contains("SYS"));
+            assert!(d.keys.contains(&lib));
+            assert!(d
+                .options
+                .iter()
+                .any(|(n, _, c)| *n == 12 && c.starts_with("WRKOBJPDM")));
+        }
+        other => panic!("{other:?}"),
+    }
+    match job
+        .run(&format!("WRKLIBPDM LIB({}*)", &lib[..lib.len() - 1]))
+        .await
+        .unwrap()
+    {
+        Outcome::Display(d) => assert!(d.keys.contains(&lib), "{:?}", d.keys),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// CPYTOIMPF and CPYFRMIMPF (IBM i CL reference): records to delimited
+/// text and back. Character fields between quotation marks (a quotation
+/// mark inside doubled), fields separated by commas, numbers with a
+/// period; ADDCOLNAM(*SYS) puts the field names first, and CPYFRMIMPF's
+/// RMVCOLNAM(*YES) skips them; MBROPT(*REPLACE) clears the file first.
+#[tokio::test]
+async fn copy_to_and_from_import_file() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let dir = format!("/tmp/{lib}");
+    job.run(&format!("MKDIR '{dir}'")).await.unwrap();
+    let csv = format!("{dir}/cust.csv");
+    job.run(&format!(
+        "CPYTOIMPF FROMFILE({lib}/CUSTMAST) TOSTMF('{csv}') MBROPT(*REPLACE) STMFCCSID(1208) RCDDLM(*LF) ADDCOLNAM(*SYS)"
+    ))
+    .await
+    .unwrap();
+    let (bytes, ccsid) = as4tainr_core::ifs::read_file(&client, &csv).await.unwrap();
+    assert_eq!(ccsid, 1208);
+    let text = String::from_utf8(bytes).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    // Column names without delimiters; a number left-aligned in its
+    // length plus two (PUB400, IBM i 7.5, tools/golden/verify36.txt
+    // b36_rows1 and b36_rows2). CUSNO is zoned 5,0, CUSBAL packed 9,2.
+    assert_eq!(lines[0], "CUSNO,CUSNAM,CUSCTY,CUSBAL");
+    assert!(
+        lines[1].starts_with("1      ,\"Acme Tooling "),
+        "{}",
+        lines[1]
+    );
+    assert!(lines[1].ends_with(",1250.50    "), "{}", lines[1]);
+    // The same records back into a copy of the file.
+    job.run(&format!(
+        "CPYF FROMFILE({lib}/CUSTMAST) TOFILE({lib}/CUSTCOPY) CRTFILE(*YES)"
+    ))
+    .await
+    .unwrap();
+    // RCDDLM's default *EOR is not for a stream file: CPF2845 (reason code
+    // 11) and CPF2817, nothing copied, the file not cleared (PUB400,
+    // IBM i 7.5, tools/golden/verify37.txt f37_impa, f37_rowsa).
+    let e = job
+        .run(&format!(
+            "CPYFRMIMPF FROMSTMF('{csv}') TOFILE({lib}/CUSTCOPY) MBROPT(*REPLACE) RMVCOLNAM(*YES)"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF2845") && e.contains("\nCPF2817"), "{e}");
+    let kept: i64 = client
+        .query_one(
+            &format!("SELECT count(*) FROM {}.custcopy", lib.to_lowercase()),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(kept, 5);
+    let m = match job
+        .run(&format!(
+            "CPYFRMIMPF FROMSTMF('{csv}') TOFILE({lib}/CUSTCOPY) MBROPT(*REPLACE) RMVCOLNAM(*YES) RCDDLM(*LF)"
+        ))
+        .await
+        .unwrap()
+    {
+        Outcome::Messages(m) => m.join(" "),
+        other => panic!("{other:?}"),
+    };
+    // Completion CPC2959 (PUB400, IBM i 7.5, verify38 g38_impa).
+    assert!(
+        m.starts_with(&format!("CPC2959: {} records", lines.len() - 1)),
+        "{m}"
+    );
+    let q = |t: &str| {
+        format!(
+            "SELECT cusno::text, cusnam::text, cusbal::text FROM {}.{t} ORDER BY cusno",
+            lib.to_lowercase()
+        )
+    };
+    let a: Vec<(String, String, String)> = client
+        .query(&q("custmast"), &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    let b: Vec<(String, String, String)> = client
+        .query(&q("custcopy"), &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(a, b);
+    // MBROPT(*REPLACE) clears the member first (CL reference): the
+    // records copied in are records 1 to 5 again, not 6 to 10.
+    let rrns: Vec<i64> = client
+        .query(
+            &format!(
+                "SELECT rrn FROM {}.custcopy ORDER BY rrn",
+                lib.to_lowercase()
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(rrns, [1, 2, 3, 4, 5]);
+    // A value that is not a number stops the copy, naming the record.
+    as4tainr_core::ifs::write_file(
+        &client,
+        &format!("{dir}/bad.csv"),
+        b"7,\"X\",\"Y\",abc\n",
+        1208,
+        0o644,
+        "QSECOFR",
+    )
+    .await
+    .unwrap();
+    let e = job
+        .run(&format!(
+            "CPYFRMIMPF FROMSTMF('{dir}/bad.csv') TOFILE({lib}/CUSTCOPY) RCDDLM(*LF)"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("Record 1"), "{e}");
+}
+
+/// WRKSYSSTS, DSPLOG and EDTLIBL (IBM i CL reference): the system's
+/// status counts the jobs in the system; the history log (QHST) has a
+/// line when a job starts and when it ends; EDTLIBL is a display (it
+/// cannot run without one).
+#[tokio::test]
+async fn system_status_history_log_and_edit_library_list() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::jobs;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    match job.run("WRKSYSSTS").await.unwrap() {
+        Outcome::Display(d) => {
+            let n = d
+                .info
+                .iter()
+                .find(|(k, _)| k == "Jobs in system")
+                .map(|(_, v)| v.parse::<i64>().unwrap())
+                .unwrap();
+            assert!(n >= 0);
+        }
+        other => panic!("{other:?}"),
+    }
+    // A job of this test's own queue, started and ended.
+    let q = format!("H{}", &lib[1..]);
+    let id = jobs::submit(
+        &client,
+        &jobs::Submit {
+            name: "HISTJOB".into(),
+            user: "QSECOFR".into(),
+            command: "DSPLIBL".into(),
+            jobq: q.clone(),
+            curlib: None,
+            libl: vec!["QGPL".into()],
+            submitted_by: "QSECOFR".into(),
+            submitter: None,
+        },
+    )
+    .await
+    .unwrap();
+    let started = jobs::claim_next(&client, &q).await.unwrap().unwrap();
+    jobs::end(&client, &started.id, true).await.unwrap();
+    match job.run(&format!("DSPLOG JOB({id})")).await.unwrap() {
+        Outcome::Display(d) => {
+            assert_eq!(d.rows.len(), 2, "{:?}", d.rows);
+            assert!(
+                d.rows[0].ends_with(&format!("Job {id} started.")),
+                "{:?}",
+                d.rows
+            );
+            assert!(
+                d.rows[1].ends_with(&format!("Job {id} ended.")),
+                "{:?}",
+                d.rows
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(job.run("EDTLIBL").await.is_err());
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    job.display = Some(tx);
+    assert!(matches!(
+        job.run("EDTLIBL").await.unwrap(),
+        Outcome::EditLibraryList
+    ));
+}
+
+/// CHGSYSVAL (IBM i CL reference; system values documentation:
+/// QPWDEXPITV is *NOMAX as shipped, or 1-366 days): a new value is kept
+/// (DSPSYSVAL shows it, with the shipped value beside it, also after the
+/// values are loaded again as a new process does), a value out of range
+/// is refused.
+#[tokio::test]
+async fn change_a_system_value() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let shown = |o: Outcome| match o {
+        Outcome::Display(d) => d.info,
+        other => panic!("{other:?}"),
+    };
+    assert!(job
+        .run("CHGSYSVAL SYSVAL(QPWDEXPITV) VALUE('400')")
+        .await
+        .is_err());
+    assert!(job
+        .run("CHGSYSVAL SYSVAL(QNOSUCH) VALUE('1')")
+        .await
+        .unwrap_err()
+        .to_string()
+        .starts_with("CPF1028"));
+    job.run("CHGSYSVAL SYSVAL(QPWDEXPITV) VALUE('90')")
+        .await
+        .unwrap();
+    as4tainr_core::clpgm::load_system_values(&client)
+        .await
+        .unwrap();
+    let info = shown(job.run("DSPSYSVAL QPWDEXPITV").await.unwrap());
+    assert!(
+        info.contains(&("Value".to_string(), "90".to_string())),
+        "{info:?}"
+    );
+    assert!(
+        info.contains(&("Shipped value".to_string(), "*NOMAX".to_string())),
+        "{info:?}"
+    );
+    // With QPWDEXPITV 90, a password changed 100 days ago must be changed
+    // at sign-on (system values documentation, QPWDEXPITV).
+    use as4tainr_core::users;
+    let name = format!("X{}", &lib[1..]);
+    users::delete(&client, &name).await.unwrap();
+    users::create(
+        &client,
+        users::NewProfile {
+            name: name.clone(),
+            password: users::NewPassword::SameAsProfile,
+            expired: false,
+            enabled: true,
+            usrcls: "*USER".into(),
+            special: vec![],
+            curlib: "QGPL".into(),
+            text: String::new(),
+            inlpgm: users::DEFAULT_INLPGM.into(),
+            inlmnu: users::DEFAULT_INLMNU.into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        !users::authenticate(&client, &name, &name)
+            .await
+            .unwrap()
+            .pwd_expired
+    );
+    client
+        .execute(
+            "UPDATE as4tainr.user_profiles SET pwd_changed = now() - interval '100 days' WHERE name = $1",
+            &[&name],
+        )
+        .await
+        .unwrap();
+    assert!(
+        users::authenticate(&client, &name, &name)
+            .await
+            .unwrap()
+            .pwd_expired
+    );
+    job.run("CHGSYSVAL SYSVAL(QPWDEXPITV) VALUE(*NOMAX)")
+        .await
+        .unwrap();
+    assert!(
+        !users::authenticate(&client, &name, &name)
+            .await
+            .unwrap()
+            .pwd_expired
+    );
+    users::delete(&client, &name).await.unwrap();
+    let info = shown(job.run("DSPSYSVAL QPWDEXPITV").await.unwrap());
+    assert!(
+        info.contains(&("Value".to_string(), "*NOMAX".to_string())),
+        "{info:?}"
+    );
+}
+
+/// PWRDWNSYS (IBM i CL reference: OPTION *CNTRLD or *IMMED, DELAY in
+/// seconds, RESTART *NO or *YES; *JOBCTL special authority): the
+/// server listening for it gets what was asked; with no server running,
+/// it is an error; a delay out of range is refused.
+#[tokio::test]
+async fn power_down_system_reaches_the_server() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::jobs;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    assert!(job.run("PWRDWNSYS DELAY(0)").await.is_err());
+    if jobs::power_down_listeners(&client).await.unwrap() == 0 {
+        let e = job.run("PWRDWNSYS").await.unwrap_err().to_string();
+        assert!(e.contains("No as4tainr server"), "{e}");
+    }
+    // A listener as the server has (`as4tainr tn5250`).
+    let u = url.clone();
+    let listener = tokio::spawn(async move { jobs::wait_for_power_down(&u).await });
+    for _ in 0..50 {
+        if jobs::power_down_listeners(&client).await.unwrap() > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    job.run("PWRDWNSYS OPTION(*IMMED) DELAY(60) RESTART(*YES)")
+        .await
+        .unwrap();
+    let pd = tokio::time::timeout(std::time::Duration::from_secs(10), listener)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pd,
+        jobs::PowerDown {
+            immediate: true,
+            delay: Some(60),
+            restart: true
+        }
+    );
+}
+
+/// SNDBRKMSG (IBM i CL reference): a break message for display stations,
+/// all (*ALLWS) or those named, from the user who sent it.
+#[tokio::test]
+async fn break_message_to_display_stations() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::jobs;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let mut rx = jobs::break_receiver();
+    let text = format!("Back up {lib} now");
+    job.run(&format!("SNDBRKMSG MSG('{text}') TOMSGQ(QPADEV0042)"))
+        .await
+        .unwrap();
+    let m = loop {
+        let m = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if m.text == text {
+            break m;
+        }
+    };
+    assert_eq!(m.from, "QSECOFR");
+    assert!(m.is_for("QPADEV0042") && !m.is_for("QPADEV0001"));
+    let all = jobs::BreakMessage {
+        to: vec!["*ALLWS".into()],
+        ..m
+    };
+    assert!(all.is_for("QPADEV0001"));
+}
+
+/// DSPRCDLCK (IBM i CL reference): the records of a file locked by a
+/// read for update, with the job holding each (here the job name a
+/// program's database session carries, as CPF5027 names it).
+#[tokio::test]
+async fn display_record_locks() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let holder = format!("000077/QSECOFR/K{}", &lib[1..]);
+    let a = runtime::connect_db(&url).await.unwrap();
+    runtime::job_session(&a, Some(&holder), std::time::Duration::from_millis(500))
+        .await
+        .unwrap();
+    let f = catalog::resolve_file(&a, std::slice::from_ref(&lib), "CUSTMAST")
+        .await
+        .unwrap();
+    let mut fa = rla::OpenFile::new(f).for_update(format!("{lib}/CUSTMAST"));
+    let r = fa.chain(&a, &["2".to_string()]).await.unwrap();
+    let r = fa.lock_after_read(&a, r, true, None).await.unwrap();
+    let rrn = r.rrn.unwrap();
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    match job
+        .run(&format!("DSPRCDLCK FILE({lib}/CUSTMAST)"))
+        .await
+        .unwrap()
+    {
+        Outcome::Display(d) => {
+            assert!(
+                d.rows
+                    .iter()
+                    .any(|r| r.trim_start().starts_with(&rrn.to_string())
+                        && r.contains(&holder)
+                        && r.contains("HELD")),
+                "{:?}",
+                d.rows
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    fa.release(&a).await.unwrap();
+    match job
+        .run(&format!("DSPRCDLCK FILE({lib}/CUSTMAST)"))
+        .await
+        .unwrap()
+    {
+        Outcome::Display(d) => assert!(!d.rows.iter().any(|r| r.contains(&holder)), "{:?}", d.rows),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// QMAXSIGN (IBM i system values: 3 sign-on attempts that are not valid,
+/// as shipped, disable the user profile; a valid one starts the count
+/// again): the third wrong password disables the profile, then even the
+/// right one cannot sign on, until CHGUSRPRF STATUS(*ENABLED). QSECOFR is
+/// not disabled (docs/fidelity-gaps.md).
+#[tokio::test]
+async fn sign_on_attempts_disable_a_profile() {
+    use as4tainr_core::users;
+    let url = require_db!();
+    let client = runtime::connect_db(&url).await.unwrap();
+    catalog::init(&client).await.unwrap();
+    let name = format!("M{}", std::process::id() % 1_000_000);
+    users::delete(&client, &name).await.unwrap();
+    users::create(
+        &client,
+        users::NewProfile {
+            name: name.clone(),
+            password: users::NewPassword::SameAsProfile,
+            expired: false,
+            enabled: true,
+            usrcls: "*USER".into(),
+            special: vec![],
+            curlib: "QGPL".into(),
+            text: String::new(),
+            inlpgm: users::DEFAULT_INLPGM.into(),
+            inlmnu: users::DEFAULT_INLMNU.into(),
+        },
+    )
+    .await
+    .unwrap();
+    // Two wrong, one right: the count starts again.
+    for _ in 0..2 {
+        assert!(users::authenticate(&client, &name, "wrong").await.is_err());
+    }
+    users::authenticate(&client, &name, &name).await.unwrap();
+    for _ in 0..2 {
+        let e = users::authenticate(&client, &name, "wrong")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("CPF1107") && !e.contains("disabled"), "{e}");
+    }
+    let e = users::authenticate(&client, &name, "wrong")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("disabled"), "{e}");
+    assert_eq!(
+        users::get(&client, &name).await.unwrap().unwrap().status,
+        "*DISABLED"
+    );
+    let e = users::authenticate(&client, &name, &name)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("cannot sign on"), "{e}");
+    users::change(
+        &client,
+        &name,
+        &users::ProfileChanges {
+            enabled: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    users::authenticate(&client, &name, &name).await.unwrap();
+    users::delete(&client, &name).await.unwrap();
+}
+
+// ENDSBS QBATCH: the subsystem starts no more jobs from its job queue
+// until STRSBS QBATCH (CL reference, ENDSBS and STRSBS; both need *JOBCTL
+// special authority). QINTER is the server's: refused here
+// (docs/fidelity-gaps.md, Work with lists).
+#[tokio::test]
+async fn end_and_start_the_batch_subsystem() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::jobs;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let msg = |o: Outcome| match o {
+        Outcome::Messages(m) => m.join(" "),
+        other => panic!("{other:?}"),
+    };
+    let was = jobs::subsystem_active(&client, jobs::BATCH_QUEUE)
+        .await
+        .unwrap();
+    jobs::set_subsystem_active(&client, jobs::BATCH_QUEUE, true)
+        .await
+        .unwrap();
+    assert!(job.run("ENDSBS SBS(QINTER)").await.is_err());
+    assert!(job.run("ENDSBS SBS(QBATCH) OPTION(*SOON)").await.is_err());
+    msg(job.run("ENDSBS SBS(QBATCH) OPTION(*IMMED)").await.unwrap());
+    assert!(!jobs::subsystem_active(&client, jobs::BATCH_QUEUE)
+        .await
+        .unwrap());
+    assert!(job.run("ENDSBS QBATCH").await.is_err());
+    let list = match job.run("WRKSBS").await.unwrap() {
+        Outcome::Display(d) => d.rows.join("\n"),
+        other => panic!("{other:?}"),
+    };
+    assert!(list.contains("QBATCH      QSYS        INACTIVE"), "{list}");
+    assert!(job.run("STRSBS SBSD(QSYS/QINTER)").await.is_err());
+    assert!(job.run("STRSBS SBSD(MYLIB/QBATCH)").await.is_err());
+    msg(job.run("STRSBS SBSD(QSYS/QBATCH)").await.unwrap());
+    assert!(jobs::subsystem_active(&client, jobs::BATCH_QUEUE)
+        .await
+        .unwrap());
+    assert!(job.run("STRSBS QBATCH").await.is_err());
+    // A user without *JOBCTL.
+    let mut plain = Job {
+        user: "QUSER".into(),
+        ..job
+    };
+    assert!(plain.run("ENDSBS QBATCH").await.is_err());
+    jobs::set_subsystem_active(&client, jobs::BATCH_QUEUE, was)
+        .await
+        .unwrap();
+}
+
+// ALCOBJ, DLCOBJ and WRKOBJLCK between two jobs: the lock state table of
+// the CL reference (ALCOBJ: *EXCLRD can be held with *SHRRD only, *SHRUPD
+// with *SHRUPD and *SHRRD, *EXCL with nothing), all or none, WAIT, and
+// CPF1002 when an object cannot be allocated (the message CL programs
+// monitor for after ALCOBJ: LOADCUST.CLLE in the lennon corpus).
+#[tokio::test]
+async fn allocate_objects_between_jobs() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let other = runtime::connect_db(&url).await.unwrap();
+    runtime::job_session(
+        &other,
+        Some(&format!("000078/QSECOFR/L{}", &lib[1..])),
+        std::time::Duration::from_millis(500),
+    )
+    .await
+    .unwrap();
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mk = |c| Job {
+        client: c,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let mut a = mk(&client);
+    let mut b = mk(&other);
+    a.run(&format!("CRTDTAARA DTAARA({lib}/LCK) TYPE(*CHAR) LEN(1)"))
+        .await
+        .unwrap();
+    a.run("ALCOBJ OBJ((LCK *DTAARA *EXCLRD)) WAIT(0)")
+        .await
+        .unwrap();
+    // *SHRRD goes with *EXCLRD; *SHRUPD does not.
+    b.run("ALCOBJ OBJ((LCK *DTAARA *SHRRD)) WAIT(0)")
+        .await
+        .unwrap();
+    let e = b
+        .run("ALCOBJ OBJ((LCK *DTAARA *SHRUPD)) WAIT(1)")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF1002"), "{e}");
+    // The job's own locks do not conflict with each other (*SHRUPD with
+    // a's *EXCLRD; b's *SHRRD goes with both).
+    a.run("ALCOBJ OBJ((LCK *DTAARA *SHRUPD)) WAIT(0)")
+        .await
+        .unwrap();
+    let list = match a
+        .run(&format!("WRKOBJLCK OBJ({lib}/LCK) OBJTYPE(*DTAARA)"))
+        .await
+        .unwrap()
+    {
+        Outcome::Display(d) => d.rows.join("\n"),
+        other => panic!("{other:?}"),
+    };
+    assert!(list.contains("*EXCLRD"), "{list}");
+    // b's job as name, user and number (h39_call's columns).
+    assert!(
+        list.contains(&format!(
+            "{:<10}  QSECOFR     000078  *SHRRD",
+            format!("L{}", &lib[1..])
+        )),
+        "{list}"
+    );
+    // All or none: the missing second object gives back the first; the
+    // messages are CPF0939 and CPF1085 (PUB400, verify39 h39_two; this
+    // expected CPF1002 before the capture).
+    let e = b
+        .run(&format!(
+            "ALCOBJ OBJ(({lib}/LCK *DTAARA *SHRRD) ({lib}/NOSUCH *DTAARA *SHRRD)) WAIT(0)"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF0939"), "{e}");
+    assert_eq!(as4tainr_core::jobs::escape_id(&e), "CPF1085", "{e}");
+    // b's *SHRRD from before is still held once, the list's was given back.
+    let n = |list: &str| list.matches("*SHRRD").count();
+    let list = match a
+        .run(&format!("WRKOBJLCK OBJ({lib}/LCK) OBJTYPE(*DTAARA)"))
+        .await
+        .unwrap()
+    {
+        Outcome::Display(d) => d.rows.join("\n"),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(n(&list), 1, "{list}");
+    // A lock state that is not one: CPD0084, CPF0006 (h39_badstate).
+    let e = a
+        .run("ALCOBJ OBJ((LCK *DTAARA *SHARE)) WAIT(0)")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPD0084") && e.contains("CPF0006"), "{e}");
+    a.run("DLCOBJ OBJ((LCK *DTAARA *SHRUPD) (LCK *DTAARA *EXCLRD))")
+        .await
+        .unwrap();
+    // Now only b's *SHRRD (held once) is left: *SHRUPD can be had.
+    b.run("ALCOBJ OBJ((LCK *DTAARA *SHRUPD)) WAIT(0)")
+        .await
+        .unwrap();
+    // *EXCL waits for b's locks and gives up after WAIT.
+    let t = std::time::Instant::now();
+    assert!(a
+        .run("ALCOBJ OBJ((LCK *DTAARA *EXCL)) WAIT(1)")
+        .await
+        .is_err());
+    assert!(t.elapsed() >= std::time::Duration::from_secs(1));
+    b.run("DLCOBJ OBJ((LCK *DTAARA *SHRUPD) (LCK *DTAARA *SHRRD))")
+        .await
+        .unwrap();
+    a.run("ALCOBJ OBJ((LCK *DTAARA *EXCL)) WAIT(0)")
+        .await
+        .unwrap();
+    // A lock not held: passed by without a message (PUB400, verify39
+    // h39_dlcnot; this expected one message before the capture).
+    match b.run("DLCOBJ OBJ((LCK *DTAARA *SHRRD))").await.unwrap() {
+        Outcome::Messages(m) => assert!(m.is_empty(), "{m:?}"),
+        other => panic!("{other:?}"),
+    }
+    // Allocated twice, a lock is listed twice (h39_call).
+    let locks = |out: Outcome| match out {
+        Outcome::Display(d) => d.rows.join("\n"),
+        other => panic!("{other:?}"),
+    };
+    let wrk = format!("WRKOBJLCK OBJ({lib}/LCK) OBJTYPE(*DTAARA)");
+    a.run("ALCOBJ OBJ((LCK *DTAARA *SHRRD)) WAIT(0)")
+        .await
+        .unwrap();
+    let list = locks(a.run(&wrk).await.unwrap());
+    assert_eq!(n(&list), 1, "{list}");
+    assert_eq!(list.matches("*EXCL").count(), 1, "{list}");
+    a.run("ALCOBJ OBJ((LCK *DTAARA *SHRRD)) WAIT(0)")
+        .await
+        .unwrap();
+    let list = locks(a.run(&wrk).await.unwrap());
+    assert_eq!(n(&list), 2, "{list}");
+    assert!(a.run("ALCOBJ OBJ((LCK *DTAARA *BAD))").await.is_err());
+}
+
+// RGZPFM: deleted records' numbers are removed and the records numbered
+// again from 1, in arrival order, or in the file's key order with
+// KEYFILE(*FILE) (CL reference, RGZPFM: "the relative record numbers of
+// the records change"); a record written afterwards takes the next number.
+#[tokio::test]
+async fn reorganize_a_physical_file_member() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let t = format!("{}.custmast", catalog::ident(&lib));
+    async fn rows(c: &Client, t: String) -> Vec<(i64, String)> {
+        c.query(
+            &format!("SELECT rrn, cusno::text FROM {t} ORDER BY rrn"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get::<_, i64>(0), r.get::<_, String>(1)))
+        .collect()
+    }
+    let before = rows(&client, t.clone()).await;
+    assert!(before.len() >= 3);
+    client
+        .execute(&format!("DELETE FROM {t} WHERE rrn = 2"), &[])
+        .await
+        .unwrap();
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {t} (cusno, cusnam, cuscty, cusbal) VALUES (0, 'Zero', 'Nowhere', 0)"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    // CPC2983 when done (PUB400, verify40 i40_rgz).
+    match job.run("RGZPFM FILE(CUSTMAST)").await.unwrap() {
+        as4tainr_core::commands::Outcome::Messages(m) => {
+            assert!(m[0].starts_with("CPC2983"), "{m:?}")
+        }
+        other => panic!("{other:?}"),
+    }
+    // A file not found: CPF2991, then CPF2981 (i40_nosuch).
+    let e = job
+        .run("RGZPFM FILE(NOSUCHF)")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF2991"), "{e}");
+    assert_eq!(as4tainr_core::jobs::escape_id(&e), "CPF2981", "{e}");
+    let after = rows(&client, t.clone()).await;
+    let want: Vec<String> = before
+        .iter()
+        .filter(|(r, _)| *r != 2)
+        .map(|(_, k)| k.clone())
+        .chain(["0".to_string()])
+        .collect();
+    assert_eq!(
+        after.iter().map(|(_, k)| k.clone()).collect::<Vec<_>>(),
+        want
+    );
+    assert_eq!(
+        after.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+        (1..=want.len() as i64).collect::<Vec<_>>()
+    );
+    // By key: customer 0 first.
+    job.run(&format!("RGZPFM FILE({lib}/CUSTMAST) KEYFILE(*FILE)"))
+        .await
+        .unwrap();
+    let keyed = rows(&client, t.clone()).await;
+    let mut sorted: Vec<i64> = want.iter().map(|k| k.parse().unwrap()).collect();
+    sorted.sort();
+    assert_eq!(
+        keyed
+            .iter()
+            .map(|(_, k)| k.parse::<i64>().unwrap())
+            .collect::<Vec<_>>(),
+        sorted
+    );
+    // The next record written is number n + 1.
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {t} (cusno, cusnam, cuscty, cusbal) VALUES (99999, 'Last', 'X', 0)"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let last = rows(&client, t.clone()).await;
+    assert_eq!(
+        last.last().unwrap(),
+        &(want.len() as i64 + 1, "99999".into())
+    );
+    assert!(job
+        .run("RGZPFM FILE(CUSTMAST) KEYFILE(OTHERLF)")
+        .await
+        .is_err());
+}
+
+// HLDJOBQ and RLSJOBQ: the subsystem takes no job from a held job queue
+// until it is released (CL reference, HLDJOBQ and RLSJOBQ; *JOBCTL).
+// WRKJOBQ shows the queue HLD, then RLS. A queue of this test's own (no
+// subsystem serves it).
+#[tokio::test]
+async fn hold_and_release_a_job_queue() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::jobs;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let q = format!("H{}", &lib[1..]);
+    let submitted = jobs::submit(
+        &client,
+        &jobs::Submit {
+            name: "HQJOB".into(),
+            user: "QSECOFR".into(),
+            command: "DSPLIBL".into(),
+            jobq: q.clone(),
+            curlib: None,
+            libl: vec!["QGPL".into()],
+            submitted_by: "QSECOFR".into(),
+            submitter: None,
+        },
+    )
+    .await
+    .unwrap();
+    let _ = submitted;
+    assert!(job.run("HLDJOBQ JOBQ(NOSUCHQ)").await.is_err());
+    job.run(&format!("HLDJOBQ JOBQ(QGPL/{q})")).await.unwrap();
+    assert!(job.run(&format!("HLDJOBQ JOBQ({q})")).await.is_err());
+    assert!(jobs::claim_next(&client, &q).await.unwrap().is_none());
+    let list = match job.run(&format!("WRKJOBQ JOBQ({q})")).await.unwrap() {
+        Outcome::Display(d) => d.rows.join("\n"),
+        other => panic!("{other:?}"),
+    };
+    assert!(list.trim_end().ends_with("HLD"), "{list}");
+    let mut plain = Job {
+        user: "QUSER".into(),
+        curlib: None,
+        libl: vec!["QGPL".into()],
+        ..job
+    };
+    assert!(plain.run(&format!("RLSJOBQ JOBQ({q})")).await.is_err());
+    let mut job = Job {
+        user: "QSECOFR".into(),
+        ..plain
+    };
+    job.run(&format!("RLSJOBQ JOBQ({q})")).await.unwrap();
+    let got = jobs::claim_next(&client, &q).await.unwrap().unwrap();
+    assert_eq!(got.id.name, "HQJOB");
+}
+
+// Common commands testers asked for (CL reference for each): WRKLIB and
+// WRKF are WRKOBJ of one type; MOVOBJ moves an object to TOLIB (CPF2112
+// when TOLIB has one of that name); RNMM renames a source member;
+// CLRMSGQ removes a queue's messages; CLRJOBQ ends the jobs waiting on a
+// job queue; CPY copies a stream file (an existing target only with
+// REPLACE(*YES)), MOV moves one into TODIR.
+#[tokio::test]
+async fn work_with_move_rename_and_clear() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::{ifs, jobs};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let rows = |o: Outcome| match o {
+        Outcome::Display(d) => (d.title, d.rows.join("\n")),
+        other => panic!("{other:?}"),
+    };
+    let (title, list) = rows(job.run(&format!("WRKLIB LIB({lib})")).await.unwrap());
+    assert_eq!(title, "Work with Libraries");
+    assert!(list.contains(&lib) && list.contains("*LIB"), "{list}");
+    let (_, list) = rows(job.run(&format!("WRKF FILE({lib}/CUST*)")).await.unwrap());
+    assert!(
+        list.contains("CUSTMAST") && !list.contains("ORDLIN"),
+        "{list}"
+    );
+    assert!(job.run(&format!("WRKPGM PGM({lib}/NOPGM*)")).await.is_err());
+
+    // MOVOBJ.
+    let other = format!("M{}", &lib[1..]);
+    let _ = job.run(&format!("DLTLIB LIB({other})")).await;
+    job.run(&format!("CRTLIB LIB({other})")).await.unwrap();
+    job.run(&format!(
+        "CRTDTAARA DTAARA({lib}/MOVME) TYPE(*CHAR) LEN(3) VALUE(abc)"
+    ))
+    .await
+    .unwrap();
+    job.run(&format!(
+        "MOVOBJ OBJ({lib}/MOVME) OBJTYPE(*DTAARA) TOLIB({other})"
+    ))
+    .await
+    .unwrap();
+    assert!(
+        !catalog::object_exists(&client, std::slice::from_ref(&lib), "MOVME", "*DTAARA")
+            .await
+            .unwrap()
+    );
+    assert!(
+        catalog::object_exists(&client, std::slice::from_ref(&other), "MOVME", "*DTAARA")
+            .await
+            .unwrap()
+    );
+    job.run(&format!("CRTDTAARA DTAARA({lib}/MOVME) TYPE(*CHAR) LEN(3)"))
+        .await
+        .unwrap();
+    let e = job
+        .run(&format!(
+            "MOVOBJ OBJ({lib}/MOVME) OBJTYPE(*DTAARA) TOLIB({other})"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF2112"), "{e}");
+    job.run(&format!("DLTLIB LIB({other})")).await.unwrap();
+
+    // RNMM.
+    job.run(&format!("CRTSRCPF FILE({lib}/QTXTSRC)"))
+        .await
+        .unwrap();
+    job.run(&format!("ADDPFM FILE({lib}/QTXTSRC) MBR(OLDNAME)"))
+        .await
+        .unwrap();
+    job.run(&format!(
+        "RNMM FILE({lib}/QTXTSRC) MBR(OLDNAME) NEWMBR(NEWNAME)"
+    ))
+    .await
+    .unwrap();
+    let names: Vec<String> = as4tainr_core::source::members(&client, &lib, "QTXTSRC")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.0)
+        .collect();
+    assert_eq!(names, ["NEWNAME"]);
+    // A member not found: CPF9815, then CPF3178 (PUB400, verify41
+    // j41_rnmmnone; this expected CPF3141 before the capture).
+    let e = job
+        .run(&format!("RNMM FILE({lib}/QTXTSRC) MBR(OLDNAME) NEWMBR(X)"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF9815"), "{e}");
+    assert_eq!(jobs::escape_id(&e), "CPF3178", "{e}");
+    // MOVOBJ into QTEMP: CPD0090, CPF0006 (j41_mov).
+    let e = job
+        .run(&format!(
+            "MOVOBJ OBJ({lib}/CUSTMAST) OBJTYPE(*FILE) TOLIB(QTEMP)"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPD0090") && e.contains("CPF0006"), "{e}");
+
+    // CLRMSGQ.
+    job.run(&format!("CRTMSGQ MSGQ({lib}/MYQ)")).await.unwrap();
+    job.run(&format!("SNDMSG MSG('one') TOMSGQ({lib}/MYQ)"))
+        .await
+        .unwrap();
+    let key = format!("{lib}/MYQ");
+    assert_eq!(jobs::messages(&client, &key, false).await.unwrap().len(), 1);
+    // CPC2353 (j41_clrmsgq).
+    match job.run(&format!("CLRMSGQ MSGQ({lib}/MYQ)")).await.unwrap() {
+        Outcome::Messages(m) => assert!(m[0].starts_with("CPC2353"), "{m:?}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(jobs::messages(&client, &key, false)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // CLRJOBQ on a queue of this test's own.
+    let q = format!("C{}", &lib[1..]);
+    let mut numbers = Vec::new();
+    for n in ["CQ1", "CQ2"] {
+        let id = jobs::submit(
+            &client,
+            &jobs::Submit {
+                name: n.into(),
+                user: "QSECOFR".into(),
+                command: "DSPLIBL".into(),
+                jobq: q.clone(),
+                curlib: None,
+                libl: vec!["QGPL".into()],
+                submitted_by: "QSECOFR".into(),
+                submitter: None,
+            },
+        )
+        .await
+        .unwrap();
+        numbers.push(id.number);
+    }
+    job.run(&format!("CLRJOBQ JOBQ({q})")).await.unwrap();
+    for n in numbers {
+        let st: String = client
+            .query_one("SELECT status FROM as4tainr.jobs WHERE number = $1", &[&n])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(st, "OUTQ");
+    }
+    assert!(jobs::claim_next(&client, &q).await.unwrap().is_none());
+
+    // CPY and MOV.
+    let dir = format!("/tmp/{lib}");
+    ifs::mkdir(&client, &dir, 0o755, "QSECOFR").await.unwrap();
+    ifs::mkdir(&client, &format!("{dir}/sub"), 0o755, "QSECOFR")
+        .await
+        .unwrap();
+    ifs::write_file(
+        &client,
+        &format!("{dir}/a.txt"),
+        b"hello\n",
+        1208,
+        0o644,
+        "QSECOFR",
+    )
+    .await
+    .unwrap();
+    // CPCA087 (j41_cpy).
+    match job
+        .run(&format!("CPY OBJ('{dir}/a.txt') TOOBJ('{dir}/b.txt')"))
+        .await
+        .unwrap()
+    {
+        Outcome::Messages(m) => assert!(m[0].starts_with("CPCA087"), "{m:?}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        ifs::read_file(&client, &format!("{dir}/b.txt"))
+            .await
+            .unwrap(),
+        (b"hello\n".to_vec(), 1208)
+    );
+    let e = job
+        .run(&format!("CPY OBJ('{dir}/a.txt') TOOBJ('{dir}/b.txt')"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPFA0A0"), "{e}");
+    job.run(&format!(
+        "CPY OBJ('{dir}/a.txt') TOOBJ('{dir}/b.txt') REPLACE(*YES)"
+    ))
+    .await
+    .unwrap();
+    job.run(&format!("MOV OBJ('{dir}/b.txt') TODIR('{dir}/sub')"))
+        .await
+        .unwrap();
+    assert!(ifs::stat(&client, &format!("{dir}/b.txt"))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(ifs::stat(&client, &format!("{dir}/sub/b.txt"))
+        .await
+        .unwrap()
+        .is_some());
+}
+
+// CHGPF SRCFILE: the file made again from its changed DDS with its
+// records kept field by field by name: a longer field keeps its value, a
+// new field gets its default (blanks), a dropped field goes (CL
+// reference, CHGPF); in arrival order (CPYF FROMRCD: "the file is
+// processed in arrival sequence").
+#[tokio::test]
+async fn change_a_physical_file_from_changed_dds() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source::{put_member, Member};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    job.run(&format!("CRTSRCPF FILE({lib}/QDDSSRC)"))
+        .await
+        .unwrap();
+    let dds = |src: &str| Member {
+        library: lib.clone(),
+        file: "QDDSSRC".into(),
+        name: "CHGME".into(),
+        srctype: "PF".into(),
+        source: src.into(),
+        ..Default::default()
+    };
+    let old = "     A          R CHGMER\n     A            K1             5P 0\n     A            NAME          10A\n     A            GONE           3A\n     A          K K1\n";
+    put_member(&client, &dds(old), true).await.unwrap();
+    job.run(&format!("CRTPF FILE({lib}/CHGME) SRCFILE({lib}/QDDSSRC)"))
+        .await
+        .unwrap();
+    let t = format!("{}.chgme", catalog::ident(&lib));
+    client
+        .execute(
+            &format!("INSERT INTO {t} (k1, name, gone) VALUES (2, 'two', 'x'), (1, 'one', 'y')"),
+            &[],
+        )
+        .await
+        .unwrap();
+    let new = "     A          R CHGMER\n     A            K1             5P 0\n     A            NAME          20A\n     A            CITY          10A\n     A          K K1\n";
+    put_member(&client, &dds(new), true).await.unwrap();
+    job.run(&format!(
+        "CHGPF FILE({lib}/CHGME) SRCFILE({lib}/QDDSSRC) TEXT('changed')"
+    ))
+    .await
+    .unwrap();
+    let rows: Vec<(String, String, String)> = client
+        .query(
+            &format!("SELECT k1::text, rtrim(name), city FROM {t} ORDER BY rrn"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("2".to_string(), "two".to_string(), " ".repeat(10)),
+            ("1".to_string(), "one".to_string(), " ".repeat(10))
+        ]
+    );
+    let gone = client
+        .query_opt(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'chgme' AND column_name = 'gone'",
+            &[&lib.to_ascii_lowercase()],
+        )
+        .await
+        .unwrap();
+    assert!(gone.is_none());
+    // Still in its library, with the new description; nothing left aside.
+    let objs = catalog::list_objects(&client, &lib).await.unwrap();
+    let f = objs.iter().find(|o| o.name == "CHGME").unwrap();
+    assert_eq!(f.text, "changed");
+    assert!(
+        !objs.iter().any(|o| o.objtype == "*FILE"
+            && o.name.len() == 10
+            && o.name.starts_with('Q')
+            && o.name[1..].chars().all(|c| c.is_ascii_digit())),
+        "the old file was left aside"
+    );
+}
+
+// CPYF FROMRCD and TORCD: the records from one relative record number to
+// another, in arrival sequence even from a keyed file (CL reference,
+// CPYF FROMRCD).
+#[tokio::test]
+async fn copy_file_from_and_to_record_numbers() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let t = format!("{}.custmast", catalog::ident(&lib));
+    let by_rrn: Vec<String> = client
+        .query(&format!("SELECT cusno::text FROM {t} ORDER BY rrn"), &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert!(by_rrn.len() >= 3);
+    job.run(&format!(
+        "CPYF FROMFILE({lib}/CUSTMAST) TOFILE({lib}/CUSTCOPY) CRTFILE(*YES) FROMRCD(2) TORCD(3)"
+    ))
+    .await
+    .unwrap();
+    let copied: Vec<String> = client
+        .query(
+            &format!(
+                "SELECT cusno::text FROM {}.custcopy ORDER BY rrn",
+                catalog::ident(&lib)
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(copied, by_rrn[1..3]);
+    assert!(job
+        .run(&format!(
+            "CPYF FROMFILE({lib}/CUSTMAST) TOFILE({lib}/CUSTCOPY) MBROPT(*ADD) FROMRCD(X)"
+        ))
+        .await
+        .is_err());
+}
+
+// RTVCLSRC (CL reference): a CL program's source into a member, SRCMBR
+// *PGM the program's name; ALWRTVSRC(*NO) at creation keeps it from
+// being retrieved. WRKMSG lists a queue's messages; WRKCFGSTS
+// CFGTYPE(*DEV) and WRKDEVD the display devices in use.
+#[tokio::test]
+async fn retrieve_cl_source_and_work_with_messages_and_devices() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::jobs;
+    use as4tainr_core::source::{put_member, Member};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    job.run(&format!("CRTSRCPF FILE({lib}/QCLSRC)"))
+        .await
+        .unwrap();
+    let src = "PGM\n  DCL &X *CHAR 1\n  CHGVAR &X 'A'\nENDPGM\n";
+    put_member(
+        &client,
+        &Member {
+            library: lib.clone(),
+            file: "QCLSRC".into(),
+            name: "RTVME".into(),
+            srctype: "CLLE".into(),
+            source: src.into(),
+            ..Default::default()
+        },
+        true,
+    )
+    .await
+    .unwrap();
+    job.run(&format!("CRTBNDCL PGM({lib}/RTVME) SRCFILE({lib}/QCLSRC)"))
+        .await
+        .unwrap();
+    job.run(&format!("CRTSRCPF FILE({lib}/QOUTSRC)"))
+        .await
+        .unwrap();
+    job.run(&format!("RTVCLSRC PGM({lib}/RTVME) SRCFILE({lib}/QOUTSRC)"))
+        .await
+        .unwrap();
+    let m =
+        as4tainr_core::source::find_member(&client, std::slice::from_ref(&lib), "QOUTSRC", "RTVME")
+            .await
+            .unwrap();
+    assert_eq!(m.srctype, "CLLE");
+    // Written again as IBM i does (PUB400, verify42 k42_rows): a comment
+    // box, then each statement with its keywords (this expected the
+    // original text before the capture).
+    assert!(m.source.starts_with("/****"), "{}", m.source);
+    assert!(
+        m.source.contains("\n     CHGVAR VAR(&X) VALUE('A')\n"),
+        "{}",
+        m.source
+    );
+    job.run(&format!(
+        "CRTBNDCL PGM({lib}/NORTV) SRCFILE({lib}/QCLSRC) SRCMBR(RTVME) ALWRTVSRC(*NO)"
+    ))
+    .await
+    .unwrap();
+    // The retrieved source compiles and runs again.
+    job.run(&format!(
+        "CRTBNDCL PGM({lib}/RTVBACK) SRCFILE({lib}/QOUTSRC) SRCMBR(RTVME)"
+    ))
+    .await
+    .unwrap();
+    job.run(&format!("CALL PGM({lib}/RTVBACK)")).await.unwrap();
+    // CPF0569 (k42_rtvno), CPF9801 for a program not there (k42_rtvnone).
+    let e = job
+        .run(&format!("RTVCLSRC PGM({lib}/NORTV) SRCFILE({lib}/QOUTSRC)"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF0569"), "{e}");
+    let e = job
+        .run(&format!(
+            "RTVCLSRC PGM({lib}/NOSUCHPGM) SRCFILE({lib}/QOUTSRC)"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF9801"), "{e}");
+
+    // WRKMSG.
+    job.run(&format!("CRTMSGQ MSGQ({lib}/WMQ)")).await.unwrap();
+    job.run(&format!("SNDMSG MSG('hello there') TOMSGQ({lib}/WMQ)"))
+        .await
+        .unwrap();
+    match job.run(&format!("WRKMSG MSGQ({lib}/WMQ)")).await.unwrap() {
+        Outcome::Display(d) => {
+            assert_eq!(d.title, "Work with Messages");
+            assert!(
+                d.rows.iter().any(|r| r.contains("hello there")),
+                "{:?}",
+                d.rows
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // WRKCFGSTS and WRKDEVD: an interactive job's device.
+    let dev = format!("D{}", &lib[1..]);
+    let id = jobs::start_interactive(&client, &dev, "QSECOFR", None, &[])
+        .await
+        .unwrap();
+    for c in [
+        format!("WRKCFGSTS CFGTYPE(*DEV) CFGD({dev})"),
+        format!("WRKDEVD DEVD({dev})"),
+    ] {
+        match job.run(&c).await.unwrap() {
+            Outcome::Display(d) => {
+                assert!(
+                    d.rows
+                        .iter()
+                        .any(|r| r.starts_with(&dev) && r.contains("ACTIVE")),
+                    "{c}: {:?}",
+                    d.rows
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(job.run("WRKCFGSTS CFGTYPE(*LIN)").await.is_err());
+    client
+        .execute(
+            "UPDATE as4tainr.jobs SET status='OUTQ', ended=now() WHERE number=$1",
+            &[&id.number],
+        )
+        .await
+        .unwrap();
+}
+
+// DSPAUT, CHGAUT and CHGOWN of an IFS object (CL reference): *PUBLIC's
+// and the owner's data authorities are the mode's other and owner bits
+// (*R is r--, *RWX rwx, *EXCLUDE none); CHGOWN gives it a new owner (a
+// profile that exists).
+#[tokio::test]
+async fn ifs_authorities_and_owner() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::ifs;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let path = format!("/tmp/aut{lib}.txt");
+    ifs::write_file(&client, &path, b"x", 1208, 0o644, "QSECOFR")
+        .await
+        .unwrap();
+    // *EXCLUDE with OBJAUT(*SAME), the default: CPD2212, CPF0006 (PUB400,
+    // verify43 l43_chgaut; this test gave no OBJAUT before the capture).
+    let e = job
+        .run(&format!(
+            "CHGAUT OBJ('{path}') USER(*PUBLIC) DTAAUT(*EXCLUDE)"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPD2212") && e.contains("CPF0006"), "{e}");
+    job.run(&format!(
+        "CHGAUT OBJ('{path}') USER(*PUBLIC) DTAAUT(*EXCLUDE) OBJAUT(*NONE)"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        ifs::stat(&client, &path).await.unwrap().unwrap().mode & 0o777,
+        0o640
+    );
+    job.run(&format!("CHGAUT OBJ('{path}') USER(QSECOFR) DTAAUT(*RWX)"))
+        .await
+        .unwrap();
+    assert_eq!(
+        ifs::stat(&client, &path).await.unwrap().unwrap().mode & 0o777,
+        0o740
+    );
+    match job.run(&format!("DSPAUT OBJ('{path}')")).await.unwrap() {
+        Outcome::Display(d) => {
+            // *PUBLIC first, then the owner (verify43 l43_dspaut).
+            assert_eq!(d.rows[0], "*PUBLIC     *EXCLUDE");
+            assert_eq!(d.rows[1], "QSECOFR     *RWX");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(job
+        .run(&format!("CHGAUT OBJ('{path}') USER(*PUBLIC) DTAAUT(*ALL)"))
+        .await
+        .is_err());
+    let user = format!("U{}", &lib[1..]);
+    let _ = job.run(&format!("DLTUSRPRF USRPRF({user})")).await;
+    job.run(&format!("CRTUSRPRF USRPRF({user}) PASSWORD(*NONE)"))
+        .await
+        .unwrap();
+    // CPC221B (verify43 l43_chgown).
+    match job
+        .run(&format!("CHGOWN OBJ('{path}') NEWOWN({user})"))
+        .await
+        .unwrap()
+    {
+        Outcome::Messages(m) => assert!(m[0].starts_with("CPC221B"), "{m:?}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        ifs::stat(&client, &path).await.unwrap().unwrap().owner,
+        user
+    );
+    assert!(job
+        .run(&format!("CHGOWN OBJ('{path}') NEWOWN(NOSUCHUSR)"))
+        .await
+        .is_err());
+    job.run(&format!("DLTUSRPRF USRPRF({user})")).await.unwrap();
 }

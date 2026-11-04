@@ -42,6 +42,19 @@ pub(super) struct KeptSql {
 }
 
 type Key = (String, String, String);
+thread_local! {
+    /// The result sets SET RESULT SETS named, returned to the caller of
+    /// the procedure (an external SQL procedure) when it ends.
+    static RESULT_SETS: std::cell::RefCell<Vec<crate::sqlpl::ResultSet>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The result sets the procedure that ran on this thread left (none from
+/// now on).
+pub fn take_result_sets() -> Vec<crate::sqlpl::ResultSet> {
+    RESULT_SETS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
 static KEPT: std::sync::Mutex<Option<HashMap<Key, KeptSql>>> = std::sync::Mutex::new(None);
 
 /// The activation group ends: its modules' cursors close.
@@ -208,7 +221,7 @@ impl Outcome {
 }
 
 /// SQLSTATE for an SQLCODE, as DB2 for i reports them.
-fn sqlstate(code: i64) -> &'static str {
+pub(super) fn sqlstate(code: i64) -> &'static str {
     match code {
         0 => "00000",
         100 => "02000",
@@ -328,7 +341,7 @@ fn literal(v: &Value) -> Result<String> {
 }
 
 /// Replace `?` parameter markers (outside literals) with values.
-fn fill_markers(sql: &str, values: &[String]) -> Result<String> {
+pub(super) fn fill_markers(sql: &str, values: &[String]) -> Result<String> {
     let mut out = String::new();
     let mut quote = None;
     let mut n = 0;
@@ -674,6 +687,15 @@ impl Machine<'_> {
                 {
                     parts.push(format!("CAST({} AS char({n}))", literal(&v)?))
                 }
+                // A timestamp host variable is a TIMESTAMP value (Db2 for
+                // i SQL Programming, "Host variables in ILE RPG": Z maps
+                // to TIMESTAMP), whatever form its text has
+                // ('2026-10-31-20.43.10.123456'): the IBM i Unit test
+                // runner inserts one into a TIMESTAMP column.
+                (Some(super::data::DType::Timestamp(_)), Value::Char(c)) => {
+                    let t = iso_timestamp(a(c).replace('\0', "").trim());
+                    parts.push(format!("CAST('{}' AS timestamp)", t.replace('\'', "''")))
+                }
                 _ => parts.push(literal(&v)?),
             }
         }
@@ -684,7 +706,7 @@ impl Machine<'_> {
     fn lob(&self, name: &str) -> Option<(Expr, Expr)> {
         let up = name.to_ascii_uppercase();
         match self.sym(&up) {
-            Some(Sym::Ds(d)) if d.subfields == [format!("{up}_LEN"), format!("{up}_DATA")] => {
+            Some(Sym::Ds(d)) if *d.subfields == [format!("{up}_LEN"), format!("{up}_DATA")] => {
                 Some((
                     Expr::name(&format!("{up}_LEN")),
                     Expr::name(&format!("{up}_DATA")),
@@ -880,15 +902,22 @@ impl Machine<'_> {
     fn sql_statement(&mut self, sql: &str) -> Result<Outcome> {
         // QSYS2.STACK_INFO('*'): the job's call stack as it is now.
         if sql.to_ascii_uppercase().contains("STACK_INFO") {
-            let entries: Vec<serde_json::Value> = crate::pgmmsg::stack_listed(&self.io.job_key)
-                .iter()
-                .map(|e| {
-                    serde_json::json!({
+            // An RPG program's main procedure has its program entry
+            // procedure below it, _QRNP_PEP_ and the program's name
+            // (PUB400 2026-10-31, verify32 y32_rows).
+            let mut entries: Vec<serde_json::Value> = Vec::new();
+            for e in crate::pgmmsg::stack_listed(&self.io.job_key) {
+                if e.pep {
+                    entries.push(serde_json::json!({
                         "pgm": e.pgm, "lib": e.lib, "module": e.module,
-                        "proc": e.proc, "actgrp": e.actgrp, "line": e.line,
-                    })
-                })
-                .collect();
+                        "proc": format!("_QRNP_PEP_{}", e.pgm), "actgrp": e.actgrp, "line": 0,
+                    }));
+                }
+                entries.push(serde_json::json!({
+                    "pgm": e.pgm, "lib": e.lib, "module": e.module,
+                    "proc": e.proc, "actgrp": e.actgrp, "line": e.line,
+                }));
+            }
             let json = serde_json::Value::Array(entries).to_string();
             let rt = self.io.rt.clone();
             self.session()?;
@@ -967,6 +996,7 @@ impl Machine<'_> {
                 }
                 return self.sql_change(&text);
             }
+            "SET" if second == "RESULT" => return self.sql_set_result_sets(sql),
             "SET" if second.starts_with(':') => {
                 // SET :host = expression.
                 let eq = sql
@@ -1119,7 +1149,7 @@ impl Machine<'_> {
         let mut rows = Vec::new();
         for i in 1..=n {
             let mut parts = Vec::new();
-            for sf in &d.subfields {
+            for sf in d.subfields.iter() {
                 let e = crate::rpg::expr::parse(&format!("{host}({i}).{sf}"))?;
                 let v = self.eval(&e)?;
                 match (self.type_of(&e), &v) {
@@ -1133,6 +1163,91 @@ impl Machine<'_> {
         }
         let text = format!("{} VALUES {}", self.bind_host(target)?, rows.join(", "));
         self.sql_change(&text)
+    }
+
+    /// SET RESULT SETS [WITH RETURN TO CALLER | CLIENT] ARRAY
+    /// :host-structure-array FOR n ROWS (Db2 for i SQL Reference, SET
+    /// RESULT SETS): the result set the procedure returns, a row for each
+    /// of the first n elements (or occurrences) of the structure, a
+    /// column for each subfield. NONE: no result set.
+    fn sql_set_result_sets(&mut self, sql: &str) -> Result<Outcome> {
+        let w = words(sql);
+        if w.iter().any(|x| x == "NONE") {
+            RESULT_SETS.with(|r| r.borrow_mut().clear());
+            return Ok(Outcome::ok(0));
+        }
+        let Some(k) = w.iter().position(|x| x == "ARRAY") else {
+            return Ok(Outcome::error(
+                -84,
+                "SQL0084: SET RESULT SETS CURSOR is not available in as4tainr yet.",
+            ));
+        };
+        let host = w
+            .get(k + 1)
+            .ok_or_else(|| anyhow!("SQL0104: a host structure is expected after ARRAY"))?
+            .trim_start_matches(':')
+            .to_ascii_uppercase();
+        let count = w
+            .get(k + 3)
+            .filter(|_| w.get(k + 2).map(String::as_str) == Some("FOR"))
+            .ok_or_else(|| anyhow!("SQL0104: FOR n ROWS is expected"))?;
+        let n = match count.strip_prefix(':') {
+            Some(h) => self.eval(&crate::rpg::expr::parse(h)?)?.num()?,
+            None => crate::rpg::dec::Dec::parse(count)?,
+        }
+        .to_i128()?
+        .max(0) as usize;
+        let Some(Sym::Ds(d)) = self.sym(&host) else {
+            bail!("SQL0312: {host} must be a host structure array");
+        };
+        let ds = crate::rpg::expr::parse(&host)?;
+        let occurs = self.prog.occurs.iter().any(|o| o.name == host);
+        let reps = if occurs {
+            self.prog
+                .occurs
+                .iter()
+                .find(|o| o.name == host)
+                .map(|o| o.count as usize)
+                .unwrap_or(1)
+        } else {
+            d.dim.max(1) as usize
+        };
+        let n = n.min(reps);
+        let was = if occurs {
+            Some(self.occurrence(&ds)?)
+        } else {
+            None
+        };
+        let mut rows = Vec::new();
+        for i in 1..=n {
+            if occurs {
+                self.set_occurrence(&ds, i as i128)?;
+            }
+            let mut row = Vec::new();
+            for sf in d.subfields.iter() {
+                let e = if occurs {
+                    crate::rpg::expr::parse(&format!("{host}.{sf}"))
+                        .or_else(|_| crate::rpg::expr::parse(sf))?
+                } else {
+                    crate::rpg::expr::parse(&format!("{host}({i}).{sf}"))?
+                };
+                let v = match self.eval(&e) {
+                    Ok(v) => v,
+                    Err(_) => self.eval(&crate::rpg::expr::parse(sf)?)?,
+                };
+                row.push(Some(match v {
+                    Value::Char(c) => super::data::a(&c),
+                    other => other.num().map(|d| d.to_string()).unwrap_or_default(),
+                }));
+            }
+            rows.push(row);
+        }
+        if let Some(o) = was {
+            self.set_occurrence(&ds, o as i128)?;
+        }
+        let columns = d.subfields.to_vec();
+        RESULT_SETS.with(|r| *r.borrow_mut() = vec![(columns, rows)]);
+        Ok(Outcome::ok(0))
     }
 
     /// INSERT, UPDATE, DELETE (or a query run for nothing).
@@ -1527,6 +1642,26 @@ impl Machine<'_> {
         }
         Ok(out)
     }
+}
+
+/// An RPG timestamp's text ('2026-10-23-13.38.38.840000') in the form
+/// PostgreSQL reads ('2026-10-23 13:38:38.840000'); other text as it is.
+fn iso_timestamp(t: &str) -> String {
+    let b = t.as_bytes();
+    let db2 = b.len() >= 19
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'-'
+        && b[13] == b'.'
+        && b[16] == b'.'
+        && t[..19]
+            .chars()
+            .enumerate()
+            .all(|(i, c)| [4, 7, 10, 13, 16].contains(&i) || c.is_ascii_digit());
+    if !db2 {
+        return t.to_string();
+    }
+    format!("{} {}{}", &t[..10], t[11..19].replace('.', ":"), &t[19..])
 }
 
 /// A timestamp as PostgreSQL gives it ('2026-10-23 13:38:38.84'), in the

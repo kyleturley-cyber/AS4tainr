@@ -242,6 +242,32 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] iMoq passes all its own tests (IMOQTEST 32/32, IMOQDEMO 12/12, EXAMPLES 23/23): recursive linear-main programs, storage lent to called programs, CLEAR of a DS array element, VARCHAR(n:4), *NOPASS vs *OMIT, CRTCMD ALLOW lists, QSYS2.BOUND_SRVPGM_INFO; verify24 capture: CPYSRCF/RTVBNDSRC messages, DSPFD *MBRLIST report, CEE9901 for unmonitored escapes in ILE CL
 - [x] IBMiUnit's own test suites run (20 suites, 121 tests): procedure-local prototypes, heap shared within an activation group, EXTPGM 'LIB/PGM', float literals; verify25/26: CL %CHAR padding, CPF9999/CEE9901 for unmonitored escapes, RNF7016 (DSPLY over 52 bytes)
 - [x] IBM's TOBi example: its VAT300 and CUS300 iRPGUnit suites pass (18 test cases, 54 assertions); DDS reference fields (REF, REFFLD, +n/-n, *SRC), ARCAD object scripts and makei recipes in the import, bound calls to a module's cycle main procedure, DSPSRVPGM DETAIL(*SIGNATURE/*PROCEXP) printed (verify28).
+- [x] XMLSERVICE (IBM) builds and runs its PHP tests' XML (tools/xmlservice_tests.py, 92 of 178): program and service program calls through PASE emulation (Qp2CallPase of _RSLOBJ2, _PGMCALL, _ILELOAD, _ILESYM, _ILECALL), _CALLPGMV, iconv, QXX functions, vsprintf, SET RESULT SETS ARRAY
+- [x] Bound calls without copying a service program module's static storage (XMLSERVICE's largest test 92 s to 1.4 s)
+- [x] The SQL call level interface (SQLAllocEnv ... SQLFetch, SQLEndTran, SQLGetDiagRec) for ILE programs; XMLSERVICE's <sql> tests pass (its tests 108 of 170)
+- [x] GO LICPGM (Work with Licensed Programs) and DSPSFWRSC; QWCRSSTS SSTS0100, QUSRJOBI JOBI0600, ftok
+- [x] XMLSERVICE: 134 of its 163 single-call tests pass (*hex documents, error reports); RPG interpreter about 2.7 times faster on XMLSERVICE's parser
+- [x] Record locks: a record read for update is read again once locked (a lost update in the three-clerk gate)
+- [x] WRKJOB, WRKUSRJOB, WRKMSGQ, WRKUSRPRF, WRKSYSVAL, WRKSBS, WRKJOBQ, DSPNETA; DSPMSG of any message queue
+- [x] Source editor: STRSEU (edit/browse), WRKMBRPDM option 2; SEU line commands I, D, C, M, A, B, R and blocks
+- [x] Upgrade check: a database made by an earlier version (2026-10-22) works with the current one
+- [x] CPYTOIMPF and CPYFRMIMPF (delimited text); MBROPT(*REPLACE) numbers records from 1 again (CPYF, CPYFRMSTMF)
+- [x] HLDJOB, RLSJOB, SBMJOB HOLD(*YES); STRPDM and WRKLIBPDM
+- [x] WRKSYSSTS, DSPLOG (QHST job history), EDTLIBL
+- [x] verify35 and verify36 captured: CPYTOIMPF writes numbers, dates and column names as PUB400 does
+- [x] verify37: CPYFRMIMPF's RCDDLM(*EOR) default with a stream file is CPF2845 reason code 11
+- [x] CHGSYSVAL (date and time formats, decimal format, currency sign, printer, sign-on and password values), kept across processes; CPYFRMIMPF completion CPC2959 (verify38)
+- [x] PWRDWNSYS (*CNTRLD/*IMMED, DELAY, RESTART) ends or restarts the server; GO LICPGM with IBM's option numbers, RSTLICPGM/DLTLICPGM/SAVLICPGM explain, DSPSFWRSC lists the products as4tainr provides
+- [x] SNDBRKMSG (break messages over the display), PWRDWNSYS warns signed-on users, DSPRCDLCK
+- [x] Sign-on enforces QMAXSIGN and QPWDEXPITV; ENDSBS/STRSBS for QBATCH; ALCOBJ, DLCOBJ and WRKOBJLCK lock objects between jobs (lock state table, WAIT, CPF1002)
+- [x] ALCOBJ/DLCOBJ/WRKOBJLCK messages and printed report as IBM i 7.5 gives them (verify39); RGZPFM; HLDJOBQ/RLSJOBQ
+- [x] RGZPFM messages and record numbers as IBM i 7.5 gives them (verify40); EDTF edits stream files
+- [x] WRKLIB, WRKF, WRKPGM and the other WRK-by-type commands; MOVOBJ, RNMM, CLRMSGQ, CLRJOBQ, CPY, MOV, DSPF
+- [x] MOVOBJ, RNMM, CLRMSGQ, CPY, MOV messages as IBM i 7.5 gives them (verify41); CHGPF SRCFILE; CPYF FROMRCD and TORCD
+- [x] RTVCLSRC, WRKMSG, WRKCFGSTS and WRKDEVD
+- [x] RTVCLSRC writes CL source back in IBM i's form; WRKCFGSTS printed (verify42)
+- [x] DSPAUT, CHGAUT and CHGOWN for IFS objects; RTVCLSRC continues lines by the member's record length
+- [x] RTVCLSRC labels, long lines and member source as IBM i 7.5 writes them; DSPAUT report, CHGAUT and CHGOWN messages (verify43)
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).
 - [x] Journals and trigger programs: COM's SETUPJRN, ORDAUDJV (QSYS2.DISPLAY_JOURNAL) and ORDTRG (ADDPFTRG) run (docs/journals.md).

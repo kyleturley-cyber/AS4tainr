@@ -1,0 +1,16 @@
+/* verify43: labels, a long command, nested commands, DCLF. */
+             PGM
+             DCLF       FILE(QSYS/QADSPOBJ)
+             DCL        VAR(&A) TYPE(*CHAR) LEN(10) VALUE('x')
+             DCL        VAR(&N) TYPE(*DEC) LEN(5 0)
+ START:      CHGVAR     VAR(&N) VALUE(&N + 1)
+             IF         COND(&N *LT 3) THEN(GOTO CMDLBL(START))
+             ELSE       CMD(CHGVAR &A 'y')
+             SNDPGMMSG  MSG('A message text that is long enough to need more +
+                          than one line of source when it is written back +
+                          by RTVCLSRC') TOPGMQ(*SAME)
+             MONMSG     MSGID(CPF0000) EXEC(DO)
+               CHGVAR &A 'z'
+             ENDDO
+ DONE:
+             ENDPGM

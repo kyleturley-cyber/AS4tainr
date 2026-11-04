@@ -1,0 +1,11 @@
+# Golden: hexadecimal literals for integer parameters passed by value and
+# assigned to integer and unsigned fields (XMLSERVICE passes x'40' to
+# memset's 10I 0 VALUE parameter and compares the storage with *BLANKS).
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify35.txt -Files tools\golden\verify35
+a35_cleanup|!for c in "DLTF FILE(AS4TRAINR1/GLD35OUT)" "DLTPGM PGM(AS4TRAINR1/GLD35A)"; do system -q "$c"; done; echo cleaned
+a35_tag|!setccsid 819 /home/AS4TRAINR/gld/gld35a.sqlrpgle; ls /home/AS4TRAINR/gld | grep gld35
+a35_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD35OUT (LINE VARCHAR(200))') COMMIT(*NONE)
+a35_crt|CRTSQLRPGI OBJ(AS4TRAINR1/GLD35A) SRCSTMF('/home/AS4TRAINR/gld/gld35a.sqlrpgle') COMMIT(*NONE)
+a35_call|!system "CALL PGM(AS4TRAINR1/GLD35A)"
+a35_rows|CPYF FROMFILE(AS4TRAINR1/GLD35OUT) TOFILE(*PRINT)
+a35_end|!for c in "DLTF FILE(AS4TRAINR1/GLD35OUT)" "DLTPGM PGM(AS4TRAINR1/GLD35A)"; do system -q "$c"; done; echo cleaned

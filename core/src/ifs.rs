@@ -447,6 +447,66 @@ pub async fn unlink(client: &Client, path: &str) -> Result<()> {
     }
 }
 
+/// Change an object's mode (permission bits, CHGAUT) or owner (CHGOWN).
+pub async fn set_mode(client: &Client, path: &str, mode: i32) -> Result<()> {
+    let path = normalize(path)?;
+    let n = client
+        .execute(
+            "UPDATE as4tainr.ifs SET mode = $2 WHERE path_key = $1",
+            &[&key(&path), &mode],
+        )
+        .await?;
+    if n == 0 {
+        return err(errno::ENOENT);
+    }
+    Ok(())
+}
+
+pub async fn set_owner(client: &Client, path: &str, owner: &str) -> Result<()> {
+    let path = normalize(path)?;
+    let n = client
+        .execute(
+            "UPDATE as4tainr.ifs SET owner = $2 WHERE path_key = $1",
+            &[&key(&path), &owner],
+        )
+        .await?;
+    if n == 0 {
+        return err(errno::ENOENT);
+    }
+    Ok(())
+}
+
+/// The data authority three mode bits (r, w, x) give, as DSPAUT and
+/// CHGAUT name it (CL reference, CHGAUT DTAAUT: *RWX, *RW, *RX, *WX, *R,
+/// *W, *X, *EXCLUDE).
+pub fn data_authority(bits: i32) -> &'static str {
+    match bits & 7 {
+        7 => "*RWX",
+        6 => "*RW",
+        5 => "*RX",
+        3 => "*WX",
+        4 => "*R",
+        2 => "*W",
+        1 => "*X",
+        _ => "*EXCLUDE",
+    }
+}
+
+/// CHGAUT DTAAUT's value as three mode bits.
+pub fn authority_bits(dtaaut: &str) -> Option<i32> {
+    Some(match dtaaut {
+        "*RWX" => 7,
+        "*RW" => 6,
+        "*RX" => 5,
+        "*WX" => 3,
+        "*R" => 4,
+        "*W" => 2,
+        "*X" => 1,
+        "*EXCLUDE" | "*NONE" => 0,
+        _ => return None,
+    })
+}
+
 /// Rename an object, keeping an existing target (Qp0lRenameKeep: EEXIST).
 /// A directory moves with everything in it.
 pub async fn rename(client: &Client, old: &str, new: &str) -> Result<()> {

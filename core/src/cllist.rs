@@ -639,9 +639,23 @@ const RCVMSG_TYPES: &[&str] = &[
 ///   severity 30 (`CHGVAR &B2 (X'00' *CAT %SST(&D &I 1))`).
 fn value_checks(line: usize, cmd: &str, st: &crate::clpgm::Statement) -> Vec<Diag> {
     let mut out = Vec::new();
-    for p in &st.params {
+    for (i, p) in st.params.iter().enumerate() {
         let kw = p.keyword.as_deref().unwrap_or("").to_ascii_uppercase();
         let v = p.value.trim();
+        // MOVOBJ TOLIB(QTEMP): CPD0090, severity 30 (PUB400, verify41
+        // j41_crtc).
+        if cmd == "MOVOBJ"
+            && (kw == "TOLIB" || (kw.is_empty() && i == 2))
+            && v.eq_ignore_ascii_case("QTEMP")
+        {
+            out.push(Diag {
+                line,
+                id: "CPD0090".into(),
+                sev: 30,
+                text: "TOLIB cannot be QTEMP: an object is not moved into a job's own library."
+                    .into(),
+            });
+        }
         if cmd == "RCVMSG" && kw == "MSGTYPE" {
             let u = v.to_ascii_uppercase();
             if !u.starts_with('&') && !RCVMSG_TYPES.contains(&u.as_str()) {
@@ -772,5 +786,21 @@ mod tests {
             .map(|d| (d.line, d.id.as_str(), d.sev))
             .collect();
         assert_eq!(ids, [(4, "CPD0084", 30), (5, "CPD0126", 30)]);
+    }
+
+    /// MOVOBJ TOLIB(QTEMP) is CPD0090, severity 30: the program is not
+    /// created (CRTBNDCL on PUB400, verify41 j41_crtc, line 6 of
+    /// gld41c.clle).
+    #[test]
+    fn movobj_to_qtemp() {
+        let src = "PGM\n  MOVOBJ OBJ(A/X) OBJTYPE(*DTAARA) +\n    TOLIB(QTEMP)\n  MOVOBJ A/Y *DTAARA QTEMP\n  MOVOBJ A/Z *DTAARA B\nENDPGM\n";
+        let a = analyze(src, &|c| c == "MOVOBJ", &|_| vec![]);
+        let ids: Vec<(&str, u8)> = a
+            .diags
+            .iter()
+            .filter(|d| d.id != "CPD0791" && d.id != "CPD0792")
+            .map(|d| (d.id.as_str(), d.sev))
+            .collect();
+        assert_eq!(ids, [("CPD0090", 30), ("CPD0090", 30)]);
     }
 }

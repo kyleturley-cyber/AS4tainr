@@ -31,8 +31,13 @@ mod cycle;
 mod errors;
 #[path = "exec_sql.rs"]
 mod exec_sql;
+pub use exec_sql::take_result_sets;
+#[path = "cli.rs"]
+pub mod cli;
 #[path = "ops.rs"]
 mod ops;
+#[path = "pase.rs"]
+pub mod pase;
 #[path = "printer.rs"]
 mod printer;
 #[path = "ptrs.rs"]
@@ -459,12 +464,19 @@ fn ind_name(n: &str) -> String {
     }
 }
 
-/// A value as a float: a big float as it is, a number converted.
 /// A module's global storage put where a call back finds it during a
-/// call out: (its activation unit, or the program's module key, and the
-/// storage as it was).
-type Reentry = Option<(Option<String>, String, Vec<Vec<u8>>)>;
+/// call out.
+type Reentry = Option<Back>;
 
+/// Where a module's storage went for calls back into it during a call
+/// out: its activation group (the unit, the version kept there), or the
+/// program's copy of a bound module's storage (the key, the copy).
+enum Back {
+    Group(String, u64),
+    Module(String, Vec<Vec<u8>>),
+}
+
+/// A value as a float: a big float as it is, a number converted.
 fn float_value(v: &Value) -> Result<f64> {
     match v {
         Value::Float(x) => Ok(*x),
@@ -503,11 +515,21 @@ pub fn char_of_num_edit(d: &Dec, point: char, zero: bool) -> String {
 
 impl<'a> Machine<'a> {
     pub fn new(prog: &'a Program, io: Io<'a>) -> Machine<'a> {
+        Self::with_storage(prog, io, None)
+    }
+
+    /// A machine for the module, on the global storage given (its
+    /// activation's), or a copy of its initial storage.
+    pub fn with_storage(
+        prog: &'a Program,
+        io: Io<'a>,
+        storage: Option<Vec<Vec<u8>>>,
+    ) -> Machine<'a> {
         let owner = super::mem::new_owner();
         Machine {
             prog,
             bufs: {
-                let mut m = super::mem::Mem::new(prog.globals.clone());
+                let mut m = super::mem::Mem::new(storage.unwrap_or_else(|| prog.globals.clone()));
                 m.scratch(Self::largest_based(prog));
                 m
             },
@@ -932,17 +954,18 @@ impl<'a> Machine<'a> {
                 _ => bail!("{} is not a field", parts.join(".")),
             },
             Expr::Name { parts, args } => {
-                let name = parts.join(".");
-                match self.sym(&name) {
+                let name = joined(parts);
+                let name = name.as_ref();
+                match self.sym(name) {
                     Some(Sym::Var(v)) => {
                         let i = self.index_of(args)?;
-                        let i = self.table_index(&name, &v, i);
+                        let i = self.table_index(name, &v, i);
                         if i.is_none() && v.dim > 0 {
                             bail!("{name} is an array: an index is needed here");
                         }
                         if let Some(k) = i {
-                            if self.prog.varying.contains_key(&name) {
-                                let n = self.elems_in_use(&name, &v);
+                            if self.prog.varying.contains_key(name) {
+                                let n = self.elems_in_use(name, &v);
                                 if k < 1 || k > n as i128 {
                                     bail!("RNQ0121: An array index is out of range (index {k}, {n} elements in use).");
                                 }
@@ -957,15 +980,15 @@ impl<'a> Machine<'a> {
                         Value::Char(self.bufs[d.buf][off..off + d.size].to_vec())
                     }
                     Some(Sym::Klist(_)) => bail!("{name} is a key list, not a value"),
-                    None => match name.as_str() {
-                        "*DATE" | "UDATE" => Value::Num(Dec::from_i64(today_num(&name))),
+                    None => match name {
+                        "*DATE" | "UDATE" => Value::Num(Dec::from_i64(today_num(name))),
                         "*DAY" | "UDAY" => Value::Num(Dec::from_i64(today().2 as i64)),
                         "*MONTH" | "UMONTH" => Value::Num(Dec::from_i64(today().1 as i64)),
                         "*YEAR" => Value::Num(Dec::from_i64(today().0 as i64)),
                         "UYEAR" => Value::Num(Dec::from_i64((today().0 % 100) as i64)),
-                        _ if args.is_some() && self.callable(&name) => {
+                        _ if args.is_some() && self.callable(name) => {
                             let args = args.clone().unwrap_or_default();
-                            self.call_named(&name, &args)?.ok_or_else(|| {
+                            self.call_named(name, &args)?.ok_or_else(|| {
                                 anyhow!("procedure {name} returns no value; it cannot be used in an expression")
                             })?
                         }
@@ -1243,13 +1266,11 @@ impl<'a> Machine<'a> {
 
     fn type_of(&self, ex: &Expr) -> Option<DType> {
         match ex {
-            Expr::Name { parts, .. } | Expr::Path { parts, .. } => {
-                match self.sym(&parts.join(".")) {
-                    Some(Sym::Var(v)) => Some(v.dtype),
-                    Some(Sym::Ds(d)) => Some(DType::Char(d.size as u32)),
-                    _ => None,
-                }
-            }
+            Expr::Name { parts, .. } | Expr::Path { parts, .. } => match self.sym(&joined(parts)) {
+                Some(Sym::Var(v)) => Some(v.dtype),
+                Some(Sym::Ds(d)) => Some(DType::Char(d.size as u32)),
+                _ => None,
+            },
             Expr::Ind(_) => Some(DType::Ind),
             _ => None,
         }
@@ -1610,7 +1631,13 @@ impl<'a> Machine<'a> {
                     },
                     None => (v.int_digits() + v.scale() as u32, v.scale() as u32),
                 };
-                let mut out = edit_code(&v, digits, decs, code.chars().next().unwrap_or('Z'));
+                let mut out = edit_code_with(
+                    &v,
+                    digits,
+                    decs,
+                    code.chars().next().unwrap_or('Z'),
+                    self.prog.decedit(),
+                );
                 // The third argument (ILE RPG Reference, %EDITC): *ASTFILL
                 // replaces the leading blanks with asterisks; *CURSYM (the
                 // currency symbol, '$' unless CURSYM says otherwise) or a
@@ -3146,7 +3173,18 @@ impl<'a> Machine<'a> {
                 ext,
                 right,
             } => {
-                let v = self.eval(value)?;
+                let mut v = self.eval(value)?;
+                // A hexadecimal literal assigned to an integer or unsigned
+                // field: its bytes as an unsigned number (XMLSERVICE's
+                // convPad = x'40' on a 10I 0 field gives 64).
+                if let (Expr::Hex(b), Some(DType::Int(_) | DType::Uns(_))) =
+                    (value, self.type_of(target))
+                {
+                    if b.len() <= 8 {
+                        let n = b.iter().fold(0u64, |acc, x| (acc << 8) | *x as u64);
+                        v = Value::Num(Dec::parse(&n.to_string())?);
+                    }
+                }
                 self.assign(
                     target,
                     &v,
@@ -4110,12 +4148,13 @@ impl<'a> Machine<'a> {
                         // Where the error happened, for its exception
                         // message's sender (shown as "line N").
                         None => {
-                            let sender = errors::origin(&err)
-                                .map(|a| a.sender)
-                                .unwrap_or_else(|| self.sender());
+                            let first = errors::origin(&err);
+                            let called = first.as_ref().is_some_and(|a| a.called);
+                            let sender = first.map(|a| a.sender).unwrap_or_else(|| self.sender());
                             return Err(err.context(errors::At {
                                 line: i.line,
                                 sender,
+                                called,
                             }));
                         }
                     }
@@ -4711,13 +4750,43 @@ impl<'a> Machine<'a> {
     }
 }
 
+/// The programs of the operating system `system_program` does (besides
+/// the APIs of `sysapi::is_api`): in QSYS for rslvsp and _RSLOBJ2.
+const SYSTEM_PROGRAMS: &[&str] = &[
+    "QCMDEXC", "QCAPCMD", "QSPRILSP", "QLICHGLL", "QUSPTRUS", "QDCXLATE", "QMHSNDPM", "QMHRCVPM",
+    "QGYOLMSG", "QGYOLJBL", "QMHRSNEM", "QWCRTVCA", "QGYCLST", "QGYOLSPL", "QGYGTLE", "QSPOPNSP",
+    "QSPGETSP", "QSPCLOSP", "QWVRCSTK", "QMHRMVPM",
+];
+
+/// Is NAME a program of QSYS that as4tainr does itself?
+/// A qualified name's parts joined with periods, borrowed when it has
+/// only one (the usual case: no string made for each use of a name).
+fn joined(parts: &[String]) -> std::borrow::Cow<'_, str> {
+    match parts {
+        [one] => std::borrow::Cow::Borrowed(one.as_str()),
+        _ => std::borrow::Cow::Owned(parts.join(".")),
+    }
+}
+
+pub fn is_system_program(name: &str) -> bool {
+    let n = name.trim().to_ascii_uppercase();
+    SYSTEM_PROGRAMS.contains(&n.as_str()) || crate::sysapi::is_api(&n)
+}
+
 impl Machine<'_> {
     /// Programs of the operating system that RPG programs call, done
     /// here (true when `name` is one of them).
     fn system_program(&mut self, name: &str, locs: &[Loc]) -> Result<bool> {
         let text = |m: &Self, l: &Loc| a(&m.bufs[l.buf][l.off..l.off + l.size]);
+        // A number: as the parameter's type says; character storage (a
+        // caller that passes addresses only: PASE's _PGMCALL) as the
+        // APIs' binary(4).
         let num = |m: &Self, l: &Loc| -> Result<Dec> {
-            data::load(&l.dtype, &m.bufs[l.buf][l.off..l.off + l.size])?.num()
+            let b = &m.bufs[l.buf][l.off..l.off + l.size];
+            if matches!(l.dtype, DType::Char(n) if n >= 4) {
+                return Ok(Dec::from_i64(i32::from_be_bytes(b[..4].try_into()?) as i64));
+            }
+            data::load(&l.dtype, b)?.num()
         };
         match name {
             // QCMDEXC (command, length): run a CL command in the job.
@@ -6259,6 +6328,16 @@ impl<'a> Machine<'a> {
                 } else {
                     self.eval(a)?
                 };
+                // A hexadecimal literal for an integer or unsigned
+                // parameter: its bytes as an unsigned number, as in an
+                // assignment (XMLSERVICE's memset(p : x'40' : n) fills
+                // blanks that cacAddLab then compares with *BLANKS).
+                if let (Expr::Hex(b), DType::Int(_) | DType::Uns(_)) = (a, p.dtype) {
+                    if b.len() <= 8 {
+                        let n = b.iter().fold(0u64, |acc, x| (acc << 8) | *x as u64);
+                        v = Value::Num(Dec::parse(&n.to_string())?);
+                    }
+                }
                 // OPTIONS(*TRIM): without leading and trailing blanks.
                 if p.trim {
                     if let Value::Char(b) = &v {
@@ -6349,7 +6428,7 @@ impl<'a> Machine<'a> {
         } else {
             String::new()
         };
-        for sf in &d.subfields {
+        for sf in d.subfields.iter() {
             let full = format!("{prefix}{sf}");
             match self.sym(&full) {
                 Some(Sym::Var(v)) => {
@@ -6427,7 +6506,39 @@ impl<'a> Machine<'a> {
         // Where this entry is, for the call stack (QWVRCSTK).
         crate::pgmmsg::stack_line(&self.io.job_key, self.line);
         let mark = self.temp_strings.len();
-        let r = self.call_named_inner(name, args);
+        // AS4TAINR_TRACE_CALLS=1: each call to standard error (what a
+        // program does on its way to an unexpected result).
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TRACE.get_or_init(|| std::env::var("AS4TAINR_TRACE_CALLS").is_ok()) {
+            eprintln!("[call] {} line {} -> {name}", self.prog.name, self.line);
+        }
+        // An error the called procedure did not handle comes out of the
+        // call: 00202 here (errors::status_code).
+        let r = self.call_named_inner(name, args).map_err(|mut e| {
+            if let Some(a) = e.downcast_mut::<errors::At>() {
+                a.called = true;
+            }
+            e
+        });
+        if *TRACE.get_or_init(|| false) {
+            if let Ok(Some(v)) = &r {
+                let shown = match v {
+                    Value::Char(c) if c.len() > 40 => format!("'{}...'", a(&c[..40])),
+                    v => v.describe(),
+                };
+                eprintln!("[return] {name} = {shown}");
+            }
+        }
+        // A call that ends normally leaves the program status 00000 (the
+        // exception ID in the PSDS stays): PUB400 2026-11-01, verify34
+        // a34_rows: %STATUS and PSDS 11-15 are 0 after a service program
+        // procedure returned, 202 before.
+        if r.is_ok() && self.last.code != 0 && self.last.code < 1000 {
+            self.last.code = 0;
+            if let Some(ds) = self.prog.psds.clone() {
+                self.ds_zoned(&ds, 11, 5, 0);
+            }
+        }
         // The OPTIONS(*STRING) copies last as long as the call.
         for h in self.temp_strings.split_off(mark) {
             if let (Some(f), Some(b)) = (
@@ -6562,10 +6673,39 @@ impl<'a> Machine<'a> {
             }
             None => pr.extproc.clone().unwrap_or_else(|| name.to_string()),
         };
-        match prog.procs.get(&target) {
+        // EXTPROC('Qp2CallPase') names the system procedure, in that case:
+        // not this module's own QP2CALLPASE (XMLSERVICE wraps the one in
+        // the other); names are matched without regard to case otherwise.
+        let system_named = pr
+            .written
+            .as_deref()
+            .is_some_and(|w| w != w.to_ascii_uppercase())
+            && crt::C_FUNCTIONS.contains(&target.as_str());
+        // A procedure the binder found in a module or service program
+        // (XMLSERVICE's own isDigit, in another of its modules) comes
+        // before the system's of the same name: the binder looks at the
+        // objects named first (ILE Concepts, symbol resolution).
+        let bound_import = !system_named
+            && self
+                .io
+                .binding
+                .as_ref()
+                .is_some_and(|b| b.imports.contains_key(&target.to_ascii_uppercase()));
+        match prog.procs.get(&target).filter(|_| !system_named) {
             Some(pi) => {
                 let a = self.args_for(name, &pr.params, args)?;
                 self.call_proc(pi, a)
+            }
+            None if bound_import => {
+                let sym = target.to_ascii_uppercase();
+                let t = self
+                    .io
+                    .binding
+                    .as_ref()
+                    .and_then(|b| b.imports.get(&sym))
+                    .cloned();
+                let a = self.args_for(name, &pr.params, args)?;
+                self.call_bound(&sym, &t.expect("checked above"), a)
             }
             None if cee::CEE_APIS.contains(&target.to_ascii_uppercase().as_str()) => {
                 let a = self.args_for(name, &pr.params, args)?;
@@ -6690,6 +6830,50 @@ impl<'a> Machine<'a> {
         self.run_bound(sym, target, args, unit, binding, prog, pi)
     }
 
+    /// A bound call whose arguments are made from the callee's
+    /// interface (PASE's _ILECALL: an argument list without a prototype
+    /// of the caller's): the return value and its type.
+    fn call_bound_built(
+        &mut self,
+        sym: &str,
+        target: &crate::ile::Target,
+        build: &mut dyn FnMut(&mut Self, &ProcInfo) -> Result<Vec<Arg>>,
+    ) -> Result<(Option<Value>, Option<DType>)> {
+        let client = self.io.client;
+        let libl = self.io.libl.clone();
+        let bound_key = (
+            self.io.job_key.clone(),
+            self.io.actgrp.clone(),
+            format!("{}|{:?}|None|{sym}", self.io.program, target),
+        );
+        let cached = BOUND
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|m| m.get(&bound_key).cloned()));
+        let generation = crate::ile::BINDING_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+        let (_, unit, binding, prog) = match cached.filter(|c| c.0 == generation) {
+            Some(c) => c,
+            None => {
+                let mut c = self.resolve_bound(sym, target, None, client, &libl)?;
+                c.0 = generation;
+                if let Ok(mut g) = BOUND.lock() {
+                    g.get_or_insert_with(HashMap::new)
+                        .insert(bound_key, c.clone());
+                }
+                c
+            }
+        };
+        let prog: &Program = &prog;
+        let pi = prog
+            .procs
+            .get(sym)
+            .filter(|pi| pi.export)
+            .ok_or_else(|| anyhow!("CPD5D02: Module does not export {sym}."))?;
+        let args = build(self, pi)?;
+        let r = self.run_bound(sym, target, args, unit, binding, prog, pi)?;
+        Ok((r, pi.returns))
+    }
+
     /// The program fields of a record format (a file's, or a display
     /// file's format), if `name` is one.
     fn format_fields(&self, name: &str) -> Option<Vec<String>> {
@@ -6802,12 +6986,13 @@ impl<'a> Machine<'a> {
                 act: self.owner,
                 globals: self.prog.globals.len(),
                 bufs: std::mem::take(&mut self.bufs.own),
+                pulled: None,
             });
             mach.bufs.heap = std::mem::take(&mut self.bufs.heap);
             mach.heap_lent = true;
             let r = mach.run_bytes(&mut parms);
-            self.bufs.own = mach.bufs.lent.pop().map(|l| l.bufs).unwrap_or_default();
-            self.bufs.lent = std::mem::take(&mut mach.bufs.lent);
+            (self.bufs.own, self.bufs.lent) =
+                super::mem::give_back(std::mem::take(&mut mach.bufs.lent));
             self.bufs.heap = std::mem::take(&mut mach.bufs.heap);
             self.messages.append(&mut mach.messages);
             self.printed.append(&mut mach.printed);
@@ -7099,10 +7284,53 @@ impl<'a> Machine<'a> {
         // bound module's storage), so the callee (or a procedure it calls
         // through a pointer) runs on the same storage; what such a call
         // changed comes back after.
-        let reentry = self.reentry_out();
+        // A service program module calling another bound procedure
+        // leaves its storage where it is: lent to the call, where a call
+        // back into the module finds it (`running` below).
+        let reentry = if self.io.unit.is_some() {
+            None
+        } else {
+            self.reentry_out()
+        };
         // The module's global storage: its activation, or its first use.
+        // (A module whose storage a caller took for its call is in the
+        // lent storage: the call runs on it, and it goes back there.)
+        let mut from_lent = None;
+        // A call back into a module that is running (it called out and
+        // is lent to the call): a copy of its storage, which goes back
+        // into it after (None: this module's own).
+        let mut from_running: Option<(Option<usize>, Vec<Vec<u8>>)> = None;
         let storage = if let Some(u) = &act_unit {
-            crate::ile::activation(&self.io.job_key, &group, u)
+            crate::ile::take_activation(&self.io.job_key, &group, u)
+                .or_else(|| {
+                    // (Not one taken from there by the call running it.)
+                    let i = self.bufs.lent.iter().rposition(|l| {
+                        l.pulled
+                            .as_ref()
+                            .is_some_and(|(g, x)| *g == group && x == u)
+                            && !l.bufs.is_empty()
+                    })?;
+                    from_lent = Some(i);
+                    Some(std::mem::take(&mut self.bufs.lent[i].bufs))
+                })
+                .or_else(|| {
+                    let act = crate::ile::activation_owner(&self.io.job_key, &group, u);
+                    let n = prog.globals.len();
+                    let (at, b) =
+                        if act == self.owner && self.io.unit.as_deref() == Some(u.as_str()) {
+                            (None, &self.bufs.own)
+                        } else {
+                            let i = self
+                                .bufs
+                                .lent
+                                .iter()
+                                .rposition(|l| l.act == act && l.pulled.is_none())?;
+                            (Some(i), &self.bufs.lent[i].bufs)
+                        };
+                    let copy = b[..n.min(b.len())].to_vec();
+                    from_running = Some((at, copy.clone()));
+                    Some(copy)
+                })
         } else {
             self.io
                 .modules
@@ -7110,7 +7338,8 @@ impl<'a> Machine<'a> {
                 .ok()
                 .and_then(|m| m.get(&unit).cloned())
         };
-        let mut m = Machine::new(
+        let fresh = storage.is_none();
+        let mut m = Machine::with_storage(
             prog,
             Io {
                 rt: self.io.rt.clone(),
@@ -7139,6 +7368,7 @@ impl<'a> Machine<'a> {
                 },
                 shared: self.io.shared.clone(),
             },
+            storage,
         );
         if let Some(u) = &act_unit {
             m.owner = crate::ile::activation_owner(&self.io.job_key, &group, u);
@@ -7162,13 +7392,10 @@ impl<'a> Machine<'a> {
             }
             m.printers = printers;
         }
-        match storage {
-            Some(s) => m.bufs.own = s,
-            None => {
-                m.user_inz()?;
-                // The module's PSDS, set when it is activated.
-                m.psds_start();
-            }
+        if fresh {
+            m.user_inz()?;
+            // The module's PSDS, set when it is activated.
+            m.psds_start();
         }
         // Exported data: the caller's changes go to the shared copy, the
         // callee sees them.
@@ -7191,7 +7418,37 @@ impl<'a> Machine<'a> {
             act: self.owner,
             globals: self.prog.globals.len(),
             bufs: std::mem::take(&mut self.bufs.own),
+            pulled: None,
         });
+        // The other modules activated in the group (not running): a
+        // pointer to their static storage that this module or the callee
+        // got reaches it during the call.
+        if act_unit.is_some() {
+            let except: Vec<String> = [Some(unit.clone()), act_unit.clone(), self.io.unit.clone()]
+                .into_iter()
+                .flatten()
+                .collect();
+            let running: Vec<u32> = m.bufs.lent.iter().map(|l| l.act).collect();
+            // Modules running (their copy for calls back into them) and a
+            // program's entry module's copy (`reentry_out`, "PGM ...") stay
+            // where those calls find them.
+            let job = self.io.job_key.clone();
+            let stays = |u: &str| {
+                except.iter().any(|x| x == u)
+                    || u.starts_with("PGM ")
+                    || running.contains(&crate::ile::activation_owner(&job, &group, u))
+            };
+            for (u, bufs) in crate::ile::take_activations(&self.io.job_key, &group, &stays) {
+                let act = crate::ile::activation_owner(&self.io.job_key, &group, &u);
+                m.bufs.lent.push(super::mem::Lent {
+                    owner: act,
+                    act,
+                    globals: bufs.len(),
+                    bufs,
+                    pulled: Some((group.clone(), u)),
+                });
+            }
+        }
         m.bufs.heap = std::mem::take(&mut self.bufs.heap);
         let lent = |b: usize| -> usize {
             if b < super::mem::HEAP_BASE {
@@ -7223,16 +7480,32 @@ impl<'a> Machine<'a> {
             m.sql.keep(sql_key);
         }
         m.share_out();
+        // The activations taken for the call (and those the callee's own
+        // calls left) stay with the caller: a pointer it got to their
+        // static storage reaches them; they go back to their groups when
+        // the outermost procedure ends (`Drop`).
         // The caller's storage comes back.
-        self.bufs.own = m.bufs.lent.pop().map(|l| l.bufs).unwrap_or_default();
-        self.bufs.lent = std::mem::take(&mut m.bufs.lent);
+        (self.bufs.own, self.bufs.lent) = super::mem::give_back(std::mem::take(&mut m.bufs.lent));
         self.bufs.heap = std::mem::take(&mut m.bufs.heap);
         self.reentry_in(reentry);
         self.share_in();
         self.messages.append(&mut m.messages);
         self.printed.append(&mut m.printed);
         self.logged.append(&mut m.logged);
-        let kept: Vec<Vec<u8>> = m.bufs.own[..globals].to_vec();
+        // The library list is the job's: a change the callee made (a
+        // CHGLIBL it ran) holds for the caller too.
+        if m.io.libl != self.io.libl {
+            self.io.libl = m.io.libl.clone();
+            if let (Some(c), Some(mc)) = (self.io.cl.as_mut(), m.io.cl.as_ref()) {
+                c.user_libl = mc.user_libl.clone();
+                c.curlib = mc.curlib.clone();
+            }
+        }
+        let kept: Vec<Vec<u8>> = {
+            let mut own = std::mem::take(&mut m.bufs.own);
+            own.truncate(globals);
+            own
+        };
         // Printed lines go to the spooled file now; the file stays open.
         let names: Vec<String> = m.printers.keys().cloned().collect();
         for n in names {
@@ -7247,7 +7520,61 @@ impl<'a> Machine<'a> {
             }
         }
         if let Some(u) = &act_unit {
-            crate::ile::keep_activation(&self.io.job_key, &group, u, kept);
+            // Kept with the caller (see above), unless the module is on
+            // the stack further up (its storage is with its caller there).
+            // A copy it left in the group while it ran is older: dropped.
+            let act = crate::ile::activation_owner(&self.io.job_key, &group, u);
+            let pulled_at = from_lent.or_else(|| {
+                self.bufs.lent.iter().rposition(|l| {
+                    l.pulled
+                        .as_ref()
+                        .is_some_and(|(g, x)| *g == group && x == u)
+                })
+            });
+            let running = self
+                .bufs
+                .lent
+                .iter()
+                .any(|l| l.act == act && l.pulled.is_none())
+                || act == self.owner;
+            // A call back into a running module: what it changed goes
+            // into the module's storage (what else changed there during
+            // the call, through pointers, stays).
+            if let Some((at, orig)) = from_running {
+                let dest = match at {
+                    Some(i) => self.bufs.lent.get_mut(i).map(|l| &mut l.bufs),
+                    None => Some(&mut self.bufs.own),
+                };
+                if let Some(dest) = dest {
+                    for ((d, old), new) in dest.iter_mut().zip(&orig).zip(&kept) {
+                        if old != new && old.len() == new.len() && d.len() == new.len() {
+                            for ((x, o), n) in d.iter_mut().zip(old).zip(new) {
+                                if o != n {
+                                    *x = *n;
+                                }
+                            }
+                        }
+                    }
+                }
+            // A program's entry module called back: its copy goes back
+            // where the program's `reentry_in` finds it.
+            } else if running || u.starts_with("PGM ") {
+                crate::ile::keep_activation(&self.io.job_key, &group, u, kept);
+            } else if let Some(i) = pulled_at {
+                crate::ile::drop_activation(&self.io.job_key, &group, u);
+                if let Some(l) = self.bufs.lent.get_mut(i) {
+                    l.bufs = kept;
+                }
+            } else {
+                crate::ile::drop_activation(&self.io.job_key, &group, u);
+                self.bufs.lent.push(super::mem::Lent {
+                    owner: act,
+                    act,
+                    globals: kept.len(),
+                    bufs: kept,
+                    pulled: Some((group.clone(), u.clone())),
+                });
+            }
         } else if let Ok(mut g) = self.io.modules.lock() {
             g.insert(unit, kept);
         }
@@ -7481,7 +7808,9 @@ impl<'a> Machine<'a> {
                 // procedure gets all its storage, as through a pointer to
                 // the parameter (OPTIONS(*VARSIZE), list parameters).
                 match v {
-                    Value::Char(c) if c.len() > size && matches!(p.dtype, DType::Char(_)) => {
+                    Value::Char(c)
+                        if c.len() > size && matches!(p.dtype, DType::Char(_) | DType::Pointer) =>
+                    {
                         b = c.clone();
                     }
                     _ => data::store(
@@ -7778,51 +8107,71 @@ impl<'a> Machine<'a> {
     /// (ILE Concepts: one static storage per activation).
     fn reentry_out(&mut self) -> Reentry {
         let n = self.prog.globals.len().min(self.bufs.own.len());
-        if let Some(u) = self.io.unit.clone() {
-            let snap = self.bufs.own[..n].to_vec();
-            crate::ile::keep_activation(&self.io.job_key, &self.io.actgrp, &u, snap.clone());
-            Some((Some(u), String::new(), snap))
-        } else if let Some(m) = self.io.program.strip_prefix("*BOUND/") {
-            let key = format!("MODULE {m}");
-            let snap = self.bufs.own[..n].to_vec();
-            if let Ok(mut g) = self.io.modules.lock() {
-                g.insert(key.clone(), snap.clone());
-            }
-            Some((None, key, snap))
+        let unit = if let Some(u) = self.io.unit.clone() {
+            Some(u)
+        } else if self.io.program.strip_prefix("*BOUND/").is_some() {
+            None
         } else if self.io.program.contains('/') && !self.io.program.starts_with('*') {
             // A program's entry module: where a procedure pointer into it
             // (Target::Pgm) finds its storage.
-            let u = format!("PGM {}", self.io.program);
-            let snap = self.bufs.own[..n].to_vec();
-            crate::ile::keep_activation(&self.io.job_key, &self.io.actgrp, &u, snap.clone());
-            Some((Some(u), String::new(), snap))
+            Some(format!("PGM {}", self.io.program))
         } else {
-            None
+            return None;
+        };
+        let snap = self.bufs.own[..n].to_vec();
+        match unit {
+            // In the activation group: a version to compare with after
+            // the call (no copy kept here).
+            Some(u) => {
+                let v = crate::ile::keep_watched(&self.io.job_key, &self.io.actgrp, &u, snap);
+                Some(Back::Group(u, v))
+            }
+            None => {
+                let m = self.io.program.strip_prefix("*BOUND/").unwrap_or_default();
+                let key = format!("MODULE {m}");
+                if let Ok(mut g) = self.io.modules.lock() {
+                    g.insert(key.clone(), snap.clone());
+                }
+                Some(Back::Module(key, snap))
+            }
         }
     }
 
     /// After the call: what a call back changed in the module's storage
     /// comes back.
     fn reentry_in(&mut self, reentry: Reentry) {
-        let Some((u, key, snap)) = reentry else {
+        let Some(back) = reentry else {
             return;
         };
-        let now = match u {
-            Some(u) => crate::ile::activation(&self.io.job_key, &self.io.actgrp, &u),
-            None => self
-                .io
-                .modules
-                .lock()
-                .ok()
-                .and_then(|g| g.get(&key).cloned()),
+        let (snap, now) = match back {
+            Back::Group(u, v) => {
+                // A service program module's copy goes (its storage is
+                // this machine's); a program entry module's stays for
+                // procedure pointers into it after the program returned.
+                let forget = !u.starts_with("PGM ");
+                match crate::ile::changed_since(&self.io.job_key, &self.io.actgrp, &u, v, forget) {
+                    Some(x) => x,
+                    None => return,
+                }
+            }
+            Back::Module(key, snap) => {
+                match self
+                    .io
+                    .modules
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.get(&key).cloned())
+                {
+                    Some(now) => (snap, now),
+                    None => return,
+                }
+            }
         };
-        if let Some(now) = now {
-            for (i, (old, new)) in snap.iter().zip(&now).enumerate() {
-                if old != new && old.len() == new.len() {
-                    for (j, (o, n)) in old.iter().zip(new).enumerate() {
-                        if o != n {
-                            self.bufs.own[i][j] = *n;
-                        }
+        for (i, (old, new)) in snap.iter().zip(&now).enumerate() {
+            if old != new && old.len() == new.len() {
+                for (j, (o, n)) in old.iter().zip(new).enumerate() {
+                    if o != n {
+                        self.bufs.own[i][j] = *n;
                     }
                 }
             }
@@ -8024,6 +8373,7 @@ impl<'a> Machine<'a> {
                 act: self.owner,
                 globals: self.prog.globals.len(),
                 bufs: std::mem::take(&mut self.bufs.own),
+                pulled: None,
             });
             // In the same activation group, the same heap.
             let share_heap = m.io.actgrp == self.io.actgrp;
@@ -8032,8 +8382,8 @@ impl<'a> Machine<'a> {
                 m.heap_lent = true;
             }
             let r = m.run_bytes(&mut parms);
-            self.bufs.own = m.bufs.lent.pop().map(|l| l.bufs).unwrap_or_default();
-            self.bufs.lent = std::mem::take(&mut m.bufs.lent);
+            (self.bufs.own, self.bufs.lent) =
+                super::mem::give_back(std::mem::take(&mut m.bufs.lent));
             if share_heap {
                 self.bufs.heap = std::mem::take(&mut m.bufs.heap);
             }
@@ -8183,7 +8533,7 @@ impl Machine<'_> {
             return edit_word(&value, digits, decs, &word);
         }
         Ok(match f.edit_code {
-            Some(c) => edit_code(&value, digits, decs, c),
+            Some(c) => edit_code_with(&value, digits, decs, c, self.prog.decedit()),
             None => {
                 // No edit code: every digit, a minus sign after a
                 // negative number.
@@ -8538,7 +8888,23 @@ pub fn edit_word(v: &Dec, digits: u32, decs: u32, word: &str) -> Result<String> 
 }
 
 pub fn edit_code(v: &Dec, digits: u32, decs: u32, code: char) -> String {
+    edit_code_with(v, digits, decs, code, ('.', false))
+}
+
+/// An edit code with the program's DECEDIT (ILE RPG Reference, control
+/// keyword DECEDIT: the decimal point character, a comma for the
+/// thousands separator when the point is a period and a period when it
+/// is a comma, and with '0,' or '0.' a zero before the point of a value
+/// below 1).
+pub fn edit_code_with(
+    v: &Dec,
+    digits: u32,
+    decs: u32,
+    code: char,
+    (point, zero): (char, bool),
+) -> String {
     let code = code.to_ascii_uppercase();
+    let thousands = if point == ',' { '.' } else { ',' };
     let d = v.rescale(decs as u8, false).unwrap_or(*v);
     let raw = d.mantissa().unsigned_abs().to_string();
     let raw = format!("{:0>w$}", raw, w = digits as usize);
@@ -8586,12 +8952,15 @@ pub fn edit_code(v: &Dec, digits: u32, decs: u32, code: char) -> String {
     let mut int_out = String::new();
     for (k, c) in int_trim.chars().enumerate() {
         if commas && k > 0 && (int_trim.len() - k) % 3 == 0 {
-            int_out.push(',');
+            int_out.push(thousands);
         }
         int_out.push(c);
     }
+    if zero && decs > 0 && int_out.is_empty() {
+        int_out.push('0');
+    }
     let body = if decs > 0 && code != 'Z' {
-        format!("{int_out}.{frac}")
+        format!("{int_out}{point}{frac}")
     } else if int_out.is_empty() {
         // Codes that do not blank zero show one zero.
         "0".to_string()
@@ -9107,6 +9476,18 @@ fn overprint(old: &str, new: &str) -> String {
     o.into_iter().collect()
 }
 
+/// The activations a procedure took for its calls (`run_bound`) go back
+/// to their activation groups when the outermost one ends.
+impl Drop for Machine<'_> {
+    fn drop(&mut self) {
+        for l in std::mem::take(&mut self.bufs.lent) {
+            if let Some((group, unit)) = l.pulled {
+                crate::ile::keep_activation(&self.io.job_key, &group, &unit, l.bufs);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9167,6 +9548,22 @@ mod tests {
         assert_eq!(ew("1000.00", 6, 2, "  ,  $0.  "), " $1,000.00");
         // The ampersand is a blank.
         assert_eq!(ew("12", 2, 0, "  &DOLLARS"), "12 DOLLARS");
+    }
+
+    #[test]
+    fn edit_codes_with_decedit() {
+        // ILE RPG Reference, control keyword DECEDIT: '0,' makes the
+        // decimal point a comma, the thousands separator a period, and
+        // puts a zero before the point of a value below 1 (iRPGUnit's
+        // H_SPEC, DECEDIT('0,'), formats numbers this way).
+        assert_eq!(
+            edit_code_with(&Dec::parse("-0.5").unwrap(), 15, 5, 'P', (',', true)).trim(),
+            "-0,50000"
+        );
+        assert_eq!(
+            edit_code_with(&Dec::parse("1234.50").unwrap(), 7, 2, '1', (',', false)).trim(),
+            "1.234,50"
+        );
     }
 
     #[test]

@@ -612,6 +612,9 @@ fn fixed_type(
         'T' => DType::Time(crate::rpg::dates::TimeFmt::unset()),
         'Z' => DType::Timestamp(6),
         '*' => DType::Pointer,
+        // An object reference (CLASS(*JAVA:...)): a reference as wide as
+        // a pointer; there is no JVM, so a Java method call fails.
+        'O' => DType::Pointer,
         other => bail!("data type {other} is not supported yet"),
     }))
 }
@@ -675,6 +678,7 @@ fn free_type(word: &str, args: &[String]) -> Result<Option<DType>> {
             None => DType::Timestamp(6),
         },
         "POINTER" => DType::Pointer,
+        "OBJECT" => DType::Pointer,
         _ => return Ok(None),
     }))
 }
@@ -867,7 +871,8 @@ pub fn parse_defined(
         selects: vec![],
     };
     ctx.src.ctdata = lines.ctdata;
-    let units = std::mem::take(&mut lines.units);
+    let mut units = std::mem::take(&mut lines.units);
+    join_continued_literals(&mut units);
     let mut i = 0;
     while i < units.len() {
         match &units[i] {
@@ -1039,6 +1044,53 @@ fn name_continuation(cs: &[char]) -> Option<String> {
         .map(String::from)
 }
 
+/// A literal in a D spec's keyword area continued on the next D line
+/// (ILE RPG Reference, "Continuation Rules": a literal ending in '-' goes
+/// on with position 44 of the next line, one ending in '+' with its first
+/// nonblank character), joined into one keyword area; the next line's is
+/// left empty.
+fn join_continued_literals(units: &mut [Unit]) {
+    for i in 0..units.len().saturating_sub(1) {
+        let Unit::Spec('D', cs, _) = &units[i] else {
+            continue;
+        };
+        let area = col(cs, 44, cs.len().max(80));
+        let head = area.trim_end();
+        if head.matches('\'').count().is_multiple_of(2) {
+            continue;
+        }
+        let Some(marker) = head.chars().last().filter(|c| *c == '-' || *c == '+') else {
+            continue;
+        };
+        let Unit::Spec('D', next, _) = &units[i + 1] else {
+            continue;
+        };
+        if !col(next, 7, 43).trim().is_empty() {
+            continue;
+        }
+        let more = col(next, 44, next.len().max(80));
+        let more = if marker == '-' {
+            more.trim_end().to_string()
+        } else {
+            more.trim().to_string()
+        };
+        let mut joined: Vec<char> = cs[..43.min(cs.len())].to_vec();
+        joined.resize(43, ' ');
+        joined.extend(head[..head.len() - 1].chars());
+        joined.extend(more.chars());
+        let mut blanked = next.clone();
+        for c in blanked.iter_mut().skip(43) {
+            *c = ' ';
+        }
+        if let Unit::Spec(_, c, _) = &mut units[i] {
+            *c = joined;
+        }
+        if let Unit::Spec(_, c, _) = &mut units[i + 1] {
+            *c = blanked;
+        }
+    }
+}
+
 fn fixed_d(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
     let raw_name = colt(cs, 7, 21);
     // A long name: NAME... on this line, the definition on the next.
@@ -1058,7 +1110,23 @@ fn fixed_d(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
     let mut to = colt(cs, 33, 39);
     let tchar = cs.get(39).copied().unwrap_or(' ');
     let decs = colt(cs, 41, 42);
-    let mut kws = keywords(&col(cs, 44, 80))?;
+    let area = col(cs, 44, cs.len().max(80));
+    // A named constant's value written in the keyword area without CONST:
+    // a literal (its case kept, blanks in it) or a constant expression
+    // (ILE RPG Reference, named constants: %DIV(%SIZE(A):%SIZE(B))).
+    let literal_const = dtype_code == "C"
+        && !area
+            .trim_start()
+            .get(..6)
+            .is_some_and(|k| k.eq_ignore_ascii_case("CONST("));
+    let mut kws = if literal_const {
+        vec![Keyword {
+            name: "CONST".into(),
+            args: vec![area.trim().to_string()],
+        }]
+    } else {
+        keywords(&area)?
+    };
     // Position 23 of a DS line: S, the program status data structure; U,
     // a data area data structure (ILE RPG Reference, definition
     // specifications position 23).
@@ -1108,6 +1176,23 @@ fn fixed_d(ctx: &mut Ctx, cs: &[char], lineno: usize) -> Result<()> {
             .defs()
             .last_mut()
             .ok_or_else(|| anyhow!("keywords continue no definition"))?;
+        // A named constant's literal continued: '-' goes on with position
+        // 44 of this line, '+' with its first nonblank character (ILE RPG
+        // Reference, "Continuation Rules" for literals).
+        if target.kind == DefKind::Const {
+            if let Some(k) = target.keywords.iter_mut().find(|k| k.name == "CONST") {
+                if let Some(v) = k.args.last_mut() {
+                    if let Some(head) = v.strip_suffix('-') {
+                        *v = format!("{head}{}", area.trim_end());
+                        return Ok(());
+                    }
+                    if let Some(head) = v.strip_suffix('+') {
+                        *v = format!("{head}{}", area.trim());
+                        return Ok(());
+                    }
+                }
+            }
+        }
         target.keywords.extend(kws);
         return Ok(());
     }

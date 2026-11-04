@@ -15,6 +15,35 @@ use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// A table of names: looked up for every use of a name as a program
+/// runs, with a quick hash (FxHash's multiply-rotate: names come from
+/// the program's own source, not from outside it).
+pub type SymMap = HashMap<String, Sym, std::hash::BuildHasherDefault<NameHasher>>;
+
+/// FxHash (as in rustc): one multiply and rotate per word.
+#[derive(Default, Clone, Copy)]
+pub struct NameHasher(u64);
+
+impl std::hash::Hasher for NameHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let w = u64::from_le_bytes(c.try_into().unwrap_or([0; 8]));
+            self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(K);
+        }
+        for &b in chunks.remainder() {
+            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(K);
+        }
+    }
+    fn write_u8(&mut self, b: u8) {
+        self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 /// Where a variable's bytes are: a storage buffer and an offset.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VarInfo {
@@ -40,7 +69,7 @@ pub struct DsInfo {
     pub size: usize,
     pub dim: u32,
     pub qualified: bool,
-    pub subfields: Vec<String>,
+    pub subfields: std::sync::Arc<[String]>,
     pub local: bool,
 }
 
@@ -223,7 +252,7 @@ pub struct ProcInfo {
     pub written: Option<String>,
     /// Local names (variables with `local` set: their buffers are the
     /// frame's), constants and key lists.
-    pub syms: HashMap<String, Sym>,
+    pub syms: SymMap,
     /// Initial contents of the frame buffers of a call.
     pub frame: Vec<Vec<u8>>,
     pub params: Vec<ParamInfo>,
@@ -247,7 +276,7 @@ pub struct ProcInfo {
 #[derive(Clone, Debug)]
 pub struct Program {
     pub name: String,
-    pub syms: HashMap<String, Sym>,
+    pub syms: SymMap,
     /// Initial contents of the global storage buffers.
     pub globals: Vec<Vec<u8>>,
     pub files: Vec<FileInfo>,
@@ -623,12 +652,12 @@ fn display_type(f: &crate::dspf::Field) -> DType {
     }
 }
 
-fn literal_value(text: &str, syms: &HashMap<String, Sym>) -> Result<Value> {
+fn literal_value(text: &str, syms: &SymMap) -> Result<Value> {
     let e = expr::parse(text)?;
     const_value(&e, syms)
 }
 
-fn const_value(e: &Expr, syms: &HashMap<String, Sym>) -> Result<Value> {
+fn const_value(e: &Expr, syms: &SymMap) -> Result<Value> {
     Ok(match e {
         Expr::Num(d) => Value::Num(*d),
         Expr::Str(s) | Expr::Hex(s) => Value::Char(s.clone()),
@@ -643,7 +672,14 @@ fn const_value(e: &Expr, syms: &HashMap<String, Sym>) -> Result<Value> {
         // compiled (ILE RPG Reference: both are allowed in definition
         // keywords such as INZ and DIM). %SIZE of an array is the size of
         // one element.
-        Expr::Bif(f, a) if (f == "SIZE" || f == "ELEM") && a.len() == 1 => {
+        // %SIZE(array:*ALL): the whole array.
+        Expr::Bif(f, a)
+            if (f == "SIZE" || f == "ELEM")
+                && (a.len() == 1
+                    || f == "SIZE"
+                        && a.len() == 2
+                        && matches!(&a[1], Expr::Name { parts, .. } if parts[0] == "*ALL")) =>
+        {
             let Expr::Name { parts, args: None } = &a[0] else {
                 bail!("%{f} needs the name of a defined item");
             };
@@ -654,7 +690,11 @@ fn const_value(e: &Expr, syms: &HashMap<String, Sym>) -> Result<Value> {
                 Some(Sym::Const(Value::Char(c))) if f == "SIZE" => (c.len(), 0),
                 _ => bail!("%{f}({name}): {name} is not defined before it is used"),
             };
-            let n = if f == "SIZE" { size as i64 } else { dim as i64 };
+            let n = match (f.as_str(), a.len()) {
+                ("SIZE", 2) => (size * dim.max(1) as usize) as i64,
+                ("SIZE", _) => size as i64,
+                _ => dim as i64,
+            };
             Value::Num(Dec::from_i64(n))
         }
         // %LEN of a defined item of fixed length: its length in
@@ -705,6 +745,26 @@ fn const_value(e: &Expr, syms: &HashMap<String, Sym>) -> Result<Value> {
                 _ => bail!("%DECPOS({name}): it is not a numeric item defined before it is used"),
             }
         }
+        // %DIV and %REM of constants (ILE RPG Reference: both are allowed
+        // in definitions; XMLSERVICE's SBMNBR is %DIV(%SIZE(..):%SIZE(..))).
+        Expr::Bif(f, a) if (f == "DIV" || f == "REM") && a.len() == 2 => {
+            let (l, r) = (
+                const_value(&a[0], syms)?.num()?,
+                const_value(&a[1], syms)?.num()?,
+            );
+            Value::Num(if f == "DIV" {
+                l.trunc().div_scale(&r.trunc(), 0)?
+            } else {
+                l.trunc().rem(&r.trunc())?
+            })
+        }
+        // %UCS2 or %CHAR of a literal: the literal, converted when it is
+        // stored in the field it initializes.
+        Expr::Bif(f, a)
+            if (f == "UCS2" || f == "CHAR") && a.len() == 1 && matches!(a[0], Expr::Str(_)) =>
+        {
+            const_value(&a[0], syms)?
+        }
         Expr::Bin(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), l, r) => {
             let (l, r) = (const_value(l, syms)?.num()?, const_value(r, syms)?.num()?);
             Value::Num(match op {
@@ -717,7 +777,7 @@ fn const_value(e: &Expr, syms: &HashMap<String, Sym>) -> Result<Value> {
     })
 }
 
-fn num_arg(a: &str, syms: &HashMap<String, Sym>) -> Result<u32> {
+fn num_arg(a: &str, syms: &SymMap) -> Result<u32> {
     if let Ok(n) = a.trim().parse() {
         return Ok(n);
     }
@@ -794,7 +854,7 @@ pub fn program_type(f: &crate::dds::FieldDef, in_ds: bool, extbinint: bool) -> O
 type RecordFormat = (Vec<(String, DType)>, Vec<String>);
 
 struct Binder<'a> {
-    syms: HashMap<String, Sym>,
+    syms: SymMap,
     bufs: Vec<Vec<u8>>,
     externals: &'a HashMap<String, FileRef>,
     /// Types of external file fields, by name.
@@ -1412,6 +1472,22 @@ impl Binder<'_> {
             if matches!(&v, Err(t) if t.trim().eq_ignore_ascii_case("*LIKEDS")) {
                 continue;
             }
+            // A hexadecimal literal for a numeric field of its size: its
+            // bytes (XMLSERVICE's INZ(X'FFFFFFFF') on a 10U 0 field).
+            if let (Err(text), Some(Sym::Var(var))) = (&v, self.syms.get(&name).cloned()) {
+                let t = text.trim();
+                if var.dtype.is_numeric() && (t.starts_with("X'") || t.starts_with("x'")) {
+                    if let Ok(Value::Char(bytes)) = literal_value(t, &self.syms) {
+                        if bytes.len() == var.dtype.size() {
+                            for k in 0..var.dim.max(1) as usize {
+                                let at = var.off + k * var.stride;
+                                self.bufs[var.buf][at..at + bytes.len()].copy_from_slice(&bytes);
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
             let v = match v {
                 Ok(v) => v,
                 Err(text) => literal_value(&text, &self.syms)?,
@@ -1426,7 +1502,8 @@ impl Binder<'_> {
                         out,
                         data::Fit::Strict { half_adjust: false },
                         false,
-                    )?;
+                    )
+                    .map_err(|e| anyhow!("INZ of {name}: {e}"))?;
                 }
             }
         }
@@ -1585,8 +1662,17 @@ impl Binder<'_> {
             }
             if let Some(a) = k.args.first().filter(|a| !a.is_empty()) {
                 // A value that names something not defined yet is worked
-                // out once all definitions are in.
-                let v = literal_value(a, &self.syms).map_err(|_| a.clone());
+                // out once all definitions are in (a hexadecimal literal
+                // too: for a numeric field it gives the bytes).
+                let hex = a
+                    .trim_start()
+                    .get(..2)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("X'"));
+                let v = if hex {
+                    Err(a.clone())
+                } else {
+                    literal_value(a, &self.syms).map_err(|_| a.clone())
+                };
                 self.inz.push((name.to_string(), v));
             }
         }
@@ -1730,7 +1816,7 @@ impl Binder<'_> {
             };
             let other = &tname;
             template = Some((other.clone(), o.clone()));
-            for sf in &o.subfields {
+            for sf in o.subfields.iter() {
                 let key = if o.qualified {
                     format!("{other}.{sf}")
                 } else {
@@ -2149,7 +2235,7 @@ impl Binder<'_> {
                 size,
                 dim,
                 qualified: qualified || likeds.is_some() || likerec.is_some(),
-                subfields: names,
+                subfields: names.into(),
                 local: self.local,
             }),
         );
@@ -2248,7 +2334,7 @@ pub fn bind(
     printers: &HashMap<String, PrinterInfo>,
 ) -> Result<Program> {
     let mut b = Binder {
-        syms: HashMap::new(),
+        syms: SymMap::default(),
         bufs: vec![],
         externals,
         file_fields: HashMap::new(),
@@ -2741,7 +2827,7 @@ pub fn bind(
             b.bufs.push(pb.bufs[lb].clone());
             moved.insert(lb, b.bufs.len() - 1);
         }
-        let mut syms = HashMap::new();
+        let mut syms = SymMap::default();
         for (k, v) in pb.syms {
             let keep = match &v {
                 Sym::Var(x) => x.local,
@@ -2887,6 +2973,9 @@ pub fn bind(
         .filter(|p| called(&p.name) || via_overload.contains(&p.name))
         .filter_map(|p| p.extproc.clone())
         .map(|t| t.to_ascii_uppercase())
+        // A Java method (EXTPROC(*JAVA:class:method)) is no import: the
+        // JVM finds it when it is called (there is none here).
+        .filter(|t| !t.starts_with('*'))
         .filter(|t| !procs.contains_key(t) && !SYSTEM_PROCEDURES.contains(&t.as_str()))
         .collect();
     imports.sort();

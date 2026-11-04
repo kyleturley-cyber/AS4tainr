@@ -46,8 +46,15 @@ pub async fn serve(listener: tokio::net::TcpListener, cfg: ServerConfig) -> Resu
     }
 }
 
+#[path = "seu_screen.rs"]
+mod seu_screen;
+
 struct Term {
     conn: Connection,
+    /// The display device's name (QPADEV0001...).
+    device: String,
+    /// Break messages (SNDBRKMSG, PWRDWNSYS) for this process's sessions.
+    breaks: tokio::sync::broadcast::Receiver<crate::jobs::BreakMessage>,
 }
 
 impl Term {
@@ -55,8 +62,53 @@ impl Term {
         self.conn
             .send_record(opcode::PUT_GET, &s.to_stream())
             .await?;
-        let data = self.conn.read_record().await?;
-        Ok(ds::parse_input(&data, s))
+        loop {
+            tokio::select! {
+                data = self.conn.read_record() => return Ok(ds::parse_input(&data?, s)),
+                m = self.breaks.recv() => {
+                    let Ok(m) = m else { continue };
+                    if !m.is_for(&self.device) {
+                        continue;
+                    }
+                    // A break message interrupts the display: shown over
+                    // it until Enter, then the display again (what was
+                    // typed on it before is gone).
+                    self.break_message(&m).await?;
+                    self.conn
+                        .send_record(opcode::PUT_GET, &s.to_stream())
+                        .await?;
+                }
+            }
+        }
+    }
+
+    /// A break message on its own display (as4tainr's layout).
+    async fn break_message(&mut self, m: &crate::jobs::BreakMessage) -> Result<()> {
+        let mut s = Screen::new();
+        centered(&mut s, 1, "Break Message");
+        s.put(3, 2, &format!("From . . . :   {:<10}  {}", m.from, m.sent));
+        let mut row = 5u8;
+        let mut line = String::new();
+        for w in m.text.split(' ') {
+            if !line.is_empty() && line.len() + 1 + w.len() > 76 {
+                s.put(row, 4, &line);
+                row += 1;
+                line.clear();
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(w);
+        }
+        if !line.is_empty() && row < 20 {
+            s.put(row, 4, &line);
+        }
+        s.text(22, 2, attr::HIGH, "Press Enter to continue.");
+        self.conn
+            .send_record(opcode::PUT_GET, &s.to_stream())
+            .await?;
+        self.conn.read_record().await?;
+        Ok(())
     }
 }
 
@@ -123,7 +175,11 @@ pub async fn run(stream: tokio::net::TcpStream, cfg: &ServerConfig, device: &str
     let mut conn = Connection::new(stream);
     conn.negotiate().await?;
     eprintln!("as4tainr: {device}: terminal type {}", conn.terminal_type);
-    let mut term = Term { conn };
+    let mut term = Term {
+        conn,
+        device: device.to_string(),
+        breaks: crate::jobs::break_receiver(),
+    };
     let client = runtime::connect_db(&cfg.env.database_url).await?;
     let mut message = String::new();
     let mut attempts = 0;
@@ -931,6 +987,23 @@ async fn request(
         }
         Ok(Outcome::StartSql) => {
             sql_session(term, job).await?;
+        }
+        Ok(Outcome::EditLibraryList) => {
+            done.message = edit_library_list(term, job).await?;
+            if !done.message.is_empty() {
+                rq.log.push((rq.level, format!("  {}", done.message)));
+                done.in_log = true;
+            }
+        }
+        Ok(Outcome::Edit(t)) => {
+            match seu_screen::edit(term, job, &t).await {
+                Ok(m) => done.message = m,
+                Err(e) => done.message = crate::jobs::display_text(&e.to_string()),
+            }
+            if !done.message.is_empty() {
+                rq.log.push((rq.level, format!("  {}", done.message)));
+                done.in_log = true;
+            }
         }
         Ok(Outcome::SignOff) => done.next = Next::SignOff,
         Ok(Outcome::CommandEntry) => {
@@ -1800,6 +1873,75 @@ async fn sql_session(term: &mut Term, job: &mut Job<'_>) -> Result<()> {
     }
 }
 
+/// EDTLIBL: the user part of the library list as fields to change (a
+/// library typed, blanked out or moved to another line), then CHGLIBL
+/// with the libraries in the order of the lines. as4tainr's own display.
+async fn edit_library_list(term: &mut Term, job: &mut Job<'_>) -> Result<String> {
+    const LINES: usize = 25;
+    let mut message = String::new();
+    let mut libs: Vec<String> = job
+        .library_list_entries()
+        .into_iter()
+        .filter(|(_, k)| *k == "USR")
+        .map(|(l, _)| crate::qtemp::logical(&l))
+        .collect();
+    loop {
+        let mut s = Screen::new();
+        centered(&mut s, 1, "Edit Library List");
+        s.put(3, 2, "Type new or changed library names, press Enter.");
+        s.put(4, 2, "A blank line takes a library off the list.");
+        s.text(6, 2, attr::HIGH, "Seq   Library");
+        for i in 0..LINES {
+            let (row, col) = if i < 13 {
+                (7 + i as u8, 2u8)
+            } else {
+                (7 + (i - 13) as u8, 40u8)
+            };
+            s.put(row, col, &format!("{:03}", (i + 1) * 10));
+            s.field(
+                &format!("L{i}"),
+                row,
+                col + 6,
+                10,
+                FieldKind::Upper,
+                libs.get(i).map(String::as_str).unwrap_or(""),
+            );
+        }
+        keys(&mut s, 23, "F3=Exit   F5=Refresh   F12=Cancel");
+        s.message(&message);
+        message.clear();
+        let inp = term.show(&s).await?;
+        match inp.aid {
+            Aid::F(3) | Aid::F(12) => return Ok(String::new()),
+            Aid::F(5) => continue,
+            Aid::Enter => {}
+            _ => {
+                message = "That key is not valid on this display.".into();
+                continue;
+            }
+        }
+        let typed: Vec<String> = (0..LINES)
+            .map(|i| inp.get(&format!("L{i}")).trim().to_ascii_uppercase())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if typed == libs {
+            return Ok(String::new());
+        }
+        let line = if typed.is_empty() {
+            "CHGLIBL LIBL(*NONE)".to_string()
+        } else {
+            format!("CHGLIBL LIBL({})", typed.join(" "))
+        };
+        match job.run(&line).await {
+            Ok(_) => return Ok("Library list changed.".into()),
+            Err(e) => {
+                message = crate::jobs::display_text(&e.to_string());
+                libs = typed;
+            }
+        }
+    }
+}
+
 /// Columns moved by F19 (Left) and F20 (Right) on wide lists.
 const SHIFT: usize = 40;
 
@@ -1847,6 +1989,10 @@ async fn show_list(term: &mut Term, job: &mut Job<'_>, system: &str, d: ListDisp
                 for c in cmds {
                     match job.run(&c).await {
                         Ok(Outcome::Display(d)) => shown.push(d),
+                        Ok(Outcome::Edit(t)) => match seu_screen::edit(term, job, &t).await {
+                            Ok(m) => message = m,
+                            Err(e) => message = crate::jobs::display_text(&e.to_string()),
+                        },
                         Ok(Outcome::Messages(m)) => message = m.last().cloned().unwrap_or_default(),
                         Ok(_) => {}
                         Err(e) => message = crate::jobs::display_text(&e.to_string()),

@@ -3627,23 +3627,136 @@ pub(crate) fn system_value_description(name: &str) -> Option<&'static str> {
     })
 }
 
-/// A system value as IBM ships it. This system's system values cannot be
-/// changed yet (no CHGSYSVAL), so it is the current value.
+/// System values CHGSYSVAL changed (`as4tainr.system_values`), loaded
+/// at catalog initialization; None: not loaded (all as shipped).
+static CHANGED_VALUES: std::sync::RwLock<Option<HashMap<String, String>>> =
+    std::sync::RwLock::new(None);
+
+/// The system values CHGSYSVAL can change here: those a value of
+/// as4tainr's own reads (dates and times, decimal format, currency
+/// sign, printer, sign-on attempts, password expiry).
+pub(crate) const CHANGEABLE_SYSTEM_VALUES: &[&str] = &[
+    "QDATFMT",
+    "QDATSEP",
+    "QTIMSEP",
+    "QDECFMT",
+    "QCURSYM",
+    "QPRTDEV",
+    "QPRTTXT",
+    "QMAXSIGN",
+    "QPWDEXPITV",
+];
+
+pub(crate) const SYSVAL_DDL: &str = "
+CREATE TABLE IF NOT EXISTS as4tainr.system_values (
+    name  text PRIMARY KEY,
+    value text NOT NULL
+);
+";
+
+/// Load the changed system values (catalog initialization).
+pub async fn load_system_values(client: &tokio_postgres::Client) -> Result<()> {
+    client.batch_execute(SYSVAL_DDL).await?;
+    let map: HashMap<String, String> = client
+        .query("SELECT name, value FROM as4tainr.system_values", &[])
+        .await?
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    if let Ok(mut g) = CHANGED_VALUES.write() {
+        *g = Some(map);
+    }
+    Ok(())
+}
+
+/// CHGSYSVAL: check a new value as the system value takes it and keep it
+/// (for this process at once; other processes when they initialize).
+pub async fn change_system_value(
+    client: &tokio_postgres::Client,
+    name: &str,
+    value: &str,
+) -> Result<()> {
+    let name = name.trim().to_ascii_uppercase();
+    if system_value_description(&name).is_none() {
+        bail!("CPF1028: System value {name} not found.");
+    }
+    if !CHANGEABLE_SYSTEM_VALUES.contains(&name.as_str()) {
+        bail!("System value {name} cannot be changed here.");
+    }
+    let v = value.trim();
+    let v = v
+        .strip_prefix('\'')
+        .and_then(|x| x.strip_suffix('\''))
+        .map(|x| x.replace("''", "'"))
+        .unwrap_or_else(|| v.to_string());
+    let up = v.to_ascii_uppercase();
+    // The values each one takes (CL reference, CHGSYSVAL; IBM i system
+    // values documentation).
+    let ok = match name.as_str() {
+        "QDATFMT" => matches!(up.as_str(), "YMD" | "MDY" | "DMY" | "JUL"),
+        "QDATSEP" => matches!(v.as_str(), "/" | "-" | "." | "," | " "),
+        "QTIMSEP" => matches!(v.as_str(), ":" | "." | "," | " "),
+        "QDECFMT" => matches!(up.as_str(), " " | "" | "J" | "I"),
+        "QCURSYM" => v.chars().count() == 1,
+        "QPRTDEV" => crate::catalog::validate_name("device", &up).is_ok(),
+        "QPRTTXT" => v.chars().count() <= 30,
+        "QMAXSIGN" => up == "*NOMAX" || up.parse::<u32>().is_ok_and(|n| (1..=25).contains(&n)),
+        "QPWDEXPITV" => up == "*NOMAX" || up.parse::<u32>().is_ok_and(|n| (1..=366).contains(&n)),
+        _ => false,
+    };
+    if !ok {
+        bail!("Value '{v}' is not valid for system value {name}.");
+    }
+    let keep = match name.as_str() {
+        "QDATFMT" | "QPRTDEV" | "QMAXSIGN" | "QPWDEXPITV" | "QDECFMT" => up,
+        _ => v,
+    };
+    client
+        .execute(
+            "INSERT INTO as4tainr.system_values VALUES ($1, $2)
+             ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
+            &[&name, &keep],
+        )
+        .await?;
+    if let Ok(mut g) = CHANGED_VALUES.write() {
+        g.get_or_insert_with(HashMap::new).insert(name, keep);
+    }
+    Ok(())
+}
+
+/// A system value as IBM ships it.
 pub(crate) fn shipped_system_value_text(name: &str) -> Option<Result<String, i64>> {
-    system_value_text(name)
+    as_text(system_value_of(name, false).ok()?)
 }
 
 /// A system value as text, or as a number (QSYS2.SYSTEM_VALUE_INFO).
 pub(crate) fn system_value_text(name: &str) -> Option<Result<String, i64>> {
-    match system_value(name).ok()? {
+    as_text(system_value(name).ok()?)
+}
+
+fn as_text(v: Value) -> Option<Result<String, i64>> {
+    match v {
         Value::Dec(d) => Some(Err(d.trunc().to_string().parse().unwrap_or(0))),
         other => other.as_char().ok().map(Ok),
     }
 }
 
-/// A system value (RTVSYSVAL): the values IBM ships, the date and time
-/// from the clock.
+/// A system value (RTVSYSVAL): changed by CHGSYSVAL, or as IBM ships it;
+/// the date and time from the clock.
 fn system_value(name: &str) -> Result<Value> {
+    system_value_of(name, true)
+}
+
+fn system_value_of(name: &str, changed: bool) -> Result<Value> {
+    if changed {
+        if let Some(v) = CHANGED_VALUES
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|m| m.get(name).cloned()))
+        {
+            return Ok(Value::Char(v));
+        }
+    }
     let ((y, mo, d), (h, mi, sec), us) = crate::rpg::dates::now();
     let c = |s: String| Value::Char(s);
     // A list of libraries: ten characters each.
@@ -4892,7 +5005,7 @@ async fn command(
                 }
             }
             let job_name = job.id.as_ref().map(|i| i.to_string());
-            let (back, ret, messages) = crate::rpg::call_procedure(
+            let (back, ret, messages, _) = crate::rpg::call_procedure(
                 &job.env.database_url,
                 job.library_list(),
                 job.user.clone(),
@@ -4902,6 +5015,13 @@ async fn command(
                 pgm.actgrp.clone(),
                 prc,
                 args,
+                Some(crate::rpg::ClContext {
+                    env: job.env.clone(),
+                    curlib: job.curlib.clone(),
+                    user_libl: job.libl.clone(),
+                    overrides: job.calls.overrides.clone(),
+                    caller_group: Some(pgm.actgrp.clone()),
+                }),
             )
             .await?;
             msgs.extend(messages);
@@ -5092,9 +5212,23 @@ async fn command(
                         job.calls.printed.extend(d.print.iter().cloned());
                     }
                 }
+                // A batch job (no display): the command prints what it
+                // would show, as it does run as the job's own request
+                // (jobs.rs; CL reference, OUTPUT(*): "printed with the
+                // job's spooled output" for a batch job).
+                Outcome::Display(d) if job.calls.batch => {
+                    let Some(id) = job.id.clone() else {
+                        return Ok(None);
+                    };
+                    let lines = crate::jobs::printed_display(&d);
+                    let file = crate::report::printer_file(&st.name);
+                    crate::spool::print_lines(job.client, &id, file, &st.name, &lines).await?;
+                }
                 Outcome::Display(_)
                 | Outcome::ChangePassword
                 | Outcome::StartSql
+                | Outcome::Edit(_)
+                | Outcome::EditLibraryList
                 | Outcome::Menu(_)
                 | Outcome::CommandEntry => {
                     bail!(

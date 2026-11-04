@@ -1592,7 +1592,7 @@ fn global_names(
     let mut subfields: HashSet<String> = HashSet::new();
     for s in prog.syms.values() {
         if let Sym::Ds(d) = s {
-            for f in &d.subfields {
+            for f in d.subfields.iter() {
                 subfields.insert(f.to_ascii_uppercase());
             }
         }

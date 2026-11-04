@@ -41,6 +41,10 @@ UPDATE as4tainr.user_profiles SET curlib = '*CRTDFT'
 -- after sign-on. IBM's defaults are *NONE and MAIN.
 ALTER TABLE as4tainr.user_profiles ADD COLUMN IF NOT EXISTS inlpgm text NOT NULL DEFAULT '*NONE';
 ALTER TABLE as4tainr.user_profiles ADD COLUMN IF NOT EXISTS inlmnu text NOT NULL DEFAULT 'MAIN';
+-- Sign-on attempts that were not valid since the last valid one
+-- (QMAXSIGN), and when the password was last changed (QPWDEXPITV).
+ALTER TABLE as4tainr.user_profiles ADD COLUMN IF NOT EXISTS invalid_signons integer NOT NULL DEFAULT 0;
+ALTER TABLE as4tainr.user_profiles ADD COLUMN IF NOT EXISTS pwd_changed timestamptz NOT NULL DEFAULT now();
 "#;
 
 /// CRTUSRPRF INLPGM and INLMNU defaults (IBM i CL reference).
@@ -287,7 +291,8 @@ pub async fn reset_password(client: &Client, name: &str) -> Result<bool> {
     Ok(client
         .execute(
             "UPDATE as4tainr.user_profiles
-             SET password_hash = $2, pwd_expired = true, status = '*ENABLED'
+             SET password_hash = $2, pwd_expired = true, status = '*ENABLED',
+                 invalid_signons = 0, pwd_changed = now()
              WHERE name = $1",
             &[&name, &hash_password(&normalized(&name))?],
         )
@@ -317,6 +322,7 @@ pub async fn change(client: &Client, name: &str, c: &ProfileChanges) -> Result<b
             "UPDATE as4tainr.user_profiles SET
                 pwd_expired = COALESCE($2, pwd_expired),
                 status = COALESCE($3, status),
+                invalid_signons = CASE WHEN $3 = '*ENABLED' THEN 0 ELSE invalid_signons END,
                 curlib = COALESCE($4, curlib),
                 text = COALESCE($5, text),
                 inlpgm = COALESCE($6, inlpgm),
@@ -398,6 +404,32 @@ pub async fn authenticate(client: &Client, user: &str, password: &str) -> Result
                 )
                 .await?;
         } else {
+            // QMAXSIGN (IBM i system values: sign-on attempts not valid
+            // before the profile is disabled; 3 as shipped). QSECOFR is
+            // not disabled: as4tainr has no console to recover from
+            // (`as4tainr rstpwd` resets it).
+            let n: i32 = client
+                .query_one(
+                    "UPDATE as4tainr.user_profiles SET invalid_signons = invalid_signons + 1
+                     WHERE name = $1 RETURNING invalid_signons",
+                    &[&user],
+                )
+                .await?
+                .get(0);
+            let max = crate::clpgm::system_value_text("QMAXSIGN")
+                .and_then(|v| v.ok())
+                .and_then(|v| v.trim().parse::<i32>().ok());
+            if let Some(max) = max {
+                if n >= max && user != "QSECOFR" {
+                    client
+                        .execute(
+                            "UPDATE as4tainr.user_profiles SET status = '*DISABLED' WHERE name = $1",
+                            &[&user],
+                        )
+                        .await?;
+                    bail!("{BAD}\nUser profile {user} was disabled: {n} sign-on attempts were not valid (QMAXSIGN {max}).");
+                }
+            }
             bail!(BAD);
         }
     }
@@ -407,13 +439,27 @@ pub async fn authenticate(client: &Client, user: &str, password: &str) -> Result
     }
     client
         .execute(
-            "UPDATE as4tainr.user_profiles SET last_signon = now() WHERE name = $1",
+            "UPDATE as4tainr.user_profiles SET last_signon = now(), invalid_signons = 0 WHERE name = $1",
             &[&user],
         )
         .await?;
+    // QPWDEXPITV: a password older than that many days must be changed.
+    let days = crate::clpgm::system_value_text("QPWDEXPITV")
+        .and_then(|v| v.ok())
+        .and_then(|v| v.trim().parse::<i32>().ok());
+    let too_old = match days {
+        Some(d) => client
+            .query_one(
+                "SELECT pwd_changed < now() - make_interval(days => $2) FROM as4tainr.user_profiles WHERE name = $1",
+                &[&user, &d],
+            )
+            .await?
+            .get(0),
+        None => false,
+    };
     Ok(Profile {
         name: user,
-        pwd_expired: row.get(1),
+        pwd_expired: row.get::<_, bool>(1) || too_old,
         special_auth: row.get(2),
         curlib: row.get(3),
         text: row.get(4),
@@ -423,16 +469,28 @@ pub async fn authenticate(client: &Client, user: &str, password: &str) -> Result
 }
 
 pub async fn change_password(client: &Client, user: &str, current: &str, new: &str) -> Result<()> {
-    authenticate(client, user, current)
-        .await
-        .map_err(|_| anyhow!("Current password not correct."))?;
+    // The current password checked (not a sign-on attempt).
+    let user = user.trim().to_ascii_uppercase();
+    let user = user.as_str();
+    let hash: Option<String> = client
+        .query_opt(
+            "SELECT password_hash FROM as4tainr.user_profiles WHERE name = $1",
+            &[&user],
+        )
+        .await?
+        .map(|r| r.get(0));
+    let ok =
+        hash.is_some_and(|h| verify_hash(&normalized(current), &h) || verify_hash(current, &h));
+    if !ok {
+        bail!("Current password not correct.");
+    }
     check_password_rules(user, new)?;
     if normalized(new) == normalized(current) {
         bail!("The new password must be different from the current password.");
     }
     client
         .execute(
-            "UPDATE as4tainr.user_profiles SET password_hash = $2, pwd_expired = false WHERE name = $1",
+            "UPDATE as4tainr.user_profiles SET password_hash = $2, pwd_expired = false, pwd_changed = now() WHERE name = $1",
             &[&user, &hash_password(&normalized(new))?],
         )
         .await?;

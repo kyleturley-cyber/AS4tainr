@@ -127,6 +127,12 @@ pub const C_FUNCTIONS: &[&str] = &[
     "STRCMPI",
     "STRICMP",
     "TOUPPER",
+    "ISLOWER",
+    "ISUPPER",
+    "ISDIGIT",
+    "ISALPHA",
+    "ISALNUM",
+    "ISSPACE",
     "TOLOWER",
     "ABS",
     "RAND",
@@ -135,6 +141,83 @@ pub const C_FUNCTIONS: &[&str] = &[
     "_C_IFS_TMPNAM",
     "SLEEP",
     "USLEEP",
+    // Signals and interval timers: as4tainr sends a job no signals, so
+    // these accept what they are given and change nothing (XMLSERVICE
+    // arms an alarm for its time-outs; it never fires here).
+    "SETITIMER",
+    "GETITIMER",
+    "ALARM",
+    "SIGACTION",
+    "SIGEMPTYSET",
+    "SIGFILLSET",
+    "SIGADDSET",
+    "SIGDELSET",
+    "SIGISMEMBER",
+    "SIGPROCMASK",
+    "SIGPENDING",
+    "QP0SENABLESIGNALS",
+    "QP0SDISABLESIGNALS",
+    "GETPID",
+    // MI built-ins (ILE C/C++ MI Library Reference): copy bytes.
+    "_CPYBYTES",
+    // PASE and iconv (pase.rs).
+    "QP2PTRSIZE",
+    "QP2JOBCCSID",
+    "QP2PASECCSID",
+    "QP2RUNPASE",
+    "QP2DLOPEN",
+    "QP2DLSYM",
+    "QP2MALLOC",
+    "QP2FREE",
+    "QP2ERRNOP",
+    "QP2SIGNALPASE",
+    "QP2ENDPASE",
+    "QP2CALLPASE",
+    "QTQICONVOPEN",
+    "ICONV",
+    "ICONV_CLOSE",
+    "QXXDTOP",
+    "QXXDTOZ",
+    "QXXPTOD",
+    "QXXZTOD",
+    "VSPRINTF",
+    "_CALLPGMV",
+    "FTOK",
+    "SQLALLOCENV",
+    "SQLALLOCCONNECT",
+    "SQLALLOCSTMT",
+    "SQLALLOCHANDLE",
+    "SQLFREEENV",
+    "SQLFREECONNECT",
+    "SQLFREESTMT",
+    "SQLFREEHANDLE",
+    "SQLSETENVATTR",
+    "SQLSETCONNECTATTR",
+    "SQLSETSTMTATTR",
+    "SQLCONNECT",
+    "SQLDISCONNECT",
+    "SQLENDTRAN",
+    "SQLTRANSACT",
+    "SQLPREPARE",
+    "SQLEXECUTE",
+    "SQLEXECDIRECT",
+    "SQLNUMPARAMS",
+    "SQLDESCRIBEPARAM",
+    "SQLBINDPARAMETER",
+    "SQLNUMRESULTCOLS",
+    "SQLDESCRIBECOL",
+    "SQLBINDCOL",
+    "SQLFETCH",
+    "SQLFETCHSCROLL",
+    "SQLGETCOL",
+    "SQLGETDATA",
+    "SQLROWCOUNT",
+    "SQLERROR",
+    "SQLGETDIAGREC",
+    "SQLCLOSECURSOR",
+    "_CPYBWP",
+    "__MEMSET",
+    "__MEMCMP",
     "POW",
 ];
 
@@ -193,6 +276,12 @@ impl<'a> Machine<'a> {
         if !C_FUNCTIONS.contains(&name) {
             return None;
         }
+        if let Some(r) = self.pase_call(name, args) {
+            return Some(r);
+        }
+        if let Some(r) = self.cli_call(name, args) {
+            return Some(r);
+        }
         Some(self.c_call_inner(name, args))
     }
 
@@ -232,6 +321,23 @@ impl<'a> Machine<'a> {
             }
             "LSEEK" | "LSEEK64" => {
                 let r = self.c_lseek(int(0) as i32, int(1), int(2));
+                self.c_result(r)
+            }
+            // ftok(path, id) (UNIX-type APIs, Generate IPC Key from File
+            // Name): a key from the file and the low 8 bits of id; -1 and
+            // ENOENT when there is no such file.
+            "FTOK" => {
+                let path = self.c_string(&val(0))?;
+                let client = self.io.client;
+                let r = self.block(ifs::stat(client, &path)).and_then(|e| match e {
+                    Some(_) => {
+                        let h = path.bytes().fold(0x811c9dc5u32, |h, b| {
+                            (h ^ b as u32).wrapping_mul(0x01000193)
+                        });
+                        Ok(((int(1) & 0xFF) << 24) | (h & 0xFF_FFFF) as i64)
+                    }
+                    None => Err(ifs::Errno(errno::ENOENT).into()),
+                });
                 self.c_result(r)
             }
             "UNLINK" | "RMDIR" | "MKDIR" | "ACCESS" => {
@@ -640,6 +746,21 @@ impl<'a> Machine<'a> {
             }
             // sleep(seconds), usleep(microseconds): the job waits; 0
             // (C library: both return 0 when the time has passed).
+            "SETITIMER" | "GETITIMER" | "ALARM" | "SIGACTION" | "SIGEMPTYSET" | "SIGFILLSET"
+            | "SIGADDSET" | "SIGDELSET" | "SIGPROCMASK" | "SIGPENDING" | "QP0SENABLESIGNALS"
+            | "QP0SDISABLESIGNALS" => num(0),
+            // No signal is pending or blocked: never a member.
+            "SIGISMEMBER" => num(0),
+            "GETPID" => num(std::process::id() as i64),
+            // _CPYBYTES(target, source, length).
+            "_CPYBYTES" => {
+                let n = int(2).max(0) as usize;
+                let (sb, so) = self.addr(&val(1), n)?;
+                let bytes = self.bufs[sb][so..so + n].to_vec();
+                let (db, d) = self.addr(&val(0), n)?;
+                self.bufs[db][d..d + n].copy_from_slice(&bytes);
+                num(0)
+            }
             "SLEEP" | "USLEEP" => {
                 let n = val(0).num()?.to_i128()?.max(0) as u64;
                 let d = if name == "SLEEP" {
@@ -686,7 +807,8 @@ impl<'a> Machine<'a> {
                     Ordering::Greater => 1,
                 })
             }
-            "MEMCPY" | "MEMMOVE" => {
+            // _CPYBWP: copy bytes with pointers (MI built-in), as memmove.
+            "MEMCPY" | "MEMMOVE" | "_CPYBWP" => {
                 let n = int(2).max(0) as usize;
                 let (sb, so) = self.addr(&val(1), n)?;
                 let bytes = self.bufs[sb][so..so + n].to_vec();
@@ -695,14 +817,14 @@ impl<'a> Machine<'a> {
                 self.bufs[db][d..d + n].copy_from_slice(&bytes);
                 Ok(dst)
             }
-            "MEMSET" => {
+            "MEMSET" | "__MEMSET" => {
                 let n = int(2).max(0) as usize;
                 let dst = val(0);
                 let (db, d) = self.addr(&dst, n)?;
                 self.bufs[db][d..d + n].fill(int(1) as u8);
                 Ok(dst)
             }
-            "MEMCMP" => {
+            "MEMCMP" | "__MEMCMP" => {
                 let n = int(2).max(0) as usize;
                 let (xb, xo) = self.addr(&val(0), n)?;
                 let (yb, yo) = self.addr(&val(1), n)?;
@@ -897,6 +1019,20 @@ impl<'a> Machine<'a> {
                 })
             }
             // toupper and tolower of a character (EBCDIC).
+            // Character classes of a character in the job's CCSID (ctype.h).
+            "ISLOWER" | "ISUPPER" | "ISDIGIT" | "ISALPHA" | "ISALNUM" | "ISSPACE" => {
+                let c = int(0);
+                let ch = a(&[c.clamp(0, 255) as u8]).chars().next().unwrap_or('\0');
+                let r = match name {
+                    "ISLOWER" => ch.is_ascii_lowercase(),
+                    "ISUPPER" => ch.is_ascii_uppercase(),
+                    "ISDIGIT" => ch.is_ascii_digit(),
+                    "ISALPHA" => ch.is_ascii_alphabetic(),
+                    "ISALNUM" => ch.is_ascii_alphanumeric(),
+                    _ => ch.is_ascii_whitespace(),
+                };
+                num(r as i64)
+            }
             "TOUPPER" | "TOLOWER" => {
                 let c = int(0);
                 let ch = a(&[c as u8]);

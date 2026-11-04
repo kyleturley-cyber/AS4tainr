@@ -302,6 +302,69 @@ pub const SYSTEM_BNDDIRS: &[&str] = &["QC2LE", "QUSAPIBD"];
 /// Procedures of the system's service programs that as4tainr provides.
 pub const SYSTEM_PROCEDURES: &[&str] = crate::rpg::interp::crt::C_FUNCTIONS;
 
+/// Procedures of IBM i's system service programs and MI built-ins that
+/// as4tainr does not provide yet: a program that imports one is bound (on
+/// IBM i the system has them), and calling one fails (CPF3CF2-like
+/// error, as4tainr's own text). XMLSERVICE imports these: the SQL CLI
+/// (QSQCLI), signals, PASE (QP2*), shared memory and semaphores, iconv,
+/// the MI built-ins _CALLPGMV, _CPYBYTES, _CMPSWP4.
+pub const UNAVAILABLE_PROCEDURES: &[&str] = &[
+    "FCLOSE",
+    "FGETS",
+    "FOPEN",
+    "FPUTS",
+    "ALARM",
+    "FSYNC",
+    "GETITIMER",
+    "GETPID",
+    "GETTIMEOFDAY",
+    "KILL",
+    "QP0SDISABLESIGNALS",
+    "QP0SENABLESIGNALS",
+    "SEMCTL",
+    "SEMGET",
+    "SEMOP",
+    "SETITIMER",
+    "SHMAT",
+    "SHMCTL",
+    "SHMDT",
+    "SHMGET",
+    "SIGACTION",
+    "SIGADDSET",
+    "SIGDELSET",
+    "SIGEMPTYSET",
+    "SIGFILLSET",
+    "SIGISMEMBER",
+    "SIGNAL",
+    "SIGPENDING",
+    "SIGPROCMASK",
+    "SIGSUSPEND",
+    "SIGTIMEDWAIT",
+    "SIGWAIT",
+    "SPAWN",
+    "SQLCOLUMNPRIVILEGES",
+    "SQLCOLUMNS",
+    "SQLFOREIGNKEYS",
+    "SQLGETINFO",
+    "SQLGETLENGTH",
+    "SQLGETSUBSTRING",
+    "SQLPRIMARYKEYS",
+    "SQLPROCEDURECOLUMNS",
+    "SQLPROCEDURES",
+    "SQLSPECIALCOLUMNS",
+    "SQLSTATISTICS",
+    "SQLTABLEPRIVILEGES",
+    "SQLTABLES",
+    "SYSCONF",
+    "WAITPID",
+    "_CMPSWP4",
+    "_CPYBYTES",
+    "_C_SIG_DFL",
+    "_C_SIG_ERR",
+    "_C_SIG_IGN",
+    "_SETSPPFP",
+];
+
 /// Data the ILE C runtime exports (QC2LE): _EXCP_MSGID, the message ID
 /// of the exception a failed system() call ended with.
 pub const SYSTEM_DATA: &[&str] = &["_EXCP_MSGID"];
@@ -484,6 +547,7 @@ pub async fn bind(
             // Qp0zLprintf): resolved without a binding.
             if !found
                 && (SYSTEM_PROCEDURES.contains(&sym.as_str())
+                    || UNAVAILABLE_PROCEDURES.contains(&sym.as_str())
                     || SYSTEM_DATA.contains(&sym.as_str())
                     || crate::rpg::interp::cee::CEE_APIS.contains(&sym.as_str()))
             {
@@ -687,10 +751,53 @@ pub fn generated_signature(exports: &[String]) -> String {
 
 /// Global storage of the service programs active in each job, by
 /// activation group: (job, activation group, LIB/SRVPGM/MODULE) → the
-/// module's global storage.
-type Activations = HashMap<(String, String, String), Vec<Vec<u8>>>;
+/// module's global storage and its version (each keep makes a new one).
+type ActKey = (String, String, String);
+/// A module's global storage: its buffers.
+pub type Storage = Vec<Vec<u8>>;
+type Activations = HashMap<ActKey, (Vec<Vec<u8>>, u64)>;
 
-static ACTIVATIONS: Mutex<Option<Activations>> = Mutex::new(None);
+#[derive(Default)]
+struct Registry {
+    acts: Activations,
+    next: u64,
+    /// Versions a module leaving for a call (`keep_watched`) wants to
+    /// know about: when one is replaced or taken, its storage is kept
+    /// here for the module's comparison after the call.
+    watched: std::collections::HashSet<(ActKey, u64)>,
+    originals: HashMap<(ActKey, u64), Vec<Vec<u8>>>,
+}
+
+impl Registry {
+    /// The entry leaves (or is replaced): a watched version is kept.
+    fn leaving(&mut self, k: &ActKey, copy: bool) -> Option<Vec<Vec<u8>>> {
+        let (st, ver) = self.acts.remove(k)?;
+        let w = (k.clone(), ver);
+        if self.watched.contains(&w) && !self.originals.contains_key(&w) {
+            if copy {
+                self.originals.insert(w, st.clone());
+            } else {
+                self.originals.insert(w, st);
+                return None;
+            }
+        }
+        Some(st)
+    }
+
+    fn put(&mut self, k: ActKey, st: Vec<Vec<u8>>) -> u64 {
+        self.leaving(&k, false);
+        self.next += 1;
+        let v = self.next;
+        self.acts.insert(k, (st, v));
+        v
+    }
+}
+
+static ACTIVATIONS: Mutex<Option<Registry>> = Mutex::new(None);
+
+fn key(job: &str, group: &str, unit: &str) -> ActKey {
+    (job.to_string(), group.to_string(), unit.to_string())
+}
 
 /// A module's storage in a service program activation, if it was
 /// activated before in the activation group.
@@ -699,8 +806,56 @@ pub fn activation(job: &str, group: &str, unit: &str) -> Option<Vec<Vec<u8>>> {
         .lock()
         .ok()?
         .as_ref()?
-        .get(&(job.to_string(), group.to_string(), unit.to_string()))
-        .cloned()
+        .acts
+        .get(&key(job, group, unit))
+        .map(|(s, _)| s.clone())
+}
+
+/// The same, taken out of the activation group (the call that runs on it
+/// keeps or lends it back after).
+pub fn take_activation(job: &str, group: &str, unit: &str) -> Option<Vec<Vec<u8>>> {
+    let mut g = ACTIVATIONS.lock().ok()?;
+    g.as_mut()?.leaving(&key(job, group, unit), true)
+}
+
+/// Keep a module's storage in its activation group for calls back into
+/// it while the module calls out: its version, for `changed_since`.
+pub fn keep_watched(job: &str, group: &str, unit: &str, storage: Vec<Vec<u8>>) -> u64 {
+    let mut g = ACTIVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let r = g.get_or_insert_with(Registry::default);
+    let k = key(job, group, unit);
+    let v = r.put(k.clone(), storage);
+    r.watched.insert((k, v));
+    v
+}
+
+/// After the call: None when nothing replaced the version kept (no call
+/// came back into the module), else the storage as kept and as it is
+/// now. `forget`: the copy leaves the group (the module's own storage,
+/// running, is the one: a copy left there would be found by a later call
+/// back instead of it).
+pub fn changed_since(
+    job: &str,
+    group: &str,
+    unit: &str,
+    version: u64,
+    forget: bool,
+) -> Option<(Storage, Storage)> {
+    let mut g = ACTIVATIONS.lock().ok()?;
+    let r = g.as_mut()?;
+    let k = key(job, group, unit);
+    let w = (k.clone(), version);
+    r.watched.remove(&w);
+    let old = r.originals.remove(&w);
+    let out = match r.acts.get(&k) {
+        Some((_, v)) if *v == version => None,
+        Some((now, _)) => old.map(|o| (o, now.clone())),
+        None => None,
+    };
+    if forget {
+        r.acts.remove(&k);
+    }
+    out
 }
 
 /// The owner number of a module's storage in its activation: the same
@@ -722,7 +877,8 @@ pub fn job_groups(job: &str) -> Vec<String> {
         .ok()
         .and_then(|g| {
             g.as_ref().map(|m| {
-                m.keys()
+                m.acts
+                    .keys()
                     .filter(|(j, g, _)| j == job && g != DEFAULT_GROUP)
                     .map(|(_, g, _)| g.clone())
                     .collect()
@@ -734,13 +890,46 @@ pub fn job_groups(job: &str) -> Vec<String> {
     out
 }
 
+/// Take the storage of every module activated in a job's activation
+/// group out of it, but `except`: (unit, storage), to be put back with
+/// `keep_activation`.
+pub fn take_activations(
+    job: &str,
+    group: &str,
+    except: &dyn Fn(&str) -> bool,
+) -> Vec<(String, Vec<Vec<u8>>)> {
+    let Ok(mut g) = ACTIVATIONS.lock() else {
+        return vec![];
+    };
+    let Some(m) = g.as_mut() else {
+        return vec![];
+    };
+    let keys: Vec<ActKey> = m
+        .acts
+        .keys()
+        .filter(|(j, gr, u)| j == job && gr == group && !except(u))
+        .cloned()
+        .collect();
+    keys.into_iter()
+        .filter_map(|k| m.leaving(&k, true).map(|s| (k.2, s)))
+        .collect()
+}
+
+/// Forget a module's storage kept in the activation group (a copy the
+/// module left for calls back into it while it ran).
+pub fn drop_activation(job: &str, group: &str, unit: &str) {
+    if let Ok(mut g) = ACTIVATIONS.lock() {
+        if let Some(m) = g.as_mut() {
+            m.leaving(&key(job, group, unit), false);
+        }
+    }
+}
+
 /// Keep a module's storage in its activation group.
 pub fn keep_activation(job: &str, group: &str, unit: &str, storage: Vec<Vec<u8>>) {
     if let Ok(mut g) = ACTIVATIONS.lock() {
-        g.get_or_insert_with(HashMap::new).insert(
-            (job.to_string(), group.to_string(), unit.to_string()),
-            storage,
-        );
+        g.get_or_insert_with(Registry::default)
+            .put(key(job, group, unit), storage);
     }
 }
 
@@ -772,9 +961,14 @@ pub fn end_activations(job: &str, groups: &Groups) -> usize {
     let mut n = 0;
     if let Ok(mut g) = ACTIVATIONS.lock() {
         if let Some(m) = g.as_mut() {
-            let before = m.len();
-            m.retain(|(j, grp, _), _| !(j == job && groups.covers(grp)));
-            n = before - m.len();
+            let before = m.acts.len();
+            m.acts
+                .retain(|(j, grp, _), _| !(j == job && groups.covers(grp)));
+            n = before - m.acts.len();
+            m.originals
+                .retain(|((j, grp, _), _), _| !(j == job && groups.covers(grp)));
+            m.watched
+                .retain(|((j, grp, _), _)| !(j == job && groups.covers(grp)));
         }
     }
     crate::ovr::end_groups(job, |g| groups.covers(g));

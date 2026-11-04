@@ -51,11 +51,13 @@ pub const CEE_APIS: &[&str] = &[
     "_RSLVSP4",
     "QLEACTBNDPGM",
     "QLEGETEXP",
+    "QLEACTBNDPGMLONG",
+    "QLEGETEXPLONG",
 ];
 
 /// Service programs activated with QleActBndPgm: activation mark - 1 →
 /// (library, name).
-static ACTIVATED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+pub(super) static ACTIVATED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
 /// Heaps made with CEECRHP: heap ID → its blocks (heap block numbers).
 type Heaps = (i32, HashMap<i32, Vec<usize>>);
@@ -931,7 +933,14 @@ impl<'a> Machine<'a> {
                 };
                 let client = self.io.client;
                 let mut found = None;
-                for l in libs {
+                // A system program as4tainr does itself is in QSYS.
+                if objtype == "*PGM"
+                    && (lib.is_empty() || lib == "*LIBL" || lib == "QSYS")
+                    && super::is_system_program(&obj)
+                {
+                    found = Some("QSYS".to_string());
+                }
+                for l in libs.into_iter().filter(|_| found.is_none()) {
                     if self.block(crate::catalog::object_exists(
                         client,
                         std::slice::from_ref(&l),
@@ -1032,10 +1041,18 @@ impl<'a> Machine<'a> {
             // QleActBndPgm(service program system pointer, activation mark,
             // activation information, its length, error code) (Activate
             // Bound Program API): the activation mark, also returned.
-            "QLEACTBNDPGM" => {
+            // QleActBndPgmLong: the same, the mark 8 bytes. A prototype
+            // may pass the system pointer's address by value.
+            "QLEACTBNDPGM" | "QLEACTBNDPGMLONG" => {
                 let target = match self.cee_value(g(0))? {
                     Some(Value::Ptr(p)) if p.kind == super::super::mem::KIND_SYS => {
                         super::super::mem::sys_ref(p.buf)
+                    }
+                    Some(v @ Value::Ptr(_)) => {
+                        let (b, o) = self.addr(&v, 16)?;
+                        super::super::mem::Ptr::decode(&self.bufs[b][o..o + 16])
+                            .filter(|p| p.kind == super::super::mem::KIND_SYS)
+                            .and_then(|p| super::super::mem::sys_ref(p.buf))
                     }
                     _ => None,
                 };
@@ -1066,11 +1083,20 @@ impl<'a> Machine<'a> {
             // a procedure pointer to the export (by number, or by name
             // when the number is 0); export type 1 for a procedure, 0
             // when there is no such export.
-            "QLEGETEXP" => {
+            // QleGetExpLong: the same, the mark 8 bytes. The name and the
+            // export pointer may be passed as pointers by value.
+            "QLEGETEXP" | "QLEGETEXPLONG" => {
                 let mark = self.cee_num(g(0))?.to_i128()? as usize;
                 let number = self.cee_num(g(1))?.to_i128()? as usize;
                 let len = self.cee_num(g(2))?.to_i128()?.max(0) as usize;
-                let nm: String = self.cee_text(g(3))?.chars().take(len).collect();
+                let text = match self.cee_value(g(3))? {
+                    Some(v @ Value::Ptr(_)) => {
+                        let (b, o) = self.addr(&v, len)?;
+                        a(&self.bufs[b][o..o + len])
+                    }
+                    _ => self.cee_text(g(3))?,
+                };
+                let nm: String = text.chars().take(len).collect();
                 let act = ACTIVATED
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -1106,7 +1132,17 @@ impl<'a> Machine<'a> {
                     ),
                     None => (Value::Fig(Fig::Null), 0),
                 };
-                self.cee_set(g(4), ptr.clone())?;
+                match g(4) {
+                    Some(Arg::Val(at @ Value::Ptr(_))) => {
+                        let (b, o) = self.addr(at, 16)?;
+                        let bytes = match &ptr {
+                            Value::Ptr(p) => p.encode(),
+                            _ => [0u8; 16],
+                        };
+                        self.bufs[b][o..o + 16].copy_from_slice(&bytes);
+                    }
+                    other => self.cee_set(other, ptr.clone())?,
+                }
                 self.cee_set(g(5), Value::Num(Dec::from_i64(kind)))?;
                 Ok(ptr)
             }

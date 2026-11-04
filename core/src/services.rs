@@ -1230,8 +1230,11 @@ BEGIN
 END $as4tainr$;
 
 -- QSYS2.STACK_INFO(job [, thread]): the call stack of the statement's
--- own job ('*'), oldest entry first, as the program running the
--- statement left it in as4tainr.stack; other jobs: no rows.
+-- own job ('*') as the program running the statement left it in
+-- as4tainr.stack, the newest entry first, numbered from the oldest
+-- (PUB400 2026-10-31, verify32 y32_rows); a control boundary where an
+-- ILE entry's caller is in another activation group or is not ILE;
+-- other jobs: no rows.
 DROP FUNCTION IF EXISTS qsys2.stack_info(varchar, varchar);
 CREATE FUNCTION qsys2.stack_info(job_name varchar DEFAULT '*', thread varchar DEFAULT 'ALL')
 RETURNS TABLE (thread_id bigint, ordinal_position integer, entry_type varchar(10),
@@ -1245,6 +1248,7 @@ LANGUAGE sql STABLE AS $as4tainr$
          CAST(e.v ->> 'pgm' AS varchar(10)), CAST(e.v ->> 'lib' AS varchar(10)),
          CAST(nullif(e.v ->> 'line', '0') AS varchar(109)),
          CAST(CASE WHEN e.v ->> 'actgrp' IS DISTINCT FROM lag(e.v ->> 'actgrp') OVER (ORDER BY e.n)
+                     OR coalesce(lag(e.v ->> 'module') OVER (ORDER BY e.n), '') = ''
                    THEN 'YES' ELSE 'NO' END AS varchar(3)),
          CAST(nullif(e.v ->> 'module', '') AS varchar(10)),
          CAST(CASE WHEN coalesce(e.v ->> 'module', '') = '' THEN NULL ELSE e.v ->> 'lib' END AS varchar(10)),
@@ -1254,6 +1258,7 @@ LANGUAGE sql STABLE AS $as4tainr$
            CASE WHEN upper(trim(coalesce(job_name, '*'))) = '*'
                 THEN coalesce(nullif(current_setting('as4tainr.stack', true), ''), '[]')::jsonb
                 ELSE '[]'::jsonb END) WITH ORDINALITY AS e(v, n)
+   ORDER BY e.n DESC
 $as4tainr$;
 
 DROP FUNCTION IF EXISTS qsys2.ifs_object_statistics(varchar, varchar, varchar, varchar, varchar);

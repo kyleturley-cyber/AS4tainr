@@ -1,0 +1,16 @@
+# Golden: %STATUS and the PSDS after a MONITOR caught a divide by zero in
+# a service program's procedure, read at once, after a call that ends
+# normally, after CALLP(E), and for a procedure found with QleActBndPgm/QleGetExp in a
+# program of ACTGRP(*NEW) (IBM i Unit's test runner reports status 0 on
+# PUB400 in its README's screenshot; verify33 showed 202).
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify34.txt -Files tools\golden\verify34
+a34_cleanup|!for c in "DLTF FILE(AS4TRAINR1/GLD34OUT)" "DLTPGM PGM(AS4TRAINR1/GLD34S)" "DLTMOD MODULE(AS4TRAINR1/GLD34S)" "DLTSRVPGM SRVPGM(AS4TRAINR1/GLD34V)" "DLTMOD MODULE(AS4TRAINR1/GLD34V)"; do system -q "$c"; done; echo cleaned
+a34_tag|!for f in gld34v.rpgle gld34s.sqlrpgle; do setccsid 819 /home/AS4TRAINR/gld/$f; done; ls /home/AS4TRAINR/gld | grep gld34
+a34_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD34OUT (N INT, LINE VARCHAR(200))') COMMIT(*NONE)
+a34_crtm|CRTRPGMOD MODULE(AS4TRAINR1/GLD34V) SRCSTMF('/home/AS4TRAINR/gld/gld34v.rpgle')
+a34_crtv|CRTSRVPGM SRVPGM(AS4TRAINR1/GLD34V) MODULE(AS4TRAINR1/GLD34V) EXPORT(*ALL) ACTGRP(*CALLER)
+a34_crtsm|CRTSQLRPGI OBJ(AS4TRAINR1/GLD34S) SRCSTMF('/home/AS4TRAINR/gld/gld34s.sqlrpgle') OBJTYPE(*MODULE) COMMIT(*NONE)
+a34_crts|CRTPGM PGM(AS4TRAINR1/GLD34S) MODULE(AS4TRAINR1/GLD34S) BNDSRVPGM((AS4TRAINR1/GLD34V)) ACTGRP(*NEW)
+a34_call|!system "CALL PGM(AS4TRAINR1/GLD34S)"
+a34_rows|CPYF FROMFILE(AS4TRAINR1/GLD34OUT) TOFILE(*PRINT)
+a34_end|!for c in "DLTF FILE(AS4TRAINR1/GLD34OUT)" "DLTPGM PGM(AS4TRAINR1/GLD34S)" "DLTMOD MODULE(AS4TRAINR1/GLD34S)" "DLTSRVPGM SRVPGM(AS4TRAINR1/GLD34V)" "DLTMOD MODULE(AS4TRAINR1/GLD34V)"; do system -q "$c"; done; echo cleaned

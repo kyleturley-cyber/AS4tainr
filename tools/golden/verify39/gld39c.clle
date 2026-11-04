@@ -1,0 +1,13 @@
+/* verify39: one job allocates a data area twice, prints its locks,  */
+/* and deallocates it three times (the third holds no lock).          */
+PGM
+             ALCOBJ     OBJ((AS4TRAINR1/GLD39D *DTAARA *SHRRD)) WAIT(0)
+             ALCOBJ     OBJ((AS4TRAINR1/GLD39D *DTAARA *SHRRD)) WAIT(0)
+             ALCOBJ     OBJ((AS4TRAINR1/GLD39D *DTAARA *EXCL)) WAIT(0)
+             WRKOBJLCK  OBJ(AS4TRAINR1/GLD39D) OBJTYPE(*DTAARA) +
+                          OUTPUT(*PRINT)
+             DLCOBJ     OBJ((AS4TRAINR1/GLD39D *DTAARA *EXCL))
+             DLCOBJ     OBJ((AS4TRAINR1/GLD39D *DTAARA *SHRRD))
+             DLCOBJ     OBJ((AS4TRAINR1/GLD39D *DTAARA *SHRRD))
+             DLCOBJ     OBJ((AS4TRAINR1/GLD39D *DTAARA *SHRRD))
+ENDPGM

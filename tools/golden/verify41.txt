@@ -1,0 +1,27 @@
+# Golden: the messages of commands added for testers: MOVOBJ (moved, a
+# target that exists, an object not found), RNMM (renamed, a member not
+# found), CLRMSGQ of a queue of our own, CPY and MOV of stream files (an
+# existing target, REPLACE(*YES), TODIR). Objects
+# move into QTEMP (the profile cannot create a library).
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify41.txt
+j41_cleanup|!for c in "DLTDTAARA DTAARA(AS4TRAINR1/GLD41D)" "DLTDTAARA DTAARA(AS4TRAINR1/GLD41E)" "DLTPGM PGM(AS4TRAINR1/GLD41C)" "DLTF FILE(AS4TRAINR1/GLD41S)" "DLTMSGQ MSGQ(AS4TRAINR1/GLD41Q)"; do system -q "$c"; done; rm -rf /home/AS4TRAINR/gld/g41; echo cleaned
+j41_mkdir|MKDIR DIR('/home/AS4TRAINR/gld/g41')
+j41_mkdir2|MKDIR DIR('/home/AS4TRAINR/gld/g41/sub')
+j41_dtaara|CRTDTAARA DTAARA(AS4TRAINR1/GLD41D) TYPE(*CHAR) LEN(3) VALUE(abc)
+j41_mov|MOVOBJ OBJ(AS4TRAINR1/GLD41D) OBJTYPE(*DTAARA) TOLIB(QTEMP)
+j41_movnone|MOVOBJ OBJ(AS4TRAINR1/GLD41X) OBJTYPE(*DTAARA) TOLIB(QTEMP)
+j41_crtc|CRTBNDCL PGM(AS4TRAINR1/GLD41C) SRCSTMF('/home/AS4TRAINR/gld/gld41c.clle')
+j41_movdup|CALL PGM(AS4TRAINR1/GLD41C)
+j41_srcpf|CRTSRCPF FILE(AS4TRAINR1/GLD41S)
+j41_mbr|ADDPFM FILE(AS4TRAINR1/GLD41S) MBR(OLDNAME)
+j41_rnmm|RNMM FILE(AS4TRAINR1/GLD41S) MBR(OLDNAME) NEWMBR(NEWNAME)
+j41_rnmmnone|RNMM FILE(AS4TRAINR1/GLD41S) MBR(OLDNAME) NEWMBR(OTHER)
+j41_msgq|CRTMSGQ MSGQ(AS4TRAINR1/GLD41Q)
+j41_sndmsg|SNDMSG MSG('one') TOMSGQ(AS4TRAINR1/GLD41Q)
+j41_clrmsgq|CLRMSGQ MSGQ(AS4TRAINR1/GLD41Q)
+j41_stmf|!echo hello > /home/AS4TRAINR/gld/g41/a.txt; echo made
+j41_cpy|CPY OBJ('/home/AS4TRAINR/gld/g41/a.txt') TOOBJ('/home/AS4TRAINR/gld/g41/b.txt')
+j41_cpydup|CPY OBJ('/home/AS4TRAINR/gld/g41/a.txt') TOOBJ('/home/AS4TRAINR/gld/g41/b.txt')
+j41_cpyrpl|CPY OBJ('/home/AS4TRAINR/gld/g41/a.txt') TOOBJ('/home/AS4TRAINR/gld/g41/b.txt') REPLACE(*YES)
+j41_mv|MOV OBJ('/home/AS4TRAINR/gld/g41/b.txt') TODIR('/home/AS4TRAINR/gld/g41/sub')
+j41_end|!for c in "DLTDTAARA DTAARA(AS4TRAINR1/GLD41D)" "DLTDTAARA DTAARA(AS4TRAINR1/GLD41E)" "DLTPGM PGM(AS4TRAINR1/GLD41C)" "DLTF FILE(AS4TRAINR1/GLD41S)" "DLTMSGQ MSGQ(AS4TRAINR1/GLD41Q)"; do system -q "$c"; done; rm -rf /home/AS4TRAINR/gld/g41; echo cleaned

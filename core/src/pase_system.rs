@@ -40,7 +40,14 @@ struct Options {
 
 /// Run `system` with its arguments (options, then the command; words
 /// after the options are joined with blanks).
+/// One `system` job runs in a process at a time: its call stack and job
+/// log are the process's (job key PID<n>). Tests that run `system` in
+/// threads of one process take turns (verify19's DSPJOB *PGMSTK once saw
+/// another test's QCMDEXC entry).
+static ONE_JOB: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub async fn run(job: &mut Job<'_>, args: &[String]) -> Output {
+    let _one = ONE_JOB.lock().await;
     // The job starts (its job log's first message).
     crate::pgmmsg::job_started();
     let mut opts = Options::default();

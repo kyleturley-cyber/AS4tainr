@@ -409,6 +409,37 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "DSPSFWRSC",
+        description: "Display Software Resources",
+        params: &[p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT")],
+    },
+    CommandDef {
+        name: "RSTLICPGM",
+        description: "Restore Licensed Program",
+        params: &[
+            p("LICPGM", Kind::Text, false, None, "Product").ch("Product ID"),
+            p("DEV", Kind::Name, false, None, "Device").ch("Name, *SAVF"),
+            p("OPTION", Kind::Text, false, Some("*BASE"), "Optional part to be restored").ch("*BASE, 1-99"),
+        ],
+    },
+    CommandDef {
+        name: "DLTLICPGM",
+        description: "Delete Licensed Program",
+        params: &[
+            p("LICPGM", Kind::Text, true, None, "Product").ch("Product ID"),
+            p("OPTION", Kind::Text, false, Some("*ALL"), "Optional part to be deleted").ch("*ALL, *BASE, 1-99"),
+        ],
+    },
+    CommandDef {
+        name: "SAVLICPGM",
+        description: "Save Licensed Program",
+        params: &[
+            p("LICPGM", Kind::Text, true, None, "Product").ch("Product ID"),
+            p("DEV", Kind::Name, false, None, "Device").ch("Name, *SAVF"),
+            p("OPTION", Kind::Text, false, Some("*BASE"), "Optional part to be saved").ch("*BASE, 1-99"),
+        ],
+    },
+    CommandDef {
         name: "GO",
         description: "Go to Menu",
         params: &[p("MENU", Kind::Qualified, true, None, "Menu").ch("Name, MAIN")],
@@ -1091,6 +1122,48 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "RNMM",
+        description: "Rename Member",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "Database file").ch("Name"),
+            p("MBR", Kind::Name, true, None, "Member").ch("Name"),
+            p("NEWMBR", Kind::Name, true, None, "New member").ch("Name"),
+        ],
+    },
+    CommandDef {
+        name: "CHGPF",
+        description: "Change Physical File",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "Physical file").ch("Name"),
+            p("SRCFILE", Kind::Qualified, false, Some("*NONE"), "Source file").ch("Name, *NONE"),
+            p("SRCMBR", Kind::Name, false, Some("*FILE"), "Source member").ch("Name, *FILE"),
+            p("TEXT", Kind::Text, false, Some("*SAME"), "Text 'description'").keyword_only(),
+            p("SIZE", Kind::List, false, Some("*SAME"), "Member size").keyword_only(),
+            p("MAXMBRS", Kind::Text, false, Some("*SAME"), "Maximum members").keyword_only(),
+            p("WAITFILE", Kind::Text, false, Some("*SAME"), "Maximum file wait time").keyword_only(),
+            p("WAITRCD", Kind::Text, false, Some("*SAME"), "Maximum record wait time").keyword_only(),
+            p("REUSEDLT", Kind::Name, false, Some("*SAME"), "Reuse deleted records").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "RTVCLSRC",
+        description: "Retrieve CL Source",
+        params: &[
+            p("PGM", Kind::Qualified, true, None, "Program").ch("Name"),
+            p("SRCFILE", Kind::Qualified, false, Some("QCLSRC"), "Source file").ch("Name"),
+            p("SRCMBR", Kind::Name, false, Some("*PGM"), "Source member").ch("Name, *PGM"),
+        ],
+    },
+    CommandDef {
+        name: "RGZPFM",
+        description: "Reorganize Physical File Member",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "Physical file").ch("Name"),
+            p("MBR", Kind::Name, false, Some("*FIRST"), "Member").ch("Name, *FIRST, *LAST"),
+            p("KEYFILE", Kind::List, false, Some("*NONE"), "Key file").ch("*NONE, *FILE"),
+        ],
+    },
+    CommandDef {
         name: "DLYJOB",
         description: "Delay Job",
         params: &[
@@ -1332,6 +1405,74 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "WRKLIB",
+        description: "Work with Libraries",
+        params: &[p("LIB", Kind::Name, true, None, "Library").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKF",
+        description: "Work with Files",
+        params: &[p("FILE", Kind::Qualified, true, None, "File").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKPGM",
+        description: "Work with Programs",
+        params: &[p("PGM", Kind::Qualified, true, None, "Program").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKSRVPGM",
+        description: "Work with Service Programs",
+        params: &[p("SRVPGM", Kind::Qualified, true, None, "Service program").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKDTAARA",
+        description: "Work with Data Areas",
+        params: &[p("DTAARA", Kind::Qualified, true, None, "Data area").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKDTAQ",
+        description: "Work with Data Queues",
+        params: &[p("DTAQ", Kind::Qualified, true, None, "Data queue").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKJOBD",
+        description: "Work with Job Descriptions",
+        params: &[p("JOBD", Kind::Qualified, true, None, "Job description").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKMSGF",
+        description: "Work with Message Files",
+        params: &[p("MSGF", Kind::Qualified, true, None, "Message file").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKCMD",
+        description: "Work with Commands",
+        params: &[p("CMD", Kind::Qualified, true, None, "Command").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKMNU",
+        description: "Work with Menus",
+        params: &[p("MENU", Kind::Qualified, true, None, "Menu").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKBNDDIR",
+        description: "Work with Binding Directories",
+        params: &[p("BNDDIR", Kind::Qualified, true, None, "Binding directory").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "WRKMOD",
+        description: "Work with Modules",
+        params: &[p("MODULE", Kind::Qualified, true, None, "Module").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "CLRMSGQ",
+        description: "Clear Message Queue",
+        params: &[
+            p("MSGQ", Kind::Qualified, true, None, "Message queue").ch("Name"),
+            p("CLEAR", Kind::Name, false, Some("*ALL"), "Messages to clear").ch("*ALL, *KEEPUNANS"),
+        ],
+    },
+    CommandDef {
         name: "WRKMBRPDM",
         description: "Work with Members Using PDM",
         params: &[
@@ -1340,6 +1481,17 @@ pub static COMMANDS: &[CommandDef] = &[
             p("MBRTYPE", Kind::Name, false, Some("*ALL"), "Member type")
                 .ch("Name, generic*, *ALL"),
         ],
+    },
+    CommandDef {
+        name: "STRPDM",
+        description: "Start PDM",
+        params: &[],
+    },
+    CommandDef {
+        name: "WRKLIBPDM",
+        description: "Work with Libraries Using PDM",
+        params: &[p("LIB", Kind::Name, false, Some("*LIBL"), "Library")
+            .ch("Name, generic*, *LIBL, *USRLIBL, *ALL")],
     },
     CommandDef {
         name: "WRKOBJPDM",
@@ -1412,7 +1564,20 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("Name, *CURRENT, *JOBD, *SYSVAL")
             .keyword_only(),
+            p("HOLD", Kind::Name, false, Some("*JOBD"), "Hold on job queue")
+                .ch("*JOBD, *NO, *YES")
+                .keyword_only(),
         ],
+    },
+    CommandDef {
+        name: "HLDJOB",
+        description: "Hold Job",
+        params: &[p("JOB", Kind::Text, true, None, "Job name").ch("number/user/name")],
+    },
+    CommandDef {
+        name: "RLSJOB",
+        description: "Release Job",
+        params: &[p("JOB", Kind::Text, true, None, "Job name").ch("number/user/name")],
     },
     CommandDef {
         name: "WRKACTJOB",
@@ -1423,6 +1588,25 @@ pub static COMMANDS: &[CommandDef] = &[
         name: "WRKSBMJOB",
         description: "Work with Submitted Jobs",
         params: &[],
+    },
+    CommandDef {
+        name: "WRKJOB",
+        description: "Work with Job",
+        params: &[
+            p("JOB", Kind::Text, false, Some("*"), "Job name").ch("*, number/user/name"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+            p("OPTION", Kind::Name, false, Some("*SELECT"), "Option")
+                .ch("*SELECT, *ALL, *STSA, *DFNA, *RUNA, *SPLF, *JOBLOG, *PGMSTK, *LIBL, *ACTGRP, *ENVVAR"),
+        ],
+    },
+    CommandDef {
+        name: "WRKUSRJOB",
+        description: "Work with User Jobs",
+        params: &[
+            p("USER", Kind::Name, false, Some("*"), "User").ch("Name, *"),
+            p("STATUS", Kind::Name, false, Some("*ALL"), "Status of user job")
+                .ch("*ALL, *ACTIVE, *JOBQ, *OUTQ"),
+        ],
     },
     CommandDef {
         name: "DSPJOB",
@@ -1669,8 +1853,29 @@ pub static COMMANDS: &[CommandDef] = &[
         name: "DSPMSG",
         description: "Display Messages",
         params: &[
-            p("MSGQ", Kind::Name, false, Some("*USRPRF"), "Message queue").ch("*USRPRF, user name"),
+            p("MSGQ", Kind::Qualified, false, Some("*USRPRF"), "Message queue").ch("*USRPRF, name"),
         ],
+    },
+    CommandDef {
+        name: "WRKMSG",
+        description: "Work with Messages",
+        params: &[
+            p("MSGQ", Kind::Qualified, false, Some("*USRPRF"), "Message queue").ch("*USRPRF, *WRKUSR, name"),
+        ],
+    },
+    CommandDef {
+        name: "WRKCFGSTS",
+        description: "Work with Configuration Status",
+        params: &[
+            p("CFGTYPE", Kind::Name, true, None, "Type").ch("*DEV"),
+            p("CFGD", Kind::Name, false, Some("*ALL"), "Configuration description").ch("Name, generic*, *ALL"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
+    },
+    CommandDef {
+        name: "WRKDEVD",
+        description: "Work with Device Descriptions",
+        params: &[p("DEVD", Kind::Name, false, Some("*ALL"), "Device description").ch("Name, generic*, *ALL")],
     },
     CommandDef {
         name: "GRTOBJAUT",
@@ -1733,6 +1938,15 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "MOVOBJ",
+        description: "Move Object",
+        params: &[
+            p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
+            p("OBJTYPE", Kind::Name, true, None, "Object type").ch("*FILE, *PGM, *DTAARA, ..."),
+            p("TOLIB", Kind::Name, true, None, "To library").ch("Name"),
+        ],
+    },
+    CommandDef {
         name: "RNMOBJ",
         description: "Rename Object",
         params: &[
@@ -1791,6 +2005,11 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "WRKMSGQ",
+        description: "Work with Message Queues",
+        params: &[p("MSGQ", Kind::Qualified, false, Some("*ALL"), "Message queue").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
         name: "DLTMSGQ",
         description: "Delete Message Queue",
         params: &[p("MSGQ", Kind::Qualified, true, None, "Message queue").ch("Name, generic*")],
@@ -1844,6 +2063,127 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "WRKSYSVAL",
+        description: "Work with System Values",
+        params: &[p("SYSVAL", Kind::Name, false, Some("*ALL"), "System value").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "DSPNETA",
+        description: "Display Network Attributes",
+        params: &[p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT")],
+    },
+    CommandDef {
+        name: "WRKSYSSTS",
+        description: "Work with System Status",
+        params: &[p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT")],
+    },
+    CommandDef {
+        name: "DSPLOG",
+        description: "Display Log",
+        params: &[
+            p("LOG", Kind::Name, false, Some("QHST"), "Log").ch("QHST"),
+            p("PERIOD", Kind::List, false, Some("*AVAIL *CURRENT"), "Time period for log output")
+                .ch("Start time and date, end time and date"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+            p("JOB", Kind::Text, false, Some("*NONE"), "Job").ch("Name, *NONE").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "EDTLIBL",
+        description: "Edit Library List",
+        params: &[],
+    },
+    CommandDef {
+        name: "SNDBRKMSG",
+        description: "Send Break Message",
+        params: &[
+            p("MSG", Kind::Text, true, None, "Message text").ch("Text"),
+            p("TOMSGQ", Kind::List, false, Some("*ALLWS"), "To work station message queue")
+                .ch("Name, *ALLWS"),
+            p("MSGTYPE", Kind::Name, false, Some("*INFO"), "Message type").ch("*INFO"),
+        ],
+    },
+    CommandDef {
+        name: "DSPRCDLCK",
+        description: "Display Record Locks",
+        params: &[
+            p("FILE", Kind::Qualified, true, None, "Physical file").ch("Name"),
+            p("MBR", Kind::Name, false, Some("*FIRST"), "Member").ch("Name, *FIRST"),
+            p("RCDNBR", Kind::Text, false, Some("*ALL"), "Record number").ch("Number, *ALL"),
+        ],
+    },
+    CommandDef {
+        name: "WRKOBJLCK",
+        description: "Work with Object Locks",
+        params: &[
+            p("OBJ", Kind::Qualified, true, None, "Object").ch("Name"),
+            p("OBJTYPE", Kind::Name, true, None, "Object type").ch("*FILE, *DTAARA, *DTAQ, *PGM, ..."),
+            p("MBR", Kind::Name, false, Some("*NONE"), "Member").ch("Name, *NONE").keyword_only(),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
+    },
+    CommandDef {
+        name: "PWRDWNSYS",
+        description: "Power Down System",
+        params: &[
+            p("OPTION", Kind::Name, false, Some("*CNTRLD"), "How to end").ch("*CNTRLD, *IMMED"),
+            p("DELAY", Kind::Text, false, Some("3600"), "Controlled end delay time").ch("Seconds, *NOLIMIT"),
+            p("RESTART", Kind::List, false, Some("*NO"), "Restart options").ch("*NO, *YES"),
+        ],
+    },
+    CommandDef {
+        name: "WRKSBS",
+        description: "Work with Subsystems",
+        params: &[],
+    },
+    CommandDef {
+        name: "ENDSBS",
+        description: "End Subsystem",
+        params: &[
+            p("SBS", Kind::Name, true, None, "Subsystem").ch("Name, *ALL"),
+            p("OPTION", Kind::Name, false, Some("*CNTRLD"), "How to end").ch("*CNTRLD, *IMMED"),
+            p("DELAY", Kind::Text, false, Some("*NOLIMIT"), "Controlled end delay time").ch("Seconds, *NOLIMIT"),
+        ],
+    },
+    CommandDef {
+        name: "STRSBS",
+        description: "Start Subsystem",
+        params: &[p("SBSD", Kind::Qualified, true, None, "Subsystem description").ch("Name")],
+    },
+    CommandDef {
+        name: "CLRJOBQ",
+        description: "Clear Job Queue",
+        params: &[p("JOBQ", Kind::Qualified, true, None, "Job queue").ch("Name")],
+    },
+    CommandDef {
+        name: "HLDJOBQ",
+        description: "Hold Job Queue",
+        params: &[p("JOBQ", Kind::Qualified, true, None, "Job queue").ch("Name")],
+    },
+    CommandDef {
+        name: "RLSJOBQ",
+        description: "Release Job Queue",
+        params: &[p("JOBQ", Kind::Qualified, true, None, "Job queue").ch("Name")],
+    },
+    CommandDef {
+        name: "WRKJOBQ",
+        description: "Work with Job Queues",
+        params: &[p("JOBQ", Kind::Qualified, false, Some("*ALL"), "Job queue").ch("Name, *ALL")],
+    },
+    CommandDef {
+        name: "WRKUSRPRF",
+        description: "Work with User Profiles",
+        params: &[p("USRPRF", Kind::Name, false, Some("*ALL"), "User profile").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "CHGSYSVAL",
+        description: "Change System Value",
+        params: &[
+            p("SYSVAL", Kind::Name, true, None, "System value").ch("QDATFMT, QDATSEP, QTIMSEP, ..."),
+            p("VALUE", Kind::Text, true, None, "New value").ch("Value"),
+        ],
+    },
+    CommandDef {
         name: "DSPSYSVAL",
         description: "Display System Value",
         params: &[
@@ -1888,6 +2228,27 @@ pub static COMMANDS: &[CommandDef] = &[
             p("FILE", Kind::Qualified, true, None, "File").ch("Name"),
             p("MBR", Kind::Name, false, Some("*FIRST"), "Member").ch("Name, *FIRST"),
         ],
+    },
+    CommandDef {
+        name: "STRSEU",
+        description: "Start Source Entry Utility",
+        params: &[
+            p("SRCFILE", Kind::Qualified, true, None, "Source file").ch("Name"),
+            p("SRCMBR", Kind::Name, true, None, "Source member").ch("Name"),
+            p("TYPE", Kind::Name, false, Some("*SAME"), "Source type").ch("*SAME, RPGLE, CLLE, ..."),
+            p("OPTION", Kind::Text, false, Some("2"), "Option").ch("2=Edit, 5=Browse"),
+            p("TEXT", Kind::Text, false, Some("*BLANK"), "Text 'description'").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "DSPF",
+        description: "Display File",
+        params: &[p("STMF", Kind::Text, true, None, "Stream file").ch("Path name")],
+    },
+    CommandDef {
+        name: "EDTF",
+        description: "Edit File",
+        params: &[p("STMF", Kind::Text, true, None, "Stream file").ch("Path name")],
     },
     CommandDef {
         name: "CRTSRCPF",
@@ -3389,6 +3750,25 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[p("OBJLNK", Kind::Text, true, None, "Object link").ch("Path name, generic*")],
     },
     CommandDef {
+        name: "CPY",
+        description: "Copy Object",
+        params: &[
+            p("OBJ", Kind::Text, true, None, "Object").ch("Path name"),
+            p("TOOBJ", Kind::Text, false, Some("*NONE"), "To object").ch("Path name"),
+            p("TODIR", Kind::Text, false, Some("*NONE"), "To directory").ch("Path name, ."),
+            p("REPLACE", Kind::Name, false, Some("*NO"), "Replace object").ch("*NO, *YES").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "MOV",
+        description: "Move Object",
+        params: &[
+            p("OBJ", Kind::Text, true, None, "Object").ch("Path name"),
+            p("TOOBJ", Kind::Text, false, Some("*NONE"), "To object").ch("Path name"),
+            p("TODIR", Kind::Text, false, Some("*NONE"), "To directory").ch("Path name, ."),
+        ],
+    },
+    CommandDef {
         name: "RNM",
         description: "Rename Object",
         params: &[
@@ -3411,9 +3791,103 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "DSPAUT",
+        description: "Display Authority",
+        params: &[
+            p("OBJ", Kind::Text, true, None, "Object").ch("Path name"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
+    },
+    CommandDef {
+        name: "CHGAUT",
+        description: "Change Authority",
+        params: &[
+            p("OBJ", Kind::Text, true, None, "Object").ch("Path name"),
+            p("USER", Kind::List, false, Some("*PUBLIC"), "User").ch("Name, *PUBLIC"),
+            p("DTAAUT", Kind::Name, false, Some("*SAME"), "New data authorities").ch("*SAME, *RWX, *RX, *RW, *WX, *R, *W, *X, *EXCLUDE"),
+            p("OBJAUT", Kind::List, false, Some("*SAME"), "New object authorities").ch("*SAME, *ALL, *NONE, *OBJEXIST..."),
+            p("SUBTREE", Kind::Name, false, Some("*NONE"), "Directory subtree").ch("*NONE, *ALL").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CHGOWN",
+        description: "Change Owner",
+        params: &[
+            p("OBJ", Kind::Text, true, None, "Object").ch("Path name"),
+            p("NEWOWN", Kind::Name, true, None, "New owner").ch("Name"),
+            p("RVKOLDAUT", Kind::Name, false, Some("*YES"), "Revoke current owner authority").ch("*YES, *NO"),
+        ],
+    },
+    CommandDef {
         name: "DSPLNK",
         description: "Display Object Links",
         params: &[p("OBJ", Kind::Text, false, Some("*"), "Object").ch("Path name, *")],
+    },
+    CommandDef {
+        name: "CPYTOIMPF",
+        description: "Copy To Import File",
+        params: &[
+            p("FROMFILE", Kind::List, true, None, "From file").ch("Name, member"),
+            p("TOSTMF", Kind::Text, true, None, "To stream file").ch("Path name"),
+            p("MBROPT", Kind::Name, false, Some("*ADD"), "Replace or add records").ch("*ADD, *REPLACE"),
+            p("STMFCCSID", Kind::Text, false, Some("*FILE"), "Stream file CCSID")
+                .ch("1-65533, *FILE, *PCASCII, *STDASCII")
+                .keyword_only(),
+            p("RCDDLM", Kind::Text, false, Some("*EOR"), "Record delimiter")
+                .ch("*EOR, *CRLF, *LF, *CR, *LFCR")
+                .keyword_only(),
+            p("DTAFMT", Kind::Name, false, Some("*DLM"), "Record format of import file")
+                .ch("*DLM")
+                .keyword_only(),
+            p("STRDLM", Kind::Text, false, Some("*DBLQUOTE"), "String delimiter")
+                .ch("Character, *DBLQUOTE, *NONE")
+                .keyword_only(),
+            p("STRESCCHR", Kind::Text, false, Some("*STRDLM"), "String escape character")
+                .ch("Character, *STRDLM, *NONE")
+                .keyword_only(),
+            p("RMVBLANK", Kind::Name, false, Some("*NONE"), "Remove blanks")
+                .ch("*NONE, *LEADING, *TRAILING, *BOTH")
+                .keyword_only(),
+            p("FLDDLM", Kind::Text, false, Some("','"), "Field delimiter").ch("Character").keyword_only(),
+            p("DECPNT", Kind::Name, false, Some("*PERIOD"), "Decimal point")
+                .ch("*PERIOD, *COMMA")
+                .keyword_only(),
+            p("ADDCOLNAM", Kind::Name, false, Some("*NONE"), "Column names")
+                .ch("*NONE, *SYS, *SQL")
+                .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CPYFRMIMPF",
+        description: "Copy From Import File",
+        params: &[
+            p("FROMSTMF", Kind::Text, true, None, "From stream file").ch("Path name"),
+            p("TOFILE", Kind::List, true, None, "To data base file").ch("Name, member"),
+            p("MBROPT", Kind::Name, false, Some("*ADD"), "Replace or add records").ch("*ADD, *REPLACE"),
+            p("RCDDLM", Kind::Text, false, Some("*EOR"), "Record delimiter")
+                .ch("*EOR, *CRLF, *LF, *CR, *LFCR")
+                .keyword_only(),
+            p("DTAFMT", Kind::Name, false, Some("*DLM"), "Record format of import file")
+                .ch("*DLM")
+                .keyword_only(),
+            p("STRDLM", Kind::Text, false, Some("*DBLQUOTE"), "String delimiter")
+                .ch("Character, *DBLQUOTE, *NONE")
+                .keyword_only(),
+            p("STRESCCHR", Kind::Text, false, Some("*STRDLM"), "String escape character")
+                .ch("Character, *STRDLM, *NONE")
+                .keyword_only(),
+            p("FLDDLM", Kind::Text, false, Some("','"), "Field delimiter").ch("Character").keyword_only(),
+            p("DECPNT", Kind::Name, false, Some("*PERIOD"), "Decimal point")
+                .ch("*PERIOD, *COMMA")
+                .keyword_only(),
+            p("FROMRCD", Kind::List, false, Some("1"), "Start record").ch("Number, *END").keyword_only(),
+            p("RMVCOLNAM", Kind::Name, false, Some("*NO"), "Remove column names")
+                .ch("*NO, *YES")
+                .keyword_only(),
+            p("RPLNULLVAL", Kind::Name, false, Some("*NO"), "Replace null values")
+                .ch("*NO, *FLDDFT")
+                .keyword_only(),
+        ],
     },
     CommandDef {
         name: "CPYTOSTMF",
@@ -4215,6 +4689,12 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .ch("*NONE, *ADD, *REPLACE"),
             p("CRTFILE", Kind::Name, false, Some("*NO"), "Create file").ch("*NO, *YES"),
+            p("FROMRCD", Kind::Text, false, Some("*START"), "Copy from record number")
+                .ch("Number, *START")
+                .keyword_only(),
+            p("TORCD", Kind::Text, false, Some("*END"), "Copy to record number")
+                .ch("Number, *END")
+                .keyword_only(),
             p("PRINT", Kind::List, false, Some("*NONE"), "Print format")
                 .ch("*NONE, *COPIED, *EXCLD")
                 .keyword_only(),
@@ -4266,6 +4746,12 @@ pub fn value_error(detail: &str) -> anyhow::Error {
     anyhow::anyhow!("CPD0084: {detail}\n{CPF0006}")
 }
 
+/// A value the command analyzer refuses with a diagnostic of its own
+/// (e.g. CPD0090), then CPF0006.
+pub fn value_error_id(id: &str, detail: &str) -> anyhow::Error {
+    anyhow::anyhow!("{id}: {detail}\n{CPF0006}")
+}
+
 /// A group of commands on the F4 menu.
 pub struct Group {
     /// The line on the Command Groups menu.
@@ -4291,6 +4777,7 @@ pub static GROUPS: &[Group] = &[
             "RMVLIBLE",
             "CHGCURLIB",
             "CHGLIBL",
+            "EDTLIBL",
         ],
     },
     Group {
@@ -4298,9 +4785,22 @@ pub static GROUPS: &[Group] = &[
         title: "Object Commands",
         commands: &[
             "WRKOBJ",
+            "WRKLIB",
+            "WRKF",
+            "WRKPGM",
+            "WRKSRVPGM",
+            "WRKDTAARA",
+            "WRKDTAQ",
+            "WRKJOBD",
+            "WRKMSGF",
+            "WRKCMD",
+            "WRKMNU",
+            "WRKBNDDIR",
+            "WRKMOD",
             "DSPOBJD",
             "CHGOBJD",
             "RNMOBJ",
+            "MOVOBJ",
             "DLTOBJ",
             "ALCOBJ",
             "DLCOBJ",
@@ -4327,12 +4827,24 @@ pub static GROUPS: &[Group] = &[
             "RMVM",
             "WRKMBRPDM",
             "WRKOBJPDM",
+            "WRKLIBPDM",
+            "STRPDM",
+            "STRSEU",
+            "EDTF",
+            "DSPF",
         ],
     },
     Group {
         item: "User profile commands",
         title: "User Profile Commands",
-        commands: &["CRTUSRPRF", "DSPUSRPRF", "DLTUSRPRF", "CHGPWD", "CHGUSRPRF"],
+        commands: &[
+            "CRTUSRPRF",
+            "DSPUSRPRF",
+            "DLTUSRPRF",
+            "CHGPWD",
+            "CHGUSRPRF",
+            "WRKUSRPRF",
+        ],
     },
     Group {
         item: "Security commands",
@@ -4365,11 +4877,40 @@ pub static GROUPS: &[Group] = &[
             "DSPJOBLOG",
             "ENDJOB",
             "SNDMSG",
+            "SNDBRKMSG",
+            "DSPRCDLCK",
+            "WRKOBJLCK",
             "DSPMSG",
+            "CLRMSGQ",
+            "WRKMSG",
+            "WRKCFGSTS",
+            "WRKDEVD",
             "CRTMSGQ",
             "DLTMSGQ",
             "DLYJOB",
             "DSPSYSVAL",
+            "CHGSYSVAL",
+            "DSPSFWRSC",
+            "RSTLICPGM",
+            "DLTLICPGM",
+            "SAVLICPGM",
+            "HLDJOB",
+            "RLSJOB",
+            "WRKJOB",
+            "WRKUSRJOB",
+            "WRKMSGQ",
+            "WRKSYSVAL",
+            "WRKSYSSTS",
+            "PWRDWNSYS",
+            "DSPLOG",
+            "DSPNETA",
+            "WRKSBS",
+            "ENDSBS",
+            "STRSBS",
+            "HLDJOBQ",
+            "CLRJOBQ",
+            "RLSJOBQ",
+            "WRKJOBQ",
             "ADDENVVAR",
             "CHGENVVAR",
             "RMVENVVAR",
@@ -4446,6 +4987,10 @@ pub static GROUPS: &[Group] = &[
             "OVRPRTF",
             "DLTOVR",
             "CLRPFM",
+            "RGZPFM",
+            "RTVCLSRC",
+            "CHGPF",
+            "RNMM",
             "STRCMTCTL",
             "ENDCMTCTL",
             "COMMIT",
@@ -4482,6 +5027,9 @@ pub static GROUPS: &[Group] = &[
             "STRQSH",
             "STRREXPRC",
             "DSPATR",
+            "DSPAUT",
+            "CHGAUT",
+            "CHGOWN",
             "WRKLNK",
             "DSPLNK",
             "MKDIR",
@@ -4494,8 +5042,12 @@ pub static GROUPS: &[Group] = &[
             "DEL",
             "ERASE",
             "RNM",
+            "CPY",
+            "MOV",
             "CHGCURDIR",
             "CD",
+            "CPYTOIMPF",
+            "CPYFRMIMPF",
             "CPYTOSTMF",
             "CPYFRMSTMF",
         ],

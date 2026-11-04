@@ -1,0 +1,19 @@
+# Golden: RTVCLSRC of a program made from a source member (the original
+# source file, library, member and change date in the comment box),
+# with labels, a long command, nested commands (THEN, CMD, EXEC) and
+# DCLF; DSPAUT, CHGAUT and CHGOWN of a stream file.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify43.txt
+l43_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLD43C)" "DLTF FILE(AS4TRAINR1/GLD43S)"; do system -q "$c"; done; rm -f /home/AS4TRAINR/gld/g43.txt; echo cleaned
+l43_srcpf|CRTSRCPF FILE(AS4TRAINR1/GLD43S) RCDLEN(112)
+l43_mbr|CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld43c.clle') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD43S.FILE/GLD43C.MBR')
+l43_crtc|CRTBNDCL PGM(AS4TRAINR1/GLD43C) SRCFILE(AS4TRAINR1/GLD43S) SRCMBR(GLD43C)
+l43_rtv|RTVCLSRC PGM(AS4TRAINR1/GLD43C) SRCFILE(AS4TRAINR1/GLD43S) SRCMBR(RTV43)
+l43_rows|CPYF FROMFILE(AS4TRAINR1/GLD43S) TOFILE(*PRINT) FROMMBR(RTV43)
+l43_stmf|!echo x > /home/AS4TRAINR/gld/g43.txt; echo made
+l43_dspaut|DSPAUT OBJ('/home/AS4TRAINR/gld/g43.txt') OUTPUT(*PRINT)
+l43_chgaut|CHGAUT OBJ('/home/AS4TRAINR/gld/g43.txt') USER(*PUBLIC) DTAAUT(*EXCLUDE)
+l43_dspaut2|DSPAUT OBJ('/home/AS4TRAINR/gld/g43.txt') OUTPUT(*PRINT)
+l43_chgautbad|CHGAUT OBJ('/home/AS4TRAINR/gld/g43.txt') USER(*PUBLIC) DTAAUT(*ALL)
+l43_chgown|CHGOWN OBJ('/home/AS4TRAINR/gld/g43.txt') NEWOWN(AS4TRAINR)
+l43_chgownbad|CHGOWN OBJ('/home/AS4TRAINR/gld/g43.txt') NEWOWN(NOSUCHUSR)
+l43_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLD43C)" "DLTF FILE(AS4TRAINR1/GLD43S)"; do system -q "$c"; done; rm -f /home/AS4TRAINR/gld/g43.txt; echo cleaned

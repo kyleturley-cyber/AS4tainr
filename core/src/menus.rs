@@ -140,7 +140,58 @@ pub const BUILTIN: &[BuiltinMenu] = &[
             SIGN_OFF,
         ],
     },
+    // GO LICPGM: work with licensed programs (option numbers as IBM i's
+    // LICPGM menu numbers them, texts as4tainr's). as4tainr's functions
+    // are built in: the install, delete and save options say so
+    // (RSTLICPGM, DLTLICPGM, SAVLICPGM).
+    BuiltinMenu {
+        name: "LICPGM",
+        title: "Work with Licensed Programs",
+        options: &[
+            o(1, "Install licensed programs from media", "RSTLICPGM"),
+            o(10, "Display installed licensed programs", "DSPSFWRSC"),
+            o(11, "Install a licensed program", "RSTLICPGM"),
+            o(12, "Delete a licensed program", "?DLTLICPGM"),
+            o(13, "Save a licensed program", "?SAVLICPGM"),
+            o(50, "Display the history log", "DSPLOG"),
+            SIGN_OFF,
+        ],
+    },
 ];
+
+/// WRKJOB's menu for the job it runs in (not a menu GO shows): the
+/// option numbers are IBM i's for these displays, the texts as4tainr's.
+pub const WRKJOB: BuiltinMenu = BuiltinMenu {
+    name: "WRKJOB",
+    title: "Work with Job",
+    options: &[
+        o(1, "Status attributes of the job", "DSPJOB OPTION(*STSA)"),
+        o(
+            2,
+            "Definition attributes of the job",
+            "DSPJOB OPTION(*DFNA)",
+        ),
+        o(3, "Run attributes of the job", "DSPJOB OPTION(*RUNA)"),
+        o(4, "Spooled files", "WRKSPLF"),
+        o(10, "Job log", "DSPJOBLOG"),
+        o(11, "Call stack", "DSPJOB OPTION(*PGMSTK)"),
+        o(13, "Library list", "DSPJOB OPTION(*LIBL)"),
+        o(18, "Activation groups", "DSPJOB OPTION(*ACTGRP)"),
+    ],
+};
+
+/// STRPDM's menu (not one GO shows): the option numbers are PDM's, the
+/// texts as4tainr's; each option prompts its command, as PDM asks for
+/// the library, file or objects to work with.
+pub const PDM: BuiltinMenu = BuiltinMenu {
+    name: "PDM",
+    title: "Programming Development Manager (PDM)",
+    options: &[
+        o(1, "Work with libraries", "?WRKLIBPDM"),
+        o(2, "Work with objects", "?WRKOBJPDM"),
+        o(3, "Work with members", "?WRKMBRPDM"),
+    ],
+};
 
 /// A menu found by GO.
 #[derive(Debug, Clone)]

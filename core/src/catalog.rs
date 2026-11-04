@@ -455,6 +455,10 @@ pub async fn init(client: &Client) -> Result<()> {
             .await
             .context("creating catalog")?;
         client
+            .batch_execute(crate::objlock::DDL)
+            .await
+            .context("creating catalog")?;
+        client
             .batch_execute(crate::spool::DDL)
             .await
             .context("creating catalog")?;
@@ -524,7 +528,9 @@ pub async fn init(client: &Client) -> Result<()> {
     client
         .execute("SELECT pg_advisory_unlock($1)", &[&INIT_LOCK_KEY])
         .await?;
-    result
+    result?;
+    // The system values CHGSYSVAL changed, for this process.
+    crate::clpgm::load_system_values(client).await
 }
 
 /// CRTLIB: like `create_library`, but fails with CPF2111 when the library exists.
@@ -789,6 +795,70 @@ pub async fn object_size(client: &Client, library: &str, name: &str, objtype: &s
         )
         .await?;
     Ok(row.get(0))
+}
+
+/// Clear a physical file's records for MBROPT(*REPLACE): the member is
+/// cleared, so the records copied in are numbered from 1 again (as after
+/// CLRPFM). `table` is the file's quoted `schema.table`. Row by row (not
+/// TRUNCATE), so journaling and triggers see the deletes.
+pub async fn replace_records(client: &Client, table: &str) -> Result<()> {
+    client.execute(&format!("DELETE FROM {table}"), &[]).await?;
+    client
+        .execute(
+            "SELECT setval(pg_get_serial_sequence($1, 'rrn'), 1, false)",
+            &[&table],
+        )
+        .await?;
+    Ok(())
+}
+
+/// RGZPFM: a physical file's records numbered 1..n in `order` (an ORDER
+/// BY list over the table's columns, ending with rrn), the record number
+/// sequence going on after the last one; triggers (journal, trigger
+/// programs) do not fire. The number of record numbers that were gaps.
+/// `table` is the file's quoted `schema.table`.
+pub async fn reorganize(client: &Client, table: &str, order: &str) -> Result<i64> {
+    client
+        .batch_execute(&format!(
+            "BEGIN; SET LOCAL session_replication_role = replica;
+             LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE;"
+        ))
+        .await?;
+    let work = async {
+        let row = client
+            .query_one(
+                &format!("SELECT count(*), coalesce(max(rrn), 0)::bigint FROM {table}"),
+                &[],
+            )
+            .await?;
+        let (n, max): (i64, i64) = (row.get(0), row.get(1));
+        client
+            .batch_execute(&format!(
+                "UPDATE {table} t SET rrn = -o.n
+                   FROM (SELECT rrn AS old, row_number() OVER (ORDER BY {order}) AS n FROM {table}) o
+                  WHERE t.rrn = o.old;
+                 UPDATE {table} SET rrn = -rrn;"
+            ))
+            .await?;
+        client
+            .execute(
+                "SELECT setval(pg_get_serial_sequence($1, 'rrn'), greatest($2::bigint, 1), $2::bigint > 0)",
+                &[&table, &n],
+            )
+            .await?;
+        anyhow::Ok(max - n)
+    }
+    .await;
+    match work {
+        Ok(removed) => {
+            client.batch_execute("COMMIT").await?;
+            Ok(removed)
+        }
+        Err(e) => {
+            client.batch_execute("ROLLBACK").await?;
+            Err(e)
+        }
+    }
 }
 
 /// All libraries, by name.

@@ -124,6 +124,25 @@ async fn lock_holder(client: &Client, lock_name: &str, rrn: i64) -> Option<Strin
     }
 }
 
+/// The record locks on a physical file (DSPRCDLCK): record number, the
+/// job's name (its session's application_name), and whether it holds
+/// the lock (false: it waits for it), by record number.
+pub async fn record_locks(client: &Client, lock_name: &str) -> Result<Vec<(i64, String, bool)>> {
+    Ok(client
+        .query(
+            "SELECT l.objid::bigint, a.application_name, l.granted
+               FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+              WHERE l.locktype = 'advisory' AND l.objsubid = 2
+                AND l.classid = (hashtext($1)::bigint & 4294967295)::oid
+              ORDER BY 1, 3 DESC, 2",
+            &[&lock_name],
+        )
+        .await?
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect())
+}
+
 enum Dir {
     Forward,
     Backward,
@@ -233,27 +252,30 @@ impl OpenFile {
                 }
                 return Err(e.into());
             }
-            // Another job may have changed or deleted it meanwhile.
-            match self
-                .fetch_one(
-                    client,
-                    "t.rrn = CAST($1::text AS bigint)",
-                    "t.rrn",
-                    &[rrn.to_string()],
-                )
-                .await?
-            {
-                Some((rec, _)) => r.record = Some(rec),
-                None => {
-                    client
-                        .execute(RECORD_UNLOCK_SQL, &[&self.lock_name, &rrn])
-                        .await?;
-                    self.current_rrn = None;
-                    bail!(
-                        "CPF5013: Record {rrn} in file {} was deleted by another job.",
-                        self.lock_name
-                    );
-                }
+        }
+        // The record as it is now that it is locked: another job may have
+        // changed or deleted it since it was read, also when the lock came
+        // at once (that job's UPDATE and release came between the read and
+        // the lock); the old image would undo its change at UPDATE.
+        match self
+            .fetch_one(
+                client,
+                "t.rrn = CAST($1::text AS bigint)",
+                "t.rrn",
+                &[rrn.to_string()],
+            )
+            .await?
+        {
+            Some((rec, _)) => r.record = Some(rec),
+            None => {
+                client
+                    .execute(RECORD_UNLOCK_SQL, &[&self.lock_name, &rrn])
+                    .await?;
+                self.current_rrn = None;
+                bail!(
+                    "CPF5013: Record {rrn} in file {} was deleted by another job.",
+                    self.lock_name
+                );
             }
         }
         self.locked = Some(rrn);

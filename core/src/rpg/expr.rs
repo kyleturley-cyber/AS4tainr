@@ -549,6 +549,12 @@ impl Parser {
             "*OFF" => Expr::Fig(Fig::Off),
             "*NULL" => Expr::Fig(Fig::Null),
             "*OMIT" => Expr::Omit,
+            // *ALL alone: %SIZE(array:*ALL), %ELEM, LOOKUP... (a special
+            // value, not the figurative constant).
+            "*ALL" if !matches!(self.peek(), Some(Tok::Str(_)) | Some(Tok::Hex(_))) => Expr::Name {
+                parts: vec!["*ALL".into()],
+                args: None,
+            },
             "*ALL" => match self.next() {
                 Some(Tok::Str(p)) => Expr::Fig(Fig::All(e(&p))),
                 Some(Tok::Hex(b)) => Expr::Fig(Fig::All(b)),

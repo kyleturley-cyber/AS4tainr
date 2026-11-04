@@ -328,6 +328,28 @@ impl Job<'_> {
                 }
             }
         }
+        // FROMRCD and TORCD: the records from one relative record number
+        // to another, in arrival sequence whatever the file's keys (CL
+        // reference, CPYF FROMRCD: "the file is processed in arrival
+        // sequence").
+        let rcd = |kw: &str, special: &str| -> Result<Option<i64>> {
+            let v = cmd.get(kw).trim().to_ascii_uppercase();
+            if v.is_empty() || v == special {
+                return Ok(None);
+            }
+            v.parse::<i64>().map(Some).map_err(|_| {
+                crate::cl::value_error(&format!("{kw}({v}) is not a record number or {special}."))
+            })
+        };
+        let (from_rcd, to_rcd) = (rcd("FROMRCD", "*START")?, rcd("TORCD", "*END")?);
+        if from_rcd.is_some() || to_rcd.is_some() {
+            let mut both: Vec<(i64, rla::Record)> = rrns.into_iter().zip(records).collect();
+            both.sort_by_key(|(r, _)| *r);
+            both.retain(|(r, _)| {
+                from_rcd.is_none_or(|f| *r >= f) && to_rcd.is_none_or(|t| *r <= t)
+            });
+            (rrns, records) = both.into_iter().unzip();
+        }
         let fields: Vec<String> = from.file.fields.iter().map(|f| f.name.clone()).collect();
         // No records: CPC2957, to a file or *PRINT (PUB400 2026-10-27,
         // verify5 z_cpysplf_2f, verify8 c8_cpyf_empty).
@@ -461,9 +483,7 @@ impl Job<'_> {
             .get(0);
         match cmd.get("MBROPT").to_ascii_uppercase().as_str() {
             "*REPLACE" => {
-                self.client
-                    .batch_execute(&format!("DELETE FROM {table}"))
-                    .await?;
+                crate::catalog::replace_records(self.client, &table).await?;
             }
             "*ADD" => {}
             // MBROPT(*NONE): only into a to-file this copy creates.

@@ -1,0 +1,19 @@
+# Golden: RGZPFM: a file with a deleted record reorganized in arrival
+# order and by key (the record numbers afterwards in CPYF's printed
+# listing), its messages, and the errors for a file that does not exist
+# and a logical file; DSPFD *MBR's deleted record count before and after.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify40.txt
+i40_cleanup|!for c in "DLTF FILE(AS4TRAINR1/GLD40L)" "DLTF FILE(AS4TRAINR1/GLD40T)"; do system -q "$c"; done; echo cleaned
+i40_table|RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD40T (K DECIMAL(5, 0) NOT NULL PRIMARY KEY, NAME CHAR(10) NOT NULL)') COMMIT(*NONE)
+i40_ins|RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD40T VALUES(3, ''three''), (1, ''one''), (2, ''two''), (5, ''five'')') COMMIT(*NONE)
+i40_del|RUNSQL SQL('DELETE FROM AS4TRAINR1/GLD40T WHERE K = 1') COMMIT(*NONE)
+i40_index|RUNSQL SQL('CREATE INDEX AS4TRAINR1/GLD40L ON AS4TRAINR1/GLD40T (NAME)') COMMIT(*NONE)
+i40_mbr1|DSPFD FILE(AS4TRAINR1/GLD40T) TYPE(*MBR)
+i40_rgz|RGZPFM FILE(AS4TRAINR1/GLD40T)
+i40_mbr2|DSPFD FILE(AS4TRAINR1/GLD40T) TYPE(*MBR)
+i40_rows1|CPYF FROMFILE(AS4TRAINR1/GLD40T) TOFILE(*PRINT) OUTFMT(*CHAR)
+i40_rgzkey|RGZPFM FILE(AS4TRAINR1/GLD40T) KEYFILE(*FILE)
+i40_rows2|CPYF FROMFILE(AS4TRAINR1/GLD40T) TOFILE(*PRINT) OUTFMT(*CHAR)
+i40_rgzlf|RGZPFM FILE(AS4TRAINR1/GLD40L)
+i40_nosuch|RGZPFM FILE(AS4TRAINR1/GLD40X)
+i40_end|!for c in "DLTF FILE(AS4TRAINR1/GLD40L)" "DLTF FILE(AS4TRAINR1/GLD40T)"; do system -q "$c"; done; echo cleaned

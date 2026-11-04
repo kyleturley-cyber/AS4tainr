@@ -46,6 +46,16 @@ CREATE TABLE IF NOT EXISTS as4tainr.jobs (
 -- The last spooled file number the job gave (numbers are not reused
 -- within a job when files are deleted).
 ALTER TABLE as4tainr.jobs ADD COLUMN IF NOT EXISTS last_splf integer NOT NULL DEFAULT 0;
+-- ENDSBS and STRSBS: whether a subsystem starts jobs (QBATCH).
+CREATE TABLE IF NOT EXISTS as4tainr.subsystems (
+    name   text PRIMARY KEY,
+    active boolean NOT NULL DEFAULT true
+);
+-- HLDJOBQ: a job queue the subsystem takes no jobs from until RLSJOBQ
+-- (by the queue's name, as jobs carry it).
+CREATE TABLE IF NOT EXISTS as4tainr.held_job_queues (name text PRIMARY KEY);
+-- HLDJOB of a job on a job queue: the subsystem passes it by until RLSJOB.
+ALTER TABLE as4tainr.jobs ADD COLUMN IF NOT EXISTS held boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS as4tainr.job_log (
     seq    bigserial PRIMARY KEY,
     job    bigint NOT NULL,
@@ -418,7 +428,8 @@ pub async fn claim_next(client: &Client, jobq: &str) -> Result<Option<JobInfo>> 
         .query_opt(
             &format!(
                 "UPDATE as4tainr.jobs SET status='ACTIVE', activity='RUN', started=now()
-                 WHERE number = (SELECT number FROM as4tainr.jobs WHERE status='JOBQ' AND jobq=$1
+                 WHERE number = (SELECT number FROM as4tainr.jobs WHERE status='JOBQ' AND jobq=$1 AND NOT held
+                                   AND NOT EXISTS (SELECT 1 FROM as4tainr.held_job_queues h WHERE h.name = $1)
                                  ORDER BY entered, number LIMIT 1 FOR UPDATE SKIP LOCKED)
                  RETURNING {JOB_COLS}"
             ),
@@ -472,6 +483,23 @@ pub async fn submitted_by(client: &Client, user: &str) -> Result<Vec<JobInfo>> {
         .collect())
 }
 
+/// A user's jobs (WRKUSRJOB): all of them, or those with one status
+/// (JOBQ, ACTIVE, OUTQ), oldest first.
+pub async fn of_user(client: &Client, user: &str, status: Option<&str>) -> Result<Vec<JobInfo>> {
+    Ok(client
+        .query(
+            &format!(
+                "SELECT {JOB_COLS} FROM as4tainr.jobs
+                 WHERE user_name=$1 AND ($2::text IS NULL OR status=$2) ORDER BY number"
+            ),
+            &[&user, &status],
+        )
+        .await?
+        .iter()
+        .map(job_row)
+        .collect())
+}
+
 /// Find one job. Without a number, the newest job of that name (and user)
 /// is taken, as on IBM i when the name is unique.
 pub async fn find(client: &Client, spec: &JobSpec) -> Result<JobInfo> {
@@ -509,6 +537,28 @@ pub async fn get(client: &Client, number: i64) -> Result<JobInfo> {
         .await?
         .map(|r| job_row(&r))
         .ok_or_else(|| anyhow!("Job number {number:06} not found."))
+}
+
+/// HLDJOB (true) or RLSJOB (false) of a job on its job queue: a held job
+/// stays there, passed by, until it is released. False when the job is
+/// not on a job queue (any more).
+pub async fn set_held(client: &Client, number: i64, held: bool) -> Result<bool> {
+    Ok(client
+        .execute(
+            "UPDATE as4tainr.jobs SET held=$2 WHERE number=$1 AND status='JOBQ'",
+            &[&number, &held],
+        )
+        .await?
+        == 1)
+}
+
+/// Whether a job is held on its job queue.
+pub async fn is_held(client: &Client, number: i64) -> Result<bool> {
+    Ok(client
+        .query_opt("SELECT held FROM as4tainr.jobs WHERE number=$1", &[&number])
+        .await?
+        .map(|r| r.get(0))
+        .unwrap_or(false))
 }
 
 /// ENDJOB of a job still on its job queue: it is taken off and never runs.
@@ -797,6 +847,7 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
         id: Some(id.clone()),
         calls: Default::default(),
     };
+    job.calls.batch = true;
     let first = info
         .command
         .split_whitespace()
@@ -807,9 +858,23 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
     // The job's own QTEMP, deleted when it ends.
     let key = id.to_string();
     let user = job.user.clone();
-    let normal = match crate::qtemp::scope(&client, &key, &user, job.run(&info.command)).await {
+    let outcome = crate::qtemp::scope(&client, &key, &user, job.run(&info.command)).await;
+    // What the job's programs left on their message queues is in its job
+    // log too, in the order sent (CL programs' SNDPGMMSG to *SAME, the
+    // commands they ran): IUNIT's I_RUNALL logs each test that way. The
+    // request's own messages that are among them are not logged twice.
+    job.flush_log().await;
+    let mut already: Vec<String> = std::mem::take(&mut job.calls.flushed_lines);
+    let mut first_time = |line: &str| match already.iter().position(|a| a == line.trim_end()) {
+        Some(i) => {
+            already.remove(i);
+            false
+        }
+        None => true,
+    };
+    let normal = match outcome {
         Ok(crate::commands::Outcome::Messages(m)) => {
-            for line in m {
+            for line in m.into_iter().filter(|l| first_time(l)) {
                 log(
                     &client,
                     &id,
@@ -828,18 +893,7 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
             // A display command in batch prints what it would show, as on
             // IBM i (spooled file QSYSPRT).
             // Commands with IBM's report layout print it (report.rs).
-            let lines = if d.print.is_empty() {
-                let mut lines = vec![d.title.clone(), String::new()];
-                lines.extend(d.info.iter().map(|(k, v)| format!("{k}: {v}")));
-                if !d.info.is_empty() {
-                    lines.push(String::new());
-                }
-                lines.push(d.heading.clone());
-                lines.extend(d.rows.iter().cloned());
-                lines
-            } else {
-                d.print.clone()
-            };
+            let lines = printed_display(&d);
             // The command's own printer file (report.rs printer_file;
             // verify9 d9_prt_rows).
             let file = crate::report::printer_file(first.as_str());
@@ -867,7 +921,7 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
             false
         }
         Err(e) => {
-            for line in format!("{e:#}").lines() {
+            for line in format!("{e:#}").lines().filter(|l| first_time(l)) {
                 log(&client, &id, "*ESCAPE", line).await;
             }
             false
@@ -904,9 +958,18 @@ pub async fn run_batch_job(env: &crate::commands::Environment, info: &JobInfo) -
 /// most `max_active` at a time, until the task is dropped.
 pub async fn run_subsystem(env: crate::commands::Environment, max_active: usize) -> Result<()> {
     let client = crate::runtime::connect_db(&env.database_url).await?;
+    set_subsystem_active(&client, BATCH_QUEUE, true).await?;
     let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(max_active));
     let env = std::sync::Arc::new(env);
     loop {
+        // PWRDWNSYS *CNTRLD or ENDSBS QBATCH: no new jobs start; those
+        // running end.
+        if ENDING.load(std::sync::atomic::Ordering::Relaxed)
+            || !subsystem_active(&client, BATCH_QUEUE).await.unwrap_or(true)
+        {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
         let permit = slots.clone().acquire_owned().await?;
         match claim_next(&client, BATCH_QUEUE).await {
             Ok(Some(info)) => {
@@ -929,6 +992,240 @@ pub async fn run_subsystem(env: crate::commands::Environment, max_active: usize)
             }
         }
     }
+}
+
+/// Is a job queue held (HLDJOBQ)?
+pub async fn job_queue_held(client: &Client, name: &str) -> Result<bool> {
+    Ok(client
+        .query_opt(
+            "SELECT 1 FROM as4tainr.held_job_queues WHERE name = $1",
+            &[&name],
+        )
+        .await?
+        .is_some())
+}
+
+/// HLDJOBQ (true) and RLSJOBQ (false); false when it already was so.
+pub async fn set_job_queue_held(client: &Client, name: &str, held: bool) -> Result<bool> {
+    let n = if held {
+        client
+            .execute(
+                "INSERT INTO as4tainr.held_job_queues VALUES ($1) ON CONFLICT DO NOTHING",
+                &[&name],
+            )
+            .await?
+    } else {
+        client
+            .execute(
+                "DELETE FROM as4tainr.held_job_queues WHERE name = $1",
+                &[&name],
+            )
+            .await?
+    };
+    Ok(n == 1)
+}
+
+/// Is a subsystem active (not ended with ENDSBS)?
+pub async fn subsystem_active(client: &Client, name: &str) -> Result<bool> {
+    Ok(client
+        .query_opt(
+            "SELECT active FROM as4tainr.subsystems WHERE name = $1",
+            &[&name],
+        )
+        .await?
+        .map(|r| r.get(0))
+        .unwrap_or(true))
+}
+
+/// ENDSBS (false) and STRSBS (true) of a subsystem; the server's start
+/// starts QBATCH again (as an IPL starts the subsystems).
+pub async fn set_subsystem_active(client: &Client, name: &str, active: bool) -> Result<()> {
+    client
+        .execute(
+            "INSERT INTO as4tainr.subsystems VALUES ($1, $2) ON CONFLICT (name) DO UPDATE SET active = EXCLUDED.active",
+            &[&name, &active],
+        )
+        .await?;
+    Ok(())
+}
+
+/// The system is ending (PWRDWNSYS): the subsystems start no more jobs.
+pub static ENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The notification channel PWRDWNSYS sends on, and the application name
+/// of the server's session that listens to it.
+pub const POWER_DOWN_CHANNEL: &str = "as4tainr_pwrdwnsys";
+pub const POWER_DOWN_LISTENER: &str = "as4tainr power-down listener";
+
+/// What PWRDWNSYS asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PowerDown {
+    /// OPTION(*IMMED): end at once; *CNTRLD: let batch jobs finish first.
+    pub immediate: bool,
+    /// DELAY for *CNTRLD, in seconds (None: *NOLIMIT).
+    pub delay: Option<u64>,
+    /// RESTART(*YES): start again (the server runs itself anew).
+    pub restart: bool,
+}
+
+impl PowerDown {
+    pub fn payload(&self) -> String {
+        format!(
+            "{} {} {}",
+            if self.immediate { "*IMMED" } else { "*CNTRLD" },
+            self.delay
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "*NOLIMIT".into()),
+            if self.restart { "*YES" } else { "*NO" }
+        )
+    }
+
+    pub fn parse(s: &str) -> Option<PowerDown> {
+        let mut w = s.split_whitespace();
+        let immediate = w.next()? == "*IMMED";
+        let delay = match w.next()? {
+            "*NOLIMIT" => None,
+            d => Some(d.parse().ok()?),
+        };
+        let restart = w.next()? == "*YES";
+        Some(PowerDown {
+            immediate,
+            delay,
+            restart,
+        })
+    }
+}
+
+/// The notification channel SNDBRKMSG sends on.
+pub const BREAK_CHANNEL: &str = "as4tainr_brkmsg";
+
+/// A break message (SNDBRKMSG): shown at once on the display sessions it
+/// is for, over what they show.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BreakMessage {
+    /// *ALLWS, or the display devices' names.
+    pub to: Vec<String>,
+    pub from: String,
+    pub sent: String,
+    pub text: String,
+}
+
+impl BreakMessage {
+    /// Is it for the display device `device`?
+    pub fn is_for(&self, device: &str) -> bool {
+        self.to
+            .iter()
+            .any(|t| t == "*ALLWS" || t.eq_ignore_ascii_case(device))
+    }
+}
+
+static BREAKS: std::sync::OnceLock<tokio::sync::broadcast::Sender<BreakMessage>> =
+    std::sync::OnceLock::new();
+
+fn breaks() -> &'static tokio::sync::broadcast::Sender<BreakMessage> {
+    BREAKS.get_or_init(|| tokio::sync::broadcast::channel(64).0)
+}
+
+/// A display session's receiver of break messages.
+pub fn break_receiver() -> tokio::sync::broadcast::Receiver<BreakMessage> {
+    breaks().subscribe()
+}
+
+/// Give a break message to this process's display sessions.
+pub fn deliver_break(m: BreakMessage) {
+    let _ = breaks().send(m);
+}
+
+/// The server waits here for PWRDWNSYS (a PostgreSQL notification, so a
+/// PWRDWNSYS from any process of the system reaches it); break messages
+/// (SNDBRKMSG) on the same connection go to the display sessions.
+pub async fn wait_for_power_down(database_url: &str) -> Result<PowerDown> {
+    use futures_util::StreamExt;
+    let (client, mut conn) = tokio_postgres::connect(database_url, tokio_postgres::NoTls).await?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut stream = futures_util::stream::poll_fn(move |cx| conn.poll_message(cx));
+        while let Some(m) = stream.next().await {
+            match m {
+                Ok(tokio_postgres::AsyncMessage::Notification(n)) => {
+                    if n.channel() == BREAK_CHANNEL {
+                        if let Ok(m) = serde_json::from_str::<BreakMessage>(n.payload()) {
+                            deliver_break(m);
+                        }
+                    } else {
+                        let _ = tx.send(n.payload().to_string());
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+    client
+        .batch_execute(&format!(
+            "SET application_name = '{POWER_DOWN_LISTENER}'; LISTEN {POWER_DOWN_CHANNEL}; LISTEN {BREAK_CHANNEL}"
+        ))
+        .await?;
+    loop {
+        let Some(p) = rx.recv().await else {
+            bail!("the power-down listener lost its database connection");
+        };
+        if let Some(pd) = PowerDown::parse(&p) {
+            // Keep the session (and its LISTEN) until the end.
+            std::mem::forget(client);
+            return Ok(pd);
+        }
+    }
+}
+
+/// Is a server listening for PWRDWNSYS?
+pub async fn power_down_listeners(client: &Client) -> Result<i64> {
+    Ok(client
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1 AND datname = current_database()",
+            &[&POWER_DOWN_LISTENER],
+        )
+        .await?
+        .get(0))
+}
+
+/// PWRDWNSYS *CNTRLD: wait for the active batch jobs to end, up to the
+/// delay; true when they all ended.
+pub async fn wait_for_batch_jobs(client: &Client, delay: Option<u64>) -> Result<bool> {
+    let start = std::time::Instant::now();
+    loop {
+        let n: i64 = client
+            .query_one(
+                "SELECT count(*) FROM as4tainr.jobs WHERE status='ACTIVE' AND type='BCH'",
+                &[],
+            )
+            .await?
+            .get(0);
+        if n == 0 {
+            return Ok(true);
+        }
+        if delay.is_some_and(|d| start.elapsed().as_secs() >= d) {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// What a display command prints in a batch job instead of showing it:
+/// its report in IBM's layout when it has one, otherwise the display's
+/// title, information and rows.
+pub(crate) fn printed_display(d: &crate::commands::ListDisplay) -> Vec<String> {
+    if !d.print.is_empty() {
+        return d.print.clone();
+    }
+    let mut lines = vec![d.title.clone(), String::new()];
+    lines.extend(d.info.iter().map(|(k, v)| format!("{k}: {v}")));
+    if !d.info.is_empty() {
+        lines.push(String::new());
+    }
+    lines.push(d.heading.clone());
+    lines.extend(d.rows.iter().cloned());
+    lines
 }
 
 #[cfg(test)]

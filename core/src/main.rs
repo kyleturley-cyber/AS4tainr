@@ -88,8 +88,14 @@ enum Cmd {
     },
     /// Run one SQL statement (DB2 for i dialect) with the library list.
     Sql {
-        /// The statement, e.g. "SELECT * FROM CUSTMAST".
+        /// The statement, e.g. "SELECT * FROM CUSTMAST"; - reads it from
+        /// standard input (a statement longer than a command line takes).
         statement: String,
+        /// Rows as JSON ({"columns": [...], "rows": [[...]...]}), each
+        /// value as it is (no column alignment, trailing blanks kept);
+        /// a message as {"message": "..."}.
+        #[arg(long)]
+        json: bool,
     },
     /// CRTDSPF: create a display file from DDS source.
     Crtdspf {
@@ -255,7 +261,7 @@ async fn run(cli: Cli) -> Result<u8> {
             catalog::init(&client).await?;
             let user = user.to_ascii_uppercase();
             if !users::reset_password(&client, &user).await? {
-                bail!("CPF2204: User profile {user} not found.");
+                bail!("CPF2204: There is no user profile {user}.");
             }
             println!(
                 "Password of {user} reset to {user} (expired: it must be changed at the next sign-on)."
@@ -283,7 +289,14 @@ async fn run(cli: Cli) -> Result<u8> {
                 pgm.decls.len()
             );
         }
-        Cmd::Sql { statement } => {
+        Cmd::Sql { statement, json } => {
+            let statement = if statement == "-" {
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+                text
+            } else {
+                statement
+            };
             let client = runtime::connect_db(&cli.database_url).await?;
             if let Some(msg) = as4tainr_core::ddl::try_run(
                 &cli.database_url,
@@ -295,10 +308,29 @@ async fn run(cli: Cli) -> Result<u8> {
             )
             .await?
             {
-                println!("{msg}");
+                if json {
+                    println!("{}", serde_json::json!({ "message": msg }));
+                } else {
+                    println!("{msg}");
+                }
                 return Ok(0);
             }
-            match as4tainr_core::sql::run(&client, &cli.database_url, &libl, &statement).await? {
+            let out =
+                as4tainr_core::sql::run(&client, &cli.database_url, &libl, &statement).await?;
+            if json {
+                let v = match out {
+                    as4tainr_core::sql::Outcome::Rows { columns, rows, .. } => {
+                        serde_json::json!({ "columns": columns, "rows": rows })
+                    }
+                    as4tainr_core::sql::Outcome::Count(kind, n) => {
+                        serde_json::json!({ "message": as4tainr_core::sql::count_message(kind, n) })
+                    }
+                    as4tainr_core::sql::Outcome::Message(m) => serde_json::json!({ "message": m }),
+                };
+                println!("{v}");
+                return Ok(0);
+            }
+            match out {
                 as4tainr_core::sql::Outcome::Rows {
                     columns,
                     numeric,
@@ -561,10 +593,16 @@ async fn run(cli: Cli) -> Result<u8> {
             let maxact = as4tainr_core::jobs::batch_max_active();
             println!("as4tainr: subsystem QBATCH started (MAXACT {maxact})");
             let qbatch = tokio::spawn(as4tainr_core::jobs::run_subsystem(cfg.env.clone(), maxact));
+            let db_url = cfg.env.database_url.clone();
+            let power = as4tainr_core::jobs::wait_for_power_down(&db_url);
             tokio::select! {
                 r = tn5250::serve(listener, cfg) => r?,
                 r = qbatch => r??,
                 r = web => r?,
+                pd = power => {
+                    let pd = pd?;
+                    power_down(&db_url, &pd).await?;
+                }
             }
         }
         Cmd::Batch { command, user } => {
@@ -674,4 +712,46 @@ async fn run(cli: Cli) -> Result<u8> {
         }
     }
     Ok(0)
+}
+
+/// PWRDWNSYS reached the server: *CNTRLD lets the active batch jobs end
+/// (no new ones start), then the server ends; the jobs still active are
+/// marked ended when it starts again (`jobs::recover`). RESTART(*YES)
+/// runs the server anew in this process (the same process ID, so a
+/// container keeps running); otherwise the process ends (a container
+/// stops).
+async fn power_down(database_url: &str, pd: &as4tainr_core::jobs::PowerDown) -> anyhow::Result<()> {
+    use as4tainr_core::jobs;
+    println!("as4tainr: PWRDWNSYS {}: the system is ending", pd.payload());
+    jobs::ENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+    // The signed-on users are told (a break message on every display).
+    let st = as4tainr_core::report::Stamp::now();
+    jobs::deliver_break(jobs::BreakMessage {
+        to: vec!["*ALLWS".into()],
+        from: "QSYS".into(),
+        sent: format!("{} {}", st.date, st.time),
+        text: if pd.restart {
+            "The system is ending and will start again. Sign off now; you can sign on again when it is back.".into()
+        } else {
+            "The system is ending. Sign off now.".into()
+        },
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    if !pd.immediate {
+        let client = runtime::connect_db(database_url).await?;
+        if !jobs::wait_for_batch_jobs(&client, pd.delay).await? {
+            println!("as4tainr: PWRDWNSYS: the delay ended with batch jobs still active");
+        }
+    }
+    if pd.restart {
+        println!("as4tainr: PWRDWNSYS: starting again");
+        use std::os::unix::process::CommandExt;
+        let exe = std::env::current_exe()?;
+        let e = std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .exec();
+        anyhow::bail!("PWRDWNSYS RESTART(*YES): the server could not start again: {e}");
+    }
+    println!("as4tainr: PWRDWNSYS: the system has ended");
+    std::process::exit(0);
 }

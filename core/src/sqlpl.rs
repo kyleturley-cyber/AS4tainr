@@ -1479,7 +1479,7 @@ impl<'a, 'e> Run<'a, 'e> {
 
     async fn query(&self, sql: &str) -> Result<(Vec<String>, Vec<Vec<Option<String>>>)> {
         match self.env.session.exec(self.env.catalog, sql).await? {
-            Exec::Rows { columns, rows } => Ok((columns, rows)),
+            Exec::Rows { columns, rows, .. } => Ok((columns, rows)),
             Exec::Count(..) => bail!("SQL0104: a query was expected: {sql}"),
         }
     }
@@ -2453,6 +2453,11 @@ async fn call_external(
     pgm: &str,
     values: Vec<Option<String>>,
 ) -> Result<CallResult> {
+    // EXTERNAL NAME 'LIB/SRVPGM(PROCEDURE)': a service program's procedure.
+    if let Some((obj, rest)) = pgm.split_once('(') {
+        let sym = rest.trim_end_matches(')').trim().to_ascii_uppercase();
+        return call_external_procedure(env, r, obj.trim(), &sym, values).await;
+    }
     let mut args = Vec::new();
     for (k, p) in r.parms.iter().enumerate() {
         let v = values.get(k).cloned().flatten();
@@ -2483,6 +2488,158 @@ async fn call_external(
     Ok(CallResult {
         values: back.into_iter().map(Some).collect(),
         result_sets: vec![],
+        status: 0,
+    })
+}
+
+/// The longest value of a LOB type (`CLOB(512K)`), in bytes.
+/// VARCHAR(n) (CHARACTER VARYING): n.
+fn varchar_length(ty: &str) -> Option<usize> {
+    let t = ty.trim().to_ascii_uppercase();
+    let inner = ["VARCHAR(", "CHAR VARYING(", "CHARACTER VARYING("]
+        .iter()
+        .find_map(|p| t.strip_prefix(p))?;
+    inner.split([')', ' ']).next()?.trim().parse().ok()
+}
+
+/// CHAR(n) (CHARACTER(n), CHAR: 1).
+fn char_length(ty: &str) -> Option<usize> {
+    let t = ty.trim().to_ascii_uppercase();
+    if t == "CHAR" || t == "CHARACTER" {
+        return Some(1);
+    }
+    let inner = ["CHAR(", "CHARACTER("]
+        .iter()
+        .find_map(|p| t.strip_prefix(p))?;
+    inner.split([')', ' ']).next()?.trim().parse().ok()
+}
+
+fn lob_length(ty: &str) -> Option<usize> {
+    let t = ty.trim().to_ascii_uppercase();
+    let inner = ["CLOB(", "BLOB(", "DBCLOB("]
+        .iter()
+        .find_map(|p| t.strip_prefix(p))?
+        .trim_end_matches(')')
+        .trim();
+    let (digits, unit) = match inner.chars().last()? {
+        'K' => (&inner[..inner.len() - 1], 1024),
+        'M' => (&inner[..inner.len() - 1], 1024 * 1024),
+        'G' => (&inner[..inner.len() - 1], 1024 * 1024 * 1024),
+        _ => (inner, 1),
+    };
+    digits.trim().parse::<usize>().ok().map(|n| n * unit)
+}
+
+/// An external procedure that is a service program's procedure (Db2 for i
+/// SQL Reference, CREATE PROCEDURE (external): EXTERNAL NAME
+/// 'lib/srvpgm(entry)'), PARAMETER STYLE GENERAL: each parameter by
+/// reference; a LOB as its 4-byte length then its data (the storage of
+/// its longest value), CHAR(n) as n bytes. XMLSERVICE's iPLUG procedures.
+async fn call_external_procedure(
+    env: &Env<'_>,
+    r: &Routine,
+    obj: &str,
+    sym: &str,
+    values: Vec<Option<String>>,
+) -> Result<CallResult> {
+    use crate::rpg::data::{e, Value};
+    let (lib, name) = match obj.split_once('/') {
+        Some((l, n)) => (l.trim().to_ascii_uppercase(), n.trim().to_ascii_uppercase()),
+        None => ("*LIBL".to_string(), obj.trim().to_ascii_uppercase()),
+    };
+    let mut args = Vec::new();
+    for (k, p) in r.parms.iter().enumerate() {
+        let v = values.get(k).cloned().flatten().unwrap_or_default();
+        if let Some(max) = lob_length(&p.ty) {
+            let mut b = vec![0u8; 4 + max];
+            if p.mode != "OUT" {
+                let data = e(&v);
+                let n = data.len().min(max);
+                b[..4].copy_from_slice(&(n as u32).to_be_bytes());
+                b[4..4 + n].copy_from_slice(&data[..n]);
+            }
+            args.push(Value::Char(b));
+        } else if let Some(max) = varchar_length(&p.ty) {
+            // VARCHAR: its 2-byte length and the characters, in storage
+            // of the maximum length (Db2 for i SQL Programming, parameter
+            // passing for PARAMETER STYLE GENERAL).
+            let mut b = vec![0x40u8; 2 + max];
+            let data = e(&v);
+            let n = data.len().min(max);
+            b[..2].copy_from_slice(&(n as u16).to_be_bytes());
+            b[2..2 + n].copy_from_slice(&data[..n]);
+            args.push(Value::Char(b));
+        } else if let Some(len) = char_length(&p.ty) {
+            // CHAR(n): n characters, blanks after the value.
+            let mut b = e(&v);
+            b.resize(len, 0x40);
+            args.push(Value::Char(b));
+        } else if is_numeric_type(&p.ty) {
+            // A number for a numeric parameter (INTEGER as the 10I 0
+            // the program declares).
+            args.push(Value::Num(
+                crate::rpg::dec::Dec::parse(v.trim())
+                    .unwrap_or_else(|_| crate::rpg::dec::Dec::from_i64(0)),
+            ));
+        } else {
+            args.push(Value::Char(e(&v)));
+        }
+    }
+    let mut binding = crate::ile::Binding::default();
+    binding.imports.insert(
+        sym.to_string(),
+        crate::ile::Target::SrvPgm {
+            library: lib.clone(),
+            name: name.clone(),
+        },
+    );
+    let (back, _ret, _msgs, sets) = crate::rpg::call_procedure(
+        env.database_url,
+        env.libl.to_vec(),
+        env.user.to_string(),
+        None,
+        format!("{lib}/{name}"),
+        binding,
+        "*DFTACTGRP".to_string(),
+        sym.to_string(),
+        args,
+        Some(crate::rpg::ClContext {
+            env: crate::commands::Environment {
+                database_url: env.database_url.to_string(),
+            },
+            curlib: env.curlib.clone(),
+            user_libl: env.libl.to_vec(),
+            overrides: vec![],
+            caller_group: None,
+        }),
+    )
+    .await
+    .map_err(|e| anyhow!("SQL0443: Procedure {} failed: {e:#}", r.name))?;
+    let mut out = Vec::new();
+    for (k, p) in r.parms.iter().enumerate() {
+        let bytes = match back.get(k) {
+            Some(Value::Char(b)) => b.clone(),
+            Some(Value::Num(d)) => {
+                out.push(Some(d.to_string()));
+                continue;
+            }
+            _ => vec![],
+        };
+        out.push(Some(if lob_length(&p.ty).is_some() && bytes.len() >= 4 {
+            let n = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+            crate::rpg::data::a(&bytes[4..(4 + n).min(bytes.len())])
+        } else if varchar_length(&p.ty).is_some() && bytes.len() >= 2 {
+            let n = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+            crate::rpg::data::a(&bytes[2..(2 + n).min(bytes.len())])
+        } else {
+            crate::rpg::data::a(&bytes).trim_end().to_string()
+        }));
+    }
+    // At most the result sets the procedure was defined with (DYNAMIC
+    // RESULT SETS).
+    Ok(CallResult {
+        values: out,
+        result_sets: sets.into_iter().take(r.result_sets as usize).collect(),
         status: 0,
     })
 }

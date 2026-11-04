@@ -278,7 +278,10 @@ impl ApiArgs for RpgArgs {
             .0
             .get(i)
             .ok_or_else(|| anyhow!("CPF3C36: Parameter {} was not passed.", i + 1))?;
-        if matches!(t, DType::Char(4)) {
+        // Character storage for a number: a binary(4) parameter (also
+        // storage without a type, passed through PASE's _PGMCALL, where
+        // the data queue APIs' packed parameters get their type first).
+        if matches!(t, DType::Char(n) if *n >= 4) {
             return Ok(i32::from_be_bytes(b[..4].try_into().unwrap()) as i64);
         }
         Ok(load(t, b)?.num()?.to_i128()? as i64)
@@ -292,7 +295,7 @@ impl ApiArgs for RpgArgs {
     fn set_num(&mut self, i: usize, n: i64) -> Result<()> {
         use crate::rpg::data::{store, DType, Fit, Value};
         if let Some((buf, t)) = self.0.get_mut(i) {
-            if matches!(t, DType::Char(4)) {
+            if matches!(t, DType::Char(n) if *n >= 4) {
                 buf[..4].copy_from_slice(&(n as i32).to_be_bytes());
                 return Ok(());
             }
@@ -300,6 +303,18 @@ impl ApiArgs for RpgArgs {
             store(t, &v, buf, Fit::Truncate { half_adjust: false }, false)?;
         }
         Ok(())
+    }
+}
+
+/// The packed decimal parameters of the data queue APIs (0-based, digits)
+/// (Send Data Queue, Receive Data Queue, Clear Data Queue APIs): a caller
+/// that passes addresses only (PASE's _PGMCALL) gets them so.
+pub fn packed_params(name: &str) -> &'static [(usize, u32)] {
+    match name {
+        "QSNDDTAQ" => &[(2, 5), (4, 3)],
+        "QRCVDTAQ" => &[(2, 5), (4, 5), (6, 3), (8, 3)],
+        "QCLRDTAQ" => &[(3, 3)],
+        _ => &[],
     }
 }
 

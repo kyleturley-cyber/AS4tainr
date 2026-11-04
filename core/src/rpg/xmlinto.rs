@@ -364,7 +364,7 @@ impl Machine<'_> {
                 .collect(),
             None => Vec::new(),
         };
-        for sf in &d.subfields {
+        for sf in d.subfields.iter() {
             let sl = sub(sf);
             // The data subfield: the element's own text.
             if o.datasubf.as_deref() == Some(sf.as_str()) {

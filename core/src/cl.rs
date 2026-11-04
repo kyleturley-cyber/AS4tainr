@@ -1582,7 +1582,11 @@ pub static COMMANDS: &[CommandDef] = &[
     CommandDef {
         name: "WRKACTJOB",
         description: "Work with Active Jobs",
-        params: &[],
+        params: &[
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+            p("SBS", Kind::List, false, Some("*ALL"), "Subsystem").ch("Name, *ALL"),
+            p("JOB", Kind::Name, false, Some("*ALL"), "Job name").ch("Name, generic*, *ALL").keyword_only(),
+        ],
     },
     CommandDef {
         name: "WRKSBMJOB",

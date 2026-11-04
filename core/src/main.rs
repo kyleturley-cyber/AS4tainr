@@ -510,10 +510,17 @@ async fn run(cli: Cli) -> Result<u8> {
             let env = commands::Environment {
                 database_url: cli.database_url.clone(),
             };
+            // The user it runs for: AS4TAINR_USER (a shell command's
+            // `system` gets the job's user, qsh.rs), else QSECOFR.
+            let user = std::env::var("AS4TAINR_USER")
+                .ok()
+                .map(|u| u.trim().to_ascii_uppercase())
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| "QSECOFR".into());
             let mut job = commands::Job {
                 client: &client,
                 env: &env,
-                user: "QSECOFR".into(),
+                user,
                 curlib: curlib.clone(),
                 libl: libl.clone(),
                 display: None,

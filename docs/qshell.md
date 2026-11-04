@@ -18,3 +18,7 @@ The command works on the integrated file system at its paths (`/home/...`, `/tmp
 Mount namespaces need a privilege containers do not have by default. With Docker, add `cap_add: [SYS_ADMIN]` to the as4tainr service (and `security_opt: [apparmor:unconfined]` on hosts whose AppArmor profile forbids mounts). Without it QSH still runs, on the container's own files, and as4tainr says so once on standard error. When as4tainr does not run as root, the namespace is a user namespace whose root cannot make directories in the container's `/`: a top-level IFS directory the container does not have (`/mydir`) is then not seen by the command; directories under ones the container has (`/home/...`, `/tmp/...`) are. `AS4TAINR_QSH_IFS=0` turns the IFS copy off; `AS4TAINR_QSH_MIRROR` names the directory for it (default: one per database in the temporary directory).
 
 One QSH command at a time uses the copy of the IFS. The command can read every stream file, whatever the user's authority to it. See docs/fidelity-gaps.md for the rest.
+
+## The `system` utility
+
+In a QSH command (and in a PASE command XMLSERVICE runs), `system` runs a CL command as IBM i's Qshell and PASE `system` utility does: it is `as4tainr system`, for the job's user, its messages and printed output on standard output. as4tainr puts a small script for it first on the command's PATH (in `/var/tmp/as4tainr-bin`), and `/usr/bin/system` or `/QOpenSys/usr/bin/system` written as a command word is taken as `system`. A shell script file that names those paths runs only where the container has them.

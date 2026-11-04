@@ -700,7 +700,7 @@ impl Job<'_> {
             "DLCOBJ" => self.dlcobj(&cmd).await,
             "WRKOBJLCK" => self.wrkobjlck(&cmd).await,
             "SBMJOB" => self.sbmjob(&cmd).await,
-            "WRKACTJOB" => self.wrkactjob().await,
+            "WRKACTJOB" => self.wrkactjob(&cmd).await,
             "WRKSBMJOB" => self.wrksbmjob().await,
             "DSPJOBLOG" => self.dspjoblog(&cmd).await,
             "DSPJOB" => self.dspjob(&cmd).await,
@@ -6775,8 +6775,28 @@ impl Job<'_> {
         )]))
     }
 
-    async fn wrkactjob(&mut self) -> Result<Outcome> {
+    async fn wrkactjob(&mut self, cmd: &Command) -> Result<Outcome> {
+        // SBS: the subsystems shown (*ALL: every active one); JOB: the
+        // jobs in them, by name or generic name.
+        let shown: Vec<String> = cmd
+            .list("SBS")
+            .iter()
+            .map(|s| s.trim().to_ascii_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let all = shown.is_empty() || shown.iter().any(|s| s == "*ALL");
+        let want = cmd.get("JOB").to_ascii_uppercase();
+        let named = |n: &str| match want.as_str() {
+            "*ALL" => true,
+            w => match w.strip_suffix('*') {
+                Some(prefix) => n.starts_with(prefix),
+                None => n == w,
+            },
+        };
+        // "Active jobs" counts all of them, whatever is shown.
         let active = jobs::active(self.client).await?;
+        let total = active.len();
+        let active: Vec<_> = active.into_iter().filter(|j| named(&j.id.name)).collect();
         let mut rows = Vec::new();
         let mut keys = Vec::new();
         // IBM i 7.5's WRKACTJOB (PUB400): subsystem/job, user, type, CPU %
@@ -6788,6 +6808,9 @@ impl Job<'_> {
             )
         };
         for sbs in [jobs::BATCH_QUEUE, jobs::INTERACTIVE_SUBSYSTEM] {
+            if !all && !shown.iter().any(|s| s == sbs) {
+                continue;
+            }
             rows.push(fmt(sbs, "QSYS", "SBS", "", "DEQW"));
             keys.push(String::new());
             for j in active.iter().filter(|j| j.subsystem == sbs) {
@@ -6821,7 +6844,7 @@ impl Job<'_> {
                         .trim_end()
                         .to_string()
                 },
-                lines: vec![format!("{:48}Active jobs:   {}", "", active.len())],
+                lines: vec![format!("{:48}Active jobs:   {}", "", total)],
                 heading2: format!("{:15}Current", ""),
                 command_line: Some("Parameters or command".into()),
                 tight: true,

@@ -3558,6 +3558,35 @@ ENDPGM";
         panic!()
     };
     assert!(d.keys.contains(&id.to_string()));
+    // SBS limits it to the subsystems named and JOB to the jobs of that
+    // name (IBM i 7.5 documentation, WRKACTJOB: "Subsystem (SBS)" and
+    // "Job name (JOB)").
+    let Outcome::Display(d) = job.run("WRKACTJOB SBS(QBATCH)").await.unwrap() else {
+        panic!()
+    };
+    assert!(!d.keys.contains(&id.to_string()), "{:?}", d.rows);
+    assert!(
+        d.rows.iter().any(|r| r.starts_with("QBATCH")),
+        "{:?}",
+        d.rows
+    );
+    assert!(
+        !d.rows.iter().any(|r| r.starts_with("QINTER")),
+        "{:?}",
+        d.rows
+    );
+    let Outcome::Display(d) = job
+        .run(&format!("WRKACTJOB SBS(QINTER) JOB({})", id.name))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(d.keys.contains(&id.to_string()));
+    let Outcome::Display(d) = job.run("WRKACTJOB JOB(NOSUCHJOB)").await.unwrap() else {
+        panic!()
+    };
+    assert!(d.keys.iter().all(|k| k.is_empty()), "{:?}", d.rows);
 
     // ENDJOB of a job that has not started takes it off the queue.
     let m = msg(job.run("SBMJOB CMD(DSPLIBL) JOB(NEVER)").await.unwrap());

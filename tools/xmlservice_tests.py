@@ -82,7 +82,7 @@ def tests(clone):
             'absent': re.findall(lit + r'>\s*0\)\s*die', t),
             'present': re.findall(lit + r'<\s*1\)\s*die', t)
             # $expect = "..." looked for in what came back.
-            + (re.findall(r'\$expect\s*=\s*"([^"$]+)"', t) if re.search(r'strpos\(.{0,80}?\$expect\)', t) else []),
+            + ([a or b for a, b in re.findall(r'\$expect\s*=\s*(?:"([^"$]+)"|\'([^\'$]+)\')', t)] if re.search(r'strpos\(.{0,80}?\$expect\)', t) else []),
             # An error report the test reads through XPath (/report/...).
             'report': "'/report" in t or '"/report' in t,
             # A test of errors (its name says so) that checks only what it

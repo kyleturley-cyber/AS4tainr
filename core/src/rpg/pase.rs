@@ -751,6 +751,7 @@ impl<'a> Machine<'a> {
                     self.set_errno(crate::ifs::errno::EPERM);
                     0
                 } else {
+                    // (`system` at its IBM i paths: qsh.rs shell_run.)
                     let line = cmd.replace("/QOpenSys/", "/");
                     let out = self.shell_output(&line)?;
                     let mut g = POPENED.lock().unwrap_or_else(|e| e.into_inner());

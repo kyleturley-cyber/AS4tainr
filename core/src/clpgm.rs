@@ -3565,6 +3565,7 @@ pub(crate) const SYSTEM_VALUE_NAMES: &[&str] = &[
     "QDAY",
     "QCENTURY",
     "QTIME",
+    "QDATETIME",
     "QHOUR",
     "QMINUTE",
     "QSECOND",
@@ -3600,6 +3601,7 @@ pub(crate) fn system_value_description(name: &str) -> Option<&'static str> {
         "QDAY" => "Day of the current date",
         "QCENTURY" => "Century of the current date",
         "QTIME" => "Current time",
+        "QDATETIME" => "Current date and time",
         "QHOUR" => "Hour of the current time",
         "QMINUTE" => "Minute of the current time",
         "QSECOND" => "Second of the current time",
@@ -3771,6 +3773,10 @@ fn system_value_of(name: &str, changed: bool) -> Result<Value> {
         "QDAY" => c(format!("{d:02}")),
         "QCENTURY" => c(if y >= 2000 { "1" } else { "0" }.into()),
         "QTIME" => c(format!("{h:02}{mi:02}{sec:02}{:03}", us / 1000)),
+        // QDATETIME: YYYYMMDDHHNNSSXXXXXX, microseconds last (Work
+        // Management, system values: date and time; XMLSERVICE's
+        // test_10552 retrieves it).
+        "QDATETIME" => c(format!("{y:04}{mo:02}{d:02}{h:02}{mi:02}{sec:02}{us:06}")),
         "QHOUR" => c(format!("{h:02}")),
         "QMINUTE" => c(format!("{mi:02}")),
         "QSECOND" => c(format!("{sec:02}")),
@@ -4325,6 +4331,9 @@ async fn command(
                 "USEDATE",
                 "USEUPD",
                 "NBRDAYSUSE",
+                // Days used count (USECOUNT): XMLSERVICE's
+                // test_10565 retrieves it; usage is not counted here (0).
+                "USECOUNT",
                 "RESETDATE",
                 "SRCF",
                 "SRCFLIB",
@@ -5543,5 +5552,17 @@ mod tests {
         assert!(e("PGM\nELSE\nENDPGM").contains("ELSE"));
         assert!(e("PGM PARM(&P)\nENDPGM").contains("not declared"));
         assert!(e("PGM\nMONMSG CPF0000\nDCL &A *CHAR 1\nENDPGM").contains("start"));
+    }
+
+    // QDATETIME: 20 characters, YYYYMMDDHHNNSSXXXXXX (the date, the time
+    // and microseconds), XMLSERVICE's test_10552 retrieves it.
+    #[test]
+    fn system_value_qdatetime() {
+        let Value::Char(v) = super::system_value_of("QDATETIME", false).unwrap() else {
+            panic!("not character")
+        };
+        assert_eq!(v.len(), 20);
+        assert!(v.chars().all(|c| c.is_ascii_digit()), "{v}");
+        assert!(v.starts_with("20"), "{v}");
     }
 }

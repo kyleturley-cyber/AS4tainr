@@ -126,6 +126,20 @@ fn envvar_data(name: &str, quoted: bool) -> Vec<u8> {
     d
 }
 
+/// A command line that starts with Qshell's interpreter (`/usr/bin/qsh`
+/// or `qsh`) with the container's `/bin/sh` in its place.
+fn qsh_as_sh(line: &str) -> String {
+    let t = line.trim_start();
+    for p in ["/usr/bin/qsh", "qsh"] {
+        if let Some(rest) = t.strip_prefix(p) {
+            if rest.is_empty() || rest.starts_with(' ') {
+                return format!("/bin/sh{rest}");
+            }
+        }
+    }
+    line.to_string()
+}
+
 impl Job<'_> {
     pub(crate) async fn qsh_command(&mut self, cmd: &Command) -> Result<Option<Outcome>> {
         Ok(Some(match cmd.def.name {
@@ -237,23 +251,15 @@ impl Job<'_> {
         Ok(())
     }
 
-    async fn qsh(&mut self, cmd: &Command) -> Result<Outcome> {
-        let line = raw(cmd, "CMD");
-        if line.is_empty() || line.eq_ignore_ascii_case("*NONE") {
-            // No interactive Qshell session here; in a batch job IBM's
-            // does nothing either.
-            return Ok(Outcome::Messages(vec![]));
-        }
-        if !enabled() {
-            bail!(
-                "CPF9899: Qshell is not set up on this system (AS4TAINR_QSH): the command was not run."
-            );
-        }
+    /// Run a command line with /bin/sh as the user, on the IFS at its
+    /// paths when this system can (qshfs.rs), with the job's environment
+    /// variables: what QSH CMD and PASE popen (rpg/pase.rs) run. Its
+    /// standard output (and error) and exit status.
+    pub(crate) async fn shell_run(&mut self, line: &str) -> Result<std::process::Output> {
+        let line = line.to_string();
         let job = self.job_key();
         let vars = envvar::for_process(self.client, &job).await?;
         let setting = |n: &str| vars.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
-        let out = output(setting("QIBM_QSH_CMD_OUTPUT").as_deref());
-        let escape_msg = setting("QIBM_QSH_CMD_ESCAPE_MSG").is_some_and(|v| v == "Y");
         // The IFS at its paths, when this system can (qshfs.rs); the
         // command starts in the user's home directory if there is one.
         let mirror = if crate::qshfs::available() {
@@ -308,7 +314,31 @@ impl Job<'_> {
         if let Some(m) = mirror {
             m.close(self.client, &self.user).await?;
         }
-        let r = r?;
+        r.map_err(Into::into)
+    }
+
+    async fn qsh(&mut self, cmd: &Command) -> Result<Outcome> {
+        let line = raw(cmd, "CMD");
+        if line.is_empty() || line.eq_ignore_ascii_case("*NONE") {
+            // No interactive Qshell session here; in a batch job IBM's
+            // does nothing either.
+            return Ok(Outcome::Messages(vec![]));
+        }
+        if !enabled() {
+            bail!(
+                "CPF9899: Qshell is not set up on this system (AS4TAINR_QSH): the command was not run."
+            );
+        }
+        // Qshell's own interpreter, /usr/bin/qsh (Qshell for IBM i: "qsh
+        // - Qshell command language interpreter"), is the container's
+        // shell here (XMLSERVICE runs `STRQSH CMD('/usr/bin/qsh -c ...')`).
+        let line = qsh_as_sh(&line);
+        let job = self.job_key();
+        let vars = envvar::for_process(self.client, &job).await?;
+        let setting = |n: &str| vars.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+        let out = output(setting("QIBM_QSH_CMD_OUTPUT").as_deref());
+        let escape_msg = setting("QIBM_QSH_CMD_ESCAPE_MSG").is_some_and(|v| v == "Y");
+        let r = self.shell_run(&line).await?;
         let text = String::from_utf8_lossy(&r.stdout).to_string();
         match &out {
             Output::Stdout => self
@@ -399,5 +429,16 @@ mod tests {
         assert!(!e);
         let (m, d, e) = end_message(End::Signal(9), true);
         assert!(m.starts_with("QSH0006") && d == [0, 0, 0, 9] && e);
+    }
+
+    #[test]
+    fn qshell_interpreter_is_the_shell() {
+        assert_eq!(
+            super::qsh_as_sh("/usr/bin/qsh -c 'ls /tmp'"),
+            "/bin/sh -c 'ls /tmp'"
+        );
+        assert_eq!(super::qsh_as_sh("qsh"), "/bin/sh");
+        assert_eq!(super::qsh_as_sh("qshx -c a"), "qshx -c a");
+        assert_eq!(super::qsh_as_sh("ls"), "ls");
     }
 }

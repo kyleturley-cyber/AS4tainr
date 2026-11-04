@@ -583,5 +583,47 @@ error:
     // EXIT 3: CPF7CFF.
     assert_eq!(r.rc, 255);
     assert_eq!(ids(&r.err).last(), Some(&"CPF7CFF"), "{:?}", r.err);
+    // SAY with STDOUT overridden to a source member (OVRDBF FILE(STDOUT)
+    // TOFILE MBR, REXX/400 Programmer's Guide: STDOUT is a file that can
+    // be overridden; XMLSERVICE reads its REXX output from such a
+    // member): the lines are the member's records, not standard output.
+    let src2 = format!(
+        "'CRTSRCPF FILE({lib}/OUTREXX) MBR(OUTREXX)'\n'OVRDBF FILE(STDOUT) TOFILE({lib}/OUTREXX) MBR(OUTREXX)'\nsay 'first line'\nsay 'second' 2+3\n"
+    );
+    std::fs::write(dir.join("o.rexx"), src2).unwrap();
+    let put = Command::new(env!("CARGO_BIN_EXE_as4tainr"))
+        .args(["--database-url", &url, "put"])
+        .arg(dir.join("o.rexx"))
+        .arg(format!("/tmp/{lib}o.rexx"))
+        .output()
+        .unwrap();
+    assert!(put.status.success());
+    let c = format!(
+        "CPYFRMSTMF FROMSTMF('/tmp/{lib}o.rexx') TOMBR('/QSYS.LIB/{lib}.LIB/QREXSRC.FILE/O.MBR')"
+    );
+    assert_eq!(system(&url, &[&c]).rc, 0);
+    let r = system(
+        &url,
+        &[&format!("STRREXPRC SRCMBR(O) SRCFILE({lib}/QREXSRC)")],
+    );
+    assert_eq!(r.rc, 0, "{:?}", r.err);
+    assert!(r.out.is_empty(), "{:?}", r.out);
+    let r = system(
+        &url,
+        &[&format!(
+            "CPYTOSTMF FROMMBR('/QSYS.LIB/{lib}.LIB/OUTREXX.FILE/OUTREXX.MBR') TOSTMF('/tmp/{lib}o.txt') STMFOPT(*REPLACE) STMFCCSID(*PCASCII) ENDLINFMT(*LF)"
+        )],
+    );
+    assert_eq!(r.rc, 0, "{:?}", r.err);
+    let local = dir.join("o.txt");
+    let got = Command::new(env!("CARGO_BIN_EXE_as4tainr"))
+        .args(["--database-url", &url, "get"])
+        .arg(format!("/tmp/{lib}o.txt"))
+        .arg(&local)
+        .output()
+        .unwrap();
+    assert!(got.status.success(), "{got:?}");
+    let text = std::fs::read_to_string(&local).unwrap_or_default();
+    assert!(text.contains("first line\nsecond 5"), "{text:?}");
     assert_eq!(system(&url, &[&format!("DLTLIB {lib}")]).rc, 0);
 }

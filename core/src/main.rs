@@ -290,6 +290,7 @@ async fn run(cli: Cli) -> Result<u8> {
             );
         }
         Cmd::Sql { statement, json } => {
+            runtime::set_process_job("QSQSRVR");
             let statement = if statement == "-" {
                 let mut text = String::new();
                 std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;

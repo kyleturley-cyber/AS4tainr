@@ -268,6 +268,7 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] RTVCLSRC writes CL source back in IBM i's form; WRKCFGSTS printed (verify42)
 - [x] DSPAUT, CHGAUT and CHGOWN for IFS objects; RTVCLSRC continues lines by the member's record length
 - [x] RTVCLSRC labels, long lines and member source as IBM i 7.5 writes them; DSPAUT report, CHGAUT and CHGOWN messages (verify43)
+- [x] XMLSERVICE 154 of 163: REXX commands, <qsh> and <sh> through PASE popen, C stream I/O on IFS files and members, QSQSRVR job name
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).
 - [x] Journals and trigger programs: COM's SETUPJRN, ORDAUDJV (QSYS2.DISPLAY_JOURNAL) and ORDTRG (ADDPFTRG) run (docs/journals.md).

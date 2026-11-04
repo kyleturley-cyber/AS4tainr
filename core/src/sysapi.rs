@@ -1008,8 +1008,16 @@ fn job_information(caller: &Caller, args: &mut dyn ApiArgs) -> Result<()> {
     let (jname, juser, jnbr) = match &caller.job {
         Some(j) => (j.name.clone(), j.user.clone(), format!("{:06}", j.number)),
         // No job of as4tainr's (`as4tainr system`, `call`): blank, as
-        // RTVJOBA JOB and NBR give there.
-        None => (String::new(), caller.user.clone(), String::new()),
+        // RTVJOBA JOB and NBR give there; `as4tainr sql`'s process is an
+        // SQL server job (`runtime::process_job`), user QUSER.
+        None => match crate::runtime::process_job() {
+            Some(name) => (
+                name.to_string(),
+                "QUSER".to_string(),
+                format!("{:06}", std::process::id() % 1_000_000),
+            ),
+            None => (String::new(), caller.user.clone(), String::new()),
+        },
     };
     let mut o = vec![0u8; 8];
     o.extend(field(&jname, 10));

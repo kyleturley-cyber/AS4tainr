@@ -15,7 +15,7 @@
 //! a table named as the file; when it is closed they are the member's
 //! lines again ([`open_member`], [`close_member`]).
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use tokio_postgres::Client;
 
 use crate::catalog::validate_name;
@@ -1090,6 +1090,46 @@ pub async fn close_member(client: &Client, library: &str, file: &str, member: &s
     client
         .batch_execute(&format!("DROP TABLE IF EXISTS {table}"))
         .await?;
+    Ok(())
+}
+
+/// A line added to a source member as its last record (REXX SAY to
+/// STDOUT overridden to the member): `tofile` LIB/FILE (QTEMP the job's),
+/// `mbr` None for the file's first member.
+pub async fn append_line(
+    client: &Client,
+    tofile: &str,
+    mbr: Option<&str>,
+    line: &str,
+) -> Result<()> {
+    let (lib, file) = match tofile.split_once('/') {
+        Some((l, f)) => (
+            crate::qtemp::real(&l.to_ascii_uppercase()),
+            f.to_ascii_uppercase(),
+        ),
+        None => bail!("STDOUT's override names {tofile} without a library."),
+    };
+    let mbr = match mbr {
+        Some(m) if !m.starts_with('*') => m.to_ascii_uppercase(),
+        _ => members(client, &lib, &file)
+            .await?
+            .first()
+            .map(|m| m.0.clone())
+            .ok_or_else(|| anyhow!("CPF9815: File {file} in library {lib} has no member."))?,
+    };
+    let n = client
+        .execute(
+            "UPDATE as4tainr.source_members
+                SET source = CASE WHEN source = '' OR right(source, 1) = E'\\n' THEN source
+                                  ELSE source || E'\\n' END || $4 || E'\\n',
+                    changed = now()
+              WHERE library=$1 AND file=$2 AND member=$3",
+            &[&lib, &file, &mbr, &line],
+        )
+        .await?;
+    if n == 0 {
+        bail!("CPF9815: File {file} in library {lib} has no member {mbr}.");
+    }
     Ok(())
 }
 

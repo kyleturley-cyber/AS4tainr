@@ -50,6 +50,16 @@ const ARG_PTR32: i16 = -5;
 const ARG_PTR64: i16 = -6;
 const RESULT_WORD: i16 = -1;
 const RESULT_DWORD: i16 = -2;
+const RESULT_PTR32: i16 = -5;
+const RESULT_PTR64: i16 = -6;
+
+/// The output of commands popen ran, by job and stream: the bytes (in
+/// PASE's CCSID, 819), how far fgets has read, the exit status.
+type Popened = HashMap<u64, (Vec<u8>, usize, i32)>;
+static POPENED: std::sync::Mutex<Option<HashMap<String, Popened>>> = std::sync::Mutex::new(None);
+/// Where popen's stream handles start (not storage: fgets and pclose
+/// take them back).
+const POPEN_BASE: u64 = 0x7000_0000;
 /// Qp2CallPase's return codes: normal; no PASE program (a function
 /// as4tainr's PASE does not have).
 const CALLPASE_NORMAL: i64 = 0;
@@ -730,10 +740,92 @@ impl<'a> Machine<'a> {
                 )?;
                 0
             }
+            // FILE *popen(const char *cmd, const char *mode): the command
+            // run by the shell (as QSH CMD runs one: only where
+            // AS4TAINR_QSH=1 lets commands run, NULL otherwise), its output
+            // kept for fgets. PASE's /QOpenSys tree is the container's
+            // root (/QOpenSys/usr/bin/ls is /usr/bin/ls).
+            "popen" => {
+                let cmd = self.pase_string(argv.first().copied().unwrap_or(0))?;
+                if !crate::qsh::enabled() {
+                    self.set_errno(crate::ifs::errno::EPERM);
+                    0
+                } else {
+                    let line = cmd.replace("/QOpenSys/", "/");
+                    let out = self.shell_output(&line)?;
+                    let mut g = POPENED.lock().unwrap_or_else(|e| e.into_inner());
+                    let m = g
+                        .get_or_insert_with(HashMap::new)
+                        .entry(self.io.job_key.clone())
+                        .or_default();
+                    let h = POPEN_BASE + 16 * (m.len() as u64 + 1);
+                    m.insert(h, out);
+                    h as i64
+                }
+            }
+            // char *fgets(char *s, int n, FILE *stream): the next line of
+            // a popen stream (with its new line), up to n-1 bytes, then a
+            // null; NULL at the end.
+            "fgets" => {
+                let s = argv.first().copied().unwrap_or(0);
+                let n = argv.get(1).copied().unwrap_or(0) as u32 as i32 as i64;
+                let h = argv.get(2).copied().unwrap_or(0);
+                let chunk = {
+                    let mut g = POPENED.lock().unwrap_or_else(|e| e.into_inner());
+                    g.get_or_insert_with(HashMap::new)
+                        .get_mut(&self.io.job_key)
+                        .and_then(|m| m.get_mut(&h))
+                        .map(|(data, pos, _)| {
+                            let rest = &data[(*pos).min(data.len())..];
+                            let max = (n.max(1) - 1) as usize;
+                            let end = rest
+                                .iter()
+                                .position(|&c| c == b'\n')
+                                .map(|i| i + 1)
+                                .unwrap_or(rest.len())
+                                .min(max);
+                            let c = rest[..end].to_vec();
+                            *pos += end;
+                            c
+                        })
+                };
+                match chunk {
+                    Some(c) if !c.is_empty() => {
+                        let (b, o, left) = self.pase_addr(s)?;
+                        let k = c.len().min(left.saturating_sub(1));
+                        self.bufs[b][o..o + k].copy_from_slice(&c[..k]);
+                        self.bufs[b][o + k] = 0;
+                        s as i64
+                    }
+                    _ => 0,
+                }
+            }
+            // int pclose(FILE *stream): the command's exit status (as
+            // wait() gives it: the code times 256).
+            "pclose" => {
+                let h = argv.first().copied().unwrap_or(0);
+                let mut g = POPENED.lock().unwrap_or_else(|e| e.into_inner());
+                match g
+                    .get_or_insert_with(HashMap::new)
+                    .get_mut(&self.io.job_key)
+                    .and_then(|m| m.remove(&h))
+                {
+                    Some((_, _, status)) => (status as i64) << 8,
+                    None => -1,
+                }
+            }
             _ => return Ok(CALLPASE_ENVIRON_ERROR),
         };
         if !matches!(buf, Value::Fig(Fig::Null)) {
             match result {
+                RESULT_PTR32 => {
+                    let (b, o) = self.addr(buf, 4)?;
+                    self.bufs[b][o..o + 4].copy_from_slice(&(rc as u32).to_be_bytes());
+                }
+                RESULT_PTR64 => {
+                    let (b, o) = self.addr(buf, 8)?;
+                    self.bufs[b][o..o + 8].copy_from_slice(&(rc as u64).to_be_bytes());
+                }
                 RESULT_WORD => {
                     let (b, o) = self.addr(buf, 4)?;
                     self.bufs[b][o..o + 4].copy_from_slice(&(rc as i32).to_be_bytes());
@@ -751,6 +843,30 @@ impl<'a> Machine<'a> {
 }
 
 impl Machine<'_> {
+    /// A shell command's output (in PASE's CCSID, 819) and exit status,
+    /// run as QSH runs one (`Job::shell_run`).
+    fn shell_output(&mut self, line: &str) -> Result<(Vec<u8>, usize, i32)> {
+        let ctx = self
+            .io
+            .cl
+            .clone()
+            .ok_or_else(|| anyhow!("popen: the program has no job to run '{line}' in"))?;
+        let mut job = crate::commands::Job {
+            client: self.io.client,
+            env: &ctx.env,
+            user: self.io.user.clone(),
+            curlib: ctx.curlib.clone(),
+            libl: ctx.user_libl.clone(),
+            display: None,
+            id: self.io.job.clone(),
+            calls: Default::default(),
+        };
+        let out = self.block(job.shell_run(line))?;
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let bytes = crate::ifs::codec::convert(1208, 819, text.as_bytes());
+        Ok((bytes, 0, out.status.code().unwrap_or(1)))
+    }
+
     fn ilecall(&mut self, target: u64, base: u64, sig: u64, result: i32) -> Result<()> {
         let (b, o, _) = self.pase_addr(target)?;
         let p = Ptr::decode(&self.bufs[b][o..o + 16])

@@ -25046,3 +25046,76 @@ async fn retrieve_cl_source_and_work_with_messages_and_devices() {
         .await
         .unwrap();
 }
+
+// DSPAUT, CHGAUT and CHGOWN of an IFS object (CL reference): *PUBLIC's
+// and the owner's data authorities are the mode's other and owner bits
+// (*R is r--, *RWX rwx, *EXCLUDE none); CHGOWN gives it a new owner (a
+// profile that exists).
+#[tokio::test]
+async fn ifs_authorities_and_owner() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::ifs;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let path = format!("/tmp/aut{lib}.txt");
+    ifs::write_file(&client, &path, b"x", 1208, 0o644, "QSECOFR")
+        .await
+        .unwrap();
+    job.run(&format!(
+        "CHGAUT OBJ('{path}') USER(*PUBLIC) DTAAUT(*EXCLUDE)"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        ifs::stat(&client, &path).await.unwrap().unwrap().mode & 0o777,
+        0o640
+    );
+    job.run(&format!("CHGAUT OBJ('{path}') USER(QSECOFR) DTAAUT(*RWX)"))
+        .await
+        .unwrap();
+    assert_eq!(
+        ifs::stat(&client, &path).await.unwrap().unwrap().mode & 0o777,
+        0o740
+    );
+    match job.run(&format!("DSPAUT OBJ('{path}')")).await.unwrap() {
+        Outcome::Display(d) => {
+            assert_eq!(d.rows[0], "QSECOFR     *RWX");
+            assert_eq!(d.rows[1], "*PUBLIC     *EXCLUDE");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(job
+        .run(&format!("CHGAUT OBJ('{path}') USER(*PUBLIC) DTAAUT(*ALL)"))
+        .await
+        .is_err());
+    let user = format!("U{}", &lib[1..]);
+    let _ = job.run(&format!("DLTUSRPRF USRPRF({user})")).await;
+    job.run(&format!("CRTUSRPRF USRPRF({user}) PASSWORD(*NONE)"))
+        .await
+        .unwrap();
+    job.run(&format!("CHGOWN OBJ('{path}') NEWOWN({user})"))
+        .await
+        .unwrap();
+    assert_eq!(
+        ifs::stat(&client, &path).await.unwrap().unwrap().owner,
+        user
+    );
+    assert!(job
+        .run(&format!("CHGOWN OBJ('{path}') NEWOWN(NOSUCHUSR)"))
+        .await
+        .is_err());
+    job.run(&format!("DLTUSRPRF USRPRF({user})")).await.unwrap();
+}

@@ -2736,7 +2736,7 @@ impl Job<'_> {
         )]))
     }
 
-    async fn require_secadm(&self, what: &str) -> Result<()> {
+    pub(crate) async fn require_secadm(&self, what: &str) -> Result<()> {
         if !users::has_special(self.client, &self.user, "*SECADM").await? {
             bail!("Not authorized to {what}: *SECADM special authority is needed.");
         }
@@ -5865,6 +5865,10 @@ impl Job<'_> {
         let when = format!("{} {}", stamp.date, stamp.time);
         let shown_lib = crate::qtemp::logical(&p.library);
         let sl = crate::qtemp::logical(&sl);
+        let width = crate::source::record_length(self.client, &slib, &sfile)
+            .await
+            .map(|n| (n as usize).saturating_sub(12))
+            .unwrap_or(crate::rtvclsrc::WIDTH);
         let lines = crate::rtvclsrc::retrieve(
             &p.source,
             &crate::rtvclsrc::Header {
@@ -5875,6 +5879,7 @@ impl Job<'_> {
                 owner: &owner,
                 when: &when,
             },
+            width,
         )?;
         let mut source = lines.join("\n");
         source.push('\n');

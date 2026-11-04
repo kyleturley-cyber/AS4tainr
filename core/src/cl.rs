@@ -3791,6 +3791,34 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "DSPAUT",
+        description: "Display Authority",
+        params: &[
+            p("OBJ", Kind::Text, true, None, "Object").ch("Path name"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
+    },
+    CommandDef {
+        name: "CHGAUT",
+        description: "Change Authority",
+        params: &[
+            p("OBJ", Kind::Text, true, None, "Object").ch("Path name"),
+            p("USER", Kind::List, false, Some("*PUBLIC"), "User").ch("Name, *PUBLIC"),
+            p("DTAAUT", Kind::Name, false, Some("*SAME"), "New data authorities").ch("*SAME, *RWX, *RX, *RW, *WX, *R, *W, *X, *EXCLUDE"),
+            p("OBJAUT", Kind::List, false, Some("*SAME"), "New object authorities").ch("*SAME, *ALL, *NONE, *OBJEXIST..."),
+            p("SUBTREE", Kind::Name, false, Some("*NONE"), "Directory subtree").ch("*NONE, *ALL").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CHGOWN",
+        description: "Change Owner",
+        params: &[
+            p("OBJ", Kind::Text, true, None, "Object").ch("Path name"),
+            p("NEWOWN", Kind::Name, true, None, "New owner").ch("Name"),
+            p("RVKOLDAUT", Kind::Name, false, Some("*YES"), "Revoke current owner authority").ch("*YES, *NO"),
+        ],
+    },
+    CommandDef {
         name: "DSPLNK",
         description: "Display Object Links",
         params: &[p("OBJ", Kind::Text, false, Some("*"), "Object").ch("Path name, *")],
@@ -4999,6 +5027,9 @@ pub static GROUPS: &[Group] = &[
             "STRQSH",
             "STRREXPRC",
             "DSPATR",
+            "DSPAUT",
+            "CHGAUT",
+            "CHGOWN",
             "WRKLNK",
             "DSPLNK",
             "MKDIR",

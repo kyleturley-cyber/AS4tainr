@@ -196,14 +196,15 @@ fn statement(st: &crate::clpgm::Statement) -> Result<String> {
     Ok(out)
 }
 
-/// Data columns of a source record (QCLSRC's 92-byte records less
-/// SRCSEQ and SRCDAT).
-const WIDTH: usize = 80;
+/// The member's data width (its record length less SRCSEQ and SRCDAT)
+/// decides where long statements are continued.
+/// Data columns of QCLSRC's 92-byte records (less SRCSEQ and SRCDAT).
+pub const WIDTH: usize = 80;
 
 /// A long line as several: `+` at the end of each but the last, the
 /// rest ten blanks in.
-fn wrap(line: String) -> Vec<String> {
-    if line.chars().count() <= WIDTH {
+fn wrap(line: String, width: usize) -> Vec<String> {
+    if line.chars().count() <= width {
         return vec![line];
     }
     let mut out = Vec::new();
@@ -211,7 +212,7 @@ fn wrap(line: String) -> Vec<String> {
     let mut first = true;
     loop {
         let indent = if first { 0 } else { 10 };
-        let room = WIDTH - indent;
+        let room = width - indent;
         if rest.len() <= room {
             out.push(format!(
                 "{}{}",
@@ -236,7 +237,7 @@ fn wrap(line: String) -> Vec<String> {
 }
 
 /// The member's lines: the comment box, then the statements.
-pub fn retrieve(source: &str, h: &Header) -> Result<Vec<String>> {
+pub fn retrieve(source: &str, h: &Header, width: usize) -> Result<Vec<String>> {
     let boxed = |s: String| format!("/*{s:<66}*/");
     let field =
         |label: &str, value: &str, tag: &str| boxed(format!(" {label:<41}:   {value:<18}{tag}"));
@@ -276,7 +277,7 @@ pub fn retrieve(source: &str, h: &Header) -> Result<Vec<String>> {
             Some(l) => format!("{l}: {body}"),
             None => body,
         };
-        out.extend(wrap(format!("     {body}")));
+        out.extend(wrap(format!("     {body}"), width.max(40)));
     }
     Ok(out)
 }
@@ -301,6 +302,7 @@ mod tests {
                 owner: "AS4TRAINR",
                 when: "26-11-04 00:22:29",
             },
+            WIDTH,
         )
         .unwrap();
         let want = [
@@ -337,7 +339,7 @@ mod tests {
     #[test]
     fn long_statements_continue() {
         let l = format!("     CALL PGM(X) PARM({})", "'a' ".repeat(30));
-        let w = wrap(l);
+        let w = wrap(l, WIDTH);
         assert!(w.len() > 1);
         assert!(w.iter().all(|x| x.chars().count() <= WIDTH));
         assert!(w[0].ends_with(" +"));

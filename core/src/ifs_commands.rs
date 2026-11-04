@@ -182,6 +182,107 @@ impl Job<'_> {
                     .map_err(|e| cl_error(e, obj))?;
                 msg(format!("Object {obj} renamed to {new}."))
             }
+            // DSPAUT (CL reference): an IFS object's owner and *PUBLIC
+            // with their data authorities, here from the mode's owner and
+            // other bits.
+            "DSPAUT" => {
+                let obj = cmd.get("OBJ");
+                let Some(e) = ifs::stat(self.client, obj)
+                    .await
+                    .map_err(|e| cl_error(e, obj))?
+                else {
+                    return Err(cl_error(ifs::Errno(errno::ENOENT).into(), obj));
+                };
+                let fmt = |u: &str, a: &str| format!("{u:<10}  {a}");
+                let rows = vec![
+                    fmt(&e.owner, ifs::data_authority(e.mode >> 6)),
+                    fmt("*PUBLIC", ifs::data_authority(e.mode)),
+                ];
+                Ok(Some(Outcome::Display(ListDisplay {
+                    title: "Display Authority".into(),
+                    info: vec![
+                        ("Object".into(), e.path.clone()),
+                        ("Owner".into(), e.owner.clone()),
+                        (
+                            "Type of object".into(),
+                            if e.dir { "*DIR" } else { "*STMF" }.into(),
+                        ),
+                    ],
+                    heading: fmt("User", "Data authority"),
+                    rows,
+                    ..Default::default()
+                })))
+            }
+            // CHGAUT (CL reference): a user's data authority to an IFS
+            // object. *PUBLIC's and the owner's are the mode's other and
+            // owner bits; other users' are not kept here (fidelity-gaps).
+            "CHGAUT" => {
+                let obj = cmd.get("OBJ");
+                let Some(e) = ifs::stat(self.client, obj)
+                    .await
+                    .map_err(|e| cl_error(e, obj))?
+                else {
+                    return Err(cl_error(ifs::Errno(errno::ENOENT).into(), obj));
+                };
+                if e.owner != self.user {
+                    self.require_secadm("change the authority of objects you do not own")
+                        .await?;
+                }
+                let dta = cmd.get("DTAAUT").trim().to_ascii_uppercase();
+                if dta == "*SAME" || dta.is_empty() {
+                    return Ok(Some(Outcome::Messages(Vec::new())));
+                }
+                let Some(bits) = ifs::authority_bits(&dta) else {
+                    return Err(crate::cl::value_error(&format!(
+                        "DTAAUT({dta}) is not *RWX, *RW, *RX, *WX, *R, *W, *X, *EXCLUDE or *SAME."
+                    )));
+                };
+                let mut mode = e.mode;
+                let mut kept = true;
+                for u in cmd.list("USER") {
+                    let u = u.trim().to_ascii_uppercase();
+                    if u == "*PUBLIC" {
+                        mode = (mode & !0o7) | bits;
+                    } else if u == e.owner {
+                        mode = (mode & !0o700) | (bits << 6);
+                    } else {
+                        kept = false;
+                    }
+                }
+                ifs::set_mode(self.client, obj, mode)
+                    .await
+                    .map_err(|e| cl_error(e, obj))?;
+                let mut out = Vec::new();
+                if !kept {
+                    out.push(format!(
+                        "Authorities of users other than *PUBLIC and the owner ({}) are not kept for {obj}.",
+                        e.owner
+                    ));
+                }
+                Ok(Some(Outcome::Messages(out)))
+            }
+            // CHGOWN (CL reference): an IFS object's new owner.
+            "CHGOWN" => {
+                let obj = cmd.get("OBJ");
+                let Some(e) = ifs::stat(self.client, obj)
+                    .await
+                    .map_err(|e| cl_error(e, obj))?
+                else {
+                    return Err(cl_error(ifs::Errno(errno::ENOENT).into(), obj));
+                };
+                if e.owner != self.user {
+                    self.require_secadm("change the owner of objects you do not own")
+                        .await?;
+                }
+                let new = cmd.get("NEWOWN").trim().to_ascii_uppercase();
+                if crate::users::get(self.client, &new).await?.is_none() {
+                    bail!("CPF2204: There is no user profile {new}.");
+                }
+                ifs::set_owner(self.client, obj, &new)
+                    .await
+                    .map_err(|e| cl_error(e, obj))?;
+                Ok(Some(Outcome::Messages(Vec::new())))
+            }
             // DSPATR (CL reference): an IFS object's attributes, here
             // those the IFS keeps (as4tainr's own layout).
             "DSPATR" => {

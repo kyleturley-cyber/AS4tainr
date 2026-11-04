@@ -27,12 +27,12 @@ pub struct NameHasher(u64);
 impl std::hash::Hasher for NameHasher {
     fn write(&mut self, bytes: &[u8]) {
         const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
-        let mut chunks = bytes.chunks_exact(8);
-        for c in &mut chunks {
-            let w = u64::from_le_bytes(c.try_into().unwrap_or([0; 8]));
+        let (words, rest) = bytes.as_chunks::<8>();
+        for c in words {
+            let w = u64::from_le_bytes(*c);
             self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(K);
         }
-        for &b in chunks.remainder() {
+        for &b in rest {
             self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(K);
         }
     }

@@ -40,6 +40,8 @@ Batch programs run without a display: `EXFMT` in a batch job fails, as it does o
 | `WRKJOB JOB(*) OPTION(*SELECT)` | On a display, a menu of what can be shown about your job (1 status, 2 definition, 3 run attributes, 4 spooled files, 10 job log, 11 call stack, 13 library list, 18 activation groups); another OPTION shows that display; another job or OUTPUT(*PRINT) shows all of DSPJOB |
 | `HLDJOB JOB(...)`, `RLSJOB JOB(...)`, `SBMJOB ... HOLD(*YES)` | Hold a job on its job queue (QBATCH passes it by) and release it; WRKSBMJOB options 3 and 6 |
 | `HLDJOBQ JOBQ(...)`, `RLSJOBQ JOBQ(...)` | Hold and release a job queue (*JOBCTL): its jobs wait on it; WRKJOBQ status HLD or RLS |
+| `CRTJOBQ JOBQ(lib/name)`, `DLTJOBQ`, `WRKJOBQ JOBQ(lib/name)` | Job queues of your own: SBMJOB JOBQ(lib/name) puts jobs on one, where they wait (no subsystem here takes jobs from them); WRKJOBQ of one queue lists its jobs and prints IBM i's report |
+| `ADDJOBSCDE JOB(name) CMD(...) FRQ(*WEEKLY) SCDDATE(*NONE) SCDDAY(*MON *FRI) SCDTIME('020000')` | A job schedule entry: the QBATCH subsystem submits the command as a batch job at that time (FRQ *ONCE, *WEEKLY, *MONTHLY; SCDDATE a date, *CURRENT, *MONTHSTR, *MONTHEND), then works out the next time; `WRKJOBSCDE` lists the entries (options 3 hold, 4 remove, 6 release), `CHGJOBSCDE`, `HLDJOBSCDE`, `RLSJOBSCDE`, `RMVJOBSCDE` |
 | `ENDSBS QBATCH`, `STRSBS QBATCH` | Stop and start the server's QBATCH taking jobs off its queue (*JOBCTL); running jobs finish, waiting jobs stay; WRKSBS shows it INACTIVE |
 | `ALCOBJ`, `DLCOBJ`, `WRKOBJLCK` | Object locks between jobs (lock states as the CL reference's table, WAIT, CPF1002), held until DLCOBJ or the job ends |
 | `PWRDWNSYS OPTION(*CNTRLD) DELAY(3600) RESTART(*NO)` | Ends the as4tainr server: *CNTRLD lets the active batch jobs finish (up to DELAY seconds) and starts no new ones, *IMMED ends at once; RESTART(*YES) starts the server again (in Docker the container keeps running; with *NO it stops). Needs *JOBCTL |
@@ -60,7 +62,7 @@ CHGJOB changes only this job: another job named is found (CPF1321 when it is not
 
 ## Not yet
 
-- Ending an active job (`ENDJOB` of a running job, `*IMMED`/`*CNTRLD`), clearing job queues (`CLRJOBQ`), job priorities, scheduled jobs (`SCDDATE`), `WRKJOBQ`, `WRKSBS`.
+- Ending an active job (`ENDJOB` of a running job, `*IMMED`/`*CNTRLD`), clearing job queues (`CLRJOBQ`), job priorities, SBMJOB's `SCDDATE` and `SCDTIME`, subsystems for job queues other than QBATCH.
 - Other job queues and subsystems, subsystem descriptions, job descriptions (`JOBD` is always `QDFTJOBD`), routing entries.
 - Job logs are kept in the catalog for every job. As on IBM i, a batch job's log becomes spooled file `QPJOBLOG` only when the job ends abnormally (or with `DSPJOBLOG OUTPUT(*PRINT)`, `SIGNOFF LOG(*LIST)`); see [spooled-files.md](spooled-files.md).
 - Message replies (`*INQ` messages), break messages, `RCVMSG` from a message queue (CL programs receive from their program message queue, see cl-programs.md), the `QSYSOPR` operator's console. `DSPMSG` is a plain list.

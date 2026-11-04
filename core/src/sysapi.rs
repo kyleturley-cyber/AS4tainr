@@ -365,7 +365,7 @@ async fn object_description(
             bail!("CPF9810: There is no library {lib}.");
         }
         match objtype.as_str() {
-            "*PGM" => bail!("CPF9811: Program {name} in library {lib} not found."),
+            "*PGM" => bail!("CPF9811: There is no program {name} in library {lib}."),
             "*FILE" => bail!("CPF9812: There is no file {name} in library {lib}."),
             _ => bail!("CPF9801: Object {name} is not in library {lib}."),
         }

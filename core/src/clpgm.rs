@@ -4137,7 +4137,7 @@ async fn command(
                 // a message when there is none (*MAX: until one comes).
                 let name = msgq.rsplit('/').next().unwrap_or(&msgq).to_string();
                 if name != "QSYSOPR" && crate::users::get(job.client, &name).await?.is_none() {
-                    bail!("CPF2403: Message queue {name} in *LIBL not found.");
+                    bail!("CPF2403: There is no message queue {name} in *LIBL.");
                 }
                 let wait = match up("WAIT", "0").as_str() {
                     "*MAX" => u64::MAX,

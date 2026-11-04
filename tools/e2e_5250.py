@@ -768,6 +768,15 @@ with Tn5250(HOST) as t:
     t.fkey(3); t.wait_for("Work with Members Using PDM")
     t.fkey(3); t.wait_for("Command Entry")
     command(t, "rmvm contacts/qrpglesrc e2enew", "removed")
+    # SEU's syntax checking (SEU User's Guide: the lines changed in a CL
+    # member are checked at Enter; an error is shown with its line).
+    command(t, "strseu contacts/qrpglesrc e2ecl type(clle)", "Source Entry: Edit")
+    t.tab(); t.tab(); t.type("pgm"); t.tab(); t.tab(); t.type("nosuchcmd x(1)"); t.enter()
+    t.wait_for("NOSUCHCMD")
+    check("Line 0002.00" in t.text(), "SEU checks the CL lines typed: a command that is not there", t)
+    t.fkey(3); t.wait_for("Save the changed member")
+    t.enter(); t.wait_for("Command Entry")
+    command(t, "rmvm contacts/qrpglesrc e2ecl", "removed")
     # EDTF (CL reference: edits a stream file; one that does not exist is
     # created). The lines typed are the file's lines when saved.
     command(t, "edtf stmf('/tmp/e2e_edtf.txt')", "Edit File")

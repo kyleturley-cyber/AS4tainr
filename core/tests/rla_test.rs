@@ -24545,11 +24545,24 @@ async fn hold_and_release_a_job_queue() {
     job.run(&format!("HLDJOBQ JOBQ(QGPL/{q})")).await.unwrap();
     assert!(job.run(&format!("HLDJOBQ JOBQ({q})")).await.is_err());
     assert!(jobs::claim_next(&client, &q).await.unwrap().is_none());
-    let list = match job.run(&format!("WRKJOBQ JOBQ({q})")).await.unwrap() {
-        Outcome::Display(d) => d.rows.join("\n"),
+    // WRKJOBQ of one queue shows its jobs, the queue's status above them
+    // (this looked for HLD at the end of the queue's row in the list of
+    // all queues; PUB400's WRKJOBQ JOBQ(name), verify44 m44_wrkjobq, is
+    // the queue's own jobs).
+    let d = match job.run(&format!("WRKJOBQ JOBQ({q})")).await.unwrap() {
+        Outcome::Display(d) => d,
         other => panic!("{other:?}"),
     };
-    assert!(list.trim_end().ends_with("HLD"), "{list}");
+    assert!(
+        d.info.iter().any(|(k, v)| k == "Status" && v == "HLD"),
+        "{:?}",
+        d.info
+    );
+    assert!(
+        d.rows.iter().any(|r| r.starts_with("HQJOB")),
+        "{:?}",
+        d.rows
+    );
     let mut plain = Job {
         user: "QUSER".into(),
         curlib: None,
@@ -25164,4 +25177,374 @@ async fn ifs_authorities_and_owner() {
         .await
         .is_err());
     job.run(&format!("DLTUSRPRF USRPRF({user})")).await.unwrap();
+}
+
+/// Job queues, authorization lists, CHGMSGQ, CHGPGM, DSPPGMREF, CMPPFM and
+/// CPYLIB, each with the message IDs IBM i 7.5 sends (PUB400,
+/// tools/golden/verify44.txt; the m44_* name of each capture is given).
+#[tokio::test]
+async fn job_queues_authorization_lists_and_program_references() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::source::{put_member, Member};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let msgs = |o: Outcome| match o {
+        Outcome::Messages(m) => m.join("\n"),
+        other => panic!("{other:?}"),
+    };
+    let err = |e: anyhow::Error| format!("{e:#}");
+    // m44_crtjobq, m44_crtjobq2.
+    let m = msgs(job.run(&format!("CRTJOBQ JOBQ({lib}/Q44)")).await.unwrap());
+    assert!(m.starts_with("CPC9801"), "{m}");
+    let e = err(job
+        .run(&format!("CRTJOBQ JOBQ({lib}/Q44)"))
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("CPF3323"), "{e}");
+    // A job submitted to it waits there (no subsystem takes jobs from it).
+    let m = msgs(
+        job.run(&format!(
+            "SBMJOB CMD(DLYJOB DLY(1)) JOB(W44) JOBQ({lib}/Q44)"
+        ))
+        .await
+        .unwrap(),
+    );
+    assert!(
+        m.contains(&format!("job queue Q44 in library {lib}")),
+        "{m}"
+    );
+    let Outcome::Display(d) = job.run(&format!("WRKJOBQ JOBQ({lib}/Q44)")).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(d.rows.len(), 1, "{:?}", d.rows);
+    assert!(d.rows[0].starts_with("W44"), "{:?}", d.rows);
+    // m44_wrkjobq's headings.
+    assert_eq!(
+        d.print[1],
+        " Job Name     User         Number   Priority   Status"
+    );
+    let key = d.keys[0].clone();
+    job.run(&format!("ENDJOB JOB({key})")).await.ok();
+    // m44_dltjobq, m44_dltjobq2.
+    let m = msgs(job.run(&format!("DLTJOBQ JOBQ({lib}/Q44)")).await.unwrap());
+    assert!(m.starts_with("CPC2191"), "{m}");
+    let e = err(job
+        .run(&format!("DLTJOBQ JOBQ({lib}/Q44)"))
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("CPF2105"), "{e}");
+
+    // Authorization lists: m44_crtautl, m44_addautle, m44_dspautl,
+    // m44_rmvautle, m44_rmvautle2, m44_dltautl, m44_dspautlx.
+    let al = format!("A{}", &lib[lib.len().saturating_sub(8)..]);
+    let m = msgs(job.run(&format!("CRTAUTL AUTL({al})")).await.unwrap());
+    assert!(m.starts_with("CPC2207"), "{m}");
+    let m = msgs(
+        job.run(&format!("ADDAUTLE AUTL({al}) USER(QUSER) AUT(*USE)"))
+            .await
+            .unwrap(),
+    );
+    let ids: Vec<&str> = m.lines().map(|l| &l[..7]).collect();
+    assert_eq!(ids, ["CPI2211", "CPC2208"], "{m}");
+    let Outcome::Display(d) = job.run(&format!("DSPAUTL AUTL({al})")).await.unwrap() else {
+        panic!()
+    };
+    // *PUBLIC *CHANGE (QCRTAUT), the owner with list management, QUSER
+    // *USE, as m44_dspautl shows them.
+    assert!(
+        d.print[6].starts_with(" *PUBLIC        *CHANGE "),
+        "{:?}",
+        d.print
+    );
+    assert!(
+        d.print[7].starts_with(" QSECOFR        *ALL           X"),
+        "{:?}",
+        d.print
+    );
+    assert!(
+        d.print[8].starts_with(" QUSER          *USE "),
+        "{:?}",
+        d.print
+    );
+    let m = msgs(
+        job.run(&format!("RMVAUTLE AUTL({al}) USER(QUSER)"))
+            .await
+            .unwrap(),
+    );
+    let ids: Vec<&str> = m.lines().map(|l| &l[..7]).collect();
+    assert_eq!(ids, ["CPI2213", "CPC2210"], "{m}");
+    let e = err(job
+        .run(&format!("RMVAUTLE AUTL({al}) USER(QUSER)"))
+        .await
+        .unwrap_err());
+    let ids: Vec<&str> = e.lines().map(|l| &l[..7]).collect();
+    assert_eq!(ids, ["CPD2276", "CPF2285"], "{e}");
+    let m = msgs(job.run(&format!("DLTAUTL AUTL({al})")).await.unwrap());
+    assert!(m.starts_with("CPC2191"), "{m}");
+    let e = err(job.run(&format!("DSPAUTL AUTL({al})")).await.unwrap_err());
+    assert!(e.starts_with("CPF2283"), "{e}");
+
+    // CHGMSGQ sends no message (m44_chgmsgq); CPF2403 (m44_chgmsgq2).
+    job.run(&format!("CRTMSGQ MSGQ({lib}/M44)")).await.unwrap();
+    let m = msgs(
+        job.run(&format!("CHGMSGQ MSGQ({lib}/M44) DLVRY(*HOLD) SEV(10)"))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(m, "");
+    let e = err(job
+        .run(&format!("CHGMSGQ MSGQ({lib}/NOSUCHQ) DLVRY(*HOLD)"))
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("CPF2403"), "{e}");
+
+    // A CL program's references (m44_pgmref), CHGPGM (m44_chgpgm,
+    // m44_chgpgmx), DSPPGMREF of a missing program (m44_pgmrefx).
+    job.run(&format!("CRTSRCPF FILE({lib}/S44) RCDLEN(92)"))
+        .await
+        .unwrap();
+    let a = "PGM\n DCL VAR(&A) TYPE(*CHAR) LEN(10) VALUE('x')\n CALL PGM(QSYS/QCMDEXC) PARM('DLYJOB DLY(1)' 13)\n ENDPGM\n";
+    let b = "PGM\n DCL VAR(&A) TYPE(*CHAR) LEN(10) VALUE('y')\n CALL PGM(QSYS/QCMDEXC) PARM('DLYJOB DLY(1)' 13)\n ENDPGM\n";
+    for (name, src) in [("P44", a), ("P44B", b)] {
+        put_member(
+            &client,
+            &Member {
+                library: lib.clone(),
+                file: "S44".into(),
+                name: name.into(),
+                srctype: "CLLE".into(),
+                source: src.into(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .unwrap();
+    }
+    job.run(&format!("CRTBNDCL PGM({lib}/P44) SRCFILE({lib}/S44)"))
+        .await
+        .unwrap();
+    let Outcome::Display(d) = job.run(&format!("DSPPGMREF PGM({lib}/P44)")).await.unwrap() else {
+        panic!()
+    };
+    let objs: Vec<&str> = d
+        .rows
+        .iter()
+        .map(|r| r.split_whitespace().next().unwrap())
+        .collect();
+    assert_eq!(objs, ["QCMDEXC", "QLECWI", "QCLSRV", "QLEAWI"]);
+    let e = err(job
+        .run(&format!("DSPPGMREF PGM({lib}/NOSUCHPGM)"))
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("CPF3033"), "{e}");
+    let m = msgs(
+        job.run(&format!("CHGPGM PGM({lib}/P44) TEXT('changed 44')"))
+            .await
+            .unwrap(),
+    );
+    assert!(m.starts_with("CPC0540"), "{m}");
+    let e = err(job
+        .run(&format!("CHGPGM PGM({lib}/NOSUCHPGM) TEXT('x')"))
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("CPF9811"), "{e}");
+
+    // CMPPFM: SPC6002, SPC6001 (m44_cmppfm, m44_cmpsame), SPC5010
+    // (m44_cmpnone), CPD0084 for RPTTYPE(*LINE) (m44_cmplin).
+    let Outcome::Display(d) = job
+        .run(&format!(
+            "CMPPFM NEWFILE({lib}/S44) NEWMBR(P44B) OLDFILE({lib}/S44) OLDMBR(P44) RPTTYPE(*CHANGE)"
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(d.print_msg.as_deref().unwrap_or("").starts_with("SPC6002"));
+    assert!(
+        d.print
+            .iter()
+            .any(|l| l.starts_with("PAIRED CHANGES") && l.ends_with(" 1")),
+        "{:?}",
+        d.print
+    );
+    let Outcome::Display(d) = job
+        .run(&format!("CMPPFM NEWFILE({lib}/S44) NEWMBR(P44)"))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(d.print_msg.as_deref().unwrap_or("").starts_with("SPC6001"));
+    let e = err(job
+        .run(&format!(
+            "CMPPFM NEWFILE({lib}/S44) NEWMBR(NOSUCH) OLDMBR(P44)"
+        ))
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("SPC5010"), "{e}");
+    let e = err(job
+        .run(&format!(
+            "CMPPFM NEWFILE({lib}/S44) NEWMBR(P44) RPTTYPE(*LINE)"
+        ))
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("CPD0084"), "{e}");
+
+    // CPYLIB: CPF2365 (m44_cpylibe), CPF2358 (m44_cpylibx); a copy has
+    // the objects (CL reference).
+    let e = err(job
+        .run(&format!("CPYLIB FROMLIB({lib}) TOLIB({lib})"))
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("CPF2365"), "{e}");
+    let e = err(job
+        .run("CPYLIB FROMLIB(NOSUCHLIB) TOLIB(NOSUCHLB2)")
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("CPF2358"), "{e}");
+    let to = format!("C{}", &lib[lib.len().saturating_sub(8)..]);
+    job.run(&format!("DLTLIB LIB({to})")).await.ok();
+    job.run(&format!("CPYLIB FROMLIB({lib}) TOLIB({to})"))
+        .await
+        .unwrap();
+    job.run(&format!("CHKOBJ OBJ({to}/P44) OBJTYPE(*PGM)"))
+        .await
+        .unwrap();
+    job.run(&format!("CHKOBJ OBJ({to}/S44) OBJTYPE(*FILE)"))
+        .await
+        .unwrap();
+    job.run(&format!("DLTLIB LIB({to})")).await.unwrap();
+}
+
+/// Job schedule entries (CL reference, ADDJOBSCDE and the commands that
+/// work with entries): an entry is added, shown, held, released,
+/// changed and removed; CPF1628 for one that is not there (PUB400
+/// verify44 m44_hldscde); a due entry's job goes on its job queue and the
+/// entry gets its next time.
+#[tokio::test]
+async fn job_schedule_entries() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let name = format!("S{}", &lib[lib.len().saturating_sub(8)..]);
+    job.run(&format!(
+        "ADDJOBSCDE JOB({name}) CMD(DLYJOB DLY(1)) FRQ(*WEEKLY) SCDDATE(*NONE) SCDDAY(*SUN) SCDTIME('235900') TEXT('weekly')"
+    ))
+    .await
+    .unwrap();
+    let rows = |o: Outcome| match o {
+        Outcome::Display(d) => d.rows,
+        other => panic!("{other:?}"),
+    };
+    let r = rows(job.run(&format!("WRKJOBSCDE JOB({name})")).await.unwrap());
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert!(
+        r[0].contains("SCD") && r[0].contains("*SUN 23:59:00") && r[0].contains("*WEEKLY"),
+        "{r:?}"
+    );
+    job.run(&format!("HLDJOBSCDE JOB({name})")).await.unwrap();
+    let r = rows(job.run(&format!("WRKJOBSCDE JOB({name})")).await.unwrap());
+    assert!(r[0].contains(" HLD "), "{r:?}");
+    job.run(&format!("RLSJOBSCDE JOB({name})")).await.unwrap();
+    job.run(&format!(
+        "CHGJOBSCDE JOB({name}) ENTRYNBR(*ONLY) SCDTIME('235800')"
+    ))
+    .await
+    .unwrap();
+    let r = rows(job.run(&format!("WRKJOBSCDE JOB({name})")).await.unwrap());
+    assert!(r[0].contains("*SUN 23:58:00"), "{r:?}");
+    // SCDDATE and SCDDAY together are not allowed (CL reference).
+    assert!(job
+        .run(&format!(
+            "ADDJOBSCDE JOB({name}) CMD(DLYJOB DLY(1)) FRQ(*ONCE) SCDDATE(*CURRENT) SCDDAY(*MON)"
+        ))
+        .await
+        .is_err());
+    // Due now: its job is submitted to QBATCH and the entry moves on to
+    // its next Sunday.
+    client
+        .execute(
+            "UPDATE as4tainr.job_schedule SET next_run='2000-01-01 00:00:00' WHERE name=$1",
+            &[&name],
+        )
+        .await
+        .unwrap();
+    as4tainr_core::jobscde::submit_due(&client).await.unwrap();
+    let queued: i64 = client
+        .query_one(
+            "SELECT count(*) FROM as4tainr.jobs WHERE name=$1 AND status='JOBQ' AND jobq='QBATCH'",
+            &[&name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(queued, 1);
+    let next: String = client
+        .query_one(
+            "SELECT next_run FROM as4tainr.job_schedule WHERE name=$1",
+            &[&name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        next.ends_with("23:58:00") && next.as_str() > "2026-01-01",
+        "{next}"
+    );
+    for id in client
+        .query(
+            "SELECT number, user_name FROM as4tainr.jobs WHERE name=$1 AND status='JOBQ'",
+            &[&name],
+        )
+        .await
+        .unwrap()
+    {
+        let (n, u): (i64, String) = (id.get(0), id.get(1));
+        job.run(&format!("ENDJOB JOB({n:06}/{u}/{name})"))
+            .await
+            .ok();
+    }
+    job.run(&format!("RMVJOBSCDE JOB({name})")).await.unwrap();
+    let e = format!(
+        "{:#}",
+        job.run(&format!("RMVJOBSCDE JOB({name})"))
+            .await
+            .unwrap_err()
+    );
+    assert!(e.starts_with("CPF1628"), "{e}");
+    let e = format!(
+        "{:#}",
+        job.run(&format!("HLDJOBSCDE JOB({name}) ENTRYNBR(*ONLY)"))
+            .await
+            .unwrap_err()
+    );
+    assert!(e.starts_with("CPF1628"), "{e}");
 }

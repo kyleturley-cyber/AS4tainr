@@ -5329,7 +5329,9 @@ impl Machine<'_> {
                             return self
                                 .api_error(
                                     rest.first(),
-                                    anyhow!("CPF2403: Message queue {qname} in {qlib} not found."),
+                                    anyhow!(
+                                        "CPF2403: There is no message queue {qname} in {qlib}."
+                                    ),
                                 )
                                 .map(|_| true);
                         }

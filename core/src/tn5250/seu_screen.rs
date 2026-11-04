@@ -234,8 +234,13 @@ pub(super) async fn edit(term: &mut Term, job: &mut Job<'_>, t: &EditTarget) -> 
             }
         }
         if !t.browse {
+            let changed: Vec<usize> = typed.texts.iter().map(|(i, _)| *i).collect();
             if let Err(e) = ed.apply(&typed) {
                 message = e;
+            } else if let Source::Member { member: m, .. } = &src {
+                if let Some(m2) = syntax_check(job, &m.srctype, &ed, &changed).await? {
+                    message = m2;
+                }
             }
         }
         let n = ed.lines.len();
@@ -321,6 +326,79 @@ pub(super) async fn edit(term: &mut Term, job: &mut Job<'_>, t: &EditTarget) -> 
             command = cmd;
         }
     }
+}
+
+/// SEU's syntax checking of a CL member (SEU User's Guide: the lines
+/// changed are checked when Enter is pressed and an error is shown
+/// with the line): the statements that hold a changed line, checked as
+/// the CL compiler checks a statement (a command that is not there, a
+/// value not valid, a statement that cannot be parsed). Checks that need
+/// the whole program (variables declared, labels) wait for the compile.
+/// The first error, with its line's sequence number; None when there is
+/// none or the member is not CL.
+async fn syntax_check(
+    job: &mut Job<'_>,
+    srctype: &str,
+    ed: &Editor,
+    changed: &[usize],
+) -> Result<Option<String>> {
+    if !matches!(srctype.to_ascii_uppercase().as_str(), "CLP" | "CLLE" | "CL") || changed.is_empty()
+    {
+        return Ok(None);
+    }
+    // The statements the changed lines are in: a line continues the one
+    // before when that one ends in + or -.
+    let mut starts = std::collections::BTreeSet::new();
+    for &i in changed {
+        let mut s = i.min(ed.lines.len().saturating_sub(1));
+        while s > 0 {
+            let prev = ed.lines[s - 1].text.trim_end();
+            if prev.ends_with('+') || prev.ends_with('-') {
+                s -= 1;
+            } else {
+                break;
+            }
+        }
+        starts.insert(s + 1);
+    }
+    let source: String = ed
+        .lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let user_cmds: Vec<String> = job
+        .client
+        .query(
+            "SELECT name FROM as4tainr.objects WHERE objtype='*CMD'",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let known = |c: &str| {
+        let bare = c.rsplit('/').next().unwrap_or(c);
+        crate::cl::find(bare).is_some()
+            || crate::ibmcmds::is_ibm(bare)
+            || user_cmds.iter().any(|u| u == bare)
+    };
+    let a = crate::cllist::analyze(&source, &known, &|_| Vec::new());
+    // CPD0727, CPD0726, CPD0791, CPD0792: variables and labels, which
+    // the compile checks over the whole program.
+    let found = a.diags.iter().find(|d| {
+        starts.contains(&d.line)
+            && d.sev >= 30
+            && !matches!(d.id.as_str(), "CPD0727" | "CPD0726" | "CPD0791" | "CPD0792")
+    });
+    Ok(found.map(|d| {
+        let seq = ed
+            .lines
+            .get(d.line.saturating_sub(1))
+            .map(|l| Editor::seq_text(l.seq))
+            .unwrap_or_default();
+        format!("Line {seq}: {}", crate::jobs::message_text(&d.text).trim())
+    }))
 }
 
 /// A column ruler from column `left` + 1.

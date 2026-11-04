@@ -459,6 +459,10 @@ pub async fn init(client: &Client) -> Result<()> {
             .await
             .context("creating catalog")?;
         client
+            .batch_execute(crate::jobscde::DDL)
+            .await
+            .context("creating catalog")?;
+        client
             .batch_execute(crate::spool::DDL)
             .await
             .context("creating catalog")?;

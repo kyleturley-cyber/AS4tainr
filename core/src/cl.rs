@@ -1545,7 +1545,7 @@ pub static COMMANDS: &[CommandDef] = &[
             p("CMD", Kind::Command, true, None, "Command to run"),
             p("JOB", Kind::Name, false, Some("*JOBD"), "Job name").ch("Name, *JOBD"),
             p("JOBD", Kind::Qualified, false, Some("*USRPRF"), "Job description").ch("Name, *USRPRF"),
-            p("JOBQ", Kind::Name, false, Some("*JOBD"), "Job queue").ch("QBATCH, *JOBD"),
+            p("JOBQ", Kind::Qualified, false, Some("*JOBD"), "Job queue").ch("Name, *JOBD"),
             p(
                 "CURLIB",
                 Kind::Name,
@@ -2009,6 +2009,21 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "CHGMSGQ",
+        description: "Change Message Queue",
+        params: &[
+            p("MSGQ", Kind::Qualified, true, None, "Message queue").ch("Name"),
+            p("DLVRY", Kind::Name, false, Some("*SAME"), "Delivery").ch("*SAME, *BREAK, *DFT, *HOLD, *NOTIFY"),
+            p("SEV", Kind::Text, false, Some("*SAME"), "Severity code filter").ch("0-99, *SAME"),
+            p("PGM", Kind::Qualified, false, Some("*SAME"), "Break handling program").ch("Name, *SAME, *DSPMSG").keyword_only(),
+            p("RESET", Kind::Name, false, Some("*NO"), "Reset old messages").ch("*NO, *YES").keyword_only(),
+            p("FORCE", Kind::Name, false, Some("*SAME"), "Force to auxiliary storage").ch("*SAME, *NO, *YES").keyword_only(),
+            p("TEXT", Kind::Text, false, Some("*SAME"), "Text 'description'").keyword_only(),
+            p("ALWALR", Kind::Name, false, Some("*SAME"), "Allow alerts").ch("*SAME, *NO, *YES").keyword_only(),
+            p("CCSID", Kind::Text, false, Some("*SAME"), "Coded character set ID").keyword_only(),
+        ],
+    },
+    CommandDef {
         name: "WRKMSGQ",
         description: "Work with Message Queues",
         params: &[p("MSGQ", Kind::Qualified, false, Some("*ALL"), "Message queue").ch("Name, generic*, *ALL")],
@@ -2170,9 +2185,197 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[p("JOBQ", Kind::Qualified, true, None, "Job queue").ch("Name")],
     },
     CommandDef {
+        name: "ADDJOBSCDE",
+        description: "Add Job Schedule Entry",
+        params: &[
+            p("JOB", Kind::Name, true, None, "Job name").ch("Name"),
+            p("CMD", Kind::Command, true, None, "Command to run"),
+            p("FRQ", Kind::Name, true, None, "Frequency").ch("*ONCE, *WEEKLY, *MONTHLY"),
+            p("SCDDATE", Kind::Name, false, Some("*CURRENT"), "Schedule date").ch("Date, *CURRENT, *MONTHSTR, *MONTHEND, *NONE"),
+            p("SCDDAY", Kind::List, false, Some("*NONE"), "Schedule day").ch("*NONE, *ALL, *MON, *TUE, *WED, *THU, *FRI, *SAT, *SUN"),
+            p("SCDTIME", Kind::Text, false, Some("*CURRENT"), "Schedule time").ch("Time, *CURRENT"),
+            p("RELDAYMON", Kind::List, false, Some("*NONE"), "Relative day of month").keyword_only(),
+            p("SAVE", Kind::Name, false, Some("*NO"), "Save").ch("*NO, *YES").keyword_only(),
+            p("OMITDATE", Kind::List, false, Some("*NONE"), "Omit date").keyword_only(),
+            p("RCYACN", Kind::Name, false, Some("*SBMRLS"), "Recovery action").ch("*SBMRLS, *SBMHLD, *NOSBM").keyword_only(),
+            p("JOBD", Kind::Qualified, false, Some("*USRPRF"), "Job description").keyword_only(),
+            p("JOBQ", Kind::Qualified, false, Some("*JOBD"), "Job queue").ch("Name, *JOBD").keyword_only(),
+            p("USER", Kind::Name, false, Some("*CURRENT"), "User").ch("Name, *CURRENT, *JOBD").keyword_only(),
+            p("MSGQ", Kind::Qualified, false, Some("*USRPRF"), "Message queue").keyword_only(),
+            p("TEXT", Kind::Text, false, Some("*BLANK"), "Text 'description'").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CHGJOBSCDE",
+        description: "Change Job Schedule Entry",
+        params: &[
+            p("JOB", Kind::Name, true, None, "Job name").ch("Name"),
+            p("ENTRYNBR", Kind::Name, true, None, "Entry number").ch("000001-999999, *ONLY"),
+            p("CMD", Kind::Command, false, Some("*SAME"), "Command to run"),
+            p("FRQ", Kind::Name, false, Some("*SAME"), "Frequency").ch("*SAME, *ONCE, *WEEKLY, *MONTHLY"),
+            p("SCDDATE", Kind::Name, false, Some("*SAME"), "Schedule date").ch("Date, *SAME, *CURRENT, *MONTHSTR, *MONTHEND, *NONE"),
+            p("SCDDAY", Kind::List, false, Some("*SAME"), "Schedule day").ch("*SAME, *NONE, *ALL, *MON, *TUE, *WED, *THU, *FRI, *SAT, *SUN"),
+            p("SCDTIME", Kind::Text, false, Some("*SAME"), "Schedule time").ch("Time, *SAME, *CURRENT"),
+            p("TEXT", Kind::Text, false, Some("*SAME"), "Text 'description'").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "RMVJOBSCDE",
+        description: "Remove Job Schedule Entry",
+        params: &[
+            p("JOB", Kind::Name, true, None, "Job name").ch("Name, generic*, *ALL"),
+            p("ENTRYNBR", Kind::Name, false, Some("*ONLY"), "Entry number").ch("000001-999999, *ONLY, *ALL"),
+        ],
+    },
+    CommandDef {
+        name: "HLDJOBSCDE",
+        description: "Hold Job Schedule Entry",
+        params: &[
+            p("JOB", Kind::Name, true, None, "Job name").ch("Name, generic*, *ALL"),
+            p("ENTRYNBR", Kind::Name, false, Some("*ONLY"), "Entry number").ch("000001-999999, *ONLY, *ALL"),
+        ],
+    },
+    CommandDef {
+        name: "RLSJOBSCDE",
+        description: "Release Job Schedule Entry",
+        params: &[
+            p("JOB", Kind::Name, true, None, "Job name").ch("Name, generic*, *ALL"),
+            p("ENTRYNBR", Kind::Name, false, Some("*ONLY"), "Entry number").ch("000001-999999, *ONLY, *ALL"),
+        ],
+    },
+    CommandDef {
+        name: "WRKJOBSCDE",
+        description: "Work with Job Schedule Entries",
+        params: &[
+            p("JOB", Kind::Name, false, Some("*ALL"), "Job name").ch("Name, generic*, *ALL"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+            p("PRTFMT", Kind::Name, false, Some("*BASIC"), "Print format").ch("*BASIC, *FULL").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CRTJOBQ",
+        description: "Create Job Queue",
+        params: &[
+            p("JOBQ", Kind::Qualified, true, None, "Job queue").ch("Name"),
+            p("TEXT", Kind::Text, false, Some("*BLANK"), "Text 'description'"),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
+                .ch("*LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE")
+                .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "DLTJOBQ",
+        description: "Delete Job Queue",
+        params: &[p("JOBQ", Kind::Qualified, true, None, "Job queue").ch("Name")],
+    },
+    CommandDef {
+        name: "CRTAUTL",
+        description: "Create Authorization List",
+        params: &[
+            p("AUTL", Kind::Name, true, None, "Authorization list").ch("Name"),
+            p("TEXT", Kind::Text, false, Some("*BLANK"), "Text 'description'"),
+            p("AUT", Kind::Name, false, Some("*LIBCRTAUT"), "Authority")
+                .ch("*LIBCRTAUT, *CHANGE, *ALL, *USE, *EXCLUDE")
+                .keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "DLTAUTL",
+        description: "Delete Authorization List",
+        params: &[p("AUTL", Kind::Name, true, None, "Authorization list").ch("Name")],
+    },
+    CommandDef {
+        name: "ADDAUTLE",
+        description: "Add Authorization List Entry",
+        params: &[
+            p("AUTL", Kind::Name, true, None, "Authorization list").ch("Name"),
+            p("USER", Kind::List, true, None, "User").ch("Name"),
+            p("AUT", Kind::List, false, Some("*USE"), "Authority").ch("*CHANGE, *ALL, *USE, *EXCLUDE, *AUTLMGT"),
+        ],
+    },
+    CommandDef {
+        name: "CHGAUTLE",
+        description: "Change Authorization List Entry",
+        params: &[
+            p("AUTL", Kind::Name, true, None, "Authorization list").ch("Name"),
+            p("USER", Kind::List, true, None, "User").ch("Name, *PUBLIC"),
+            p("AUT", Kind::List, true, None, "Authority").ch("*CHANGE, *ALL, *USE, *EXCLUDE, *AUTLMGT"),
+        ],
+    },
+    CommandDef {
+        name: "RMVAUTLE",
+        description: "Remove Authorization List Entry",
+        params: &[
+            p("AUTL", Kind::Name, true, None, "Authorization list").ch("Name"),
+            p("USER", Kind::List, true, None, "User").ch("Name"),
+        ],
+    },
+    CommandDef {
+        name: "DSPAUTL",
+        description: "Display Authorization List",
+        params: &[
+            p("AUTL", Kind::Name, true, None, "Authorization list").ch("Name"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
+    },
+    CommandDef {
+        name: "WRKAUTL",
+        description: "Work with Authorization Lists",
+        params: &[p("AUTL", Kind::Name, false, Some("*ALL"), "Authorization list").ch("Name, generic*, *ALL")],
+    },
+    CommandDef {
+        name: "CPYLIB",
+        description: "Copy Library",
+        params: &[
+            p("FROMLIB", Kind::Name, true, None, "Existing library").ch("Name"),
+            p("TOLIB", Kind::Name, true, None, "New library").ch("Name"),
+            p("CRTLIB", Kind::Name, false, Some("*YES"), "Create library").ch("*YES, *NO"),
+            p("ASPDEV", Kind::Name, false, Some("*"), "ASP device").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CMPPFM",
+        description: "Compare Physical File Member",
+        params: &[
+            p("NEWFILE", Kind::Qualified, true, None, "New file").ch("Name"),
+            p("NEWMBR", Kind::Name, true, None, "New member").ch("Name"),
+            p("OLDFILE", Kind::Qualified, false, Some("*NEWFILE"), "Old file").ch("Name, *NEWFILE"),
+            p("OLDMBR", Kind::Name, false, Some("*NEWMBR"), "Old member").ch("Name, *NEWMBR"),
+            p("CMPTYPE", Kind::Name, false, Some("*LINE"), "Compare type").ch("*LINE, *WORD, *FILE"),
+            p("RPTTYPE", Kind::Name, false, Some("*DIFF"), "Report type").ch("*DIFF, *SUMMARY, *CHANGE, *DETAIL"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
+    },
+    CommandDef {
+        name: "DSPPGMREF",
+        description: "Display Program References",
+        params: &[
+            p("PGM", Kind::Qualified, true, None, "Program").ch("Name, generic*, *ALL"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT, *OUTFILE"),
+            p("OBJTYPE", Kind::List, false, Some("*PGM"), "Object type").ch("*ALL, *SQLPKG, *SRVPGM, *MODULE, *PGM"),
+            p("OUTFILE", Kind::Qualified, false, None, "File to receive output").keyword_only(),
+            p("OUTMBR", Kind::List, false, Some("*FIRST *REPLACE"), "Output member options").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CHGPGM",
+        description: "Change Program",
+        params: &[
+            p("PGM", Kind::Qualified, true, None, "Program").ch("Name, generic*, *ALL"),
+            p("OPTIMIZE", Kind::Name, false, Some("*SAME"), "Optimize program").ch("*SAME, *YES, *NO, *BASIC, *FULL"),
+            p("USRPRF", Kind::Name, false, Some("*SAME"), "User profile").ch("*SAME, *USER, *OWNER"),
+            p("USEADPAUT", Kind::Name, false, Some("*SAME"), "Use adopted authority").ch("*SAME, *YES, *NO"),
+            p("TEXT", Kind::Text, false, Some("*SAME"), "Text 'description'").keyword_only(),
+            p("FRCCRT", Kind::Name, false, Some("*NO"), "Force program recreation").ch("*NO, *YES, *NOCRT").keyword_only(),
+        ],
+    },
+    CommandDef {
         name: "WRKJOBQ",
         description: "Work with Job Queues",
-        params: &[p("JOBQ", Kind::Qualified, false, Some("*ALL"), "Job queue").ch("Name, *ALL")],
+        params: &[
+            p("JOBQ", Kind::Qualified, false, Some("*ALL"), "Job queue").ch("Name, *ALL"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
     },
     CommandDef {
         name: "WRKUSRPRF",
@@ -4853,7 +5056,19 @@ pub static GROUPS: &[Group] = &[
     Group {
         item: "Security commands",
         title: "Security Commands",
-        commands: &["GRTOBJAUT", "RVKOBJAUT", "DSPOBJAUT", "CHGOBJOWN"],
+        commands: &[
+            "GRTOBJAUT",
+            "RVKOBJAUT",
+            "DSPOBJAUT",
+            "CHGOBJOWN",
+            "CRTAUTL",
+            "DLTAUTL",
+            "ADDAUTLE",
+            "CHGAUTLE",
+            "RMVAUTLE",
+            "DSPAUTL",
+            "WRKAUTL",
+        ],
     },
     Group {
         item: "SQL commands",
@@ -4863,7 +5078,7 @@ pub static GROUPS: &[Group] = &[
     Group {
         item: "Program commands",
         title: "Program Commands",
-        commands: &["CALL", "CALLPRC"],
+        commands: &["CALL", "CALLPRC", "DSPPGMREF", "CHGPGM"],
     },
     Group {
         item: "Job and message commands",
@@ -4890,6 +5105,7 @@ pub static GROUPS: &[Group] = &[
             "WRKCFGSTS",
             "WRKDEVD",
             "CRTMSGQ",
+            "CHGMSGQ",
             "DLTMSGQ",
             "DLYJOB",
             "DSPSYSVAL",
@@ -4915,6 +5131,14 @@ pub static GROUPS: &[Group] = &[
             "CLRJOBQ",
             "RLSJOBQ",
             "WRKJOBQ",
+            "CRTJOBQ",
+            "DLTJOBQ",
+            "ADDJOBSCDE",
+            "CHGJOBSCDE",
+            "RMVJOBSCDE",
+            "HLDJOBSCDE",
+            "RLSJOBSCDE",
+            "WRKJOBSCDE",
             "ADDENVVAR",
             "CHGENVVAR",
             "RMVENVVAR",
@@ -4992,6 +5216,7 @@ pub static GROUPS: &[Group] = &[
             "DLTOVR",
             "CLRPFM",
             "RGZPFM",
+            "CMPPFM",
             "RTVCLSRC",
             "CHGPF",
             "RNMM",
@@ -5069,6 +5294,7 @@ pub static GROUPS: &[Group] = &[
             "RSTOBJ",
             "RSTLIB",
             "CRTDUPOBJ",
+            "CPYLIB",
         ],
     },
     Group {

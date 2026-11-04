@@ -24904,3 +24904,119 @@ async fn copy_file_from_and_to_record_numbers() {
         .await
         .is_err());
 }
+
+// RTVCLSRC (CL reference): a CL program's source into a member, SRCMBR
+// *PGM the program's name; ALWRTVSRC(*NO) at creation keeps it from
+// being retrieved. WRKMSG lists a queue's messages; WRKCFGSTS
+// CFGTYPE(*DEV) and WRKDEVD the display devices in use.
+#[tokio::test]
+async fn retrieve_cl_source_and_work_with_messages_and_devices() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::jobs;
+    use as4tainr_core::source::{put_member, Member};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    job.run(&format!("CRTSRCPF FILE({lib}/QCLSRC)"))
+        .await
+        .unwrap();
+    let src = "PGM\n  DCL &X *CHAR 1\n  CHGVAR &X 'A'\nENDPGM\n";
+    put_member(
+        &client,
+        &Member {
+            library: lib.clone(),
+            file: "QCLSRC".into(),
+            name: "RTVME".into(),
+            srctype: "CLLE".into(),
+            source: src.into(),
+            ..Default::default()
+        },
+        true,
+    )
+    .await
+    .unwrap();
+    job.run(&format!("CRTBNDCL PGM({lib}/RTVME) SRCFILE({lib}/QCLSRC)"))
+        .await
+        .unwrap();
+    job.run(&format!("CRTSRCPF FILE({lib}/QOUTSRC)"))
+        .await
+        .unwrap();
+    job.run(&format!("RTVCLSRC PGM({lib}/RTVME) SRCFILE({lib}/QOUTSRC)"))
+        .await
+        .unwrap();
+    let m =
+        as4tainr_core::source::find_member(&client, std::slice::from_ref(&lib), "QOUTSRC", "RTVME")
+            .await
+            .unwrap();
+    assert_eq!(m.srctype, "CLLE");
+    assert!(m.source.contains("CHGVAR &X 'A'"), "{}", m.source);
+    job.run(&format!(
+        "CRTBNDCL PGM({lib}/NORTV) SRCFILE({lib}/QCLSRC) SRCMBR(RTVME) ALWRTVSRC(*NO)"
+    ))
+    .await
+    .unwrap();
+    assert!(job
+        .run(&format!("RTVCLSRC PGM({lib}/NORTV) SRCFILE({lib}/QOUTSRC)"))
+        .await
+        .is_err());
+
+    // WRKMSG.
+    job.run(&format!("CRTMSGQ MSGQ({lib}/WMQ)")).await.unwrap();
+    job.run(&format!("SNDMSG MSG('hello there') TOMSGQ({lib}/WMQ)"))
+        .await
+        .unwrap();
+    match job.run(&format!("WRKMSG MSGQ({lib}/WMQ)")).await.unwrap() {
+        Outcome::Display(d) => {
+            assert_eq!(d.title, "Work with Messages");
+            assert!(
+                d.rows.iter().any(|r| r.contains("hello there")),
+                "{:?}",
+                d.rows
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // WRKCFGSTS and WRKDEVD: an interactive job's device.
+    let dev = format!("D{}", &lib[1..]);
+    let id = jobs::start_interactive(&client, &dev, "QSECOFR", None, &[])
+        .await
+        .unwrap();
+    for c in [
+        format!("WRKCFGSTS CFGTYPE(*DEV) CFGD({dev})"),
+        format!("WRKDEVD DEVD({dev})"),
+    ] {
+        match job.run(&c).await.unwrap() {
+            Outcome::Display(d) => {
+                assert!(
+                    d.rows
+                        .iter()
+                        .any(|r| r.starts_with(&dev) && r.contains("ACTIVE")),
+                    "{c}: {:?}",
+                    d.rows
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(job.run("WRKCFGSTS CFGTYPE(*LIN)").await.is_err());
+    client
+        .execute(
+            "UPDATE as4tainr.jobs SET status='OUTQ', ended=now() WHERE number=$1",
+            &[&id.number],
+        )
+        .await
+        .unwrap();
+}

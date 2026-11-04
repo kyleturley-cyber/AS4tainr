@@ -1,0 +1,17 @@
+# Golden: RTVCLSRC: the source IBM i writes back from a CL program (its
+# layout of comments, continued lines, lower case, positional values),
+# printed with CPYF; RTVCLSRC of a program made with ALWRTVSRC(*NO) and
+# of one that does not exist; WRKCFGSTS OUTPUT(*PRINT) of a device
+# that does not exist.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify42.txt
+k42_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLD42C)" "DLTPGM PGM(AS4TRAINR1/GLD42N)" "DLTF FILE(AS4TRAINR1/GLD42S)"; do system -q "$c"; done; echo cleaned
+k42_crtc|CRTBNDCL PGM(AS4TRAINR1/GLD42C) SRCSTMF('/home/AS4TRAINR/gld/gld42c.clle')
+k42_crtn|CRTBNDCL PGM(AS4TRAINR1/GLD42N) SRCSTMF('/home/AS4TRAINR/gld/gld42c.clle') ALWRTVSRC(*NO)
+k42_srcpf|CRTSRCPF FILE(AS4TRAINR1/GLD42S)
+k42_rtv|RTVCLSRC PGM(AS4TRAINR1/GLD42C) SRCFILE(AS4TRAINR1/GLD42S)
+k42_rows|CPYF FROMFILE(AS4TRAINR1/GLD42S) TOFILE(*PRINT) FROMMBR(GLD42C)
+k42_rtvagain|RTVCLSRC PGM(AS4TRAINR1/GLD42C) SRCFILE(AS4TRAINR1/GLD42S)
+k42_rtvno|RTVCLSRC PGM(AS4TRAINR1/GLD42N) SRCFILE(AS4TRAINR1/GLD42S)
+k42_rtvnone|RTVCLSRC PGM(AS4TRAINR1/GLD42X) SRCFILE(AS4TRAINR1/GLD42S)
+k42_cfgsts|WRKCFGSTS CFGTYPE(*DEV) CFGD(GLD42Z) OUTPUT(*PRINT)
+k42_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLD42C)" "DLTPGM PGM(AS4TRAINR1/GLD42N)" "DLTF FILE(AS4TRAINR1/GLD42S)"; do system -q "$c"; done; echo cleaned

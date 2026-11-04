@@ -1,0 +1,11 @@
+/* verify42: a program whose source RTVCLSRC retrieves: a comment, */
+/* a continued command, keywords and positional values.              */
+PGM        PARM(&IN)
+             DCL        VAR(&IN) TYPE(*CHAR) LEN(10)
+             DCL        &X *CHAR 20 /* short form */
+  chgvar &x ('a' *cat +
+                &in)
+             IF         COND(&X *EQ ' ') THEN(DO)
+               SNDPGMMSG  MSG('blank')
+             ENDDO
+ENDPGM

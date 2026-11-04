@@ -603,6 +603,7 @@ impl Job<'_> {
             "DLTOVR" => self.dltovr(&cmd),
             "CLRPFM" => self.clrpfm(&cmd).await,
             "RGZPFM" => self.rgzpfm(&cmd).await,
+            "RTVCLSRC" => self.rtvclsrc(&cmd).await,
             "CHGPF" => Box::pin(self.chgpf(&cmd)).await,
             "RNMM" => self.rnmm(&cmd).await,
             "DLYJOB" => self.dlyjob(&cmd).await,
@@ -743,6 +744,8 @@ impl Job<'_> {
             "SNDMSG" => self.sndmsg(&cmd).await,
             "DSPMSG" => self.dspmsg(&cmd).await,
             "CLRMSGQ" => self.clrmsgq(&cmd).await,
+            "WRKMSG" => self.wrkmsg(&cmd).await,
+            "WRKCFGSTS" | "WRKDEVD" => self.work_with_devices(&cmd).await,
             "SIGNOFF" => {
                 // LOG(*LIST): the job log is kept as a spooled file.
                 if cmd.get("LOG") == "*LIST" {
@@ -4123,6 +4126,12 @@ impl Job<'_> {
         }
         let mut c = runtime::connect_db(&self.env.database_url).await?;
         catalog::create_program(&mut c, &lib, &name, attribute, &text, &source, replace).await?;
+        // ALWRTVSRC(*NO): RTVCLSRC is refused for the program.
+        let options = if cmd.get("ALWRTVSRC").eq_ignore_ascii_case("*NO") {
+            format!("{options} ALWRTVSRC(*NO)").trim().to_string()
+        } else {
+            options
+        };
         catalog::set_program_options(self.client, &lib, &name, &options).await?;
         catalog::set_program_source(self.client, &lib, &name, (&m.file, &m.library, &m.name))
             .await?;
@@ -5781,6 +5790,75 @@ impl Job<'_> {
             msgs.push(format!("File {name} in library {shown} changed."));
         }
         Ok(Outcome::Messages(msgs))
+    }
+
+    /// RTVCLSRC: a CL program's source into a source member (CL reference,
+    /// RTVCLSRC: SRCMBR(*PGM) is the program's name; a program created
+    /// with ALWRTVSRC(*NO) gives none). The source is the program's own,
+    /// as it was compiled (IBM i writes it again from the program, in its
+    /// own layout: docs/fidelity-gaps.md).
+    async fn rtvclsrc(&mut self, cmd: &Command) -> Result<Outcome> {
+        let (libs, name) = self.search(cmd.get("PGM"));
+        let name = name.to_ascii_uppercase();
+        let Some(p) = catalog::find_program(self.client, &libs, &name).await? else {
+            bail!(
+                "CPF9811: There is no program {name} in library {}.",
+                libs.join(",")
+            );
+        };
+        if !matches!(p.attribute.as_str(), "CLLE" | "CLP") {
+            bail!(
+                "Program {name} in library {} is not a CL program ({}): RTVCLSRC retrieves CL source.",
+                crate::qtemp::logical(&p.library),
+                p.attribute
+            );
+        }
+        authority::check(self.client, &self.user, &p.library, &name, "*PGM", Aut::Use).await?;
+        if option_values(&p.options, "ALWRTVSRC")
+            .first()
+            .is_some_and(|v| v.eq_ignore_ascii_case("*NO"))
+        {
+            bail!(
+                "The source of program {name} cannot be retrieved: it was created with ALWRTVSRC(*NO)."
+            );
+        }
+        let (slibs, sfile) = self.search(cmd.get("SRCFILE"));
+        let sfile = sfile.to_ascii_uppercase();
+        let mut slib = None;
+        for l in &slibs {
+            if crate::source::is_source_file(self.client, l, &sfile).await? {
+                slib = Some(l.clone());
+                break;
+            }
+        }
+        let Some(slib) = slib else {
+            bail!(
+                "CPF9812: There is no source file {sfile} in library {}.",
+                slibs.join(",")
+            );
+        };
+        authority::check(self.client, &self.user, &slib, &sfile, "*FILE", Aut::Change).await?;
+        let mbr = match cmd.get("SRCMBR").trim().to_ascii_uppercase().as_str() {
+            "*PGM" | "" => name.clone(),
+            m => m.to_string(),
+        };
+        crate::source::put_member(
+            self.client,
+            &crate::source::Member {
+                library: slib.clone(),
+                file: sfile.clone(),
+                name: mbr.clone(),
+                srctype: p.attribute.clone(),
+                source: p.source.clone(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await?;
+        Ok(Outcome::Messages(vec![format!(
+            "The source of program {name} is in member {mbr} of file {sfile} in library {}.",
+            crate::qtemp::logical(&slib)
+        )]))
     }
 
     /// RGZPFM: the records numbered again from 1 with no gaps where
@@ -8630,6 +8708,100 @@ impl Job<'_> {
         Ok(Outcome::Messages(vec![format!(
             "CPC2353: The messages of message queue {name} in library {shown_lib} were removed."
         )]))
+    }
+
+    /// WRKMSG: a message queue's messages, one line each (oldest first,
+    /// the sender, date, time and text), in as4tainr's layout; MSGQ
+    /// *WRKUSR is the user's own queue (CL reference, WRKMSG). Messages
+    /// are not removed or answered from this list (CLRMSGQ removes them).
+    async fn wrkmsg(&mut self, cmd: &Command) -> Result<Outcome> {
+        let spec = match cmd.get("MSGQ").trim().to_ascii_uppercase().as_str() {
+            "*WRKUSR" | "*USRPRF" | "" => "*USRPRF".to_string(),
+            s => s.to_string(),
+        };
+        let (q, qlib) = self
+            .message_queue(&spec, Aut::Use, "work with other users' messages")
+            .await?;
+        let msgs = jobs::messages(self.client, &q, q == self.user).await?;
+        let shown_q = q.rsplit('/').next().unwrap_or(&q).to_string();
+        let mut rows: Vec<String> = msgs
+            .iter()
+            .map(|m| {
+                let text: String = jobs::shown_text(&m.text).chars().take(48).collect();
+                format!("{:<10}  {:<17}  {text}", m.from_user, m.sent)
+            })
+            .collect();
+        if rows.is_empty() {
+            rows.push("(No messages.)".into());
+        }
+        let n = rows.len();
+        Ok(Outcome::Display(ListDisplay {
+            title: "Work with Messages".into(),
+            info: vec![("Messages in".into(), shown_q), ("Library".into(), qlib)],
+            heading: format!("{:<10}  {:<17}  Message", "From", "Date and time"),
+            rows,
+            keys: vec![String::new(); n],
+            refresh: Some(format!("WRKMSG MSGQ({spec})")),
+            ..Default::default()
+        }))
+    }
+
+    /// WRKCFGSTS CFGTYPE(*DEV) and WRKDEVD: the display devices, which
+    /// here are the display sessions signed on now (a 5250 session's
+    /// device is its interactive job's name; the server makes devices as
+    /// clients connect and they go with the session). Status as IBM i
+    /// shows a device with a job: SIGNON DISPLAY is not kept, so every
+    /// one listed is ACTIVE. Other types (lines, controllers) have none.
+    async fn work_with_devices(&mut self, cmd: &Command) -> Result<Outcome> {
+        let wrkcfgsts = cmd.def.name == "WRKCFGSTS";
+        if wrkcfgsts {
+            let t = cmd.get("CFGTYPE").trim().to_ascii_uppercase();
+            if t != "*DEV" {
+                bail!("CFGTYPE({t}): as4tainr has display devices only (*DEV); it has no lines, controllers or network interfaces.");
+            }
+        }
+        let pattern = cmd
+            .get(if wrkcfgsts { "CFGD" } else { "DEVD" })
+            .trim()
+            .to_ascii_uppercase();
+        let pattern = if pattern.is_empty() {
+            "*ALL".to_string()
+        } else {
+            pattern
+        };
+        let mut devices: Vec<(String, String)> = jobs::active(self.client)
+            .await?
+            .into_iter()
+            .filter(|j| j.job_type == "INT")
+            .filter(|j| catalog::name_matches(&pattern, &j.id.name))
+            .map(|j| (j.id.name.clone(), j.id.to_string()))
+            .collect();
+        devices.sort();
+        let fmt = |d: &str, t: &str, s: &str, j: &str| format!("{d:<10}  {t:<8}  {s:<10}  {j}");
+        let mut rows: Vec<String> = devices
+            .iter()
+            .map(|(d, j)| fmt(d, "*DSP", "ACTIVE", j))
+            .collect();
+        if rows.is_empty() {
+            rows.push("(No display devices are in use.)".into());
+        }
+        let n = rows.len();
+        Ok(Outcome::Display(ListDisplay {
+            title: if wrkcfgsts {
+                "Work with Configuration Status".into()
+            } else {
+                "Work with Device Descriptions".into()
+            },
+            heading: fmt("Device", "Type", "Status", "Job"),
+            rows,
+            keys: vec![String::new(); n],
+            refresh: Some(if wrkcfgsts {
+                format!("WRKCFGSTS CFGTYPE(*DEV) CFGD({pattern})")
+            } else {
+                format!("WRKDEVD DEVD({pattern})")
+            }),
+            ..Default::default()
+        }))
     }
 
     async fn dspmsg(&mut self, cmd: &Command) -> Result<Outcome> {

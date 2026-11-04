@@ -1146,6 +1146,15 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "RTVCLSRC",
+        description: "Retrieve CL Source",
+        params: &[
+            p("PGM", Kind::Qualified, true, None, "Program").ch("Name"),
+            p("SRCFILE", Kind::Qualified, false, Some("QCLSRC"), "Source file").ch("Name"),
+            p("SRCMBR", Kind::Name, false, Some("*PGM"), "Source member").ch("Name, *PGM"),
+        ],
+    },
+    CommandDef {
         name: "RGZPFM",
         description: "Reorganize Physical File Member",
         params: &[
@@ -1846,6 +1855,27 @@ pub static COMMANDS: &[CommandDef] = &[
         params: &[
             p("MSGQ", Kind::Qualified, false, Some("*USRPRF"), "Message queue").ch("*USRPRF, name"),
         ],
+    },
+    CommandDef {
+        name: "WRKMSG",
+        description: "Work with Messages",
+        params: &[
+            p("MSGQ", Kind::Qualified, false, Some("*USRPRF"), "Message queue").ch("*USRPRF, *WRKUSR, name"),
+        ],
+    },
+    CommandDef {
+        name: "WRKCFGSTS",
+        description: "Work with Configuration Status",
+        params: &[
+            p("CFGTYPE", Kind::Name, true, None, "Type").ch("*DEV"),
+            p("CFGD", Kind::Name, false, Some("*ALL"), "Configuration description").ch("Name, generic*, *ALL"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
+    },
+    CommandDef {
+        name: "WRKDEVD",
+        description: "Work with Device Descriptions",
+        params: &[p("DEVD", Kind::Name, false, Some("*ALL"), "Device description").ch("Name, generic*, *ALL")],
     },
     CommandDef {
         name: "GRTOBJAUT",
@@ -4824,6 +4854,9 @@ pub static GROUPS: &[Group] = &[
             "WRKOBJLCK",
             "DSPMSG",
             "CLRMSGQ",
+            "WRKMSG",
+            "WRKCFGSTS",
+            "WRKDEVD",
             "CRTMSGQ",
             "DLTMSGQ",
             "DLYJOB",
@@ -4927,6 +4960,7 @@ pub static GROUPS: &[Group] = &[
             "DLTOVR",
             "CLRPFM",
             "RGZPFM",
+            "RTVCLSRC",
             "CHGPF",
             "RNMM",
             "STRCMTCTL",

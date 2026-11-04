@@ -24961,16 +24961,42 @@ async fn retrieve_cl_source_and_work_with_messages_and_devices() {
             .await
             .unwrap();
     assert_eq!(m.srctype, "CLLE");
-    assert!(m.source.contains("CHGVAR &X 'A'"), "{}", m.source);
+    // Written again as IBM i does (PUB400, verify42 k42_rows): a comment
+    // box, then each statement with its keywords (this expected the
+    // original text before the capture).
+    assert!(m.source.starts_with("/****"), "{}", m.source);
+    assert!(
+        m.source.contains("\n     CHGVAR VAR(&X) VALUE('A')\n"),
+        "{}",
+        m.source
+    );
     job.run(&format!(
         "CRTBNDCL PGM({lib}/NORTV) SRCFILE({lib}/QCLSRC) SRCMBR(RTVME) ALWRTVSRC(*NO)"
     ))
     .await
     .unwrap();
-    assert!(job
+    // The retrieved source compiles and runs again.
+    job.run(&format!(
+        "CRTBNDCL PGM({lib}/RTVBACK) SRCFILE({lib}/QOUTSRC) SRCMBR(RTVME)"
+    ))
+    .await
+    .unwrap();
+    job.run(&format!("CALL PGM({lib}/RTVBACK)")).await.unwrap();
+    // CPF0569 (k42_rtvno), CPF9801 for a program not there (k42_rtvnone).
+    let e = job
         .run(&format!("RTVCLSRC PGM({lib}/NORTV) SRCFILE({lib}/QOUTSRC)"))
         .await
-        .is_err());
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF0569"), "{e}");
+    let e = job
+        .run(&format!(
+            "RTVCLSRC PGM({lib}/NOSUCHPGM) SRCFILE({lib}/QOUTSRC)"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF9801"), "{e}");
 
     // WRKMSG.
     job.run(&format!("CRTMSGQ MSGQ({lib}/WMQ)")).await.unwrap();

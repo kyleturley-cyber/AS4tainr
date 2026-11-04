@@ -5801,10 +5801,13 @@ impl Job<'_> {
         let (libs, name) = self.search(cmd.get("PGM"));
         let name = name.to_ascii_uppercase();
         let Some(p) = catalog::find_program(self.client, &libs, &name).await? else {
-            bail!(
-                "CPF9811: There is no program {name} in library {}.",
-                libs.join(",")
-            );
+            // CPF9801 (PUB400, verify42 k42_rtvnone).
+            let label = cmd
+                .get("PGM")
+                .split_once('/')
+                .map(|(l, _)| l.to_ascii_uppercase())
+                .unwrap_or_else(|| "*LIBL".into());
+            bail!("CPF9801: There is no object {name} in library {label}.");
         };
         if !matches!(p.attribute.as_str(), "CLLE" | "CLP") {
             bail!(
@@ -5814,12 +5817,14 @@ impl Job<'_> {
             );
         }
         authority::check(self.client, &self.user, &p.library, &name, "*PGM", Aut::Use).await?;
+        // ALWRTVSRC(*NO): CPF0569 (verify42 k42_rtvno).
         if option_values(&p.options, "ALWRTVSRC")
             .first()
             .is_some_and(|v| v.eq_ignore_ascii_case("*NO"))
         {
             bail!(
-                "The source of program {name} cannot be retrieved: it was created with ALWRTVSRC(*NO)."
+                "CPF0569: Program {name} in library {} has no CL source to retrieve.",
+                crate::qtemp::logical(&p.library)
             );
         }
         let (slibs, sfile) = self.search(cmd.get("SRCFILE"));
@@ -5842,6 +5847,37 @@ impl Job<'_> {
             "*PGM" | "" => name.clone(),
             m => m.to_string(),
         };
+        // The source as IBM i writes it again from the program
+        // (`rtvclsrc.rs`).
+        let row = self
+            .client
+            .query_one(
+                "SELECT coalesce(o.text, ''), coalesce(o.owner, ''), p.src_file, p.src_lib, p.src_mbr
+                   FROM as4tainr.programs p
+                   LEFT JOIN as4tainr.objects o ON o.library = p.library AND o.name = p.name AND o.objtype = '*PGM'
+                  WHERE p.library = $1 AND p.name = $2",
+                &[&p.library, &name],
+            )
+            .await?;
+        let (text, owner, sf, sl, sm): (String, String, String, String, String) =
+            (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
+        let stamp = crate::report::Stamp::now();
+        let when = format!("{} {}", stamp.date, stamp.time);
+        let shown_lib = crate::qtemp::logical(&p.library);
+        let sl = crate::qtemp::logical(&sl);
+        let lines = crate::rtvclsrc::retrieve(
+            &p.source,
+            &crate::rtvclsrc::Header {
+                program: &name,
+                library: &shown_lib,
+                source: (&sf, &sl, &sm),
+                text: &text,
+                owner: &owner,
+                when: &when,
+            },
+        )?;
+        let mut source = lines.join("\n");
+        source.push('\n');
         crate::source::put_member(
             self.client,
             &crate::source::Member {
@@ -5849,15 +5885,15 @@ impl Job<'_> {
                 file: sfile.clone(),
                 name: mbr.clone(),
                 srctype: p.attribute.clone(),
-                source: p.source.clone(),
+                source,
                 ..Default::default()
             },
             true,
         )
         .await?;
+        // CPC0560 (verify42 k42_rtv).
         Ok(Outcome::Messages(vec![format!(
-            "The source of program {name} is in member {mbr} of file {sfile} in library {}.",
-            crate::qtemp::logical(&slib)
+            "CPC0560: The CL source of *PGM {name} in {shown_lib} was retrieved."
         )]))
     }
 
@@ -8786,7 +8822,44 @@ impl Job<'_> {
             rows.push("(No display devices are in use.)".into());
         }
         let n = rows.len();
+        // WRKCFGSTS OUTPUT(*PRINT) in IBM i 7.5's layout (PUB400, verify42
+        // k42_cfgsts: the title and page on the first line, product,
+        // system, date and time with the zone on the second, the column
+        // heading). Device lines and the line for none are as4tainr's own.
+        let print = if wrkcfgsts {
+            use crate::report::{at, Stamp, LEVEL, PRODUCT};
+            let st = Stamp::now();
+            let time = format!("{} {}", st.time, st.zone);
+            let mut p = vec![
+                at(&[(18, "Work with Configuration Status"), (69, "Page     1")]),
+                at(&[
+                    (1, PRODUCT),
+                    (17, LEVEL),
+                    (47, &crate::report::system_name()),
+                    (57, &st.date),
+                    (67, time.trim_end()),
+                ]),
+                at(&[
+                    (2, "Description"),
+                    (23, "Type"),
+                    (32, "Status"),
+                    (57, "----------------Job-----------------"),
+                    (98, "Pass-through device"),
+                ]),
+            ];
+            if devices.is_empty() {
+                p.push("   (No device matches.)".into());
+            }
+            for (d, j) in &devices {
+                p.push(at(&[(4, d), (23, "*DSP"), (32, "ACTIVE"), (57, j)]));
+            }
+            p.push("              * * * * *   E N D   O F   L I S T I N G   * * * * *".into());
+            p
+        } else {
+            Vec::new()
+        };
         Ok(Outcome::Display(ListDisplay {
+            print,
             title: if wrkcfgsts {
                 "Work with Configuration Status".into()
             } else {

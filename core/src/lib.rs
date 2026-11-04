@@ -70,6 +70,7 @@ pub mod report;
 pub mod rexx;
 pub mod rla;
 pub mod rpg;
+pub mod rtvclsrc;
 pub mod runtime;
 pub mod save;
 pub mod services;

@@ -3585,10 +3585,15 @@ impl Job<'_> {
                 };
             }
             "CRTLF" => {
-                let lf = match crate::dds::parse_lf(&name, &dds_columns(&m.source)) {
+                let mut lf = match crate::dds::parse_lf(&name, &dds_columns(&m.source)) {
                     Ok(lf) => lf,
                     Err(e) => return Err(self.dds_failed(cmd, &m, &lib, &name, false, e).await),
                 };
+                match cmd.get("TEXT") {
+                    "" | "*SRCMBRTXT" => {}
+                    "*BLANK" => lf.text = String::new(),
+                    t => lf.text = t.to_string(),
+                }
                 if let Err(e) =
                     catalog::create_logical_file(&mut c, &self.library_list(), &lib, &lf).await
                 {
@@ -3611,6 +3616,13 @@ impl Job<'_> {
                     true,
                 )
                 .await?;
+                // Its DDS, for CHGPF to build it again over a changed file.
+                self.client
+                    .execute(
+                        "UPDATE as4tainr.logical_files SET dds=$3 WHERE library=$1 AND name=$2",
+                        &[&lib, &name, &dds_columns(&m.source)],
+                    )
+                    .await?;
                 // CPC7301 and CPC7305, as for a physical file (observed on
                 // IBM i 7.5).
                 authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
@@ -5729,6 +5741,33 @@ impl Job<'_> {
                 "*FILE" | "" => name.clone(),
                 m => m.to_string(),
             };
+            // Logical files over the file are kept (CL reference, CHGPF:
+            // the file's dependent logical files are changed with it):
+            // here those CRTLF made are built again from their DDS; SQL
+            // indexes and views over it must be dropped first.
+            let mut rebuild: Vec<(String, String, String, String, String)> = Vec::new();
+            for (dl, dn) in catalog::dependent_files(self.client, &lib, &name).await? {
+                let row = self
+                    .client
+                    .query_opt(
+                        "SELECT l.dds, coalesce(o.text, ''), coalesce(o.owner, '')
+                           FROM as4tainr.logical_files l
+                           LEFT JOIN as4tainr.objects o
+                             ON o.library = l.library AND o.name = l.name AND o.objtype = '*FILE'
+                          WHERE l.library=$1 AND l.name=$2",
+                        &[&dl, &dn],
+                    )
+                    .await?;
+                match row {
+                    Some(r) if !r.get::<_, String>(0).trim().is_empty() => {
+                        rebuild.push((dl, dn, r.get(0), r.get(1), r.get(2)))
+                    }
+                    _ => bail!(
+                        "File {name} in library {shown} was not changed: {dn} in library {} over it is an SQL index or view, or a logical file made before as4tainr kept its DDS; delete it first.",
+                        crate::qtemp::logical(&dl)
+                    ),
+                }
+            }
             let records: i64 = self
                 .client
                 .query_one(
@@ -5759,6 +5798,67 @@ impl Job<'_> {
                     )));
                 }
             }
+            // Each logical file must build over the new file (its fields
+            // and keys still there) before anything is changed: tried in
+            // QTEMP over the new file.
+            let mut c = runtime::connect_db(&self.env.database_url).await?;
+            for (dl, dn, dds, _, _) in &rebuild {
+                let tried = match crate::dds::parse_lf(dn, dds) {
+                    Ok(mut lf) => {
+                        lf.based_on = format!("QTEMP/{name}");
+                        let r = catalog::create_logical_file(
+                            &mut c,
+                            &self.library_list(),
+                            "QTEMP",
+                            &lf,
+                        )
+                        .await;
+                        let _ = Box::pin(self.run(&format!("DLTF FILE(QTEMP/{dn})"))).await;
+                        r
+                    }
+                    Err(e) => Err(anyhow!("{e}")),
+                };
+                if let Err(e) = tried {
+                    let _ = Box::pin(self.run(&format!("DLTF FILE(QTEMP/{name})"))).await;
+                    return Err(e.context(format!(
+                        "File {name} in library {shown} was not changed: logical file {dn} in library {} cannot be built over the new fields.",
+                        crate::qtemp::logical(dl)
+                    )));
+                }
+            }
+            for (dl, dn, ..) in &rebuild {
+                Box::pin(self.run(&format!("DLTF FILE({dl}/{dn})"))).await?;
+            }
+            // The logical files over the file in `lib/name`, as they were.
+            async fn build_again(
+                job: &mut Job<'_>,
+                c: &mut tokio_postgres::Client,
+                lib: &str,
+                name: &str,
+                rebuild: &[(String, String, String, String, String)],
+            ) -> Result<()> {
+                for (dl, dn, dds, text, owner) in rebuild {
+                    let mut lf = crate::dds::parse_lf(dn, dds)?;
+                    lf.based_on = format!("{lib}/{name}");
+                    catalog::create_logical_file(c, &job.library_list(), dl, &lf).await?;
+                    job.client
+                        .execute(
+                            "UPDATE as4tainr.logical_files SET dds=$3 WHERE library=$1 AND name=$2",
+                            &[dl, dn, dds],
+                        )
+                        .await?;
+                    job.client
+                        .execute(
+                            "UPDATE as4tainr.objects SET text=$3 WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+                            &[dl, dn, text],
+                        )
+                        .await?;
+                    if !owner.is_empty() {
+                        authority::set_owner(job.client, dl, dn, "*FILE", owner).await?;
+                    }
+                }
+                Ok(())
+            }
             // The old file aside under a name of its own, the new one in.
             let aside = format!("Q{:09}", std::process::id() % 1_000_000_000);
             if let Err(e) = Box::pin(self.run(&format!(
@@ -5767,8 +5867,9 @@ impl Job<'_> {
             .await
             {
                 let _ = Box::pin(self.run(&format!("DLTF FILE(QTEMP/{name})"))).await;
+                let _ = build_again(self, &mut c, &lib, &name, &rebuild).await;
                 return Err(e.context(format!(
-                    "File {name} in library {shown} was not changed (logical files or views over it must be deleted first)."
+                    "File {name} in library {shown} was not changed (SQL views over it must be dropped first)."
                 )));
             }
             if let Err(e) = Box::pin(self.run(&format!(
@@ -5781,9 +5882,11 @@ impl Job<'_> {
                 )))
                 .await;
                 let _ = Box::pin(self.run(&format!("DLTF FILE(QTEMP/{name})"))).await;
+                let _ = build_again(self, &mut c, &lib, &name, &rebuild).await;
                 return Err(e.context(format!("File {name} in library {shown} was not changed.")));
             }
             Box::pin(self.run(&format!("DLTF FILE({lib}/{aside})"))).await?;
+            build_again(self, &mut c, &lib, &name, &rebuild).await?;
             msgs.push(format!(
                 "File {name} in library {shown} changed from source member {mbr}: {records} record(s) kept."
             ));

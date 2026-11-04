@@ -25548,3 +25548,188 @@ async fn job_schedule_entries() {
     );
     assert!(e.starts_with("CPF1628"), "{e}");
 }
+
+// DSPFD TYPE(*MBR) of an SQL table keyed by its primary key, with a
+// deleted record, then after RGZPFM. Expected lines: PUB400 (IBM i 7.5)
+// 2026-11-03, tools/golden/verify40.txt i40_mbr1 (3 records, 1 deleted,
+// key field 1 with 3 values, the constraint Q_lib_file_K_00001) and
+// i40_mbr2 (0 deleted after RGZPFM).
+#[tokio::test]
+async fn dspfd_member_description() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    for c in [
+        format!("RUNSQL SQL('CREATE TABLE {lib}/GLD40T (K DECIMAL(5, 0) NOT NULL PRIMARY KEY, NAME CHAR(10) NOT NULL)') COMMIT(*NONE)"),
+        format!("RUNSQL SQL('INSERT INTO {lib}/GLD40T VALUES(3, ''three''), (1, ''one''), (2, ''two''), (5, ''five'')') COMMIT(*NONE)"),
+        format!("RUNSQL SQL('DELETE FROM {lib}/GLD40T WHERE K = 1') COMMIT(*NONE)"),
+    ] {
+        job.run(&c).await.unwrap();
+    }
+    async fn report(job: &mut Job<'_>, lib: &str) -> Vec<String> {
+        match job
+            .run(&format!("DSPFD FILE({lib}/GLD40T) TYPE(*MBR)"))
+            .await
+            .unwrap()
+        {
+            Outcome::Display(d) => d.print,
+            other => panic!("{other:?}"),
+        }
+    }
+    let r = report(&mut job, &lib).await;
+    for want in [
+        "   Member  . . . . . . . . . . . . . . . . . . : MBR        GLD40T".to_string(),
+        "     Member size . . . . . . . . . . . . . . . : SIZE       *NOMAX".into(),
+        "     Current number of records . . . . . . . . :                     3".into(),
+        "     Number of deleted records . . . . . . . . :                     1".into(),
+        "       Number of access path entries . . . . . :                     3".into(),
+        "         Key field 1 . . . . . . . . . . . . . :                          3".into(),
+        format!(
+            "       Constraint  . . . . . . . . . . . . . . : CST        Q_{lib}_GLD40T_K_00001"
+        ),
+    ] {
+        assert!(r.contains(&want), "missing {want:?} in {r:#?}");
+    }
+    job.run(&format!("RGZPFM FILE({lib}/GLD40T)"))
+        .await
+        .unwrap();
+    let r = report(&mut job, &lib).await;
+    assert!(
+        r.contains(
+            &"     Number of deleted records . . . . . . . . :                     0".to_string()
+        ),
+        "{r:#?}"
+    );
+}
+
+// CHGPF SRCFILE of a file with a logical file over it (IBM i CL
+// reference, CHGPF, SRCFILE: the file's dependent logical files are kept
+// over the changed file; the change is refused when a logical file uses
+// a field the new description no longer has, and the file is left as
+// it was).
+#[tokio::test]
+async fn change_a_physical_file_with_a_logical_file_over_it() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source::{put_member, Member};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    job.run(&format!("CRTSRCPF FILE({lib}/QDDSSRC)"))
+        .await
+        .unwrap();
+    let put = |name: &str, src: &str| Member {
+        library: lib.clone(),
+        file: "QDDSSRC".into(),
+        name: name.into(),
+        srctype: "PF".into(),
+        source: src.into(),
+        ..Default::default()
+    };
+    let old = "     A          R CHGLR\n     A            K1             5P 0\n     A            NAME          10A\n     A          K K1\n";
+    put_member(&client, &put("CHGLP", old), true).await.unwrap();
+    let lf = "     A          R CHGLR                     PFILE(CHGLP)\n     A          K NAME\n";
+    put_member(&client, &put("CHGLL", lf), true).await.unwrap();
+    job.run(&format!("CRTPF FILE({lib}/CHGLP) SRCFILE({lib}/QDDSSRC)"))
+        .await
+        .unwrap();
+    job.run(&format!(
+        "CRTLF FILE({lib}/CHGLL) SRCFILE({lib}/QDDSSRC) TEXT('by name')"
+    ))
+    .await
+    .unwrap();
+    let t = format!("{}.chglp", catalog::ident(&lib));
+    client
+        .execute(
+            &format!("INSERT INTO {t} (k1, name) VALUES (1, 'zed'), (2, 'amy')"),
+            &[],
+        )
+        .await
+        .unwrap();
+    // A field added: the logical file is still there, over the new file.
+    let new = "     A          R CHGLR\n     A            K1             5P 0\n     A            NAME          10A\n     A            CITY          10A\n     A          K K1\n";
+    put_member(&client, &put("CHGLP", new), true).await.unwrap();
+    job.run(&format!("CHGPF FILE({lib}/CHGLP) SRCFILE({lib}/QDDSSRC)"))
+        .await
+        .unwrap();
+    let lfrow = client
+        .query_one(
+            "SELECT pf_name FROM as4tainr.logical_files WHERE library=$1 AND name='CHGLL'",
+            &[&lib],
+        )
+        .await
+        .unwrap();
+    assert_eq!(lfrow.get::<_, String>(0), "CHGLP");
+    let objs = catalog::list_objects(&client, &lib).await.unwrap();
+    let l = objs.iter().find(|o| o.name == "CHGLL").unwrap();
+    assert_eq!(l.text, "by name");
+    // The logical file reads the records in its key order.
+    let r = job
+        .run(&format!(
+            "CPYF FROMFILE({lib}/CHGLL) TOFILE({lib}/CHGLC) CRTFILE(*YES)"
+        ))
+        .await;
+    assert!(r.is_ok(), "{r:?}");
+    let names: Vec<String> = client
+        .query(
+            &format!(
+                "SELECT rtrim(name) FROM {}.chglc ORDER BY rrn",
+                catalog::ident(&lib)
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(names, ["amy", "zed"]);
+    // NAME removed: the logical file's key needs it, so nothing changes.
+    let bad = "     A          R CHGLR\n     A            K1             5P 0\n     A            CITY          10A\n     A          K K1\n";
+    put_member(&client, &put("CHGLP", bad), true).await.unwrap();
+    let e = job
+        .run(&format!("CHGPF FILE({lib}/CHGLP) SRCFILE({lib}/QDDSSRC)"))
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("CHGLL"), "{e:#}");
+    let still = client
+        .query_opt(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'chglp' AND column_name = 'name'",
+            &[&lib.to_ascii_lowercase()],
+        )
+        .await
+        .unwrap();
+    assert!(still.is_some());
+    assert!(client
+        .query_opt(
+            "SELECT 1 FROM as4tainr.logical_files WHERE library=$1 AND name='CHGLL'",
+            &[&lib],
+        )
+        .await
+        .unwrap()
+        .is_some());
+}

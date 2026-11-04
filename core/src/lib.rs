@@ -53,6 +53,7 @@ pub mod jobq;
 pub mod jobs;
 pub mod jobscde;
 pub mod journal;
+pub mod mbrdesc;
 pub mod menus;
 pub mod msgf;
 pub mod objdesc;

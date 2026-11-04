@@ -2624,6 +2624,15 @@ pub static COMMANDS: &[CommandDef] = &[
             // The DDS listing's *NOSRC and *NOLIST (ddslist.rs).
             p("OPTION", Kind::List, false, Some("*SRC *LIST"), "Source listing options")
                 .keyword_only(),
+            // TEXT as CRTPF's (CL reference, CRTLF TEXT).
+            p(
+                "TEXT",
+                Kind::Text,
+                false,
+                Some("*SRCMBRTXT"),
+                "Text 'description'",
+            )
+            .keyword_only(),
         ],
     },
     CommandDef {

@@ -113,6 +113,12 @@ CREATE TABLE IF NOT EXISTS as4tainr.logical_files (
 -- (other sessions may be using the catalog).
 DO $$
 BEGIN
+  -- A logical file's DDS as CRTLF compiled it (CHGPF builds the logical
+  -- files over a changed physical file again from it).
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='logical_files' AND column_name='dds') THEN
+    ALTER TABLE as4tainr.logical_files ADD COLUMN IF NOT EXISTS dds text NOT NULL DEFAULT '';
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns
                  WHERE table_schema='as4tainr' AND table_name='file_keys' AND column_name='descending') THEN
     ALTER TABLE as4tainr.file_keys ADD COLUMN descending boolean NOT NULL DEFAULT false;

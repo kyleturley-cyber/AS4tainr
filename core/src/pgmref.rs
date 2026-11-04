@@ -76,6 +76,53 @@ pub fn cl_references(source: &str, ile: bool) -> Result<Vec<Reference>> {
     Ok(out)
 }
 
+/// DSPPGMREF OUTPUT(*OUTFILE): a record per referenced object in
+/// QADSPPGM's format (n45_ffdpgm: the program, its text, the number of
+/// objects, the retrieval date and time as century, date and time, the
+/// object, its library and type). The one-letter object type and the
+/// file usage follow the model's field descriptions as as4tainr reads
+/// them (F file, P program, S service program; usage 1 for a file read);
+/// record format counts and level identifiers are not kept (zero and
+/// blank). Values not captured from IBM i (docs/fidelity-gaps.md).
+pub fn records(
+    pgm: &str,
+    lib: &str,
+    text: &str,
+    refs: &[Reference],
+    now: &str,
+    system: &str,
+) -> Vec<crate::outfile::Record> {
+    refs.iter()
+        .map(|(n, l, t)| {
+            let letter = match t.as_str() {
+                "*FILE" => "F",
+                "*SRVPGM" => "S",
+                _ => "P",
+            };
+            vec![
+                ("WHLIB", lib.to_string()),
+                ("WHPNAM", pgm.to_string()),
+                ("WHTEXT", text.to_string()),
+                ("WHFNUM", refs.len().to_string()),
+                ("WHDTTM", now.to_string()),
+                ("WHFNAM", n.clone()),
+                ("WHLNAM", l.clone()),
+                ("WHSNAM", String::new()),
+                ("WHRFNO", "0".into()),
+                ("WHFUSG", if t == "*FILE" { "1" } else { "0" }.into()),
+                ("WHRFNM", String::new()),
+                ("WHRFSN", String::new()),
+                ("WHRFFN", "0".into()),
+                ("WHOBJT", letter.into()),
+                ("WHOTYP", t.clone()),
+                ("WHSYSN", system.to_string()),
+                ("WHSPKG", "P".into()),
+                ("WHRFNB", "0".into()),
+            ]
+        })
+        .collect()
+}
+
 /// The objects an RPG program's source names: files and called programs.
 pub fn rpg_references(source: &str) -> Vec<Reference> {
     let mut out = Vec::new();
@@ -198,9 +245,6 @@ impl Job<'_> {
                 format!("CPF3033: There is no program {n} in library {l}.")
             })
             .await?;
-        if cmd.get("OUTPUT").eq_ignore_ascii_case("*OUTFILE") {
-            bail!("DSPPGMREF OUTPUT(*OUTFILE) is not available here: use OUTPUT(*PRINT).");
-        }
         let refs = match p.attribute.as_str() {
             "CLLE" => cl_references(&p.source, true)?,
             "CLP" => cl_references(&p.source, false)?,
@@ -216,6 +260,37 @@ impl Job<'_> {
             .await?
             .map(|r| r.get(0))
             .unwrap_or_default();
+        if cmd.get("OUTPUT").eq_ignore_ascii_case("*OUTFILE") {
+            let outfile = cmd.get("OUTFILE").trim().to_string();
+            if outfile.is_empty() {
+                bail!(
+                    "CPD9861: OUTPUT(*OUTFILE) was given without OUTFILE, the file to receive the records.\n{}",
+                    crate::cl::CPF0006
+                );
+            }
+            let option = cmd
+                .list("OUTMBR")
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "*REPLACE".into());
+            let now: String = self
+                .client
+                .query_one(
+                    "SELECT CASE WHEN t < '2000-01-01' THEN '0' ELSE '1' END || to_char(t, 'YYMMDDHH24MISS')
+                       FROM (SELECT now() AT TIME ZONE 'UTC' AS t) x",
+                    &[],
+                )
+                .await?
+                .get(0);
+            let system: String = crate::report::system_name().chars().take(8).collect();
+            let recs = records(&p.name, &lib, &text, &refs, &now, &system);
+            let w =
+                crate::outfile::write(self, &outfile, &option, &crate::outfile::QADSPPGM, &recs)
+                    .await?;
+            let mut messages = w.messages.clone();
+            messages.push(crate::outfile::records_added(&w, recs.len()));
+            return Ok(Outcome::Messages(messages));
+        }
         let print = report(&p.name, &lib, &text, &refs, &crate::report::Stamp::now());
         let fmt = |n: &str, l: &str, t: &str| format!("{n:<10}  {l:<10}  {t}");
         Ok(Outcome::Display(ListDisplay {

@@ -25259,6 +25259,16 @@ async fn job_queues_authorization_lists_and_program_references() {
     );
     let ids: Vec<&str> = m.lines().map(|l| &l[..7]).collect();
     assert_eq!(ids, ["CPI2211", "CPC2208"], "{m}");
+    // The list again: CPF2278 (verify45 n45_crtautl2); the user again:
+    // CPD2272 then CPF2282 (n45_addautle2).
+    let e = err(job.run(&format!("CRTAUTL AUTL({al})")).await.unwrap_err());
+    assert!(e.starts_with("CPF2278"), "{e}");
+    let e = err(job
+        .run(&format!("ADDAUTLE AUTL({al}) USER(QUSER) AUT(*USE)"))
+        .await
+        .unwrap_err());
+    let ids: Vec<&str> = e.lines().map(|l| &l[..7]).collect();
+    assert_eq!(ids, ["CPD2272", "CPF2282"], "{e}");
     let Outcome::Display(d) = job.run(&format!("DSPAUTL AUTL({al})")).await.unwrap() else {
         panic!()
     };
@@ -25346,6 +25356,40 @@ async fn job_queues_authorization_lists_and_program_references() {
         .map(|r| r.split_whitespace().next().unwrap())
         .collect();
     assert_eq!(objs, ["QCMDEXC", "QLECWI", "QCLSRV", "QLEAWI"]);
+    // OUTPUT(*OUTFILE): a record per object in QADSPPGM's format
+    // (verify45 n45_ffdpgm: QWHDRPPR, 179 bytes); CPF9861/CPF9862 when
+    // the file is made, then CPF3030, as the other outfiles.
+    let m = msgs(
+        job.run(&format!(
+            "DSPPGMREF PGM({lib}/P44) OUTPUT(*OUTFILE) OUTFILE({lib}/R44)"
+        ))
+        .await
+        .unwrap(),
+    );
+    assert!(m.contains("CPF3030"), "{m}");
+    let rows: Vec<(String, String, String)> = client
+        .query(
+            &format!(
+                "SELECT rtrim(whfnam), rtrim(whlnam), rtrim(whotyp) FROM {}.r44 ORDER BY rrn",
+                catalog::ident(&lib)
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    // The same objects as the printed report (checked against m44_pgmref).
+    let printed: Vec<(String, String, String)> = d
+        .rows
+        .iter()
+        .map(|r| {
+            let w: Vec<&str> = r.split_whitespace().collect();
+            (w[0].into(), w[1].into(), w[2].into())
+        })
+        .collect();
+    assert_eq!(rows, printed);
     let e = err(job
         .run(&format!("DSPPGMREF PGM({lib}/NOSUCHPGM)"))
         .await

@@ -312,6 +312,36 @@ const QWHDRFFD: &[Field] = &[
 ];
 
 /// DSPDBR OUTPUT(*OUTFILE). (PUB400 2026-10-26, verify2 m_dbr: 16 fields, 372 bytes.)
+/// DSPPGMREF's model (PUB400 2026-11-04, verify45 n45_ffdpgm: format
+/// QWHDRPPR, 18 fields, 179 bytes).
+pub const QADSPPGM: Model = Model {
+    file: "QADSPPGM",
+    format: "QWHDRPPR",
+    text: "Model output file for DSPPGMREF",
+    fields: QWHDRPPR,
+};
+
+const QWHDRPPR: &[Field] = &[
+    ("WHLIB", 'A', 10, 0),
+    ("WHPNAM", 'A', 10, 0),
+    ("WHTEXT", 'A', 50, 0),
+    ("WHFNUM", 'S', 5, 0),
+    ("WHDTTM", 'A', 13, 0),
+    ("WHFNAM", 'A', 11, 0),
+    ("WHLNAM", 'A', 11, 0),
+    ("WHSNAM", 'A', 11, 0),
+    ("WHRFNO", 'S', 3, 0),
+    ("WHFUSG", 'S', 2, 0),
+    ("WHRFNM", 'A', 10, 0),
+    ("WHRFSN", 'A', 13, 0),
+    ("WHRFFN", 'S', 5, 0),
+    ("WHOBJT", 'A', 1, 0),
+    ("WHOTYP", 'A', 10, 0),
+    ("WHSYSN", 'A', 8, 0),
+    ("WHSPKG", 'A', 1, 0),
+    ("WHRFNB", 'S', 5, 0),
+];
+
 pub const QADSPDBR: Model = Model {
     file: "QADSPDBR",
     format: "QWHDRDBR",
@@ -812,7 +842,7 @@ fn description(m: &Model, name: &str) -> Result<crate::dds::PhysicalFile> {
 pub async fn init(client: &Client) -> Result<()> {
     for m in [
         &QADSPOBJ, &QAFDMBRL, &QADSPFFD, &QADSPDBR, &QAFDBASI, &QAFDMBR, &QAFDPHY, &QAFDACCP,
-        &QAFDRFMT,
+        &QAFDRFMT, &QADSPPGM,
     ] {
         let there = client
             .query_opt(

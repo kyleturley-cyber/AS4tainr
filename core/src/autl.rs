@@ -169,7 +169,8 @@ impl Job<'_> {
             )
             .await?;
         if n == 0 {
-            bail!("Authorization list {name} already exists.");
+            // CPF2278 (PUB400 2026-11-04, verify45 n45_crtautl2).
+            bail!("CPF2278: CRTAUTL found an authorization list named {name} in place already.");
         }
         authority::set_owner(self.client, LIB, &name, TYPE, &self.user).await?;
         authority::grant(self.client, LIB, &name, TYPE, "*PUBLIC", public).await?;
@@ -228,7 +229,11 @@ impl Job<'_> {
                 bail!("User {u} is not on authorization list {name}.");
             }
             if !change && on {
-                bail!("User {u} is already on authorization list {name}.");
+                // CPD2272 then CPF2282 with the counts (PUB400
+                // 2026-11-04, verify45 n45_addautle2).
+                bail!(
+                    "CPD2272: {u} has an entry on authorization list {name} already.\nCPF2282: ADDAUTLE: users not added 1; authorization lists done 1."
+                );
             }
             authority::grant(self.client, LIB, &name, TYPE, &u, aut).await?;
             if !change {

@@ -85,10 +85,7 @@ impl Job<'_> {
         }
         // A data physical file's member: IBM i 7.5's printed Member
         // Description (verify40 i40_mbr1).
-        if ty == "*MBR"
-            && attr == "PF"
-            && !crate::source::is_source_file(self.client, &lib, &name).await?
-        {
+        if ty == "*MBR" && matches!(attr.as_str(), "PF" | "LF" | "PF-SRC") {
             return self.dspfd_mbr(&lib, &name, &attr).await;
         }
         // A data physical file's attributes: the printed report.
@@ -343,7 +340,52 @@ impl Job<'_> {
                     .unwrap_or(f.records),
             );
         }
+        // The members: a data file's one, named like the file; a source
+        // file's each with its lines, type and dates.
+        let members = if f.source {
+            let mut out = Vec::new();
+            for r in self
+                .client
+                .query(
+                    "SELECT member, text, srctype,
+                            (length(source) - length(replace(source, chr(10), '')))::bigint
+                              + CASE WHEN source <> '' AND right(source, 1) <> chr(10) THEN 1 ELSE 0 END,
+                            CASE WHEN added < '2000-01-01' THEN '0' ELSE '1' END,
+                            to_char(added AT TIME ZONE 'UTC', 'YYMMDD'),
+                            to_char(added AT TIME ZONE 'UTC', 'HH24MISS'),
+                            CASE WHEN changed < '2000-01-01' THEN '0' ELSE '1' END,
+                            to_char(changed AT TIME ZONE 'UTC', 'YYMMDD'),
+                            to_char(changed AT TIME ZONE 'UTC', 'HH24MISS')
+                       FROM as4tainr.source_members
+                      WHERE library=$1 AND file=$2 ORDER BY added, member",
+                    &[&lib, &name],
+                )
+                .await?
+            {
+                out.push(crate::mbrdesc::Member {
+                    name: r.get(0),
+                    text: r.get(1),
+                    srctype: Some(r.get(2)),
+                    records: r.get(3),
+                    deleted: 0,
+                    created: (r.get(4), r.get(5), r.get(6)),
+                    changed: (r.get(7), r.get(8), r.get(9)),
+                });
+            }
+            out
+        } else {
+            vec![crate::mbrdesc::Member {
+                name: f.name.clone(),
+                text: f.text.clone(),
+                created: f.created.clone(),
+                changed: f.changed.clone(),
+                records: f.records,
+                deleted: f.deleted,
+                srctype: None,
+            }]
+        };
         let x = crate::mbrdesc::MemberExtra {
+            members,
             partial_keys,
             constraints: cons
                 .iter()

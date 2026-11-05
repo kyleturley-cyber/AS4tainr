@@ -26277,3 +26277,89 @@ async fn copy_from_stream_file_cuts_long_lines() {
         .to_string();
     assert_eq!(as4tainr_core::jobs::escape_id(&e), "CPF0820", "{e}");
 }
+
+// An RPG program's open for update holds *SHRRD on the file and *SHRUPD
+// on the member's data (PUB400 2026-11-05, tools/golden/verify52.txt
+// u52_open): another job's ALCOBJ *SHRUPD is allocated, *SHRNUP gets
+// CPF1002, and CLRPFM waits the job's default wait time, then CPF3156.
+#[tokio::test]
+async fn update_opens_keep_out_shrnup_and_clrpfm() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let other = runtime::connect_db(&url).await.unwrap();
+    runtime::job_session(
+        &other,
+        Some(&format!("000082/QSECOFR/U{}", &lib[1..])),
+        std::time::Duration::from_millis(500),
+    )
+    .await
+    .unwrap();
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mk = |c| Job {
+        client: c,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let mut a = mk(&client);
+    let mut b = mk(&other);
+    for c in [
+        format!("RUNSQL SQL('CREATE TABLE {lib}/UPDF (K INTEGER NOT NULL)') COMMIT(*NONE)"),
+        format!("RUNSQL SQL('INSERT INTO {lib}/UPDF VALUES(1), (2)') COMMIT(*NONE)"),
+    ] {
+        a.run(&c).await.unwrap();
+    }
+    let src = "**FREE\ndcl-f UPDF usage(*update) rename(UPDF:UPDR);\ndcl-pr qcmdexc extpgm('QCMDEXC');\n  cmd char(32) const;\n  len packed(15: 5) const;\nend-pr;\nread UPDR;\nqcmdexc('DLYJOB DLY(6)': 14);\n*inlr = *on;\n";
+    let path = format!("/tmp/{}upd.rpgle", lib.to_ascii_lowercase());
+    as4tainr_core::ifs::write_file(&client, &path, src.as_bytes(), 819, 0o644, "QSECOFR")
+        .await
+        .unwrap();
+    a.run(&format!("CRTBNDRPG PGM({lib}/UPDP) SRCSTMF('{path}')"))
+        .await
+        .unwrap();
+    b.run("CHGJOB DFTWAIT(1)").await.unwrap();
+    let call = format!("CALL PGM({lib}/UPDP)");
+    let key = format!("{lib}/UPDF *FILE");
+    let (ra, (upd, nup, clr)) = tokio::join!(a.run(&call), async {
+        for _ in 0..300 {
+            let open = other
+                .query_opt(
+                    "SELECT 1 FROM as4tainr.object_locks WHERE key = $1 AND kind = 'OPENUPD'",
+                    &[&key],
+                )
+                .await
+                .unwrap()
+                .is_some();
+            if open {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let upd = b
+            .run(&format!("ALCOBJ OBJ(({lib}/UPDF *FILE *SHRUPD)) WAIT(0)"))
+            .await;
+        if upd.is_ok() {
+            b.run(&format!("DLCOBJ OBJ(({lib}/UPDF *FILE *SHRUPD))"))
+                .await
+                .unwrap();
+        }
+        let nup = b
+            .run(&format!("ALCOBJ OBJ(({lib}/UPDF *FILE *SHRNUP)) WAIT(0)"))
+            .await;
+        let clr = b.run(&format!("CLRPFM FILE({lib}/UPDF)")).await;
+        (upd, nup, clr)
+    });
+    assert!(ra.is_ok(), "{ra:?}");
+    assert!(upd.is_ok(), "{upd:?}");
+    let e = nup.unwrap_err().to_string();
+    assert!(e.starts_with("CPF1002"), "{e}");
+    let e = clr.unwrap_err().to_string();
+    assert!(e.starts_with("CPF3156"), "{e}");
+}

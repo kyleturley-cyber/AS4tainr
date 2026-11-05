@@ -5614,9 +5614,19 @@ impl Job<'_> {
             Aut::Change,
         )
         .await?;
-        // Another job's lock on the file (an open, ALCOBJ) keeps CLRPFM
-        // out: CPF3130 (PUB400 2026-11-05, tools/golden/verify50.txt
-        // s50_open: a CL program in another job had the file open).
+        // CLRPFM takes *EXCLRD on the member's data: another job's open
+        // for update (*SHRUPD) keeps it out for the job's default wait
+        // time, then CPF3156 (PUB400 2026-11-05, tools/golden/verify52.txt
+        // u52_open: waited over 20 seconds). Any other lock (an open for
+        // input, ALCOBJ) then keeps out the clearing itself: CPF3130
+        // (verify50 s50_open: a CL program in another job had the file
+        // open for input).
+        if self.file_kept_out(&fr.library, &name, "*EXCLRD").await? {
+            bail!(
+                "CPF3156: File {name} in library {} is in use by another job; it was not cleared.",
+                crate::qtemp::logical(&fr.library)
+            );
+        }
         let owner = self.lock_owner().await?;
         let t = crate::objlock::Target {
             library: fr.library.clone(),
@@ -8416,6 +8426,17 @@ impl Job<'_> {
     /// CPF3202 (PUB400 2026-11-05, tools/golden/verify51.txt t51_open:
     /// both waited more than 20 seconds for a file another job had open).
     pub(crate) async fn file_in_use(&self, library: &str, name: &str) -> Result<bool> {
+        self.file_kept_out(library, name, "*EXCL").await
+    }
+
+    /// Does another job's lock on the file keep out `state` for longer
+    /// than the job's default wait time?
+    pub(crate) async fn file_kept_out(
+        &self,
+        library: &str,
+        name: &str,
+        state: &str,
+    ) -> Result<bool> {
         let owner = self.lock_owner().await?;
         let t = crate::objlock::Target {
             library: library.to_string(),
@@ -8429,7 +8450,7 @@ impl Job<'_> {
         };
         let start = std::time::Instant::now();
         loop {
-            if !crate::objlock::kept_out(self.client, &t, "*EXCL", &owner).await? {
+            if !crate::objlock::kept_out(self.client, &t, state, &owner).await? {
                 return Ok(false);
             }
             if start.elapsed() >= std::time::Duration::from_secs(wait) {

@@ -158,8 +158,8 @@ pub async fn open_file(
         record(client, &t, "*SHRRD", owner, OPEN_READ).await?;
         return Ok(true);
     }
-    // An open for update takes *SHRUPD and waits for conflicting locks
-    // (not captured: the lock state table's *SHRUPD).
+    // An open for update takes *SHRUPD (its member data lock, verify52
+    // u52_open) and waits for conflicting locks.
     take(client, &t, "*SHRUPD", Some(wait), owner, false, OPEN_UPDATE).await
 }
 
@@ -309,7 +309,17 @@ pub async fn held(client: &Client, t: &Target) -> Result<Vec<Held>> {
         .iter()
         .map(|r| Held {
             job: r.get(0),
-            state: r.get(1),
+            // An open for update holds *SHRRD on the file and *SHRUPD on
+            // the member's data (PUB400 2026-11-05,
+            // tools/golden/verify52.txt u52_open); it is recorded as
+            // *SHRUPD, which keeps out what the member lock does
+            // (another job's ALCOBJ *SHRNUP and *EXCLRD got CPF1002,
+            // *SHRRD and *SHRUPD were allocated).
+            state: if r.get::<_, String>(2) == OPEN_UPDATE {
+                "*SHRRD".into()
+            } else {
+                r.get(1)
+            },
             open: match r.get::<_, String>(2).as_str() {
                 OPEN_READ => Some("*SHRRD".into()),
                 OPEN_UPDATE => Some("*SHRUPD".into()),

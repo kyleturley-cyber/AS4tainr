@@ -24361,14 +24361,19 @@ async fn allocate_objects_between_jobs() {
     a.run("ALCOBJ OBJ((LCK *DTAARA *EXCL)) WAIT(0)")
         .await
         .unwrap();
-    // Another job's CHGDTAARA of the data area a holds *EXCL: CPF1063
-    // (PUB400 2026-11-05, verify49 r49_dtaara); a's own change goes.
+    // Another job's CHGDTAARA of the data area a holds *EXCL waits the
+    // job's default wait time (1 second here), then CPF1063 (PUB400
+    // 2026-11-05, verify49 r49_dtaara, verify53 v53_held: it waited over
+    // 20 seconds there); a's own change goes.
+    b.run("CHGJOB DFTWAIT(1)").await.unwrap();
+    let t = std::time::Instant::now();
     let e = b
         .run("CHGDTAARA DTAARA(LCK) VALUE('x')")
         .await
         .unwrap_err()
         .to_string();
     assert!(e.starts_with("CPF1063"), "{e}");
+    assert!(t.elapsed() >= std::time::Duration::from_secs(1));
     a.run("CHGDTAARA DTAARA(LCK) VALUE('y')").await.unwrap();
     // A lock not held: passed by without a message (PUB400, verify39
     // h39_dlcnot; this expected one message before the capture).

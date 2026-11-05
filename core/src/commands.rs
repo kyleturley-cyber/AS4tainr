@@ -8437,12 +8437,22 @@ impl Job<'_> {
         name: &str,
         state: &str,
     ) -> Result<bool> {
-        let owner = self.lock_owner().await?;
         let t = crate::objlock::Target {
             library: library.to_string(),
             name: name.to_string(),
             objtype: "*FILE".into(),
         };
+        self.kept_out_waiting(&t, state).await
+    }
+
+    /// Does another job's lock on the object keep out `state` for longer
+    /// than the job's default wait time?
+    pub(crate) async fn kept_out_waiting(
+        &self,
+        t: &crate::objlock::Target,
+        state: &str,
+    ) -> Result<bool> {
+        let owner = self.lock_owner().await?;
         let wait = match crate::jobattr::get(&self.job_key(), "DFTWAIT").as_deref() {
             Some("*NOMAX") => u64::MAX / 4,
             Some(n) => n.trim().parse::<u64>().unwrap_or(30),
@@ -8450,7 +8460,7 @@ impl Job<'_> {
         };
         let start = std::time::Instant::now();
         loop {
-            if !crate::objlock::kept_out(self.client, &t, state, &owner).await? {
+            if !crate::objlock::kept_out(self.client, t, state, &owner).await? {
                 return Ok(false);
             }
             if start.elapsed() >= std::time::Duration::from_secs(wait) {
@@ -10179,16 +10189,17 @@ impl Job<'_> {
         )
         .await?;
         // Another job holding the data area *EXCL keeps the change out:
-        // CPF1063 (PUB400 2026-11-05, tools/golden/verify49.txt r49_dtaara:
-        // a background job's ALCOBJ *EXCL). The change needs *SHRUPD (the
-        // lock state table; only *EXCL was captured).
+        // it waits the job's default wait time, then CPF1063 (PUB400
+        // 2026-11-05, tools/golden/verify49.txt r49_dtaara, verify53.txt
+        // v53_held: waited over 20 seconds; a background job's ALCOBJ
+        // *EXCL). The change needs *SHRUPD (the lock state table; only
+        // *EXCL was captured).
         let t = crate::objlock::Target {
             library: found.library.clone(),
             name: found.name.clone(),
             objtype: "*DTAARA".into(),
         };
-        let owner = self.lock_owner().await?;
-        if crate::objlock::kept_out(self.client, &t, "*SHRUPD", &owner).await? {
+        if self.kept_out_waiting(&t, "*SHRUPD").await? {
             bail!(
                 "CPF1063: Data area {} in library {} is locked by another job; it was not changed.",
                 found.name,

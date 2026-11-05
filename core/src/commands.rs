@@ -5608,6 +5608,24 @@ impl Job<'_> {
             Aut::Change,
         )
         .await?;
+        // Another job's lock on the file (an open, ALCOBJ) keeps CLRPFM
+        // out: CPF3130 (PUB400 2026-11-05, tools/golden/verify50.txt
+        // s50_open: a CL program in another job had the file open).
+        let owner = self.lock_owner().await?;
+        let t = crate::objlock::Target {
+            library: fr.library.clone(),
+            name: name.clone(),
+            objtype: "*FILE".into(),
+        };
+        if crate::objlock::kept_out(self.client, &t, "*EXCL", &owner).await? {
+            let mbr = match cmd.get("MBR") {
+                "*FIRST" | "*LAST" | "" => name.clone(),
+                m => m.to_ascii_uppercase(),
+            };
+            bail!(
+                "CPF3130: Member {mbr} of file {name} is being used by another job; it was not cleared."
+            );
+        }
         self.client
             .batch_execute(&format!(
                 "TRUNCATE TABLE {}.{} RESTART IDENTITY",
@@ -8460,7 +8478,31 @@ impl Job<'_> {
             rows.push("(No job holds a lock on this object.)".into());
         }
         let n = rows.len();
-        let print = crate::objlock::print(&target, &library, &locks, &crate::report::Stamp::now());
+        let member_type = if target.objtype == "*FILE" {
+            let lf = self
+                .client
+                .query_opt(
+                    "SELECT 1 FROM as4tainr.logical_files WHERE library=$1 AND name=$2",
+                    &[&target.library, &target.name],
+                )
+                .await?
+                .is_some();
+            Some(if lf { "LGL" } else { "PHY" })
+        } else {
+            None
+        };
+        let shown_type = match member_type {
+            Some(m) => format!("*FILE-{m}"),
+            None => target.objtype.clone(),
+        };
+        let print = crate::objlock::print(
+            &target,
+            &library,
+            &shown_type,
+            member_type,
+            &locks,
+            &crate::report::Stamp::now(),
+        );
         Ok(Outcome::Display(ListDisplay {
             title: "Work with Object Locks".into(),
             info: vec![

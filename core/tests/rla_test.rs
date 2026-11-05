@@ -26169,7 +26169,8 @@ async fn cl_declared_files_hold_shared_read_locks() {
     let alc = format!("ALCOBJ OBJ(({lib}/CLKF *FILE *EXCL)) WAIT(0)");
     let dlc = format!("DLCOBJ OBJ(({lib}/CLKF *FILE *EXCL))");
     let key = format!("{lib}/CLKF *FILE");
-    let (ra, (rb1, rb2)) = tokio::join!(a.run(&call), async {
+    let clr = format!("CLRPFM FILE({lib}/CLKF)");
+    let (ra, (rb1, rb2, rc1, rc2)) = tokio::join!(a.run(&call), async {
         // While the file is open (its *SHRRD recorded): refused.
         for _ in 0..300 {
             let open = other
@@ -26186,6 +26187,9 @@ async fn cl_declared_files_hold_shared_read_locks() {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         let r1 = b.run(&alc).await;
+        // CLRPFM of the open file: CPF3130 (PUB400 2026-11-05,
+        // tools/golden/verify50.txt s50_open).
+        let c1 = b.run(&clr).await;
         // After CLOSE (3 s after the open; the program goes on 6 s more):
         // allocated.
         tokio::time::sleep(std::time::Duration::from_millis(4500)).await;
@@ -26193,12 +26197,17 @@ async fn cl_declared_files_hold_shared_read_locks() {
         if r2.is_ok() {
             let _ = b.run(&dlc).await;
         }
-        (r1, r2)
+        // Closed and nothing allocated: cleared.
+        let c2 = b.run(&clr).await;
+        (r1, r2, c1, c2)
     });
     assert!(ra.is_ok(), "{ra:?}");
     let e = rb1.unwrap_err().to_string();
     assert!(e.starts_with("CPF1002"), "{e}");
     assert!(rb2.is_ok(), "{rb2:?}");
+    let e = rc1.unwrap_err().to_string();
+    assert!(e.starts_with("CPF3130"), "{e}");
+    assert!(rc2.is_ok(), "{rc2:?}");
 }
 
 // CPYFRMSTMF of lines longer than the source file's records: the lines

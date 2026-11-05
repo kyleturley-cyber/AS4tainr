@@ -111,14 +111,14 @@ pub async fn kept_out(client: &Client, t: &Target, state: &str, owner: &str) -> 
 
 /// Record an allocation (before checking for conflicts, so two jobs
 /// asking at once see each other).
-async fn record(client: &Client, t: &Target, state: &str, owner: &str) -> Result<i64> {
+async fn record(client: &Client, t: &Target, state: &str, owner: &str, kind: &str) -> Result<i64> {
     Ok(client
         .query_one(
             &format!(
-                "INSERT INTO as4tainr.object_locks (pid, started, key, state, owner)
-                 SELECT pid, backend_start, $1, $2, $3 FROM {ME} m RETURNING seq"
+                "INSERT INTO as4tainr.object_locks (pid, started, key, state, owner, kind)
+                 SELECT pid, backend_start, $1, $2, $3, $4 FROM {ME} m RETURNING seq"
             ),
-            &[&t.key(), &state, &owner],
+            &[&t.key(), &state, &owner, &kind],
         )
         .await?
         .get(0))
@@ -155,13 +155,18 @@ pub async fn open_file(
         // succeeded, while a third job's ALCOBJ *SHRRD got CPF1002). Its
         // *SHRRD is recorded, so other jobs' ALCOBJ see it.
         take_shared(client, &t, "*SHRRD").await?;
-        record(client, &t, "*SHRRD", owner).await?;
+        record(client, &t, "*SHRRD", owner, OPEN_READ).await?;
         return Ok(true);
     }
     // An open for update takes *SHRUPD and waits for conflicting locks
     // (not captured: the lock state table's *SHRUPD).
-    take(client, &t, "*SHRUPD", Some(wait), owner, false).await
+    take(client, &t, "*SHRUPD", Some(wait), owner, false, OPEN_UPDATE).await
 }
+
+/// What a recorded lock is besides an allocation: an open for input or
+/// for update (its member locks are listed by WRKOBJLCK).
+const OPEN_READ: &str = "OPEN";
+const OPEN_UPDATE: &str = "OPENUPD";
 
 /// Take a lock: the session's shared advisory lock (it goes with the
 /// session) and its recorded allocation; given back when another job's
@@ -174,6 +179,7 @@ async fn take(
     wait: Option<Duration>,
     owner: &str,
     sweep: bool,
+    kind: &str,
 ) -> Result<bool> {
     if sweep {
         client
@@ -187,7 +193,7 @@ async fn take(
     let start = Instant::now();
     loop {
         take_shared(client, t, state).await?;
-        let seq = record(client, t, state, owner).await?;
+        let seq = record(client, t, state, owner, kind).await?;
         if !conflicting(client, t, state, owner).await? {
             return Ok(true);
         }
@@ -230,6 +236,10 @@ BEGIN
                  WHERE table_schema='as4tainr' AND table_name='object_locks' AND column_name='owner') THEN
     ALTER TABLE as4tainr.object_locks ADD COLUMN IF NOT EXISTS owner text NOT NULL DEFAULT '';
   END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='object_locks' AND column_name='kind') THEN
+    ALTER TABLE as4tainr.object_locks ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT '';
+  END IF;
 END $$;
 ";
 
@@ -249,7 +259,7 @@ pub async fn allocate(
     if !STATES.contains(&state) {
         bail!("Lock state {state} is not valid; use *EXCL, *EXCLRD, *SHRUPD, *SHRNUP or *SHRRD.");
     }
-    take(client, t, state, wait, owner, true).await
+    take(client, t, state, wait, owner, true, "").await
 }
 
 /// Deallocate one allocation (the latest); false when the job held none
@@ -278,6 +288,9 @@ pub async fn deallocate(client: &Client, t: &Target, state: &str) -> Result<bool
 pub struct Held {
     pub job: String,
     pub state: String,
+    /// The lock of a file open: None for an allocation, else the open's
+    /// member data lock (*SHRRD for input, *SHRUPD for update).
+    pub open: Option<String>,
 }
 
 /// The allocations held on an object: by job (in the order the jobs
@@ -285,7 +298,7 @@ pub struct Held {
 pub async fn held(client: &Client, t: &Target) -> Result<Vec<Held>> {
     Ok(client
         .query(
-            "SELECT a.application_name, o.state
+            "SELECT COALESCE(NULLIF(o.owner, ''), a.application_name), o.state, o.kind
                FROM as4tainr.object_locks o
                JOIN pg_stat_activity a ON a.pid = o.pid AND a.backend_start = o.started
               WHERE o.key = $1
@@ -297,13 +310,28 @@ pub async fn held(client: &Client, t: &Target) -> Result<Vec<Held>> {
         .map(|r| Held {
             job: r.get(0),
             state: r.get(1),
+            open: match r.get::<_, String>(2).as_str() {
+                OPEN_READ => Some("*SHRRD".into()),
+                OPEN_UPDATE => Some("*SHRUPD".into()),
+                _ => None,
+            },
         })
         .collect())
 }
 
 /// A job's name, user and number from the name its connection carries
 /// ("number/user/name"); another name is the job's name alone.
+/// A `system` job (no as4tainr job; its key is "PID<n>") is QP0ZSPWT of
+/// QUSER with the process's number, as IBM i's (PUB400 2026-11-05,
+/// tools/golden/verify50.txt s50_open).
 pub fn job_parts(job: &str) -> (String, String, String) {
+    if let Some(n) = job.strip_prefix("PID").and_then(|n| n.parse::<u32>().ok()) {
+        return (
+            "QP0ZSPWT".into(),
+            "QUSER".into(),
+            format!("{:06}", n % 1_000_000),
+        );
+    }
     let p: Vec<&str> = job.split('/').collect();
     match p.as_slice() {
         [n, u, j] => (j.to_string(), u.to_string(), n.to_string()),
@@ -316,9 +344,16 @@ pub fn job_parts(job: &str) -> (String, String, String) {
 /// the object line, "Object Locks", the column heading, one line per
 /// allocation (the job's name, user and number on its first only), the
 /// end-of-listing line. The line for no locks is as4tainr's own text.
+/// A file's type shows its attribute (*FILE-PHY) and its opens are
+/// listed again under "Member Locks", each a MBR and a DATA lock of the
+/// file's member (PUB400 2026-11-05, tools/golden/verify50.txt s50_open:
+/// a CL program's RCVF holds MBR *SHRRD and DATA *SHRRD); `member_type`
+/// is PHY or LGL for a file.
 pub fn print(
     t: &Target,
     library: &str,
+    shown_type: &str,
+    member_type: Option<&str>,
     locks: &[Held],
     stamp: &crate::report::Stamp,
 ) -> Vec<String> {
@@ -331,7 +366,7 @@ pub fn print(
             (35, "Library . . . . :"),
             (55, library),
             (70, "Type . . . . :"),
-            (87, &t.objtype),
+            (87, shown_type),
             (102, "ASP device . . :"),
             (121, "*SYSBAS"),
         ]),
@@ -365,6 +400,62 @@ pub fn print(
             (47, "HELD"),
             (55, "*JOB"),
         ]));
+    }
+    let opens: Vec<&Held> = locks.iter().filter(|h| h.open.is_some()).collect();
+    if let (Some(mt), false) = (member_type, opens.is_empty()) {
+        out.push(at(&[(37, "Member Locks")]));
+        out.push(at(&[
+            (1, "File . . . . . :"),
+            (20, &t.name),
+            (35, "Library . . . . :"),
+            (55, library),
+            (70, "Type . . . . :"),
+            (87, mt),
+            (102, "ASP device . . :"),
+            (121, "*SYSBAS"),
+        ]));
+        out.push(at(&[(46, "Lock")]));
+        out.push(at(&[
+            (4, "Member"),
+            (15, "Job"),
+            (26, "User"),
+            (37, "Number"),
+            (46, "Type"),
+            (55, "Lock"),
+            (62, "Status"),
+            (80, "Scope"),
+            (90, "Thread"),
+        ]));
+        let mut last = String::new();
+        for (i, h) in opens.iter().enumerate() {
+            let member = if i == 0 {
+                t.name.clone()
+            } else {
+                String::new()
+            };
+            let (name, user, number) = if h.job == last {
+                Default::default()
+            } else {
+                job_parts(&h.job)
+            };
+            last = h.job.clone();
+            out.push(at(&[
+                (4, &member),
+                (15, &name),
+                (26, &user),
+                (37, &number),
+                (46, "MBR"),
+                (54, "*SHRRD"),
+                (63, "HELD"),
+                (80, "*JOB"),
+            ]));
+            out.push(at(&[
+                (46, "DATA"),
+                (54, h.open.as_deref().unwrap_or_default()),
+                (63, "HELD"),
+                (80, "*JOB"),
+            ]));
+        }
     }
     out.push("                        * * * * *   E N D   O F   L I S T I N G   * * * * *".into());
     out
@@ -456,10 +547,13 @@ mod tests {
         let held = |s: &str| Held {
             job: job.clone(),
             state: s.into(),
+            open: None,
         };
         let lines = print(
             &t,
             "AS4TRAINR1",
+            "*DTAARA",
+            None,
             &[held("*SHRRD"), held("*SHRRD"), held("*EXCL")],
             &stamp,
         );
@@ -474,9 +568,52 @@ mod tests {
             "                        * * * * *   E N D   O F   L I S T I N G   * * * * *",
         ];
         assert_eq!(lines, want);
-        let none = print(&t, "AS4TRAINR1", &[], &stamp);
+        let none = print(&t, "AS4TRAINR1", "*DTAARA", None, &[], &stamp);
         assert_eq!(none.len(), 6);
         assert_eq!(none[3], want[3]);
         assert_eq!(none[5], want[7]);
+    }
+
+    /// A file a `system` job's CL program has open (PUB400 2026-11-05,
+    /// tools/golden/verify50.txt s50_open: WRKOBJLCK's lines with *SHRRD,
+    /// cut at 90 columns there; the job's number is the process's here).
+    #[test]
+    fn printed_locks_of_an_open_file() {
+        let t = Target {
+            library: "AS4TRAINR1".into(),
+            name: "GLD50F".into(),
+            objtype: "*FILE".into(),
+        };
+        let stamp = crate::report::Stamp {
+            date: "26-11-05".into(),
+            time: "15:42:07".into(),
+            zone: String::new(),
+        };
+        let lines = print(
+            &t,
+            "AS4TRAINR1",
+            "*FILE-PHY",
+            Some("PHY"),
+            &[Held {
+                job: "PID1786218".into(),
+                state: "*SHRRD".into(),
+                open: Some("*SHRRD".into()),
+            }],
+            &stamp,
+        );
+        let want = [
+            "Object . . . . :   GLD50F         Library . . . . :   AS4TRAINR1     Type . . . . :   *FILE-PHY      ASP device . . :   *SYSBAS",
+            "                                    Object Locks",
+            "   Job         User        Number    Lock    Status   Scope     Thread",
+            "   QP0ZSPWT    QUSER       786218   *SHRRD    HELD    *JOB",
+            "                                    Member Locks",
+            "File . . . . . :   GLD50F         Library . . . . :   AS4TRAINR1     Type . . . . :   PHY            ASP device . . :   *SYSBAS",
+            "                                             Lock",
+            "   Member     Job        User       Number   Type     Lock   Status            Scope     Thread",
+            "   GLD50F     QP0ZSPWT   QUSER      786218   MBR     *SHRRD   HELD             *JOB",
+            "                                             DATA    *SHRRD   HELD             *JOB",
+            "                        * * * * *   E N D   O F   L I S T I N G   * * * * *",
+        ];
+        assert_eq!(lines[1..], want);
     }
 }

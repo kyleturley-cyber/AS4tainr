@@ -282,6 +282,7 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] Object locks are held by job (a job's own sessions never conflict; two `system` processes are two jobs, verify47)
 - [x] CHGPF keeps SQL indexes over the file; DSPDTAARA OUTPUT
 - [x] Input opens record *SHRRD and take no conflict check, as verify48 showed; CHGDTAARA of a locked data area CPF1063; RGZPFM of an empty member CPF2995/CPF2981; CPYFRMSTMF cuts long lines with CPIA083 (verify49)
+- [x] CLRPFM of a file another job has open or allocated: CPF3130; WRKOBJLCK of a file lists its opens under Member Locks and a `system` job as QP0ZSPWT (verify50)
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).
 - [x] Journals and trigger programs: COM's SETUPJRN, ORDAUDJV (QSYS2.DISPLAY_JOURNAL) and ORDTRG (ADDPFTRG) run (docs/journals.md).

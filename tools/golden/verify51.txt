@@ -1,0 +1,12 @@
+# Golden (after verify50, whose RGZPFM and DLTF succeeded, maybe after
+# the other job's hold had ended): whether each command waited over 20 s, what a
+# file open by another job (a CL program in a background `system` job,
+# DCLF and RCVF, holding it 80 s) does to RGZPFM and DLTF, WRKOBJLCK showing
+# the hold still there; then DLTF after the hold.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify51.txt -Files tools\golden\verify51
+t51_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLD51H)" "DLTF FILE(AS4TRAINR1/GLD51F)" "DLTF FILE(AS4TRAINR1/GLD51S)"; do system -q "$c"; done; echo cleaned
+t51_tag|!setccsid 819 /home/AS4TRAINR/gld/gld51h.clle; ls /home/AS4TRAINR/gld | grep gld51
+t51_make|!system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD51F (K INTEGER NOT NULL)') COMMIT(*NONE)"; system "RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD51F VALUES(1), (2)') COMMIT(*NONE)"; system -q "CRTSRCPF FILE(AS4TRAINR1/GLD51S) RCDLEN(92)"; system "CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld51h.clle') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD51S.FILE/GLD51H.MBR')"; system "CRTBNDCL PGM(AS4TRAINR1/GLD51H) SRCFILE(AS4TRAINR1/GLD51S)" | grep -E "^CP[CF]"
+t51_open|!(system "CALL PGM(AS4TRAINR1/GLD51H)" > /dev/null 2>&1 &); sleep 5; for c in "RGZPFM FILE(AS4TRAINR1/GLD51F)" "DLTF FILE(AS4TRAINR1/GLD51F)"; do echo "== $c"; s=$(date +%s); system "$c" 2>&1; echo "rc=$? waited=$(( $(date +%s) - s > 20 ))"; done; system "WRKOBJLCK OBJ(AS4TRAINR1/GLD51F) OBJTYPE(*FILE)" | grep -E "EXCL|SHR|Locks" | cut -c1-90
+t51_after|!sleep 90; system "DLTF FILE(AS4TRAINR1/GLD51F)"; echo "rc=$?"
+t51_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLD51H)" "DLTF FILE(AS4TRAINR1/GLD51F)" "DLTF FILE(AS4TRAINR1/GLD51S)"; do system -q "$c"; done; echo cleaned

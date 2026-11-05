@@ -83,6 +83,11 @@ impl Job<'_> {
             }
             return self.dspfd_mbrlist_outfile(cmd, &lib, &name, &attr).await;
         }
+        // A data physical file's member: IBM i 7.5's printed Member
+        // Description (verify40 i40_mbr1).
+        if ty == "*MBR" && matches!(attr.as_str(), "PF" | "LF" | "PF-SRC") {
+            return self.dspfd_mbr(&lib, &name, &attr).await;
+        }
         // A data physical file's attributes: the printed report.
         if ty == "*ATR"
             && attr == "PF"
@@ -278,6 +283,130 @@ impl Job<'_> {
             rows,
             print,
             spool: Some(Box::new(view)),
+            ..Default::default()
+        }))
+    }
+
+    /// DSPFD TYPE(*MBR) of a data physical file (`mbrdesc.rs`): the
+    /// access path's keys are the file's, or its primary key's columns;
+    /// the number of distinct values of each leading part of the key.
+    async fn dspfd_mbr(&mut self, lib: &str, name: &str, attr: &str) -> Result<Outcome> {
+        let f = self.file_info(lib, name, attr).await?;
+        let cons = self
+            .client
+            .query(
+                "SELECT name, kind FROM as4tainr.constraints
+                  WHERE library=$1 AND file=$2 AND kind IN ('PRIMARY KEY', 'UNIQUE')
+                  ORDER BY created, name",
+                &[&lib, &name],
+            )
+            .await?;
+        let mut keys: Vec<String> = f.file.keys.clone();
+        if keys.is_empty() {
+            if let Some(pk) = cons.iter().find(|r| r.get::<_, String>(1) == "PRIMARY KEY") {
+                let pk: String = pk.get(0);
+                let index = format!(
+                    "{}.{}",
+                    catalog::ident(lib),
+                    catalog::ident(&format!("{name}_{pk}"))
+                );
+                keys = self
+                    .client
+                    .query(
+                        "SELECT upper(a.attname::text) FROM pg_index i
+                           CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+                           JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                          WHERE i.indexrelid = to_regclass($1) ORDER BY k.ord",
+                        &[&index],
+                    )
+                    .await
+                    .map(|rows| rows.iter().map(|r| r.get(0)).collect())
+                    .unwrap_or_default();
+            }
+        }
+        let table = format!("{}.{}", catalog::ident(lib), catalog::ident(name));
+        let mut partial_keys = Vec::new();
+        for i in 1..=keys.len() {
+            let cols: Vec<String> = keys[..i].iter().map(|k| catalog::ident(k)).collect();
+            let sql = format!(
+                "SELECT count(*) FROM (SELECT DISTINCT {} FROM {table}) x",
+                cols.join(", ")
+            );
+            partial_keys.push(
+                self.client
+                    .query_one(&sql, &[])
+                    .await
+                    .map(|r| r.get::<_, i64>(0))
+                    .unwrap_or(f.records),
+            );
+        }
+        // The members: a data file's one, named like the file; a source
+        // file's each with its lines, type and dates.
+        let members = if f.source {
+            let mut out = Vec::new();
+            for r in self
+                .client
+                .query(
+                    "SELECT member, text, srctype,
+                            (length(source) - length(replace(source, chr(10), '')))::bigint
+                              + CASE WHEN source <> '' AND right(source, 1) <> chr(10) THEN 1 ELSE 0 END,
+                            CASE WHEN added < '2000-01-01' THEN '0' ELSE '1' END,
+                            to_char(added AT TIME ZONE 'UTC', 'YYMMDD'),
+                            to_char(added AT TIME ZONE 'UTC', 'HH24MISS'),
+                            CASE WHEN changed < '2000-01-01' THEN '0' ELSE '1' END,
+                            to_char(changed AT TIME ZONE 'UTC', 'YYMMDD'),
+                            to_char(changed AT TIME ZONE 'UTC', 'HH24MISS')
+                       FROM as4tainr.source_members
+                      WHERE library=$1 AND file=$2 ORDER BY added, member",
+                    &[&lib, &name],
+                )
+                .await?
+            {
+                out.push(crate::mbrdesc::Member {
+                    name: r.get(0),
+                    text: r.get(1),
+                    srctype: Some(r.get(2)),
+                    records: r.get(3),
+                    deleted: 0,
+                    created: (r.get(4), r.get(5), r.get(6)),
+                    changed: (r.get(7), r.get(8), r.get(9)),
+                });
+            }
+            out
+        } else {
+            vec![crate::mbrdesc::Member {
+                name: f.name.clone(),
+                text: f.text.clone(),
+                created: f.created.clone(),
+                changed: f.changed.clone(),
+                records: f.records,
+                deleted: f.deleted,
+                srctype: None,
+            }]
+        };
+        let x = crate::mbrdesc::MemberExtra {
+            members,
+            partial_keys,
+            constraints: cons
+                .iter()
+                .map(|r| {
+                    crate::mbrdesc::constraint_name(
+                        &crate::qtemp::logical(lib),
+                        name,
+                        &r.get::<_, String>(0),
+                    )
+                })
+                .collect(),
+        };
+        let print = crate::mbrdesc::report(&f, &x, &crate::report::Stamp::now());
+        Ok(Outcome::Display(ListDisplay {
+            title: "Display File Description".into(),
+            info: vec![
+                ("File".into(), name.to_string()),
+                ("Library".into(), crate::qtemp::logical(lib)),
+            ],
+            rows: print.clone(),
+            print,
             ..Default::default()
         }))
     }

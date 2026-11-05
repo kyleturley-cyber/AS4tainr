@@ -65,6 +65,13 @@ CREATE TABLE IF NOT EXISTS as4tainr.job_log (
     text   text NOT NULL
 );
 CREATE INDEX IF NOT EXISTS job_log_job ON as4tainr.job_log (job, seq);
+-- CHGMSGQ's DLVRY and SEV of a message queue (key as msgq_key gives it).
+CREATE TABLE IF NOT EXISTS as4tainr.message_queue_attributes (
+    msgq  text NOT NULL,
+    attr  text NOT NULL,
+    value text NOT NULL,
+    PRIMARY KEY (msgq, attr)
+);
 CREATE TABLE IF NOT EXISTS as4tainr.messages (
     id        bigserial PRIMARY KEY,
     msgq      text NOT NULL,
@@ -969,6 +976,11 @@ pub async fn run_subsystem(env: crate::commands::Environment, max_active: usize)
         {
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
+        }
+        // Job schedule entries that are due put their jobs on their
+        // queues (jobscde.rs).
+        if let Err(e) = crate::jobscde::submit_due(&client).await {
+            eprintln!("as4tainr: job schedule: {e:#}");
         }
         let permit = slots.clone().acquire_owned().await?;
         match claim_next(&client, BATCH_QUEUE).await {

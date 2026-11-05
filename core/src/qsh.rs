@@ -126,6 +126,68 @@ fn envvar_data(name: &str, quoted: bool) -> Vec<u8> {
     d
 }
 
+/// A directory with a `system` command for shell commands: it runs this
+/// executable's `system` (through /proc, which the IFS's mounts do not
+/// hide) for the user AS4TAINR_USER names. In /var/tmp, which the IFS
+/// is not mounted over. None when it cannot be made.
+fn system_utility_dir() -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::path::Path::new("/var/tmp/as4tainr-bin");
+    let script = dir.join("system");
+    let body = "#!/bin/sh\nexec \"$AS4TAINR_EXE\" system \"$@\"\n";
+    if std::fs::read_to_string(&script).ok().as_deref() != Some(body) {
+        std::fs::create_dir_all(dir).ok()?;
+        std::fs::write(&script, body).ok()?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).ok()?;
+    }
+    Some(dir.to_string_lossy().to_string())
+}
+
+/// IBM i's paths to the `system` utility (/usr/bin/system in Qshell,
+/// /QOpenSys/usr/bin/system in PASE), wherever they stand as a command
+/// word, as `system` (the as4tainr one on the PATH, `shell_run`).
+fn system_utility_paths(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    'scan: while !rest.is_empty() {
+        for p in ["/QOpenSys/usr/bin/system", "/usr/bin/system"] {
+            if let Some(after) = rest.strip_prefix(p) {
+                let before_ok = out
+                    .chars()
+                    .last()
+                    .is_none_or(|c| c.is_whitespace() || "'\";|&(`".contains(c));
+                let after_ok = after
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c.is_whitespace() || "'\";|&)`".contains(c));
+                if before_ok && after_ok {
+                    out.push_str("system");
+                    rest = after;
+                    continue 'scan;
+                }
+            }
+        }
+        let c = rest.chars().next().unwrap_or_default();
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
+/// A command line that starts with Qshell's interpreter (`/usr/bin/qsh`
+/// or `qsh`) with the container's `/bin/sh` in its place.
+fn qsh_as_sh(line: &str) -> String {
+    let t = line.trim_start();
+    for p in ["/usr/bin/qsh", "qsh"] {
+        if let Some(rest) = t.strip_prefix(p) {
+            if rest.is_empty() || rest.starts_with(' ') {
+                return format!("/bin/sh{rest}");
+            }
+        }
+    }
+    line.to_string()
+}
+
 impl Job<'_> {
     pub(crate) async fn qsh_command(&mut self, cmd: &Command) -> Result<Option<Outcome>> {
         Ok(Some(match cmd.def.name {
@@ -237,23 +299,15 @@ impl Job<'_> {
         Ok(())
     }
 
-    async fn qsh(&mut self, cmd: &Command) -> Result<Outcome> {
-        let line = raw(cmd, "CMD");
-        if line.is_empty() || line.eq_ignore_ascii_case("*NONE") {
-            // No interactive Qshell session here; in a batch job IBM's
-            // does nothing either.
-            return Ok(Outcome::Messages(vec![]));
-        }
-        if !enabled() {
-            bail!(
-                "CPF9899: Qshell is not set up on this system (AS4TAINR_QSH): the command was not run."
-            );
-        }
+    /// Run a command line with /bin/sh as the user, on the IFS at its
+    /// paths when this system can (qshfs.rs), with the job's environment
+    /// variables: what QSH CMD and PASE popen (rpg/pase.rs) run. Its
+    /// standard output (and error) and exit status.
+    pub(crate) async fn shell_run(&mut self, line: &str) -> Result<std::process::Output> {
+        let line = system_utility_paths(line);
         let job = self.job_key();
         let vars = envvar::for_process(self.client, &job).await?;
         let setting = |n: &str| vars.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
-        let out = output(setting("QIBM_QSH_CMD_OUTPUT").as_deref());
-        let escape_msg = setting("QIBM_QSH_CMD_ESCAPE_MSG").is_some_and(|v| v == "Y");
         // The IFS at its paths, when this system can (qshfs.rs); the
         // command starts in the user's home directory if there is one.
         let mirror = if crate::qshfs::available() {
@@ -289,8 +343,21 @@ impl Job<'_> {
             .envs(vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped());
-        if setting("PATH").is_none() {
-            p.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+        // `system` (the PASE and Qshell utility that runs a CL command,
+        // `as4tainr system`) as the job's user, found first on the PATH.
+        let tools = system_utility_dir();
+        let path = setting("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
+        p.env(
+            "PATH",
+            match &tools {
+                Some(d) => format!("{d}:{path}"),
+                None => path,
+            },
+        );
+        if tools.is_some() {
+            p.env("AS4TAINR_EXE", format!("/proc/{}/exe", std::process::id()))
+                .env("AS4TAINR_DATABASE_URL", &self.env.database_url)
+                .env("AS4TAINR_USER", &self.user);
         }
         if setting("HOME").is_none() {
             p.env(
@@ -308,7 +375,31 @@ impl Job<'_> {
         if let Some(m) = mirror {
             m.close(self.client, &self.user).await?;
         }
-        let r = r?;
+        r.map_err(Into::into)
+    }
+
+    async fn qsh(&mut self, cmd: &Command) -> Result<Outcome> {
+        let line = raw(cmd, "CMD");
+        if line.is_empty() || line.eq_ignore_ascii_case("*NONE") {
+            // No interactive Qshell session here; in a batch job IBM's
+            // does nothing either.
+            return Ok(Outcome::Messages(vec![]));
+        }
+        if !enabled() {
+            bail!(
+                "CPF9899: Qshell is not set up on this system (AS4TAINR_QSH): the command was not run."
+            );
+        }
+        // Qshell's own interpreter, /usr/bin/qsh (Qshell for IBM i: "qsh
+        // - Qshell command language interpreter"), is the container's
+        // shell here (XMLSERVICE runs `STRQSH CMD('/usr/bin/qsh -c ...')`).
+        let line = qsh_as_sh(&line);
+        let job = self.job_key();
+        let vars = envvar::for_process(self.client, &job).await?;
+        let setting = |n: &str| vars.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+        let out = output(setting("QIBM_QSH_CMD_OUTPUT").as_deref());
+        let escape_msg = setting("QIBM_QSH_CMD_ESCAPE_MSG").is_some_and(|v| v == "Y");
+        let r = self.shell_run(&line).await?;
         let text = String::from_utf8_lossy(&r.stdout).to_string();
         match &out {
             Output::Stdout => self
@@ -399,5 +490,32 @@ mod tests {
         assert!(!e);
         let (m, d, e) = end_message(End::Signal(9), true);
         assert!(m.starts_with("QSH0006") && d == [0, 0, 0, 9] && e);
+    }
+
+    #[test]
+    fn qshell_interpreter_is_the_shell() {
+        assert_eq!(
+            super::qsh_as_sh("/usr/bin/qsh -c 'ls /tmp'"),
+            "/bin/sh -c 'ls /tmp'"
+        );
+        assert_eq!(super::qsh_as_sh("qsh"), "/bin/sh");
+        assert_eq!(
+            super::system_utility_paths("/bin/sh -c '/usr/bin/system -i ''wrkactjob''' | wc"),
+            "/bin/sh -c 'system -i ''wrkactjob''' | wc"
+        );
+        assert_eq!(
+            super::system_utility_paths("ls; /QOpenSys/usr/bin/system dspjob"),
+            "ls; system dspjob"
+        );
+        assert_eq!(
+            super::system_utility_paths("ls /usr/bin/systemd"),
+            "ls /usr/bin/systemd"
+        );
+        assert_eq!(
+            super::system_utility_paths("x/usr/bin/system"),
+            "x/usr/bin/system"
+        );
+        assert_eq!(super::qsh_as_sh("qshx -c a"), "qshx -c a");
+        assert_eq!(super::qsh_as_sh("ls"), "ls");
     }
 }

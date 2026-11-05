@@ -2954,6 +2954,22 @@ async fn run_program(
     pgm: &Program,
     args: &[String],
 ) -> Result<(Outcome, Vec<String>)> {
+    let mut io = FileIo::default();
+    let r = Box::pin(run_program_with(job, pgm, args, &mut io)).await;
+    // The files the program opened are closed when it ends, however it
+    // ends: their object locks go.
+    for (_, f) in io.open.drain() {
+        let _ = crate::objlock::close_file(job.client, &f.file.library, &f.file.file.name).await;
+    }
+    r
+}
+
+async fn run_program_with(
+    job: &mut Job<'_>,
+    pgm: &Program,
+    args: &[String],
+    io: &mut FileIo,
+) -> Result<(Outcome, Vec<String>)> {
     let mut vars: HashMap<String, Var> = pgm.decls.iter().cloned().collect();
     // The job, for %SWITCH (a name no CL variable can have).
     vars.insert(
@@ -3025,7 +3041,6 @@ async fn run_program(
         .map(|(n, _)| n.clone())
         .collect();
     let mut msgs: Vec<String> = Vec::new();
-    let mut io = FileIo::default();
     let mut pc = 0usize;
     let mut steps = 0u64;
     let mut resume_at: Option<usize> = None;
@@ -3128,7 +3143,7 @@ async fn run_program(
                 job.calls.escape = None;
                 job.calls.escape_to_caller = false;
                 job.calls.set_line(st.line);
-                let result = command(job, pgm, st, &mut vars, &mut msgs, &mut io).await;
+                let result = command(job, pgm, st, &mut vars, &mut msgs, io).await;
                 match result {
                     Ok(Some(o)) => return Ok((o, param_values(pgm, &vars))),
                     Ok(None) => pc += 1,
@@ -3472,7 +3487,9 @@ async fn file_command(
     match (&f.kind, st.name.as_str()) {
         (_, "CLOSE") => {
             // The next RCVF opens the file again, at its first record.
-            io.open.remove(&i);
+            if let Some(f) = io.open.remove(&i) {
+                crate::objlock::close_file(job.client, &f.file.library, &f.file.file.name).await?;
+            }
         }
         (ClFile::Db(r), "RCVF") => {
             if let std::collections::hash_map::Entry::Vacant(slot) = io.open.entry(i) {
@@ -3508,6 +3525,23 @@ async fn file_command(
                     }
                     None => r.clone(),
                 };
+                // The open takes *SHRRD on the file, as an RPG open does
+                // (objlock.rs; WAITFILE *IMMED).
+                job.name_session().await?;
+                if !crate::objlock::open_file(
+                    job.client,
+                    &fr.library,
+                    &fr.file.name,
+                    std::time::Duration::ZERO,
+                )
+                .await?
+                {
+                    bail!(
+                        "File {} in library {} could not be opened: another job holds a lock on it that keeps out a shared read lock.",
+                        fr.file.name,
+                        crate::qtemp::logical(&fr.library)
+                    );
+                }
                 slot.insert(crate::rla::OpenFile::new(fr));
             }
             let of = io.open.get_mut(&i).expect("opened above");
@@ -3565,6 +3599,7 @@ pub(crate) const SYSTEM_VALUE_NAMES: &[&str] = &[
     "QDAY",
     "QCENTURY",
     "QTIME",
+    "QDATETIME",
     "QHOUR",
     "QMINUTE",
     "QSECOND",
@@ -3600,6 +3635,7 @@ pub(crate) fn system_value_description(name: &str) -> Option<&'static str> {
         "QDAY" => "Day of the current date",
         "QCENTURY" => "Century of the current date",
         "QTIME" => "Current time",
+        "QDATETIME" => "Current date and time",
         "QHOUR" => "Hour of the current time",
         "QMINUTE" => "Minute of the current time",
         "QSECOND" => "Second of the current time",
@@ -3771,6 +3807,10 @@ fn system_value_of(name: &str, changed: bool) -> Result<Value> {
         "QDAY" => c(format!("{d:02}")),
         "QCENTURY" => c(if y >= 2000 { "1" } else { "0" }.into()),
         "QTIME" => c(format!("{h:02}{mi:02}{sec:02}{:03}", us / 1000)),
+        // QDATETIME: YYYYMMDDHHNNSSXXXXXX, microseconds last (Work
+        // Management, system values: date and time; XMLSERVICE's
+        // test_10552 retrieves it).
+        "QDATETIME" => c(format!("{y:04}{mo:02}{d:02}{h:02}{mi:02}{sec:02}{us:06}")),
         "QHOUR" => c(format!("{h:02}")),
         "QMINUTE" => c(format!("{mi:02}")),
         "QSECOND" => c(format!("{sec:02}")),
@@ -4131,7 +4171,7 @@ async fn command(
                 // a message when there is none (*MAX: until one comes).
                 let name = msgq.rsplit('/').next().unwrap_or(&msgq).to_string();
                 if name != "QSYSOPR" && crate::users::get(job.client, &name).await?.is_none() {
-                    bail!("CPF2403: Message queue {name} in *LIBL not found.");
+                    bail!("CPF2403: There is no message queue {name} in *LIBL.");
                 }
                 let wait = match up("WAIT", "0").as_str() {
                     "*MAX" => u64::MAX,
@@ -4325,6 +4365,9 @@ async fn command(
                 "USEDATE",
                 "USEUPD",
                 "NBRDAYSUSE",
+                // Days used count (USECOUNT): XMLSERVICE's
+                // test_10565 retrieves it; usage is not counted here (0).
+                "USECOUNT",
                 "RESETDATE",
                 "SRCF",
                 "SRCFLIB",
@@ -5543,5 +5586,17 @@ mod tests {
         assert!(e("PGM\nELSE\nENDPGM").contains("ELSE"));
         assert!(e("PGM PARM(&P)\nENDPGM").contains("not declared"));
         assert!(e("PGM\nMONMSG CPF0000\nDCL &A *CHAR 1\nENDPGM").contains("start"));
+    }
+
+    // QDATETIME: 20 characters, YYYYMMDDHHNNSSXXXXXX (the date, the time
+    // and microseconds), XMLSERVICE's test_10552 retrieves it.
+    #[test]
+    fn system_value_qdatetime() {
+        let Value::Char(v) = super::system_value_of("QDATETIME", false).unwrap() else {
+            panic!("not character")
+        };
+        assert_eq!(v.len(), 20);
+        assert!(v.chars().all(|c| c.is_ascii_digit()), "{v}");
+        assert!(v.starts_with("20"), "{v}");
     }
 }

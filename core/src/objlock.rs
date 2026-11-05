@@ -12,9 +12,12 @@
 //! for conflicting states both see the other's and wait (neither is given
 //! its lock wrongly). WAIT is the seconds to keep trying.
 //!
-//! Not done: file opens and data area `IN *LOCK` take no object locks, so
-//! ALCOBJ keeps out other ALCOBJs only; member locks; CONFLICT(*RQSRLS);
-//! docs/fidelity-gaps.md.
+//! An RPG program's file open, and a CL program's first RCVF of a
+//! declared file, take *SHRRD on the file (`open_file`); the close (CL's
+//! CLOSE or the program's end) gives it back. Conflicts are read from PostgreSQL's lock
+//! table, a job's other sessions (its RPG session) not counting.
+//! Not done: SQL and data area `IN *LOCK` take no object
+//! locks; member and data locks; CONFLICT(*RQSRLS); docs/fidelity-gaps.md.
 
 use std::time::{Duration, Instant};
 
@@ -77,26 +80,77 @@ async fn drop_shared(client: &Client, t: &Target, state: &str) -> Result<bool> {
 }
 
 /// Does another job hold one of the states that conflict with `state`?
+/// Read from PostgreSQL's lock table: a lock held by a session of the
+/// same job (this session, or one with the same job name: the job's RPG
+/// session holding a file it opened) does not conflict, as a job's own
+/// locks never do on IBM i. Sessions without a job name count as one
+/// job (docs/fidelity-gaps.md).
 async fn conflicting(client: &Client, t: &Target, state: &str) -> Result<bool> {
     for c in conflicts(state) {
-        let free: bool = client
+        let n: i64 = client
             .query_one(
-                "SELECT pg_try_advisory_lock(hashtext($1), hashtext($2))",
+                "SELECT count(*) FROM pg_locks l
+                   JOIN pg_stat_activity a ON a.pid = l.pid
+                  WHERE l.locktype = 'advisory' AND l.objsubid = 2 AND l.granted
+                    AND l.classid = (hashtext($1)::bigint & 4294967295)::oid
+                    AND l.objid = (hashtext($2)::bigint & 4294967295)::oid
+                    AND l.pid <> pg_backend_pid()
+                    AND a.application_name IS DISTINCT FROM current_setting('application_name')",
                 &[&class(c), &t.key()],
             )
             .await?
             .get(0);
-        if !free {
+        if n > 0 {
             return Ok(true);
         }
-        client
-            .execute(
-                "SELECT pg_advisory_unlock(hashtext($1), hashtext($2))",
-                &[&class(c), &t.key()],
-            )
-            .await?;
     }
     Ok(false)
+}
+
+/// A file opened by a program: *SHRRD on the file (IBM i's open takes a
+/// shared read lock on the file, which keeps out another job's *EXCL;
+/// ALCOBJ in the CL reference, lock states). Waits up to `wait` for a
+/// conflicting lock to go; false when it did not.
+pub async fn open_file(client: &Client, library: &str, file: &str, wait: Duration) -> Result<bool> {
+    let t = Target {
+        library: library.to_string(),
+        name: file.to_string(),
+        objtype: "*FILE".into(),
+    };
+    // As `allocate`, without its sweep of ended sessions' rows (opens are
+    // frequent; ALCOBJ's next allocation clears them).
+    let start = Instant::now();
+    loop {
+        take_shared(client, &t, "*SHRRD").await?;
+        if !conflicting(client, &t, "*SHRRD").await? {
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO as4tainr.object_locks (pid, started, key, state)
+                         SELECT pid, backend_start, $1, '*SHRRD' FROM {ME} m"
+                    ),
+                    &[&t.key()],
+                )
+                .await?;
+            return Ok(true);
+        }
+        drop_shared(client, &t, "*SHRRD").await?;
+        if start.elapsed() >= wait {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The file closed: its open lock goes.
+pub async fn close_file(client: &Client, library: &str, file: &str) -> Result<()> {
+    let t = Target {
+        library: library.to_string(),
+        name: file.to_string(),
+        objtype: "*FILE".into(),
+    };
+    deallocate(client, &t, "*SHRRD").await?;
+    Ok(())
 }
 
 /// Each allocation a job holds, in the order it was made (WRKOBJLCK

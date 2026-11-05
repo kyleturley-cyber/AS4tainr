@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 41";
+const VERSION: &str = "as4tainr services 42";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -692,6 +692,7 @@ fn system_value_info() -> String {
                 "CASE WHEN extract(year FROM localtimestamp) >= 2000 THEN '1' ELSE '0' END"
             }
             "QTIME" => "to_char(localtimestamp, 'HH24MISSMS')",
+            "QDATETIME" => "to_char(localtimestamp, 'YYYYMMDDHH24MISSUS')",
             "QHOUR" => "to_char(localtimestamp, 'HH24')",
             "QMINUTE" => "to_char(localtimestamp, 'MI')",
             "QSECOND" => "to_char(localtimestamp, 'SS')",

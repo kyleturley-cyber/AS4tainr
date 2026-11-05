@@ -523,7 +523,8 @@ xs "CRTCLPGM PGM(XMLSERVICE/ZZSHLOMO) SRCFILE(XMLSERVICE/QCLSRC)" | grep -E "^CP
 # Its PHP tests' XML, through the iPLUG procedures (tools/xmlservice_tests.py;
 # about 15 minutes with a release binary; XMLSERVICE_TESTS=0 leaves it out).
 if [ "${XMLSERVICE_TESTS:-1}" != 0 ]; then
-  AS4TAINR_BIN="$bin" python3 tools/xmlservice_tests.py "$xd" | tail -1
+  # AS4TAINR_QSH=1: its <sh> and <qsh> tests run shell commands (ls).
+  AS4TAINR_QSH=1 AS4TAINR_BIN="$bin" python3 tools/xmlservice_tests.py "$xd" | tail -1
 fi
 
 step "IBMi-topics (import, then SPLFDLT *LOGONLY and *BOTH in batch jobs)"

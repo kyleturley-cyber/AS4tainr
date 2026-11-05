@@ -17,12 +17,14 @@
 //! - [`web`]: the browser 5250 terminal
 
 pub mod authority;
+pub mod autl;
 pub mod catalog;
 pub mod cl;
 pub mod cllist;
 pub mod clpgm;
 pub mod cmd;
 pub mod cmdlist;
+pub mod cmppfm;
 pub mod cmtctl;
 pub mod collate;
 pub mod commands;
@@ -47,9 +49,12 @@ pub mod import;
 pub mod jobattr;
 pub mod jobd;
 pub mod joblog;
+pub mod jobq;
 pub mod jobs;
+pub mod jobscde;
 pub mod journal;
 pub mod lfmap;
+pub mod mbrdesc;
 pub mod menus;
 pub mod msgf;
 pub mod objdesc;
@@ -62,6 +67,7 @@ pub mod pdm;
 pub mod pfmview;
 pub mod pftrg;
 pub mod pgmmsg;
+pub mod pgmref;
 pub mod prtf;
 pub mod qsh;
 pub mod qshfs;

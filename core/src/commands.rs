@@ -539,6 +539,21 @@ impl Job<'_> {
         if let Some(o) = Box::pin(self.jobd_command(&cmd)).await? {
             return Ok(o);
         }
+        if let Some(o) = Box::pin(self.jobq_command(&cmd)).await? {
+            return Ok(o);
+        }
+        if let Some(o) = Box::pin(self.jobscde_command(&cmd)).await? {
+            return Ok(o);
+        }
+        if let Some(o) = Box::pin(self.autl_command(&cmd)).await? {
+            return Ok(o);
+        }
+        if let Some(o) = Box::pin(self.pgmref_command(&cmd)).await? {
+            return Ok(o);
+        }
+        if let Some(o) = Box::pin(self.cmppfm_command(&cmd)).await? {
+            return Ok(o);
+        }
         if let Some(o) = Box::pin(self.pdm_command(&cmd)).await? {
             return Ok(o);
         }
@@ -681,6 +696,7 @@ impl Job<'_> {
             "DLTDTAQ" => self.dltdtaq(&cmd).await,
             "CRTMSGQ" => self.crtmsgq(&cmd).await,
             "DLTMSGQ" => self.dltmsgq(&cmd).await,
+            "CHGMSGQ" => self.chgmsgq(&cmd).await,
             "CHKOBJ" => {
                 self.chkobj(
                     cmd.get("OBJ"),
@@ -700,7 +716,7 @@ impl Job<'_> {
             "DLCOBJ" => self.dlcobj(&cmd).await,
             "WRKOBJLCK" => self.wrkobjlck(&cmd).await,
             "SBMJOB" => self.sbmjob(&cmd).await,
-            "WRKACTJOB" => self.wrkactjob().await,
+            "WRKACTJOB" => self.wrkactjob(&cmd).await,
             "WRKSBMJOB" => self.wrksbmjob().await,
             "DSPJOBLOG" => self.dspjoblog(&cmd).await,
             "DSPJOB" => self.dspjob(&cmd).await,
@@ -3569,10 +3585,15 @@ impl Job<'_> {
                 };
             }
             "CRTLF" => {
-                let lf = match crate::dds::parse_lf(&name, &dds_columns(&m.source)) {
+                let mut lf = match crate::dds::parse_lf(&name, &dds_columns(&m.source)) {
                     Ok(lf) => lf,
                     Err(e) => return Err(self.dds_failed(cmd, &m, &lib, &name, false, e).await),
                 };
+                match cmd.get("TEXT") {
+                    "" | "*SRCMBRTXT" => {}
+                    "*BLANK" => lf.text = String::new(),
+                    t => lf.text = t.to_string(),
+                }
                 if let Err(e) =
                     catalog::create_logical_file(&mut c, &self.library_list(), &lib, &lf).await
                 {
@@ -3595,6 +3616,13 @@ impl Job<'_> {
                     true,
                 )
                 .await?;
+                // Its DDS, for CHGPF to build it again over a changed file.
+                self.client
+                    .execute(
+                        "UPDATE as4tainr.logical_files SET dds=$3 WHERE library=$1 AND name=$2",
+                        &[&lib, &name, &dds_columns(&m.source)],
+                    )
+                    .await?;
                 // CPC7301 and CPC7305, as for a physical file (observed on
                 // IBM i 7.5).
                 authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
@@ -5713,6 +5741,38 @@ impl Job<'_> {
                 "*FILE" | "" => name.clone(),
                 m => m.to_string(),
             };
+            // Logical files over the file are kept (CL reference, CHGPF:
+            // the file's dependent logical files are changed with it):
+            // here those CRTLF made are built again from their DDS; SQL
+            // indexes and views over it must be dropped first.
+            let mut rebuild: Vec<(String, String, String, String, String)> = Vec::new();
+            for (dl, dn) in catalog::dependent_files(self.client, &lib, &name).await? {
+                let row = self
+                    .client
+                    .query_opt(
+                        "SELECT l.dds, coalesce(o.text, ''), coalesce(o.owner, '')
+                           FROM as4tainr.logical_files l
+                           LEFT JOIN as4tainr.objects o
+                             ON o.library = l.library AND o.name = l.name AND o.objtype = '*FILE'
+                          WHERE l.library=$1 AND l.name=$2",
+                        &[&dl, &dn],
+                    )
+                    .await?;
+                match row {
+                    Some(r) if !r.get::<_, String>(0).trim().is_empty() => {
+                        rebuild.push((dl, dn, r.get(0), r.get(1), r.get(2)))
+                    }
+                    _ => bail!(
+                        "File {name} in library {shown} was not changed: {dn} in library {} over it is an SQL index or view, or a logical file made before as4tainr kept its DDS; delete it first.",
+                        crate::qtemp::logical(&dl)
+                    ),
+                }
+            }
+            // The logical files' authorities, before they are deleted.
+            let mut kept_lfs = Vec::new();
+            for (dl, dn, ..) in &rebuild {
+                kept_lfs.push(authority::keep(self.client, dl, dn, "*FILE").await?);
+            }
             let records: i64 = self
                 .client
                 .query_one(
@@ -5743,6 +5803,111 @@ impl Job<'_> {
                     )));
                 }
             }
+            // Each logical file must build over the new file (its fields
+            // and keys still there) before anything is changed: tried in
+            // QTEMP over the new file.
+            let mut c = runtime::connect_db(&self.env.database_url).await?;
+            for (dl, dn, dds, _, _) in &rebuild {
+                let tried = match crate::dds::parse_lf(dn, dds) {
+                    Ok(mut lf) => {
+                        lf.based_on = format!("QTEMP/{name}");
+                        let r = catalog::create_logical_file(
+                            &mut c,
+                            &self.library_list(),
+                            "QTEMP",
+                            &lf,
+                        )
+                        .await;
+                        let _ = Box::pin(self.run(&format!("DLTF FILE(QTEMP/{dn})"))).await;
+                        r
+                    }
+                    Err(e) => Err(anyhow!("{e}")),
+                };
+                if let Err(e) = tried {
+                    let _ = Box::pin(self.run(&format!("DLTF FILE(QTEMP/{name})"))).await;
+                    return Err(e.context(format!(
+                        "File {name} in library {shown} was not changed: logical file {dn} in library {} cannot be built over the new fields.",
+                        crate::qtemp::logical(dl)
+                    )));
+                }
+            }
+            for (dl, dn, ..) in &rebuild {
+                Box::pin(self.run(&format!("DLTF FILE({dl}/{dn})"))).await?;
+            }
+            // The logical files over the file in `lib/name`, as they were.
+            async fn build_again(
+                job: &mut Job<'_>,
+                c: &mut tokio_postgres::Client,
+                lib: &str,
+                name: &str,
+                rebuild: &[(String, String, String, String, String)],
+            ) -> Result<()> {
+                for (dl, dn, dds, text, owner) in rebuild {
+                    let mut lf = crate::dds::parse_lf(dn, dds)?;
+                    lf.based_on = format!("{lib}/{name}");
+                    catalog::create_logical_file(c, &job.library_list(), dl, &lf).await?;
+                    job.client
+                        .execute(
+                            "UPDATE as4tainr.logical_files SET dds=$3 WHERE library=$1 AND name=$2",
+                            &[dl, dn, dds],
+                        )
+                        .await?;
+                    job.client
+                        .execute(
+                            "UPDATE as4tainr.objects SET text=$3 WHERE library=$1 AND name=$2 AND objtype='*FILE'",
+                            &[dl, dn, text],
+                        )
+                        .await?;
+                    if !owner.is_empty() {
+                        authority::set_owner(job.client, dl, dn, "*FILE", owner).await?;
+                    }
+                }
+                Ok(())
+            }
+            // The file's owner and authorities, and its logical files'
+            // go to the changed file (CL reference, CHGPF: the file keeps
+            // its authorities).
+            let kept = authority::keep(self.client, &lib, &name, "*FILE").await?;
+            // Its journaling and trigger programs, started and added again
+            // on the changed file (the file is the same object on IBM i).
+            let mut again: Vec<String> = Vec::new();
+            if let Some(j) = self
+                .client
+                .query_opt(
+                    "SELECT journal_lib, journal, images, omtjrne FROM as4tainr.journaled_files WHERE library=$1 AND file=$2",
+                    &[&lib, &name],
+                )
+                .await?
+            {
+                again.push(format!(
+                    "STRJRNPF FILE({lib}/{name}) JRN({}/{}) IMAGES({}) OMTJRNE({})",
+                    j.get::<_, String>(0),
+                    j.get::<_, String>(1),
+                    j.get::<_, String>(2),
+                    j.get::<_, String>(3)
+                ));
+            }
+            for t in self
+                .client
+                .query(
+                    "SELECT trg_lib, trg, time, event, pgm_lib, pgm, alwrepchg, updcnd
+                       FROM as4tainr.file_triggers WHERE library=$1 AND file=$2 ORDER BY added",
+                    &[&lib, &name],
+                )
+                .await?
+            {
+                again.push(format!(
+                    "ADDPFTRG FILE({lib}/{name}) TRGTIME({}) TRGEVENT({}) PGM({}/{}) TRG('{}') TRGLIB({}) ALWREPCHG({}) TRGUPDCND({})",
+                    t.get::<_, String>(2),
+                    t.get::<_, String>(3),
+                    t.get::<_, String>(4),
+                    t.get::<_, String>(5),
+                    t.get::<_, String>(1).replace('\'', "''"),
+                    t.get::<_, String>(0),
+                    if t.get::<_, bool>(6) { "*YES" } else { "*NO" },
+                    t.get::<_, String>(7)
+                ));
+            }
             // The old file aside under a name of its own, the new one in.
             let aside = format!("Q{:09}", std::process::id() % 1_000_000_000);
             if let Err(e) = Box::pin(self.run(&format!(
@@ -5751,8 +5916,9 @@ impl Job<'_> {
             .await
             {
                 let _ = Box::pin(self.run(&format!("DLTF FILE(QTEMP/{name})"))).await;
+                let _ = build_again(self, &mut c, &lib, &name, &rebuild).await;
                 return Err(e.context(format!(
-                    "File {name} in library {shown} was not changed (logical files or views over it must be deleted first)."
+                    "File {name} in library {shown} was not changed (SQL views over it must be dropped first)."
                 )));
             }
             if let Err(e) = Box::pin(self.run(&format!(
@@ -5765,9 +5931,49 @@ impl Job<'_> {
                 )))
                 .await;
                 let _ = Box::pin(self.run(&format!("DLTF FILE(QTEMP/{name})"))).await;
+                let _ = build_again(self, &mut c, &lib, &name, &rebuild).await;
                 return Err(e.context(format!("File {name} in library {shown} was not changed.")));
             }
             Box::pin(self.run(&format!("DLTF FILE({lib}/{aside})"))).await?;
+            build_again(self, &mut c, &lib, &name, &rebuild).await?;
+            authority::restore(self.client, &lib, &name, "*FILE", &kept).await?;
+            for c in &again {
+                // What the move kept already is not done again.
+                let there = if c.starts_with("STRJRNPF") {
+                    self.client
+                        .query_opt(
+                            "SELECT 1 FROM as4tainr.journaled_files WHERE library=$1 AND file=$2",
+                            &[&lib, &name],
+                        )
+                        .await?
+                        .is_some()
+                } else {
+                    let trg = c
+                        .split("TRG('")
+                        .nth(1)
+                        .and_then(|x| x.split("')").next())
+                        .unwrap_or("")
+                        .replace("''", "'");
+                    self.client
+                        .query_opt(
+                            "SELECT 1 FROM as4tainr.file_triggers WHERE library=$1 AND file=$2 AND trg=$3",
+                            &[&lib, &name, &trg],
+                        )
+                        .await?
+                        .is_some()
+                };
+                if there {
+                    continue;
+                }
+                Box::pin(self.run(c)).await.map_err(|e| {
+                    e.context(format!(
+                        "File {name} in library {shown} was changed, but this did not run again on it: {c}"
+                    ))
+                })?;
+            }
+            for ((dl, dn, ..), k) in rebuild.iter().zip(&kept_lfs) {
+                authority::restore(self.client, dl, dn, "*FILE", k).await?;
+            }
             msgs.push(format!(
                 "File {name} in library {shown} changed from source member {mbr}: {records} record(s) kept."
             ));
@@ -6682,11 +6888,14 @@ impl Job<'_> {
                 .unwrap_or_else(|| jobs::DEFAULT_BATCH_JOB_NAME.to_string()),
             n => n.to_string(),
         };
+        // QBATCH (the job description's queue here), or a queue made with
+        // CRTJOBQ, where the job waits (jobq.rs).
         let jobq = match cmd.get("JOBQ") {
-            "*JOBD" | "QBATCH" | "*LIBL/QBATCH" | "QGPL/QBATCH" | "QSYS/QBATCH" => {
-                jobs::BATCH_QUEUE
-            }
-            other => bail!("Job queue {other} not found. The job queue is QBATCH (JOBQ(*JOBD))."),
+            "*JOBD" => jobs::BATCH_QUEUE.to_string(),
+            other => match self.find_job_queue(other).await? {
+                Some((_, _, key)) => key,
+                None => bail!("Job queue {other} not found."),
+            },
         };
         let curlib = match cmd.get("CURLIB") {
             "*CURRENT" => self.curlib.clone(),
@@ -6734,8 +6943,12 @@ impl Job<'_> {
         if cmd.get("HOLD").trim().eq_ignore_ascii_case("*YES") {
             jobs::set_held(self.client, id.number, true).await?;
         }
+        let (qlib, qname) = match jobq.split_once('/') {
+            Some((l, n)) => (crate::qtemp::logical(l), n.to_string()),
+            None => ("QGPL".to_string(), jobq.clone()),
+        };
         Ok(Outcome::Messages(vec![format!(
-            "CPC1221: Job {id} was put on job queue {jobq} in library QGPL."
+            "CPC1221: Job {id} was put on job queue {qname} in library {qlib}."
         )]))
     }
 
@@ -6775,8 +6988,28 @@ impl Job<'_> {
         )]))
     }
 
-    async fn wrkactjob(&mut self) -> Result<Outcome> {
+    async fn wrkactjob(&mut self, cmd: &Command) -> Result<Outcome> {
+        // SBS: the subsystems shown (*ALL: every active one); JOB: the
+        // jobs in them, by name or generic name.
+        let shown: Vec<String> = cmd
+            .list("SBS")
+            .iter()
+            .map(|s| s.trim().to_ascii_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let all = shown.is_empty() || shown.iter().any(|s| s == "*ALL");
+        let want = cmd.get("JOB").to_ascii_uppercase();
+        let named = |n: &str| match want.as_str() {
+            "*ALL" => true,
+            w => match w.strip_suffix('*') {
+                Some(prefix) => n.starts_with(prefix),
+                None => n == w,
+            },
+        };
+        // "Active jobs" counts all of them, whatever is shown.
         let active = jobs::active(self.client).await?;
+        let total = active.len();
+        let active: Vec<_> = active.into_iter().filter(|j| named(&j.id.name)).collect();
         let mut rows = Vec::new();
         let mut keys = Vec::new();
         // IBM i 7.5's WRKACTJOB (PUB400): subsystem/job, user, type, CPU %
@@ -6787,10 +7020,38 @@ impl Job<'_> {
                 ""
             )
         };
+        let mut printed: Vec<ActiveJobLine> = Vec::new();
         for sbs in [jobs::BATCH_QUEUE, jobs::INTERACTIVE_SUBSYSTEM] {
+            if !all && !shown.iter().any(|s| s == sbs) {
+                continue;
+            }
+            let jobs_in: Vec<_> = active.iter().filter(|j| j.subsystem == sbs).collect();
+            // A JOB that selects none of a subsystem's jobs leaves the
+            // subsystem out too (PUB400, verify44 m44_actjob).
+            if want != "*ALL" && jobs_in.is_empty() {
+                continue;
+            }
+            printed.push(ActiveJobLine {
+                name: sbs.into(),
+                user: "QSYS".into(),
+                number: None,
+                job_type: "SBS".into(),
+                function: String::new(),
+                status: "DEQW".into(),
+            });
+            for j in &jobs_in {
+                printed.push(ActiveJobLine {
+                    name: j.id.name.clone(),
+                    user: j.id.user.clone(),
+                    number: Some(j.id.number),
+                    job_type: j.job_type.clone(),
+                    function: j.function.clone(),
+                    status: j.activity.clone(),
+                });
+            }
             rows.push(fmt(sbs, "QSYS", "SBS", "", "DEQW"));
             keys.push(String::new());
-            for j in active.iter().filter(|j| j.subsystem == sbs) {
+            for j in jobs_in {
                 rows.push(fmt(
                     &format!("  {}", j.id.name),
                     &j.id.user,
@@ -6812,7 +7073,15 @@ impl Job<'_> {
             options: vec![(5, "Display job log".into(), "DSPJOBLOG JOB({})".into())],
             keys,
             refresh: Some("WRKACTJOB".into()),
-            print: vec![],
+            print: wrkactjob_report(
+                &printed,
+                &ActiveJobSelection {
+                    subsystems: if all { "*ALL".into() } else { shown.join(" ") },
+                    job: want.clone(),
+                    total,
+                },
+                &crate::report::Stamp::now(),
+            ),
             ibm: IbmLayout::some(IbmLayout {
                 system_row1: true,
                 right2: {
@@ -6821,7 +7090,7 @@ impl Job<'_> {
                         .trim_end()
                         .to_string()
                 },
-                lines: vec![format!("{:48}Active jobs:   {}", "", active.len())],
+                lines: vec![format!("{:48}Active jobs:   {}", "", total)],
                 heading2: format!("{:15}Current", ""),
                 command_line: Some("Parameters or command".into()),
                 tight: true,
@@ -7998,6 +8267,7 @@ impl Job<'_> {
             }
             wanted.push((name, ty, state));
         }
+        self.name_session().await?;
         let mut taken: Vec<(crate::objlock::Target, String)> = Vec::new();
         for (name, ty, state) in wanted {
             let target = match self.lock_target(&name, &ty).await {
@@ -8030,6 +8300,18 @@ impl Job<'_> {
             taken.push((target, state));
         }
         Ok(Outcome::Messages(Vec::new()))
+    }
+
+    /// The job's connection carries the job's name, as its RPG session
+    /// does, so the job's own object locks do not conflict (objlock.rs).
+    pub(crate) async fn name_session(&self) -> Result<()> {
+        if let Some(id) = &self.id {
+            let name = id.to_string().replace('\'', "");
+            self.client
+                .batch_execute(&format!("SET application_name = '{name}'"))
+                .await?;
+        }
+        Ok(())
     }
 
     async fn release_locks(&mut self, taken: &[(crate::objlock::Target, String)]) -> Result<()> {
@@ -8309,6 +8591,65 @@ impl Job<'_> {
     async fn wrkjobq(&mut self, cmd: &Command) -> Result<Outcome> {
         let spec = cmd.get("JOBQ").trim().to_ascii_uppercase();
         let only = spec.rsplit('/').next().unwrap_or("*ALL").to_string();
+        // One queue: its jobs (Work with Job Queue), printed as IBM i 7.5
+        // prints it (jobq.rs, verify44 m44_wrkjobq).
+        if !only.is_empty() && only != "*ALL" && !only.ends_with('*') {
+            let Some((lib, name, key)) = self.find_job_queue(&spec).await? else {
+                bail!("Job queue {only} not found.");
+            };
+            let waiting: Vec<crate::jobq::QueuedJob> = self
+                .client
+                .query(
+                    "SELECT name, user_name, number, held FROM as4tainr.jobs
+                     WHERE jobq=$1 AND status='JOBQ' ORDER BY number",
+                    &[&key],
+                )
+                .await?
+                .iter()
+                .map(|r| crate::jobq::QueuedJob {
+                    name: r.get(0),
+                    user: r.get(1),
+                    number: r.get(2),
+                    held: r.get(3),
+                })
+                .collect();
+            let fmt =
+                |n: &str, u: &str, no: &str, st: &str| format!("{n:<10}  {u:<10}  {no:>6}  {st}");
+            return Ok(Outcome::Display(ListDisplay {
+                title: "Work with Job Queue".into(),
+                info: vec![
+                    ("Queue".into(), format!("{lib}/{name}")),
+                    (
+                        "Status".into(),
+                        if jobs::job_queue_held(self.client, &key).await? {
+                            "HLD"
+                        } else {
+                            "RLS"
+                        }
+                        .into(),
+                    ),
+                ],
+                heading: fmt("Job", "User", "Number", "Status"),
+                rows: waiting
+                    .iter()
+                    .map(|j| {
+                        fmt(
+                            &j.name,
+                            &j.user,
+                            &format!("{:06}", j.number),
+                            if j.held { "HLD" } else { "RLS" },
+                        )
+                    })
+                    .collect(),
+                keys: waiting
+                    .iter()
+                    .map(|j| format!("{:06}/{}/{}", j.number, j.user, j.name))
+                    .collect(),
+                print: crate::jobq::report(&name, &lib, &waiting, &crate::report::Stamp::now()),
+                refresh: Some(format!("WRKJOBQ JOBQ({spec})")),
+                ..Default::default()
+            }));
+        }
         let mut queues: Vec<(String, i64)> = self
             .client
             .query(
@@ -8323,10 +8664,24 @@ impl Job<'_> {
         if !queues.iter().any(|(q, _)| q.ends_with("QBATCH")) {
             queues.insert(0, ("QGPL/QBATCH".into(), 0));
         }
+        // Queues made with CRTJOBQ that have no jobs.
+        for r in self
+            .client
+            .query(
+                "SELECT library || '/' || name FROM as4tainr.objects WHERE objtype='*JOBQ' ORDER BY 1",
+                &[],
+            )
+            .await?
+        {
+            let q: String = r.get(0);
+            if !queues.iter().any(|(k, _)| *k == q) {
+                queues.push((q, 0));
+            }
+        }
         let queues: Vec<(String, String, i64)> = queues
             .into_iter()
             .map(|(q, n)| match q.split_once('/') {
-                Some((l, nm)) => (nm.to_string(), l.to_string(), n),
+                Some((l, nm)) => (nm.to_string(), crate::qtemp::logical(l), n),
                 None => (q, "QGPL".into(), n),
             })
             .filter(|(nm, _, _)| only == "*ALL" || only.is_empty() || *nm == only)
@@ -8345,7 +8700,9 @@ impl Job<'_> {
             } else {
                 "RLS"
             };
-            rows.push(fmt(q, l, &n.to_string(), "QBATCH", st));
+            // Only QBATCH is a subsystem's queue here (jobq.rs).
+            let sbs = if q == jobs::BATCH_QUEUE { "QBATCH" } else { "" };
+            rows.push(fmt(q, l, &n.to_string(), sbs, st).trim_end().to_string());
         }
         Ok(Outcome::Display(ListDisplay {
             title: "Work with All Job Queues".into(),
@@ -8580,6 +8937,56 @@ impl Job<'_> {
         )]))
     }
 
+    /// CHGMSGQ (CL reference): a message queue's text and delivery
+    /// attributes; it sends no message when it is done (PUB400, verify44
+    /// m44_chgmsgq), CPF2403 for a queue that is not there
+    /// (m44_chgmsgq2). DLVRY, SEV and the others are kept and not acted
+    /// on (docs/fidelity-gaps.md).
+    async fn chgmsgq(&mut self, cmd: &Command) -> Result<Outcome> {
+        let spec = cmd.get("MSGQ").trim().to_ascii_uppercase();
+        let (libs, name) = self.search(&spec);
+        let shown = spec
+            .split_once('/')
+            .map(|x| x.0.to_string())
+            .unwrap_or_else(|| "*LIBL".into());
+        let libs: Vec<String> = libs.iter().map(|l| crate::qtemp::real(l)).collect();
+        let Some(key) = jobs::msgq_key(self.client, &libs, &name).await? else {
+            bail!("CPF2403: There is no message queue {name} in {shown}.");
+        };
+        if let Some((lib, n)) = key.split_once('/') {
+            authority::check(self.client, &self.user, lib, n, "*MSGQ", Aut::Change).await?;
+            let text = cmd.get("TEXT");
+            if text != "*SAME" {
+                let text = if text == "*BLANK" { "" } else { text };
+                self.client
+                    .execute(
+                        "UPDATE as4tainr.objects SET text=$3 WHERE library=$1 AND name=$2 AND objtype='*MSGQ'",
+                        &[&lib, &n, &text],
+                    )
+                    .await?;
+            }
+        }
+        for kw in ["DLVRY", "SEV"] {
+            let v = cmd.get(kw);
+            if kw == "SEV" && v != "*SAME" && v.parse::<u8>().map_or(true, |n| n > 99) {
+                return Err(cl::diag_error(
+                    "CPD0084",
+                    &format!("'{v}' is not a valid value for SEV: use 0 through 99 or *SAME."),
+                ));
+            }
+            if v != "*SAME" {
+                self.client
+                    .execute(
+                        "INSERT INTO as4tainr.message_queue_attributes (msgq, attr, value) VALUES ($1, $2, $3)
+                         ON CONFLICT (msgq, attr) DO UPDATE SET value = EXCLUDED.value",
+                        &[&key, &kw, &v],
+                    )
+                    .await?;
+            }
+        }
+        Ok(Outcome::Messages(vec![]))
+    }
+
     /// DLTMSGQ: the queue and its messages; CPC2191 / CPF2105 as for
     /// DLTDTAQ.
     async fn dltmsgq(&mut self, cmd: &Command) -> Result<Outcome> {
@@ -8658,7 +9065,7 @@ impl Job<'_> {
                     Some(k) => keys.push(k),
                     None => {
                         let lib = q.split_once('/').map(|x| x.0).unwrap_or("*LIBL");
-                        bail!("CPF2403: Message queue {name} in {lib} not found.");
+                        bail!("CPF2403: There is no message queue {name} in {lib}.");
                     }
                 }
             }
@@ -8727,7 +9134,7 @@ impl Job<'_> {
                 }
                 let key = crate::jobs::msgq_key(self.client, &libs, &name)
                     .await?
-                    .ok_or_else(|| anyhow!("CPF2403: Message queue {name} not found."))?;
+                    .ok_or_else(|| anyhow!("CPF2403: There is no message queue {name}."))?;
                 match key.split_once('/') {
                     Some((l, n)) => {
                         authority::check(self.client, &self.user, l, n, "*MSGQ", aut).await?;
@@ -11027,9 +11434,195 @@ fn object_elements(vals: &[String]) -> Vec<String> {
     }
 }
 
+/// A line of WRKACTJOB's report: a subsystem (`number` None) or a job.
+#[derive(Debug, Clone, Default)]
+pub struct ActiveJobLine {
+    pub name: String,
+    pub user: String,
+    pub number: Option<i64>,
+    pub job_type: String,
+    pub function: String,
+    pub status: String,
+}
+
+/// What WRKACTJOB was asked to show, as its report lists it.
+#[derive(Debug, Clone, Default)]
+pub struct ActiveJobSelection {
+    pub subsystems: String,
+    pub job: String,
+    pub total: usize,
+}
+
+/// WRKACTJOB's printed report (OUTPUT(*PRINT), batch, `system`) in IBM
+/// i 7.5's layout (PUB400, verify44 m44_actprt, m44_actjob): the title
+/// and page, the product line, the selection, the totals, two heading
+/// lines, a line per subsystem and per job under it, the end line.
+/// CPU, auxiliary I/O and storage are not measured here: blank.
+pub fn wrkactjob_report(
+    lines: &[ActiveJobLine],
+    sel: &ActiveJobSelection,
+    stamp: &crate::report::Stamp,
+) -> Vec<String> {
+    use crate::report::at;
+    let right = |end: usize, t: &str| (end + 1 - t.chars().count().min(end), t.to_string());
+    let time = format!("{} {}", stamp.time, stamp.zone);
+    let system = crate::report::system_name();
+    let label = |l: &str| dsp_label(l, 38);
+    let mut out = vec![
+        at(&[(41, "Work with Active Jobs"), (122, "Page    1")]),
+        at(&[
+            (2, crate::report::PRODUCT),
+            (17, crate::report::LEVEL),
+            (99, &system),
+            (109, &stamp.date),
+            (119, time.trim_end()),
+        ]),
+        at(&[(2, &label("Reset")), (46, "*NO")]),
+        at(&[(2, &label("Subsystems")), (46, &sel.subsystems)]),
+        at(&[(2, &label("CPU Percent Limit")), (46, "*NONE")]),
+        at(&[(2, &label("Response Time Limit")), (46, "*NONE")]),
+        at(&[(2, &label("Sequence")), (46, "*SBS")]),
+        at(&[(2, &label("Job name")), (46, &sel.job)]),
+        at(&[
+            (2, &dsp_label("CPU %", 11)),
+            (34, &dsp_label("Elapsed time", 25)),
+            (65, "00:00:00"),
+            (84, &dsp_label("Active jobs", 22)),
+            (112, &sel.total.to_string()),
+        ]),
+        at(&[
+            (38, "Current"),
+            (74, "--------Elapsed---------"),
+            (134, "Temporary"),
+        ]),
+        at(&[
+            (2, "Subsystem/Job"),
+            (17, "User"),
+            (29, "Number"),
+            (38, "User"),
+            (50, "Type Pool Pty"),
+            (68, "CPU"),
+            (74, "Int"),
+            (81, "Rsp"),
+            (86, "AuxIO"),
+            (94, "CPU%"),
+            (100, "Function"),
+            (115, "Status"),
+            (124, "Threads"),
+            (135, "Storage"),
+        ]),
+    ];
+    if lines.is_empty() {
+        out.push(at(&[(4, "(No active jobs selected)")]));
+    }
+    for l in lines {
+        let job = l.number.is_some();
+        // Run priorities as the shipped classes give them (QBATCH 50,
+        // QINTER 20); a subsystem runs at 0.
+        let pty = match l.job_type.as_str() {
+            "SBS" => "0",
+            "INT" => "20",
+            _ => "50",
+        };
+        let number = l.number.map(|n| format!("{n:06}")).unwrap_or_default();
+        let threads = if job { "1" } else { "" };
+        let f = vec![
+            (if job { 4 } else { 2 }, l.name.clone()),
+            (17, l.user.clone()),
+            (29, number),
+            (38, l.user.clone()),
+            (50, l.job_type.clone()),
+            right(57, "2"),
+            right(61, pty),
+            (100, l.function.clone()),
+            (116, l.status.clone()),
+            right(130, threads),
+        ];
+        let f: Vec<(usize, &str)> = f
+            .iter()
+            .filter(|(_, t)| !t.is_empty())
+            .map(|(c, t)| (*c, t.as_str()))
+            .collect();
+        out.push(at(&f));
+    }
+    out.push(crate::report::END_A.into());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::dsp_label;
+
+    #[test]
+    fn wrkactjob_report_as_ibm_i_prints_it() {
+        // PUB400 (IBM i 7.5), verify44 m44_actprt: WRKACTJOB
+        // OUTPUT(*PRINT) SBS(QUSRWRK); the selection lines, headings, a
+        // subsystem line and a job line in their columns. CPU, AuxIO,
+        // CPU% and storage are blank here (not measured), the rest as
+        // captured.
+        let lines = [
+            super::ActiveJobLine {
+                name: "QUSRWRK".into(),
+                user: "QSYS".into(),
+                number: None,
+                job_type: "SBS".into(),
+                function: String::new(),
+                status: "DEQW".into(),
+            },
+            super::ActiveJobLine {
+                name: "JW0MAIN".into(),
+                user: "DONGENAV".into(),
+                number: Some(231219),
+                job_type: "BCH".into(),
+                function: "PGM-JOBWATCH".into(),
+                status: "DEQA".into(),
+            },
+        ];
+        let sel = super::ActiveJobSelection {
+            subsystems: "QUSRWRK".into(),
+            job: "*ALL".into(),
+            total: 1410,
+        };
+        let r = super::wrkactjob_report(&lines, &sel, &crate::report::Stamp::default());
+        let want = [
+            " Reset . . . . . . . . . . . . . . . . . :   *NO",
+            " Subsystems  . . . . . . . . . . . . . . :   QUSRWRK",
+            " CPU Percent Limit . . . . . . . . . . . :   *NONE",
+            " Response Time Limit . . . . . . . . . . :   *NONE",
+            " Sequence  . . . . . . . . . . . . . . . :   *SBS",
+            " Job name  . . . . . . . . . . . . . . . :   *ALL",
+        ];
+        assert_eq!(r[2..8], want);
+        assert!(r[8].starts_with(" CPU %  . . . :"), "{}", r[8]);
+        assert_eq!(
+            &r[8][33..],
+            "Elapsed time . . . . . . . :   00:00:00           Active jobs . . . . . . :   1410"
+        );
+        assert_eq!(
+            r[9],
+            "                                     Current                             --------Elapsed---------                                    Temporary"
+        );
+        assert_eq!(
+            r[10],
+            " Subsystem/Job  User        Number   User        Type Pool Pty     CPU   Int    Rsp  AuxIO   CPU%  Function       Status   Threads    Storage"
+        );
+        // Captured: " QUSRWRK        QSYS        665858   QSYS        SBS    2   0 ..."
+        // (the subsystem's own job number is not kept here).
+        assert_eq!(
+            r[11],
+            " QUSRWRK        QSYS                 QSYS        SBS    2   0                                                      DEQW"
+        );
+        // Captured: "   JW0MAIN      DONGENAV    231219   DONGENAV    BCH    2  99       4.0 ..."
+        // (its class's priority 99 there; QBATCH's 50 here).
+        assert_eq!(
+            r[12],
+            "   JW0MAIN      DONGENAV    231219   DONGENAV    BCH    2  50                                      PGM-JOBWATCH    DEQA          1"
+        );
+        assert_eq!(
+            r[13],
+            "                          * * * * *  E N D  O F  L I S T I N G  * * * * *"
+        );
+    }
 
     #[test]
     fn compile_options_of_crtsqlrpgi() {

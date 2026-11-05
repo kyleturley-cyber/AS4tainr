@@ -1650,6 +1650,7 @@ impl Job<'_> {
             "RSTOBJ" | "RSTLIB" => self.restore(cmd).await?,
             "DLTLIB" | "CLRLIB" => self.dltlib(cmd).await?,
             "CRTDUPOBJ" => self.crtdupobj(cmd).await?,
+            "CPYLIB" => self.cpylib(cmd).await?,
             "RNMOBJ" => self.rnmobj(cmd).await?,
             "MOVOBJ" => self.movobj(cmd).await?,
             "DLTOBJ" => self.dltobj(cmd).await?,
@@ -2483,6 +2484,98 @@ impl Job<'_> {
         msgs.push(format!(
             "{} objects duplicated from library {from} to library {to}.",
             done.len()
+        ));
+        Ok(msgs)
+    }
+
+    /// CPYLIB (CL reference): every object of a library, with its data,
+    /// into a new library (CRTLIB(*YES): made with the first one's type
+    /// and text) or an existing one (CRTLIB(*NO)), as CRTDUPOBJ OBJ(*ALL)
+    /// DATA(*YES) does. CPF2365 for the same library twice, CPF2358 for a
+    /// library that cannot be copied (PUB400 verify44 m44_cpylibe,
+    /// m44_cpylibx); the completion message has no ID here (not captured).
+    async fn cpylib(&mut self, cmd: &Command) -> Result<Vec<String>> {
+        let from = cmd.get("FROMLIB").trim().to_ascii_uppercase();
+        let to = cmd.get("TOLIB").trim().to_ascii_uppercase();
+        if from == to {
+            bail!("CPF2365: FROMLIB and TOLIB name the same library {from}.");
+        }
+        let from_real = crate::qtemp::real(&from);
+        let to_real = crate::qtemp::real(&to);
+        if !catalog::library_exists(self.client, &from_real).await? {
+            bail!("CPF2358: Library {from} was not copied: there is no such library.");
+        }
+        crate::authority::check(
+            self.client,
+            &self.user,
+            "QSYS",
+            &from_real,
+            "*LIB",
+            crate::authority::Aut::Use,
+        )
+        .await?;
+        let mut msgs = Vec::new();
+        if cmd.get("CRTLIB").eq_ignore_ascii_case("*NO") {
+            if !catalog::library_exists(self.client, &to_real).await? {
+                bail!("CPF2358: Library {from} was not copied: there is no library {to}.");
+            }
+        } else {
+            let text: String = self
+                .client
+                .query_opt(
+                    "SELECT text FROM as4tainr.objects WHERE library='QSYS' AND name=$1 AND objtype='*LIB'",
+                    &[&from_real],
+                )
+                .await?
+                .map(|r| r.get(0))
+                .unwrap_or_default();
+            let lib = catalog::create_library_new(self.client, &to, &text)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "CPF2358: Library {from} was not copied: {}",
+                        crate::jobs::message_text(&e.to_string())
+                    )
+                })?;
+            crate::authority::set_owner(self.client, "QSYS", &lib, "*LIB", &self.user).await?;
+        }
+        let rows = self
+            .client
+            .query(
+                "SELECT name, objtype FROM as4tainr.objects WHERE library=$1 ORDER BY name, objtype",
+                &[&from_real],
+            )
+            .await?;
+        let mut chosen: BTreeSet<(String, String)> = BTreeSet::new();
+        for r in rows {
+            let (n, t): (String, String) = (r.get(0), r.get(1));
+            if NOT_SAVED.contains(&t.as_str()) {
+                msgs.push(format!(
+                    "Object {n} type {t} not copied (as4tainr does not copy this type)."
+                ));
+                continue;
+            }
+            if catalog::object_exists(self.client, std::slice::from_ref(&to_real), &n, &t).await? {
+                msgs.push(format!(
+                    "Object {n} type {t} is already in library {to}: not copied."
+                ));
+                continue;
+            }
+            chosen.insert((n, t));
+        }
+        let count = chosen.len();
+        if count > 0 {
+            let pick = Pick {
+                objects: Some(chosen),
+            };
+            let mut c = crate::runtime::connect_db(&self.env.database_url).await?;
+            let saved = save_library(&mut c, &from_real, &pick, false).await?;
+            let (_, mut notes) =
+                restore_library(&mut c, &saved, &to_real, &|_| true, &self.user).await?;
+            msgs.append(&mut notes);
+        }
+        msgs.push(format!(
+            "Library {from} copied to library {to}: {count} objects."
         ));
         Ok(msgs)
     }

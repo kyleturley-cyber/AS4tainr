@@ -56,6 +56,14 @@ pub(super) const C_OUT_BUFFERS: &[(&str, usize)] = &[
 ];
 
 pub const C_FUNCTIONS: &[&str] = &[
+    "FOPEN",
+    "_C_IFS_FOPEN",
+    "FGETS",
+    "_C_IFS_FGETS",
+    "FPUTS",
+    "_C_IFS_FPUTS",
+    "FCLOSE",
+    "_C_IFS_FCLOSE",
     "OPEN",
     "OPEN64",
     "READ",
@@ -302,6 +310,121 @@ impl<'a> Machine<'a> {
         };
         let num = |n: i64| Ok(Value::Num(Dec::from_i64(n)));
         match name {
+            // Stream I/O (ILE C Runtime: fopen, fgets, fputs, fclose) on the
+            // descriptors open() uses: a FILE is a block of heap storage
+            // that holds its descriptor. The mode's letters as C gives them
+            // (r, w, a, +; ", ..." options ignored); text is converted
+            // between the file's CCSID and the job's. A database member
+            // can be named LIB/FILE(MBR) or by its /QSYS.LIB path.
+            "FOPEN" | "_C_IFS_FOPEN" => {
+                let path = self.c_string(&val(0))?;
+                let mode = self.c_string(&val(1)).unwrap_or_default();
+                let m = mode
+                    .split(',')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                let plus = m.contains('+');
+                let flags = match m.chars().next() {
+                    Some('r') => {
+                        if plus {
+                            O_RDWR
+                        } else {
+                            O_RDONLY
+                        }
+                    }
+                    Some('w') => (if plus { O_RDWR } else { O_WRONLY }) | O_CREAT | O_TRUNC,
+                    Some('a') => (if plus { O_RDWR } else { O_WRONLY }) | O_CREAT | O_APPEND,
+                    _ => {
+                        self.set_errno(errno::EINVAL);
+                        return Ok(Value::Fig(Fig::Null));
+                    }
+                };
+                let path = member_stream_path(&path).unwrap_or(path);
+                match self.c_open(&path, flags | O_TEXTDATA, 0o644, 0, 0, 3) {
+                    Ok(fd) => {
+                        let h = self.alloc(&Value::Num(Dec::from_i64(16)))?;
+                        let (b, o) = self.addr(&h, 8)?;
+                        self.bufs[b][o..o + 4].copy_from_slice(b"FILE");
+                        self.bufs[b][o + 4..o + 8].copy_from_slice(&(fd as i32).to_be_bytes());
+                        Ok(h)
+                    }
+                    Err(e) => {
+                        self.set_errno(ifs::errno_of(&e));
+                        Ok(Value::Fig(Fig::Null))
+                    }
+                }
+            }
+            // fgets(buf, n, stream): up to n-1 bytes, to and with a new
+            // line, null-terminated; NULL at the end of the file.
+            "FGETS" | "_C_IFS_FGETS" => {
+                let Some(fd) = self.stream_fd(&val(2)) else {
+                    self.set_errno(errno::EBADF);
+                    return Ok(Value::Fig(Fig::Null));
+                };
+                let n = int(1).max(1) as usize;
+                let buf = val(0);
+                let (b, o) = self.addr(&buf, n)?;
+                let mut got = 0usize;
+                let one = self.alloc(&Value::Num(Dec::from_i64(4)))?;
+                while got + 1 < n {
+                    match self.c_read(fd, &one, 1) {
+                        Ok(1) => {
+                            let (ob, oo) = self.addr(&one, 1)?;
+                            let c = self.bufs[ob][oo];
+                            self.bufs[b][o + got] = c;
+                            got += 1;
+                            // A new line: EBCDIC LF (the job's text).
+                            if c == 0x25 || c == 0x15 {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                if got == 0 {
+                    return Ok(Value::Fig(Fig::Null));
+                }
+                self.bufs[b][o + got] = 0;
+                Ok(buf)
+            }
+            // fputs(string, stream): the string without its null; EOF (-1)
+            // when it cannot be written.
+            "FPUTS" | "_C_IFS_FPUTS" => {
+                let Some(fd) = self.stream_fd(&val(1)) else {
+                    self.set_errno(errno::EBADF);
+                    return num(-1);
+                };
+                let text = self.str_at(&val(0), None)?.chars()?;
+                let n = text.len();
+                let tmp = self.alloc(&Value::Num(Dec::from_i64(n.max(1) as i64)))?;
+                let (b, o) = self.addr(&tmp, n)?;
+                self.bufs[b][o..o + n].copy_from_slice(&text);
+                match self.c_write(fd, &tmp, n as i64) {
+                    Ok(_) => num(0),
+                    Err(e) => {
+                        self.set_errno(ifs::errno_of(&e));
+                        num(-1)
+                    }
+                }
+            }
+            "FCLOSE" | "_C_IFS_FCLOSE" => {
+                let Some(fd) = self.stream_fd(&val(0)) else {
+                    self.set_errno(errno::EBADF);
+                    return num(-1);
+                };
+                if let Ok((b, o)) = self.addr(&val(0), 8) {
+                    self.bufs[b][o..o + 4].copy_from_slice(b"\0\0\0\0");
+                }
+                match self.c_close(fd) {
+                    Ok(()) => num(0),
+                    Err(e) => {
+                        self.set_errno(ifs::errno_of(&e));
+                        num(-1)
+                    }
+                }
+            }
             "OPEN" | "OPEN64" => {
                 let path = self.c_string(&val(0))?;
                 let r = self.c_open(&path, int(1), int(2), int(3), int(4), args.len());
@@ -1132,7 +1255,7 @@ impl<'a> Machine<'a> {
         self.ptr_to(HEAP_BASE + h, 0)
     }
 
-    fn set_errno(&mut self, n: i32) {
+    pub(super) fn set_errno(&mut self, n: i32) {
         let Value::Ptr(p) = self.errno_ptr() else {
             return;
         };
@@ -1195,6 +1318,9 @@ impl<'a> Machine<'a> {
         // (IBM i: writes are seen by other opens at once).
         self.c_flush();
         let client = self.io.client;
+        if let Some((lib, file, mbr)) = member_of_path(path) {
+            return self.c_open_member(path, (&lib, &file, &mbr), flags, access);
+        }
         let existing = self.block(ifs::stat(client, path))?;
         let (data, file_ccsid, created) = match existing {
             Some(e) if e.dir => {
@@ -1281,21 +1407,137 @@ impl<'a> Machine<'a> {
         })
     }
 
+    /// open() of a database member (its /QSYS.LIB path): its lines as
+    /// text, a new line after each, in CCSID 37; a member that is not
+    /// there is added when the file exists and O_CREAT is given.
+    fn c_open_member(
+        &mut self,
+        path: &str,
+        (lib, file, mbr): (&str, &str, &str),
+        flags: i64,
+        access: i64,
+    ) -> Result<i64> {
+        let client = self.io.client;
+        let real = crate::qtemp::real(lib);
+        if !self.block(crate::source::is_source_file(client, &real, file))? {
+            return Err(ifs::Errno(errno::ENOENT).into());
+        }
+        let data = match self.block(crate::source::find_member(
+            client,
+            std::slice::from_ref(&real),
+            file,
+            mbr,
+        )) {
+            Ok(m) => {
+                let mut t = m.source.clone();
+                if !t.is_empty() && !t.ends_with('\n') {
+                    t.push('\n');
+                }
+                codec::convert(1208, 37, t.as_bytes())
+            }
+            Err(_) if flags & O_CREAT != 0 => Vec::new(),
+            Err(_) => return Err(ifs::Errno(errno::ENOENT).into()),
+        };
+        let truncate = flags & O_TRUNC != 0 && access != O_RDONLY;
+        let stream = Stream {
+            path: path.to_string(),
+            data: if truncate { Vec::new() } else { data },
+            pos: 0,
+            read: access != O_WRONLY,
+            write: access != O_RDONLY,
+            append: flags & O_APPEND != 0,
+            text: None,
+            dirty: truncate,
+            owner: self.owner,
+        };
+        with_fds(&self.job(), |fds| {
+            let fd = (0..MAX_FDS as i32).find(|n| !fds.contains_key(n));
+            match fd {
+                Some(fd) => {
+                    fds.insert(fd, stream);
+                    Ok(fd as i64)
+                }
+                None => Err(ifs::Errno(errno::EMFILE).into()),
+            }
+        })
+    }
+
+    /// The descriptor a FILE pointer (fopen's) holds.
+    fn stream_fd(&mut self, p: &Value) -> Option<i32> {
+        if matches!(p, Value::Fig(Fig::Null)) {
+            return None;
+        }
+        let (b, o) = self.addr(p, 8).ok()?;
+        if &self.bufs[b][o..o + 4] != b"FILE" {
+            return None;
+        }
+        let mut n = [0u8; 4];
+        n.copy_from_slice(&self.bufs[b][o + 4..o + 8]);
+        Some(i32::from_be_bytes(n))
+    }
+
+    /// Store what a descriptor wrote: a stream file, or a database
+    /// member (its lines as records).
+    fn c_store(&mut self, path: &str, data: &[u8]) -> Result<()> {
+        if let Some((lib, file, mbr)) = member_of_path(path) {
+            let text = codec::text(37, data);
+            let mut source = String::new();
+            for l in text.split('\n') {
+                source.push_str(l.trim_end_matches('\r'));
+                source.push('\n');
+            }
+            if text.ends_with('\n') {
+                source.pop();
+            }
+            if source == "\n" {
+                source.clear();
+            }
+            let client = self.io.client;
+            let lib = crate::qtemp::real(&lib);
+            let old = self
+                .block(crate::source::find_member(
+                    client,
+                    std::slice::from_ref(&lib),
+                    &file,
+                    &mbr,
+                ))
+                .ok();
+            let (srctype, mtext) = old
+                .map(|m| (m.srctype, m.text))
+                .unwrap_or_else(|| ("TXT".into(), String::new()));
+            self.block(crate::source::put_member(
+                client,
+                &crate::source::Member {
+                    library: lib,
+                    file,
+                    name: mbr,
+                    srctype,
+                    text: mtext,
+                    source,
+                    ..Default::default()
+                },
+                true,
+            ))?;
+            return Ok(());
+        }
+        let user = self.io.user.clone();
+        self.block(ifs::write_file(
+            self.io.client,
+            path,
+            data,
+            37,
+            0o644,
+            &user,
+        ))
+    }
+
     fn c_close(&mut self, fd: i32) -> Result<()> {
         let s = with_fds(&self.job(), |fds| fds.remove(&fd));
         let Some(s) = s else {
             return Err(ifs::Errno(errno::EBADF).into());
         };
         if s.dirty {
-            let user = self.io.user.clone();
-            self.block(ifs::write_file(
-                self.io.client,
-                &s.path,
-                &s.data,
-                37,
-                0o644,
-                &user,
-            ))?;
+            self.c_store(&s.path, &s.data)?;
         }
         Ok(())
     }
@@ -1311,16 +1553,8 @@ impl<'a> Machine<'a> {
                 })
                 .collect()
         });
-        let user = self.io.user.clone();
         for (path, data) in pending {
-            let _ = self.block(ifs::write_file(
-                self.io.client,
-                &path,
-                &data,
-                37,
-                0o644,
-                &user,
-            ));
+            let _ = self.c_store(&path, &data);
         }
     }
 
@@ -1516,6 +1750,39 @@ fn strftime(fmt: &str, tm: &[i32]) -> String {
     out
 }
 
+/// A database member's /QSYS.LIB path (/QSYS.LIB/LIB.LIB/FILE.FILE/MBR.MBR,
+/// any case): its library, file and member.
+fn member_of_path(path: &str) -> Option<(String, String, String)> {
+    let up = path.trim().to_ascii_uppercase();
+    let parts: Vec<&str> = up.trim_start_matches('/').split('/').collect();
+    match parts.as_slice() {
+        ["QSYS.LIB", lib, file, mbr] => Some((
+            lib.strip_suffix(".LIB")?.to_string(),
+            file.strip_suffix(".FILE")?.to_string(),
+            mbr.strip_suffix(".MBR")?.to_string(),
+        )),
+        _ => None,
+    }
+}
+
+/// fopen's name for a database member, LIB/FILE(MBR) or FILE(MBR) (the
+/// library list's *LIBL taken as QTEMP's caller cannot know it: a library
+/// is needed), as its /QSYS.LIB path; None for a stream file's path.
+fn member_stream_path(name: &str) -> Option<String> {
+    let n = name.trim();
+    if n.starts_with('/') || !n.ends_with(')') {
+        return None;
+    }
+    let (head, mbr) = n[..n.len() - 1].split_once('(')?;
+    let (lib, file) = head.split_once('/')?;
+    Some(format!(
+        "/QSYS.LIB/{}.LIB/{}.FILE/{}.MBR",
+        lib.trim(),
+        file.trim(),
+        mbr.trim()
+    ))
+}
+
 #[cfg(test)]
 mod time_tests {
     // The C runtime's struct tm (ISO C): 2026-10-24 12:34:56 UTC is a
@@ -1528,5 +1795,19 @@ mod time_tests {
             super::strftime("%Y-%m-%d%H.%M.%S %a", &tm),
             "2026-10-2412.34.56 Sat"
         );
+    }
+
+    #[test]
+    fn member_names_for_streams() {
+        assert_eq!(
+            super::member_of_path("/qsys.lib/QTEMP.lib/xmlrexx.file/how.mbr"),
+            Some(("QTEMP".into(), "XMLREXX".into(), "HOW".into()))
+        );
+        assert_eq!(super::member_of_path("/home/a.txt"), None);
+        assert_eq!(
+            super::member_stream_path("QTEMP/OUTREXX(OUTREXX)").as_deref(),
+            Some("/QSYS.LIB/QTEMP.LIB/OUTREXX.FILE/OUTREXX.MBR")
+        );
+        assert_eq!(super::member_stream_path("/tmp/x(1)"), None);
     }
 }

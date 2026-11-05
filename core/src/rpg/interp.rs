@@ -2238,6 +2238,22 @@ impl<'a> Machine<'a> {
             self.files[i].open = Some(open);
             return Ok(());
         }
+        // The open takes *SHRRD on the file: another job's *EXCL keeps
+        // it out (objlock.rs). The wait is WAITFILE(*IMMED), CRTPF's
+        // default: one try.
+        let locked = self.block(crate::objlock::open_file(
+            self.io.client,
+            &fref.library,
+            &fref.file.name,
+            std::time::Duration::ZERO,
+        ))?;
+        if !locked {
+            bail!(
+                "File {} in library {} could not be opened: another job holds a lock on it that keeps out a shared read lock.",
+                fref.file.name,
+                crate::qtemp::logical(&fref.library)
+            );
+        }
         let mut open = OpenFile::new(fref.clone());
         if update {
             let (lib, pf) = self.block(crate::catalog::physical_file_of(
@@ -2256,6 +2272,13 @@ impl<'a> Machine<'a> {
     pub(super) fn close_open_file(&mut self, mut f: OpenFile) -> Result<()> {
         let client = self.io.client;
         let _ = self.io.rt.block_on(f.release(client));
+        if f.file.file.source.is_none() {
+            let _ = self.io.rt.block_on(crate::objlock::close_file(
+                client,
+                &f.file.library,
+                &f.file.file.name,
+            ));
+        }
         if let Some(m) = f.file.file.source.clone().filter(|m| !m.is_empty()) {
             self.block(crate::source::close_member(
                 client,
@@ -5329,7 +5352,9 @@ impl Machine<'_> {
                             return self
                                 .api_error(
                                     rest.first(),
-                                    anyhow!("CPF2403: Message queue {qname} in {qlib} not found."),
+                                    anyhow!(
+                                        "CPF2403: There is no message queue {qname} in {qlib}."
+                                    ),
                                 )
                                 .map(|_| true);
                         }

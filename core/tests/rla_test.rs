@@ -4099,6 +4099,35 @@ ENDPGM";
         panic!()
     };
     assert!(d.keys.contains(&id.to_string()));
+    // SBS limits it to the subsystems named and JOB to the jobs of that
+    // name (IBM i 7.5 documentation, WRKACTJOB: "Subsystem (SBS)" and
+    // "Job name (JOB)").
+    let Outcome::Display(d) = job.run("WRKACTJOB SBS(QBATCH)").await.unwrap() else {
+        panic!()
+    };
+    assert!(!d.keys.contains(&id.to_string()), "{:?}", d.rows);
+    assert!(
+        d.rows.iter().any(|r| r.starts_with("QBATCH")),
+        "{:?}",
+        d.rows
+    );
+    assert!(
+        !d.rows.iter().any(|r| r.starts_with("QINTER")),
+        "{:?}",
+        d.rows
+    );
+    let Outcome::Display(d) = job
+        .run(&format!("WRKACTJOB SBS(QINTER) JOB({})", id.name))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(d.keys.contains(&id.to_string()));
+    let Outcome::Display(d) = job.run("WRKACTJOB JOB(NOSUCHJOB)").await.unwrap() else {
+        panic!()
+    };
+    assert!(d.keys.iter().all(|k| k.is_empty()), "{:?}", d.rows);
 
     // ENDJOB of a job that has not started takes it off the queue.
     let m = msg(job.run("SBMJOB CMD(DSPLIBL) JOB(NEVER)").await.unwrap());
@@ -25057,11 +25086,24 @@ async fn hold_and_release_a_job_queue() {
     job.run(&format!("HLDJOBQ JOBQ(QGPL/{q})")).await.unwrap();
     assert!(job.run(&format!("HLDJOBQ JOBQ({q})")).await.is_err());
     assert!(jobs::claim_next(&client, &q).await.unwrap().is_none());
-    let list = match job.run(&format!("WRKJOBQ JOBQ({q})")).await.unwrap() {
-        Outcome::Display(d) => d.rows.join("\n"),
+    // WRKJOBQ of one queue shows its jobs, the queue's status above them
+    // (this looked for HLD at the end of the queue's row in the list of
+    // all queues; PUB400's WRKJOBQ JOBQ(name), verify44 m44_wrkjobq, is
+    // the queue's own jobs).
+    let d = match job.run(&format!("WRKJOBQ JOBQ({q})")).await.unwrap() {
+        Outcome::Display(d) => d,
         other => panic!("{other:?}"),
     };
-    assert!(list.trim_end().ends_with("HLD"), "{list}");
+    assert!(
+        d.info.iter().any(|(k, v)| k == "Status" && v == "HLD"),
+        "{:?}",
+        d.info
+    );
+    assert!(
+        d.rows.iter().any(|r| r.starts_with("HQJOB")),
+        "{:?}",
+        d.rows
+    );
     let mut plain = Job {
         user: "QUSER".into(),
         curlib: None,
@@ -25676,4 +25718,950 @@ async fn ifs_authorities_and_owner() {
         .await
         .is_err());
     job.run(&format!("DLTUSRPRF USRPRF({user})")).await.unwrap();
+}
+
+/// Job queues, authorization lists, CHGMSGQ, CHGPGM, DSPPGMREF, CMPPFM and
+/// CPYLIB, each with the message IDs IBM i 7.5 sends (PUB400,
+/// tools/golden/verify44.txt; the m44_* name of each capture is given).
+#[tokio::test]
+async fn job_queues_authorization_lists_and_program_references() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    use as4tainr_core::source::{put_member, Member};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let msgs = |o: Outcome| match o {
+        Outcome::Messages(m) => m.join("\n"),
+        other => panic!("{other:?}"),
+    };
+    let err = |e: anyhow::Error| format!("{e:#}");
+    // m44_crtjobq, m44_crtjobq2.
+    let m = msgs(job.run(&format!("CRTJOBQ JOBQ({lib}/Q44)")).await.unwrap());
+    assert!(m.starts_with("CPC9801"), "{m}");
+    let e = err(job
+        .run(&format!("CRTJOBQ JOBQ({lib}/Q44)"))
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("CPF3323"), "{e}");
+    // A job submitted to it waits there (no subsystem takes jobs from it).
+    let m = msgs(
+        job.run(&format!(
+            "SBMJOB CMD(DLYJOB DLY(1)) JOB(W44) JOBQ({lib}/Q44)"
+        ))
+        .await
+        .unwrap(),
+    );
+    assert!(
+        m.contains(&format!("job queue Q44 in library {lib}")),
+        "{m}"
+    );
+    let Outcome::Display(d) = job.run(&format!("WRKJOBQ JOBQ({lib}/Q44)")).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(d.rows.len(), 1, "{:?}", d.rows);
+    assert!(d.rows[0].starts_with("W44"), "{:?}", d.rows);
+    // m44_wrkjobq's headings.
+    assert_eq!(
+        d.print[1],
+        " Job Name     User         Number   Priority   Status"
+    );
+    let key = d.keys[0].clone();
+    job.run(&format!("ENDJOB JOB({key})")).await.ok();
+    // m44_dltjobq, m44_dltjobq2.
+    let m = msgs(job.run(&format!("DLTJOBQ JOBQ({lib}/Q44)")).await.unwrap());
+    assert!(m.starts_with("CPC2191"), "{m}");
+    let e = err(job
+        .run(&format!("DLTJOBQ JOBQ({lib}/Q44)"))
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("CPF2105"), "{e}");
+
+    // Authorization lists: m44_crtautl, m44_addautle, m44_dspautl,
+    // m44_rmvautle, m44_rmvautle2, m44_dltautl, m44_dspautlx.
+    let al = format!("A{}", &lib[lib.len().saturating_sub(8)..]);
+    let m = msgs(job.run(&format!("CRTAUTL AUTL({al})")).await.unwrap());
+    assert!(m.starts_with("CPC2207"), "{m}");
+    let m = msgs(
+        job.run(&format!("ADDAUTLE AUTL({al}) USER(QUSER) AUT(*USE)"))
+            .await
+            .unwrap(),
+    );
+    let ids: Vec<&str> = m.lines().map(|l| &l[..7]).collect();
+    assert_eq!(ids, ["CPI2211", "CPC2208"], "{m}");
+    // The list again: CPF2278 (verify45 n45_crtautl2); the user again:
+    // CPD2272 then CPF2282 (n45_addautle2).
+    let e = err(job.run(&format!("CRTAUTL AUTL({al})")).await.unwrap_err());
+    assert!(e.starts_with("CPF2278"), "{e}");
+    let e = err(job
+        .run(&format!("ADDAUTLE AUTL({al}) USER(QUSER) AUT(*USE)"))
+        .await
+        .unwrap_err());
+    let ids: Vec<&str> = e.lines().map(|l| &l[..7]).collect();
+    assert_eq!(ids, ["CPD2272", "CPF2282"], "{e}");
+    let Outcome::Display(d) = job.run(&format!("DSPAUTL AUTL({al})")).await.unwrap() else {
+        panic!()
+    };
+    // *PUBLIC *CHANGE (QCRTAUT), the owner with list management, QUSER
+    // *USE, as m44_dspautl shows them.
+    assert!(
+        d.print[6].starts_with(" *PUBLIC        *CHANGE "),
+        "{:?}",
+        d.print
+    );
+    assert!(
+        d.print[7].starts_with(" QSECOFR        *ALL           X"),
+        "{:?}",
+        d.print
+    );
+    assert!(
+        d.print[8].starts_with(" QUSER          *USE "),
+        "{:?}",
+        d.print
+    );
+    let m = msgs(
+        job.run(&format!("RMVAUTLE AUTL({al}) USER(QUSER)"))
+            .await
+            .unwrap(),
+    );
+    let ids: Vec<&str> = m.lines().map(|l| &l[..7]).collect();
+    assert_eq!(ids, ["CPI2213", "CPC2210"], "{m}");
+    let e = err(job
+        .run(&format!("RMVAUTLE AUTL({al}) USER(QUSER)"))
+        .await
+        .unwrap_err());
+    let ids: Vec<&str> = e.lines().map(|l| &l[..7]).collect();
+    assert_eq!(ids, ["CPD2276", "CPF2285"], "{e}");
+    let m = msgs(job.run(&format!("DLTAUTL AUTL({al})")).await.unwrap());
+    assert!(m.starts_with("CPC2191"), "{m}");
+    let e = err(job.run(&format!("DSPAUTL AUTL({al})")).await.unwrap_err());
+    assert!(e.starts_with("CPF2283"), "{e}");
+
+    // CHGMSGQ sends no message (m44_chgmsgq); CPF2403 (m44_chgmsgq2).
+    job.run(&format!("CRTMSGQ MSGQ({lib}/M44)")).await.unwrap();
+    let m = msgs(
+        job.run(&format!("CHGMSGQ MSGQ({lib}/M44) DLVRY(*HOLD) SEV(10)"))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(m, "");
+    let e = err(job
+        .run(&format!("CHGMSGQ MSGQ({lib}/NOSUCHQ) DLVRY(*HOLD)"))
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("CPF2403"), "{e}");
+
+    // A CL program's references (m44_pgmref), CHGPGM (m44_chgpgm,
+    // m44_chgpgmx), DSPPGMREF of a missing program (m44_pgmrefx).
+    job.run(&format!("CRTSRCPF FILE({lib}/S44) RCDLEN(92)"))
+        .await
+        .unwrap();
+    let a = "PGM\n DCL VAR(&A) TYPE(*CHAR) LEN(10) VALUE('x')\n CALL PGM(QSYS/QCMDEXC) PARM('DLYJOB DLY(1)' 13)\n ENDPGM\n";
+    let b = "PGM\n DCL VAR(&A) TYPE(*CHAR) LEN(10) VALUE('y')\n CALL PGM(QSYS/QCMDEXC) PARM('DLYJOB DLY(1)' 13)\n ENDPGM\n";
+    for (name, src) in [("P44", a), ("P44B", b)] {
+        put_member(
+            &client,
+            &Member {
+                library: lib.clone(),
+                file: "S44".into(),
+                name: name.into(),
+                srctype: "CLLE".into(),
+                source: src.into(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .unwrap();
+    }
+    job.run(&format!("CRTBNDCL PGM({lib}/P44) SRCFILE({lib}/S44)"))
+        .await
+        .unwrap();
+    let Outcome::Display(d) = job.run(&format!("DSPPGMREF PGM({lib}/P44)")).await.unwrap() else {
+        panic!()
+    };
+    let objs: Vec<&str> = d
+        .rows
+        .iter()
+        .map(|r| r.split_whitespace().next().unwrap())
+        .collect();
+    assert_eq!(objs, ["QCMDEXC", "QLECWI", "QCLSRV", "QLEAWI"]);
+    // OUTPUT(*OUTFILE): a record per object in QADSPPGM's format
+    // (verify45 n45_ffdpgm: QWHDRPPR, 179 bytes); CPF9861/CPF9862 when
+    // the file is made, then CPF3030, as the other outfiles.
+    let m = msgs(
+        job.run(&format!(
+            "DSPPGMREF PGM({lib}/P44) OUTPUT(*OUTFILE) OUTFILE({lib}/R44)"
+        ))
+        .await
+        .unwrap(),
+    );
+    assert!(m.contains("CPF3030"), "{m}");
+    let rows: Vec<(String, String, String)> = client
+        .query(
+            &format!(
+                "SELECT rtrim(whfnam), rtrim(whlnam), rtrim(whotyp) FROM {}.r44 ORDER BY rrn",
+                catalog::ident(&lib)
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    // The same objects as the printed report (checked against m44_pgmref).
+    let printed: Vec<(String, String, String)> = d
+        .rows
+        .iter()
+        .map(|r| {
+            let w: Vec<&str> = r.split_whitespace().collect();
+            (w[0].into(), w[1].into(), w[2].into())
+        })
+        .collect();
+    assert_eq!(rows, printed);
+    let e = err(job
+        .run(&format!("DSPPGMREF PGM({lib}/NOSUCHPGM)"))
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("CPF3033"), "{e}");
+    let m = msgs(
+        job.run(&format!("CHGPGM PGM({lib}/P44) TEXT('changed 44')"))
+            .await
+            .unwrap(),
+    );
+    assert!(m.starts_with("CPC0540"), "{m}");
+    let e = err(job
+        .run(&format!("CHGPGM PGM({lib}/NOSUCHPGM) TEXT('x')"))
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("CPF9811"), "{e}");
+
+    // CMPPFM: SPC6002, SPC6001 (m44_cmppfm, m44_cmpsame), SPC5010
+    // (m44_cmpnone), CPD0084 for RPTTYPE(*LINE) (m44_cmplin).
+    let Outcome::Display(d) = job
+        .run(&format!(
+            "CMPPFM NEWFILE({lib}/S44) NEWMBR(P44B) OLDFILE({lib}/S44) OLDMBR(P44) RPTTYPE(*CHANGE)"
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(d.print_msg.as_deref().unwrap_or("").starts_with("SPC6002"));
+    assert!(
+        d.print
+            .iter()
+            .any(|l| l.starts_with("PAIRED CHANGES") && l.ends_with(" 1")),
+        "{:?}",
+        d.print
+    );
+    let Outcome::Display(d) = job
+        .run(&format!("CMPPFM NEWFILE({lib}/S44) NEWMBR(P44)"))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(d.print_msg.as_deref().unwrap_or("").starts_with("SPC6001"));
+    let e = err(job
+        .run(&format!(
+            "CMPPFM NEWFILE({lib}/S44) NEWMBR(NOSUCH) OLDMBR(P44)"
+        ))
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("SPC5010"), "{e}");
+    let e = err(job
+        .run(&format!(
+            "CMPPFM NEWFILE({lib}/S44) NEWMBR(P44) RPTTYPE(*LINE)"
+        ))
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("CPD0084"), "{e}");
+
+    // CPYLIB: CPF2365 (m44_cpylibe), CPF2358 (m44_cpylibx); a copy has
+    // the objects (CL reference).
+    let e = err(job
+        .run(&format!("CPYLIB FROMLIB({lib}) TOLIB({lib})"))
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("CPF2365"), "{e}");
+    let e = err(job
+        .run("CPYLIB FROMLIB(NOSUCHLIB) TOLIB(NOSUCHLB2)")
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("CPF2358"), "{e}");
+    let to = format!("C{}", &lib[lib.len().saturating_sub(8)..]);
+    job.run(&format!("DLTLIB LIB({to})")).await.ok();
+    job.run(&format!("CPYLIB FROMLIB({lib}) TOLIB({to})"))
+        .await
+        .unwrap();
+    job.run(&format!("CHKOBJ OBJ({to}/P44) OBJTYPE(*PGM)"))
+        .await
+        .unwrap();
+    job.run(&format!("CHKOBJ OBJ({to}/S44) OBJTYPE(*FILE)"))
+        .await
+        .unwrap();
+    job.run(&format!("DLTLIB LIB({to})")).await.unwrap();
+}
+
+/// Job schedule entries (CL reference, ADDJOBSCDE and the commands that
+/// work with entries): an entry is added, shown, held, released,
+/// changed and removed; CPF1628 for one that is not there (PUB400
+/// verify44 m44_hldscde); a due entry's job goes on its job queue and the
+/// entry gets its next time.
+#[tokio::test]
+async fn job_schedule_entries() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let name = format!("S{}", &lib[lib.len().saturating_sub(8)..]);
+    job.run(&format!(
+        "ADDJOBSCDE JOB({name}) CMD(DLYJOB DLY(1)) FRQ(*WEEKLY) SCDDATE(*NONE) SCDDAY(*SUN) SCDTIME('235900') TEXT('weekly')"
+    ))
+    .await
+    .unwrap();
+    let rows = |o: Outcome| match o {
+        Outcome::Display(d) => d.rows,
+        other => panic!("{other:?}"),
+    };
+    let r = rows(job.run(&format!("WRKJOBSCDE JOB({name})")).await.unwrap());
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert!(
+        r[0].contains("SCD") && r[0].contains("*SUN 23:59:00") && r[0].contains("*WEEKLY"),
+        "{r:?}"
+    );
+    job.run(&format!("HLDJOBSCDE JOB({name})")).await.unwrap();
+    let r = rows(job.run(&format!("WRKJOBSCDE JOB({name})")).await.unwrap());
+    assert!(r[0].contains(" HLD "), "{r:?}");
+    job.run(&format!("RLSJOBSCDE JOB({name})")).await.unwrap();
+    job.run(&format!(
+        "CHGJOBSCDE JOB({name}) ENTRYNBR(*ONLY) SCDTIME('235800')"
+    ))
+    .await
+    .unwrap();
+    let r = rows(job.run(&format!("WRKJOBSCDE JOB({name})")).await.unwrap());
+    assert!(r[0].contains("*SUN 23:58:00"), "{r:?}");
+    // SCDDATE and SCDDAY together are not allowed (CL reference).
+    assert!(job
+        .run(&format!(
+            "ADDJOBSCDE JOB({name}) CMD(DLYJOB DLY(1)) FRQ(*ONCE) SCDDATE(*CURRENT) SCDDAY(*MON)"
+        ))
+        .await
+        .is_err());
+    // Due now: its job is submitted to QBATCH and the entry moves on to
+    // its next Sunday.
+    client
+        .execute(
+            "UPDATE as4tainr.job_schedule SET next_run='2000-01-01 00:00:00' WHERE name=$1",
+            &[&name],
+        )
+        .await
+        .unwrap();
+    as4tainr_core::jobscde::submit_due(&client).await.unwrap();
+    let queued: i64 = client
+        .query_one(
+            "SELECT count(*) FROM as4tainr.jobs WHERE name=$1 AND status='JOBQ' AND jobq='QBATCH'",
+            &[&name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(queued, 1);
+    let next: String = client
+        .query_one(
+            "SELECT next_run FROM as4tainr.job_schedule WHERE name=$1",
+            &[&name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        next.ends_with("23:58:00") && next.as_str() > "2026-01-01",
+        "{next}"
+    );
+    for id in client
+        .query(
+            "SELECT number, user_name FROM as4tainr.jobs WHERE name=$1 AND status='JOBQ'",
+            &[&name],
+        )
+        .await
+        .unwrap()
+    {
+        let (n, u): (i64, String) = (id.get(0), id.get(1));
+        job.run(&format!("ENDJOB JOB({n:06}/{u}/{name})"))
+            .await
+            .ok();
+    }
+    job.run(&format!("RMVJOBSCDE JOB({name})")).await.unwrap();
+    let e = format!(
+        "{:#}",
+        job.run(&format!("RMVJOBSCDE JOB({name})"))
+            .await
+            .unwrap_err()
+    );
+    assert!(e.starts_with("CPF1628"), "{e}");
+    let e = format!(
+        "{:#}",
+        job.run(&format!("HLDJOBSCDE JOB({name}) ENTRYNBR(*ONLY)"))
+            .await
+            .unwrap_err()
+    );
+    assert!(e.starts_with("CPF1628"), "{e}");
+}
+
+// DSPFD TYPE(*MBR) of an SQL table keyed by its primary key, with a
+// deleted record, then after RGZPFM. Expected lines: PUB400 (IBM i 7.5)
+// 2026-11-03, tools/golden/verify40.txt i40_mbr1 (3 records, 1 deleted,
+// key field 1 with 3 values, the constraint Q_lib_file_K_00001) and
+// i40_mbr2 (0 deleted after RGZPFM).
+#[tokio::test]
+async fn dspfd_member_description() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    for c in [
+        format!("RUNSQL SQL('CREATE TABLE {lib}/GLD40T (K DECIMAL(5, 0) NOT NULL PRIMARY KEY, NAME CHAR(10) NOT NULL)') COMMIT(*NONE)"),
+        format!("RUNSQL SQL('INSERT INTO {lib}/GLD40T VALUES(3, ''three''), (1, ''one''), (2, ''two''), (5, ''five'')') COMMIT(*NONE)"),
+        format!("RUNSQL SQL('DELETE FROM {lib}/GLD40T WHERE K = 1') COMMIT(*NONE)"),
+    ] {
+        job.run(&c).await.unwrap();
+    }
+    async fn report(job: &mut Job<'_>, lib: &str) -> Vec<String> {
+        match job
+            .run(&format!("DSPFD FILE({lib}/GLD40T) TYPE(*MBR)"))
+            .await
+            .unwrap()
+        {
+            Outcome::Display(d) => d.print,
+            other => panic!("{other:?}"),
+        }
+    }
+    let r = report(&mut job, &lib).await;
+    for want in [
+        "   Member  . . . . . . . . . . . . . . . . . . : MBR        GLD40T".to_string(),
+        "     Member size . . . . . . . . . . . . . . . : SIZE       *NOMAX".into(),
+        "     Current number of records . . . . . . . . :                     3".into(),
+        "     Number of deleted records . . . . . . . . :                     1".into(),
+        "       Number of access path entries . . . . . :                     3".into(),
+        "         Key field 1 . . . . . . . . . . . . . :                          3".into(),
+        format!(
+            "       Constraint  . . . . . . . . . . . . . . : CST        Q_{lib}_GLD40T_K_00001"
+        ),
+    ] {
+        assert!(r.contains(&want), "missing {want:?} in {r:#?}");
+    }
+    job.run(&format!("RGZPFM FILE({lib}/GLD40T)"))
+        .await
+        .unwrap();
+    let r = report(&mut job, &lib).await;
+    assert!(
+        r.contains(
+            &"     Number of deleted records . . . . . . . . :                     0".to_string()
+        ),
+        "{r:#?}"
+    );
+}
+
+// CHGPF SRCFILE of a file with a logical file over it (IBM i CL
+// reference, CHGPF, SRCFILE: the file's dependent logical files are kept
+// over the changed file; the change is refused when a logical file uses
+// a field the new description no longer has, and the file is left as
+// it was).
+#[tokio::test]
+async fn change_a_physical_file_with_a_logical_file_over_it() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source::{put_member, Member};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    job.run(&format!("CRTSRCPF FILE({lib}/QDDSSRC)"))
+        .await
+        .unwrap();
+    let put = |name: &str, src: &str| Member {
+        library: lib.clone(),
+        file: "QDDSSRC".into(),
+        name: name.into(),
+        srctype: "PF".into(),
+        source: src.into(),
+        ..Default::default()
+    };
+    let old = "     A          R CHGLR\n     A            K1             5P 0\n     A            NAME          10A\n     A          K K1\n";
+    put_member(&client, &put("CHGLP", old), true).await.unwrap();
+    let lf = "     A          R CHGLR                     PFILE(CHGLP)\n     A          K NAME\n";
+    put_member(&client, &put("CHGLL", lf), true).await.unwrap();
+    job.run(&format!("CRTPF FILE({lib}/CHGLP) SRCFILE({lib}/QDDSSRC)"))
+        .await
+        .unwrap();
+    job.run(&format!(
+        "CRTLF FILE({lib}/CHGLL) SRCFILE({lib}/QDDSSRC) TEXT('by name')"
+    ))
+    .await
+    .unwrap();
+    let t = format!("{}.chglp", catalog::ident(&lib));
+    client
+        .execute(
+            &format!("INSERT INTO {t} (k1, name) VALUES (1, 'zed'), (2, 'amy')"),
+            &[],
+        )
+        .await
+        .unwrap();
+    // Authorities the file and the logical file have before the change
+    // stay with them (CHGPF changes the file; it is the same object).
+    for c in [
+        format!("GRTOBJAUT OBJ({lib}/CHGLP) OBJTYPE(*FILE) USER(QUSER) AUT(*USE)"),
+        format!(
+            "GRTOBJAUT OBJ({lib}/CHGLP) OBJTYPE(*FILE) USER(*PUBLIC) AUT(*EXCLUDE) REPLACE(*YES)"
+        ),
+        format!("GRTOBJAUT OBJ({lib}/CHGLL) OBJTYPE(*FILE) USER(QUSER) AUT(*CHANGE)"),
+        // Journaling and a trigger program stay with the file too.
+        format!("CRTJRNRCV JRNRCV({lib}/CHGR0001)"),
+        format!("CRTJRN JRN({lib}/CHGJ) JRNRCV({lib}/CHGR0001)"),
+        format!("STRJRNPF FILE({lib}/CHGLP) JRN({lib}/CHGJ) IMAGES(*BOTH)"),
+    ] {
+        job.run(&c).await.unwrap();
+    }
+    put_member(
+        &client,
+        &Member {
+            srctype: "CLLE".into(),
+            ..put(
+                "CHGLT",
+                "PGM PARM(&B &L)\nDCL &B *CHAR 1\nDCL &L *CHAR 4\nENDPGM\n",
+            )
+        },
+        true,
+    )
+    .await
+    .unwrap();
+    job.run(&format!("CRTBNDCL PGM({lib}/CHGLT) SRCFILE({lib}/QDDSSRC)"))
+        .await
+        .unwrap();
+    job.run(&format!(
+        "ADDPFTRG FILE({lib}/CHGLP) TRGTIME(*AFTER) TRGEVENT(*INSERT) PGM({lib}/CHGLT) TRG(CHGTRG)"
+    ))
+    .await
+    .unwrap();
+    // A field added: the logical file is still there, over the new file.
+    let new = "     A          R CHGLR\n     A            K1             5P 0\n     A            NAME          10A\n     A            CITY          10A\n     A          K K1\n";
+    put_member(&client, &put("CHGLP", new), true).await.unwrap();
+    job.run(&format!("CHGPF FILE({lib}/CHGLP) SRCFILE({lib}/QDDSSRC)"))
+        .await
+        .unwrap();
+    let lfrow = client
+        .query_one(
+            "SELECT pf_name FROM as4tainr.logical_files WHERE library=$1 AND name='CHGLL'",
+            &[&lib],
+        )
+        .await
+        .unwrap();
+    assert_eq!(lfrow.get::<_, String>(0), "CHGLP");
+    let objs = catalog::list_objects(&client, &lib).await.unwrap();
+    let l = objs.iter().find(|o| o.name == "CHGLL").unwrap();
+    assert_eq!(l.text, "by name");
+    let auts: Vec<(String, String)> = client
+        .query(
+            "SELECT name, aut FROM as4tainr.object_auths WHERE library=$1 AND user_name='QUSER' ORDER BY name",
+            &[&lib],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(
+        auts,
+        [
+            ("CHGLL".to_string(), "*CHANGE".to_string()),
+            ("CHGLP".to_string(), "*USE".to_string())
+        ]
+    );
+    let public: String = client
+        .query_one(
+            "SELECT public_aut FROM as4tainr.objects WHERE library=$1 AND name='CHGLP' AND objtype='*FILE'",
+            &[&lib],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(public, "*EXCLUDE");
+    let journaled: Option<String> = client
+        .query_opt(
+            "SELECT images FROM as4tainr.journaled_files WHERE library=$1 AND file='CHGLP'",
+            &[&lib],
+        )
+        .await
+        .unwrap()
+        .map(|r| r.get(0));
+    assert_eq!(journaled.as_deref(), Some("*BOTH"));
+    let trg: Vec<String> = client
+        .query(
+            "SELECT trg FROM as4tainr.file_triggers WHERE library=$1 AND file='CHGLP'",
+            &[&lib],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(trg, ["CHGTRG"]);
+    // The logical file reads the records in its key order.
+    let r = job
+        .run(&format!(
+            "CPYF FROMFILE({lib}/CHGLL) TOFILE({lib}/CHGLC) CRTFILE(*YES)"
+        ))
+        .await;
+    assert!(r.is_ok(), "{r:?}");
+    let names: Vec<String> = client
+        .query(
+            &format!(
+                "SELECT rtrim(name) FROM {}.chglc ORDER BY rrn",
+                catalog::ident(&lib)
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(names, ["amy", "zed"]);
+    // NAME removed: the logical file's key needs it, so nothing changes.
+    let bad = "     A          R CHGLR\n     A            K1             5P 0\n     A            CITY          10A\n     A          K K1\n";
+    put_member(&client, &put("CHGLP", bad), true).await.unwrap();
+    let e = job
+        .run(&format!("CHGPF FILE({lib}/CHGLP) SRCFILE({lib}/QDDSSRC)"))
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("CHGLL"), "{e:#}");
+    let still = client
+        .query_opt(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'chglp' AND column_name = 'name'",
+            &[&lib.to_ascii_lowercase()],
+        )
+        .await
+        .unwrap();
+    assert!(still.is_some());
+    assert!(client
+        .query_opt(
+            "SELECT 1 FROM as4tainr.logical_files WHERE library=$1 AND name='CHGLL'",
+            &[&lib],
+        )
+        .await
+        .unwrap()
+        .is_some());
+}
+
+// DSPPGMREF of an RPG program and CREATE TABLE AS of zoned columns, as
+// PUB400 (IBM i 7.5) showed them on 2026-11-04 (tools/golden/verify46.txt):
+// o46_pgmref/o46_refg: the programs it calls (GLD46C before QCMDEXC),
+// the file with the library it is in, its name in the program, Input,
+// one record format, then QRNXIE, QRNXIO, QRNXUTIL, QLEAWI in QSYS; the
+// outfile's one-letter types P, F and blank for a service program;
+// o46_refcv: CREATE TABLE AS keeps ZONED columns zoned.
+#[tokio::test]
+async fn rpg_program_references_and_create_table_as_zoned() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    job.run(&format!(
+        "RUNSQL SQL('CREATE TABLE {lib}/GLD46P (CODE DECIMAL(5, 0) NOT NULL, NAME CHAR(20) NOT NULL)') COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
+    let src = "**FREE\nctl-opt dftactgrp(*no) actgrp(*caller);\ndcl-f GLD46P usage(*input);\ndcl-pr qcmdexc extpgm('QCMDEXC');\n  cmd char(100) const;\n  len packed(15: 5) const;\nend-pr;\ndcl-pr callc extpgm('GLD46C') end-pr;\nread GLD46P;\n*inlr = *on;\n";
+    let path = format!("/tmp/{}.rpgle", lib.to_ascii_lowercase());
+    as4tainr_core::ifs::write_file(&client, &path, src.as_bytes(), 819, 0o644, "QSECOFR")
+        .await
+        .unwrap();
+    job.run(&format!("CRTBNDRPG PGM({lib}/GLD46G) SRCSTMF('{path}')"))
+        .await
+        .unwrap();
+    let Outcome::Display(d) = job
+        .run(&format!("DSPPGMREF PGM({lib}/GLD46G) OUTPUT(*PRINT)"))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let objs: Vec<&str> = d
+        .rows
+        .iter()
+        .map(|r| r.split_whitespace().next().unwrap())
+        .collect();
+    assert_eq!(
+        objs,
+        ["GLD46C", "QCMDEXC", "GLD46P", "QRNXIE", "QRNXIO", "QRNXUTIL", "QLEAWI"]
+    );
+    assert!(d.rows[2].contains(&lib), "{:?}", d.rows);
+    for want in [
+        "     File name in program  . . . . . . . . . . :       GLD46P",
+        "     File usage  . . . . . . . . . . . . . . . :       Input",
+        "     Number of record formats  . . . . . . . . :           1",
+    ] {
+        assert!(d.print.iter().any(|l| l == want), "{want:?} {:#?}", d.print);
+    }
+    job.run(&format!(
+        "DSPPGMREF PGM({lib}/GLD46G) OUTPUT(*OUTFILE) OUTFILE({lib}/GLD46R)"
+    ))
+    .await
+    .unwrap();
+    let rows: Vec<(String, String, String, String)> = client
+        .query(
+            &format!(
+                "SELECT rtrim(whfnam), whobjt, whfusg::text, rtrim(whsnam) FROM {}.gld46r ORDER BY rrn",
+                catalog::ident(&lib)
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .collect();
+    assert_eq!(
+        rows[0],
+        ("GLD46C".into(), "P".into(), "0".into(), "".into())
+    );
+    assert_eq!(
+        rows[2],
+        ("GLD46P".into(), "F".into(), "1".into(), "GLD46P".into())
+    );
+    assert_eq!(
+        rows[3],
+        ("QRNXIE".into(), " ".into(), "0".into(), "".into())
+    );
+    // CREATE TABLE AS keeps WHFUSG zoned (2 digits) and an expression packed.
+    job.run(&format!(
+        "RUNSQL SQL('CREATE TABLE {lib}/GLD46V AS (SELECT WHFUSG, WHFUSG + 1 AS NEXT FROM {lib}/GLD46R) WITH DATA') COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
+    let f = catalog::resolve_file(&client, std::slice::from_ref(&lib), "GLD46V")
+        .await
+        .unwrap();
+    assert_eq!(
+        f.file.fields[0].data_type,
+        as4tainr_core::dds::DataType::Zoned
+    );
+    assert_eq!(
+        f.file.fields[1].data_type,
+        as4tainr_core::dds::DataType::Packed
+    );
+}
+
+// A program's open file holds *SHRRD on the file (IBM i Database
+// programming, "Locking shared data": an open places a shared read lock
+// on the file; CL reference, ALCOBJ lock state table: *EXCL goes with
+// no other job's lock). Another job's ALCOBJ *EXCL fails with CPF1002
+// while the file is open; the job's own ALCOBJ from the program does
+// not conflict; another job's *EXCL keeps the open out.
+#[tokio::test]
+async fn open_files_hold_shared_read_locks() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let other = runtime::connect_db(&url).await.unwrap();
+    runtime::job_session(
+        &other,
+        Some(&format!("000079/QSECOFR/O{}", &lib[1..])),
+        std::time::Duration::from_millis(500),
+    )
+    .await
+    .unwrap();
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mk = |c| Job {
+        client: c,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let mut a = mk(&client);
+    let mut b = mk(&other);
+    a.run(&format!(
+        "RUNSQL SQL('CREATE TABLE {lib}/LCKF (K INTEGER NOT NULL)') COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
+    a.run(&format!(
+        "RUNSQL SQL('INSERT INTO {lib}/LCKF VALUES(1)') COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
+    let src = format!(
+        "**FREE\ndcl-f LCKF usage(*input);\ndcl-pr qcmdexc extpgm('QCMDEXC');\n  cmd char(200) const;\n  len packed(15: 5) const;\nend-pr;\nread LCKF;\nqcmdexc('ALCOBJ OBJ(({lib}/LCKF *FILE *EXCL)) WAIT(0)': 200);\nqcmdexc('DLCOBJ OBJ(({lib}/LCKF *FILE *EXCL))': 200);\nqcmdexc('DLYJOB DLY(3)': 200);\n*inlr = *on;\n"
+    );
+    let path = format!("/tmp/{}lck.rpgle", lib.to_ascii_lowercase());
+    as4tainr_core::ifs::write_file(&client, &path, src.as_bytes(), 819, 0o644, "QSECOFR")
+        .await
+        .unwrap();
+    a.run(&format!("CRTBNDRPG PGM({lib}/LCKR) SRCSTMF('{path}')"))
+        .await
+        .unwrap();
+    let call = format!("CALL PGM({lib}/LCKR)");
+    let alc = format!("ALCOBJ OBJ(({lib}/LCKF *FILE *EXCL)) WAIT(0)");
+    let (ra, rb) = tokio::join!(a.run(&call), async {
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        b.run(&alc).await
+    });
+    assert!(ra.is_ok(), "{ra:?}");
+    let e = rb.unwrap_err().to_string();
+    assert!(e.starts_with("CPF1002"), "{e}");
+    // The program has ended and closed the file: B gets *EXCL now, and
+    // then A's program cannot open the file.
+    b.run(&format!("ALCOBJ OBJ(({lib}/LCKF *FILE *EXCL)) WAIT(0)"))
+        .await
+        .unwrap();
+    let e = a.run(&format!("CALL PGM({lib}/LCKR)")).await.unwrap_err();
+    assert!(format!("{e:#}").contains("LCKF"), "{e:#}");
+    b.run(&format!("DLCOBJ OBJ(({lib}/LCKF *FILE *EXCL))"))
+        .await
+        .unwrap();
+}
+
+// A CL program's declared file is opened at its first RCVF with *SHRRD,
+// as an RPG open (IBM i Database programming, "Locking shared data");
+// another job's ALCOBJ *EXCL fails meanwhile; CLOSE and the program's end
+// give the lock back.
+#[tokio::test]
+async fn cl_declared_files_hold_shared_read_locks() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source::{put_member, Member};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let other = runtime::connect_db(&url).await.unwrap();
+    runtime::job_session(
+        &other,
+        Some(&format!("000081/QSECOFR/C{}", &lib[1..])),
+        std::time::Duration::from_millis(500),
+    )
+    .await
+    .unwrap();
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mk = |c| Job {
+        client: c,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let mut a = mk(&client);
+    let mut b = mk(&other);
+    for c in [
+        format!("RUNSQL SQL('CREATE TABLE {lib}/CLKF (K INTEGER NOT NULL)') COMMIT(*NONE)"),
+        format!("RUNSQL SQL('INSERT INTO {lib}/CLKF VALUES(1)') COMMIT(*NONE)"),
+        format!("CRTSRCPF FILE({lib}/QCLSRC)"),
+    ] {
+        a.run(&c).await.unwrap();
+    }
+    let src = "PGM\nDCLF FILE(CLKF)\nRCVF\nDLYJOB DLY(3)\nCLOSE\nDLYJOB DLY(2)\nENDPGM\n";
+    put_member(
+        &client,
+        &Member {
+            library: lib.clone(),
+            file: "QCLSRC".into(),
+            name: "CLKP".into(),
+            srctype: "CLLE".into(),
+            source: src.into(),
+            ..Default::default()
+        },
+        true,
+    )
+    .await
+    .unwrap();
+    a.run(&format!("CRTBNDCL PGM({lib}/CLKP) SRCFILE({lib}/QCLSRC)"))
+        .await
+        .unwrap();
+    let call = format!("CALL PGM({lib}/CLKP)");
+    let alc = format!("ALCOBJ OBJ(({lib}/CLKF *FILE *EXCL)) WAIT(0)");
+    let dlc = format!("DLCOBJ OBJ(({lib}/CLKF *FILE *EXCL))");
+    let (ra, (rb1, rb2)) = tokio::join!(a.run(&call), async {
+        // While the file is open: refused.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let r1 = b.run(&alc).await;
+        // After CLOSE (the program is still running): allocated.
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        let r2 = b.run(&alc).await;
+        if r2.is_ok() {
+            let _ = b.run(&dlc).await;
+        }
+        (r1, r2)
+    });
+    assert!(ra.is_ok(), "{ra:?}");
+    let e = rb1.unwrap_err().to_string();
+    assert!(e.starts_with("CPF1002"), "{e}");
+    assert!(rb2.is_ok(), "{rb2:?}");
 }

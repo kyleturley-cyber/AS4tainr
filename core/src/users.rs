@@ -210,6 +210,34 @@ pub async fn init(client: &Client) -> Result<()> {
         )
         .await?;
     }
+    // QUSER, the IBM-supplied profile server jobs run under (Security
+    // reference, "IBM-supplied user profiles": user class *USER, no
+    // password, so no one signs on with it).
+    let quser = client
+        .query_opt(
+            "SELECT 1 FROM as4tainr.user_profiles WHERE name = 'QUSER'",
+            &[],
+        )
+        .await?
+        .is_some();
+    if !quser {
+        create(
+            client,
+            NewProfile {
+                name: "QUSER".into(),
+                password: NewPassword::None,
+                expired: false,
+                enabled: true,
+                usrcls: "*USER".into(),
+                special: vec![],
+                curlib: "*CRTDFT".into(),
+                text: "Work station user".into(),
+                inlpgm: DEFAULT_INLPGM.into(),
+                inlmnu: DEFAULT_INLMNU.into(),
+            },
+        )
+        .await?;
+    }
     Ok(())
 }
 

@@ -3316,10 +3316,63 @@ pub(crate) async fn query_fields(
             &[],
         )
         .await;
+    // The table columns the query reads, to give a result column the
+    // decimal form (zoned or packed) of the column it is (Db2 for i keeps
+    // a ZONED column zoned in CREATE TABLE AS; PostgreSQL's numeric has
+    // no form: PUB400 2026-11-04, verify46 o46_refcv printed the zoned
+    // fields of QADSPPGM copied with CREATE TABLE AS as digits).
+    let used: Vec<(String, String, String)> = c
+        .query(
+            "SELECT DISTINCT n.nspname::text, t.relname::text, a.attname::text
+               FROM pg_rewrite w
+               JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = w.oid
+               JOIN pg_class t ON t.oid = d.refobjid
+               JOIN pg_namespace n ON n.oid = t.relnamespace
+               JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+              WHERE w.ev_class = 'pg_temp.as4tainr_ctas'::regclass AND d.refobjsubid > 0",
+            &[],
+        )
+        .await
+        .map(|rows| {
+            rows.iter()
+                .map(|r| (r.get(0), r.get(1), r.get(2)))
+                .collect()
+        })
+        .unwrap_or_default();
     let _ = c.batch_execute("DROP VIEW as4tainr_ctas").await;
     let _ = client.batch_execute(catalog::ROLE_DDL_UNLOCK).await;
     let cols = cols?;
-    let (fields, _) = catalog::fields_of_columns(&cols)?;
+    let (mut fields, _) = catalog::fields_of_columns(&cols)?;
+    for f in fields
+        .iter_mut()
+        .filter(|f| f.data_type == crate::dds::DataType::Packed)
+    {
+        let col = f.name.to_ascii_lowercase();
+        let from: Vec<&(String, String, String)> = used.iter().filter(|u| u.2 == col).collect();
+        // Only a name one table gives: an expression's column keeps packed.
+        if let [(schema, table, _)] = from.as_slice() {
+            let q = format!(
+                "{}/{}",
+                schema.to_ascii_uppercase(),
+                table.to_ascii_uppercase()
+            );
+            if let Ok(fr) = catalog::resolve_file(client, libl, &q).await {
+                if let Some(src) = fr
+                    .file
+                    .fields
+                    .iter()
+                    .find(|x| x.name.eq_ignore_ascii_case(&f.name))
+                {
+                    if src.data_type == crate::dds::DataType::Zoned
+                        && src.length == f.length
+                        && src.decimals == f.decimals
+                    {
+                        f.data_type = crate::dds::DataType::Zoned;
+                    }
+                }
+            }
+        }
+    }
     if fields.is_empty() {
         bail!("SQL0104: the query has no columns.");
     }

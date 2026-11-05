@@ -28,6 +28,21 @@ impl DataSession {
 
 /// The tasks driving the database connections still open. A command
 /// line process waits for them before it exits ([`close_connections`]).
+/// The job a process without one of as4tainr's jobs is to programs that
+/// ask (QUSRJOBI): `as4tainr sql` is an SQL client's server job, QSQSRVR
+/// (as XMLSERVICE's tests see a stateless call from PHP's ibm_db2 in
+/// server mode: test_80005's <jobname>QSQSRVR</jobname>); None: blank, as
+/// `system` and `call` (RTVJOBA there).
+static PROCESS_JOB: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+pub fn set_process_job(name: &'static str) {
+    let _ = PROCESS_JOB.set(name);
+}
+
+pub fn process_job() -> Option<&'static str> {
+    PROCESS_JOB.get().copied()
+}
+
 static CONNECTIONS: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> =
     std::sync::Mutex::new(Vec::new());
 

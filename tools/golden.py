@@ -93,6 +93,9 @@ def printed(lines):
 def shell_for(cmd, sandbox):
     if cmd.startswith("!"):
         line = cmd[1:].replace("/home/", sandbox + "/home/")
+        # IBM i's path to the `system` utility is the shim here (as QSH
+        # and PASE commands in as4tainr take it, qsh.rs).
+        line = re.sub(r"(?<![\w/])(/QOpenSys)?/usr/bin/system(?=[\s'\";|&)]|$)", "system", line)
         # A file written into a directory made with MKDIR (in the IFS, not
         # in the sandbox): make the directory in the sandbox too, so the
         # file is there to put into the IFS.

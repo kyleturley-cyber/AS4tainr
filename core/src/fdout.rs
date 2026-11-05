@@ -379,7 +379,7 @@ pub fn accpth(f: &FileInfo) -> Vec<Record> {
 
 impl Job<'_> {
     /// What the outfiles need to know about a file.
-    async fn file_info(&self, lib: &str, name: &str, attr: &str) -> Result<FileInfo> {
+    pub(crate) async fn file_info(&self, lib: &str, name: &str, attr: &str) -> Result<FileInfo> {
         let stamp = |col: &str| {
             format!(
                 "SELECT CASE WHEN t < '2000-01-01' THEN '0' ELSE '1' END, to_char(t, 'YYMMDD'), to_char(t, 'HH24MISS')

@@ -501,8 +501,23 @@ impl<'j, 'a> Rx<'j, 'a> {
                         Some(e) => self.eval(e).await?,
                         None => String::new(),
                     };
-                    let key = self.job.job_key();
-                    crate::pgmmsg::write_stdout(&key, &format!("{v}\n"));
+                    // SAY writes to STDOUT: an OVRDBF FILE(STDOUT) to a
+                    // source member adds the line to it as a record (REXX/400
+                    // Programmer's Guide: STDOUT can be overridden to a
+                    // database file); otherwise the job's standard output.
+                    let to = crate::ovr::effective(
+                        &self.job.calls.overrides,
+                        crate::ovr::Kind::Db,
+                        "STDOUT",
+                    )
+                    .and_then(|o| o.tofile.clone().map(|t| (t, o.mbr.clone())));
+                    if let Some((tofile, mbr)) = to {
+                        crate::source::append_line(self.job.client, &tofile, mbr.as_deref(), &v)
+                            .await?;
+                    } else {
+                        let key = self.job.job_key();
+                        crate::pgmmsg::write_stdout(&key, &format!("{v}\n"));
+                    }
                     Flow::Next
                 }
                 Stmt::Assign(n, e) => {

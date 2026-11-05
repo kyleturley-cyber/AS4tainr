@@ -23,7 +23,7 @@ A clause that is only an expression is a command for the command environment, `*
 
 After a command, RC is 0, or the identifier of the escape message it ended with (`CPF9801`); a command that fails raises the ERROR condition (SIGNAL ON ERROR jumps to the label `ERROR`, or the one NAME gives). `SNDPGMMSG MSGTYPE(*ESCAPE)` to the caller ends the procedure, and STRREXPRC with it.
 
-`SAY` writes to the job's standard output (`as4tainr system` shows it). `PULL` reads the external data queue (`PUSH`, `QUEUE`); there is no terminal input, so an empty queue gives an empty line. `EXIT n` with n not 0 ends STRREXPRC with CPF7CFF.
+`SAY` writes to the job's standard output (`as4tainr system` shows it), or, with OVRDBF FILE(STDOUT) TOFILE(lib/file) MBR(mbr) in effect, adds the line to that source member (XMLSERVICE reads its REXX output so). `PULL` reads the external data queue (`PUSH`, `QUEUE`); there is no terminal input, so an empty queue gives an empty line. `EXIT n` with n not 0 ends STRREXPRC with CPF7CFF.
 
 ## Commands with a REXX command processing program
 

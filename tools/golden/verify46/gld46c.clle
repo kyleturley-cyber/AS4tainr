@@ -1,0 +1,6 @@
+/* verify44: a program for DSPPGMREF, CHGPGM and CMPPFM.          */
+             PGM
+             DCLF       FILE(QSYS/QADSPOBJ)
+             DCL        VAR(&A) TYPE(*CHAR) LEN(10) VALUE('x')
+             CALL       PGM(QSYS/QCMDEXC) PARM('DLYJOB DLY(1)' 13)
+             ENDPGM

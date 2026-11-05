@@ -1,0 +1,6 @@
+/* verify49: hold data area GLD49A *EXCL for 60 seconds in a job of its own. */
+PGM
+  ALCOBJ OBJ((AS4TRAINR1/GLD49A *DTAARA *EXCL)) WAIT(0)
+  DLYJOB DLY(60)
+  DLCOBJ OBJ((AS4TRAINR1/GLD49A *DTAARA *EXCL))
+ENDPGM

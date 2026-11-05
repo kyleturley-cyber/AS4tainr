@@ -14,8 +14,9 @@
 //!
 //! An RPG program's file open, and a CL program's first RCVF of a
 //! declared file, take *SHRRD on the file (`open_file`); the close (CL's
-//! CLOSE or the program's end) gives it back. Conflicts are read from PostgreSQL's lock
-//! table, a job's other sessions (its RPG session) not counting.
+//! CLOSE or the program's end) gives it back. Conflicts are read from the allocations
+//! recorded by job (`owner`), a job's other sessions (its RPG session) not
+//! counting.
 //! Not done: SQL and data area `IN *LOCK` take no object
 //! locks; member and data locks; CONFLICT(*RQSRLS); docs/fidelity-gaps.md.
 
@@ -80,62 +81,99 @@ async fn drop_shared(client: &Client, t: &Target, state: &str) -> Result<bool> {
 }
 
 /// Does another job hold one of the states that conflict with `state`?
-/// Read from PostgreSQL's lock table: a lock held by a session of the
-/// same job (this session, or one with the same job name: the job's RPG
-/// session holding a file it opened) does not conflict, as a job's own
-/// locks never do on IBM i. Sessions without a job name count as one
-/// job (docs/fidelity-gaps.md).
-async fn conflicting(client: &Client, t: &Target, state: &str) -> Result<bool> {
-    for c in conflicts(state) {
-        let n: i64 = client
-            .query_one(
-                "SELECT count(*) FROM pg_locks l
-                   JOIN pg_stat_activity a ON a.pid = l.pid
-                  WHERE l.locktype = 'advisory' AND l.objsubid = 2 AND l.granted
-                    AND l.classid = (hashtext($1)::bigint & 4294967295)::oid
-                    AND l.objid = (hashtext($2)::bigint & 4294967295)::oid
-                    AND l.pid <> pg_backend_pid()
-                    AND a.application_name IS DISTINCT FROM current_setting('application_name')",
-                &[&class(c), &t.key()],
-            )
-            .await?
-            .get(0);
-        if n > 0 {
-            return Ok(true);
-        }
+/// Read from the allocations recorded in `as4tainr.object_locks` by job
+/// (`owner`: the job, or `PID<n>` for a process without one), of
+/// sessions still there: a job's own locks never conflict, whichever of
+/// its sessions holds them (its connection, its RPG session), as on IBM i.
+async fn conflicting(client: &Client, t: &Target, state: &str, owner: &str) -> Result<bool> {
+    let states: Vec<String> = conflicts(state).iter().map(|s| s.to_string()).collect();
+    if states.is_empty() {
+        return Ok(false);
     }
-    Ok(false)
+    let n: i64 = client
+        .query_one(
+            "SELECT count(*) FROM as4tainr.object_locks o
+               JOIN pg_stat_activity a ON a.pid = o.pid AND a.backend_start = o.started
+              WHERE o.key = $1 AND o.state = ANY($2) AND o.owner <> $3",
+            &[&t.key(), &states, &owner],
+        )
+        .await?
+        .get(0);
+    Ok(n > 0)
+}
+
+/// Record an allocation (before checking for conflicts, so two jobs
+/// asking at once see each other).
+async fn record(client: &Client, t: &Target, state: &str, owner: &str) -> Result<i64> {
+    Ok(client
+        .query_one(
+            &format!(
+                "INSERT INTO as4tainr.object_locks (pid, started, key, state, owner)
+                 SELECT pid, backend_start, $1, $2, $3 FROM {ME} m RETURNING seq"
+            ),
+            &[&t.key(), &state, &owner],
+        )
+        .await?
+        .get(0))
+}
+
+async fn unrecord(client: &Client, seq: i64) -> Result<()> {
+    client
+        .execute("DELETE FROM as4tainr.object_locks WHERE seq = $1", &[&seq])
+        .await?;
+    Ok(())
 }
 
 /// A file opened by a program: *SHRRD on the file (IBM i's open takes a
 /// shared read lock on the file, which keeps out another job's *EXCL;
 /// ALCOBJ in the CL reference, lock states). Waits up to `wait` for a
 /// conflicting lock to go; false when it did not.
-pub async fn open_file(client: &Client, library: &str, file: &str, wait: Duration) -> Result<bool> {
+pub async fn open_file(
+    client: &Client,
+    library: &str,
+    file: &str,
+    wait: Duration,
+    owner: &str,
+) -> Result<bool> {
     let t = Target {
         library: library.to_string(),
         name: file.to_string(),
         objtype: "*FILE".into(),
     };
-    // As `allocate`, without its sweep of ended sessions' rows (opens are
-    // frequent; ALCOBJ's next allocation clears them).
+    take(client, &t, "*SHRRD", Some(wait), owner, false).await
+}
+
+/// Take a lock: the session's shared advisory lock (it goes with the
+/// session) and its recorded allocation; given back when another job's
+/// allocation conflicts, tried again until `wait` has passed. `sweep`
+/// clears ended sessions' rows first (ALCOBJ; opens are too frequent).
+async fn take(
+    client: &Client,
+    t: &Target,
+    state: &str,
+    wait: Option<Duration>,
+    owner: &str,
+    sweep: bool,
+) -> Result<bool> {
+    if sweep {
+        client
+            .execute(
+                "DELETE FROM as4tainr.object_locks o WHERE NOT EXISTS
+                   (SELECT 1 FROM pg_stat_activity a WHERE a.pid = o.pid AND a.backend_start = o.started)",
+                &[],
+            )
+            .await?;
+    }
     let start = Instant::now();
     loop {
-        take_shared(client, &t, "*SHRRD").await?;
-        if !conflicting(client, &t, "*SHRRD").await? {
-            client
-                .execute(
-                    &format!(
-                        "INSERT INTO as4tainr.object_locks (pid, started, key, state)
-                         SELECT pid, backend_start, $1, '*SHRRD' FROM {ME} m"
-                    ),
-                    &[&t.key()],
-                )
-                .await?;
+        take_shared(client, t, state).await?;
+        let seq = record(client, t, state, owner).await?;
+        if !conflicting(client, t, state, owner).await? {
             return Ok(true);
         }
-        drop_shared(client, &t, "*SHRRD").await?;
-        if start.elapsed() >= wait {
+        unrecord(client, seq).await?;
+        drop_shared(client, t, state).await?;
+        if wait.is_some_and(|w| start.elapsed() >= w) {
             return Ok(false);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -166,6 +204,13 @@ CREATE TABLE IF NOT EXISTS as4tainr.object_locks (
     key      text NOT NULL,
     state    text NOT NULL
 );
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='object_locks' AND column_name='owner') THEN
+    ALTER TABLE as4tainr.object_locks ADD COLUMN IF NOT EXISTS owner text NOT NULL DEFAULT '';
+  END IF;
+END $$;
 ";
 
 /// The backend's identity: its PID and when it started (a PID can be
@@ -179,38 +224,12 @@ pub async fn allocate(
     t: &Target,
     state: &str,
     wait: Option<Duration>,
+    owner: &str,
 ) -> Result<bool> {
     if !STATES.contains(&state) {
         bail!("Lock state {state} is not valid; use *EXCL, *EXCLRD, *SHRUPD, *SHRNUP or *SHRRD.");
     }
-    let start = Instant::now();
-    loop {
-        take_shared(client, t, state).await?;
-        if !conflicting(client, t, state).await? {
-            client
-                .execute(
-                    "DELETE FROM as4tainr.object_locks o WHERE NOT EXISTS
-                       (SELECT 1 FROM pg_stat_activity a WHERE a.pid = o.pid AND a.backend_start = o.started)",
-                    &[],
-                )
-                .await?;
-            client
-                .execute(
-                    &format!(
-                        "INSERT INTO as4tainr.object_locks (pid, started, key, state)
-                         SELECT pid, backend_start, $1, $2 FROM {ME} m"
-                    ),
-                    &[&t.key(), &state],
-                )
-                .await?;
-            return Ok(true);
-        }
-        drop_shared(client, t, state).await?;
-        if wait.is_some_and(|w| start.elapsed() >= w) {
-            return Ok(false);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    take(client, t, state, wait, owner, true).await
 }
 
 /// Deallocate one allocation (the latest); false when the job held none

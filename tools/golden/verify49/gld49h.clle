@@ -1,0 +1,7 @@
+/* verify49: keep file GLD49F open (DCLF, RCVF) for 60 seconds in a job of its own. */
+PGM
+  DCLF FILE(AS4TRAINR1/GLD49F)
+  RCVF
+  DLYJOB DLY(60)
+  CLOSE
+ENDPGM

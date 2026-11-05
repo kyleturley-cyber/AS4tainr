@@ -5746,6 +5746,7 @@ impl Job<'_> {
             // here those CRTLF made are built again from their DDS; SQL
             // indexes and views over it must be dropped first.
             let mut rebuild: Vec<(String, String, String, String, String)> = Vec::new();
+            let mut sql_indexes: Vec<(String, String, Option<String>)> = Vec::new();
             for (dl, dn) in catalog::dependent_files(self.client, &lib, &name).await? {
                 let row = self
                     .client
@@ -5758,12 +5759,56 @@ impl Job<'_> {
                         &[&dl, &dn],
                     )
                     .await?;
+                // An SQL index (no DDS): described as the keyed logical
+                // file it is (all the table's fields, its keys, DESCEND,
+                // UNIQUE), built again so, then made an SQL index again
+                // with its SQL name.
+                let index = match &row {
+                    Some(r) if r.get::<_, String>(0).trim().is_empty() => self
+                        .client
+                        .query_opt(
+                            "SELECT sql_name FROM as4tainr.files WHERE library=$1 AND name=$2 AND sql_type='INDEX'",
+                            &[&dl, &dn],
+                        )
+                        .await?
+                        .map(|x| x.get::<_, Option<String>>(0)),
+                    _ => None,
+                };
+                if let (Some(r), Some(sql_name)) = (&row, index) {
+                    let ix =
+                        catalog::resolve_file(self.client, std::slice::from_ref(&dl), &dn).await?;
+                    if ix.file.format != fr.file.format {
+                        bail!(
+                            "File {name} in library {shown} was not changed: SQL index {dn} in library {} has a record format of its own (RCDFMT); drop it first.",
+                            crate::qtemp::logical(&dl)
+                        );
+                    }
+                    let mut dds = String::new();
+                    if ix.file.unique {
+                        dds.push_str(&format!("{:<44}UNIQUE\n", "     A"));
+                    }
+                    dds.push_str(&format!(
+                        "{:<44}PFILE({name})\n",
+                        format!("     A          R {}", ix.file.format)
+                    ));
+                    for k in &ix.file.keys {
+                        let line = format!("     A          K {k}");
+                        if ix.file.is_descending(k) {
+                            dds.push_str(&format!("{line:<44}DESCEND\n"));
+                        } else {
+                            dds.push_str(&format!("{line}\n"));
+                        }
+                    }
+                    sql_indexes.push((dl.clone(), dn.clone(), sql_name));
+                    rebuild.push((dl, dn, dds, r.get(1), r.get(2)));
+                    continue;
+                }
                 match row {
                     Some(r) if !r.get::<_, String>(0).trim().is_empty() => {
                         rebuild.push((dl, dn, r.get(0), r.get(1), r.get(2)))
                     }
                     _ => bail!(
-                        "File {name} in library {shown} was not changed: {dn} in library {} over it is an SQL index or view, or a logical file made before as4tainr kept its DDS; delete it first.",
+                        "File {name} in library {shown} was not changed: {dn} in library {} over it is an SQL view, or a logical file made before as4tainr kept its DDS; delete it first.",
                         crate::qtemp::logical(&dl)
                     ),
                 }
@@ -5841,6 +5886,7 @@ impl Job<'_> {
                 lib: &str,
                 name: &str,
                 rebuild: &[(String, String, String, String, String)],
+                sql_indexes: &[(String, String, Option<String>)],
             ) -> Result<()> {
                 for (dl, dn, dds, text, owner) in rebuild {
                     let mut lf = crate::dds::parse_lf(dn, dds)?;
@@ -5860,6 +5906,18 @@ impl Job<'_> {
                         .await?;
                     if !owner.is_empty() {
                         authority::set_owner(job.client, dl, dn, "*FILE", owner).await?;
+                    }
+                }
+                for (dl, dn, sql_name) in sql_indexes {
+                    job.client
+                        .execute(
+                            "UPDATE as4tainr.logical_files SET dds='' WHERE library=$1 AND name=$2",
+                            &[dl, dn],
+                        )
+                        .await?;
+                    catalog::set_sql_type(job.client, dl, dn, "INDEX").await?;
+                    if let Some(n) = sql_name.as_ref().filter(|n| n.as_str() != dn.as_str()) {
+                        catalog::set_sql_name(job.client, dl, dn, n, false).await?;
                     }
                 }
                 Ok(())
@@ -5916,7 +5974,7 @@ impl Job<'_> {
             .await
             {
                 let _ = Box::pin(self.run(&format!("DLTF FILE(QTEMP/{name})"))).await;
-                let _ = build_again(self, &mut c, &lib, &name, &rebuild).await;
+                let _ = build_again(self, &mut c, &lib, &name, &rebuild, &sql_indexes).await;
                 return Err(e.context(format!(
                     "File {name} in library {shown} was not changed (SQL views over it must be dropped first)."
                 )));
@@ -5931,11 +5989,11 @@ impl Job<'_> {
                 )))
                 .await;
                 let _ = Box::pin(self.run(&format!("DLTF FILE(QTEMP/{name})"))).await;
-                let _ = build_again(self, &mut c, &lib, &name, &rebuild).await;
+                let _ = build_again(self, &mut c, &lib, &name, &rebuild, &sql_indexes).await;
                 return Err(e.context(format!("File {name} in library {shown} was not changed.")));
             }
             Box::pin(self.run(&format!("DLTF FILE({lib}/{aside})"))).await?;
-            build_again(self, &mut c, &lib, &name, &rebuild).await?;
+            build_again(self, &mut c, &lib, &name, &rebuild, &sql_indexes).await?;
             authority::restore(self.client, &lib, &name, "*FILE", &kept).await?;
             for c in &again {
                 // What the move kept already is not done again.
@@ -8268,6 +8326,7 @@ impl Job<'_> {
             wanted.push((name, ty, state));
         }
         self.name_session().await?;
+        let owner = self.lock_owner().await?;
         let mut taken: Vec<(crate::objlock::Target, String)> = Vec::new();
         for (name, ty, state) in wanted {
             let target = match self.lock_target(&name, &ty).await {
@@ -8288,7 +8347,7 @@ impl Job<'_> {
                     return Err(err);
                 }
             };
-            if !crate::objlock::allocate(self.client, &target, &state, wait).await? {
+            if !crate::objlock::allocate(self.client, &target, &state, wait, &owner).await? {
                 self.release_locks(&taken).await?;
                 bail!(
                     "CPF1002: Cannot allocate object {} in library {} ({}): another job holds a lock that conflicts with {state}.",
@@ -8304,6 +8363,25 @@ impl Job<'_> {
 
     /// The job's connection carries the job's name, as its RPG session
     /// does, so the job's own object locks do not conflict (objlock.rs).
+    /// Who holds an object lock this job takes (objlock.rs): the job, or
+    /// the job name its connection carries, or the process (`PID<n>`, as
+    /// its RPG sessions name it).
+    pub(crate) async fn lock_owner(&self) -> Result<String> {
+        if self.id.is_some() {
+            return Ok(self.job_key());
+        }
+        let name: String = self
+            .client
+            .query_one("SELECT current_setting('application_name')", &[])
+            .await?
+            .get(0);
+        Ok(if name.is_empty() {
+            self.job_key()
+        } else {
+            name
+        })
+    }
+
     pub(crate) async fn name_session(&self) -> Result<()> {
         if let Some(id) = &self.id {
             let name = id.to_string().replace('\'', "");

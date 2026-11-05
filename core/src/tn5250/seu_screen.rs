@@ -290,7 +290,7 @@ pub(super) async fn edit(term: &mut Term, job: &mut Job<'_>, t: &EditTarget) -> 
                 let cl = matches!(&src, Source::Member { member: m, .. }
                     if matches!(m.srctype.to_ascii_uppercase().as_str(), "CLP" | "CLLE" | "CL"));
                 let row = inp.cursor.0 as usize;
-                let v = (row >= 5 && row < 5 + PAGE).then(|| top + row - 5);
+                let v = (5..5 + PAGE).contains(&row).then(|| top + row - 5);
                 match v {
                     _ if !cl => message = "F4 prompts statements of CL members here.".into(),
                     Some(v) if v >= 1 && v <= n => {
@@ -454,7 +454,8 @@ async fn syntax_check(
     }))
 }
 
-/// SEU's syntax checking of a DDS member (PF, LF, DSPF, PRTF; SEU
+/// SEU's syntax checking of a DDS or ILE RPG member (PF, LF, DSPF, PRTF,
+/// RPGLE, SQLRPGLE; SEU
 /// User's Guide: DDS source is checked as it is typed): the member parsed
 /// as its compiler parses it, the first error on one of the lines typed
 /// (1-based) with its message (an ID where the DDS listing gives one,
@@ -469,6 +470,14 @@ pub fn dds_check(srctype: &str, source: &[&str], lines: &[usize]) -> Option<(usi
         .join("\n")
         + "\n";
     let r: anyhow::Result<()> = match srctype.to_ascii_uppercase().as_str() {
+        // ILE RPG: the member parsed as the compiler parses it, /COPY
+        // members taken as empty (their lines are not this member's);
+        // names are not checked (a program being typed uses names it
+        // declares further down), as SEU's own check is of the syntax.
+        "RPGLE" | "SQLRPGLE" => {
+            let src = source.join("\n") + "\n";
+            crate::rpg::parse::parse(&src, &|_| Some(String::new())).map(|_| ())
+        }
         "PF" => {
             let refs = source.iter().any(|l| {
                 let u = l.to_ascii_uppercase();
@@ -631,7 +640,17 @@ mod tests {
             "     A            NAME          20X",
         ];
         assert!(dds_check("PF", &refs, &[3]).is_none());
-        assert!(dds_check("RPGLE", &src, &[3]).is_none());
+        assert!(dds_check("TXT", &src, &[3]).is_none());
+        // ILE RPG: a syntax error on a line typed is shown with its line
+        // (the compiler's parse error); a name not defined is left to the
+        // compile.
+        let rpg = [
+            "     C                   EVAL      X = 1 +",
+            "     C                   EVAL      Y = UNDEFINED",
+        ];
+        let (line, _) = dds_check("RPGLE", &rpg, &[1]).unwrap();
+        assert_eq!(line, 1);
+        assert!(dds_check("RPGLE", &rpg, &[2]).is_none());
     }
 
     #[test]

@@ -2064,7 +2064,12 @@ pub static COMMANDS: &[CommandDef] = &[
     CommandDef {
         name: "DSPDTAARA",
         description: "Display Data Area",
-        params: &[p("DTAARA", Kind::Qualified, true, None, "Data area").ch("Name, *LDA")],
+        // OUTPUT (CL reference, DSPDTAARA): * or *PRINT; the report is
+        // printed in batch and under `system` either way.
+        params: &[
+            p("DTAARA", Kind::Qualified, true, None, "Data area").ch("Name, *LDA"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT"),
+        ],
     },
     CommandDef {
         name: "DLTDTAARA",

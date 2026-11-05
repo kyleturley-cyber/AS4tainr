@@ -278,6 +278,9 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] RPG file opens hold a shared read lock (*SHRRD): another job's ALCOBJ *EXCL fails while a file is open, and its *EXCL keeps opens out
 - [x] CHGPF keeps the file's owner, authorities, journaling and trigger programs; SEU checks DDS members (PF, LF, DSPF, PRTF) as they are typed
 - [x] CL programs' declared files hold *SHRRD while open; SEU F4 prompts CL statements and writes them back
+- [x] ILE RPG: RNF2121/RNF2109 for a file whose record format has the file's name (verify47); SEU checks RPGLE members' syntax as they are typed
+- [x] Object locks are held by job (a job's own sessions never conflict; two `system` processes are two jobs, verify47)
+- [x] CHGPF keeps SQL indexes over the file; DSPDTAARA OUTPUT
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).
 - [x] Journals and trigger programs: COM's SETUPJRN, ORDAUDJV (QSYS2.DISPLAY_JOURNAL) and ORDTRG (ADDPFTRG) run (docs/journals.md).

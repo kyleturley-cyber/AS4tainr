@@ -1,0 +1,12 @@
+# Golden: what a file open by another job keeps out, and with which
+# messages: WRKOBJLCK of the open (file, member, data locks), CLRPFM,
+# RGZPFM, ALCOBJ *EXCL, *EXCLRD and *SHRRD, DLTF; and CHGDTAARA and
+# RTVDTAARA (in CL) of a data area another job holds *EXCL. A CL program
+# in a background `system` job holds the file or data area for 60 s.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify49.txt -Files tools\golden\verify49
+r49_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLD49H)" "DLTPGM PGM(AS4TRAINR1/GLD49D)" "DLTF FILE(AS4TRAINR1/GLD49F)" "DLTF FILE(AS4TRAINR1/GLD49S)" "DLTDTAARA DTAARA(AS4TRAINR1/GLD49A)"; do system -q "$c"; done; echo cleaned
+r49_tag|!for f in gld49h.clle gld49d.clle; do setccsid 819 /home/AS4TRAINR/gld/$f; done; ls /home/AS4TRAINR/gld | grep gld49
+r49_make|!system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD49F (K INTEGER NOT NULL)') COMMIT(*NONE)"; system "RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD49F VALUES(1), (2)') COMMIT(*NONE)"; system -q "CRTDTAARA DTAARA(AS4TRAINR1/GLD49A) TYPE(*CHAR) LEN(10) VALUE('before')"; system -q "CRTSRCPF FILE(AS4TRAINR1/GLD49S) RCDLEN(92)"; for m in GLD49H GLD49D; do f=$(echo $m | tr A-Z a-z).clle; system "CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/$f') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD49S.FILE/$m.MBR')"; system "CRTBNDCL PGM(AS4TRAINR1/$m) SRCFILE(AS4TRAINR1/GLD49S)" | grep -E "^CP[CF]"; done
+r49_open|!(system "CALL PGM(AS4TRAINR1/GLD49H)" > /dev/null 2>&1 &); sleep 5; system "WRKOBJLCK OBJ(AS4TRAINR1/GLD49F) OBJTYPE(*FILE)" | grep -E "EXCL|SHR" | cut -c1-90; for c in "CLRPFM FILE(AS4TRAINR1/GLD49F)" "RGZPFM FILE(AS4TRAINR1/GLD49F)" "ALCOBJ OBJ((AS4TRAINR1/GLD49F *FILE *EXCL)) WAIT(1)" "ALCOBJ OBJ((AS4TRAINR1/GLD49F *FILE *EXCLRD)) WAIT(1)" "ALCOBJ OBJ((AS4TRAINR1/GLD49F *FILE *SHRRD)) WAIT(1)" "DLTF FILE(AS4TRAINR1/GLD49F)"; do echo "== $c"; system "$c"; echo "rc=$?"; done; sleep 60
+r49_dtaara|!(system "CALL PGM(AS4TRAINR1/GLD49D)" > /dev/null 2>&1 &); sleep 5; system "CHGDTAARA DTAARA(AS4TRAINR1/GLD49A) VALUE('changed')"; echo "chg rc=$?"; system "DSPDTAARA DTAARA(AS4TRAINR1/GLD49A) OUTPUT(*PRINT)" | grep -iE "before|changed"; echo "dsp rc=$?"; sleep 60; system "DSPDTAARA DTAARA(AS4TRAINR1/GLD49A) OUTPUT(*PRINT)" | grep -iE "before|changed"
+r49_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLD49H)" "DLTPGM PGM(AS4TRAINR1/GLD49D)" "DLTF FILE(AS4TRAINR1/GLD49F)" "DLTF FILE(AS4TRAINR1/GLD49S)" "DLTDTAARA DTAARA(AS4TRAINR1/GLD49A)"; do system -q "$c"; done; echo cleaned

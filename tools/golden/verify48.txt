@@ -1,0 +1,13 @@
+# Golden (verify47 again: its RPG source did not compile on IBM i, RNF2121): a file open while another job holds *EXCL on the file (a CL
+# program in a background `system` job holds it for 20 seconds): the RPG
+# status and message ID of the failed open, the job log of the opening
+# job, and ALCOBJ *SHRRD and *EXCLRD from a third job meanwhile.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify48.txt -Files tools\golden\verify48
+q48_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLD48H)" "DLTPGM PGM(AS4TRAINR1/GLD48R)" "DLTF FILE(AS4TRAINR1/GLD48F)" "DLTF FILE(AS4TRAINR1/GLD48O)" "DLTF FILE(AS4TRAINR1/GLD48S)"; do system -q "$c"; done; echo cleaned
+q48_tag|!for f in gld48h.clle gld48r.rpgle; do setccsid 819 /home/AS4TRAINR/gld/$f; done; ls /home/AS4TRAINR/gld | grep gld48
+q48_files|!system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD48F (K INTEGER NOT NULL)') COMMIT(*NONE)"; system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD48O (RES CHAR(40) NOT NULL)') COMMIT(*NONE)"; system "RUNSQL SQL('LABEL ON TABLE AS4TRAINR1/GLD48O IS ''verify48''') COMMIT(*NONE)"; echo made
+q48_crth|!system -q "CRTSRCPF FILE(AS4TRAINR1/GLD48S) RCDLEN(92)"; system "CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld48h.clle') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD48S.FILE/GLD48H.MBR')"; system "CRTBNDCL PGM(AS4TRAINR1/GLD48H) SRCFILE(AS4TRAINR1/GLD48S)" | grep -E "^CP[CF]"
+q48_crtr|CRTBNDRPG PGM(AS4TRAINR1/GLD48R) SRCSTMF('/home/AS4TRAINR/gld/gld48r.rpgle')
+q48_held|!(system "CALL PGM(AS4TRAINR1/GLD48H)" > /dev/null 2>&1 &); sleep 5; system "WRKOBJLCK OBJ(AS4TRAINR1/GLD48F) OBJTYPE(*FILE)" | grep -E "EXCL|SHR" | cut -c1-80; system "ALCOBJ OBJ((AS4TRAINR1/GLD48F *FILE *SHRRD)) WAIT(1)"; echo "shrrd rc=$?"; system -i "CALL PGM(AS4TRAINR1/GLD48R)"; echo "call rc=$?"; system "DSPJOBLOG OUTPUT(*PRINT)" | grep -E "^[A-Z]{3}[0-9A-F]{4} " | head -20; sleep 20; system "CPYF FROMFILE(AS4TRAINR1/GLD48O) TOFILE(*PRINT)" | grep -E "OPENED|ST "
+q48_after|!system -i "CALL PGM(AS4TRAINR1/GLD48R)"; system "CPYF FROMFILE(AS4TRAINR1/GLD48O) TOFILE(*PRINT)" | grep -E "OPENED|ST "
+q48_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLD48H)" "DLTPGM PGM(AS4TRAINR1/GLD48R)" "DLTF FILE(AS4TRAINR1/GLD48F)" "DLTF FILE(AS4TRAINR1/GLD48O)" "DLTF FILE(AS4TRAINR1/GLD48S)"; do system -q "$c"; done; echo cleaned

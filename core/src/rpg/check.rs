@@ -15,7 +15,10 @@
 //!   not used (RNF7066, 00) (PUB400 2026-10-28, tools/golden/verify12.txt
 //!   n12_rpgp, n12_rpgx, n12_rpgj: `dcl-ds outr likerec(OUTR: *output)`);
 //! - RNF7016 (20): DSPLY of a character field longer than 52 bytes
-//!   (PUB400 2026-10-30, tools/golden/verify26.txt s26_dsply60).
+//!   (PUB400 2026-10-30, tools/golden/verify26.txt s26_dsply60);
+//! - RNF2121 (30) and RNF2109 (40): an externally described file whose
+//!   record format has the file's name, without RENAME (PUB400
+//!   2026-11-05, tools/golden/verify47.txt p47_crtr).
 //!
 //! The texts are as4tainr's own.
 
@@ -425,6 +428,41 @@ pub fn check(src: &Source, prog: &Program, text: &str) -> Checked {
                 at: None,
             });
         }
+    }
+    // An externally described file whose record format has the file's
+    // name (an SQL table) and no RENAME: RNF2121 (30) then RNF2109 (40),
+    // both pointing at the file's name on its declaration (PUB400
+    // 2026-11-05, tools/golden/verify47.txt p47_crtr: `dcl-f GLD47F` over
+    // an SQL table; the same file with rename(GLD47O:GLD47OR) compiled).
+    for f in &prog.files {
+        if f.program_described || f.fref.is_none() || f.decl.device != "DISK" {
+            continue;
+        }
+        let name = f.decl.name.to_ascii_uppercase();
+        if f.format.to_ascii_uppercase() != name {
+            continue;
+        }
+        let at = text.lines().nth(f.decl.line.wrapping_sub(1)).and_then(|l| {
+            let up = l.to_ascii_uppercase();
+            let k = up.find(&name)?;
+            Some((up[..k].chars().count(), name.chars().count()))
+        });
+        w.out.diags.push(Diag {
+            line: f.decl.line,
+            id: "RNF2121".into(),
+            sev: 30,
+            text: format!(
+                "File {name} has a record format of the same name, {name}: the format needs RENAME."
+            ),
+            at,
+        });
+        w.out.diags.push(Diag {
+            line: f.decl.line,
+            id: "RNF2109".into(),
+            sev: 40,
+            text: format!("File {name} cannot be used: its record formats are not all usable."),
+            at,
+        });
     }
     let mut out = w.out;
     out.diags.extend(blocking(src));

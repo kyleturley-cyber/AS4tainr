@@ -25726,6 +25726,9 @@ async fn change_a_physical_file_with_a_logical_file_over_it() {
         format!("CRTJRNRCV JRNRCV({lib}/CHGR0001)"),
         format!("CRTJRN JRN({lib}/CHGJ) JRNRCV({lib}/CHGR0001)"),
         format!("STRJRNPF FILE({lib}/CHGLP) JRN({lib}/CHGJ) IMAGES(*BOTH)"),
+        // An SQL index over the file is kept too (an index is the keyed
+        // access path IBM i keeps with the file).
+        format!("RUNSQL SQL('CREATE INDEX {lib}/CHGLX ON {lib}/CHGLP (NAME DESC)') COMMIT(*NONE)"),
     ] {
         job.run(&c).await.unwrap();
     }
@@ -25813,6 +25816,22 @@ async fn change_a_physical_file_with_a_logical_file_over_it() {
         .map(|r| r.get(0))
         .collect();
     assert_eq!(trg, ["CHGTRG"]);
+    let ix = client
+        .query_one(
+            "SELECT f.sql_type, l.pf_name FROM as4tainr.files f
+               JOIN as4tainr.logical_files l ON l.library = f.library AND l.name = f.name
+              WHERE f.library=$1 AND f.name='CHGLX'",
+            &[&lib],
+        )
+        .await
+        .unwrap();
+    assert_eq!(ix.get::<_, Option<String>>(0).as_deref(), Some("INDEX"));
+    assert_eq!(ix.get::<_, String>(1), "CHGLP");
+    let x = catalog::resolve_file(&client, std::slice::from_ref(&lib), "CHGLX")
+        .await
+        .unwrap();
+    assert_eq!(x.file.keys, ["NAME"]);
+    assert!(x.file.is_descending("NAME"));
     // The logical file reads the records in its key order.
     let r = job
         .run(&format!(
@@ -25890,7 +25909,7 @@ async fn rpg_program_references_and_create_table_as_zoned() {
     ))
     .await
     .unwrap();
-    let src = "**FREE\nctl-opt dftactgrp(*no) actgrp(*caller);\ndcl-f GLD46P usage(*input);\ndcl-pr qcmdexc extpgm('QCMDEXC');\n  cmd char(100) const;\n  len packed(15: 5) const;\nend-pr;\ndcl-pr callc extpgm('GLD46C') end-pr;\nread GLD46P;\n*inlr = *on;\n";
+    let src = "**FREE\nctl-opt dftactgrp(*no) actgrp(*caller);\ndcl-f GLD46P usage(*input) rename(GLD46P:GLD46R);\ndcl-pr qcmdexc extpgm('QCMDEXC');\n  cmd char(100) const;\n  len packed(15: 5) const;\nend-pr;\ndcl-pr callc extpgm('GLD46C') end-pr;\nread GLD46P;\n*inlr = *on;\n";
     let path = format!("/tmp/{}.rpgle", lib.to_ascii_lowercase());
     as4tainr_core::ifs::write_file(&client, &path, src.as_bytes(), 819, 0o644, "QSECOFR")
         .await
@@ -25971,6 +25990,8 @@ async fn rpg_program_references_and_create_table_as_zoned() {
     );
 }
 
+// (The SQL table's record format is renamed, as IBM i requires: verify47
+// p47_crtr, RNF2121.)
 // A program's open file holds *SHRRD on the file (IBM i Database
 // programming, "Locking shared data": an open places a shared read lock
 // on the file; CL reference, ALCOBJ lock state table: *EXCL goes with
@@ -26016,7 +26037,7 @@ async fn open_files_hold_shared_read_locks() {
     .await
     .unwrap();
     let src = format!(
-        "**FREE\ndcl-f LCKF usage(*input);\ndcl-pr qcmdexc extpgm('QCMDEXC');\n  cmd char(200) const;\n  len packed(15: 5) const;\nend-pr;\nread LCKF;\nqcmdexc('ALCOBJ OBJ(({lib}/LCKF *FILE *EXCL)) WAIT(0)': 200);\nqcmdexc('DLCOBJ OBJ(({lib}/LCKF *FILE *EXCL))': 200);\nqcmdexc('DLYJOB DLY(3)': 200);\n*inlr = *on;\n"
+        "**FREE\ndcl-f LCKF usage(*input) rename(LCKF:LCKR);\ndcl-pr qcmdexc extpgm('QCMDEXC');\n  cmd char(200) const;\n  len packed(15: 5) const;\nend-pr;\nread LCKF;\nqcmdexc('ALCOBJ OBJ(({lib}/LCKF *FILE *EXCL)) WAIT(0)': 200);\nqcmdexc('DLCOBJ OBJ(({lib}/LCKF *FILE *EXCL))': 200);\nqcmdexc('DLYJOB DLY(3)': 200);\n*inlr = *on;\n"
     );
     let path = format!("/tmp/{}lck.rpgle", lib.to_ascii_lowercase());
     as4tainr_core::ifs::write_file(&client, &path, src.as_bytes(), 819, 0o644, "QSECOFR")

@@ -3528,11 +3528,13 @@ async fn file_command(
                 // The open takes *SHRRD on the file, as an RPG open does
                 // (objlock.rs; WAITFILE *IMMED).
                 job.name_session().await?;
+                let owner = job.lock_owner().await?;
                 if !crate::objlock::open_file(
                     job.client,
                     &fr.library,
                     &fr.file.name,
                     std::time::Duration::ZERO,
+                    &owner,
                 )
                 .await?
                 {

@@ -2246,6 +2246,7 @@ impl<'a> Machine<'a> {
             &fref.library,
             &fref.file.name,
             std::time::Duration::ZERO,
+            &self.io.job_key,
         ))?;
         if !locked {
             bail!(

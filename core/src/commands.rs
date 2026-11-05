@@ -5768,6 +5768,11 @@ impl Job<'_> {
                     ),
                 }
             }
+            // The logical files' authorities, before they are deleted.
+            let mut kept_lfs = Vec::new();
+            for (dl, dn, ..) in &rebuild {
+                kept_lfs.push(authority::keep(self.client, dl, dn, "*FILE").await?);
+            }
             let records: i64 = self
                 .client
                 .query_one(
@@ -5859,6 +5864,50 @@ impl Job<'_> {
                 }
                 Ok(())
             }
+            // The file's owner and authorities, and its logical files'
+            // go to the changed file (CL reference, CHGPF: the file keeps
+            // its authorities).
+            let kept = authority::keep(self.client, &lib, &name, "*FILE").await?;
+            // Its journaling and trigger programs, started and added again
+            // on the changed file (the file is the same object on IBM i).
+            let mut again: Vec<String> = Vec::new();
+            if let Some(j) = self
+                .client
+                .query_opt(
+                    "SELECT journal_lib, journal, images, omtjrne FROM as4tainr.journaled_files WHERE library=$1 AND file=$2",
+                    &[&lib, &name],
+                )
+                .await?
+            {
+                again.push(format!(
+                    "STRJRNPF FILE({lib}/{name}) JRN({}/{}) IMAGES({}) OMTJRNE({})",
+                    j.get::<_, String>(0),
+                    j.get::<_, String>(1),
+                    j.get::<_, String>(2),
+                    j.get::<_, String>(3)
+                ));
+            }
+            for t in self
+                .client
+                .query(
+                    "SELECT trg_lib, trg, time, event, pgm_lib, pgm, alwrepchg, updcnd
+                       FROM as4tainr.file_triggers WHERE library=$1 AND file=$2 ORDER BY added",
+                    &[&lib, &name],
+                )
+                .await?
+            {
+                again.push(format!(
+                    "ADDPFTRG FILE({lib}/{name}) TRGTIME({}) TRGEVENT({}) PGM({}/{}) TRG('{}') TRGLIB({}) ALWREPCHG({}) TRGUPDCND({})",
+                    t.get::<_, String>(2),
+                    t.get::<_, String>(3),
+                    t.get::<_, String>(4),
+                    t.get::<_, String>(5),
+                    t.get::<_, String>(1).replace('\'', "''"),
+                    t.get::<_, String>(0),
+                    if t.get::<_, bool>(6) { "*YES" } else { "*NO" },
+                    t.get::<_, String>(7)
+                ));
+            }
             // The old file aside under a name of its own, the new one in.
             let aside = format!("Q{:09}", std::process::id() % 1_000_000_000);
             if let Err(e) = Box::pin(self.run(&format!(
@@ -5887,6 +5936,44 @@ impl Job<'_> {
             }
             Box::pin(self.run(&format!("DLTF FILE({lib}/{aside})"))).await?;
             build_again(self, &mut c, &lib, &name, &rebuild).await?;
+            authority::restore(self.client, &lib, &name, "*FILE", &kept).await?;
+            for c in &again {
+                // What the move kept already is not done again.
+                let there = if c.starts_with("STRJRNPF") {
+                    self.client
+                        .query_opt(
+                            "SELECT 1 FROM as4tainr.journaled_files WHERE library=$1 AND file=$2",
+                            &[&lib, &name],
+                        )
+                        .await?
+                        .is_some()
+                } else {
+                    let trg = c
+                        .split("TRG('")
+                        .nth(1)
+                        .and_then(|x| x.split("')").next())
+                        .unwrap_or("")
+                        .replace("''", "'");
+                    self.client
+                        .query_opt(
+                            "SELECT 1 FROM as4tainr.file_triggers WHERE library=$1 AND file=$2 AND trg=$3",
+                            &[&lib, &name, &trg],
+                        )
+                        .await?
+                        .is_some()
+                };
+                if there {
+                    continue;
+                }
+                Box::pin(self.run(c)).await.map_err(|e| {
+                    e.context(format!(
+                        "File {name} in library {shown} was changed, but this did not run again on it: {c}"
+                    ))
+                })?;
+            }
+            for ((dl, dn, ..), k) in rebuild.iter().zip(&kept_lfs) {
+                authority::restore(self.client, dl, dn, "*FILE", k).await?;
+            }
             msgs.push(format!(
                 "File {name} in library {shown} changed from source member {mbr}: {records} record(s) kept."
             ));
@@ -8180,6 +8267,7 @@ impl Job<'_> {
             }
             wanted.push((name, ty, state));
         }
+        self.name_session().await?;
         let mut taken: Vec<(crate::objlock::Target, String)> = Vec::new();
         for (name, ty, state) in wanted {
             let target = match self.lock_target(&name, &ty).await {
@@ -8212,6 +8300,18 @@ impl Job<'_> {
             taken.push((target, state));
         }
         Ok(Outcome::Messages(Vec::new()))
+    }
+
+    /// The job's connection carries the job's name, as its RPG session
+    /// does, so the job's own object locks do not conflict (objlock.rs).
+    pub(crate) async fn name_session(&self) -> Result<()> {
+        if let Some(id) = &self.id {
+            let name = id.to_string().replace('\'', "");
+            self.client
+                .batch_execute(&format!("SET application_name = '{name}'"))
+                .await?;
+        }
+        Ok(())
     }
 
     async fn release_locks(&mut self, taken: &[(crate::objlock::Target, String)]) -> Result<()> {

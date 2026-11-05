@@ -2954,6 +2954,22 @@ async fn run_program(
     pgm: &Program,
     args: &[String],
 ) -> Result<(Outcome, Vec<String>)> {
+    let mut io = FileIo::default();
+    let r = Box::pin(run_program_with(job, pgm, args, &mut io)).await;
+    // The files the program opened are closed when it ends, however it
+    // ends: their object locks go.
+    for (_, f) in io.open.drain() {
+        let _ = crate::objlock::close_file(job.client, &f.file.library, &f.file.file.name).await;
+    }
+    r
+}
+
+async fn run_program_with(
+    job: &mut Job<'_>,
+    pgm: &Program,
+    args: &[String],
+    io: &mut FileIo,
+) -> Result<(Outcome, Vec<String>)> {
     let mut vars: HashMap<String, Var> = pgm.decls.iter().cloned().collect();
     // The job, for %SWITCH (a name no CL variable can have).
     vars.insert(
@@ -3025,7 +3041,6 @@ async fn run_program(
         .map(|(n, _)| n.clone())
         .collect();
     let mut msgs: Vec<String> = Vec::new();
-    let mut io = FileIo::default();
     let mut pc = 0usize;
     let mut steps = 0u64;
     let mut resume_at: Option<usize> = None;
@@ -3128,7 +3143,7 @@ async fn run_program(
                 job.calls.escape = None;
                 job.calls.escape_to_caller = false;
                 job.calls.set_line(st.line);
-                let result = command(job, pgm, st, &mut vars, &mut msgs, &mut io).await;
+                let result = command(job, pgm, st, &mut vars, &mut msgs, io).await;
                 match result {
                     Ok(Some(o)) => return Ok((o, param_values(pgm, &vars))),
                     Ok(None) => pc += 1,
@@ -3472,7 +3487,9 @@ async fn file_command(
     match (&f.kind, st.name.as_str()) {
         (_, "CLOSE") => {
             // The next RCVF opens the file again, at its first record.
-            io.open.remove(&i);
+            if let Some(f) = io.open.remove(&i) {
+                crate::objlock::close_file(job.client, &f.file.library, &f.file.file.name).await?;
+            }
         }
         (ClFile::Db(r), "RCVF") => {
             if let std::collections::hash_map::Entry::Vacant(slot) = io.open.entry(i) {
@@ -3508,6 +3525,23 @@ async fn file_command(
                     }
                     None => r.clone(),
                 };
+                // The open takes *SHRRD on the file, as an RPG open does
+                // (objlock.rs; WAITFILE *IMMED).
+                job.name_session().await?;
+                if !crate::objlock::open_file(
+                    job.client,
+                    &fr.library,
+                    &fr.file.name,
+                    std::time::Duration::ZERO,
+                )
+                .await?
+                {
+                    bail!(
+                        "File {} in library {} could not be opened: another job holds a lock on it that keeps out a shared read lock.",
+                        fr.file.name,
+                        crate::qtemp::logical(&fr.library)
+                    );
+                }
                 slot.insert(crate::rla::OpenFile::new(fr));
             }
             let of = io.open.get_mut(&i).expect("opened above");

@@ -1,0 +1,6 @@
+/* verify47: hold *EXCL on a file for 20 seconds in a job of its own. */
+PGM
+  ALCOBJ OBJ((AS4TRAINR1/GLD47F *FILE *EXCL)) WAIT(0)
+  DLYJOB DLY(20)
+  DLCOBJ OBJ((AS4TRAINR1/GLD47F *FILE *EXCL))
+ENDPGM

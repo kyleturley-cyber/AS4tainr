@@ -1,0 +1,13 @@
+# Golden: a file open while another job holds *EXCL on the file (a CL
+# program in a background `system` job holds it for 20 seconds): the RPG
+# status and message ID of the failed open, the job log of the opening
+# job, and ALCOBJ *SHRRD and *EXCLRD from a third job meanwhile.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify47.txt -Files tools\golden\verify47
+p47_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLD47H)" "DLTPGM PGM(AS4TRAINR1/GLD47R)" "DLTF FILE(AS4TRAINR1/GLD47F)" "DLTF FILE(AS4TRAINR1/GLD47O)" "DLTF FILE(AS4TRAINR1/GLD47S)"; do system -q "$c"; done; echo cleaned
+p47_tag|!for f in gld47h.clle gld47r.rpgle; do setccsid 819 /home/AS4TRAINR/gld/$f; done; ls /home/AS4TRAINR/gld | grep gld47
+p47_files|!system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD47F (K INTEGER NOT NULL)') COMMIT(*NONE)"; system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD47O (OUT CHAR(40) NOT NULL)') COMMIT(*NONE)"; system "RUNSQL SQL('LABEL ON TABLE AS4TRAINR1/GLD47O IS ''verify47''') COMMIT(*NONE)"; echo made
+p47_crth|!system -q "CRTSRCPF FILE(AS4TRAINR1/GLD47S) RCDLEN(92)"; system "CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld47h.clle') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD47S.FILE/GLD47H.MBR')"; system "CRTBNDCL PGM(AS4TRAINR1/GLD47H) SRCFILE(AS4TRAINR1/GLD47S)" | grep -E "^CP[CF]"
+p47_crtr|CRTBNDRPG PGM(AS4TRAINR1/GLD47R) SRCSTMF('/home/AS4TRAINR/gld/gld47r.rpgle')
+p47_held|!(system "CALL PGM(AS4TRAINR1/GLD47H)" > /dev/null 2>&1 &); sleep 5; system "WRKOBJLCK OBJ(AS4TRAINR1/GLD47F) OBJTYPE(*FILE)" | grep -E "EXCL|SHR" | cut -c1-80; system "ALCOBJ OBJ((AS4TRAINR1/GLD47F *FILE *SHRRD)) WAIT(1)"; echo "shrrd rc=$?"; system -i "CALL PGM(AS4TRAINR1/GLD47R)"; echo "call rc=$?"; system "DSPJOBLOG OUTPUT(*PRINT)" | grep -E "^[A-Z]{3}[0-9A-F]{4} " | head -20; sleep 20; system "CPYF FROMFILE(AS4TRAINR1/GLD47O) TOFILE(*PRINT)" | grep -E "OPENED|ST "
+p47_after|!system -i "CALL PGM(AS4TRAINR1/GLD47R)"; system "CPYF FROMFILE(AS4TRAINR1/GLD47O) TOFILE(*PRINT)" | grep -E "OPENED|ST "
+p47_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLD47H)" "DLTPGM PGM(AS4TRAINR1/GLD47R)" "DLTF FILE(AS4TRAINR1/GLD47F)" "DLTF FILE(AS4TRAINR1/GLD47O)" "DLTF FILE(AS4TRAINR1/GLD47S)"; do system -q "$c"; done; echo cleaned

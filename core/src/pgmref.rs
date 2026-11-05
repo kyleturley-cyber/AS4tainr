@@ -89,17 +89,22 @@ pub fn records(
     lib: &str,
     text: &str,
     refs: &[Reference],
+    files: &[FileUse],
     now: &str,
     system: &str,
 ) -> Vec<crate::outfile::Record> {
-    refs.iter()
-        .map(|(n, l, t)| {
-            let letter = match t.as_str() {
-                "*FILE" => "F",
-                "*SRVPGM" => "S",
-                _ => "P",
-            };
-            vec![
+    let mut out = Vec::new();
+    let mut fi = files.iter();
+    for (n, l, t) in refs {
+        // The one-letter type: F for a file, P for a program, blank for
+        // a service program (o46_refg, o46_refcv).
+        let letter = match t.as_str() {
+            "*FILE" => "F",
+            "*SRVPGM" => "",
+            _ => "P",
+        };
+        let base = |r: &mut crate::outfile::Record| {
+            r.extend([
                 ("WHLIB", lib.to_string()),
                 ("WHPNAM", pgm.to_string()),
                 ("WHTEXT", text.to_string()),
@@ -107,20 +112,142 @@ pub fn records(
                 ("WHDTTM", now.to_string()),
                 ("WHFNAM", n.clone()),
                 ("WHLNAM", l.clone()),
-                ("WHSNAM", String::new()),
-                ("WHRFNO", "0".into()),
-                ("WHFUSG", if t == "*FILE" { "1" } else { "0" }.into()),
-                ("WHRFNM", String::new()),
-                ("WHRFSN", String::new()),
-                ("WHRFFN", "0".into()),
-                ("WHOBJT", letter.into()),
+            ]);
+        };
+        let tail = |r: &mut crate::outfile::Record, formats: usize| {
+            r.extend([
+                ("WHOBJT", letter.to_string()),
                 ("WHOTYP", t.clone()),
                 ("WHSYSN", system.to_string()),
                 ("WHSPKG", "P".into()),
-                ("WHRFNB", "0".into()),
-            ]
-        })
+                ("WHRFNB", formats.to_string()),
+            ]);
+        };
+        let use_ = if t == "*FILE" { fi.next() } else { None };
+        match use_ {
+            // A file: a record per record format, with the file's name
+            // in the program, its use and the format's level identifier
+            // and field count (o46_refg record 3).
+            Some(u) if !u.formats.is_empty() => {
+                for (f, id, count) in &u.formats {
+                    let mut r = Vec::new();
+                    base(&mut r);
+                    r.extend([
+                        ("WHSNAM", u.in_program.clone()),
+                        ("WHRFNO", u.formats.len().to_string()),
+                        ("WHFUSG", u.usage.0.to_string()),
+                        ("WHRFNM", f.clone()),
+                        ("WHRFSN", id.clone()),
+                        ("WHRFFN", count.to_string()),
+                    ]);
+                    tail(&mut r, u.formats.len());
+                    out.push(r);
+                }
+            }
+            _ => {
+                let mut r = Vec::new();
+                base(&mut r);
+                r.extend([
+                    ("WHSNAM", String::new()),
+                    ("WHRFNO", "0".into()),
+                    ("WHFUSG", "0".into()),
+                    ("WHRFNM", String::new()),
+                    ("WHRFSN", String::new()),
+                    ("WHRFFN", "0".into()),
+                ]);
+                tail(&mut r, 0);
+                out.push(r);
+            }
+        }
+    }
+    out
+}
+
+/// The ILE RPG run time's service programs an RPG program refers to,
+/// after its own references (PUB400 2026-11-04, verify46 o46_pgmref and
+/// o46_refg: a program with a file: QRNXIE, QRNXIO, QRNXUTIL, QLEAWI).
+/// QRNXIO, the file support, is listed here only for a program with
+/// files (one without was not captured).
+fn rpg_runtime(files: bool) -> Vec<Reference> {
+    let mut out = vec!["QRNXIE"];
+    if files {
+        out.push("QRNXIO");
+    }
+    out.extend(["QRNXUTIL", "QLEAWI"]);
+    out.into_iter()
+        .map(|n| (n.to_string(), "QSYS".to_string(), "*SRVPGM".to_string()))
         .collect()
+}
+
+/// An RPG program's references in the order IBM i lists them (o46_pgmref):
+/// the called programs (GLD46C before QCMDEXC there: by name, as
+/// as4tainr takes it), the files, then the run time's service programs.
+pub fn rpg_ordered(source: &str) -> Vec<Reference> {
+    let all = rpg_references(source);
+    let mut pgms: Vec<Reference> = all.iter().filter(|r| r.2 == "*PGM").cloned().collect();
+    pgms.sort_by(|a, b| a.0.cmp(&b.0));
+    let files: Vec<Reference> = all.iter().filter(|r| r.2 == "*FILE").cloned().collect();
+    let has_files = !files.is_empty();
+    pgms.into_iter()
+        .chain(files)
+        .chain(rpg_runtime(has_files))
+        .collect()
+}
+
+/// A file's use in an RPG program as DSPPGMREF gives it: (code, words).
+/// Input is as captured (o46_pgmref "Input", o46_refg WHFUSG 01); the
+/// others follow the model's numbering as as4tainr reads it (2 output,
+/// 3 input and output, 4 update with input), not captured.
+pub fn rpg_file_usage(source: &str, file: &str) -> (u8, &'static str) {
+    let file = file.to_ascii_uppercase();
+    for raw in source.lines() {
+        let upper = raw.to_ascii_uppercase();
+        let fixed: Vec<char> = upper.chars().collect();
+        if fixed.len() > 16 && fixed[5] == 'F' && fixed[6] != '*' {
+            let name: String = fixed[6..16].iter().collect::<String>().trim().to_string();
+            if name == file {
+                return match fixed.get(16) {
+                    Some('O') => (2, "Output"),
+                    Some('U') => (4, "Update"),
+                    Some('C') => (3, "Input/Output"),
+                    _ => (1, "Input"),
+                };
+            }
+        }
+        let free = upper.trim_start();
+        if let Some(rest) = free.strip_prefix("DCL-F ") {
+            let name: String = rest
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || "#$@_".contains(*c))
+                .collect();
+            if name == file {
+                let usage = rest
+                    .find("USAGE(")
+                    .map(|i| rest[i..].split(')').next().unwrap_or("").to_string())
+                    .unwrap_or_default();
+                return if usage.contains("*UPDATE") {
+                    (4, "Update")
+                } else if usage.contains("*OUTPUT") && usage.contains("*INPUT") {
+                    (3, "Input/Output")
+                } else if usage.contains("*OUTPUT") {
+                    (2, "Output")
+                } else {
+                    (1, "Input")
+                };
+            }
+        }
+    }
+    (1, "Input")
+}
+
+/// A file a program uses: its name in the program, its use, and its
+/// record formats (name, level identifier, field count).
+#[derive(Clone, Debug, Default)]
+pub struct FileUse {
+    pub in_program: String,
+    pub usage: (u8, &'static str),
+    pub formats: Vec<(String, String, usize)>,
 }
 
 /// The objects an RPG program's source names: files and called programs.
@@ -174,6 +301,7 @@ pub fn report(
     library: &str,
     text: &str,
     refs: &[Reference],
+    files: &[FileUse],
     stamp: &crate::report::Stamp,
 ) -> Vec<String> {
     use crate::report::at;
@@ -204,10 +332,38 @@ pub fn report(
             (59 - count.len(), &count),
         ]),
     ];
+    let mut fi = files.iter();
     for (name, lib, ty) in refs {
         out.push(at(&[(4, &dsp_label("Object", 42)), (54, name)]));
         out.push(at(&[(6, &dsp_label("Library", 40)), (56, lib)]));
         out.push(at(&[(6, &dsp_label("Object type", 40)), (56, ty)]));
+        // A file's name in the program, use and record formats
+        // (o46_pgmref).
+        if ty == "*FILE" {
+            if let Some(u) = fi.next() {
+                if !u.formats.is_empty() {
+                    let n = u.formats.len().to_string();
+                    out.push(at(&[
+                        (6, &dsp_label("File name in program", 40)),
+                        (56, &u.in_program),
+                    ]));
+                    out.push(at(&[(6, &dsp_label("File usage", 40)), (56, u.usage.1)]));
+                    out.push(at(&[
+                        (6, &dsp_label("Number of record formats", 40)),
+                        (61 - n.len(), &n),
+                    ]));
+                    out.push(at(&[
+                        (8, "Record Format"),
+                        (27, "Format Level Identifier"),
+                        (55, "Field Count"),
+                    ]));
+                    for (f, id, count) in &u.formats {
+                        let c = count.to_string();
+                        out.push(at(&[(10, f), (32, id), (63 - c.len(), &c)]));
+                    }
+                }
+            }
+        }
     }
     out
 }
@@ -248,8 +404,32 @@ impl Job<'_> {
         let refs = match p.attribute.as_str() {
             "CLLE" => cl_references(&p.source, true)?,
             "CLP" => cl_references(&p.source, false)?,
-            _ => rpg_references(&p.source),
+            _ => rpg_ordered(&p.source),
         };
+        // An RPG program's files: the library the file is found in, its
+        // record format (o46_pgmref: AS4TRAINR1, not *LIBL).
+        let mut refs = refs;
+        let mut files = Vec::new();
+        if !matches!(p.attribute.as_str(), "CLLE" | "CLP") {
+            for r in refs.iter_mut().filter(|r| r.2 == "*FILE") {
+                let mut u = FileUse {
+                    in_program: r.0.clone(),
+                    usage: rpg_file_usage(&p.source, &r.0),
+                    formats: vec![],
+                };
+                if let Ok(f) =
+                    crate::catalog::resolve_file(self.client, &self.library_list(), &r.0).await
+                {
+                    r.1 = crate::qtemp::logical(&f.library);
+                    u.formats.push((
+                        f.file.format.clone(),
+                        crate::objdesc::level_id(&f.file.format, &f.file.fields),
+                        f.file.fields.len(),
+                    ));
+                }
+                files.push(u);
+            }
+        }
         let lib = crate::qtemp::logical(&p.library);
         let text: String = self
             .client
@@ -283,7 +463,7 @@ impl Job<'_> {
                 .await?
                 .get(0);
             let system: String = crate::report::system_name().chars().take(8).collect();
-            let recs = records(&p.name, &lib, &text, &refs, &now, &system);
+            let recs = records(&p.name, &lib, &text, &refs, &files, &now, &system);
             let w =
                 crate::outfile::write(self, &outfile, &option, &crate::outfile::QADSPPGM, &recs)
                     .await?;
@@ -291,7 +471,14 @@ impl Job<'_> {
             messages.push(crate::outfile::records_added(&w, recs.len()));
             return Ok(Outcome::Messages(messages));
         }
-        let print = report(&p.name, &lib, &text, &refs, &crate::report::Stamp::now());
+        let print = report(
+            &p.name,
+            &lib,
+            &text,
+            &refs,
+            &files,
+            &crate::report::Stamp::now(),
+        );
         let fmt = |n: &str, l: &str, t: &str| format!("{n:<10}  {l:<10}  {t}");
         Ok(Outcome::Display(ListDisplay {
             title: "Display Program References".into(),
@@ -392,6 +579,7 @@ mod tests {
             "AS4TRAINR1",
             "",
             &refs,
+            &[],
             &crate::report::Stamp::default(),
         );
         let want = [

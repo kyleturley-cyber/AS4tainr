@@ -145,7 +145,14 @@ fn member_lines(f: &FileInfo, x: &MemberExtra, m: &Member) -> (Vec<String>, Vec<
             label(5, "Access Path Activity Statistics"),
             label(7, "Access path logical reads"),
             label(7, "Access path physical reads"),
-            num(7, "Index size", 90112, 75),
+            // An SQL index's 155648 (verify46 o46_mbri), a DDS logical
+            // file's 90112 (n45_mbrl).
+            num(
+                7,
+                "Index size",
+                if f.sql_type == "INDEX" { 155648 } else { 90112 },
+                75,
+            ),
             kw(7, "Access path valid", "", "Yes"),
         ]);
     } else {
@@ -218,12 +225,14 @@ fn member_lines(f: &FileInfo, x: &MemberExtra, m: &Member) -> (Vec<String>, Vec<
         }
     }
     let mut tail = vec![kw(7, "Implicit access path sharing", "", "No")];
+    // An SQL index shows no partial key values (o46_mbri).
+    let index = f.sql_type == "INDEX";
     if keyed {
-        tail.extend([
-            kw(7, "Access path journaled", "", "No"),
-            label(7, "Number of unique partial key values"),
-        ]);
-        for (i, n) in x.partial_keys.iter().enumerate() {
+        tail.push(kw(7, "Access path journaled", "", "No"));
+        if !index {
+            tail.push(label(7, "Number of unique partial key values"));
+        }
+        for (i, n) in x.partial_keys.iter().enumerate().filter(|_| !index) {
             let text = if i == 0 {
                 "Key field 1".to_string()
             } else {
@@ -575,6 +584,26 @@ mod tests {
             members: vec![member("GLD45L", 2, 0)],
         };
         let ibm = capture(cases::N45_MBRL);
+        same(&report(&f, &x, &now()), &ibm, &COUNTERS);
+    }
+
+    // o46_mbri: an SQL index over an empty table: index size 155648, no
+    // partial key values.
+    #[test]
+    fn sql_index() {
+        let mut f = info(
+            "GLD46I",
+            "INDEX",
+            "     A          R GLD46R\n     A            CODE           5P 0\n     A            NAME          20A\n     A          K NAME\n",
+        );
+        f.logical = true;
+        f.based_on = Some(("AS4TRAINR1".into(), "GLD46P".into()));
+        let x = MemberExtra {
+            partial_keys: vec![0],
+            constraints: vec![],
+            members: vec![member("GLD46I", 0, 0)],
+        };
+        let ibm = capture(cases::O46_MBRI);
         same(&report(&f, &x, &now()), &ibm, &COUNTERS);
     }
 

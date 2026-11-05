@@ -274,6 +274,10 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] DSPFD TYPE(*MBR) printed in IBM i 7.5's Member Description layout (verify40)
 - [x] CHGPF SRCFILE keeps the logical files over the file (built again from the DDS CRTLF kept); CRTLF TEXT
 - [x] DSPFD TYPE(*MBR) for SQL, DDS, logical and source files as IBM i 7.5 prints them (verify45); DSPPGMREF OUTPUT(*OUTFILE) (QADSPPGM)
+- [x] DSPPGMREF of RPG programs as IBM i 7.5 lists them (file details, run time service programs, QADSPPGM values; verify46); CREATE TABLE AS keeps zoned columns zoned
+- [x] RPG file opens hold a shared read lock (*SHRRD): another job's ALCOBJ *EXCL fails while a file is open, and its *EXCL keeps opens out
+- [x] CHGPF keeps the file's owner, authorities, journaling and trigger programs; SEU checks DDS members (PF, LF, DSPF, PRTF) as they are typed
+- [x] CL programs' declared files hold *SHRRD while open; SEU F4 prompts CL statements and writes them back
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).
 - [x] Journals and trigger programs: COM's SETUPJRN, ORDAUDJV (QSYS2.DISPLAY_JOURNAL) and ORDTRG (ADDPFTRG) run (docs/journals.md).

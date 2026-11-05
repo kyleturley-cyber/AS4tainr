@@ -337,6 +337,43 @@ impl Editor {
         lines
     }
 
+    /// Lines `start..=end` (indexes) replaced by `texts` (F4's prompted
+    /// statement): the old lines keep their sequence numbers as far as
+    /// they go and get today's date, more lines are numbered between
+    /// their neighbors, fewer leave the rest out.
+    pub fn replace_lines(&mut self, start: usize, end: usize, texts: &[String]) {
+        let end = end.min(self.lines.len().saturating_sub(1));
+        let mut out: Vec<(Line, bool)> = Vec::new();
+        for l in &self.lines[..start] {
+            out.push((l.clone(), false));
+        }
+        for (k, t) in texts.iter().enumerate() {
+            let text: String = t.chars().take(self.width).collect();
+            if start + k <= end {
+                let mut l = self.lines[start + k].clone();
+                l.text = text;
+                l.date = self.today;
+                l.fresh = false;
+                out.push((l, false));
+            } else {
+                out.push((
+                    Line {
+                        seq: 0,
+                        date: self.today,
+                        text,
+                        fresh: false,
+                    },
+                    true,
+                ));
+            }
+        }
+        for l in &self.lines[end + 1..] {
+            out.push((l.clone(), false));
+        }
+        self.lines = self.number(out);
+        self.changed = true;
+    }
+
     /// The index of the next line at or after `from` whose text has
     /// `what` (any case), wrapping to the top; None when no line has it.
     pub fn find(&self, what: &str, from: usize) -> Option<usize> {
@@ -346,6 +383,96 @@ impl Editor {
             .map(|k| (from + k) % n.max(1))
             .find(|&i| self.lines[i].text.to_ascii_uppercase().contains(&w))
     }
+}
+
+/// The CL statement line `i` is part of: its first and last line
+/// (a line ending in + or - goes on in the next one).
+pub fn cl_statement(lines: &[Line], i: usize) -> (usize, usize) {
+    let cont = |t: &str| {
+        let t = t.trim_end();
+        t.ends_with('+') || t.ends_with('-')
+    };
+    let mut s = i;
+    while s > 0 && cont(&lines[s - 1].text) {
+        s -= 1;
+    }
+    let mut e = i;
+    while e + 1 < lines.len() && cont(&lines[e].text) {
+        e += 1;
+    }
+    (s, e)
+}
+
+/// A CL statement's text from its lines, without the continuation
+/// characters (+ keeps going after leading blanks of the next line, -
+/// keeps them; CL reference, continuation).
+pub fn cl_joined(lines: &[Line]) -> String {
+    let mut out = String::new();
+    let mut skip_blanks = false;
+    for l in lines {
+        let mut t: &str = &l.text;
+        if skip_blanks {
+            t = t.trim_start();
+        }
+        let tt = t.trim_end();
+        if let Some(x) = tt.strip_suffix('+') {
+            out.push_str(x);
+            skip_blanks = true;
+        } else if let Some(x) = tt.strip_suffix('-') {
+            out.push_str(x);
+            skip_blanks = false;
+        } else {
+            out.push_str(tt);
+            break;
+        }
+    }
+    out
+}
+
+/// A statement as lines of at most `width` characters: `prefix` (the
+/// label and indentation the statement had) then the text, broken after
+/// a blank outside quotes, each line but the last ending in " +", the
+/// next ones starting under the first parameter's column (prefix + 10).
+pub fn cl_wrapped(prefix: &str, text: &str, width: usize) -> Vec<String> {
+    let indent = " ".repeat(prefix.chars().count() + 10);
+    let mut out = Vec::new();
+    let mut line = prefix.to_string();
+    let mut word = String::new();
+    let mut quoted = false;
+    let mut words: Vec<String> = Vec::new();
+    for c in text.chars() {
+        if c == '\'' {
+            quoted = !quoted;
+        }
+        if c == ' ' && !quoted {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push(c);
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    let room = width.saturating_sub(2);
+    for w in words {
+        let sep = if line.trim().is_empty() || line.ends_with(' ') {
+            ""
+        } else {
+            " "
+        };
+        if line.chars().count() + sep.len() + w.chars().count() > room && !line.trim().is_empty() {
+            out.push(format!("{line} +"));
+            line = indent.clone();
+            line.push_str(&w);
+        } else {
+            line.push_str(sep);
+            line.push_str(&w);
+        }
+    }
+    out.push(line);
+    out
 }
 
 #[cfg(test)]
@@ -457,6 +584,43 @@ mod tests {
         assert!(e.apply(&cmds(&[(0, "CC"), (2, "CC"), (1, "A")])).is_err());
         assert_eq!(texts(&e), ["a", "b", "c"]);
         assert!(!e.changed);
+    }
+
+    #[test]
+    fn prompted_statement_goes_back_in_its_lines() {
+        // A statement on two lines (+ continuation) replaced by one line;
+        // a longer statement wrapped with " +" (CL reference: + continues
+        // a command on the next line, after its leading blanks).
+        let mut e = ed(&["PGM", "  CHKOBJ OBJ(A) +", "    OBJTYPE(*FILE)", "ENDPGM"]);
+        assert_eq!(cl_statement(&e.lines, 2), (1, 2));
+        assert_eq!(cl_joined(&e.lines[1..3]), "  CHKOBJ OBJ(A) OBJTYPE(*FILE)");
+        e.replace_lines(1, 2, &["  CHKOBJ OBJ(QGPL/A) OBJTYPE(*FILE)".to_string()]);
+        assert_eq!(
+            texts(&e),
+            ["PGM", "  CHKOBJ OBJ(QGPL/A) OBJTYPE(*FILE)", "ENDPGM"]
+        );
+        assert_eq!(e.lines[2].seq, 400);
+        let w = cl_wrapped("  ", "SNDPGMMSG MSGID(CPF9898) MSGF(QCPFMSG) MSGDTA('a long text here') TOPGMQ(*PRV) MSGTYPE(*ESCAPE)", 40);
+        assert!(w.iter().all(|l| l.len() <= 40), "{w:?}");
+        assert!(w[..w.len() - 1].iter().all(|l| l.ends_with(" +")), "{w:?}");
+        assert!(w.iter().any(|l| l.contains("'a long text here'")), "{w:?}");
+        let lines: Vec<Line> = w
+            .iter()
+            .map(|t| Line {
+                seq: 0,
+                date: 0,
+                text: t.clone(),
+                fresh: false,
+            })
+            .collect();
+        assert_eq!(
+            cl_joined(&lines).split_whitespace().collect::<Vec<_>>().join(" "),
+            "SNDPGMMSG MSGID(CPF9898) MSGF(QCPFMSG) MSGDTA('a long text here') TOPGMQ(*PRV) MSGTYPE(*ESCAPE)"
+        );
+        let mut e = ed(&["A", "B"]);
+        e.replace_lines(0, 0, &["X +".to_string(), "  Y".to_string()]);
+        assert_eq!(texts(&e), ["X +", "  Y", "B"]);
+        assert!(e.lines[0].seq < e.lines[1].seq && e.lines[1].seq < e.lines[2].seq);
     }
 
     #[test]

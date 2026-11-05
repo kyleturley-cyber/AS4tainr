@@ -1,7 +1,7 @@
 //! Expected DSPFD TYPE(*MBR) reports for `mbrdesc.rs` tests: PUB400 (IBM i 7.5)
 //! printed output of tools/golden/verify40.txt i40_mbr1 (2026-11-03) and
 //! tools/golden/verify45.txt n45_mbra, n45_mbru, n45_mbrp, n45_mbrl, n45_mbrs
-//! (2026-11-04), without PUB400's own page footer line and the exit status; the product
+//! and tools/golden/verify46.txt o46_mbri (2026-11-04), without PUB400's own page footer line and the exit status; the product
 //! line and the processor name are as4tainr's (the tests do not compare them).
 
 pub const I40_MBR1: &str = r#" AS4T001 V0R1M0  261021               Display File Description                                  26-11-03  17:27:21       Page    1
@@ -471,3 +471,42 @@ pub const N45_MBRS: &str = r#" AS4T001 V0R1M0  261021               Display File
      Starting journal receiver for apply . . . :
        Library . . . . . . . . . . . . . . . . :
        ASP Device  . . . . . . . . . . . . . . :"#;
+pub const O46_MBRI: &str = r#" AS4T001 V0R1M0  261021               Display File Description                                  26-11-04  23:48:21       Page    1
+   File  . . . . . . . . . . . : GLD46I
+     Library . . . . . . . . . : AS4TRAINR1
+   Type of information . . . . : *MBR
+   File attributes . . . . . . : *ALL
+   System  . . . . . . . . . . : *LCL
+   Processor . . . . . . . . . : AS4TAINR Display File Description Processor
+ File . : GLD46I       Library . : AS4TRAINR1   Type of file . : Logical *DATA             Auxiliary Storage Pool ID . : 00001
+                                        Member Description
+   Member  . . . . . . . . . . . . . . . . . . : MBR        GLD46I
+     Member level identifier . . . . . . . . . :            1261104234821
+     Member creation date  . . . . . . . . . . :            26-11-04
+     Text 'description'  . . . . . . . . . . . : TEXT
+     Expiration date for member  . . . . . . . : EXPDATE    *NONE
+     Access path maintenance . . . . . . . . . : MAINT      *IMMED
+     Access path recovery  . . . . . . . . . . : RECOVER    *AFTIPL
+     Preferred storage unit  . . . . . . . . . : UNIT       *ANY
+     Record format selector program  . . . . . : FMTSLR     *NONE
+     Records to force a write  . . . . . . . . : FRCRATIO   *NONE
+     Share open data path  . . . . . . . . . . : SHARE      *NO
+     Access Path Activity Statistics . . . . . :
+       Access path logical reads . . . . . . . :
+       Access path physical reads  . . . . . . :
+       Index size  . . . . . . . . . . . . . . :                     155648
+       Access path valid . . . . . . . . . . . :            Yes
+       Implicit access path sharing  . . . . . :            No
+       Access path journaled . . . . . . . . . :            No
+     Last change date/time . . . . . . . . . . :            26-11-04  23:48:21
+     Last save date/time . . . . . . . . . . . :
+     Last restore date/time  . . . . . . . . . :
+     Last used date  . . . . . . . . . . . . . :
+     Days used count . . . . . . . . . . . . . :                0
+       Reset date  . . . . . . . . . . . . . . :
+     Number of data members  . . . . . . . . . :                1
+     Based on file . . . . . . . . . . . . . . :            GLD46P
+       Library . . . . . . . . . . . . . . . . :            AS4TRAINR1
+       Member  . . . . . . . . . . . . . . . . :            GLD46P
+       Logical file format . . . . . . . . . . :            GLD46R
+       Number of index entries . . . . . . . . :                     0"#;

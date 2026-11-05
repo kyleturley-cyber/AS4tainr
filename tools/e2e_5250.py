@@ -777,6 +777,20 @@ with Tn5250(HOST) as t:
     t.fkey(3); t.wait_for("Save the changed member")
     t.enter(); t.wait_for("Command Entry")
     command(t, "rmvm contacts/qrpglesrc e2ecl", "removed")
+    # F4 on a CL statement (SEU User's Guide: prompting a statement): the
+    # command's prompt, and the statement written back from it.
+    command(t, "strseu contacts/qrpglesrc e2ecl2 type(clle)", "Source Entry: Edit")
+    t.tab(); t.tab(); t.type("pgm"); t.tab(); t.tab(); t.type("chkobj obj(qgpl) objtype(*lib)"); t.enter()
+    t.wait_for("Source Entry: Edit")
+    for _ in range(4):
+        t.tab()
+    t.fkey(4); t.wait_for("Check Object")
+    check("QGPL" in t.text(), "F4 in SEU prompts the statement under the cursor with its values", t)
+    t.enter(); t.wait_for("Source Entry: Edit")
+    check("CHKOBJ OBJ(QGPL) OBJTYPE(*LIB)" in t.text(), "the prompted statement goes back into the member", t)
+    t.fkey(3); t.wait_for("Save the changed member")
+    t.enter(); t.wait_for("Command Entry")
+    command(t, "rmvm contacts/qrpglesrc e2ecl2", "removed")
     # EDTF (CL reference: edits a stream file; one that does not exist is
     # created). The lines typed are the file's lines when saved.
     command(t, "edtf stmf('/tmp/e2e_edtf.txt')", "Edit File")

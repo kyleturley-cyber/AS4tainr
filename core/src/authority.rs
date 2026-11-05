@@ -232,6 +232,74 @@ pub async fn revoke(
         > 0)
 }
 
+/// An object's owner, *PUBLIC authority and private authorities, kept
+/// while the object is made again (CHGPF SRCFILE).
+#[derive(Debug, Clone, Default)]
+pub struct Kept {
+    pub owner: String,
+    pub public: String,
+    pub private: Vec<(String, String)>,
+}
+
+pub async fn keep(client: &Client, library: &str, name: &str, objtype: &str) -> Result<Kept> {
+    let o = client
+        .query_opt(
+            "SELECT owner, public_aut FROM as4tainr.objects WHERE library=$1 AND name=$2 AND objtype=$3",
+            &[&library, &name, &objtype],
+        )
+        .await?;
+    let private = client
+        .query(
+            "SELECT user_name, aut FROM as4tainr.object_auths
+              WHERE library=$1 AND name=$2 AND objtype=$3 ORDER BY user_name",
+            &[&library, &name, &objtype],
+        )
+        .await?
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    Ok(match o {
+        Some(r) => Kept {
+            owner: r.get(0),
+            public: r.get(1),
+            private,
+        },
+        None => Kept {
+            private,
+            ..Default::default()
+        },
+    })
+}
+
+/// The kept owner and authorities given to the object made again.
+pub async fn restore(
+    client: &Client,
+    library: &str,
+    name: &str,
+    objtype: &str,
+    k: &Kept,
+) -> Result<()> {
+    if !k.owner.is_empty() {
+        client
+            .execute(
+                "UPDATE as4tainr.objects SET owner=$4, public_aut=$5 WHERE library=$1 AND name=$2 AND objtype=$3",
+                &[&library, &name, &objtype, &k.owner, &k.public],
+            )
+            .await?;
+    }
+    forget(client, library, name, objtype).await?;
+    for (u, a) in &k.private {
+        client
+            .execute(
+                "INSERT INTO as4tainr.object_auths VALUES ($1,$2,$3,$4,$5)
+                 ON CONFLICT (library, name, objtype, user_name) DO UPDATE SET aut = EXCLUDED.aut",
+                &[&library, &name, &objtype, u, a],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 /// Private authorities of a deleted object go with it.
 pub async fn forget(client: &Client, library: &str, name: &str, objtype: &str) -> Result<()> {
     client

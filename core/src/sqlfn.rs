@@ -294,6 +294,32 @@ LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, pg_temp AS $as4tainr$
 CREATE OR REPLACE FUNCTION as4tainr_svc.digits(v bigint) RETURNS text
 LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, pg_temp AS $as4tainr$
   SELECT lpad(CAST(abs(CAST(v AS numeric)) AS text), 19, '0') $as4tainr$;
+-- A zoned decimal value's bytes read as characters (DDS reference,
+-- conversion between zoned decimal and character, and CONCAT): its d
+-- digits; a negative value's last digit carries the sign zone, X'D0' to
+-- X'D9', which are '}' and 'J' to 'R' in CCSID 37.
+CREATE OR REPLACE FUNCTION as4tainr_svc.zoned_chars(v numeric, d integer, s integer) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT SET search_path = pg_catalog, pg_temp AS $as4tainr$
+  SELECT CASE WHEN v < 0 THEN left(x, d - 1) || translate(right(x, 1), '0123456789', '}JKLMNOPQR')
+              ELSE x END
+    FROM (SELECT right(lpad(CAST(trunc(abs(v) * power(CAST(10 AS numeric), s)) AS text), d, '0'), d) AS x) z $as4tainr$;
+-- Characters as a zoned decimal value with s decimal positions: only the
+-- digits 0 to 9 (DDS reference: "your program cannot send an I/O
+-- operation that attempts to pass characters other than 0 through 9 from
+-- a character or hexadecimal field to a zoned decimal field"); with
+-- signs, the last may also carry a negative sign zone ('}', 'J' to 'R'),
+-- as the bytes of a zoned field moved in a concatenation do.
+CREATE OR REPLACE FUNCTION as4tainr_svc.chars_zoned(v text, s integer, signs boolean) RETURNS numeric
+LANGUAGE plpgsql IMMUTABLE STRICT SET search_path = pg_catalog, pg_temp AS $as4tainr$
+DECLARE
+  neg boolean := signs AND right(v, 1) IN ('}', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R');
+  digits text := CASE WHEN neg THEN left(v, -1) || translate(right(v, 1), '}JKLMNOPQR', '0123456789') ELSE v END;
+BEGIN
+  IF digits !~ '^[0-9]+$' THEN
+    RAISE EXCEPTION 'characters ''%'' are not a zoned decimal value', v USING ERRCODE = '22P02';
+  END IF;
+  RETURN CAST(digits AS numeric) * power(CAST(10 AS numeric), -s) * CASE WHEN neg THEN -1 ELSE 1 END;
+END $as4tainr$;
 -- TIMESTAMP (Db2 for i SQL Reference): of a string in the Db2 form
 -- yyyy-mm-dd-hh.mm.ss[.nnnnnn] (or any form PostgreSQL reads), of a date
 -- (midnight), of a date and a time.

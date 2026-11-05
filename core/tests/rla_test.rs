@@ -1037,6 +1037,547 @@ async fn logical_file_select_omit_rules_and_unique() {
     );
 }
 
+/// A DDS line in its columns: name type in 17, name in 19-28, length in
+/// 30-34 (right-aligned), data type in 35, decimal positions in 36-37,
+/// usage in 38, keywords from 45.
+fn dds_line(nt: &str, name: &str, len: &str, ty: &str, dec: &str, usage: &str, kw: &str) -> String {
+    format!("     A          {nt:1} {name:<10} {len:>5}{ty:1}{dec:>2}{usage:1}      {kw}\n")
+}
+
+/// ORDPF for the logical file field tests: zoned and packed fields, a
+/// date in three fields, character fields, a null-capable field.
+async fn ordpf(client: &mut Client, lib: &str) -> rla::OpenFile {
+    let src = [
+        dds_line("R", "ORDREC", "", "", "", "", ""),
+        dds_line("", "ORDNO", "5", "S", "0", "", ""),
+        dds_line("", "QTYDUE", "4", "S", "2", "", ""),
+        dds_line("", "MTH", "2", "S", "0", "", ""),
+        dds_line("", "DAY", "2", "S", "0", "", ""),
+        dds_line("", "YEAR", "2", "S", "0", "", ""),
+        dds_line("", "NAME", "20", "A", "", "", ""),
+        dds_line("", "CODE", "3", "A", "", "", ""),
+        dds_line("", "NEG", "3", "S", "0", "", ""),
+        dds_line("", "BAL", "7", "P", "2", "", ""),
+        dds_line("", "NOTE", "5", "A", "", "", "ALWNULL"),
+        dds_line("K", "ORDNO", "", "", "", "", ""),
+    ]
+    .concat();
+    let pf = dds::parse_pf("ORDPF", &src).unwrap();
+    catalog::create_physical_file(client, lib, &pf)
+        .await
+        .unwrap();
+    let mut f = open(client, lib, "ORDPF").await;
+    for (no, qty, m, d, y, name, code, neg, bal) in [
+        (
+            "1",
+            "0.20",
+            "12",
+            "31",
+            "25",
+            "JOHN     SMITH",
+            "042",
+            "-12",
+            "10.00",
+        ),
+        (
+            "2",
+            "2.52",
+            "1",
+            "5",
+            "26",
+            "MARY     JONES",
+            "100",
+            "7",
+            "20.00",
+        ),
+        (
+            "3",
+            "1.00",
+            "6",
+            "6",
+            "24",
+            "ANN      LEE",
+            "007",
+            "0",
+            "30.00",
+        ),
+    ] {
+        let rec: rla::Record = [
+            ("ORDNO", no),
+            ("QTYDUE", qty),
+            ("MTH", m),
+            ("DAY", d),
+            ("YEAR", y),
+            ("NAME", name),
+            ("CODE", code),
+            ("NEG", neg),
+            ("BAL", bal),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        f.write(client, &rec).await.unwrap();
+    }
+    f
+}
+
+fn lf_src(lines: &[String]) -> String {
+    lines.concat()
+}
+
+/// The physical record of an order number.
+async fn pf_rec(client: &Client, pf: &mut rla::OpenFile, no: &str) -> rla::Record {
+    pf.chain(client, &[no.into()])
+        .await
+        .unwrap()
+        .record
+        .unwrap()
+}
+
+/// Logical file fields with decimal positions of their own (IBM DDS
+/// reference, "Decimal positions for physical and logical files"): read
+/// through a logical file with fewer decimal positions, 0.20 is 0 and
+/// 2.52 is 2 (the reference's example: cut, not rounded); writing 3322
+/// through it cannot fit a field of 4 digits with 2 decimal positions;
+/// written through one with more decimal positions, the extra ones are
+/// cut.
+#[tokio::test]
+async fn logical_file_decimal_positions_of_its_own() {
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    let mut pf = ordpf(&mut client, &lib).await;
+    let src = lf_src(&[
+        dds_line("R", "ORDREC", "", "", "", "", "PFILE(ORDPF)"),
+        dds_line("", "ORDNO", "", "", "", "", ""),
+        dds_line("", "QTYDUE", "4", "S", "0", "", ""),
+        dds_line("K", "ORDNO", "", "", "", "", ""),
+    ]);
+    let mut lf = crtlf(&mut client, &lib, "QTY0", &src).await;
+    let r = lf.chain(&client, &["1".into()]).await.unwrap();
+    assert_eq!(field(&r, "QTYDUE"), "0");
+    let r = lf.chain(&client, &["2".into()]).await.unwrap();
+    assert_eq!(field(&r, "QTYDUE"), "2");
+    let mut rec = r.record.unwrap();
+    rec.insert("QTYDUE".into(), "3322".into());
+    assert!(
+        lf.update(&client, &rec).await.is_err(),
+        "3322 does not fit 2 digits left of the decimal point"
+    );
+    // The update did not happen.
+    assert_eq!(pf_rec(&client, &mut pf, "2").await["QTYDUE"], "2.52");
+
+    // +2: two more decimal positions; written values lose the ones the
+    // physical field does not have.
+    let src = lf_src(&[
+        dds_line("R", "ORDREC", "", "", "", "", "PFILE(ORDPF)"),
+        dds_line("", "ORDNO", "", "", "", "", ""),
+        dds_line("", "QTYDUE", "6", "", "+2", "", ""),
+        dds_line("K", "ORDNO", "", "", "", "", ""),
+    ]);
+    let mut lf = crtlf(&mut client, &lib, "QTY4", &src).await;
+    let r = lf.chain(&client, &["3".into()]).await.unwrap();
+    assert_eq!(field(&r, "QTYDUE"), "1.0000");
+    let mut rec = r.record.unwrap();
+    rec.insert("QTYDUE".into(), "1.2345".into());
+    lf.update(&client, &rec).await.unwrap();
+    assert_eq!(pf_rec(&client, &mut pf, "3").await["QTYDUE"], "1.23");
+}
+
+/// RENAME (IBM DDS reference, RENAME examples: `QTY RENAME(QTYDUE)`, and
+/// the renamed field as a key): the logical file's field is the physical
+/// file's under another name, for reading, keys and changes.
+#[tokio::test]
+async fn logical_file_rename() {
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    let mut pf = ordpf(&mut client, &lib).await;
+    let src = lf_src(&[
+        dds_line("R", "RCD2", "", "", "", "", "PFILE(ORDPF)"),
+        dds_line("", "ORDNO", "", "", "", "", ""),
+        dds_line("", "QTY", "", "", "", "", "RENAME(QTYDUE)"),
+        dds_line("K", "QTY", "", "", "", "", ""),
+    ]);
+    let mut lf = crtlf(&mut client, &lib, "BYQTY", &src).await;
+    let mut order = Vec::new();
+    loop {
+        let r = lf.read(&client).await.unwrap();
+        if r.eof {
+            break;
+        }
+        assert!(!r.record.as_ref().unwrap().contains_key("QTYDUE"));
+        order.push((field(&r, "ORDNO"), field(&r, "QTY")));
+    }
+    assert_eq!(
+        order,
+        [
+            ("1".to_string(), "0.20".to_string()),
+            ("3".into(), "1.00".into()),
+            ("2".into(), "2.52".into())
+        ]
+    );
+    let r = lf.chain(&client, &["1.00".into()]).await.unwrap();
+    assert_eq!(field(&r, "ORDNO"), "3");
+    let mut rec = r.record.unwrap();
+    rec.insert("QTY".into(), "9.99".into());
+    lf.update(&client, &rec).await.unwrap();
+    assert_eq!(pf_rec(&client, &mut pf, "3").await["QTYDUE"], "9.99");
+    // Written through the logical file: the physical file gets it.
+    let mut new = rla::Record::new();
+    new.insert("ORDNO".into(), "4".into());
+    new.insert("QTY".into(), "5.5".into());
+    lf.write(&client, &new).await.unwrap();
+    assert_eq!(pf_rec(&client, &mut pf, "4").await["QTYDUE"], "5.50");
+
+    // The renamed field and the field named on RENAME cannot both be
+    // keys (DDS reference, key field name).
+    let src = lf_src(&[
+        dds_line("R", "RCD2", "", "", "", "", "PFILE(ORDPF)"),
+        dds_line("", "QTY", "", "", "", "", "RENAME(QTYDUE)"),
+        dds_line("K", "QTY", "", "", "", "", ""),
+        dds_line("K", "QTYDUE", "", "", "", "", ""),
+    ]);
+    let bad = dds::parse_lf("BAD", &src).unwrap();
+    assert!(
+        catalog::create_logical_file(&mut client, std::slice::from_ref(&lib), &lib, &bad)
+            .await
+            .is_err()
+    );
+}
+
+/// CONCAT (IBM DDS reference, CONCAT example 1: `DATE CONCAT(MTH DAY
+/// YEAR)`): numeric fields make a zoned decimal field of their digits,
+/// 6 long; a character field among them makes a character field. A
+/// concatenated field is a key and is written back field by field. When
+/// one physical field is in two logical fields, the last one gives its
+/// value (DDS reference, RENAME: "the value in the last occurrence of the
+/// physical field is the value that is put in the physical record").
+#[tokio::test]
+async fn logical_file_concat() {
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    let mut pf = ordpf(&mut client, &lib).await;
+    let src = lf_src(&[
+        dds_line("R", "DATEREC", "", "", "", "", "PFILE(ORDPF)"),
+        dds_line("", "ORDNO", "", "", "", "", ""),
+        dds_line("", "MTH", "", "", "", "", ""),
+        dds_line("", "DATE", "", "", "", "", "CONCAT(MTH DAY YEAR)"),
+        dds_line("", "CODENAME", "", "", "", "", "CONCAT(CODE NAME)"),
+        dds_line("K", "DATE", "", "", "", "", ""),
+    ]);
+    let mut lf = crtlf(&mut client, &lib, "BYDATE", &src).await;
+    let mut dates = Vec::new();
+    loop {
+        let r = lf.read(&client).await.unwrap();
+        if r.eof {
+            break;
+        }
+        dates.push(field(&r, "DATE"));
+    }
+    // 01/05/26, 06/06/24, 12/31/25 as MMDDYY numbers.
+    assert_eq!(dates, ["10526", "60624", "123125"]);
+    let r = lf.chain(&client, &["123125".into()]).await.unwrap();
+    assert!(r.found);
+    assert_eq!(field(&r, "CODENAME"), "042JOHN     SMITH      ");
+    // MTH comes before DATE: DATE's month is the one written.
+    let mut rec = r.record.unwrap();
+    rec.insert("MTH".into(), "3".into());
+    rec.insert("DATE".into(), "110526".into());
+    rec.insert("CODENAME".into(), "099PAT      KIM".into());
+    lf.update(&client, &rec).await.unwrap();
+    let p = pf_rec(&client, &mut pf, "1").await;
+    assert_eq!(
+        (p["MTH"].as_str(), p["DAY"].as_str(), p["YEAR"].as_str()),
+        ("11", "5", "26")
+    );
+    assert_eq!(p["CODE"], "099");
+    assert_eq!(p["NAME"], "PAT      KIM        ");
+
+    // No data type and no decimal positions on a CONCAT field; fields
+    // with decimal positions cannot be concatenated (DDS reference).
+    let bad = lf_src(&[
+        dds_line("R", "R1", "", "", "", "", "PFILE(ORDPF)"),
+        dds_line("", "DATE", "", "A", "", "", "CONCAT(MTH DAY)"),
+    ]);
+    assert!(dds::parse_lf("BAD", &bad).is_err());
+    let bad = lf_src(&[
+        dds_line("R", "R1", "", "", "", "", "PFILE(ORDPF)"),
+        dds_line("", "X", "", "", "", "", "CONCAT(MTH QTYDUE)"),
+    ]);
+    let bad = dds::parse_lf("BAD", &bad).unwrap();
+    assert!(
+        catalog::create_logical_file(&mut client, std::slice::from_ref(&lib), &lib, &bad)
+            .await
+            .is_err()
+    );
+}
+
+/// SST (IBM DDS reference, SST example: `LASTNAME I SST(NAME 10 10)`)
+/// and input-only fields (position 38): an input-only field is read but
+/// not changed by an update, "no message is sent", and a record written
+/// through the logical file gets its default (DDS reference, usage I).
+#[tokio::test]
+async fn logical_file_substring_and_input_only() {
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    let mut pf = ordpf(&mut client, &lib).await;
+    let src = lf_src(&[
+        dds_line("R", "NAMEREC", "", "", "", "", "PFILE(ORDPF)"),
+        dds_line("", "ORDNO", "", "", "", "", ""),
+        dds_line("", "LASTNAME", "", "", "", "I", "SST(NAME 10 10)"),
+        dds_line("", "BAL", "", "", "", "I", ""),
+        dds_line("", "CODE", "", "", "", "", ""),
+        dds_line("K", "LASTNAME", "", "", "", "", ""),
+    ]);
+    let mut lf = crtlf(&mut client, &lib, "BYLAST", &src).await;
+    let r = lf.read(&client).await.unwrap();
+    assert_eq!(field(&r, "LASTNAME"), "JONES     ");
+    assert_eq!(field(&r, "BAL"), "20.00");
+    let mut rec = r.record.unwrap();
+    rec.insert("BAL".into(), "99.99".into());
+    rec.insert("LASTNAME".into(), "X".into());
+    rec.insert("CODE".into(), "555".into());
+    lf.update(&client, &rec).await.unwrap();
+    let p = pf_rec(&client, &mut pf, "2").await;
+    assert_eq!(p["BAL"], "20.00", "input-only: not changed");
+    assert_eq!(p["NAME"], "MARY     JONES      ");
+    assert_eq!(p["CODE"], "555");
+    let r = lf.chain(&client, &["LEE".into()]).await.unwrap();
+    assert_eq!(field(&r, "ORDNO"), "3");
+    let mut new = rla::Record::new();
+    new.insert("ORDNO".into(), "9".into());
+    new.insert("BAL".into(), "5.00".into());
+    new.insert("CODE".into(), "123".into());
+    lf.write(&client, &new).await.unwrap();
+    let p = pf_rec(&client, &mut pf, "9").await;
+    assert_eq!(p["BAL"], "0.00", "input-only: the default");
+    assert_eq!(p["CODE"], "123");
+    // Deleting through the logical file deletes the physical record.
+    lf.chain(&client, &["LEE".into()]).await.unwrap();
+    lf.delete(&client).await.unwrap();
+    assert!(!pf.chain(&client, &["3".into()]).await.unwrap().found);
+
+    // "The usage I in position 38 must be specified for SST fields"; N is
+    // only for join logical files.
+    let bad = lf_src(&[
+        dds_line("R", "R1", "", "", "", "", "PFILE(ORDPF)"),
+        dds_line("", "LASTNAME", "", "", "", "", "SST(NAME 10 10)"),
+    ]);
+    assert!(dds::parse_lf("BAD", &bad).is_err());
+    let bad = lf_src(&[
+        dds_line("R", "R1", "", "", "", "", "PFILE(ORDPF)"),
+        dds_line("", "CODE", "", "", "", "N", ""),
+    ]);
+    assert!(dds::parse_lf("BAD", &bad).is_err());
+}
+
+/// Character and zoned decimal fields over each other (IBM DDS reference,
+/// "Conversion between zoned decimal and character": valid when the
+/// number of characters equals the number of digits; characters other
+/// than 0 through 9 cannot be passed to a zoned decimal field). A
+/// negative zoned value's last byte has the D zone: -12 in 3 digits is
+/// X'F0F1D2', "01K" in CCSID 37. Conversions the reference's table marks
+/// not valid (character to packed) are refused.
+#[tokio::test]
+async fn logical_file_zoned_and_character() {
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    let mut pf = ordpf(&mut client, &lib).await;
+    let src = lf_src(&[
+        dds_line("R", "CVTREC", "", "", "", "", "PFILE(ORDPF)"),
+        dds_line("", "ORDNO", "", "", "", "", ""),
+        dds_line("", "CODE", "3", "S", "0", "", ""),
+        dds_line("", "NEG", "3", "A", "", "", ""),
+        dds_line("K", "ORDNO", "", "", "", "", ""),
+    ]);
+    let mut lf = crtlf(&mut client, &lib, "CVT", &src).await;
+    let r = lf.chain(&client, &["1".into()]).await.unwrap();
+    assert_eq!(field(&r, "CODE"), "42");
+    assert_eq!(field(&r, "NEG"), "01K");
+    let r = lf.chain(&client, &["2".into()]).await.unwrap();
+    assert_eq!(field(&r, "NEG"), "007");
+    let mut rec = r.record.unwrap();
+    rec.insert("CODE".into(), "8".into());
+    rec.insert("NEG".into(), "123".into());
+    lf.update(&client, &rec).await.unwrap();
+    let p = pf_rec(&client, &mut pf, "2").await;
+    assert_eq!((p["CODE"].as_str(), p["NEG"].as_str()), ("008", "123"));
+    rec.insert("NEG".into(), "1A3".into());
+    assert!(
+        lf.update(&client, &rec).await.is_err(),
+        "only the digits 0 through 9 go to a zoned decimal field"
+    );
+
+    let bad = lf_src(&[
+        dds_line("R", "R1", "", "", "", "", "PFILE(ORDPF)"),
+        dds_line("", "CODE", "3", "P", "0", "", ""),
+    ]);
+    let bad = dds::parse_lf("BAD", &bad).unwrap();
+    assert!(
+        catalog::create_logical_file(&mut client, std::slice::from_ref(&lib), &lib, &bad)
+            .await
+            .is_err(),
+        "character to packed is not a valid conversion"
+    );
+    let bad = lf_src(&[
+        dds_line("R", "R1", "", "", "", "", "PFILE(ORDPF)"),
+        dds_line("", "CODE", "4", "S", "0", "", ""),
+    ]);
+    let bad = dds::parse_lf("BAD", &bad).unwrap();
+    assert!(
+        catalog::create_logical_file(&mut client, std::slice::from_ref(&lib), &lib, &bad)
+            .await
+            .is_err(),
+        "3 characters and 4 digits"
+    );
+}
+
+/// COMP with a field name and with *NULL (IBM DDS reference, COMP example
+/// 1: `S FIELDC COMP(EQ FIELDD)`, `S FIELDE COMP(NE *NULL)`), and DYNSLT
+/// with arrival sequence (DDS reference, DYNSLT example 1: of records 1
+/// to 4, `S FLD1 COMP(GT 2)` gives the program the last two).
+#[tokio::test]
+async fn logical_file_comp_field_null_and_dynslt() {
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    let mut pf = ordpf(&mut client, &lib).await;
+    // Order 3 has MTH = DAY (6 and 6).
+    let src = lf_src(&[
+        dds_line("R", "ORDREC", "", "", "", "", "PFILE(ORDPF)"),
+        dds_line("K", "ORDNO", "", "", "", "", ""),
+        dds_line("S", "MTH", "", "", "", "", "COMP(EQ DAY)"),
+    ]);
+    let mut lf = crtlf(&mut client, &lib, "SAMEMD", &src).await;
+    let r = lf.read(&client).await.unwrap();
+    assert_eq!(field(&r, "ORDNO"), "3");
+    assert!(lf.read(&client).await.unwrap().eof);
+
+    let mut rec = pf_rec(&client, &mut pf, "2").await;
+    // The record read says NOTE is null; it no longer is.
+    rec.remove(rla::NULLS);
+    rec.insert("NOTE".into(), "hello".into());
+    pf.update(&client, &rec).await.unwrap();
+    let src = lf_src(&[
+        dds_line("R", "ORDREC", "", "", "", "", "PFILE(ORDPF)"),
+        dds_line("K", "ORDNO", "", "", "", "", ""),
+        dds_line("S", "NOTE", "", "", "", "", "COMP(NE *NULL)"),
+    ]);
+    let mut lf = crtlf(&mut client, &lib, "NOTED", &src).await;
+    let r = lf.read(&client).await.unwrap();
+    assert_eq!(field(&r, "ORDNO"), "2");
+    assert!(lf.read(&client).await.unwrap().eof);
+
+    let src = format!(
+        "{}{}",
+        dds_line("", "", "", "", "", "", "DYNSLT"),
+        lf_src(&[
+            dds_line("R", "ORDREC", "", "", "", "", "PFILE(ORDPF)"),
+            dds_line("S", "ORDNO", "", "", "", "", "COMP(GT 1)"),
+        ])
+    );
+    let parsed = dds::parse_lf("DYN", &src).unwrap();
+    assert!(parsed.dynslt);
+    let mut lf = crtlf(&mut client, &lib, "DYN", &src).await;
+    let mut seen = Vec::new();
+    loop {
+        let r = lf.read(&client).await.unwrap();
+        if r.eof {
+            break;
+        }
+        seen.push(field(&r, "ORDNO"));
+    }
+    assert_eq!(seen, ["2", "3"]);
+}
+
+/// The logical file trigger functions in a library.
+async fn lf_functions(c: &Client, lib: &str) -> i64 {
+    c.query_one(
+        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+          WHERE n.nspname = lower($1) AND p.proname LIKE '%~lfw'",
+        &[&lib],
+    )
+    .await
+    .unwrap()
+    .get(0)
+}
+
+/// A logical file whose fields are written back by a trigger (CONCAT,
+/// input only) is saved and restored with it (SAVLIB, RSTLIB), and DLTF
+/// takes the trigger's function with it. SQL changes records through it
+/// as record-level access does.
+#[tokio::test]
+async fn logical_file_with_trigger_saved_restored_deleted() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (mut client, lib) = setup(&url).await;
+    ordpf(&mut client, &lib).await;
+    let src = lf_src(&[
+        dds_line("R", "DATEREC", "", "", "", "", "PFILE(ORDPF)"),
+        dds_line("", "ORDNO", "", "", "", "", ""),
+        dds_line("", "DATE", "", "", "", "", "CONCAT(MTH DAY YEAR)"),
+        dds_line("", "BAL", "", "", "", "I", ""),
+        dds_line("K", "ORDNO", "", "", "", "", ""),
+    ]);
+    crtlf(&mut client, &lib, "ORDDATE", &src).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let jl = format!("{lib}J");
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let _ = cl_cmd(&mut job, format!("DLTLIB {jl}")).await;
+    for c in [
+        format!("CRTLIB {jl}"),
+        format!("CRTSAVF FILE({jl}/SV)"),
+        format!("SAVLIB LIB({lib}) DEV(*SAVF) SAVF({jl}/SV)"),
+        format!("DLTLIB {lib}"),
+        format!("RSTLIB SAVLIB({lib}) DEV(*SAVF) SAVF({jl}/SV)"),
+    ] {
+        cl_cmd(&mut job, c.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+    }
+    // Restored: an update through the logical file splits DATE again.
+    let mut lf = open(&client, &lib, "ORDDATE").await;
+    let r = lf.chain(&client, &["1".into()]).await.unwrap();
+    assert_eq!(field(&r, "DATE"), "123125");
+    let mut rec = r.record.unwrap();
+    rec.insert("DATE".into(), "20426".into());
+    lf.update(&client, &rec).await.unwrap();
+    let mut pf = open(&client, &lib, "ORDPF").await;
+    let p = pf_rec(&client, &mut pf, "1").await;
+    assert_eq!(
+        (p["MTH"].as_str(), p["DAY"].as_str(), p["YEAR"].as_str()),
+        ("2", "4", "26")
+    );
+    // SQL through the logical file.
+    let sql = |s: String| format!("RUNSQL SQL('{}') COMMIT(*NONE)", s.replace('\'', "''"));
+    cl_cmd(
+        &mut job,
+        sql(format!(
+            "UPDATE {lib}.ORDDATE SET DATE = 70426 WHERE ORDNO = 2"
+        )),
+    )
+    .await
+    .unwrap();
+    let p = pf_rec(&client, &mut pf, "2").await;
+    assert_eq!((p["MTH"].as_str(), p["DAY"].as_str()), ("7", "4"));
+
+    assert_eq!(lf_functions(&client, &lib).await, 1);
+    cl_cmd(&mut job, format!("DLTF {lib}/ORDDATE"))
+        .await
+        .unwrap();
+    assert_eq!(lf_functions(&client, &lib).await, 0);
+    let _ = cl_cmd(&mut job, format!("DLTLIB {jl}")).await;
+}
+
 /// Phase 1 gate: a file created from DDS is read with record-level access
 /// (the other tests) and with SQL. DB2 for i SQL reference: system naming
 /// LIB/FILE, SQL naming LIB.FILE, unqualified names through the library

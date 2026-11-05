@@ -1231,27 +1231,77 @@ fn so_literal(field: &FieldDef, v: &str) -> Result<String> {
     }
 }
 
+/// A select/omit field: its definition and its value (lfmap::find), or a
+/// physical file field that is not in the record format.
+fn so_field(
+    cols: &[crate::lfmap::Column],
+    pf: &[FieldDef],
+    name: &str,
+    prefix: &str,
+    file: &str,
+) -> Result<(FieldDef, String)> {
+    if let Some((def, e, _)) = crate::lfmap::find(cols, pf, name, prefix) {
+        return Ok((def, e));
+    }
+    let f = pf.iter().find(|f| f.name == name).ok_or_else(|| {
+        anyhow::anyhow!("select/omit field {name} is not in physical file {file}")
+    })?;
+    Ok((f.clone(), format!("{prefix}{}", f.column())))
+}
+
+/// Is a COMP value a field name (DDS reference, COMP at the select/omit
+/// field level: `COMP(relational-operator field-name)`)?
+fn is_field_name(v: &str) -> bool {
+    !v.starts_with('*')
+        && v.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || "#@$".contains(c))
+}
+
 /// The select/omit rules as an SQL condition: the first rule whose
 /// conditions all hold decides; when none does, the record is omitted if
 /// the last rule is a select and selected if it is an omit.
-/// Columns are written as `{prefix}"name"` (`t.` in the view, nothing in
-/// a partial index).
-pub fn selection_sql(lf: &LogicalFile, fields: &[FieldDef], prefix: &str) -> Result<String> {
+/// `cols` are the record format's fields with their columns written as
+/// `{prefix}"name"` (`t.` in the view, nothing in a partial index).
+pub fn selection_sql(
+    lf: &LogicalFile,
+    cols: &[crate::lfmap::Column],
+    pf: &[FieldDef],
+    prefix: &str,
+) -> Result<String> {
     if lf.select_omit.is_empty() {
         return Ok("TRUE".into());
+    }
+    // A RENAME or CONCAT field and a field named on its keyword cannot
+    // both be select/omit fields (DDS reference, select/omit field name).
+    let named: Vec<&String> = lf
+        .select_omit
+        .iter()
+        .flat_map(|r| r.conds.iter().map(|(n, _)| n))
+        .collect();
+    for c in cols {
+        if named.contains(&&c.def.name) {
+            if let Some(p) = c.params.iter().find(|p| named.contains(p)) {
+                bail!(
+                    "{} and {p}, named on its keyword, cannot both be select/omit fields",
+                    c.def.name
+                );
+            }
+        }
     }
     let mut out = String::from("CASE");
     for rule in &lf.select_omit {
         let mut conds = Vec::new();
         for (name, test) in &rule.conds {
-            let f = fields.iter().find(|f| &f.name == name).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "select/omit field {name} is not in physical file {}",
-                    lf.based_on
-                )
-            })?;
-            let col = format!("{prefix}{}", f.column());
+            let (f, col) = so_field(cols, pf, name, prefix, &lf.based_on)?;
             conds.push(match test {
+                // COMP(EQ *NULL) and COMP(NE *NULL) (DDS reference, COMP
+                // example 1: `S FIELDE COMP(NE *NULL)`).
+                Test::Comp(op, v) if v.eq_ignore_ascii_case("*NULL") => match op.as_str() {
+                    "EQ" => format!("{col} IS NULL"),
+                    "NE" => format!("{col} IS NOT NULL"),
+                    other => bail!("COMP({other} *NULL): only EQ and NE compare with *NULL"),
+                },
                 Test::Comp(op, v) => {
                     let op = match op.as_str() {
                         "EQ" => "=",
@@ -1262,19 +1312,32 @@ pub fn selection_sql(lf: &LogicalFile, fields: &[FieldDef], prefix: &str) -> Res
                         "NG" | "LE" => "<=",
                         other => bail!("COMP operator {other} is not valid"),
                     };
-                    format!("{col} {op} {}", so_literal(f, v)?)
+                    let rhs = if is_field_name(v) {
+                        let (g, other) =
+                            so_field(cols, pf, &v.to_ascii_uppercase(), prefix, &lf.based_on)?;
+                        if g.data_type.is_numeric() != f.data_type.is_numeric() {
+                            bail!(
+                                "select/omit field {name} cannot be compared with field {}: one is numeric and the other is not",
+                                g.name
+                            );
+                        }
+                        other
+                    } else {
+                        so_literal(&f, v)?
+                    };
+                    format!("{col} {op} {rhs}")
                 }
                 Test::Values(vs) => format!(
                     "{col} IN ({})",
                     vs.iter()
-                        .map(|v| so_literal(f, v))
+                        .map(|v| so_literal(&f, v))
                         .collect::<Result<Vec<_>>>()?
                         .join(", ")
                 ),
                 Test::Range(lo, hi) => format!(
                     "{col} BETWEEN {} AND {}",
-                    so_literal(f, lo)?,
-                    so_literal(f, hi)?
+                    so_literal(&f, lo)?,
+                    so_literal(&f, hi)?
                 ),
             });
         }
@@ -1290,10 +1353,13 @@ pub fn selection_sql(lf: &LogicalFile, fields: &[FieldDef], prefix: &str) -> Res
     Ok(out)
 }
 
-/// CRTLF: a logical file is a view over its physical file's table (the
-/// listed fields and rrn, filtered by select/omit), with its own index on
-/// the physical file for its key order, and a partial unique index when it
-/// is UNIQUE.
+/// CRTLF: a logical file is a view over its physical file's table (rrn
+/// and the record format's fields, each a column or an expression over
+/// the physical file's columns: lfmap.rs), filtered by select/omit, with
+/// its own index on the physical file for its key order, and a partial
+/// unique index when it is UNIQUE. When a field is converted, concatenated
+/// or input only, a trigger on the view changes the physical file's table
+/// for records written, updated and deleted through it.
 pub async fn create_logical_file(
     client: &mut Client,
     libl: &[String],
@@ -1316,44 +1382,50 @@ pub async fn create_logical_file(
             lf.based_on
         );
     }
-    let fields: Vec<FieldDef> = if lf.fields.is_empty() {
-        pf.file.fields.clone()
-    } else {
-        lf.fields
-            .iter()
-            .map(|n| {
-                pf.file
-                    .fields
-                    .iter()
-                    .find(|f| &f.name == n)
-                    .cloned()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("field {n} is not in physical file {}", pf.file.name)
-                    })
-            })
-            .collect::<Result<_>>()?
-    };
-    for k in &lf.keys {
-        if !fields.iter().any(|f| &f.name == k) {
-            bail!(
-                "key field {k} is not a field of record format {}",
-                lf.format
-            );
+    let co = crate::collate::clause(client).await?;
+    let pf_fields = &pf.file.fields;
+    let view_cols = crate::lfmap::columns(lf, pf_fields, &pf.file.name, "t.", &co)?;
+    let index_cols = crate::lfmap::columns(lf, pf_fields, &pf.file.name, "", &co)?;
+    let fields: Vec<FieldDef> = view_cols.iter().map(|c| c.def.clone()).collect();
+    // Key fields: fields of the record format. A RENAME or CONCAT field
+    // and a field named on its keyword cannot both be keys (DDS
+    // reference, CONCAT and RENAME).
+    for c in &view_cols {
+        if lf.keys.contains(&c.def.name) {
+            if let Some(p) = c.params.iter().find(|p| lf.keys.contains(p)) {
+                bail!(
+                    "{} and {p}, named on its keyword, cannot both be key fields",
+                    c.def.name
+                );
+            }
         }
     }
-    let selection = selection_sql(lf, &pf.file.fields, "t.")?;
-    let index_selection = selection_sql(lf, &pf.file.fields, "")?;
-    let as_pf = PhysicalFile {
-        name: name.clone(),
-        format: lf.format.clone(),
-        text: lf.text.clone(),
-        unique: lf.unique,
-        fields: fields.clone(),
-        keys: lf.keys.clone(),
-        descending: lf.descending.clone(),
-        view: None,
-        source: None,
-    };
+    let mut key_exprs = Vec::new();
+    for k in &lf.keys {
+        let e = match crate::lfmap::find(&index_cols, pf_fields, k, "") {
+            Some((_, e, true)) => e,
+            Some((_, _, false)) => bail!(
+                "key field {k} is named on a RENAME or CONCAT keyword but is not a field of record format {}: such keys are not supported yet",
+                lf.format
+            ),
+            None => bail!(
+                "key field {k} is not a field of record format {}",
+                lf.format
+            ),
+        };
+        let e = if e.starts_with('"') {
+            e
+        } else {
+            format!("({e})")
+        };
+        key_exprs.push(if lf.descending.contains(k) {
+            format!("{e} DESC")
+        } else {
+            e
+        });
+    }
+    let selection = selection_sql(lf, &view_cols, pf_fields, "t.")?;
+    let index_selection = selection_sql(lf, &index_cols, pf_fields, "")?;
 
     let tx = client.transaction().await?;
     if tx
@@ -1402,19 +1474,47 @@ pub async fn create_logical_file(
         &[&lib, &name, &pf.library, &pf.file.name, &index_selection],
     )
     .await?;
-    let cols: Vec<String> = fields.iter().map(|f| format!("t.{}", f.column())).collect();
+    let cols: Vec<String> = view_cols
+        .iter()
+        .map(|c| format!("{} AS {}", c.read, c.def.column()))
+        .collect();
     let view = format!("{}.{}", ident(&lib), ident(&name));
+    let base = pf.table();
     tx.batch_execute(&format!(
-        "CREATE VIEW {view} AS SELECT t.rrn, {} FROM {} AS t WHERE {selection}",
+        "CREATE VIEW {view} AS SELECT t.rrn, {} FROM {base} AS t WHERE {selection}",
         cols.join(", "),
-        pf.table()
     ))
     .await?;
-    if !lf.keys.is_empty() {
+    if crate::lfmap::needs_trigger(&view_cols) {
+        // Records written through the view get the physical fields'
+        // defaults for the fields they leave out.
+        for c in &view_cols {
+            if let Some(d) = &c.default {
+                tx.batch_execute(&format!(
+                    "ALTER VIEW {view} ALTER COLUMN {} SET DEFAULT {d}",
+                    c.def.column()
+                ))
+                .await?;
+            }
+        }
+        let func = crate::lfmap::trigger_function(&lib, &name);
+        tx.batch_execute(&format!(
+            "CREATE FUNCTION {func}() RETURNS trigger LANGUAGE plpgsql
+               SET search_path = pg_catalog, pg_temp AS $as4tainr$
+             {}
+             $as4tainr$;
+             CREATE TRIGGER lf_write INSTEAD OF INSERT OR UPDATE OR DELETE ON {view}
+               FOR EACH ROW EXECUTE FUNCTION {func}();",
+            crate::lfmap::trigger_body(&view_cols, &base)
+        ))
+        .await?;
+    }
+    if !key_exprs.is_empty() {
         // The index lives with the physical file's table; its name says
-        // which logical file it serves.
-        let base = pf.table();
-        let where_ = if index_selection == "TRUE" {
+        // which logical file it serves. With DYNSLT the access path holds
+        // every record and select/omit is tested when records are read
+        // (DDS reference, DYNSLT).
+        let where_ = if index_selection == "TRUE" || lf.dynslt {
             String::new()
         } else {
             format!(" WHERE {index_selection}")
@@ -1422,13 +1522,21 @@ pub async fn create_logical_file(
         tx.batch_execute(&format!(
             "CREATE INDEX {} ON {base} ({}, rrn){where_}",
             ident(&format!("{lib}_{name}_key")),
-            access_path(&as_pf)
+            key_exprs.join(", ")
         ))
         .await?;
         if lf.unique {
-            let keycols: Vec<String> = lf.keys.iter().map(|k| key_column(&fields, k)).collect();
+            let keycols: Vec<String> = key_exprs
+                .iter()
+                .map(|e| e.trim_end_matches(" DESC").to_string())
+                .collect();
+            let uwhere = if index_selection == "TRUE" {
+                String::new()
+            } else {
+                format!(" WHERE {index_selection}")
+            };
             tx.batch_execute(&format!(
-                "CREATE UNIQUE INDEX {} ON {base} ({}){where_}",
+                "CREATE UNIQUE INDEX {} ON {base} ({}){uwhere}",
                 ident(&format!("{lib}_{name}_ukey")),
                 keycols.join(", ")
             ))
@@ -1669,8 +1777,26 @@ pub async fn delete_file(
                     .await?;
             }
             (Some(r), _) => {
-                // The view, and the indexes on the physical file's table.
+                // The view (with its trigger's function, found by the
+                // trigger: the file may have been renamed), and the
+                // indexes on the physical file's table.
                 let pf_lib: String = r.get(0);
+                let funcs: Vec<String> = tx
+                    .query(
+                        "SELECT tg.tgfoid::regprocedure::text FROM pg_trigger tg
+                          WHERE tg.tgrelid = to_regclass($1) AND tg.tgname = 'lf_write'",
+                        &[&qualified],
+                    )
+                    .await?
+                    .iter()
+                    .map(|r| r.get(0))
+                    .collect();
+                for f in funcs {
+                    tx.batch_execute(&format!(
+                        "DROP VIEW IF EXISTS {qualified}; DROP FUNCTION IF EXISTS {f};"
+                    ))
+                    .await?;
+                }
                 tx.batch_execute(&format!(
                     "DROP VIEW IF EXISTS {qualified};
                      DROP INDEX IF EXISTS {}.{};

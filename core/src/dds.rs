@@ -649,14 +649,78 @@ pub struct LogicalFile {
     pub format: String,
     pub text: String,
     pub unique: bool,
+    /// DYNSLT: select/omit is tested when records are read, not kept in
+    /// the access path.
+    #[serde(default)]
+    pub dynslt: bool,
     /// PFILE: the physical file, `FILE` or `LIB/FILE`.
     pub based_on: String,
-    /// Field names; empty means all fields of the physical file.
-    pub fields: Vec<String>,
+    /// The record format's fields in order; empty means all fields of the
+    /// physical file.
+    pub fields: Vec<LfField>,
     pub keys: Vec<String>,
     pub descending: Vec<String>,
     /// Rules in order; the first one whose conditions hold decides.
     pub select_omit: Vec<SelectOmit>,
+}
+
+/// Where a logical file field's value comes from (DDS reference, field
+/// name, RENAME, CONCAT and SST).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LfSource {
+    /// The physical file field of this name, or the one RENAME names.
+    Field(String),
+    /// CONCAT(field-1 field-2 ...): physical file fields, in order.
+    Concat(Vec<String>),
+    /// SST(field start [length]): part of a field of the physical file or
+    /// one defined earlier in the logical file.
+    Sst {
+        field: String,
+        start: u32,
+        length: Option<u32>,
+    },
+}
+
+/// Decimal positions (positions 36-37) of a logical file field: a new
+/// value, or `+n`/`-n` to change the physical file field's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Decimals {
+    Set(u32),
+    Change(i32),
+}
+
+/// A field of a logical file's record format.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LfField {
+    pub name: String,
+    pub source: LfSource,
+    /// Positions 30-34: a length of its own.
+    pub length: Option<u32>,
+    /// Position 35: a data type of its own (DDS code).
+    pub data_type: Option<DataType>,
+    /// Positions 36-37.
+    pub decimals: Option<Decimals>,
+    /// Position 38: B (both), I (input only) or N (neither).
+    pub usage: char,
+    /// VARLEN on the logical file field.
+    pub varlen: bool,
+    pub text: Option<String>,
+}
+
+impl LfField {
+    /// A field taken from the physical file as it is.
+    pub fn plain(name: &str) -> LfField {
+        LfField {
+            name: name.to_string(),
+            source: LfSource::Field(name.to_string()),
+            length: None,
+            data_type: None,
+            decimals: None,
+            usage: 'B',
+            varlen: false,
+            text: None,
+        }
+    }
 }
 
 fn cols(line: &str, from: usize, to: usize) -> &str {
@@ -837,32 +901,6 @@ fn entries(source: &str) -> Vec<(usize, String)> {
     out
 }
 
-/// Join DDS continuation lines: a keyword area ending in '-' continues
-/// with the next line's keyword area as is; '+' skips its leading blanks.
-fn join_continuations(source: &str) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    for raw in source.lines() {
-        let line = raw.trim_end_matches('\r').to_string();
-        if let Some(prev) = lines.last_mut() {
-            let t = prev.trim_end();
-            if t.len() > 44 && (t.ends_with('-') || t.ends_with('+')) {
-                let plus = t.ends_with('+');
-                let keep = t.len() - 1;
-                prev.truncate(keep);
-                let cont = if line.len() >= 45 {
-                    line[44..].trim_end()
-                } else {
-                    ""
-                };
-                prev.push_str(if plus { cont.trim_start() } else { cont });
-                continue;
-            }
-        }
-        lines.push(line);
-    }
-    lines
-}
-
 /// Parse DDS source for a logical file over one physical file
 /// (PFILE). Written from IBM's DDS reference for logical files:
 ///
@@ -876,30 +914,31 @@ fn join_continuations(source: &str) -> Vec<String> {
 ///   decides; when none holds, a record is omitted if the last rule was a
 ///   select and selected if it was an omit.
 ///
-/// Not supported yet: join files (JFILE), several record formats, RENAME,
-/// CONCAT, SST, field attribute overrides, DYNSLT.
+/// - fields: RENAME(physical-field), CONCAT(field ...), SST(field start
+///   [length]); a length (30-34), data type (35), decimal positions
+///   (36-37, a value or +n/-n) and usage (38: B, I; N only in join
+///   files) of their own
+/// - DYNSLT at file level; COMP(op field) and COMP(EQ|NE *NULL) in
+///   select/omit
+///
+/// Not supported yet: join files (JFILE), several record formats.
 pub fn parse_lf(file_name: &str, source: &str) -> Result<LogicalFile> {
     let mut lf = LogicalFile {
         name: file_name.to_ascii_uppercase(),
         format: String::new(),
         text: String::new(),
         unique: false,
+        dynslt: false,
         based_on: String::new(),
         fields: Vec::new(),
         keys: Vec::new(),
         descending: Vec::new(),
         select_omit: Vec::new(),
     };
-    for (idx, line) in join_continuations(source).iter().enumerate() {
-        let lineno = idx + 1;
-        if line.trim().is_empty() {
-            continue;
-        }
-        // An asterisk in position 7 makes a comment line; the form type A
-        // in position 6 is optional (DDS reference, positions 1-7).
-        if cols(line, 7, 7) == "*" {
-            continue;
-        }
+    // Keyword lines (positions 7-44 blank) belong to the field, key or
+    // record format line before them.
+    for (lineno, line) in entries(source) {
+        let line = line.as_str();
         if !cols(line, 6, 6).eq_ignore_ascii_case("A") && !cols(line, 6, 6).trim().is_empty() {
             bail!("line {lineno}: expected form type 'A' in column 6");
         }
@@ -988,6 +1027,9 @@ pub fn parse_lf(file_name: &str, source: &str) -> Result<LogicalFile> {
                     if has_keyword(keywords, "UNIQUE") {
                         lf.unique = true;
                     }
+                    if has_keyword(keywords, "DYNSLT") {
+                        lf.dynslt = true;
+                    }
                 } else if lf.fields.is_empty() && lf.keys.is_empty() {
                     // A keyword line for the record format.
                     if let Some(t) = keyword_arg(keywords, "TEXT") {
@@ -1014,13 +1056,10 @@ pub fn parse_lf(file_name: &str, source: &str) -> Result<LogicalFile> {
                 if !lf.keys.is_empty() {
                     bail!("line {lineno}: field '{name}' after the key fields");
                 }
-                if !cols(line, 30, 37).is_empty() {
-                    bail!("line {lineno}: field '{name}': changing a field's length or type in a logical file is not supported yet");
-                }
-                if lf.fields.contains(&name) {
+                if lf.fields.iter().any(|f| f.name == name) {
                     bail!("line {lineno}: duplicate field '{name}'");
                 }
-                lf.fields.push(name);
+                lf.fields.push(lf_field(lineno, line, &name, keywords)?);
             }
             other => bail!("line {lineno}: unsupported name type '{other}'"),
         }
@@ -1032,6 +1071,113 @@ pub fn parse_lf(file_name: &str, source: &str) -> Result<LogicalFile> {
         bail!("UNIQUE needs key fields");
     }
     Ok(lf)
+}
+
+/// A field line of a logical file (DDS reference: positions 30-38,
+/// RENAME, CONCAT, SST).
+fn lf_field(lineno: usize, line: &str, name: &str, keywords: &str) -> Result<LfField> {
+    let mut f = LfField::plain(name);
+    let len_txt = cols(line, 30, 34);
+    if !len_txt.is_empty() {
+        f.length = Some(len_txt.parse().ok().filter(|n| *n > 0).ok_or_else(|| {
+            anyhow::anyhow!("line {lineno}: field '{name}': bad length '{len_txt}'")
+        })?);
+    }
+    let type_txt = cols(line, 35, 35).to_ascii_uppercase();
+    if !type_txt.is_empty() {
+        f.data_type = Some(
+            DataType::from_code(&type_txt)
+                .map_err(|e| anyhow::anyhow!("line {lineno}: field '{name}': {e}"))?,
+        );
+    }
+    let dec_txt = cols(line, 36, 37);
+    if !dec_txt.is_empty() {
+        let bad =
+            || anyhow::anyhow!("line {lineno}: field '{name}': bad decimal positions '{dec_txt}'");
+        f.decimals = Some(if let Some(n) = dec_txt.strip_prefix('+') {
+            Decimals::Change(n.parse().map_err(|_| bad())?)
+        } else if let Some(n) = dec_txt.strip_prefix('-') {
+            Decimals::Change(-n.parse::<i32>().map_err(|_| bad())?)
+        } else {
+            Decimals::Set(dec_txt.parse().map_err(|_| bad())?)
+        });
+    }
+    // Position 38: blank is B in a simple logical file; N is for join
+    // logical files only.
+    f.usage = match cols(line, 38, 38).to_ascii_uppercase().as_str() {
+        "" | "B" => 'B',
+        "I" => 'I',
+        "N" => bail!("line {lineno}: field '{name}': usage N is only valid in a join logical file"),
+        other => bail!("line {lineno}: field '{name}': usage '{other}' is not valid (B, I or N)"),
+    };
+    f.varlen = has_keyword(keywords, "VARLEN");
+    f.text = keyword_arg(keywords, "TEXT");
+    let rename = keyword_arg(keywords, "RENAME").map(|s| s.trim().to_ascii_uppercase());
+    let concat = keyword_args(keywords, "CONCAT");
+    let sst = keyword_args(keywords, "SST");
+    if [rename.is_some(), concat.is_some(), sst.is_some()]
+        .iter()
+        .filter(|x| **x)
+        .count()
+        > 1
+    {
+        bail!("line {lineno}: field '{name}': RENAME, CONCAT and SST cannot be used together");
+    }
+    if let Some(r) = rename {
+        if r.is_empty() {
+            bail!("line {lineno}: field '{name}': RENAME needs a field name");
+        }
+        f.source = LfSource::Field(r);
+    }
+    if let Some(c) = concat {
+        if c.len() < 2 {
+            bail!("line {lineno}: field '{name}': CONCAT needs at least two fields");
+        }
+        // The system gives a concatenation its data type, and fields with
+        // decimal positions cannot be part of one (DDS reference, CONCAT).
+        if f.data_type.is_some() {
+            bail!("line {lineno}: field '{name}': a data type cannot be given for a CONCAT field");
+        }
+        if f.decimals.is_some() {
+            bail!("line {lineno}: field '{name}': decimal positions cannot be given for a CONCAT field");
+        }
+        f.source = LfSource::Concat(c.iter().map(|s| s.to_ascii_uppercase()).collect());
+    }
+    if let Some(s) = sst {
+        let num = |v: &str| v.parse::<u32>().ok().filter(|n| *n > 0);
+        let (field, start, length) = match s.as_slice() {
+            [fld, st] => (fld, num(st), None),
+            [fld, st, ln] => (
+                fld,
+                num(st),
+                Some(num(ln).ok_or_else(|| {
+                    anyhow::anyhow!("line {lineno}: field '{name}': the SST length must be a positive integer")
+                })?),
+            ),
+            _ => bail!("line {lineno}: field '{name}': SST needs a field, a starting position and an optional length"),
+        };
+        let Some(start) = start else {
+            bail!("line {lineno}: field '{name}': the SST starting position must be a positive integer");
+        };
+        // An SST field is input only in a simple logical file (DDS
+        // reference, SST: "The usage I in position 38 must be specified").
+        if f.usage != 'I' {
+            bail!(
+                "line {lineno}: field '{name}': an SST field must be input only (I in position 38)"
+            );
+        }
+        if let (Some(a), Some(b)) = (length, f.length) {
+            if a != b {
+                bail!("line {lineno}: field '{name}': the field length and the SST length must be equal");
+            }
+        }
+        f.source = LfSource::Sst {
+            field: field.to_ascii_uppercase(),
+            start,
+            length: length.or(f.length),
+        };
+    }
+    Ok(f)
 }
 
 /// Parse DDS source for a physical file. `file_name` is the object name
@@ -1372,7 +1518,7 @@ mod tests {
         assert_eq!(lf.based_on, "CUSTMAST");
         assert_eq!(lf.text, "Customers who owe");
         assert!(lf.unique);
-        assert_eq!(lf.fields, ["CUSNO", "CUSNAM", "CUSBAL"]);
+        assert_eq!(lf.fields, ["CUSNO", "CUSNAM", "CUSBAL"].map(LfField::plain));
         assert_eq!(lf.keys, ["CUSBAL", "CUSNO"]);
         assert_eq!(lf.descending, ["CUSBAL"]);
         assert_eq!(lf.select_omit.len(), 3);
@@ -1395,12 +1541,78 @@ mod tests {
         );
     }
 
+    /// Logical file fields (IBM DDS reference: RENAME, CONCAT, SST,
+    /// positions 30-38 for logical files, DYNSLT); a keyword on the line
+    /// after a field belongs to it.
+    #[test]
+    fn parses_logical_file_fields() {
+        let src = "     A                                      DYNSLT
+     A          R RCD1                      PFILE(PF1)
+     A            QTY                       RENAME(QTYDUE)
+     A            DATE                      CONCAT(MTH DAY YEAR)
+     A            LASTNAME           I      SST(NAME 10 10)
+     A            AMT            9S 2
+     A            RATE           7 +2
+     A            CITY
+     A                                      TEXT('City')
+     A          K QTY
+";
+        let lf = parse_lf("LF1", src).unwrap();
+        assert!(lf.dynslt);
+        assert_eq!(lf.fields[0].source, LfSource::Field("QTYDUE".into()));
+        assert_eq!(
+            lf.fields[1].source,
+            LfSource::Concat(vec!["MTH".into(), "DAY".into(), "YEAR".into()])
+        );
+        assert_eq!(
+            lf.fields[2].source,
+            LfSource::Sst {
+                field: "NAME".into(),
+                start: 10,
+                length: Some(10)
+            }
+        );
+        assert_eq!(lf.fields[2].usage, 'I');
+        assert_eq!(
+            (
+                lf.fields[3].length,
+                lf.fields[3].data_type,
+                lf.fields[3].decimals
+            ),
+            (Some(9), Some(DataType::Zoned), Some(Decimals::Set(2)))
+        );
+        assert_eq!(lf.fields[4].decimals, Some(Decimals::Change(2)));
+        assert_eq!(lf.fields[5].text.as_deref(), Some("City"));
+        assert_eq!(lf.fields[5].usage, 'B');
+        // SST fields are input only; N is for join logical files.
+        assert!(parse_lf(
+            "X",
+            "     A          R R1                        PFILE(PF1)\n     A            L                         SST(NAME 1 2)\n"
+        )
+        .is_err());
+        assert!(parse_lf(
+            "X",
+            "     A          R R1                        PFILE(PF1)\n     A            L                  N\n"
+        )
+        .is_err());
+    }
+
     #[test]
     fn logical_file_errors() {
         let e = |src: &str| parse_lf("X", src).unwrap_err().to_string();
         assert!(e("     A          R REC\n").contains("PFILE"));
         assert!(e("     A          R REC                       PFILE(P)\n     A          S F1                        COMP(XX 1)\n").contains("not valid"));
-        assert!(e("     A          R REC                       PFILE(P)\n     A            F1             5A\n").contains("not supported"));
+        // A length and data type of the field's own (DDS reference,
+        // positions 30-35 for logical files): no longer refused.
+        let lf = parse_lf(
+            "X",
+            "     A          R REC                       PFILE(P)\n     A            F1             5A\n",
+        )
+        .unwrap();
+        assert_eq!(
+            (lf.fields[0].length, lf.fields[0].data_type),
+            (Some(5), Some(DataType::Char))
+        );
         assert!(
             e("     A          R REC                       PFILE(P1 P2)\n").contains("several")
         );

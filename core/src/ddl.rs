@@ -3980,6 +3980,7 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
                 format: format.clone().unwrap_or_else(|| tfile.file.format.clone()),
                 text: String::new(),
                 unique: *unique,
+                dynslt: false,
                 based_on: format!("{tlib}/{tsys}"),
                 fields: Vec::new(),
                 keys: ks.iter().map(|(k, _)| k.clone()).collect(),

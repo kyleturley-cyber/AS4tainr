@@ -26147,7 +26147,7 @@ async fn cl_declared_files_hold_shared_read_locks() {
     ] {
         a.run(&c).await.unwrap();
     }
-    let src = "PGM\nDCLF FILE(CLKF)\nRCVF\nDLYJOB DLY(3)\nCLOSE\nDLYJOB DLY(6)\nENDPGM\n";
+    let src = "PGM\nDCLF FILE(CLKF)\nRCVF\nDLYJOB DLY(6)\nCLOSE\nDLYJOB DLY(6)\nENDPGM\n";
     put_member(
         &client,
         &Member {
@@ -26170,7 +26170,11 @@ async fn cl_declared_files_hold_shared_read_locks() {
     let dlc = format!("DLCOBJ OBJ(({lib}/CLKF *FILE *EXCL))");
     let key = format!("{lib}/CLKF *FILE");
     let clr = format!("CLRPFM FILE({lib}/CLKF)");
-    let (ra, (rb1, rb2, rc1, rc2)) = tokio::join!(a.run(&call), async {
+    // RGZPFM and DLTF wait the job's default wait time (1 second here).
+    b.run("CHGJOB DFTWAIT(1)").await.unwrap();
+    let rgz = format!("RGZPFM FILE({lib}/CLKF)");
+    let dlt = format!("DLTF FILE({lib}/CLKF)");
+    let (ra, (rb1, rb2, rc1, rc2, rg, rd)) = tokio::join!(a.run(&call), async {
         // While the file is open (its *SHRRD recorded): refused.
         for _ in 0..300 {
             let open = other
@@ -26190,16 +26194,20 @@ async fn cl_declared_files_hold_shared_read_locks() {
         // CLRPFM of the open file: CPF3130 (PUB400 2026-11-05,
         // tools/golden/verify50.txt s50_open).
         let c1 = b.run(&clr).await;
-        // After CLOSE (3 s after the open; the program goes on 6 s more):
+        // RGZPFM and DLTF of the open file: CPF3202, RGZPFM's then
+        // CPF2981 (PUB400 2026-11-05, tools/golden/verify51.txt t51_open).
+        let g = b.run(&rgz).await;
+        let d = b.run(&dlt).await;
+        // After CLOSE (6 s after the open; the program goes on 6 s more):
         // allocated.
-        tokio::time::sleep(std::time::Duration::from_millis(4500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5500)).await;
         let r2 = b.run(&alc).await;
         if r2.is_ok() {
             let _ = b.run(&dlc).await;
         }
         // Closed and nothing allocated: cleared.
         let c2 = b.run(&clr).await;
-        (r1, r2, c1, c2)
+        (r1, r2, c1, c2, g, d)
     });
     assert!(ra.is_ok(), "{ra:?}");
     let e = rb1.unwrap_err().to_string();
@@ -26208,6 +26216,10 @@ async fn cl_declared_files_hold_shared_read_locks() {
     let e = rc1.unwrap_err().to_string();
     assert!(e.starts_with("CPF3130"), "{e}");
     assert!(rc2.is_ok(), "{rc2:?}");
+    let e = rg.unwrap_err().to_string();
+    assert!(e.starts_with("CPF3202") && e.contains("\nCPF2981"), "{e}");
+    let e = rd.unwrap_err().to_string();
+    assert!(e.starts_with("CPF3202"), "{e}");
 }
 
 // CPYFRMSTMF of lines longer than the source file's records: the lines

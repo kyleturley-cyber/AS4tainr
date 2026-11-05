@@ -65,7 +65,7 @@ def parse_result(lines, raw):
     """(stdout lines, rc, stderr lines) of one capture or run."""
     out, err, rc = [], [], None
     for line in lines:
-        if line.startswith("rc=") and rc is None:
+        if rc is None and re.fullmatch(r"rc=-?\d+", line):
             rc = int(line[3:])
         elif line.startswith("2> "):
             err.append(line[3:])

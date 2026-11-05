@@ -1,0 +1,10 @@
+# Golden: what an RPG program's open for update (a record read, held 60
+# s in a background `system` job) shows in WRKOBJLCK (object and member
+# locks) and keeps out: ALCOBJ *SHRRD, *SHRUPD, *SHRNUP and *EXCLRD from
+# another job, and whether CLRPFM waits before CPF3130.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify52.txt -Files tools\golden\verify52
+u52_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLD52U)" "DLTF FILE(AS4TRAINR1/GLD52F)"; do system -q "$c"; done; echo cleaned
+u52_tag|!setccsid 819 /home/AS4TRAINR/gld/gld52u.rpgle; ls /home/AS4TRAINR/gld | grep gld52
+u52_make|!system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD52F (K INTEGER NOT NULL)') COMMIT(*NONE)"; system "RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD52F VALUES(1), (2)') COMMIT(*NONE)"; system "CRTBNDRPG PGM(AS4TRAINR1/GLD52U) SRCSTMF('/home/AS4TRAINR/gld/gld52u.rpgle')" | grep -E "^CP[CF]|^RNS"
+u52_open|!(system "CALL PGM(AS4TRAINR1/GLD52U)" > /dev/null 2>&1 &); sleep 5; system "WRKOBJLCK OBJ(AS4TRAINR1/GLD52F) OBJTYPE(*FILE)" | grep -E "EXCL|SHR|Locks" | cut -c1-90; for s in "*SHRRD" "*SHRUPD" "*SHRNUP" "*EXCLRD"; do system "ALCOBJ OBJ((AS4TRAINR1/GLD52F *FILE $s)) WAIT(1)"; echo "$s rc=$?"; done; echo "== CLRPFM"; t=$(date +%s); system "CLRPFM FILE(AS4TRAINR1/GLD52F)" 2>&1 | grep -E "^CP[CF]3"; echo "waited=$(( $(date +%s) - t > 20 ))"; sleep 50
+u52_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLD52U)" "DLTF FILE(AS4TRAINR1/GLD52F)"; do system -q "$c"; done; echo cleaned

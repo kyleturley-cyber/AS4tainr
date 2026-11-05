@@ -2732,6 +2732,12 @@ impl Job<'_> {
         if authority::effective(self.client, &self.user, &lib, &name, "*FILE").await? < Aut::All {
             bail!("CPF2189: Not authorized to delete file {name} in library {lib}.");
         }
+        if self.file_in_use(&lib, &name).await? {
+            bail!(
+                "CPF3202: File {name} in library {} is in use by another job.",
+                crate::qtemp::logical(&lib)
+            );
+        }
         if crate::source::is_source_file(self.client, &lib, &name).await? {
             crate::source::delete_file(self.client, &lib, &name).await?;
             authority::forget(self.client, &lib, &name, "*FILE").await?;
@@ -6271,6 +6277,12 @@ impl Job<'_> {
             Aut::Change,
         )
         .await?;
+        if self.file_in_use(&fr.library, &name).await? {
+            let l = crate::qtemp::logical(&fr.library);
+            bail!(
+                "CPF3202: File {name} in library {l} is in use by another job.\nCPF2981: No member of file {name} in {l} was reorganized."
+            );
+        }
         let table = format!("{}.{}", catalog::ident(&fr.library), catalog::ident(&name));
         let order = if by_key && !fr.file.keys.is_empty() {
             let mut o: Vec<String> = fr
@@ -8398,6 +8410,35 @@ impl Job<'_> {
     /// Who holds an object lock this job takes (objlock.rs): the job, or
     /// the job name its connection carries, or the process (`PID<n>`, as
     /// its RPG sessions name it).
+    /// Is the file in use by another job (open or allocated) for longer
+    /// than the job's default wait time (DFTWAIT; 30 seconds for a
+    /// `system` job, DSPJOB)? RGZPFM and DLTF wait that long, then give
+    /// CPF3202 (PUB400 2026-11-05, tools/golden/verify51.txt t51_open:
+    /// both waited more than 20 seconds for a file another job had open).
+    pub(crate) async fn file_in_use(&self, library: &str, name: &str) -> Result<bool> {
+        let owner = self.lock_owner().await?;
+        let t = crate::objlock::Target {
+            library: library.to_string(),
+            name: name.to_string(),
+            objtype: "*FILE".into(),
+        };
+        let wait = match crate::jobattr::get(&self.job_key(), "DFTWAIT").as_deref() {
+            Some("*NOMAX") => u64::MAX / 4,
+            Some(n) => n.trim().parse::<u64>().unwrap_or(30),
+            None => 30,
+        };
+        let start = std::time::Instant::now();
+        loop {
+            if !crate::objlock::kept_out(self.client, &t, "*EXCL", &owner).await? {
+                return Ok(false);
+            }
+            if start.elapsed() >= std::time::Duration::from_secs(wait) {
+                return Ok(true);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
     pub(crate) async fn lock_owner(&self) -> Result<String> {
         if self.id.is_some() {
             return Ok(self.job_key());

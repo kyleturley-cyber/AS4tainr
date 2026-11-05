@@ -487,6 +487,21 @@ impl Job<'_> {
                             .map(Some);
                     }
                 }
+                // Lines longer than the source file's SRCDTA are cut to
+                // it, and the copy completes with CPIA083 instead of
+                // CPCA081 (PUB400 2026-11-05, tools/golden/verify49.txt
+                // r49_make: an 86-character line into RCDLEN(92)).
+                let width = crate::source::record_length(self.client, &lib, &file)
+                    .await?
+                    .saturating_sub(12) as usize;
+                let cut = width > 0 && lines.iter().any(|l| l.chars().count() > width);
+                if cut {
+                    body = body
+                        .split('\n')
+                        .map(|l| l.chars().take(width).collect::<String>())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                }
                 let old = crate::source::find_member(self.client, &libs, &file, &mbr)
                     .await
                     .ok();
@@ -509,9 +524,15 @@ impl Job<'_> {
                 };
                 crate::source::put_member(self.client, &m, true).await?;
                 crate::source::note_used(self.client, &lib, &file, &mbr).await;
-                msg(format!(
-                    "CPCA081: Stream file {from} was copied to member {mbr}."
-                ))
+                let done = format!("CPCA081: Stream file {from} was copied to member {mbr}.");
+                if cut {
+                    // CPIA083 first, then CPCA081 (r49_make).
+                    return Ok(Some(Outcome::Messages(vec![
+                        format!("CPIA083: Lines of stream file {from} longer than the records of member {mbr} were cut."),
+                        done,
+                    ])));
+                }
+                msg(done)
             }
             _ => Ok(None),
         }
@@ -789,9 +810,15 @@ impl Job<'_> {
             let t = format!("{t:<len$}");
             self.client.execute(&sql, &[&t]).await?;
         }
-        Ok(Outcome::Messages(vec![format!(
-            "CPCA081: Stream file {from} was copied to member {mbr}."
-        )]))
+        // Lines cut to the record: CPIA083 (as for a source member).
+        let done = format!("CPCA081: Stream file {from} was copied to member {mbr}.");
+        if lines.iter().any(|l| l.chars().count() > len) {
+            return Ok(Outcome::Messages(vec![
+                format!("CPIA083: Lines of stream file {from} longer than the records of member {mbr} were cut."),
+                done,
+            ]));
+        }
+        Ok(Outcome::Messages(vec![done]))
     }
 
     /// RMVDIR SUBTREE(*ALL): the directory and everything in it.

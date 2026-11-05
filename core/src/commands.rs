@@ -6273,11 +6273,25 @@ impl Job<'_> {
         } else {
             "rrn".into()
         };
-        crate::catalog::reorganize(self.client, &table, &order).await?;
         let mbr = match cmd.get("MBR") {
             "*FIRST" | "*LAST" | "" => name.clone(),
             m => m.to_ascii_uppercase(),
         };
+        // A member with no records is not reorganized: CPF2995 then
+        // CPF2981 (PUB400 2026-11-05, tools/golden/verify49.txt r49_open:
+        // RGZPFM after CLRPFM).
+        let records: i64 = self
+            .client
+            .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+            .await?
+            .get(0);
+        if records == 0 {
+            bail!(
+                "CPF2995: Member {mbr} of file {name} has no records to reorganize.\nCPF2981: No member of file {name} in {} was reorganized.",
+                crate::qtemp::logical(&fr.library)
+            );
+        }
+        crate::catalog::reorganize(self.client, &table, &order).await?;
         Ok(Outcome::Messages(vec![format!(
             "CPC2983: The data of member {mbr} has been reorganized."
         )]))
@@ -10060,6 +10074,23 @@ impl Job<'_> {
             Aut::Change,
         )
         .await?;
+        // Another job holding the data area *EXCL keeps the change out:
+        // CPF1063 (PUB400 2026-11-05, tools/golden/verify49.txt r49_dtaara:
+        // a background job's ALCOBJ *EXCL). The change needs *SHRUPD (the
+        // lock state table; only *EXCL was captured).
+        let t = crate::objlock::Target {
+            library: found.library.clone(),
+            name: found.name.clone(),
+            objtype: "*DTAARA".into(),
+        };
+        let owner = self.lock_owner().await?;
+        if crate::objlock::kept_out(self.client, &t, "*SHRUPD", &owner).await? {
+            bail!(
+                "CPF1063: Data area {} in library {} is locked by another job; it was not changed.",
+                found.name,
+                crate::qtemp::logical(&found.library)
+            );
+        }
         let d = dtaara::change(
             self.client,
             &name,

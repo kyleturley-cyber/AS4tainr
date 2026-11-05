@@ -1,0 +1,7 @@
+/* verify50: keep GLD50F open 60 s. */
+PGM
+  DCLF FILE(AS4TRAINR1/GLD50F)
+  RCVF
+  DLYJOB DLY(60)
+  CLOSE
+ENDPGM

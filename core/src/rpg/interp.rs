@@ -2247,6 +2247,7 @@ impl<'a> Machine<'a> {
             &fref.file.name,
             std::time::Duration::ZERO,
             &self.io.job_key,
+            update,
         ))?;
         if !locked {
             bail!(
@@ -2278,6 +2279,7 @@ impl<'a> Machine<'a> {
                 client,
                 &f.file.library,
                 &f.file.file.name,
+                f.update,
             ));
         }
         if let Some(m) = f.file.file.source.clone().filter(|m| !m.is_empty()) {

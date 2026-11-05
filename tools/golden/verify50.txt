@@ -1,0 +1,11 @@
+# Golden (verify49's file part again: its CL source had a line longer
+# than the source file's records, CPIA083, and did not compile): what a
+# file open by another job (a CL program in a background `system` job,
+# DCLF and RCVF, holding it 60 s) keeps out: WRKOBJLCK of the open,
+# CLRPFM, RGZPFM, ALCOBJ *EXCL, *EXCLRD and *SHRRD, DLTF.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify50.txt -Files tools\golden\verify50
+s50_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLD50H)" "DLTF FILE(AS4TRAINR1/GLD50F)" "DLTF FILE(AS4TRAINR1/GLD50S)"; do system -q "$c"; done; echo cleaned
+s50_tag|!setccsid 819 /home/AS4TRAINR/gld/gld50h.clle; ls /home/AS4TRAINR/gld | grep gld50
+s50_make|!system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD50F (K INTEGER NOT NULL)') COMMIT(*NONE)"; system "RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD50F VALUES(1), (2)') COMMIT(*NONE)"; system -q "CRTSRCPF FILE(AS4TRAINR1/GLD50S) RCDLEN(92)"; system "CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld50h.clle') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD50S.FILE/GLD50H.MBR')"; system "CRTBNDCL PGM(AS4TRAINR1/GLD50H) SRCFILE(AS4TRAINR1/GLD50S)" | grep -E "^CP[CF]"
+s50_open|!(system "CALL PGM(AS4TRAINR1/GLD50H)" > /dev/null 2>&1 &); sleep 5; system "WRKOBJLCK OBJ(AS4TRAINR1/GLD50F) OBJTYPE(*FILE)" | grep -E "EXCL|SHR" | cut -c1-90; for c in "ALCOBJ OBJ((AS4TRAINR1/GLD50F *FILE *EXCL)) WAIT(1)" "ALCOBJ OBJ((AS4TRAINR1/GLD50F *FILE *EXCLRD)) WAIT(1)" "ALCOBJ OBJ((AS4TRAINR1/GLD50F *FILE *SHRRD)) WAIT(1)" "CLRPFM FILE(AS4TRAINR1/GLD50F)" "RGZPFM FILE(AS4TRAINR1/GLD50F)" "DLTF FILE(AS4TRAINR1/GLD50F)"; do echo "== $c"; system "$c"; echo "rc=$?"; done; sleep 60
+s50_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLD50H)" "DLTF FILE(AS4TRAINR1/GLD50F)" "DLTF FILE(AS4TRAINR1/GLD50S)"; do system -q "$c"; done; echo cleaned

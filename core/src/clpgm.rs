@@ -2959,7 +2959,8 @@ async fn run_program(
     // The files the program opened are closed when it ends, however it
     // ends: their object locks go.
     for (_, f) in io.open.drain() {
-        let _ = crate::objlock::close_file(job.client, &f.file.library, &f.file.file.name).await;
+        let _ =
+            crate::objlock::close_file(job.client, &f.file.library, &f.file.file.name, false).await;
     }
     r
 }
@@ -3488,7 +3489,8 @@ async fn file_command(
         (_, "CLOSE") => {
             // The next RCVF opens the file again, at its first record.
             if let Some(f) = io.open.remove(&i) {
-                crate::objlock::close_file(job.client, &f.file.library, &f.file.file.name).await?;
+                crate::objlock::close_file(job.client, &f.file.library, &f.file.file.name, false)
+                    .await?;
             }
         }
         (ClFile::Db(r), "RCVF") => {
@@ -3535,6 +3537,7 @@ async fn file_command(
                     &fr.file.name,
                     std::time::Duration::ZERO,
                     &owner,
+                    false,
                 )
                 .await?
                 {

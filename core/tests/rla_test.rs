@@ -24361,6 +24361,15 @@ async fn allocate_objects_between_jobs() {
     a.run("ALCOBJ OBJ((LCK *DTAARA *EXCL)) WAIT(0)")
         .await
         .unwrap();
+    // Another job's CHGDTAARA of the data area a holds *EXCL: CPF1063
+    // (PUB400 2026-11-05, verify49 r49_dtaara); a's own change goes.
+    let e = b
+        .run("CHGDTAARA DTAARA(LCK) VALUE('x')")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF1063"), "{e}");
+    a.run("CHGDTAARA DTAARA(LCK) VALUE('y')").await.unwrap();
     // A lock not held: passed by without a message (PUB400, verify39
     // h39_dlcnot; this expected one message before the capture).
     match b.run("DLCOBJ OBJ((LCK *DTAARA *SHRRD))").await.unwrap() {
@@ -24499,6 +24508,16 @@ async fn reorganize_a_physical_file_member() {
         .run("RGZPFM FILE(CUSTMAST) KEYFILE(OTHERLF)")
         .await
         .is_err());
+    // A member with no records: CPF2995 then CPF2981 (PUB400 2026-11-05,
+    // verify49 r49_open: RGZPFM after CLRPFM).
+    job.run("CLRPFM FILE(CUSTMAST)").await.unwrap();
+    let e = job
+        .run("RGZPFM FILE(CUSTMAST)")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF2995"), "{e}");
+    assert_eq!(as4tainr_core::jobs::escape_id(&e), "CPF2981", "{e}");
 }
 
 // HLDJOBQ and RLSJOBQ: the subsystem takes no job from a held job queue
@@ -25997,7 +26016,7 @@ async fn rpg_program_references_and_create_table_as_zoned() {
 // on the file; CL reference, ALCOBJ lock state table: *EXCL goes with
 // no other job's lock). Another job's ALCOBJ *EXCL fails with CPF1002
 // while the file is open; the job's own ALCOBJ from the program does
-// not conflict; another job's *EXCL keeps the open out.
+// not conflict; another job's *EXCL does not keep an input open out.
 #[tokio::test]
 async fn open_files_hold_shared_read_locks() {
     use as4tainr_core::commands::{Environment, Job};
@@ -26048,20 +26067,41 @@ async fn open_files_hold_shared_read_locks() {
         .unwrap();
     let call = format!("CALL PGM({lib}/LCKR)");
     let alc = format!("ALCOBJ OBJ(({lib}/LCKF *FILE *EXCL)) WAIT(0)");
+    let key = format!("{lib}/LCKF *FILE");
     let (ra, rb) = tokio::join!(a.run(&call), async {
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        // B goes once A's program has the file open (its *SHRRD is
+        // recorded): the program may take a while to start.
+        for _ in 0..300 {
+            let open = other
+                .query_opt(
+                    "SELECT 1 FROM as4tainr.object_locks WHERE key = $1 AND state = '*SHRRD'",
+                    &[&key],
+                )
+                .await
+                .unwrap()
+                .is_some();
+            if open {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         b.run(&alc).await
     });
     assert!(ra.is_ok(), "{ra:?}");
     let e = rb.unwrap_err().to_string();
     assert!(e.starts_with("CPF1002"), "{e}");
-    // The program has ended and closed the file: B gets *EXCL now, and
-    // then A's program cannot open the file.
+    // The program has ended and closed the file: B gets *EXCL now. A's
+    // program still opens the file for input: IBM i's input open is not
+    // kept out by another job's ALCOBJ *EXCL (PUB400 2026-11-05,
+    // tools/golden/verify48.txt q48_held: OPENED; an earlier version of
+    // this test expected the open to fail, which the capture contradicts).
     b.run(&format!("ALCOBJ OBJ(({lib}/LCKF *FILE *EXCL)) WAIT(0)"))
         .await
         .unwrap();
-    let e = a.run(&format!("CALL PGM({lib}/LCKR)")).await.unwrap_err();
-    assert!(format!("{e:#}").contains("LCKF"), "{e:#}");
+    let r = a.run(&format!("CALL PGM({lib}/LCKR)")).await;
+    // Its own ALCOBJ *EXCL inside the program is then refused (B's *EXCL).
+    assert!(format!("{r:?}").contains("CPF1002"), "{r:?}");
     b.run(&format!("DLCOBJ OBJ(({lib}/LCKF *FILE *EXCL))"))
         .await
         .unwrap();
@@ -26107,7 +26147,7 @@ async fn cl_declared_files_hold_shared_read_locks() {
     ] {
         a.run(&c).await.unwrap();
     }
-    let src = "PGM\nDCLF FILE(CLKF)\nRCVF\nDLYJOB DLY(3)\nCLOSE\nDLYJOB DLY(2)\nENDPGM\n";
+    let src = "PGM\nDCLF FILE(CLKF)\nRCVF\nDLYJOB DLY(3)\nCLOSE\nDLYJOB DLY(6)\nENDPGM\n";
     put_member(
         &client,
         &Member {
@@ -26128,12 +26168,27 @@ async fn cl_declared_files_hold_shared_read_locks() {
     let call = format!("CALL PGM({lib}/CLKP)");
     let alc = format!("ALCOBJ OBJ(({lib}/CLKF *FILE *EXCL)) WAIT(0)");
     let dlc = format!("DLCOBJ OBJ(({lib}/CLKF *FILE *EXCL))");
+    let key = format!("{lib}/CLKF *FILE");
     let (ra, (rb1, rb2)) = tokio::join!(a.run(&call), async {
-        // While the file is open: refused.
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        // While the file is open (its *SHRRD recorded): refused.
+        for _ in 0..300 {
+            let open = other
+                .query_opt(
+                    "SELECT 1 FROM as4tainr.object_locks WHERE key = $1 AND state = '*SHRRD'",
+                    &[&key],
+                )
+                .await
+                .unwrap()
+                .is_some();
+            if open {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
         let r1 = b.run(&alc).await;
-        // After CLOSE (the program is still running): allocated.
-        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        // After CLOSE (3 s after the open; the program goes on 6 s more):
+        // allocated.
+        tokio::time::sleep(std::time::Duration::from_millis(4500)).await;
         let r2 = b.run(&alc).await;
         if r2.is_ok() {
             let _ = b.run(&dlc).await;
@@ -26144,4 +26199,60 @@ async fn cl_declared_files_hold_shared_read_locks() {
     let e = rb1.unwrap_err().to_string();
     assert!(e.starts_with("CPF1002"), "{e}");
     assert!(rb2.is_ok(), "{rb2:?}");
+}
+
+// CPYFRMSTMF of lines longer than the source file's records: the lines
+// are cut to SRCDTA, and CPIA083 comes before CPCA081 (PUB400
+// 2026-11-05, tools/golden/verify49.txt r49_make: an 86-character line
+// into RCDLEN(92), whose cut comment then failed CRTBNDCL with CPF0820).
+#[tokio::test]
+async fn copy_from_stream_file_cuts_long_lines() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let long = format!("/* {} */", "x".repeat(80));
+    let src = format!("{long}\nPGM\nENDPGM\n");
+    let path = format!("/tmp/{}cut.clle", lib.to_ascii_lowercase());
+    as4tainr_core::ifs::write_file(&client, &path, src.as_bytes(), 819, 0o644, "QSECOFR")
+        .await
+        .unwrap();
+    job.run(&format!("CRTSRCPF FILE({lib}/QCUTSRC) RCDLEN(92)"))
+        .await
+        .unwrap();
+    let m = match job
+        .run(&format!(
+            "CPYFRMSTMF FROMSTMF('{path}') TOMBR('/QSYS.LIB/{lib}.LIB/QCUTSRC.FILE/CUT.MBR')"
+        ))
+        .await
+        .unwrap()
+    {
+        Outcome::Messages(m) => m,
+        other => panic!("{other:?}"),
+    };
+    let ids: Vec<&str> = m.iter().map(|l| &l[..7]).collect();
+    assert_eq!(ids, ["CPIA083", "CPCA081"], "{m:?}");
+    let mbr =
+        as4tainr_core::source::find_member(&client, std::slice::from_ref(&lib), "QCUTSRC", "CUT")
+            .await
+            .unwrap();
+    assert_eq!(mbr.source.lines().next().unwrap().chars().count(), 80);
+    let e = job
+        .run(&format!("CRTBNDCL PGM({lib}/CUT) SRCFILE({lib}/QCUTSRC)"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(as4tainr_core::jobs::escape_id(&e), "CPF0820", "{e}");
 }

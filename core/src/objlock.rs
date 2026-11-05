@@ -13,7 +13,7 @@
 //! its lock wrongly). WAIT is the seconds to keep trying.
 //!
 //! An RPG program's file open, and a CL program's first RCVF of a
-//! declared file, take *SHRRD on the file (`open_file`); the close (CL's
+//! declared file, take *SHRRD on the file (*SHRUPD for update; `open_file`); the close (CL's
 //! CLOSE or the program's end) gives it back. Conflicts are read from the allocations
 //! recorded by job (`owner`), a job's other sessions (its RPG session) not
 //! counting.
@@ -102,6 +102,13 @@ async fn conflicting(client: &Client, t: &Target, state: &str, owner: &str) -> R
     Ok(n > 0)
 }
 
+/// Does another job hold a lock on the object that `state` cannot be
+/// held with? For commands that use an object without allocating it
+/// themselves (CHGDTAARA).
+pub async fn kept_out(client: &Client, t: &Target, state: &str, owner: &str) -> Result<bool> {
+    conflicting(client, t, state, owner).await
+}
+
 /// Record an allocation (before checking for conflicts, so two jobs
 /// asking at once see each other).
 async fn record(client: &Client, t: &Target, state: &str, owner: &str) -> Result<i64> {
@@ -134,13 +141,26 @@ pub async fn open_file(
     file: &str,
     wait: Duration,
     owner: &str,
+    update: bool,
 ) -> Result<bool> {
     let t = Target {
         library: library.to_string(),
         name: file.to_string(),
         objtype: "*FILE".into(),
     };
-    take(client, &t, "*SHRRD", Some(wait), owner, false).await
+    if !update {
+        // An open for input is not kept out by another job's ALCOBJ, even
+        // *EXCL (PUB400 2026-11-05, tools/golden/verify48.txt q48_held:
+        // the RPG program's OPEN of the file another job held *EXCL
+        // succeeded, while a third job's ALCOBJ *SHRRD got CPF1002). Its
+        // *SHRRD is recorded, so other jobs' ALCOBJ see it.
+        take_shared(client, &t, "*SHRRD").await?;
+        record(client, &t, "*SHRRD", owner).await?;
+        return Ok(true);
+    }
+    // An open for update takes *SHRUPD and waits for conflicting locks
+    // (not captured: the lock state table's *SHRUPD).
+    take(client, &t, "*SHRUPD", Some(wait), owner, false).await
 }
 
 /// Take a lock: the session's shared advisory lock (it goes with the
@@ -181,13 +201,13 @@ async fn take(
 }
 
 /// The file closed: its open lock goes.
-pub async fn close_file(client: &Client, library: &str, file: &str) -> Result<()> {
+pub async fn close_file(client: &Client, library: &str, file: &str, update: bool) -> Result<()> {
     let t = Target {
         library: library.to_string(),
         name: file.to_string(),
         objtype: "*FILE".into(),
     };
-    deallocate(client, &t, "*SHRRD").await?;
+    deallocate(client, &t, if update { "*SHRUPD" } else { "*SHRRD" }).await?;
     Ok(())
 }
 

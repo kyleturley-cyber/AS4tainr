@@ -113,7 +113,11 @@ def shell_for(cmd, sandbox):
 SHIM = """#!/bin/sh
 # `system` for golden.py: the sandbox's /home goes to the IFS first, and
 # paths into the sandbox in the command become IFS paths again.
-if [ -d "{sb}/home" ]; then
+# Only when something there changed since the last put: a put takes
+# seconds, and a test that times one job against another (verify52's
+# 60-second hold) needs `system` to start quickly.
+if [ -d "{sb}/home" ] && { [ ! -e "{sb}/.put" ] || [ -n "$(find "{sb}/home" -newer "{sb}/.put" -print -quit)" ]; }; then
+  touch "{sb}/.put"
   for d in "{sb}"/home/*; do
     [ -d "$d" ] && "{bin}" put "$d" "/home/$(basename "$d")" >/dev/null 2>&1
   done

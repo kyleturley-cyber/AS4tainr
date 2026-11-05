@@ -115,13 +115,18 @@ pub async fn init(client: &Client) -> Result<()> {
         &format!("ALTER ROLE {SQL_ROLE} PASSWORD '{password}'"),
     )
     .await?;
-    for lib in catalog::list_libraries(client).await? {
-        // Jobs' QTEMP libraries got their grants when they were made, and
-        // their jobs drop them at any moment: granting again would race
-        // with that DROP SCHEMA.
-        if lib.starts_with("#QP") || lib.starts_with("#QT") {
-            continue;
-        }
+    // Jobs' QTEMP libraries got their grants when they were made, and
+    // their jobs drop them at any moment: granting again would race with
+    // that DROP SCHEMA.
+    let libs: Vec<String> = catalog::list_libraries(client)
+        .await?
+        .into_iter()
+        .filter(|l| !l.starts_with("#QP") && !l.starts_with("#QT"))
+        .collect();
+    // Asked in one query for every library: each process initializes, and
+    // a database with thousands of libraries took seconds asking one by
+    // one.
+    for lib in missing_grants(client, &libs).await {
         // Another process may drop a library or a table in it while the
         // grants run (a job's QTEMP at its end, parallel jobs): a library
         // that is gone is skipped, and a grant that met a table being
@@ -133,9 +138,6 @@ pub async fn init(client: &Client) -> Result<()> {
         // another process's TRUNCATE or ALTER of one of them at that moment
         // fails with "tuple concurrently updated" (tests in parallel, each
         // with its own init).
-        if !missing_grants(client, &lib).await {
-            continue;
-        }
         let mut tries = 0;
         while let Err(e) = grant_library(client, &lib).await {
             let db = e.downcast_ref::<tokio_postgres::Error>();
@@ -215,27 +217,39 @@ pub(crate) async fn connect_as_sql_role(client: &Client, database_url: &str) -> 
     Ok(c)
 }
 
-/// Whether the SQL role lacks USAGE of a library's schema or a grant on a
-/// table, view or sequence in it (true when that cannot be told).
-async fn missing_grants(client: &Client, library: &str) -> bool {
+/// The libraries whose schema the SQL role lacks USAGE of, or a grant on
+/// a table, view or sequence in (all of them when that cannot be told).
+async fn missing_grants(client: &Client, libraries: &[String]) -> Vec<String> {
     client
-        .query_one(
-            "SELECT n IS NOT NULL AND (NOT has_schema_privilege($2, n, 'USAGE') OR EXISTS (
-               SELECT 1 FROM pg_class c WHERE c.relnamespace = n AND (
-                 (c.relkind IN ('r','p','v','m','f') AND NOT (
-                    coalesce(has_table_privilege($2, c.oid, 'SELECT'), true)
-                    AND coalesce(has_table_privilege($2, c.oid, 'INSERT'), true)
-                    AND coalesce(has_table_privilege($2, c.oid, 'UPDATE'), true)
-                    AND coalesce(has_table_privilege($2, c.oid, 'DELETE'), true)))
+        .query(
+            // One pass over pg_class joined to the libraries (an EXISTS
+            // per library scanned pg_class once for each).
+            "WITH libs AS (
+               SELECT l, to_regnamespace(quote_ident(s)) AS n
+                 FROM unnest($1::text[], $3::text[]) AS u(l, s))
+             SELECT l FROM libs WHERE n IS NOT NULL AND NOT has_schema_privilege($2, n, 'USAGE')
+             UNION
+             SELECT l FROM libs JOIN pg_class c ON c.relnamespace = libs.n
+              WHERE (c.relkind IN ('r','p','v','m','f') AND NOT (
+                       coalesce(has_table_privilege($2, c.oid, 'SELECT'), true)
+                       AND coalesce(has_table_privilege($2, c.oid, 'INSERT'), true)
+                       AND coalesce(has_table_privilege($2, c.oid, 'UPDATE'), true)
+                       AND coalesce(has_table_privilege($2, c.oid, 'DELETE'), true)))
                  OR (c.relkind = 'S' AND NOT (
-                    coalesce(has_sequence_privilege($2, c.oid, 'USAGE'), true)
-                    AND coalesce(has_sequence_privilege($2, c.oid, 'SELECT'), true))))))
-               FROM to_regnamespace($1) AS n",
-            &[&ident(library), &SQL_ROLE],
+                       coalesce(has_sequence_privilege($2, c.oid, 'USAGE'), true)
+                       AND coalesce(has_sequence_privilege($2, c.oid, 'SELECT'), true)))",
+            &[
+                &libraries,
+                &SQL_ROLE,
+                &libraries
+                    .iter()
+                    .map(|l| catalog::pg_name(l))
+                    .collect::<Vec<_>>(),
+            ],
         )
         .await
-        .map(|r| r.get::<_, Option<bool>>(0).unwrap_or(true))
-        .unwrap_or(true)
+        .map(|rows| rows.iter().map(|r| r.get(0)).collect())
+        .unwrap_or_else(|_| libraries.to_vec())
 }
 
 /// Let the SQL role use a library's schema and the files already in it.

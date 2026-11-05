@@ -1,0 +1,6 @@
+/* verify53: hold data area GLD53A *EXCL for 50 seconds in a job of its own. */
+PGM
+  ALCOBJ OBJ((AS4TRAINR1/GLD53A *DTAARA *EXCL)) WAIT(0)
+  DLYJOB DLY(50)
+  DLCOBJ OBJ((AS4TRAINR1/GLD53A *DTAARA *EXCL))
+ENDPGM

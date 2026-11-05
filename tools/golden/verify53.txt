@@ -1,0 +1,11 @@
+# Golden (after verify49, whose r49_dtaara ran past 120 s): while another
+# job holds a data area *EXCL (a CL program in a background `system`
+# job, 50 s), whether CHGDTAARA waits before its CPF1063 and whether
+# DSPDTAARA waits; the value after the hold.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify53.txt -Files tools\golden\verify53
+v53_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLD53D)" "DLTDTAARA DTAARA(AS4TRAINR1/GLD53A)" "DLTF FILE(AS4TRAINR1/GLD53S)"; do system -q "$c"; done; echo cleaned
+v53_tag|!setccsid 819 /home/AS4TRAINR/gld/gld53d.clle; ls /home/AS4TRAINR/gld | grep gld53
+v53_make|!system -q "CRTDTAARA DTAARA(AS4TRAINR1/GLD53A) TYPE(*CHAR) LEN(10) VALUE('before')"; system -q "CRTSRCPF FILE(AS4TRAINR1/GLD53S) RCDLEN(92)"; system "CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld53d.clle') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD53S.FILE/GLD53D.MBR')"; system "CRTBNDCL PGM(AS4TRAINR1/GLD53D) SRCFILE(AS4TRAINR1/GLD53S)" | grep -E "^CP[CF]"
+v53_held|!(system "CALL PGM(AS4TRAINR1/GLD53D)" > /dev/null 2>&1 &); sleep 5; t=$(date +%s); system "CHGDTAARA DTAARA(AS4TRAINR1/GLD53A) VALUE('changed')"; echo "chg rc=$? waited=$(( $(date +%s) - t > 20 ))"; t=$(date +%s); system "DSPDTAARA DTAARA(AS4TRAINR1/GLD53A) OUTPUT(*PRINT)" | grep -iE "before|changed"; echo "dsp waited=$(( $(date +%s) - t > 20 ))"
+v53_after|!sleep 50; system "DSPDTAARA DTAARA(AS4TRAINR1/GLD53A) OUTPUT(*PRINT)" | grep -iE "before|changed"
+v53_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLD53D)" "DLTDTAARA DTAARA(AS4TRAINR1/GLD53A)" "DLTF FILE(AS4TRAINR1/GLD53S)"; do system -q "$c"; done; echo cleaned

@@ -1,0 +1,14 @@
+# Golden (after verify56, RUNSQL): what else a table another job holds
+# *EXCL (ALCOBJ in a background `system` job, 40 s, one hold per item)
+# keeps out, and how long each waited in tens of seconds: RUNSQLSTM of a
+# DELETE, an SQLRPGLE program's DELETE (SQLCODE, SQLSTATE), an RPG open
+# for update (status, message ID); the records after.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify57.txt -Files tools\golden\verify57
+z57_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLD57D)" "DLTPGM PGM(AS4TRAINR1/GLD57Q)" "DLTPGM PGM(AS4TRAINR1/GLD57U)" "DLTF FILE(AS4TRAINR1/GLD57F)" "DLTF FILE(AS4TRAINR1/GLD57O)" "DLTF FILE(AS4TRAINR1/GLD57S)"; do system -q "$c"; done; echo cleaned
+z57_tag|!for f in gld57d.clle gld57s.sql gld57q.sqlrpgle gld57u.rpgle; do setccsid 819 /home/AS4TRAINR/gld/$f; done; ls /home/AS4TRAINR/gld | grep gld57
+z57_make|!system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD57F (K INTEGER NOT NULL)') COMMIT(*NONE)"; system "RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD57F VALUES(1), (2), (3)') COMMIT(*NONE)"; system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD57O (RES CHAR(40) NOT NULL)') COMMIT(*NONE)"; system -q "CRTSRCPF FILE(AS4TRAINR1/GLD57S) RCDLEN(92)"; system "CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld57d.clle') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD57S.FILE/GLD57D.MBR')"; system "CRTBNDCL PGM(AS4TRAINR1/GLD57D) SRCFILE(AS4TRAINR1/GLD57S)" | grep -E "^CP[CF]"; system "CRTSQLRPGI OBJ(AS4TRAINR1/GLD57Q) SRCSTMF('/home/AS4TRAINR/gld/gld57q.sqlrpgle') COMMIT(*NONE)" | grep -E "^SQL0008|^CP[CF]"; system "CRTBNDRPG PGM(AS4TRAINR1/GLD57U) SRCSTMF('/home/AS4TRAINR/gld/gld57u.rpgle')" | grep -E "^RNS9304|^CPF"
+z57_stm|!(system "CALL PGM(AS4TRAINR1/GLD57D)" > /dev/null 2>&1 &); sleep 3; t=$(date +%s); system "RUNSQLSTM SRCSTMF('/home/AS4TRAINR/gld/gld57s.sql') COMMIT(*NONE)" | grep -E "^[A-Z]{3}[0-9A-F]{4}" | cut -c1-7; echo "took $(( ($(date +%s) - t) / 10 ))"; sleep 45
+z57_sql|!(system "CALL PGM(AS4TRAINR1/GLD57D)" > /dev/null 2>&1 &); sleep 3; t=$(date +%s); system "CALL PGM(AS4TRAINR1/GLD57Q)"; echo "took $(( ($(date +%s) - t) / 10 ))"; sleep 45
+z57_upd|!(system "CALL PGM(AS4TRAINR1/GLD57D)" > /dev/null 2>&1 &); sleep 3; t=$(date +%s); system "CALL PGM(AS4TRAINR1/GLD57U)"; echo "took $(( ($(date +%s) - t) / 10 ))"; sleep 45
+z57_after|!system "CPYF FROMFILE(AS4TRAINR1/GLD57F) TOFILE(*PRINT)" | grep -E "^CP"; system "CPYF FROMFILE(AS4TRAINR1/GLD57O) TOFILE(*PRINT)" | grep -E "SQL|UPD"
+z57_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLD57D)" "DLTPGM PGM(AS4TRAINR1/GLD57Q)" "DLTPGM PGM(AS4TRAINR1/GLD57U)" "DLTF FILE(AS4TRAINR1/GLD57F)" "DLTF FILE(AS4TRAINR1/GLD57O)" "DLTF FILE(AS4TRAINR1/GLD57S)"; do system -q "$c"; done; echo cleaned

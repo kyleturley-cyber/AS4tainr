@@ -192,10 +192,10 @@ SELECT CAST(v.library AS varchar(128)) COLLATE "C" AS variable_schema,
 CREATE OR REPLACE VIEW qsys2.syssequences AS
 SELECT CAST(s.library AS varchar(128)) COLLATE "C" AS sequence_schema,
        CAST(s.name AS varchar(128)) COLLATE "C" AS sequence_name,
-       CAST(ps.max_value AS decimal(63, 0)) AS maximum_value,
-       CAST(ps.min_value AS decimal(63, 0)) AS minimum_value,
-       CAST(ps.increment_by AS integer) AS increment,
-       CAST(CASE WHEN ps.cycle THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS cycle_option,
+       CAST(q.seqmax AS decimal(63, 0)) AS maximum_value,
+       CAST(q.seqmin AS decimal(63, 0)) AS minimum_value,
+       CAST(q.seqincrement AS integer) AS increment,
+       CAST(CASE WHEN q.seqcycle THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS cycle_option,
        CAST(coalesce(s.cache, 0) AS integer) AS cache,
        CAST(CASE WHEN s.ordered THEN 'YES' ELSE 'NO' END AS varchar(3)) AS "order",
        CAST(s.data_type AS varchar(128)) COLLATE "C" AS data_type,
@@ -203,8 +203,8 @@ SELECT CAST(s.library AS varchar(128)) COLLATE "C" AS sequence_schema,
                              ELSE s.precision END AS integer) AS numeric_precision,
        CAST(NULL AS varchar(128)) COLLATE "C" AS user_defined_type_schema,
        CAST(NULL AS varchar(128)) COLLATE "C" AS user_defined_type_name,
-       CAST(ps.start_value AS decimal(63, 0)) AS start,
-       CAST(ps.last_value AS decimal(63, 0)) AS maxassignedval,
+       CAST(q.seqstart AS decimal(63, 0)) AS start,
+       CAST(CASE WHEN has_sequence_privilege(c.oid, 'SELECT,USAGE') THEN pg_sequence_last_value(c.oid) END AS decimal(63, 0)) AS maxassignedval,
        CAST(o.owner AS varchar(128)) COLLATE "C" AS sequence_definer,
        CAST(o.created AS timestamp) AS sequence_created,
        CAST(o.created AS timestamp) AS last_altered_timestamp,
@@ -215,7 +215,12 @@ SELECT CAST(s.library AS varchar(128)) COLLATE "C" AS sequence_schema,
        CAST(0 AS smallint) AS iasp_number
   FROM as4tainr.sequences s
   JOIN as4tainr.objects o ON o.library = s.library AND o.name = s.name AND o.objtype = '*DTAARA'
-  JOIN pg_sequences ps ON ps.schemaname = lower(s.library) AND ps.sequencename = lower(s.name);
+  -- pg_sequence and pg_class, not the pg_sequences view: that one reads
+  -- every sequence's last value (a lock on each) before the join, and a
+  -- database with thousands of sequences ran out of shared memory.
+  JOIN pg_namespace n ON n.nspname = lower(s.library)
+  JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = lower(s.name) AND c.relkind = 'S'
+  JOIN pg_sequence q ON q.seqrelid = c.oid;
 
 -- OUTPUT_QUEUE_ENTRIES_BASIC (IBM i Services): the spooled files. Sizes
 -- are the lines' bytes in kilobytes.

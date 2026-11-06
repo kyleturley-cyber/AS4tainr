@@ -2801,6 +2801,29 @@ impl<'a> Machine<'a> {
         }
     }
 
+    /// UNLOCK of one data area (by its field): the lock IN *LOCK took goes.
+    fn unlock_dtaara(&mut self, field: &str) -> Result<()> {
+        let name = self.prog.dtaaras.get(field).cloned().unwrap_or_default();
+        let name = match name.strip_prefix("*VAR:") {
+            Some(v) => {
+                let n = self.eval(&Expr::name(v))?.chars()?;
+                a(&n).trim().to_ascii_uppercase()
+            }
+            None => name,
+        };
+        let libl = self.io.libl.clone();
+        let cur = crate::commands::DEFAULT_CURRENT_LIBRARY;
+        let client = self.io.client;
+        let d = self.block(crate::dtaara::resolve(client, &name, &libl, cur))?;
+        let key = (d.library.clone(), d.name.clone());
+        if self.dtaara_locks.contains(&key) {
+            self.block(crate::dtaara::unlock(client, &d))?;
+            self.dtaara_unlock_object(&d.library, &d.name);
+            self.dtaara_locks.retain(|k| *k != key);
+        }
+        Ok(())
+    }
+
     /// The *EXCLRD object lock IN *LOCK took goes.
     fn dtaara_unlock_object(&mut self, library: &str, name: &str) {
         let t = crate::objlock::Target {
@@ -3319,6 +3342,26 @@ impl<'a> Machine<'a> {
                 // A result data structure: the record goes into it (or
                 // comes from it) instead of the program fields; %FIELDS:
                 // an update changes only those fields.
+                // UNLOCK of a data area (its field's name) or *DTAARA (every
+                // data area the program has locked): the IN *LOCK lock
+                // goes (ILE RPG Reference, UNLOCK).
+                if *op == FileOp::Unlock {
+                    let up = file.to_ascii_uppercase();
+                    if up == "*DTAARA" {
+                        self.release_dtaaras();
+                        return Ok(());
+                    }
+                    if let Some(f) = self
+                        .prog
+                        .dtaaras
+                        .keys()
+                        .find(|k| k.eq_ignore_ascii_case(file))
+                        .cloned()
+                    {
+                        self.unlock_dtaara(&f)?;
+                        return Ok(());
+                    }
+                }
                 self.io_ds = ds.clone();
                 self.io_fields = fields.clone();
                 let r = self.file_op(*op, file, key, ext, ind);

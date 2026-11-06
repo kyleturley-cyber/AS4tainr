@@ -26701,4 +26701,40 @@ async fn rpg_in_lock_holds_the_data_area() {
         "{rows:?}"
     );
     assert!(rows.contains(&"LOCK GOT before".to_string()), "{rows:?}");
+    // UNLOCK of the data area gives the lock back while the program goes
+    // on (ILE RPG Reference, UNLOCK): another job's CHGDTAARA then works.
+    // The program then locks LCKB, so the other job knows UNLOCK is done.
+    a.run(&format!("CRTDTAARA DTAARA({lib}/LCKB) TYPE(*CHAR) LEN(10)"))
+        .await
+        .unwrap();
+    let src = "**FREE\nctl-opt dftactgrp(*no);\ndcl-s val char(10) dtaara('LCKA');\ndcl-s mark char(10) dtaara('LCKB');\ndcl-pr qcmdexc extpgm('QCMDEXC');\n  cmd char(32) const;\n  len packed(15:5) const;\nend-pr;\nin *lock val;\nunlock val;\nin *lock mark;\nqcmdexc('DLYJOB DLY(4)': 13);\n*inlr = *on;\n";
+    let path = format!("/tmp/{}unl.rpgle", lib.to_ascii_lowercase());
+    as4tainr_core::ifs::write_file(&client, &path, src.as_bytes(), 819, 0o644, "QSECOFR")
+        .await
+        .unwrap();
+    a.run(&format!("CRTBNDRPG PGM({lib}/LCKU) SRCSTMF('{path}')"))
+        .await
+        .unwrap();
+    let call = format!("CALL PGM({lib}/LCKU)");
+    let mark = format!("{lib}/LCKB *DTAARA");
+    let (ra, chg) = tokio::join!(a.run(&call), async {
+        for _ in 0..300 {
+            if other
+                .query_opt(
+                    "SELECT 1 FROM as4tainr.object_locks WHERE key = $1 AND state = '*EXCLRD'",
+                    &[&mark],
+                )
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        b.run(&format!("CHGDTAARA DTAARA({lib}/LCKA) VALUE('changed')"))
+            .await
+    });
+    assert!(ra.is_ok(), "{ra:?}");
+    assert!(chg.is_ok(), "{chg:?}");
 }

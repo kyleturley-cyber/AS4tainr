@@ -108,8 +108,10 @@ pub(super) fn status_code(err: &anyhow::Error) -> u32 {
         "CPF502B" if text.contains("(before the change)") => 1023,
         "CPF502B" => 1024,
         "CPF5013" if text.contains("requires a prior") => 1221,
-        // Data area not found.
+        // Data area not found; a data area another job holds locked
+        // (IN *LOCK: PUB400 2026-11-06, verify58 a58_excl).
         "CPF1015" => 401,
+        "MCH5802" => 431,
         _ if id.starts_with("RNQ") || id.starts_with("RNX") => {
             id[3..].parse::<u32>().unwrap_or(9999)
         }

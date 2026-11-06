@@ -2721,6 +2721,33 @@ impl<'a> Machine<'a> {
                 crate::authority::Aut::Use,
             ))?;
             let take = lock && !held;
+            if take {
+                // IN *LOCK holds *EXCLRD on the data area (WRKOBJLCK shows
+                // it); another job's lock in the way keeps it waiting for
+                // the job's default wait time, then MCH5802, status 00431
+                // (PUB400 2026-11-06, tools/golden/verify58.txt a58_excl,
+                // a58_held, a58_second: 30-39 seconds each).
+                let t = crate::objlock::Target {
+                    library: d.library.clone(),
+                    name: d.name.clone(),
+                    objtype: "*DTAARA".into(),
+                };
+                let wait = crate::objlock::default_wait(&self.io.job_key);
+                let owner = self.io.job_key.clone();
+                if !self.block(crate::objlock::allocate(
+                    client,
+                    &t,
+                    "*EXCLRD",
+                    Some(wait),
+                    &owner,
+                ))? {
+                    bail!(
+                        "MCH5802: Data area {} in library {} is locked by another job; IN *LOCK could not lock it.",
+                        d.name,
+                        crate::qtemp::logical(&d.library)
+                    );
+                }
+            }
             let d = self.block(crate::dtaara::read(client, &name, &libl, cur, take))?;
             if take {
                 self.dtaara_locks.push(key);
@@ -2754,6 +2781,9 @@ impl<'a> Machine<'a> {
                 other => a(&other.chars()?).trim_end().to_string(),
             };
             self.block(crate::dtaara::write(client, &d, &text, held))?;
+            if held {
+                self.dtaara_unlock_object(&d.library, &d.name);
+            }
             self.dtaara_locks.retain(|k| *k != key);
         }
         Ok(())
@@ -2767,7 +2797,18 @@ impl<'a> Machine<'a> {
             if let Ok(d) = self.block(crate::dtaara::resolve(client, &name, &libl, &lib)) {
                 let _ = self.block(crate::dtaara::unlock(client, &d));
             }
+            self.dtaara_unlock_object(&lib, &name);
         }
+    }
+
+    /// The *EXCLRD object lock IN *LOCK took goes.
+    fn dtaara_unlock_object(&mut self, library: &str, name: &str) {
+        let t = crate::objlock::Target {
+            library: library.to_string(),
+            name: name.to_string(),
+            objtype: "*DTAARA".into(),
+        };
+        let _ = self.block(crate::objlock::deallocate(self.io.client, &t, "*EXCLRD"));
     }
 
     /// IN and OUT of the local data area: its bytes into the field or data

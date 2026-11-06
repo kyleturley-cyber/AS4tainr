@@ -26590,3 +26590,115 @@ async fn sql_waits_for_another_jobs_object_lock() {
     .await
     .unwrap();
 }
+
+// RPG IN *LOCK holds *EXCLRD on the data area (WRKOBJLCK shows it);
+// another job's CHGDTAARA waits the job's default wait time (1 second
+// here), then CPF1063, and its IN *LOCK waits, then status 00431 with
+// MCH5802 (PUB400 2026-11-06, tools/golden/verify58.txt a58_held,
+// a58_second: 30-39 seconds there).
+#[tokio::test]
+async fn rpg_in_lock_holds_the_data_area() {
+    use as4tainr_core::commands::{Environment, Job, Outcome};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let other = runtime::connect_db(&url).await.unwrap();
+    runtime::job_session(
+        &other,
+        Some(&format!("000084/QSECOFR/D{}", &lib[1..])),
+        std::time::Duration::from_millis(500),
+    )
+    .await
+    .unwrap();
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mk = |c| Job {
+        client: c,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let mut a = mk(&client);
+    a.id = Some(
+        as4tainr_core::jobs::start_interactive(
+            &client,
+            &format!("A{}", &lib[1..]),
+            "QSECOFR",
+            None,
+            std::slice::from_ref(&lib),
+        )
+        .await
+        .unwrap(),
+    );
+    let mut b = mk(&other);
+    for c in [
+        format!("CRTDTAARA DTAARA({lib}/LCKA) TYPE(*CHAR) LEN(10) VALUE('before')"),
+        format!("RUNSQL SQL('CREATE TABLE {lib}/LCKO (RES CHAR(40) NOT NULL)') COMMIT(*NONE)"),
+    ] {
+        a.run(&c).await.unwrap();
+    }
+    let src = "**FREE\nctl-opt dftactgrp(*no);\ndcl-f LCKO usage(*output) rename(LCKO:LCKR);\ndcl-pi *n;\n  mode char(1);\nend-pi;\ndcl-ds psds psds;\n  msgid char(7) pos(40);\nend-ds;\ndcl-s val char(10) dtaara('LCKA');\ndcl-pr qcmdexc extpgm('QCMDEXC');\n  cmd char(32) const;\n  len packed(15:5) const;\nend-pr;\nmonitor;\n  in *lock val;\n  res = 'LOCK GOT ' + %trim(val);\non-error;\n  res = 'LOCK ST ' + %char(%status) + ' ' + msgid;\nendmon;\nwrite LCKR;\nif mode = 'H';\n  qcmdexc('DLYJOB DLY(6)': 13);\nendif;\n*inlr = *on;\n";
+    let path = format!("/tmp/{}lck.rpgle", lib.to_ascii_lowercase());
+    as4tainr_core::ifs::write_file(&client, &path, src.as_bytes(), 819, 0o644, "QSECOFR")
+        .await
+        .unwrap();
+    a.run(&format!("CRTBNDRPG PGM({lib}/LCKL) SRCSTMF('{path}')"))
+        .await
+        .unwrap();
+    b.run("CHGJOB DFTWAIT(1)").await.unwrap();
+    let key = format!("{lib}/LCKA *DTAARA");
+    let hold = format!("CALL PGM({lib}/LCKL) PARM('H')");
+    let (ra, (wrk, chg, second)) = tokio::join!(a.run(&hold), async {
+        for _ in 0..300 {
+            if other
+                .query_opt(
+                    "SELECT 1 FROM as4tainr.object_locks WHERE key = $1 AND state = '*EXCLRD'",
+                    &[&key],
+                )
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let wrk = match b
+            .run(&format!("WRKOBJLCK OBJ({lib}/LCKA) OBJTYPE(*DTAARA)"))
+            .await
+            .unwrap()
+        {
+            Outcome::Display(d) => d.rows.join("\n"),
+            other => format!("{other:?}"),
+        };
+        let chg = b
+            .run(&format!("CHGDTAARA DTAARA({lib}/LCKA) VALUE('changed')"))
+            .await;
+        let second = b.run(&format!("CALL PGM({lib}/LCKL) PARM('N')")).await;
+        (wrk, chg, second)
+    });
+    assert!(ra.is_ok(), "{ra:?}");
+    assert!(wrk.contains("*EXCLRD"), "{wrk}");
+    let e = chg.unwrap_err().to_string();
+    assert!(e.starts_with("CPF1063"), "{e}");
+    assert!(second.is_ok(), "{second:?}");
+    let rows: Vec<String> = client
+        .query(
+            &format!("SELECT res FROM {}.lcko", lib.to_ascii_lowercase()),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<_, String>(0).trim().to_string())
+        .collect();
+    assert!(
+        rows.contains(&"LOCK ST 431 MCH5802".to_string()),
+        "{rows:?}"
+    );
+    assert!(rows.contains(&"LOCK GOT before".to_string()), "{rows:?}");
+}

@@ -154,6 +154,28 @@ pub fn analyze(source: &str, known: &dyn Fn(&str) -> bool, file_vars: &FileVars)
         if let Some(l) = &st.label {
             a.labels.push((l.clone(), *line));
         }
+        // A qualified name with nothing after the slash ("LIB/" and then
+        // a blank): CPD0011, severity 30, and the statement does nothing
+        // more (CRTBNDCL on PUB400, 2026-11-06, tools/golden/verify61.txt
+        // d61_dclf: `DCLF AS4TRAINR1/      FILE(GLD61D)`).
+        if let Some(p) = st.params.iter().find(|p| {
+            p.keyword.is_none()
+                && p.value.len() > 1
+                && p.value.ends_with('/')
+                && !p.value.starts_with('\'')
+                && !p.value.contains(['(', '\''])
+        }) {
+            a.diags.push(Diag {
+                line: *line,
+                id: "CPD0011".into(),
+                sev: 30,
+                text: format!(
+                    "The qualified name '{}' has no object name after the library.",
+                    p.value.trim_end_matches('/')
+                ),
+            });
+            continue;
+        }
         // The command as written, LIB/CMD included (the statement keeps
         // the bare name).
         let body = match &st.label {
@@ -498,7 +520,20 @@ pub fn listing(p: &Prologue, a: &Analysis, created: bool, stamp: &Stamp) -> Vec<
             xdiags.push(d);
         }
     }
-    if a.labels.is_empty() {
+    if a.labels.is_empty() && vars.is_empty() {
+        // No variables and no labels: the cross reference is this one
+        // message, CPD0792 severity 10 (CRTBNDCL on PUB400, 2026-11-03,
+        // tools/golden/verify39.txt h39_crtc; verify61 d61_dclf).
+        xref.truncate(1);
+        let d = Diag {
+            line: 0,
+            id: "CPD0792".into(),
+            sev: 10,
+            text: "The program uses no data areas, variables or labels.".into(),
+        };
+        xref.push(diag_line(&d));
+        xdiags.push(d);
+    } else if a.labels.is_empty() {
         let d = Diag {
             line: 0,
             id: "CPD0791".into(),
@@ -802,5 +837,22 @@ mod tests {
             .map(|d| (d.id.as_str(), d.sev))
             .collect();
         assert_eq!(ids, [("CPD0090", 30), ("CPD0090", 30)]);
+    }
+
+    /// `LIB/` and then a blank: CPD0011, severity 30, and no variables
+    /// from the DCLF, so the cross reference is CPD0792 (CRTBNDCL on
+    /// PUB400, verify61 d61_dclf).
+    #[test]
+    fn qualifier_without_object_name() {
+        let src = "PGM\n  DCLF AS4TRAINR1/      FILE(GLD61D)\n  SNDPGMMSG  MSG('compiled') MSGTYPE(*COMP)\nENDPGM\n";
+        let a = analyze(src, &|c| c == "DCLF" || c == "SNDPGMMSG", &|_| vec![]);
+        let ids: Vec<(usize, &str, u8)> = a
+            .diags
+            .iter()
+            .filter(|d| d.id != "CPD0791" && d.id != "CPD0792")
+            .map(|d| (d.line, d.id.as_str(), d.sev))
+            .collect();
+        assert_eq!(ids, [(2, "CPD0011", 30)]);
+        assert!(a.vars.is_empty());
     }
 }

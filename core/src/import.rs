@@ -217,7 +217,14 @@ fn makefile_rules(text: &str, out: &mut BTreeMap<String, (String, Vec<String>)>)
 fn read_text(path: impl AsRef<Path>) -> std::io::Result<String> {
     let bytes = std::fs::read(path)?;
     Ok(match String::from_utf8(bytes) {
-        Ok(s) => s,
+        // A UTF-8 byte order mark says how the file is encoded; it is not
+        // part of the member (PGM_REFS in the Lennon corpus starts with
+        // one, and as the start of its CREATE PROCEDURE it was not
+        // recognized).
+        Ok(s) => match s.strip_prefix('\u{FEFF}') {
+            Some(t) => t.to_string(),
+            None => s,
+        },
         Err(e) => e.into_bytes().iter().map(|&b| cp1252(b)).collect(),
     })
 }
@@ -1432,6 +1439,21 @@ pub async fn import(job: &mut Job<'_>, dir: &Path, library: &str) -> Result<Repo
 
 #[cfg(test)]
 mod tests {
+
+    /// A UTF-8 file's byte order mark is not in the member's text; a
+    /// Windows-1252 file is read byte by byte.
+    #[test]
+    fn byte_order_mark_left_out() {
+        let dir = std::env::temp_dir().join(format!("as4t-bom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("p.sql");
+        std::fs::write(&f, b"\xEF\xBB\xBF-- x\nCREATE PROCEDURE P () BEGIN END;\n").unwrap();
+        assert!(read_text(&f).unwrap().starts_with("-- x"));
+        std::fs::write(&f, b"caf\xE9").unwrap();
+        assert_eq!(read_text(&f).unwrap(), "caf\u{e9}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

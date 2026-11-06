@@ -1,0 +1,5 @@
+/* verify61: DCLF with a library and blanks before the FILE keyword. */
+             PGM
+             DCLF AS4TRAINR1/      FILE(GLD61D)
+             SNDPGMMSG  MSG('compiled') MSGTYPE(*COMP)
+             ENDPGM

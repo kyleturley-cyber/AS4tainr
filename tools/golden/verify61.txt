@@ -1,0 +1,12 @@
+# Golden: (1) a SELECT in RUNSQLSTM (IBM i 7.5): whether it runs, what the
+# listing shows and whether the statements after it run (nine members of
+# the Nick Litten and Lennon corpora have one). (2) rpg-sql's v_q01, v_q23
+# and v_q24 in RUNSQLSTM, for their SQL messages. (3) "DCLF LIB/   FILE(X)"
+# (OSSILE's su.clle): does CRTBNDCL take it.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify61.txt -Files tools\golden\verify61
+d61_cleanup|!for c in "DLTF FILE(AS4TRAINR1/GLD61T)" "DLTF FILE(AS4TRAINR1/GLD61O)" "DLTF FILE(AS4TRAINR1/GLD61D)" "DLTF FILE(AS4TRAINR1/GLD61S)" "DLTPGM PGM(AS4TRAINR1/GLD61C)"; do system -q "$c"; done; echo cleaned
+d61_tag|!for f in gld61s.sql gld61q.sql gld61c.clle; do setccsid 819 /home/AS4TRAINR/gld/$f; done; ls /home/AS4TRAINR/gld | grep gld61
+d61_select|!system "RUNSQLSTM SRCSTMF('/home/AS4TRAINR/gld/gld61s.sql') COMMIT(*NONE) ERRLVL(30)" | grep -E "^ *[A-Z]{3}[0-9]{4}|^ +[0-9]+ +[a-z]|^ +K |SELECT" | cut -c1-90; system "CPYF FROMFILE(AS4TRAINR1/GLD61T) TOFILE(*PRINT)" | grep -E "^CP"
+d61_q|!system "RUNSQLSTM SRCSTMF('/home/AS4TRAINR/gld/gld61q.sql') COMMIT(*NONE) ERRLVL(30)" | grep -E "^ *[A-Z]{3}[0-9]{4}" | cut -c1-90; system "CPYF FROMFILE(AS4TRAINR1/GLD61O) TOFILE(*PRINT)" | grep -E "Q0|Q2"
+d61_dclf|!system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD61D (A CHAR(1))') COMMIT(*NONE)"; system -q "CRTSRCPF FILE(AS4TRAINR1/GLD61S) RCDLEN(92)"; system "CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld61c.clle') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD61S.FILE/GLD61C.MBR')"; system "CRTBNDCL PGM(AS4TRAINR1/GLD61C) SRCFILE(AS4TRAINR1/GLD61S)" | grep -E "^CP[CF]|^\* CP|CPD"
+d61_end|!for c in "DLTF FILE(AS4TRAINR1/GLD61T)" "DLTF FILE(AS4TRAINR1/GLD61O)" "DLTF FILE(AS4TRAINR1/GLD61D)" "DLTF FILE(AS4TRAINR1/GLD61S)" "DLTPGM PGM(AS4TRAINR1/GLD61C)"; do system -q "$c"; done; echo cleaned

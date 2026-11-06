@@ -1,0 +1,14 @@
+# Golden: RPG IN *LOCK of a data area. (1) Another job holds the data
+# area *EXCL (ALCOBJ, 40 s): IN *LOCK's status and message ID and how long
+# it waited (tens of seconds). (2) A program holds it with IN *LOCK (40
+# s): what WRKOBJLCK shows, and what CHGDTAARA and a second IN *LOCK from
+# other jobs give and how long they waited.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify58.txt -Files tools\golden\verify58
+a58_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLD58D)" "DLTPGM PGM(AS4TRAINR1/GLD58L)" "DLTDTAARA DTAARA(AS4TRAINR1/GLD58A)" "DLTF FILE(AS4TRAINR1/GLD58O)" "DLTF FILE(AS4TRAINR1/GLD58S)"; do system -q "$c"; done; echo cleaned
+a58_tag|!for f in gld58d.clle gld58l.rpgle; do setccsid 819 /home/AS4TRAINR/gld/$f; done; ls /home/AS4TRAINR/gld | grep gld58
+a58_make|!system -q "CRTDTAARA DTAARA(AS4TRAINR1/GLD58A) TYPE(*CHAR) LEN(10) VALUE('before')"; system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD58O (RES CHAR(40) NOT NULL)') COMMIT(*NONE)"; system -q "CRTSRCPF FILE(AS4TRAINR1/GLD58S) RCDLEN(92)"; system "CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld58d.clle') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD58S.FILE/GLD58D.MBR')"; system "CRTBNDCL PGM(AS4TRAINR1/GLD58D) SRCFILE(AS4TRAINR1/GLD58S)" | grep -E "^CP[CF]"; system "CRTBNDRPG PGM(AS4TRAINR1/GLD58L) SRCSTMF('/home/AS4TRAINR/gld/gld58l.rpgle')" | grep -E "^RNS9304|^CPF"
+a58_excl|!(system "CALL PGM(AS4TRAINR1/GLD58D)" > /dev/null 2>&1 &); sleep 3; t=$(date +%s); system "CALL PGM(AS4TRAINR1/GLD58L) PARM('N')"; echo "took $(( ($(date +%s) - t) / 10 ))"; sleep 45
+a58_held|!(system "CALL PGM(AS4TRAINR1/GLD58L) PARM('H')" > /dev/null 2>&1 &); sleep 5; system "WRKOBJLCK OBJ(AS4TRAINR1/GLD58A) OBJTYPE(*DTAARA)" | grep -E "EXCL|SHR" | cut -c1-80; t=$(date +%s); system "CHGDTAARA DTAARA(AS4TRAINR1/GLD58A) VALUE('changed')"; echo "chg took $(( ($(date +%s) - t) / 10 ))"; sleep 50
+a58_second|!(system "CALL PGM(AS4TRAINR1/GLD58L) PARM('H')" > /dev/null 2>&1 &); sleep 5; t=$(date +%s); system "CALL PGM(AS4TRAINR1/GLD58L) PARM('N')"; echo "took $(( ($(date +%s) - t) / 10 ))"; sleep 45
+a58_after|!system "CPYF FROMFILE(AS4TRAINR1/GLD58O) TOFILE(*PRINT)" | grep -E "LOCK"; system "DSPDTAARA DTAARA(AS4TRAINR1/GLD58A) OUTPUT(*PRINT)" | grep -iE "before|changed"
+a58_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLD58D)" "DLTPGM PGM(AS4TRAINR1/GLD58L)" "DLTDTAARA DTAARA(AS4TRAINR1/GLD58A)" "DLTF FILE(AS4TRAINR1/GLD58O)" "DLTF FILE(AS4TRAINR1/GLD58S)"; do system -q "$c"; done; echo cleaned

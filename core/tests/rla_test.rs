@@ -26544,8 +26544,8 @@ async fn sql_waits_for_another_jobs_object_lock() {
         .to_string();
     assert!(e.starts_with("SQL9010") && e.contains("SQL0913"), "{e}");
     // Embedded SQL: SQLCODE -913, SQLSTATE 57033 (DB2 for i SQL Messages
-    // and Codes) after the record wait (60 seconds here: verify57 z57_sql
-    // outwaited a 40-second hold); an RPG open for update: status 01217
+    // and Codes) after the record wait (60 seconds: verify60 c60_sql gave
+    // -913 and 57033 after 60-69 seconds); an RPG open for update: status 01217
     // (verify57 z57_upd).
     a.run(&format!(
         "RUNSQL SQL('CREATE TABLE {lib}/SQLO (RES CHAR(40) NOT NULL)') COMMIT(*NONE)"

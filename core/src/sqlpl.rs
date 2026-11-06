@@ -2129,8 +2129,9 @@ impl<'a, 'e> Run<'a, 'e> {
         // it waits, then SQL0913. A procedure's DELETE outwaited another
         // job's 40-second *EXCL hold (PUB400 2026-11-06,
         // tools/golden/verify59.txt b59_proc: 30-39 seconds, then deleted),
-        // longer than RUNSQL's 30 seconds: the record wait (60 seconds,
-        // WAITRCD's default) is taken here, not captured to the second.
+        // longer than RUNSQL's 30 seconds: the record wait, 60 seconds
+        // (under a 90-second hold the CALL failed after 60-69 seconds,
+        // verify60 c60_proc).
         if !crate::objlock::sql_tables(text).is_empty() {
             let (_, rows) = self
                 .query("SELECT current_setting('as4tainr.job_key', true)")

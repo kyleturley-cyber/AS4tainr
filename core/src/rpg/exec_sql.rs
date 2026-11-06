@@ -910,8 +910,9 @@ impl Machine<'_> {
         {
             let libl = self.io.libl.clone();
             // The record wait (60 seconds, WAITRCD's default): a DELETE
-            // outwaited another job's 40-second hold (verify57 z57_sql),
-            // longer than RUNSQL's 30 seconds; not captured to the second.
+            // outwaited another job's 40-second hold (verify57 z57_sql) and
+            // under a 90-second one got SQLCODE -913, SQLSTATE 57033 after
+            // 60-69 seconds (verify60 c60_sql).
             let wait = crate::runtime::default_record_wait();
             let owner = self.io.job_key.clone();
             if let Err(e) = self.block(crate::objlock::sql_tables_free(

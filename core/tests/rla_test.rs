@@ -26544,8 +26544,9 @@ async fn sql_waits_for_another_jobs_object_lock() {
         .to_string();
     assert!(e.starts_with("SQL9010") && e.contains("SQL0913"), "{e}");
     // Embedded SQL: SQLCODE -913, SQLSTATE 57033 (DB2 for i SQL Messages
-    // and Codes; verify57 z57_sql waited 30-39 seconds); an RPG open for
-    // update: status 01217 (verify57 z57_upd).
+    // and Codes) after the record wait (60 seconds here: verify57 z57_sql
+    // outwaited a 40-second hold); an RPG open for update: status 01217
+    // (verify57 z57_upd).
     a.run(&format!(
         "RUNSQL SQL('CREATE TABLE {lib}/SQLO (RES CHAR(40) NOT NULL)') COMMIT(*NONE)"
     ))
@@ -26737,4 +26738,30 @@ async fn rpg_in_lock_holds_the_data_area() {
     });
     assert!(ra.is_ok(), "{ra:?}");
     assert!(chg.is_ok(), "{chg:?}");
+    // RETURN with LR off: the data area stays locked while the job goes
+    // on (PUB400 2026-11-06, tools/golden/verify59.txt b59_ret: another
+    // job's CHGDTAARA got CPF1063); OUT in the next call gives it back.
+    let src = "**FREE\nctl-opt dftactgrp(*no) actgrp(*caller);\ndcl-pi *n;\n  mode char(1);\nend-pi;\ndcl-s val char(10) dtaara('LCKA');\nif mode = 'R';\n  in *lock val;\n  return;\nendif;\nval = 'out';\nout val;\n*inlr = *on;\n";
+    let path = format!("/tmp/{}ret.rpgle", lib.to_ascii_lowercase());
+    as4tainr_core::ifs::write_file(&client, &path, src.as_bytes(), 819, 0o644, "QSECOFR")
+        .await
+        .unwrap();
+    a.run(&format!("CRTBNDRPG PGM({lib}/LCKT) SRCSTMF('{path}')"))
+        .await
+        .unwrap();
+    a.run(&format!("CALL PGM({lib}/LCKT) PARM('R')"))
+        .await
+        .unwrap();
+    let e = b
+        .run(&format!("CHGDTAARA DTAARA({lib}/LCKA) VALUE('kept')"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF1063"), "{e}");
+    a.run(&format!("CALL PGM({lib}/LCKT) PARM('O')"))
+        .await
+        .unwrap();
+    b.run(&format!("CHGDTAARA DTAARA({lib}/LCKA) VALUE('free')"))
+        .await
+        .unwrap();
 }

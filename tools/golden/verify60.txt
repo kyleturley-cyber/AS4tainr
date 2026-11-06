@@ -1,0 +1,12 @@
+# Golden (after verify57 and verify59, whose embedded SQL and procedure
+# DELETEs outwaited a 40-second hold): how long they wait before they
+# fail, under a 90-second *EXCL hold of another job (tens of seconds),
+# and what they give then.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify60.txt -Files tools\golden\verify60
+c60_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLD60D)" "DLTPGM PGM(AS4TRAINR1/GLD60Q)" "DLTF FILE(AS4TRAINR1/GLD60F)" "DLTF FILE(AS4TRAINR1/GLD60O)" "DLTF FILE(AS4TRAINR1/GLD60S)"; do system -q "$c"; done; system "RUNSQL SQL('DROP PROCEDURE AS4TRAINR1/GLD60P') COMMIT(*NONE)" > /dev/null 2>&1; echo cleaned
+c60_tag|!for f in gld60d.clle gld60q.sqlrpgle; do setccsid 819 /home/AS4TRAINR/gld/$f; done; ls /home/AS4TRAINR/gld | grep gld60
+c60_make|!system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD60F (K INTEGER NOT NULL)') COMMIT(*NONE)"; system "RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD60F VALUES(1), (2), (3)') COMMIT(*NONE)"; system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD60O (RES CHAR(40) NOT NULL)') COMMIT(*NONE)"; system "RUNSQL SQL('CREATE PROCEDURE AS4TRAINR1/GLD60P () LANGUAGE SQL BEGIN DELETE FROM AS4TRAINR1/GLD60F WHERE K = 1; END') COMMIT(*NONE)"; echo "proc rc=$?"; system -q "CRTSRCPF FILE(AS4TRAINR1/GLD60S) RCDLEN(92)"; system "CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld60d.clle') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD60S.FILE/GLD60D.MBR')"; system "CRTBNDCL PGM(AS4TRAINR1/GLD60D) SRCFILE(AS4TRAINR1/GLD60S)" | grep -E "^CP[CF]"; system "CRTSQLRPGI OBJ(AS4TRAINR1/GLD60Q) SRCSTMF('/home/AS4TRAINR/gld/gld60q.sqlrpgle') COMMIT(*NONE)" | grep -E "^CP[CF]"
+c60_sql|!(system "CALL PGM(AS4TRAINR1/GLD60D)" > /dev/null 2>&1 &); sleep 3; t=$(date +%s); system "CALL PGM(AS4TRAINR1/GLD60Q)"; echo "took $(( ($(date +%s) - t) / 10 ))"; sleep 25
+c60_proc|!sleep 5; (system "CALL PGM(AS4TRAINR1/GLD60D)" > /dev/null 2>&1 &); sleep 3; t=$(date +%s); system "RUNSQL SQL('CALL AS4TRAINR1/GLD60P()') COMMIT(*NONE)"; echo "call rc=$? took $(( ($(date +%s) - t) / 10 ))"
+c60_after|!sleep 90; system "CPYF FROMFILE(AS4TRAINR1/GLD60F) TOFILE(*PRINT)" | grep -E "^CP"; system "CPYF FROMFILE(AS4TRAINR1/GLD60O) TOFILE(*PRINT)" | grep -E "SQL"
+c60_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLD60D)" "DLTPGM PGM(AS4TRAINR1/GLD60Q)" "DLTF FILE(AS4TRAINR1/GLD60F)" "DLTF FILE(AS4TRAINR1/GLD60O)" "DLTF FILE(AS4TRAINR1/GLD60S)"; do system -q "$c"; done; system "RUNSQL SQL('DROP PROCEDURE AS4TRAINR1/GLD60P') COMMIT(*NONE)" > /dev/null 2>&1; echo cleaned

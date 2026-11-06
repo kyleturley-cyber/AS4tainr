@@ -713,6 +713,56 @@ pub async fn sql_tables_free(
     Ok(())
 }
 
+/// Connections that hold, for a job, the locks a program left when it
+/// returned with LR off (IN *LOCK of a data area stays locked while the
+/// job goes on: PUB400 2026-11-06, tools/golden/verify59.txt b59_ret),
+/// by job key.
+static KEEPERS: std::sync::Mutex<
+    Option<std::collections::HashMap<String, std::sync::Arc<Client>>>,
+> = std::sync::Mutex::new(None);
+
+/// Hold `state` on the object for the job on a connection of its own.
+pub async fn keep_for_job(
+    database_url: &str,
+    job_key: &str,
+    t: &Target,
+    state: &str,
+) -> Result<()> {
+    let have = KEEPERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(job_key).cloned());
+    let client = match have {
+        Some(c) => c,
+        None => {
+            let c = std::sync::Arc::new(crate::runtime::connect_db(database_url).await?);
+            KEEPERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(Default::default)
+                .insert(job_key.to_string(), c.clone());
+            c
+        }
+    };
+    take_shared(&client, t, state).await?;
+    record(&client, t, state, job_key, "").await?;
+    Ok(())
+}
+
+/// Give back a lock [`keep_for_job`] holds for the job (false: none).
+pub async fn release_kept(job_key: &str, t: &Target, state: &str) -> Result<bool> {
+    let have = KEEPERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(job_key).cloned());
+    match have {
+        Some(c) => deallocate(&c, t, state).await,
+        None => Ok(false),
+    }
+}
+
 /// A job's default wait time (DFTWAIT; 30 seconds when not changed, as
 /// for a `system` job, DSPJOB).
 pub fn default_wait(job_key: &str) -> Duration {

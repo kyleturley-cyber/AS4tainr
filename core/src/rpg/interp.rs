@@ -2781,9 +2781,9 @@ impl<'a> Machine<'a> {
                 other => a(&other.chars()?).trim_end().to_string(),
             };
             self.block(crate::dtaara::write(client, &d, &text, held))?;
-            if held {
-                self.dtaara_unlock_object(&d.library, &d.name);
-            }
+            // The job's lock from an earlier call that returned with LR
+            // off goes too (OUT gives back the program's lock).
+            self.dtaara_unlock_object(&d.library, &d.name);
             self.dtaara_locks.retain(|k| *k != key);
         }
         Ok(())
@@ -2832,6 +2832,8 @@ impl<'a> Machine<'a> {
             objtype: "*DTAARA".into(),
         };
         let _ = self.block(crate::objlock::deallocate(self.io.client, &t, "*EXCLRD"));
+        let key = self.io.job_key.clone();
+        let _ = self.block(crate::objlock::release_kept(&key, &t, "*EXCLRD"));
     }
 
     /// IN and OUT of the local data area: its bytes into the field or data
@@ -4789,6 +4791,23 @@ impl<'a> Machine<'a> {
         }
         if r.is_err() {
             self.release_dtaaras();
+        } else if prog.main.is_none() && !self.ind("LR") && !self.dtaara_locks.is_empty() {
+            // Returned with LR off: the data areas it locked stay locked
+            // while the job goes on (PUB400 2026-11-06,
+            // tools/golden/verify59.txt b59_ret: *EXCLRD held, another
+            // job's CHGDTAARA got CPF1063; with LR on, b59_lr, they go).
+            // This program's session ends now, so the job keeps them on a
+            // connection of its own.
+            for (lib, name) in self.dtaara_locks.clone() {
+                let t = crate::objlock::Target {
+                    library: lib,
+                    name,
+                    objtype: "*DTAARA".into(),
+                };
+                let url = self.io.database_url.clone();
+                let key = self.io.job_key.clone();
+                self.block(crate::objlock::keep_for_job(&url, &key, &t, "*EXCLRD"))?;
+            }
         }
         self.share_out();
         let closed = self.close_printers();

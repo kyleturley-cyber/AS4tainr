@@ -2125,6 +2125,30 @@ impl<'a, 'e> Run<'a, 'e> {
     async fn sql(&mut self, text: &str) -> Result<()> {
         let expanded = self.expand_qcmdexc(text).await?;
         let text = expanded.as_str();
+        // Another job's lock on a table the statement reads or changes:
+        // it waits, then SQL0913. A procedure's DELETE outwaited another
+        // job's 40-second *EXCL hold (PUB400 2026-11-06,
+        // tools/golden/verify59.txt b59_proc: 30-39 seconds, then deleted),
+        // longer than RUNSQL's 30 seconds: the record wait (60 seconds,
+        // WAITRCD's default) is taken here, not captured to the second.
+        if !crate::objlock::sql_tables(text).is_empty() {
+            let (_, rows) = self
+                .query("SELECT current_setting('as4tainr.job_key', true)")
+                .await?;
+            let owner = rows
+                .first()
+                .and_then(|r| r.first().cloned().flatten())
+                .filter(|k| !k.is_empty())
+                .unwrap_or_else(|| format!("PID{}", std::process::id()));
+            crate::objlock::sql_tables_free(
+                self.env.catalog,
+                text,
+                self.env.libl,
+                &owner,
+                crate::runtime::default_record_wait(),
+            )
+            .await?;
+        }
         let up: Vec<String> = text
             .split_whitespace()
             .take(2)

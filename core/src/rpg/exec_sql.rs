@@ -903,13 +903,16 @@ impl Machine<'_> {
 
     fn sql_statement(&mut self, sql: &str) -> Result<Outcome> {
         // Another job's lock on a table the statement reads or changes:
-        // it waits the job's default wait time, then SQLCODE -913 (PUB400
-        // 2026-11-06, tools/golden/verify57.txt z57_sql: a DELETE waited
-        // until the other job's 40-second hold ended, 30-39 seconds,
-        // and then deleted).
+        // it waits, then SQLCODE -913 (PUB400 2026-11-06,
+        // tools/golden/verify57.txt z57_sql: a DELETE waited until the
+        // other job's 40-second hold ended, 30-39 seconds, and then
+        // deleted).
         {
             let libl = self.io.libl.clone();
-            let wait = crate::objlock::default_wait(&self.io.job_key);
+            // The record wait (60 seconds, WAITRCD's default): a DELETE
+            // outwaited another job's 40-second hold (verify57 z57_sql),
+            // longer than RUNSQL's 30 seconds; not captured to the second.
+            let wait = crate::runtime::default_record_wait();
             let owner = self.io.job_key.clone();
             if let Err(e) = self.block(crate::objlock::sql_tables_free(
                 self.io.client,

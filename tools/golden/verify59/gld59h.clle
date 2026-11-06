@@ -1,0 +1,6 @@
+/* verify59: call GLD59L, then stay in the job 40 seconds. */
+PGM PARM(&MODE)
+  DCL VAR(&MODE) TYPE(*CHAR) LEN(1)
+  CALL PGM(AS4TRAINR1/GLD59L) PARM(&MODE)
+  DLYJOB DLY(40)
+ENDPGM

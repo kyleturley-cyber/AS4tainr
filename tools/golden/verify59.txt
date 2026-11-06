@@ -1,0 +1,15 @@
+# Golden: (1) whether IN *LOCK's lock outlives the program in its job
+# (a CL program calls the RPG program, which ends with LR on or with
+# RETURN and LR off, then waits 40 s): WRKOBJLCK and another job's
+# CHGDTAARA (result, wait in tens of seconds). (2) An SQL procedure's
+# DELETE of a table another job holds *EXCL (40 s): CALL's result and
+# wait.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify59.txt -Files tools\golden\verify59
+b59_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLD59L)" "DLTPGM PGM(AS4TRAINR1/GLD59H)" "DLTPGM PGM(AS4TRAINR1/GLD59D)" "DLTDTAARA DTAARA(AS4TRAINR1/GLD59A)" "DLTF FILE(AS4TRAINR1/GLD59F)" "DLTF FILE(AS4TRAINR1/GLD59S)"; do system -q "$c"; done; system "RUNSQL SQL('DROP PROCEDURE AS4TRAINR1/GLD59P') COMMIT(*NONE)" > /dev/null 2>&1; echo cleaned
+b59_tag|!for f in gld59l.rpgle gld59h.clle gld59d.clle; do setccsid 819 /home/AS4TRAINR/gld/$f; done; ls /home/AS4TRAINR/gld | grep gld59
+b59_make|!system -q "CRTDTAARA DTAARA(AS4TRAINR1/GLD59A) TYPE(*CHAR) LEN(10) VALUE('before')"; system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD59F (K INTEGER NOT NULL)') COMMIT(*NONE)"; system "RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD59F VALUES(1), (2)') COMMIT(*NONE)"; system "RUNSQL SQL('CREATE PROCEDURE AS4TRAINR1/GLD59P () LANGUAGE SQL BEGIN DELETE FROM AS4TRAINR1/GLD59F WHERE K = 1; END') COMMIT(*NONE)"; echo "proc rc=$?"; system -q "CRTSRCPF FILE(AS4TRAINR1/GLD59S) RCDLEN(92)"; for m in GLD59H GLD59D; do f=$(echo $m | tr A-Z a-z).clle; system "CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/$f') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD59S.FILE/$m.MBR')"; system "CRTBNDCL PGM(AS4TRAINR1/$m) SRCFILE(AS4TRAINR1/GLD59S)" | grep -E "^CP[CF]"; done; system "CRTBNDRPG PGM(AS4TRAINR1/GLD59L) SRCSTMF('/home/AS4TRAINR/gld/gld59l.rpgle')" | grep -E "^RNS9304|^CPF"
+b59_lr|!(system "CALL PGM(AS4TRAINR1/GLD59H) PARM('L')" > /dev/null 2>&1 &); sleep 5; system "WRKOBJLCK OBJ(AS4TRAINR1/GLD59A) OBJTYPE(*DTAARA)" | grep -E "EXCL|SHR" | cut -c1-80; t=$(date +%s); system "CHGDTAARA DTAARA(AS4TRAINR1/GLD59A) VALUE('lr')"; echo "chg rc=$? took $(( ($(date +%s) - t) / 10 ))"; sleep 45
+b59_ret|!(system "CALL PGM(AS4TRAINR1/GLD59H) PARM('R')" > /dev/null 2>&1 &); sleep 5; system "WRKOBJLCK OBJ(AS4TRAINR1/GLD59A) OBJTYPE(*DTAARA)" | grep -E "EXCL|SHR" | cut -c1-80; t=$(date +%s); system "CHGDTAARA DTAARA(AS4TRAINR1/GLD59A) VALUE('ret')"; echo "chg rc=$? took $(( ($(date +%s) - t) / 10 ))"; sleep 45
+b59_proc|!(system "CALL PGM(AS4TRAINR1/GLD59D)" > /dev/null 2>&1 &); sleep 3; t=$(date +%s); system "RUNSQL SQL('CALL AS4TRAINR1/GLD59P()') COMMIT(*NONE)"; echo "call rc=$? took $(( ($(date +%s) - t) / 10 ))"; sleep 45
+b59_after|!system "DSPDTAARA DTAARA(AS4TRAINR1/GLD59A) OUTPUT(*PRINT)" | grep -iE "before|lr|ret"; system "CPYF FROMFILE(AS4TRAINR1/GLD59F) TOFILE(*PRINT)" | grep -E "^CP"
+b59_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLD59L)" "DLTPGM PGM(AS4TRAINR1/GLD59H)" "DLTPGM PGM(AS4TRAINR1/GLD59D)" "DLTDTAARA DTAARA(AS4TRAINR1/GLD59A)" "DLTF FILE(AS4TRAINR1/GLD59F)" "DLTF FILE(AS4TRAINR1/GLD59S)"; do system -q "$c"; done; system "RUNSQL SQL('DROP PROCEDURE AS4TRAINR1/GLD59P') COMMIT(*NONE)" > /dev/null 2>&1; echo cleaned

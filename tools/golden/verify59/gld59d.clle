@@ -1,0 +1,6 @@
+/* verify59: hold file GLD59F *EXCL for 40 seconds in a job of its own. */
+PGM
+  ALCOBJ OBJ((AS4TRAINR1/GLD59F *FILE *EXCL)) WAIT(0)
+  DLYJOB DLY(40)
+  DLCOBJ OBJ((AS4TRAINR1/GLD59F *FILE *EXCL))
+ENDPGM

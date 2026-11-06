@@ -2238,20 +2238,23 @@ impl<'a> Machine<'a> {
             self.files[i].open = Some(open);
             return Ok(());
         }
-        // The open takes *SHRRD on the file: another job's *EXCL keeps
-        // it out (objlock.rs). The wait is WAITFILE(*IMMED), CRTPF's
-        // default: one try.
+        // An open for update takes *SHRUPD on the member's data (objlock.rs);
+        // another job's *EXCL keeps it out for the job's default wait
+        // time, then the open fails with status 01217 (PUB400 2026-11-06,
+        // tools/golden/verify57.txt z57_upd: 30-39 seconds, RNX1217). An
+        // open for input is not kept out (verify48).
+        let wait = crate::objlock::default_wait(&self.io.job_key);
         let locked = self.block(crate::objlock::open_file(
             self.io.client,
             &fref.library,
             &fref.file.name,
-            std::time::Duration::ZERO,
+            wait,
             &self.io.job_key,
             update,
         ))?;
         if !locked {
             bail!(
-                "File {} in library {} could not be opened: another job holds a lock on it that keeps out a shared read lock.",
+                "RNX1217: File {} in library {} was not opened: another job holds a lock on it that keeps out an open for update.",
                 fref.file.name,
                 crate::qtemp::logical(&fref.library)
             );

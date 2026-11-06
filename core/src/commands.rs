@@ -1116,36 +1116,15 @@ impl Job<'_> {
     /// held *EXCL each waited 30-39 seconds, then RUNSQL failed with
     /// SQL9010 and the table was unchanged).
     async fn sql_tables_free(&self, stmt: &str) -> Result<()> {
-        for (lib, name, write) in crate::objlock::sql_tables(stmt) {
-            let libs = match &lib {
-                Some(l) => vec![crate::qtemp::real(l)],
-                None => self.library_list(),
-            };
-            let mut found = None;
-            for l in &libs {
-                if catalog::object_exists(self.client, std::slice::from_ref(l), &name, "*FILE")
-                    .await
-                    .unwrap_or(false)
-                {
-                    found = Some(l.clone());
-                    break;
-                }
-            }
-            let Some(l) = found else { continue };
-            let t = crate::objlock::Target {
-                library: l.clone(),
-                name: name.clone(),
-                objtype: "*FILE".into(),
-            };
-            let state = if write { "*SHRUPD" } else { "*SHRRD" };
-            if self.kept_out_waiting(&t, state).await? {
-                bail!(
-                    "SQL0913: Table {name} in {} is in use by another job.",
-                    crate::qtemp::logical(&l)
-                );
-            }
-        }
-        Ok(())
+        let owner = self.lock_owner().await?;
+        crate::objlock::sql_tables_free(
+            self.client,
+            stmt,
+            &self.library_list(),
+            &owner,
+            crate::objlock::default_wait(&self.job_key()),
+        )
+        .await
     }
 
     async fn runsql(&mut self, cmd: &Command) -> Result<Outcome> {
@@ -1459,87 +1438,95 @@ impl Job<'_> {
                 Some(s) => vec![s.clone()],
                 None => self.library_list(),
             };
-            let r = match crate::ddl::try_run(
-                &self.env.database_url,
-                &self.user,
-                &self.library_list(),
-                Some(self.current_library()),
-                &mut schema,
-                stmt,
-            )
-            .await
-            {
-                Ok(Some(msg)) => {
-                    session = None;
-                    Ok(msg)
-                }
-                Ok(None) => {
-                    let t = crate::sql::translate(stmt, &|_| false);
-                    let plain = crate::sqlpl::parse_call(stmt).ok().flatten().is_none()
-                        && !crate::sqlpl::is_compound(stmt);
-                    if matches!(&t, Ok(t) if t.kind == crate::sql::Kind::Query) {
-                        Err(anyhow::anyhow!(
-                            "SQL0084: SELECT is not valid in RUNSQLSTM."
-                        ))
-                    } else if plain && t.is_ok() {
-                        if session.as_ref().map(|(l, _)| l != &libl).unwrap_or(true) {
-                            let mut s = match &unit {
-                                Some(d) => {
-                                    crate::sql::Session::open_in(
-                                        self.client,
-                                        &self.env.database_url,
-                                        &libl,
-                                        d.clone(),
-                                    )
-                                    .await?
+            // Another job's lock on a table of the statement: it waits,
+            // then SQL0913 (PUB400 2026-11-06, tools/golden/verify57.txt
+            // z57_stm: 30-39 seconds, SQL0913 in the listing, SQL9010).
+            let free = self.sql_tables_free(stmt).await;
+            let r = if let Err(e) = free {
+                Err(e)
+            } else {
+                match crate::ddl::try_run(
+                    &self.env.database_url,
+                    &self.user,
+                    &self.library_list(),
+                    Some(self.current_library()),
+                    &mut schema,
+                    stmt,
+                )
+                .await
+                {
+                    Ok(Some(msg)) => {
+                        session = None;
+                        Ok(msg)
+                    }
+                    Ok(None) => {
+                        let t = crate::sql::translate(stmt, &|_| false);
+                        let plain = crate::sqlpl::parse_call(stmt).ok().flatten().is_none()
+                            && !crate::sqlpl::is_compound(stmt);
+                        if matches!(&t, Ok(t) if t.kind == crate::sql::Kind::Query) {
+                            Err(anyhow::anyhow!(
+                                "SQL0084: SELECT is not valid in RUNSQLSTM."
+                            ))
+                        } else if plain && t.is_ok() {
+                            if session.as_ref().map(|(l, _)| l != &libl).unwrap_or(true) {
+                                let mut s = match &unit {
+                                    Some(d) => {
+                                        crate::sql::Session::open_in(
+                                            self.client,
+                                            &self.env.database_url,
+                                            &libl,
+                                            d.clone(),
+                                        )
+                                        .await?
+                                    }
+                                    None => {
+                                        crate::sql::Session::open(
+                                            self.client,
+                                            &self.env.database_url,
+                                            &libl,
+                                        )
+                                        .await?
+                                    }
+                                };
+                                s.set_context(
+                                    &self.user,
+                                    Some(self.current_library()),
+                                    self.id.as_ref().map(|i| i.to_string()),
+                                )
+                                .await?;
+                                session = Some((libl.clone(), s));
+                            }
+                            let (_, s) = session.as_ref().unwrap();
+                            match s.exec(self.client, stmt).await {
+                                Ok(crate::sql::Exec::Count(kind, n)) => {
+                                    Ok(crate::sql::count_message(kind, n))
                                 }
-                                None => {
-                                    crate::sql::Session::open(
-                                        self.client,
-                                        &self.env.database_url,
-                                        &libl,
-                                    )
-                                    .await?
-                                }
-                            };
-                            s.set_context(
+                                Ok(crate::sql::Exec::Rows { .. }) => Ok(String::new()),
+                                Err(e) => Err(e),
+                            }
+                        } else {
+                            match crate::sql::run_as(
+                                self.client,
+                                &self.env.database_url,
+                                &libl,
                                 &self.user,
                                 Some(self.current_library()),
                                 self.id.as_ref().map(|i| i.to_string()),
+                                stmt,
                             )
-                            .await?;
-                            session = Some((libl.clone(), s));
-                        }
-                        let (_, s) = session.as_ref().unwrap();
-                        match s.exec(self.client, stmt).await {
-                            Ok(crate::sql::Exec::Count(kind, n)) => {
-                                Ok(crate::sql::count_message(kind, n))
+                            .await
+                            {
+                                Ok(crate::sql::Outcome::Count(kind, n)) => {
+                                    Ok(crate::sql::count_message(kind, n))
+                                }
+                                Ok(crate::sql::Outcome::Message(m)) => Ok(m),
+                                Ok(crate::sql::Outcome::Rows { .. }) => Ok(String::new()),
+                                Err(e) => Err(e),
                             }
-                            Ok(crate::sql::Exec::Rows { .. }) => Ok(String::new()),
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        match crate::sql::run_as(
-                            self.client,
-                            &self.env.database_url,
-                            &libl,
-                            &self.user,
-                            Some(self.current_library()),
-                            self.id.as_ref().map(|i| i.to_string()),
-                            stmt,
-                        )
-                        .await
-                        {
-                            Ok(crate::sql::Outcome::Count(kind, n)) => {
-                                Ok(crate::sql::count_message(kind, n))
-                            }
-                            Ok(crate::sql::Outcome::Message(m)) => Ok(m),
-                            Ok(crate::sql::Outcome::Rows { .. }) => Ok(String::new()),
-                            Err(e) => Err(e),
                         }
                     }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
             };
             match r {
                 Ok(text) => {

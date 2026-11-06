@@ -653,6 +653,76 @@ pub fn sql_tables(stmt: &str) -> Vec<(Option<String>, String, bool)> {
     out
 }
 
+/// Wait up to `wait` for the tables an SQL statement reads (*SHRRD) or
+/// changes (*SHRUPD) to be free of other jobs' conflicting locks; the
+/// SQL0913 error when one stays locked (PUB400 2026-11-06,
+/// tools/golden/verify56.txt, verify57.txt). Unqualified names are
+/// looked for in the library list.
+pub async fn sql_tables_free(
+    client: &Client,
+    stmt: &str,
+    libl: &[String],
+    owner: &str,
+    wait: Duration,
+) -> Result<()> {
+    let tables = sql_tables(stmt);
+    if tables.is_empty() {
+        return Ok(());
+    }
+    // Most of the time no job holds any object lock: one query then.
+    let any: bool = client
+        .query_one("SELECT EXISTS (SELECT 1 FROM as4tainr.object_locks)", &[])
+        .await?
+        .get(0);
+    if !any {
+        return Ok(());
+    }
+    for (lib, name, write) in tables {
+        let libs = match &lib {
+            Some(l) => vec![crate::qtemp::real(l)],
+            None => libl.to_vec(),
+        };
+        let mut found = None;
+        for l in &libs {
+            if crate::catalog::object_exists(client, std::slice::from_ref(l), &name, "*FILE")
+                .await
+                .unwrap_or(false)
+            {
+                found = Some(l.clone());
+                break;
+            }
+        }
+        let Some(l) = found else { continue };
+        let t = Target {
+            library: l.clone(),
+            name: name.clone(),
+            objtype: "*FILE".into(),
+        };
+        let state = if write { "*SHRUPD" } else { "*SHRRD" };
+        let start = Instant::now();
+        while conflicting(client, &t, state, owner).await? {
+            if start.elapsed() >= wait {
+                bail!(
+                    "SQL0913: Table {name} in {} is in use by another job.",
+                    crate::qtemp::logical(&l)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    Ok(())
+}
+
+/// A job's default wait time (DFTWAIT; 30 seconds when not changed, as
+/// for a `system` job, DSPJOB).
+pub fn default_wait(job_key: &str) -> Duration {
+    match crate::jobattr::get(job_key, "DFTWAIT").as_deref() {
+        Some("*NOMAX") => Duration::from_secs(u64::MAX / 4),
+        Some(n) => Duration::from_secs(n.trim().parse::<u64>().unwrap_or(30)),
+        None => Duration::from_secs(30),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

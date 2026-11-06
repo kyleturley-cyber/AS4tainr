@@ -245,6 +245,8 @@ pub(super) fn sqlstate(code: i64) -> &'static str {
         -545 => "23513",
         -601 => "42710",
         -811 => "21000",
+        // Row or object in use (DB2 for i SQL Messages and Codes).
+        -913 => "57033",
         _ => "58004",
     }
 }
@@ -900,6 +902,28 @@ impl Machine<'_> {
     }
 
     fn sql_statement(&mut self, sql: &str) -> Result<Outcome> {
+        // Another job's lock on a table the statement reads or changes:
+        // it waits the job's default wait time, then SQLCODE -913 (PUB400
+        // 2026-11-06, tools/golden/verify57.txt z57_sql: a DELETE waited
+        // until the other job's 40-second hold ended, 30-39 seconds,
+        // and then deleted).
+        {
+            let libl = self.io.libl.clone();
+            let wait = crate::objlock::default_wait(&self.io.job_key);
+            let owner = self.io.job_key.clone();
+            if let Err(e) = self.block(crate::objlock::sql_tables_free(
+                self.io.client,
+                sql,
+                &libl,
+                &owner,
+                wait,
+            )) {
+                if let Some(o) = sql_error(&e) {
+                    return Ok(o);
+                }
+                return Err(e);
+            }
+        }
         // QSYS2.STACK_INFO('*'): the job's call stack as it is now.
         if sql.to_ascii_uppercase().contains("STACK_INFO") {
             // An RPG program's main procedure has its program entry

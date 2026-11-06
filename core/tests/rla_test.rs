@@ -26472,6 +26472,17 @@ async fn sql_waits_for_another_jobs_object_lock() {
         calls: Default::default(),
     };
     let mut a = mk(&client);
+    a.id = Some(
+        as4tainr_core::jobs::start_interactive(
+            &client,
+            &format!("A{}", &lib[1..]),
+            "QSECOFR",
+            None,
+            std::slice::from_ref(&lib),
+        )
+        .await
+        .unwrap(),
+    );
     let mut b = mk(&other);
     a.run(&format!(
         "RUNSQL SQL('CREATE TABLE {lib}/SQLF (K INTEGER NOT NULL)') COMMIT(*NONE)"
@@ -26509,6 +26520,67 @@ async fn sql_waits_for_another_jobs_object_lock() {
         .unwrap()
         .get(0);
     assert_eq!(n, 2);
+    // RUNSQLSTM: SQL0913 in its listing, then SQL9010 (verify57 z57_stm).
+    let w = |p: String, t: String| {
+        let c = &client;
+        async move {
+            as4tainr_core::ifs::write_file(c, &p, t.as_bytes(), 819, 0o644, "QSECOFR")
+                .await
+                .unwrap();
+        }
+    };
+    let low = lib.to_ascii_lowercase();
+    w(
+        format!("/tmp/{low}s.sql"),
+        format!("DELETE FROM {lib}/SQLF WHERE K = 1;\n"),
+    )
+    .await;
+    let e = b
+        .run(&format!(
+            "RUNSQLSTM SRCSTMF('/tmp/{low}s.sql') COMMIT(*NONE)"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("SQL9010") && e.contains("SQL0913"), "{e}");
+    // Embedded SQL: SQLCODE -913, SQLSTATE 57033 (DB2 for i SQL Messages
+    // and Codes; verify57 z57_sql waited 30-39 seconds); an RPG open for
+    // update: status 01217 (verify57 z57_upd).
+    a.run(&format!(
+        "RUNSQL SQL('CREATE TABLE {lib}/SQLO (RES CHAR(40) NOT NULL)') COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
+    w(
+        format!("/tmp/{low}q.sqlrpgle"),
+        format!("**FREE\nctl-opt dftactgrp(*no);\ndcl-f SQLO usage(*output) rename(SQLO:SQLR);\nexec sql set option commit = *none;\nexec sql delete from {lib}/SQLF where K = 2;\nres = 'SQL ' + %char(sqlcode) + ' ' + sqlstate;\nwrite SQLR;\n*inlr = *on;\n"),
+    )
+    .await;
+    w(
+        format!("/tmp/{low}u.rpgle"),
+        "**FREE\nctl-opt dftactgrp(*no);\ndcl-f SQLF usage(*update) usropn rename(SQLF:SQLFR);\ndcl-f SQLO usage(*output) rename(SQLO:SQLR);\ndcl-ds psds psds;\n  msgid char(7) pos(40);\nend-ds;\nmonitor;\n  open SQLF;\n  res = 'UPD OPENED';\non-error;\n  res = 'UPD ST ' + %char(%status) + ' ' + msgid;\nendmon;\nwrite SQLR;\n*inlr = *on;\n".to_string(),
+    )
+    .await;
+    b.run(&format!(
+        "CRTSQLRPGI OBJ({lib}/SQLQ) SRCSTMF('/tmp/{low}q.sqlrpgle') COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
+    b.run(&format!(
+        "CRTBNDRPG PGM({lib}/SQLU) SRCSTMF('/tmp/{low}u.rpgle')"
+    ))
+    .await
+    .unwrap();
+    b.run(&format!("CALL PGM({lib}/SQLQ)")).await.unwrap();
+    b.run(&format!("CALL PGM({lib}/SQLU)")).await.unwrap();
+    let rows: Vec<String> = client
+        .query(&format!("SELECT res FROM {low}.sqlo"), &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<_, String>(0).trim().to_string())
+        .collect();
+    assert_eq!(rows, ["SQL -913 57033", "UPD ST 1217 RNX1217"]);
     a.run(&format!("DLCOBJ OBJ(({lib}/SQLF *FILE *EXCL))"))
         .await
         .unwrap();

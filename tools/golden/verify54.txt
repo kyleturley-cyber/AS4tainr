@@ -1,0 +1,11 @@
+# Golden: SQL against a table another job holds *EXCL (a CL program in a
+# background `system` job, ALCOBJ *EXCL, 50 s): what RUNSQL's SELECT
+# (into a table), INSERT and DELETE give and whether they wait; how many records
+# the table has after the hold (CPYF's completion message).
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify54.txt -Files tools\golden\verify54
+w54_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLD54D)" "DLTF FILE(AS4TRAINR1/GLD54F)" "DLTF FILE(AS4TRAINR1/GLD54C)" "DLTF FILE(AS4TRAINR1/GLD54S)"; do system -q "$c"; done; echo cleaned
+w54_tag|!setccsid 819 /home/AS4TRAINR/gld/gld54d.clle; ls /home/AS4TRAINR/gld | grep gld54
+w54_make|!system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD54F (K INTEGER NOT NULL)') COMMIT(*NONE)"; system "RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD54F VALUES(1), (2)') COMMIT(*NONE)"; system -q "CRTSRCPF FILE(AS4TRAINR1/GLD54S) RCDLEN(92)"; system "CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld54d.clle') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD54S.FILE/GLD54D.MBR')"; system "CRTBNDCL PGM(AS4TRAINR1/GLD54D) SRCFILE(AS4TRAINR1/GLD54S)" | grep -E "^CP[CF]"
+w54_held|!(system "CALL PGM(AS4TRAINR1/GLD54D)" > /dev/null 2>&1 &); sleep 5; for q in "INSERT INTO AS4TRAINR1/GLD54F VALUES(3)" "DELETE FROM AS4TRAINR1/GLD54F WHERE K = 1" "CREATE TABLE AS4TRAINR1/GLD54C AS (SELECT K FROM AS4TRAINR1/GLD54F) WITH DATA"; do echo "== $q"; t=$(date +%s); system "RUNSQL SQL('$q') COMMIT(*NONE)" 2>&1 | grep -E "^[A-Z]{3}[0-9A-F]{4}" | cut -c1-8; echo "waited=$(( $(date +%s) - t > 20 ))"; done
+w54_after|!sleep 50; system "CPYF FROMFILE(AS4TRAINR1/GLD54F) TOFILE(*PRINT)" | grep -E "^CP"
+w54_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLD54D)" "DLTF FILE(AS4TRAINR1/GLD54F)" "DLTF FILE(AS4TRAINR1/GLD54C)" "DLTF FILE(AS4TRAINR1/GLD54S)"; do system -q "$c"; done; echo cleaned

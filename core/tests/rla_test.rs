@@ -8250,6 +8250,36 @@ async fn rpg_date_and_time_formats() {
     );
 }
 
+/// /SET and /RESTORE (ILE RPG Reference, "/SET", "/RESTORE"): /SET
+/// DATFMT and TIMFMT give the definitions that follow without a format
+/// of their own that format instead of the control specification's; a
+/// definition's own format still wins; /RESTORE of a keyword gives back
+/// the value before the latest /SET, the other keyword stays set.
+#[tokio::test]
+async fn rpg_set_and_restore_directives() {
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = "**FREE\nctl-opt datfmt(*iso);\n/SET DATFMT(*MDY/) TIMFMT(*HMS:)\ndcl-s d1 date;\ndcl-s t1 time;\ndcl-s d2 date(*eur);\n/RESTORE DATFMT\ndcl-s d3 date;\ndcl-s t3 time;\n/RESTORE TIMFMT\ndcl-s t4 time;\nd1 = %date('2026-11-05': *iso);\nd2 = d1;\nd3 = d1;\nt1 = %time('13.45.00': *iso);\nt3 = t1;\nt4 = t1;\ndsply d1;\ndsply t1;\ndsply d2;\ndsply d3;\ndsply t3;\ndsply t4;\n*inlr = *on;\n";
+    let r = run_rpg(&url, &lib, "QSECOFR", "SETDIR", src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let m: Vec<String> = r
+        .messages
+        .iter()
+        .map(|m| m.trim_start_matches("DSPLY").trim().to_string())
+        .collect();
+    assert_eq!(
+        m,
+        [
+            "11/05/26",
+            "13:45:00",
+            "05.11.2026",
+            "2026-11-05",
+            "13:45:00",
+            "13.45.00"
+        ]
+    );
+}
+
 /// XML-INTO (ILE RPG Reference, XML-INTO, "%XML options for the XML-INTO
 /// operation code", "Path option", "Program Status Codes"): a data
 /// structure from the element of its name, subfields from child elements

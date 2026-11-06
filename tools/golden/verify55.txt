@@ -1,0 +1,12 @@
+# Golden: ILE RPG /SET and /RESTORE (DATFMT, TIMFMT): which format the
+# definitions after them get (%CHAR of each, written to a table), and
+# whether a date literal after /SET DATFMT(*MDY/) is read in the control
+# specification's format (*ISO) or the /SET one (which source compiles).
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify55.txt -Files tools\golden\verify55
+x55_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLD55D)" "DLTPGM PGM(AS4TRAINR1/GLD55I)" "DLTPGM PGM(AS4TRAINR1/GLD55M)" "DLTF FILE(AS4TRAINR1/GLD55O)"; do system -q "$c"; done; echo cleaned
+x55_tag|!for f in gld55d.rpgle gld55i.rpgle gld55m.rpgle; do setccsid 819 /home/AS4TRAINR/gld/$f; done; ls /home/AS4TRAINR/gld | grep gld55
+x55_file|!system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD55O (RES CHAR(80) NOT NULL)') COMMIT(*NONE)"; echo made
+x55_iso|!system "CRTBNDRPG PGM(AS4TRAINR1/GLD55I) SRCSTMF('/home/AS4TRAINR/gld/gld55i.rpgle')" | grep -E "^RNS9304|^RNF|^CPF" | cut -c1-7
+x55_mdy|!system "CRTBNDRPG PGM(AS4TRAINR1/GLD55M) SRCSTMF('/home/AS4TRAINR/gld/gld55m.rpgle')" | grep -E "^RNS9304|^RNF|^CPF" | cut -c1-7
+x55_run|!system "CRTBNDRPG PGM(AS4TRAINR1/GLD55D) SRCSTMF('/home/AS4TRAINR/gld/gld55d.rpgle')" | grep -E "^RNS9304|^RNF|^CPF" | cut -c1-7; system "CALL PGM(AS4TRAINR1/GLD55D)"; system "CPYF FROMFILE(AS4TRAINR1/GLD55O) TOFILE(*PRINT)" | grep -E "^ +[0-9]+ +[0-9]"
+x55_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLD55D)" "DLTPGM PGM(AS4TRAINR1/GLD55I)" "DLTPGM PGM(AS4TRAINR1/GLD55M)" "DLTF FILE(AS4TRAINR1/GLD55O)"; do system -q "$c"; done; echo cleaned

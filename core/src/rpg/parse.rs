@@ -9,7 +9,7 @@ use super::ast::*;
 use super::data::{e, DType, Fig};
 use super::expr::{self, Parser, Tok};
 use anyhow::{anyhow, bail, Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Characters `from..=to` (1-based) of a fixed-form line.
 fn col(line: &[char], from: usize, to: usize) -> String {
@@ -108,6 +108,36 @@ struct Lines<'a> {
     /// numbered n * COPY_LINES + its line (as the compiler listing's
     /// source ID and sequence number).
     copies: usize,
+    /// The DATFMT and TIMFMT /SET made the default (ILE RPG Reference,
+    /// "/SET", "/RESTORE"), with the values each /SET replaced.
+    set: SetFormats,
+    /// The /SET values in effect at each line that has them.
+    set_at: HashMap<usize, (Option<String>, Option<String>)>,
+}
+
+/// /SET's DATFMT and TIMFMT, and for /RESTORE the values before each.
+#[derive(Clone, Default)]
+struct SetFormats {
+    datfmt: Option<String>,
+    timfmt: Option<String>,
+    datfmt_before: Vec<Option<String>>,
+    timfmt_before: Vec<Option<String>>,
+}
+
+/// A keyword's argument in a directive: `DATFMT(*MDY/)` gives `*MDY/`.
+fn directive_arg(text: &str, name: &str) -> Option<String> {
+    let up = text.to_ascii_uppercase();
+    let at = up.find(&format!("{name}("))?;
+    let rest = &up[at + name.len() + 1..];
+    let end = rest.find(')')?;
+    Some(rest[..end].trim().to_string())
+}
+
+/// Is the keyword named in a /RESTORE (alone or with arguments)?
+fn directive_names(text: &str, name: &str) -> bool {
+    text.to_ascii_uppercase()
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .any(|w| w == name)
 }
 
 /// Line numbers of /COPY members start at their order times this.
@@ -169,6 +199,14 @@ fn strip_comment(s: &str) -> String {
 }
 
 impl Lines<'_> {
+    /// Note the /SET values in effect at a line a unit was made from.
+    fn note_set(&mut self, lineno: usize) {
+        if self.set.datfmt.is_some() || self.set.timfmt.is_some() {
+            self.set_at
+                .insert(lineno, (self.set.datfmt.clone(), self.set.timfmt.clone()));
+        }
+    }
+
     fn read(&mut self, source: &str, first_line: usize) -> Result<()> {
         let free_source = is_fully_free(source);
         let mut free_region = false;
@@ -232,6 +270,7 @@ impl Lines<'_> {
                             if active(&cond) {
                                 self.units
                                     .push(Unit::Free(format!("EXEC SQL {}", text.trim()), at));
+                                self.note_set(at);
                             }
                         }
                         continue;
@@ -323,11 +362,42 @@ impl Lines<'_> {
                                 self.depth += 1;
                                 self.copies += 1;
                                 let base = self.copies * COPY_LINES;
+                                // A copied member starts with the values in
+                                // effect where it is copied, and its /SET
+                                // and /RESTORE end with it (ILE RPG
+                                // Reference, "/SET").
+                                let kept = self.set.clone();
                                 self.read(&text, base + 1)?;
+                                self.set = kept;
                                 self.depth -= 1;
                             }
-                            // /TITLE, /EJECT, /SPACE, /SET, /RESTORE:
-                            // listing and CCSID directives.
+                            // /SET: new defaults for the definitions that
+                            // follow in this member; /RESTORE: the value
+                            // before the latest /SET of each keyword it
+                            // names (ILE RPG Reference, "/SET",
+                            // "/RESTORE"). CCSID(*CHAR...) is accepted
+                            // (character data is not in CCSIDs here).
+                            "SET" => {
+                                if let Some(f) = directive_arg(&rest, "DATFMT") {
+                                    let old = self.set.datfmt.replace(f);
+                                    self.set.datfmt_before.push(old);
+                                }
+                                if let Some(f) = directive_arg(&rest, "TIMFMT") {
+                                    let old = self.set.timfmt.replace(f);
+                                    self.set.timfmt_before.push(old);
+                                }
+                            }
+                            "RESTORE" => {
+                                if directive_names(&rest, "DATFMT") {
+                                    self.set.datfmt =
+                                        self.set.datfmt_before.pop().unwrap_or_default();
+                                }
+                                if directive_names(&rest, "TIMFMT") {
+                                    self.set.timfmt =
+                                        self.set.timfmt_before.pop().unwrap_or_default();
+                                }
+                            }
+                            // /TITLE, /EJECT, /SPACE: listing directives.
                             _ => {}
                         }
                         continue;
@@ -406,6 +476,7 @@ impl Lines<'_> {
                     pending = pending[i + 1..].to_string();
                     if !st.is_empty() {
                         self.units.push(Unit::Free(st, pending_line));
+                        self.note_set(pending_line);
                     }
                     pending_line = lineno;
                 }
@@ -418,6 +489,7 @@ impl Lines<'_> {
                 let mut line = cs.clone();
                 line.truncate(80);
                 self.units.push(Unit::Spec(s, line, lineno));
+                self.note_set(lineno);
             }
         }
         if !pending.trim().is_empty() {
@@ -855,6 +927,8 @@ pub fn parse_defined(
         ctdata: Vec::new(),
         depth: 0,
         copies: 0,
+        set: SetFormats::default(),
+        set_at: HashMap::new(),
     };
     lines.read(source, 1)?;
     let mut ctx = Ctx {
@@ -927,7 +1001,39 @@ pub fn parse_defined(
         bail!("procedure {} has no end (P spec E or END-PROC)", p.name);
     }
     like_files(&mut ctx.src.files)?;
+    apply_set_formats(&mut ctx.src, &lines.set_at);
     Ok(ctx.src)
+}
+
+/// A date or time definition with no format of its own, after a /SET
+/// DATFMT or TIMFMT: that format (ILE RPG Reference, "/SET": it replaces
+/// the control specification's as the default).
+fn apply_set_formats(src: &mut Source, set_at: &HashMap<usize, (Option<String>, Option<String>)>) {
+    if set_at.is_empty() {
+        return;
+    }
+    let fix = |d: &mut Def| {
+        let Some((datfmt, timfmt)) = set_at.get(&d.line) else {
+            return;
+        };
+        let (name, f) = match d.dtype {
+            Some(DType::Date(f)) if f.name.is_empty() => ("DATFMT", datfmt),
+            Some(DType::Time(f)) if f.name.is_empty() => ("TIMFMT", timfmt),
+            _ => return,
+        };
+        if let Some(f) = f {
+            if keyword(&d.keywords, name).is_none() {
+                d.keywords.push(Keyword {
+                    name: name.into(),
+                    args: vec![f.clone()],
+                });
+            }
+        }
+    };
+    src.defs.iter_mut().for_each(fix);
+    for p in &mut src.procs {
+        p.defs.iter_mut().for_each(fix);
+    }
 }
 
 /// LIKEFILE(parent) on a file declaration (ILE RPG Reference, LIKEFILE):

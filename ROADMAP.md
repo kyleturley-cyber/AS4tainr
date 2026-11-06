@@ -287,6 +287,7 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] Opens for update hold *SHRRD on the file and *SHRUPD on the member data; CLRPFM of a file open for update waits, then CPF3156 (verify52)
 - [x] Process start checks the SQL role's grants on every library in one query (a `system` call 0.4 s instead of 5 s with thousands of libraries)
 - [x] CHGDTAARA of a data area another job holds waits the default wait time, then CPF1063 (verify53)
+- [x] ILE RPG /SET and /RESTORE of DATFMT and TIMFMT
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).
 - [x] Journals and trigger programs: COM's SETUPJRN, ORDAUDJV (QSYS2.DISPLAY_JOURNAL) and ORDTRG (ADDPFTRG) run (docs/journals.md).
@@ -294,7 +295,7 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] Journal and trigger depth: APYJRNCHG/RMVJRNCHG, rolled-back changes in the journal, trigger programs in the caller's commitment definition, *BEFORE triggers changing the record (ALWREPCHG) (docs/journals.md).
 - [ ] Trigger extras: *READ triggers, CL trigger programs, a trigger program's embedded SQL in the change's session.
 - [x] RPG language gaps: dates and times held in their DATFMT/TIMFMT (MOVE with formats, %CHAR, %DEC), XML-INTO, LIKEFILE/TEMPLATE/file parameters, EXTFILE, halt indicators, PSDS creation and source information (docs/rpg-engine.md).
-- [ ] RPG extras: XML-SAX, XML-INTO %HANDLER, DATA-INTO and DATA-GEN (the QrnDi* interface), /SET and /RESTORE, *GDA and *PDA.
+- [ ] RPG extras: XML-INTO %HANDLER, DATA-INTO and DATA-GEN (the QrnDi* interface), *GDA and *PDA in group and prestart jobs (XML-SAX and /SET, /RESTORE done).
 - [x] Close the SQL gaps: commitment control, compound statements, routines.
 - [x] IBM i SQL services: sequences, INSTEAD OF triggers, SYSCST/SYSKEYCST/SYSCHKCST/SYSREFCST/SYSTRIGGERS/SYSSEQUENCES, JOB_INFO, OUTPUT_QUEUE_ENTRIES, OBJECT_PRIVILEGES, JSON_OBJECT/JSON_ARRAY/JSON_ARRAYAGG/JSON_OBJECTAGG/JSON_VALUE/JSON_QUERY/JSON_EXISTS (docs/sql.md).
 - [ ] Remaining SQL: external functions, more scalar functions (CHAR, VARCHAR_FORMAT...), more IBM i services, LABEL ON SEQUENCE.

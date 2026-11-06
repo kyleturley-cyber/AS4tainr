@@ -288,6 +288,7 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [x] Process start checks the SQL role's grants on every library in one query (a `system` call 0.4 s instead of 5 s with thousands of libraries)
 - [x] CHGDTAARA of a data area another job holds waits the default wait time, then CPF1063 (verify53)
 - [x] ILE RPG /SET and /RESTORE of DATFMT and TIMFMT
+- [x] RUNSQL waits for another job's object lock on the tables its statement reads or changes, then SQL9010 (verify56)
 - [ ] Golden output coverage: CL command messages and reports (DSPFD of keyed and logical files, DSPPFM, WRKOBJ, DSPJOBLOG), RPG results (decimal arithmetic, %EDITC/%EDITW, date formats), SQL (`db2` in QSH), 5250 screens over the SSH tunnel; completion message IDs for every create and delete command.
 - [x] Run real applications end to end and fix what they need: Northwind for IBM i and COM order management (`tools/legacy.sh`, docs/import.md).
 - [x] Journals and trigger programs: COM's SETUPJRN, ORDAUDJV (QSYS2.DISPLAY_JOURNAL) and ORDTRG (ADDPFTRG) run (docs/journals.md).

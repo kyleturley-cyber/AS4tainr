@@ -26080,7 +26080,20 @@ async fn open_files_hold_shared_read_locks() {
         id: None,
         calls: Default::default(),
     };
+    // A job of its own: its programs' call stack is not the process's
+    // (verify19_rpg_messages_and_dspjob reads that one at the same time).
     let mut a = mk(&client);
+    a.id = Some(
+        as4tainr_core::jobs::start_interactive(
+            &client,
+            &format!("A{}", &lib[1..]),
+            "QSECOFR",
+            None,
+            std::slice::from_ref(&lib),
+        )
+        .await
+        .unwrap(),
+    );
     let mut b = mk(&other);
     a.run(&format!(
         "RUNSQL SQL('CREATE TABLE {lib}/LCKF (K INTEGER NOT NULL)') COMMIT(*NONE)"
@@ -26175,7 +26188,20 @@ async fn cl_declared_files_hold_shared_read_locks() {
         id: None,
         calls: Default::default(),
     };
+    // A job of its own: its programs' call stack is not the process's
+    // (verify19_rpg_messages_and_dspjob reads that one at the same time).
     let mut a = mk(&client);
+    a.id = Some(
+        as4tainr_core::jobs::start_interactive(
+            &client,
+            &format!("A{}", &lib[1..]),
+            "QSECOFR",
+            None,
+            std::slice::from_ref(&lib),
+        )
+        .await
+        .unwrap(),
+    );
     let mut b = mk(&other);
     for c in [
         format!("RUNSQL SQL('CREATE TABLE {lib}/CLKF (K INTEGER NOT NULL)') COMMIT(*NONE)"),
@@ -26345,7 +26371,20 @@ async fn update_opens_keep_out_shrnup_and_clrpfm() {
         id: None,
         calls: Default::default(),
     };
+    // A job of its own: its programs' call stack is not the process's
+    // (verify19_rpg_messages_and_dspjob reads that one at the same time).
     let mut a = mk(&client);
+    a.id = Some(
+        as4tainr_core::jobs::start_interactive(
+            &client,
+            &format!("A{}", &lib[1..]),
+            "QSECOFR",
+            None,
+            std::slice::from_ref(&lib),
+        )
+        .await
+        .unwrap(),
+    );
     let mut b = mk(&other);
     for c in [
         format!("RUNSQL SQL('CREATE TABLE {lib}/UPDF (K INTEGER NOT NULL)') COMMIT(*NONE)"),
@@ -26399,4 +26438,83 @@ async fn update_opens_keep_out_shrnup_and_clrpfm() {
     assert!(e.starts_with("CPF1002"), "{e}");
     let e = clr.unwrap_err().to_string();
     assert!(e.starts_with("CPF3156"), "{e}");
+}
+
+// RUNSQL of a statement that reads or changes a table another job holds
+// *EXCL waits the job's default wait time (1 second here), then SQL9010
+// with the table unchanged (PUB400 2026-11-06, tools/golden/verify56.txt:
+// DELETE, UPDATE, INSERT and CREATE TABLE AS SELECT each waited 30-39
+// seconds there); once the lock is gone it runs.
+#[tokio::test]
+async fn sql_waits_for_another_jobs_object_lock() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let other = runtime::connect_db(&url).await.unwrap();
+    runtime::job_session(
+        &other,
+        Some(&format!("000083/QSECOFR/S{}", &lib[1..])),
+        std::time::Duration::from_millis(500),
+    )
+    .await
+    .unwrap();
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mk = |c| Job {
+        client: c,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let mut a = mk(&client);
+    let mut b = mk(&other);
+    a.run(&format!(
+        "RUNSQL SQL('CREATE TABLE {lib}/SQLF (K INTEGER NOT NULL)') COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
+    a.run(&format!(
+        "RUNSQL SQL('INSERT INTO {lib}/SQLF VALUES(1), (2)') COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
+    b.run("CHGJOB DFTWAIT(1)").await.unwrap();
+    a.run(&format!("ALCOBJ OBJ(({lib}/SQLF *FILE *EXCL)) WAIT(0)"))
+        .await
+        .unwrap();
+    for q in [
+        "DELETE FROM SQLF WHERE K = 1".to_string(),
+        format!("CREATE TABLE {lib}/SQLC AS (SELECT K FROM {lib}/SQLF) WITH DATA"),
+    ] {
+        let t = std::time::Instant::now();
+        let e = b
+            .run(&format!("RUNSQL SQL('{q}') COMMIT(*NONE)"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("SQL9010") && e.contains("SQL0913"), "{e}");
+        assert!(t.elapsed() >= std::time::Duration::from_secs(1));
+    }
+    let n: i64 = client
+        .query_one(
+            &format!("SELECT count(*) FROM {}.sqlf", lib.to_ascii_lowercase()),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 2);
+    a.run(&format!("DLCOBJ OBJ(({lib}/SQLF *FILE *EXCL))"))
+        .await
+        .unwrap();
+    b.run(&format!(
+        "RUNSQL SQL('DELETE FROM {lib}/SQLF WHERE K = 1') COMMIT(*NONE)"
+    ))
+    .await
+    .unwrap();
 }

@@ -501,6 +501,158 @@ pub fn wait_time(w: &str) -> Result<Option<Duration>> {
     })
 }
 
+/// The tables an SQL statement names after FROM, JOIN, INTO, UPDATE,
+/// MERGE INTO, USING and DELETE FROM: (library or None, name, whether the
+/// statement changes it). Names are upper case unless quoted; `lib/name`
+/// and `lib.name` both qualify. Used to find another job's object lock in
+/// the way (PUB400 2026-11-06, tools/golden/verify56.txt).
+pub fn sql_tables(stmt: &str) -> Vec<(Option<String>, String, bool)> {
+    // Words and names outside string constants.
+    let mut toks: Vec<String> = Vec::new();
+    let cs: Vec<char> = stmt.chars().collect();
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if c == '\'' {
+            i += 1;
+            while i < cs.len() {
+                if cs[i] == '\'' {
+                    if cs.get(i + 1) == Some(&'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            i += 1;
+            toks.push("'".into());
+            continue;
+        }
+        if c.is_alphanumeric() || "_$#@\"/.".contains(c) {
+            let mut w = String::new();
+            let mut quoted = false;
+            while i < cs.len() {
+                let d = cs[i];
+                if d == '"' {
+                    quoted = !quoted;
+                    w.push(d);
+                } else if quoted || d.is_alphanumeric() || "_$#@/.".contains(d) {
+                    w.push(d);
+                } else {
+                    break;
+                }
+                i += 1;
+            }
+            toks.push(w);
+            continue;
+        }
+        if !c.is_whitespace() {
+            toks.push(c.to_string());
+        }
+        i += 1;
+    }
+    let up: Vec<String> = toks.iter().map(|t| t.to_ascii_uppercase()).collect();
+    let first = up.first().cloned().unwrap_or_default();
+    let changes = matches!(first.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE");
+    let name_of = |t: &str| -> Option<(Option<String>, String)> {
+        let part = |p: &str| {
+            if p.starts_with('"') {
+                p.trim_matches('"').to_string()
+            } else {
+                p.to_ascii_uppercase()
+            }
+        };
+        if t.is_empty()
+            || !(t.starts_with('"')
+                || t.chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphabetic() || "$#@".contains(c)))
+        {
+            return None;
+        }
+        match t.split_once(['/', '.']) {
+            Some((l, n)) if !n.is_empty() => Some((Some(part(l)), part(n))),
+            _ => Some((None, part(t))),
+        }
+    };
+    let mut out: Vec<(Option<String>, String, bool)> = Vec::new();
+    let mut push = |n: (Option<String>, String), w: bool| {
+        if let Some(e) = out.iter_mut().find(|e| e.0 == n.0 && e.1 == n.1) {
+            e.2 |= w;
+        } else {
+            out.push((n.0, n.1, w));
+        }
+    };
+    let mut k = 0;
+    while k < up.len() {
+        let target = match up[k].as_str() {
+            // The table the statement changes.
+            "INTO" | "UPDATE" if changes => true,
+            "FROM" if first == "DELETE" && k == 1 => true,
+            "FROM" | "JOIN" | "USING" => false,
+            _ => {
+                k += 1;
+                continue;
+            }
+        };
+        // FROM a, b: each name of the list, until a keyword or '('.
+        let mut j = k + 1;
+        loop {
+            match up.get(j).map(String::as_str) {
+                Some("(") | Some("LATERAL") | Some("TABLE") | None => break,
+                Some(_) => {
+                    let Some(n) = name_of(&toks[j]) else { break };
+                    push(n, target);
+                    j += 1;
+                    // An alias (with or without AS).
+                    if up.get(j).map(String::as_str) == Some("AS") {
+                        j += 2;
+                    } else if up.get(j).is_some_and(|t| {
+                        !matches!(
+                            t.as_str(),
+                            "," | "WHERE"
+                                | "JOIN"
+                                | "INNER"
+                                | "LEFT"
+                                | "RIGHT"
+                                | "FULL"
+                                | "CROSS"
+                                | "ON"
+                                | "GROUP"
+                                | "ORDER"
+                                | "HAVING"
+                                | "UNION"
+                                | "EXCEPT"
+                                | "INTERSECT"
+                                | "FETCH"
+                                | "LIMIT"
+                                | "OFFSET"
+                                | "SET"
+                                | "VALUES"
+                                | "SELECT"
+                                | "WITH"
+                                | ")"
+                                | "("
+                                | "FOR"
+                                | "OVERRIDING"
+                        )
+                    }) {
+                        j += 1;
+                    }
+                    if up.get(j).map(String::as_str) == Some(",") && !target {
+                        j += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        k = j.max(k + 1);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,5 +777,42 @@ mod tests {
             "                        * * * * *   E N D   O F   L I S T I N G   * * * * *",
         ];
         assert_eq!(lines[1..], want);
+    }
+
+    /// The tables of the statements verify56 ran, and a join and a
+    /// subquery.
+    #[test]
+    fn tables_an_sql_statement_names() {
+        let t = |s: &str| sql_tables(s);
+        let lib = |l: &str, n: &str, w: bool| (Some(l.to_string()), n.to_string(), w);
+        assert_eq!(
+            t("DELETE FROM AS4TRAINR1/GLD56F WHERE K = 1"),
+            [lib("AS4TRAINR1", "GLD56F", true)]
+        );
+        assert_eq!(
+            t("INSERT INTO AS4TRAINR1/GLD56F VALUES(4)"),
+            [lib("AS4TRAINR1", "GLD56F", true)]
+        );
+        assert_eq!(
+            t("UPDATE AS4TRAINR1/GLD56F SET K = 9 WHERE K = 2"),
+            [lib("AS4TRAINR1", "GLD56F", true)]
+        );
+        assert_eq!(
+            t("CREATE TABLE AS4TRAINR1/GLD56C AS (SELECT K FROM AS4TRAINR1/GLD56F) WITH DATA"),
+            [lib("AS4TRAINR1", "GLD56F", false)]
+        );
+        assert_eq!(
+            t("insert into a select x.k from lib.b x join c on x.k = c.k where x.k in (select k from \"d\")"),
+            [
+                (None, "A".to_string(), true),
+                lib("LIB", "B", false),
+                (None, "C".to_string(), false),
+                (None, "d".to_string(), false)
+            ]
+        );
+        assert_eq!(
+            t("UPDATE t SET v = 'FROM x' WHERE k = 1"),
+            [(None, "T".to_string(), true)]
+        );
     }
 }

@@ -1109,6 +1109,45 @@ impl Job<'_> {
     }
 
     /// RUNSQL: one SQL statement that does not return rows.
+    /// Another job's object lock on a table the statement reads (*SHRRD)
+    /// or changes (*SHRUPD) keeps it out for the job's default wait time,
+    /// then SQL0913 (PUB400 2026-11-06, tools/golden/verify56.txt: DELETE,
+    /// UPDATE, INSERT and CREATE TABLE AS SELECT of a table another job
+    /// held *EXCL each waited 30-39 seconds, then RUNSQL failed with
+    /// SQL9010 and the table was unchanged).
+    async fn sql_tables_free(&self, stmt: &str) -> Result<()> {
+        for (lib, name, write) in crate::objlock::sql_tables(stmt) {
+            let libs = match &lib {
+                Some(l) => vec![crate::qtemp::real(l)],
+                None => self.library_list(),
+            };
+            let mut found = None;
+            for l in &libs {
+                if catalog::object_exists(self.client, std::slice::from_ref(l), &name, "*FILE")
+                    .await
+                    .unwrap_or(false)
+                {
+                    found = Some(l.clone());
+                    break;
+                }
+            }
+            let Some(l) = found else { continue };
+            let t = crate::objlock::Target {
+                library: l.clone(),
+                name: name.clone(),
+                objtype: "*FILE".into(),
+            };
+            let state = if write { "*SHRUPD" } else { "*SHRRD" };
+            if self.kept_out_waiting(&t, state).await? {
+                bail!(
+                    "SQL0913: Table {name} in {} is in use by another job.",
+                    crate::qtemp::logical(&l)
+                );
+            }
+        }
+        Ok(())
+    }
+
     async fn runsql(&mut self, cmd: &Command) -> Result<Outcome> {
         let stmt = cmd.get("SQL");
         // A process with no job of the catalog: its job log for
@@ -1116,6 +1155,7 @@ impl Job<'_> {
         if self.id.is_none() && stmt.to_ascii_uppercase().contains("JOBLOG_INFO") {
             self.mirror_system_job_log().await;
         }
+        self.sql_tables_free(stmt).await?;
         let mut schema = None;
         if let Some(msg) = crate::ddl::try_run(
             &self.env.database_url,

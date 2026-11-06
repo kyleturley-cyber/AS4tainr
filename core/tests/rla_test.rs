@@ -8254,7 +8254,9 @@ async fn rpg_date_and_time_formats() {
 /// DATFMT and TIMFMT give the definitions that follow without a format
 /// of their own that format instead of the control specification's; a
 /// definition's own format still wins; /RESTORE of a keyword gives back
-/// the value before the latest /SET, the other keyword stays set.
+/// the value before the latest /SET, the other keyword stays set. The
+/// same program on PUB400 (2026-11-06, tools/golden/verify55.txt
+/// x55_run) gave these values.
 #[tokio::test]
 async fn rpg_set_and_restore_directives() {
     let url = require_db!();

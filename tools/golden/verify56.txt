@@ -1,0 +1,15 @@
+# Golden (after verify54: INSERT waited and failed, DELETE and CREATE
+# TABLE AS went through, timing unclear): SQL against a table another
+# job holds *EXCL (ALCOBJ in a background `system` job, 40 s, one hold
+# per statement): what each gives and how long it took in tens of
+# seconds; the records after.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify56.txt -Files tools\golden\verify56
+y56_cleanup|!for c in "DLTPGM PGM(AS4TRAINR1/GLD56D)" "DLTF FILE(AS4TRAINR1/GLD56F)" "DLTF FILE(AS4TRAINR1/GLD56C)" "DLTF FILE(AS4TRAINR1/GLD56S)"; do system -q "$c"; done; echo cleaned
+y56_tag|!setccsid 819 /home/AS4TRAINR/gld/gld56d.clle; ls /home/AS4TRAINR/gld | grep gld56
+y56_make|!system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD56F (K INTEGER NOT NULL)') COMMIT(*NONE)"; system "RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD56F VALUES(1), (2), (3)') COMMIT(*NONE)"; system -q "CRTSRCPF FILE(AS4TRAINR1/GLD56S) RCDLEN(92)"; system "CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld56d.clle') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD56S.FILE/GLD56D.MBR')"; system "CRTBNDCL PGM(AS4TRAINR1/GLD56D) SRCFILE(AS4TRAINR1/GLD56S)" | grep -E "^CP[CF]"
+y56_del|!(system "CALL PGM(AS4TRAINR1/GLD56D)" > /dev/null 2>&1 &); sleep 3; t=$(date +%s); system "RUNSQL SQL('DELETE FROM AS4TRAINR1/GLD56F WHERE K = 1') COMMIT(*NONE)"; echo "rc=$? took $(( ($(date +%s) - t) / 10 ))"; sleep 45
+y56_cta|!(system "CALL PGM(AS4TRAINR1/GLD56D)" > /dev/null 2>&1 &); sleep 3; t=$(date +%s); system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD56C AS (SELECT K FROM AS4TRAINR1/GLD56F) WITH DATA') COMMIT(*NONE)"; echo "rc=$? took $(( ($(date +%s) - t) / 10 ))"; sleep 45
+y56_upd|!(system "CALL PGM(AS4TRAINR1/GLD56D)" > /dev/null 2>&1 &); sleep 3; t=$(date +%s); system "RUNSQL SQL('UPDATE AS4TRAINR1/GLD56F SET K = 9 WHERE K = 2') COMMIT(*NONE)"; echo "rc=$? took $(( ($(date +%s) - t) / 10 ))"; sleep 45
+y56_ins|!(system "CALL PGM(AS4TRAINR1/GLD56D)" > /dev/null 2>&1 &); sleep 3; t=$(date +%s); system "RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD56F VALUES(4)') COMMIT(*NONE)"; echo "rc=$? took $(( ($(date +%s) - t) / 10 ))"; sleep 45
+y56_after|!system "CPYF FROMFILE(AS4TRAINR1/GLD56F) TOFILE(*PRINT)" | grep -E "^CP"; system "CPYF FROMFILE(AS4TRAINR1/GLD56C) TOFILE(*PRINT)" | grep -E "^CP"
+y56_end|!for c in "DLTPGM PGM(AS4TRAINR1/GLD56D)" "DLTF FILE(AS4TRAINR1/GLD56F)" "DLTF FILE(AS4TRAINR1/GLD56C)" "DLTF FILE(AS4TRAINR1/GLD56S)"; do system -q "$c"; done; echo cleaned

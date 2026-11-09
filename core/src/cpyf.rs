@@ -350,6 +350,15 @@ impl Job<'_> {
             });
             (rrns, records) = both.into_iter().unzip();
         }
+        // FROMKEY/TOKEY (keyed files: the records read in key order are
+        // kept from one key value to another), INCCHAR and INCREL (only the
+        // records that pass), then NBRRCDS (at most that many) (CL
+        // reference, CPYF).
+        // A selection that cannot be done ends the copy: CPF2817, as
+        // CPYF's other errors (PUB400, verify56 y56_after's CPYF of a file
+        // that is not there: CPF2802 then CPF2817).
+        (rrns, records) = select(&from.file, cmd, rrns, records)
+            .map_err(|e| anyhow!("{e:#}\nCPF2817: The copy was not done."))?;
         let fields: Vec<String> = from.file.fields.iter().map(|f| f.name.clone()).collect();
         // No records: CPC2957, to a file or *PRINT (PUB400 2026-10-27,
         // verify5 z_cpysplf_2f, verify8 c8_cpyf_empty).
@@ -757,6 +766,263 @@ pub fn print_listing(
         ""
     ));
     out
+}
+
+/// Words of a CL list element, quotes kept together: `(*IF A *EQ 'x y')`
+/// gives `*IF`, `A`, `*EQ`, `'x y'`.
+fn words(element: &str) -> Vec<String> {
+    let t = element.trim();
+    let t = t
+        .strip_prefix('(')
+        .and_then(|x| x.strip_suffix(')'))
+        .unwrap_or(t);
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    for c in t.chars() {
+        if c == '\'' {
+            quoted = !quoted;
+            cur.push(c);
+        } else if c.is_whitespace() && !quoted {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// A value as written: a quoted string without its quotes ('' is one
+/// quote), else the word.
+fn unquote(v: &str) -> String {
+    match v.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')) {
+        Some(x) => x.replace("''", "'"),
+        None => v.to_string(),
+    }
+}
+
+/// Compare a field's value with a value of the test: numerically for a
+/// numeric field (exact decimals), else as characters with blanks added
+/// to the shorter one.
+fn compare(numeric: bool, field: &str, value: &str) -> Result<std::cmp::Ordering> {
+    if numeric {
+        let a = crate::rpg::dec::Dec::parse(field.trim())?;
+        let b = crate::rpg::dec::Dec::parse(value.trim())
+            .map_err(|_| anyhow!("Value '{value}' is not valid for a numeric field."))?;
+        return Ok(a.cmp(&b));
+    }
+    let a = field.trim_end();
+    let b = value.trim_end();
+    Ok(a.cmp(b))
+}
+
+/// The relation of a test (*EQ, *GT...) holds for an ordering.
+fn holds(op: &str, o: std::cmp::Ordering) -> Result<bool> {
+    use std::cmp::Ordering::*;
+    Ok(match op {
+        "*EQ" => o == Equal,
+        "*NE" => o != Equal,
+        "*GT" => o == Greater,
+        "*LT" => o == Less,
+        "*GE" | "*NL" => o != Less,
+        "*LE" | "*NG" => o != Greater,
+        _ => bail!("Relational operator {op} is not valid."),
+    })
+}
+
+fn is_numeric(file: &crate::dds::PhysicalFile, name: &str) -> Result<bool> {
+    file.fields
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case(name))
+        .map(|f| f.data_type.is_numeric())
+        .ok_or_else(|| anyhow!("Field {name} is not in the record format of the from-file."))
+}
+
+/// A key bound of FROMKEY or TOKEY: the values of the first key fields.
+/// `(n 'value')` with one key field, or `(*BLDKEY (v1 v2...))` (each value
+/// one key field).
+fn key_bound(cmd: &Command, kw: &str) -> Result<Option<Vec<String>>> {
+    let parts = cmd.list(kw);
+    let joined = parts.join(" ");
+    let w = words(&joined);
+    match w.first().map(|s| s.to_ascii_uppercase()).as_deref() {
+        None | Some("*NONE") => Ok(None),
+        Some("*BLDKEY") => {
+            let rest: Vec<String> = w[1..]
+                .iter()
+                .flat_map(|x| words(x))
+                .map(|x| unquote(&x))
+                .collect();
+            Ok(Some(rest))
+        }
+        Some(n) => {
+            let count: usize = n.parse().map_err(|_| {
+                crate::cl::value_error(&format!("{kw}: {n} is not a number of key fields."))
+            })?;
+            let v = w.get(1).map(|x| unquote(x)).unwrap_or_default();
+            if count != 1 {
+                bail!("{kw}: give a value for more than one key field with *BLDKEY; a key value string over several fields is not supported.");
+            }
+            Ok(Some(vec![v]))
+        }
+    }
+}
+
+/// The records CPYF copies: FROMKEY to TOKEY, INCCHAR, INCREL, NBRRCDS.
+fn select(
+    file: &crate::dds::PhysicalFile,
+    cmd: &Command,
+    rrns: Vec<i64>,
+    records: Vec<rla::Record>,
+) -> Result<(Vec<i64>, Vec<rla::Record>)> {
+    let from_key = key_bound(cmd, "FROMKEY")?;
+    let to_key = key_bound(cmd, "TOKEY")?;
+    if (from_key.is_some() || to_key.is_some()) && file.keys.is_empty() {
+        bail!(
+            "FROMKEY and TOKEY need a keyed from-file; {} has no key.",
+            file.name
+        );
+    }
+    let get = |r: &rla::Record, name: &str| -> String {
+        r.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    let key_cmp = |r: &rla::Record, bound: &[String]| -> Result<std::cmp::Ordering> {
+        for (k, v) in file.keys.iter().zip(bound) {
+            let o = compare(is_numeric(file, k)?, &get(r, k), v)?;
+            let o = if file.descending.iter().any(|d| d.eq_ignore_ascii_case(k)) {
+                o.reverse()
+            } else {
+                o
+            };
+            if o != std::cmp::Ordering::Equal {
+                return Ok(o);
+            }
+        }
+        Ok(std::cmp::Ordering::Equal)
+    };
+    // INCCHAR(field|*RCD position operator value).
+    let incchar = {
+        let w = words(&cmd.list("INCCHAR").join(" "));
+        match w.first().map(|s| s.to_ascii_uppercase()).as_deref() {
+            None | Some("*NONE") => None,
+            Some(f) => {
+                if w.len() < 4 {
+                    bail!("INCCHAR needs a field (or *RCD), a position, an operator and a value.");
+                }
+                let pos: usize = w[1]
+                    .parse()
+                    .map_err(|_| anyhow!("INCCHAR position {} is not a number.", w[1]))?;
+                Some((
+                    f.to_string(),
+                    pos.max(1),
+                    w[2].to_ascii_uppercase(),
+                    unquote(&w[3]),
+                ))
+            }
+        }
+    };
+    // INCREL((*IF field op value) (*AND|*OR field op value)...): *AND
+    // binds before *OR.
+    let mut increl: Vec<Vec<(String, String, String)>> = Vec::new();
+    for e in cmd.list("INCREL") {
+        let w = words(&e);
+        let Some(first) = w.first().map(|s| s.to_ascii_uppercase()) else {
+            continue;
+        };
+        if first == "*NONE" {
+            break;
+        }
+        if w.len() < 4 {
+            bail!("Each INCREL relation needs *IF, *AND or *OR, a field, an operator and a value.");
+        }
+        let test = (
+            w[1].to_ascii_uppercase(),
+            w[2].to_ascii_uppercase(),
+            unquote(&w[3]),
+        );
+        match first.as_str() {
+            "*IF" | "*OR" => increl.push(vec![test]),
+            "*AND" => match increl.last_mut() {
+                Some(g) => g.push(test),
+                None => increl.push(vec![test]),
+            },
+            other => bail!("{other} is not *IF, *AND or *OR."),
+        }
+    }
+    let nbr = match cmd.get("NBRRCDS").trim().to_ascii_uppercase().as_str() {
+        "" | "*END" => None,
+        n => Some(n.parse::<usize>().map_err(|_| {
+            crate::cl::value_error(&format!("NBRRCDS({n}) is not a number of records or *END."))
+        })?),
+    };
+    let image_text =
+        |r: &rla::Record| -> String { String::from_utf8_lossy(&record_image(file, r)).to_string() };
+    let mut out_rrns = Vec::new();
+    let mut out = Vec::new();
+    for (n, r) in rrns.into_iter().zip(records) {
+        if let Some(b) = &from_key {
+            if key_cmp(&r, b)? == std::cmp::Ordering::Less {
+                continue;
+            }
+        }
+        if let Some(b) = &to_key {
+            if key_cmp(&r, b)? == std::cmp::Ordering::Greater {
+                continue;
+            }
+        }
+        if let Some((f, pos, op, v)) = &incchar {
+            let text: String = if f == "*RCD" {
+                image_text(&r)
+            } else {
+                is_numeric(file, f)?;
+                get(&r, f)
+            };
+            let part: String = text.chars().skip(pos - 1).collect();
+            let ok = if op == "*CT" {
+                part.contains(v.as_str())
+            } else {
+                let head: String = part.chars().take(v.chars().count()).collect();
+                holds(op, head.cmp(v))?
+            };
+            if !ok {
+                continue;
+            }
+        }
+        if !increl.is_empty() {
+            let mut any = false;
+            for g in &increl {
+                let mut all = true;
+                for (f, op, v) in g {
+                    let o = compare(is_numeric(file, f)?, &get(&r, f), v)?;
+                    if !holds(op, o)? {
+                        all = false;
+                        break;
+                    }
+                }
+                if all {
+                    any = true;
+                    break;
+                }
+            }
+            if !any {
+                continue;
+            }
+        }
+        out_rrns.push(n);
+        out.push(r);
+        if nbr.is_some_and(|m| out.len() >= m) {
+            break;
+        }
+    }
+    Ok((out_rrns, out))
 }
 
 #[cfg(test)]

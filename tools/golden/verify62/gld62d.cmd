@@ -1,0 +1,7 @@
+             CMD        PROMPT('verify62 DEP')
+             PARM       KWD(TYPE) TYPE(*CHAR) LEN(5) DFT(*DTA)
+             PARM       KWD(FILE) TYPE(*NAME)
+             PARM       KWD(A) TYPE(*CHAR) LEN(1)
+             PARM       KWD(B) TYPE(*CHAR) LEN(1)
+             DEP        CTL(&TYPE *EQ *FILE) PARM(FILE)
+             DEP        CTL(*ALWAYS) PARM(A B) NBRTRUE(*LE 1)

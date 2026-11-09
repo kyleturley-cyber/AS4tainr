@@ -105,6 +105,8 @@ struct Active {
     table_cur: HashMap<String, i128>,
     var_elems: HashMap<String, u32>,
     shared: HashMap<String, Vec<u8>>,
+    /// Its printer files, still open (their spooled files go on).
+    printers: HashMap<String, Printer>,
 }
 
 /// Programs active in each job's activation groups: (job, group,
@@ -180,7 +182,18 @@ pub fn end_programs(job: &str, groups: &crate::ile::Groups) -> usize {
     if let Ok(mut g) = PROGRAMS.lock() {
         if let Some(m) = g.as_mut() {
             let before = m.len();
-            m.retain(|(j, grp, _), _| !(j == job && groups.covers(grp)));
+            // Their printer files' spooled files are complete.
+            let mut ended = Vec::new();
+            m.retain(|(j, grp, _), a| {
+                let end = j == job && groups.covers(grp);
+                if end {
+                    ended.extend(a.printers.values().filter_map(|p| p.spl));
+                }
+                !end
+            });
+            if let Ok(mut e) = ENDED_SPOOLS.lock() {
+                e.extend(ended);
+            }
             n = before - m.len();
         }
     }
@@ -3969,9 +3982,10 @@ impl<'a> Machine<'a> {
                 };
                 if code == "XML-INTO" {
                     if matches!(&target, Expr::Bif(b, _) if b == "HANDLER") {
-                        bail!("XML-INTO %HANDLER is not supported yet");
+                        self.xml_into_handler(&target, &arg("XML").unwrap_or_default())?;
+                    } else {
+                        self.xml_into(&target, &arg("XML").unwrap_or_default())?;
                     }
-                    self.xml_into(&target, &arg("XML").unwrap_or_default())?;
                 } else {
                     self.data_into(&target, &arg("DATA").unwrap_or_default(), &arg("PARSER"))?;
                 }
@@ -4673,6 +4687,7 @@ impl<'a> Machine<'a> {
                 if let Ok(mut s) = self.io.shared.lock() {
                     s.extend(a.shared);
                 }
+                self.printers = a.printers;
                 self.sql.restore(&key);
                 self.reactivated = true;
                 // RT or RETURN ended it: the next cycle starts afresh.
@@ -4810,7 +4825,21 @@ impl<'a> Machine<'a> {
             }
         }
         self.share_out();
-        let closed = self.close_printers();
+        // A program that stays active (no LR) keeps its printer files
+        // open: the next call prints on to the same spooled file (ILE RPG
+        // Reference: files stay open until LR, or the activation group
+        // ends). Their lines are written out now.
+        let stays = r.is_ok()
+            && (prog.main.is_some() || !self.ind("LR"))
+            && !self.io.actgrp.starts_with("*NEW")
+            && !self.io.program.starts_with("*NONE/");
+        let closed = if stays {
+            let mut names: Vec<String> = self.printers.keys().cloned().collect();
+            names.sort();
+            names.iter().try_for_each(|n| self.flush_printer(n))
+        } else {
+            self.close_printers()
+        };
         for f in self.files.iter_mut() {
             if let Some(o) = f.open.as_mut() {
                 let _ = self.io.rt.block_on(o.release(self.io.client));
@@ -4862,12 +4891,18 @@ impl<'a> Machine<'a> {
                 table_cur: self.table_cur.clone(),
                 var_elems: self.var_elems.clone(),
                 shared: self.io.shared.lock().map(|s| s.clone()).unwrap_or_default(),
+                printers: std::mem::take(&mut self.printers),
             };
             self.sql.keep(key.clone());
             if let Ok(mut g) = PROGRAMS.lock() {
                 g.get_or_insert_with(HashMap::new).insert(key, a);
             }
         } else {
+            // Not kept after all (an error after the printers were
+            // written out): they close now.
+            if !self.printers.is_empty() {
+                self.close_printers()?;
+            }
             let opened: Vec<OpenFile> = self
                 .files
                 .iter_mut()
@@ -7718,6 +7753,93 @@ impl<'a> Machine<'a> {
     /// Call a procedure of this program: a new frame of local storage,
     /// parameters by reference as aliases, its calculations, its return
     /// value in its return type.
+    /// XML-INTO %HANDLER (ILE RPG Reference): the handler procedure's
+    /// second parameter, an array passed by reference: its name, number of
+    /// elements, bytes in all and initial bytes.
+    pub(super) fn handler_items(&self, proc: &str) -> Result<(String, u32, Vec<u8>)> {
+        let pi = self.prog.procs.get(proc).ok_or_else(|| {
+            anyhow!("%HANDLER({proc}): the handler must be a procedure of this module")
+        })?;
+        if pi.params.len() < 3 {
+            bail!("%HANDLER({proc}): the handler needs a communication area, an array and a number of elements");
+        }
+        let p = &pi.params[1];
+        let b = p.buf.ok_or_else(|| {
+            anyhow!("%HANDLER({proc}): the array parameter must be passed by reference")
+        })?;
+        let dim = match pi.syms.get(&p.name) {
+            Some(Sym::Ds(d)) => d.dim,
+            Some(Sym::Var(v)) => v.dim,
+            _ => 0,
+        };
+        if dim == 0 {
+            bail!("%HANDLER({proc}): the second parameter must be an array (DIM)");
+        }
+        Ok((p.name.clone(), dim, pi.frame[b].clone()))
+    }
+
+    /// Run `fill` with the handler's frame on the stack, its array
+    /// parameter over `buf` (so names resolve to the handler's parameter).
+    pub(super) fn in_handler_frame<R>(
+        &mut self,
+        proc: &str,
+        buf: usize,
+        fill: impl FnOnce(&mut Self) -> Result<R>,
+    ) -> Result<R> {
+        let prog: &'a Program = self.prog;
+        let pi = prog
+            .procs
+            .get(proc)
+            .ok_or_else(|| anyhow!("%HANDLER({proc}): no such procedure"))?;
+        let b = pi.params[1].buf.unwrap_or(0);
+        let base = self.bufs.len();
+        let mut alias = HashMap::new();
+        alias.insert(b, (buf, 0));
+        self.bufs.extend(pi.frame.iter().cloned());
+        self.frames.push(Frame {
+            proc: pi,
+            base,
+            alias,
+            passed: 0,
+            omitted: vec![],
+            files: HashMap::new(),
+            lengths: vec![],
+        });
+        let r = fill(self);
+        self.frames.pop();
+        self.bufs.truncate(base);
+        r
+    }
+
+    /// Call the handler: its communication area, the array in `buf`, the
+    /// number of elements filled. Its return value (0: go on).
+    pub(super) fn call_handler(
+        &mut self,
+        proc: &str,
+        comm: &Expr,
+        buf: usize,
+        count: usize,
+    ) -> Result<i64> {
+        let prog: &'a Program = self.prog;
+        let pi = prog
+            .procs
+            .get(proc)
+            .ok_or_else(|| anyhow!("%HANDLER({proc}): no such procedure"))?;
+        let mut args = self.args_for(proc, &pi.params[..1], std::slice::from_ref(comm))?;
+        args.push(Arg::Ref(Loc {
+            buf,
+            off: 0,
+            size: self.bufs[buf].len(),
+            dtype: pi.params[1].dtype,
+        }));
+        args.push(Arg::Val(Value::Num(Dec::from_i64(count as i64))));
+        let r = self.call_proc(pi, args)?;
+        Ok(match r {
+            Some(Value::Num(n)) => n.trunc().to_string().parse().unwrap_or(0),
+            _ => 0,
+        })
+    }
+
     fn call_proc(&mut self, pi: &'a ProcInfo, args: Vec<Arg>) -> Result<Option<Value>> {
         if self.frames.len() > 1000 {
             bail!("procedure {}: calls are nested too deeply", pi.name);
@@ -8669,11 +8791,21 @@ impl Machine<'_> {
         Ok(match f.edit_code {
             Some(c) => edit_code_with(&value, digits, decs, c, self.prog.decedit()),
             None => {
-                // No edit code: every digit, a minus sign after a
-                // negative number.
-                let d = value.rescale(decs as u8, false).unwrap_or(value);
-                let raw = format!("{:0>w$}", d.mantissa().unsigned_abs(), w = digits as usize);
-                format!("{raw}{}", if d.is_negative() { "-" } else { "" })
+                // No edit code: the zoned digits as they are, a negative
+                // number's sign in the zone of its last digit (ILE RPG
+                // Reference, output specifications: no edit code prints
+                // the field unedited; as edit code X does, PUB400,
+                // tools/golden/rpg-sql.txt: -1234.56 in 9,2 is 00012345O).
+                let t = DType::Zoned(digits, decs);
+                let mut b = t.initial();
+                data::store(
+                    &t,
+                    &Value::Num(value),
+                    &mut b,
+                    Fit::Truncate { half_adjust: false },
+                    false,
+                )?;
+                a(&b)
             }
         })
     }

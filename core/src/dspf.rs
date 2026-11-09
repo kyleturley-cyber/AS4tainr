@@ -76,6 +76,13 @@ pub enum Keyword {
     SflMsgKey,
     /// SFLPGMQ(length): the field names a program message queue.
     SflPgmQ(u16),
+    /// SFLRCDNBR on a control record field: the page with the subfile
+    /// record of that number is shown first; `top` (*TOP) puts the record
+    /// first on the page; `cursor` (CURSOR) puts the cursor on it.
+    SflRcdNbr {
+        top: bool,
+        cursor: bool,
+    },
     /// PAGEDOWN/ROLLUP: return to the program when paging past the last record.
     PageDown(Option<u8>),
     /// PAGEUP/ROLLDOWN: return to the program when paging before the first record.
@@ -429,6 +436,16 @@ fn to_keyword(name: &str, args: &[String]) -> Result<Keyword> {
                 .ok_or_else(|| anyhow::anyhow!("SFLMSGRCD needs a line number"))?,
         ),
         "SFLMSGKEY" => Keyword::SflMsgKey,
+        "SFLRCDNBR" => Keyword::SflRcdNbr {
+            top: args
+                .iter()
+                .flat_map(|a| a.split_whitespace())
+                .any(|a| a.eq_ignore_ascii_case("*TOP")),
+            cursor: args
+                .iter()
+                .flat_map(|a| a.split_whitespace())
+                .any(|a| a.eq_ignore_ascii_case("CURSOR")),
+        },
         "SFLPGMQ" => Keyword::SflPgmQ(
             args.first()
                 .and_then(|a| a.trim().parse().ok())

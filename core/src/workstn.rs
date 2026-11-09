@@ -17,8 +17,9 @@
 //!   the operator changed, in record number order, plus records written or
 //!   updated with SFLNXTCHG on.
 //!
-//! Not supported yet (see docs/fidelity-gaps.md): SFLRCDNBR, SFLINZ,
-//! SFLFOLD/SFLDROP, message subfiles, READ of a display file.
+//! Not supported yet (see docs/fidelity-gaps.md): SFLRNA,
+//! SFLFOLD/SFLDROP, READ of a display file (message subfiles are filled
+//! by the RPG engine, rpg/interp.rs `message_subfile`).
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{BTreeMap, HashMap};
@@ -176,6 +177,36 @@ impl Workstation {
                 sub.records.clear();
                 sub.readc_from = 0;
                 sub.current = None;
+            }
+            // SFLINZ (DDS reference): the subfile starts again with SFLSIZ
+            // records, character fields blank and numeric fields zero
+            // (SFLRNA, records not active, is not done).
+            if rec.active(&ind, |k| matches!(k, Keyword::SflInz)) {
+                let size = rec.sflsiz();
+                let sflrec = record(file, sfl)?;
+                let blank: BTreeMap<String, String> = sflrec
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        let v = if f.is_numeric() { "0" } else { "" };
+                        (f.name.clone(), v.to_string())
+                    })
+                    .collect();
+                let sub = self.subfile(file, sfl);
+                sub.records.clear();
+                sub.readc_from = 0;
+                sub.current = None;
+                for n in 1..=size {
+                    sub.records.insert(
+                        n,
+                        SflRecord {
+                            values: blank.clone(),
+                            ind: [false; 100],
+                            next_change: false,
+                            changed: false,
+                        },
+                    );
+                }
             }
             let shows = rec.active(&ind, |k| matches!(k, Keyword::SflDspCtl | Keyword::SflDsp));
             if !shows {
@@ -483,6 +514,8 @@ pub struct Interaction<'a> {
     /// Field in error: (subfile record number or None for the control
     /// record, field name).
     error: Option<(Option<u16>, String)>,
+    /// SFLRCDNBR(CURSOR): the subfile record the cursor goes to.
+    cursor_rrn: Option<u16>,
 }
 
 pub enum Step {
@@ -499,13 +532,43 @@ impl<'a> Interaction<'a> {
             .layers
             .last()
             .expect("a frame has the record being read");
+        // SFLRCDNBR (DDS reference): the control record's field gives the
+        // subfile record whose page is shown first, or (*TOP) the record
+        // that starts the page; a number not in the subfile shows the
+        // first page.
+        let mut top = 0;
+        let mut cursor_rrn = None;
+        if let Some(sf) = &frame.subfile {
+            let rec = active.record();
+            let pag = (rec.sflpag() as usize).max(1);
+            for f in &rec.fields {
+                let Some((at_top, at_cursor)) = f.keywords.iter().find_map(|k| match k.kw {
+                    Keyword::SflRcdNbr { top, cursor } => Some((top, cursor)),
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                let n: u16 = active
+                    .values
+                    .get(&f.name)
+                    .and_then(|v| v.trim().split('.').next()?.trim().parse::<u16>().ok())
+                    .unwrap_or(0);
+                if let Some(i) = sf.rows.iter().position(|r| r.rrn == n) {
+                    top = if at_top { i } else { i / pag * pag };
+                    if at_cursor {
+                        cursor_rrn = Some(n);
+                    }
+                }
+            }
+        }
         Self {
             frame,
-            top: 0,
+            top,
             ctl_values: active.values.clone(),
             edits: BTreeMap::new(),
             message: None,
             error: None,
+            cursor_rrn,
         }
     }
 
@@ -594,6 +657,17 @@ impl<'a> Interaction<'a> {
                     );
                     if cursor.is_none() {
                         cursor = d.cursor;
+                    }
+                    // SFLRCDNBR(CURSOR) (DDS reference): the cursor on the
+                    // record's first input field, unless a field asked for
+                    // it (DSPATR(PC), an error).
+                    if cursor.is_none() && self.cursor_rrn == Some(row.rrn) {
+                        cursor = sflrec
+                            .fields
+                            .iter()
+                            .filter(|f| matches!(f.usage, dspf::Usage::Input | dspf::Usage::Both))
+                            .find_map(|f| f.pos)
+                            .map(|(l, c)| (l + i as u8 * height, c));
                     }
                     if message.is_none() {
                         message = d.message;
@@ -1050,5 +1124,86 @@ mod tests {
             panic!()
         };
         assert_eq!(resp.indicators.get(&40), Some(&false));
+    }
+
+    // IBM DDS reference (SFLRCDNBR): a hidden control record field with
+    // SFLRCDNBR shows the page holding that subfile record first; with
+    // *TOP that record starts the page; a number not in the subfile shows
+    // the first page.
+    #[test]
+    fn sflrcdnbr_chooses_the_first_page_shown() {
+        let dds = CUSTWRKD.replace(
+            "     A                                      SFLDSPCTL\n",
+            "     A                                      SFLDSPCTL\n     A            RCDNBR         4S 0H      SFLRCDNBR\n",
+        );
+        let top_dds = dds.replace("SFLRCDNBR", "SFLRCDNBR(*TOP)");
+        for (src, n, first) in [
+            (&dds, "6", "Customer 5"),
+            (&dds, "99", "Customer 1"),
+            (&top_dds, "6", "Customer 6"),
+        ] {
+            let f = Arc::new(dspf::parse("CUSTWRKD", src).unwrap());
+            let mut ws = Workstation::new();
+            load(&mut ws, &f, 9);
+            let fr = ws
+                .frame(&f, "CUSTCTL", vals(&[("RCDNBR", n)]), ind(&[31]))
+                .unwrap();
+            let it = Interaction::new(&fr);
+            let t = text(&it.screen(&ctx()));
+            let shown = (1..=9)
+                .map(|i| format!("Customer {i} "))
+                .find(|c| t.contains(c.as_str()))
+                .unwrap();
+            assert_eq!(shown.trim(), first, "{n}");
+        }
+    }
+
+    // IBM DDS reference (SFLINZ): writing the control record with SFLINZ
+    // on starts the subfile again with SFLSIZ records, character fields
+    // blank and numeric fields zero.
+    #[test]
+    fn sflinz_fills_the_subfile() {
+        let dds = CUSTWRKD.replace(
+            "     A                                      SFLDSPCTL\n",
+            "     A                                      SFLDSPCTL\n     A  34                                  SFLINZ\n",
+        );
+        let f = Arc::new(dspf::parse("CUSTWRKD", &dds).unwrap());
+        let mut ws = Workstation::new();
+        load(&mut ws, &f, 3);
+        ws.write(&f, "CUSTCTL", BTreeMap::new(), ind(&[34]))
+            .unwrap();
+        let fr = ws
+            .frame(&f, "CUSTCTL", BTreeMap::new(), ind(&[31]))
+            .unwrap();
+        let sf = fr.subfile.unwrap();
+        assert_eq!(sf.rows.len(), 50);
+        assert_eq!(
+            sf.rows[0].values.get("CUSNAM").map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            sf.rows[0].values.get("CUSNO").map(String::as_str),
+            Some("0")
+        );
+    }
+
+    // IBM DDS reference (SFLRCDNBR(CURSOR)): the cursor goes to the
+    // record's first input field.
+    #[test]
+    fn sflrcdnbr_cursor() {
+        let dds = CUSTWRKD.replace(
+            "     A                                      SFLDSPCTL\n",
+            "     A                                      SFLDSPCTL\n     A            RCDNBR         4S 0H      SFLRCDNBR(CURSOR *TOP)\n",
+        );
+        let f = Arc::new(dspf::parse("CUSTWRKD", &dds).unwrap());
+        let mut ws = Workstation::new();
+        load(&mut ws, &f, 9);
+        let fr = ws
+            .frame(&f, "CUSTCTL", vals(&[("RCDNBR", "6")]), ind(&[31]))
+            .unwrap();
+        let it = Interaction::new(&fr);
+        assert_eq!(it.top(), 5);
+        // OPT of the first record on the page: line 7, column 3.
+        assert_eq!(it.screen(&ctx()).cursor(), Some((7, 3)));
     }
 }

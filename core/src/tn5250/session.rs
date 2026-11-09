@@ -1823,6 +1823,24 @@ async fn sql_session(term: &mut Term, job: &mut Job<'_>) -> Result<()> {
             Some(s) => vec![s.clone()],
             None => job.library_list(),
         };
+        // Another job's object lock on a table of the statement: it
+        // waits the job's default wait time, then SQL0913, as RUNSQL
+        // (PUB400, tools/golden/verify56.txt; STRSQL itself not captured).
+        let owner = job.lock_owner().await?;
+        if let Err(e) = crate::objlock::sql_tables_free(
+            job.client,
+            &stmt,
+            &libl,
+            &owner,
+            crate::objlock::default_wait(&job.job_key()),
+        )
+        .await
+        {
+            message = crate::jobs::display_text(&e.to_string());
+            prefill = stmt;
+            log.push(format!("  {message}"));
+            continue;
+        }
         match crate::sql::run_as(
             job.client,
             &job.env.database_url,

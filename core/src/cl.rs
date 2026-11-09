@@ -4916,6 +4916,21 @@ pub static COMMANDS: &[CommandDef] = &[
             p("TORCD", Kind::Text, false, Some("*END"), "Copy to record number")
                 .ch("Number, *END")
                 .keyword_only(),
+            p("FROMKEY", Kind::List, false, Some("*NONE"), "Copy from key value")
+                .ch("Number of key fields and value, *BLDKEY, *NONE")
+                .keyword_only(),
+            p("TOKEY", Kind::List, false, Some("*NONE"), "Copy to key value")
+                .ch("Number of key fields and value, *BLDKEY, *NONE")
+                .keyword_only(),
+            p("NBRRCDS", Kind::Text, false, Some("*END"), "Number of records to copy")
+                .ch("Number, *END")
+                .keyword_only(),
+            p("INCCHAR", Kind::List, false, Some("*NONE"), "Include records by character test")
+                .ch("Field, *RCD, *FLD; position; *EQ, *GT, *LT, *NE, *GE, *NL, *LE, *NG, *CT; value")
+                .keyword_only(),
+            p("INCREL", Kind::List, false, Some("*NONE"), "Include records by field test")
+                .ch("*IF, *AND, *OR; field; *EQ, *GT, *LT, *NE, *GE, *NL, *LE, *NG; value")
+                .keyword_only(),
             p("PRINT", Kind::List, false, Some("*NONE"), "Print format")
                 .ch("*NONE, *COPIED, *EXCLD")
                 .keyword_only(),

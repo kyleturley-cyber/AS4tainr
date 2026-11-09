@@ -159,11 +159,18 @@ pub fn analyze(source: &str, known: &dyn Fn(&str) -> bool, file_vars: &FileVars)
         // more (CRTBNDCL on PUB400, 2026-11-06, tools/golden/verify61.txt
         // d61_dclf: `DCLF AS4TRAINR1/      FILE(GLD61D)`).
         if let Some(p) = st.params.iter().find(|p| {
+            // A library name and the slash: not a special value or
+            // anything else that happens to end with one (`ENDPGM */`,
+            // as the Nick Litten corpus's IASP has it, compiles).
             p.keyword.is_none()
-                && p.value.len() > 1
-                && p.value.ends_with('/')
-                && !p.value.starts_with('\'')
-                && !p.value.contains(['(', '\''])
+                && p.value.strip_suffix('/').is_some_and(|lib| {
+                    !lib.is_empty()
+                        && lib.len() <= 10
+                        && lib.starts_with(|c: char| c.is_ascii_alphabetic() || "$#@".contains(c))
+                        && lib
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "$#@_.".contains(c))
+                })
         }) {
             a.diags.push(Diag {
                 line: *line,
@@ -854,5 +861,14 @@ mod tests {
             .collect();
         assert_eq!(ids, [(2, "CPD0011", 30)]);
         assert!(a.vars.is_empty());
+    }
+
+    /// `ENDPGM */` (a comment start left after ENDPGM): no CPD0011, the
+    /// program is created (the Nick Litten corpus's IASP).
+    #[test]
+    fn slash_value_that_is_not_a_library() {
+        let src = "PGM\n  SNDPGMMSG MSG('x')\nENDPGM */\n";
+        let a = analyze(src, &|c| c == "SNDPGMMSG", &|_| vec![]);
+        assert!(a.diags.iter().all(|d| d.id != "CPD0011"), "{:?}", a.diags);
     }
 }

@@ -75,6 +75,30 @@ pub struct Definition {
     /// TEXT, ALLOW), applied over CRTCMD's.
     #[serde(skip)]
     pub statement: BTreeMap<String, String>,
+    /// DEP statements: relations between parameters checked before the
+    /// command runs.
+    #[serde(default)]
+    pub deps: Vec<Dep>,
+}
+
+/// A DEP statement (CL reference, "Dependent (DEP)"): when CTL holds, the
+/// PARM tests must hold as NBRTRUE says; else MSGID (or as4tainr's text).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Dep {
+    /// None: *ALWAYS.
+    pub ctl: Option<DepTest>,
+    pub parms: Vec<DepTest>,
+    /// None: *ALL; else (operator, number).
+    pub nbrtrue: Option<(String, u32)>,
+    pub msgid: Option<String>,
+}
+
+/// A keyword given (`KWD`), or a relation (`&KWD *EQ value`, the value a
+/// constant or another `&KWD`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DepTest {
+    pub kwd: String,
+    pub rel: Option<(String, String)>,
 }
 
 /// The ELEM or QUAL statements under one label.
@@ -675,9 +699,68 @@ pub fn compile(library: &str, name: &str, pgm: &str, source: &str) -> Result<Def
                 }
                 l.items.push(p);
             }
-            // Dependencies and prompt control are kept out: as4tainr
-            // checks values, not relations between parameters.
-            "DEP" | "PMTCTL" => {}
+            "DEP" => {
+                let p = named(&st, &["CTL", "PARM", "NBRTRUE", "MSGID"])?;
+                let test = |t: &str| -> Result<DepTest> {
+                    let words: Vec<String> = raw_items(t)?
+                        .iter()
+                        .flat_map(|i| i.elements())
+                        .map(|i| i.text())
+                        .collect();
+                    let kwd = words
+                        .first()
+                        .map(|w| w.trim_start_matches('&').to_ascii_uppercase())
+                        .ok_or_else(|| anyhow!("line {line}: DEP: an empty test"))?;
+                    let rel = match words.len() {
+                        1 => None,
+                        3 => Some((words[1].to_ascii_uppercase(), words[2].clone())),
+                        _ => bail!("line {line}: DEP: {t} is not a keyword or a relation"),
+                    };
+                    Ok(DepTest { kwd, rel })
+                };
+                let ctl = match p.get("CTL").map(|c| c.trim()) {
+                    None | Some("*ALWAYS") | Some("") => None,
+                    Some(c) => Some(test(c)?),
+                };
+                let mut parms = Vec::new();
+                for it in raw_items(p.get("PARM").map(String::as_str).unwrap_or(""))? {
+                    parms.push(test(&match it {
+                        Item::List(v) => v.iter().map(|x| x.text()).collect::<Vec<_>>().join(" "),
+                        a => a.text(),
+                    })?);
+                }
+                if parms.is_empty() {
+                    bail!("line {line}: DEP needs PARM");
+                }
+                let nbrtrue = match p.get("NBRTRUE").map(|x| x.trim().to_ascii_uppercase()) {
+                    None => None,
+                    Some(x) if x == "*ALL" || x.is_empty() => None,
+                    Some(x) => {
+                        let w: Vec<&str> = x.split_whitespace().collect();
+                        match w.as_slice() {
+                            [op, n] => Some((
+                                op.to_string(),
+                                n.parse()
+                                    .map_err(|_| anyhow!("line {line}: DEP NBRTRUE: {n} is not a number"))?,
+                            )),
+                            _ => bail!("line {line}: DEP NBRTRUE({x}) is not *ALL or an operator and a number"),
+                        }
+                    }
+                };
+                let msgid = p
+                    .get("MSGID")
+                    .map(|m| m.trim().to_ascii_uppercase())
+                    .filter(|m| !m.is_empty() && m != "*NONE");
+                d.deps.push(Dep {
+                    ctl,
+                    parms,
+                    nbrtrue,
+                    msgid,
+                });
+            }
+            // Prompt control is kept out: the prompter shows every
+            // parameter.
+            "PMTCTL" => {}
             other => bail!("line {line}: {other} is not a command definition statement"),
         }
     }
@@ -855,11 +938,99 @@ pub fn bind<'a>(d: &'a Definition, line: &str) -> Result<Vec<Bound<'a>>> {
             );
         }
     }
-    Ok(d.parms
+    let bound: Vec<Bound<'a>> = d
+        .parms
         .iter()
         .enumerate()
         .map(|(i, p)| (p, vals.remove(&i)))
-        .collect())
+        .collect();
+    check_deps(d, &bound)?;
+    Ok(bound)
+}
+
+/// The DEP statements (CL reference, "Dependent (DEP)"): a keyword test
+/// holds when the parameter was given; a relation compares the
+/// parameter's value (given, else its default) with a constant or another
+/// parameter's value, as numbers when both are numbers.
+fn check_deps(d: &Definition, bound: &[Bound]) -> Result<()> {
+    let value = |kwd: &str| -> Option<String> {
+        bound
+            .iter()
+            .find(|(p, _)| p.kwd == kwd)
+            .and_then(|(p, v)| match v {
+                Some(items) => items.first().map(|i| i.text()),
+                None => p.dft.clone(),
+            })
+    };
+    let given = |kwd: &str| bound.iter().any(|(p, v)| p.kwd == kwd && v.is_some());
+    let holds = |t: &DepTest| -> bool {
+        match &t.rel {
+            None => given(&t.kwd),
+            Some((op, v)) => {
+                let left = value(&t.kwd).unwrap_or_default();
+                let right = match v.strip_prefix('&') {
+                    Some(k) => value(&k.to_ascii_uppercase()).unwrap_or_default(),
+                    None => v.trim_matches('\'').to_string(),
+                };
+                let o = match (
+                    crate::rpg::dec::Dec::parse(left.trim()),
+                    crate::rpg::dec::Dec::parse(right.trim()),
+                ) {
+                    (Ok(a), Ok(b)) => a.cmp(&b),
+                    _ => left
+                        .trim_end()
+                        .to_ascii_uppercase()
+                        .cmp(&right.trim_end().to_ascii_uppercase()),
+                };
+                compare_op(op, o)
+            }
+        }
+    };
+    for dep in &d.deps {
+        if !dep.ctl.as_ref().is_none_or(holds) {
+            continue;
+        }
+        let n = dep.parms.iter().filter(|t| holds(t)).count() as u32;
+        let ok = match &dep.nbrtrue {
+            None => n as usize == dep.parms.len(),
+            Some((op, m)) => compare_op(op, n.cmp(m)),
+        };
+        if !ok {
+            let what: Vec<String> = dep
+                .parms
+                .iter()
+                .map(|t| match &t.rel {
+                    None => t.kwd.clone(),
+                    Some((op, v)) => format!("{} {op} {v}", t.kwd),
+                })
+                .collect();
+            let text = format!(
+                "The parameters of command {} do not meet a dependency between them ({}).",
+                d.name,
+                what.join(", ")
+            );
+            match &dep.msgid {
+                Some(id) => bail!("{id}: {text}\nCPF0006: The command has errors and was not run."),
+                None => bail!("{text}\nCPF0006: The command has errors and was not run."),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A CL relational operator (*EQ, *GT, *LT, *GE, *LE, *NE, *NG, *NL) on an
+/// ordering.
+fn compare_op(op: &str, o: std::cmp::Ordering) -> bool {
+    use std::cmp::Ordering::*;
+    match op.to_ascii_uppercase().as_str() {
+        "*EQ" => o == Equal,
+        "*NE" => o != Equal,
+        "*GT" => o == Greater,
+        "*LT" => o == Less,
+        "*GE" | "*NL" => o != Less,
+        "*LE" | "*NG" => o != Greater,
+        _ => false,
+    }
 }
 
 /// The CL variables that RTNVAL(*YES) parameters name, by parameter
@@ -1786,5 +1957,23 @@ Q1:          QUAL       TYPE(*NAME) LEN(10)
             compile("L", "X", "L/X", "PARM KWD(A)").is_err(),
             "no CMD first"
         );
+    }
+
+    /// DEP (CL reference, "Dependent (DEP)"): CTL(&TYPE *EQ *FILE)
+    /// PARM(FILE) needs FILE when TYPE is *FILE; CTL(*ALWAYS) with
+    /// PARM(A B) NBRTRUE(*LE 1) allows at most one of them; MSGID names
+    /// the message sent when it does not hold.
+    #[test]
+    fn dependencies_between_parameters() {
+        let src = "CMD PROMPT('Dep test')\nPARM KWD(TYPE) TYPE(*CHAR) LEN(5) DFT(*DTA)\nPARM KWD(FILE) TYPE(*NAME)\nPARM KWD(A) TYPE(*CHAR) LEN(1)\nPARM KWD(B) TYPE(*CHAR) LEN(1)\nDEP CTL(&TYPE *EQ *FILE) PARM(FILE) MSGID(USR0001)\nDEP CTL(*ALWAYS) PARM(A B) NBRTRUE(*LE 1)\n";
+        let d = compile("L", "DEPT", "L/P", src).unwrap();
+        assert_eq!(d.deps.len(), 2);
+        assert!(bind(&d, "DEPT TYPE(*DTA)").is_ok());
+        let e = bind(&d, "DEPT TYPE(*FILE)").unwrap_err().to_string();
+        assert!(e.starts_with("USR0001") && e.contains("CPF0006"), "{e}");
+        assert!(bind(&d, "DEPT TYPE(*FILE) FILE(X)").is_ok());
+        assert!(bind(&d, "DEPT A(Y)").is_ok());
+        let e = bind(&d, "DEPT A(Y) B(N)").unwrap_err().to_string();
+        assert!(e.contains("CPF0006") && !e.starts_with("USR"), "{e}");
     }
 }

@@ -12,7 +12,7 @@
 //! element or attribute no subfield takes, ends the operation in status
 //! 00353 unless allowmissing=yes or allowextra=yes.
 //!
-//! %HANDLER is not done; datasubf and countprefix are.
+//! datasubf and countprefix are done; %HANDLER is xml_into_handler.
 
 use super::*;
 
@@ -274,6 +274,100 @@ impl Machine<'_> {
                 .ok_or_else(|| no_match(format!("no element for path {}", o.path.join("/"))))?
         };
         self.xml_fill(&o, node, &lv)
+    }
+
+    /// XML-INTO %HANDLER(procedure : communication area) %XML(document :
+    /// options) (ILE RPG Reference, XML-INTO): the elements the path
+    /// option names (without it, the elements of the handler's array
+    /// parameter's name under the outermost element) go into the
+    /// handler's array parameter as many at a time as it has elements;
+    /// the handler is called with the communication area, the array and
+    /// how many elements were filled, after each full array and for the
+    /// last ones; a handler that returns other than 0 ends the operation.
+    pub(super) fn xml_into_handler(&mut self, handler: &Expr, xml: &[Expr]) -> Result<()> {
+        let Expr::Bif(_, hargs) = handler else {
+            bail!("XML-INTO needs %HANDLER(procedure : communication area)");
+        };
+        if hargs.len() != 2 {
+            bail!("XML-INTO needs %HANDLER(procedure : communication area)");
+        }
+        let proc = match &hargs[0] {
+            Expr::Name { parts, args: None } => parts.join(".").to_ascii_uppercase(),
+            other => bail!("%HANDLER: a procedure is needed, found {other:?}"),
+        };
+        let comm = hargs[1].clone();
+        let (pname, dim, init) = self.handler_items(&proc)?;
+        let doc = self.eval(
+            xml.first()
+                .ok_or_else(|| anyhow!("%XML needs a document"))?,
+        )?;
+        let opts = match xml.get(1) {
+            Some(e) => a(&self.eval(e)?.chars()?),
+            None => String::new(),
+        };
+        let o = XmlOpts::parse(&opts)?;
+        let text = if o.file {
+            let path = a(&doc.chars()?).trim().to_string();
+            self.c_flush();
+            let (bytes, ccsid) = self
+                .block(crate::ifs::read_file(self.io.client, &path))
+                .map_err(|e| anyhow!("RNX0351: The XML document {path} cannot be read: {e:#}."))?;
+            if ccsid == 37 {
+                crate::tn5250::ebcdic::decode(&bytes)
+            } else {
+                String::from_utf8_lossy(&bytes).into_owned()
+            }
+        } else {
+            a(&doc.chars()?)
+        };
+        let popt = roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        };
+        let parsed = roxmltree::Document::parse_with_options(text.trim(), popt)
+            .map_err(|e| anyhow!("RNX0351: The XML document is not valid: {e}."))?;
+        let root = parsed.root_element();
+        let (parents, item): (Vec<roxmltree::Node>, String) = if o.path.is_empty() {
+            (vec![root], pname.clone())
+        } else {
+            let (last, before) = o.path.split_last().unwrap();
+            (self.xml_path(&o, root, before)?, last.clone())
+        };
+        let path_named = !o.path.is_empty();
+        let elems: Vec<roxmltree::Node> = parents
+            .iter()
+            .flat_map(|p| {
+                let v: Vec<roxmltree::Node> = if path_named && o.path.len() == 1 {
+                    vec![*p]
+                } else {
+                    p.children().filter(|c| c.is_element()).collect()
+                };
+                v
+            })
+            .filter(|c| o.matches(c.tag_name().name(), &item, path_named))
+            .collect();
+        let buf = self.bufs.len();
+        self.bufs.push(init.clone());
+        let lv = Lv {
+            parts: vec![pname.clone()],
+            idx: vec![None],
+        };
+        let r = (|| -> Result<()> {
+            for chunk in elems.chunks(dim as usize) {
+                self.bufs[buf].copy_from_slice(&init);
+                for (k, el) in chunk.iter().enumerate() {
+                    let target = lv.with_index(k as i128 + 1);
+                    let el = *el;
+                    self.in_handler_frame(&proc, buf, |m| m.xml_fill(&o, el, &target))?;
+                }
+                if self.call_handler(&proc, &comm, buf, chunk.len())? != 0 {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        self.bufs.truncate(buf);
+        r
     }
 
     /// The elements a path's items lead to (the first item is the

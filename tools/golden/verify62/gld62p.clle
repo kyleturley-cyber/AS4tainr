@@ -1,0 +1,7 @@
+/* verify62: command processing program of GLD62D (does nothing). */
+             PGM        PARM(&TYPE &FILE &A &B)
+             DCL        VAR(&TYPE) TYPE(*CHAR) LEN(5)
+             DCL        VAR(&FILE) TYPE(*CHAR) LEN(10)
+             DCL        VAR(&A) TYPE(*CHAR) LEN(1)
+             DCL        VAR(&B) TYPE(*CHAR) LEN(1)
+             ENDPGM

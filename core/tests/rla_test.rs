@@ -8282,6 +8282,26 @@ async fn rpg_set_and_restore_directives() {
     );
 }
 
+/// XML-INTO %HANDLER (ILE RPG Reference, XML-INTO, "%HANDLER"): the
+/// elements the path names go into the handler's array parameter as many
+/// at a time as it holds; the handler gets the communication area, the
+/// array and how many were filled (here 2 and then 1), and a non-zero
+/// return ends the operation.
+#[tokio::test]
+async fn rpg_xml_into_handler() {
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = "**FREE\nctl-opt dftactgrp(*no);\ndcl-ds itemT qualified template;\n  name char(10);\n  qty packed(5:0);\nend-ds;\ndcl-s total packed(7:0);\ndcl-s calls int(10);\ndcl-s names varchar(30);\ndcl-s stopAt int(10);\ndcl-s xml varchar(500);\nxml = '<order><item><name>a</name><qty>2</qty></item><item><name>b</name><qty>3</qty></item><item><name>c</name><qty>4</qty></item></order>';\nxml-into %handler(take : total) %xml(xml : 'path=order/item');\ndsply (%char(total) + ' ' + %char(calls) + ' ' + names);\ntotal = 0;\ncalls = 0;\nnames = '';\nstopAt = 1;\nxml-into %handler(take : total) %xml(xml : 'path=order/item');\ndsply (%char(total) + ' ' + %char(calls) + ' ' + names);\n*inlr = *on;\ndcl-proc take;\n  dcl-pi *n int(10);\n    tot packed(7:0);\n    items likeds(itemT) dim(2) const;\n    n uns(10) value;\n  end-pi;\n  dcl-s i int(10);\n  calls += 1;\n  for i = 1 to n;\n    tot += items(i).qty;\n    names += %trim(items(i).name);\n  endfor;\n  if stopAt > 0 and calls >= stopAt;\n    return 1;\n  endif;\n  return 0;\nend-proc;\n";
+    let r = run_rpg(&url, &lib, "QSECOFR", "XMLHND", src, None, None).await;
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let m: Vec<String> = r
+        .messages
+        .iter()
+        .map(|m| m.trim_start_matches("DSPLY").trim().to_string())
+        .collect();
+    assert_eq!(m, ["9 2 abc", "5 1 ab"]);
+}
+
 /// XML-INTO (ILE RPG Reference, XML-INTO, "%XML options for the XML-INTO
 /// operation code", "Path option", "Program Status Codes"): a data
 /// structure from the element of its name, subfields from child elements
@@ -26764,4 +26784,134 @@ async fn rpg_in_lock_holds_the_data_area() {
     b.run(&format!("CHGDTAARA DTAARA({lib}/LCKA) VALUE('free')"))
         .await
         .unwrap();
+}
+
+// CPYF's record selection (CL reference, CPYF FROMKEY, TOKEY, NBRRCDS,
+// INCCHAR, INCREL): records of a keyed file from one key value to
+// another; at most NBRRCDS of them; those whose field's characters from a
+// position compare with a value (*CT: contain it); those whose fields
+// pass the INCREL relations (*AND before *OR).
+#[tokio::test]
+async fn copy_file_selects_records() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let mut n = 0;
+    let mut copy = |sel: &'static str| {
+        n += 1;
+        let to = format!("SEL{n}");
+        let cmd = format!("CPYF FROMFILE({lib}/CUSTMAST) TOFILE({lib}/{to}) CRTFILE(*YES) {sel}");
+        (cmd, to)
+    };
+    let cases: Vec<(&str, Vec<&str>)> = vec![
+        ("FROMKEY(1 2) TOKEY(1 4)", vec!["2", "3", "4"]),
+        ("FROMKEY(*BLDKEY (2)) NBRRCDS(2)", vec!["2", "3"]),
+        (
+            "INCREL((*IF CUSBAL *GT 0) (*AND CUSCTY *NE 'Chicago') (*OR CUSNO *EQ 5))",
+            vec!["1", "4", "5"],
+        ),
+        ("INCCHAR(CUSNAM 1 *EQ 'P')", vec!["4"]),
+        ("INCCHAR(CUSNAM 1 *CT 'Supply')", vec!["3"]),
+    ];
+    for (sel, want) in cases {
+        let (cmd, to) = copy(sel);
+        job.run(&cmd)
+            .await
+            .unwrap_or_else(|e| panic!("{cmd}: {e:#}"));
+        let got: Vec<String> = client
+            .query(
+                &format!(
+                    "SELECT cusno::text FROM {}.{} ORDER BY rrn",
+                    catalog::ident(&lib),
+                    to.to_ascii_lowercase()
+                ),
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        assert_eq!(got, want, "{sel}");
+    }
+    let e = job
+        .run(&format!(
+            "CPYF FROMFILE({lib}/CUSTMAST) TOFILE({lib}/SELX) CRTFILE(*YES) INCREL((*IF NOFIELD *EQ 1))"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("CPF2817"), "{e}");
+}
+
+// A program that returns without LR stays active with its printer file
+// open: the next call prints on to the same spooled file, which is
+// complete (RDY) when the program ends with LR (ILE RPG Reference: files
+// stay open until LR is on or the activation group ends).
+#[tokio::test]
+async fn printer_stays_open_while_the_program_is_active() {
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let id = as4tainr_core::jobs::start_interactive(
+        &client,
+        &format!("P{}", &lib[1..]),
+        "QSECOFR",
+        None,
+        std::slice::from_ref(&lib),
+    )
+    .await
+    .unwrap();
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: Some(id.clone()),
+        calls: Default::default(),
+    };
+    let src = "     FQSYSPRT   O    F  132        PRINTER\n     D mode            S              1\n     C     *ENTRY        PLIST\n     C                   PARM                    mode\n     C                   EXCEPT    LINE\n     C                   IF        mode = 'L'\n     C                   EVAL      *INLR = *ON\n     C                   ENDIF\n     C                   RETURN\n     OQSYSPRT   E            LINE           1\n     O                       mode                 5\n";
+    let path = format!("/tmp/{}prt.rpgle", lib.to_ascii_lowercase());
+    as4tainr_core::ifs::write_file(&client, &path, src.as_bytes(), 819, 0o644, "QSECOFR")
+        .await
+        .unwrap();
+    job.run(&format!(
+        "CRTBNDRPG PGM({lib}/PRTA) SRCSTMF('{path}') DFTACTGRP(*NO) ACTGRP(PRTG)"
+    ))
+    .await
+    .unwrap();
+    for m in ["A", "B", "L"] {
+        job.run(&format!("CALL PGM({lib}/PRTA) PARM('{m}')"))
+            .await
+            .unwrap();
+    }
+    let rows = client
+        .query(
+            "SELECT s.status, string_agg(trim(l.text), ',' ORDER BY l.seq)
+               FROM as4tainr.spooled_files s JOIN as4tainr.spool_lines l ON l.spl = s.id
+              WHERE s.job = $1 AND s.file = 'QSYSPRT' GROUP BY s.id, s.status",
+            &[&(id.number as i64)],
+        )
+        .await
+        .unwrap();
+    let got: Vec<(String, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(got, [("RDY".to_string(), "A,B,L".to_string())]);
 }

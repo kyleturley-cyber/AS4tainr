@@ -250,6 +250,11 @@ impl Screen {
         self
     }
 
+    /// Where the cursor was put (None: the first input field).
+    pub fn cursor(&self) -> Option<(u8, u8)> {
+        self.cursor
+    }
+
     /// Put the cursor at a position (default: the first input field).
     pub fn cursor_at(&mut self, row: u8, col: u8) -> &mut Self {
         self.cursor = Some((row, col));

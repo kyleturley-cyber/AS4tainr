@@ -1,0 +1,9 @@
+# Golden (batch 11): SUM and AVG result types and values (decimal,
+# integer, zoned, smallint), arithmetic inside larger expressions, a
+# view's column in arithmetic, CREATE TABLE AS with an unnamed column.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify71.txt -Files tools\golden\verify71
+r71_cleanup|!for c in "DLTF FILE(AS4TRAINR1/GLD71V)" "DLTF FILE(AS4TRAINR1/GLD71U)" "DLTF FILE(AS4TRAINR1/GLD71T)"; do system -q "$c"; done; echo cleaned
+r71_tag|!setccsid 819 /home/AS4TRAINR/gld/mp71.jsonl; ls /home/AS4TRAINR/gld | grep mp71
+r71_make|!system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD71T (I INTEGER, S SMALLINT, C CHAR(5), V VARCHAR(10), D DECIMAL(7, 2), Z NUMERIC(5, 0))') COMMIT(*NONE)"; system "RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD71T VALUES (1, 2, ''ab'', ''cd'', 100.25, 3), (2, 5, ''x'', ''e'', -7.10, -4), (4, 1, ''zz'', ''a'', 0.01, 10)') COMMIT(*NONE)"; system "RUNSQL SQL('CREATE VIEW AS4TRAINR1/GLD71V (X) AS SELECT D FROM AS4TRAINR1/GLD71T') COMMIT(*NONE)"
+r71_mapepire|!cd /home/AS4TRAINR && while IFS= read -r l; do printf '%s\n' "$l"; sleep 2; done < /home/AS4TRAINR/gld/mp71.jsonl | env QIBM_JAVA_STDIO_CONVERT=N QIBM_PASE_DESCRIPTOR_STDIO=B QIBM_USE_DESCRIPTOR_STDIO=Y QIBM_MULTI_THREADED=Y /QOpenSys/QIBM/ProdData/JavaVM/jdk80/64bit/bin/java -Djdbc.db2.restricted.local.connection.only=true -Dos400.stdio.convert=N -jar /QOpenSys/pkgs/lib/mapepire/mapepire-server.jar --single
+r71_end|!for c in "DLTF FILE(AS4TRAINR1/GLD71V)" "DLTF FILE(AS4TRAINR1/GLD71U)" "DLTF FILE(AS4TRAINR1/GLD71T)"; do system -q "$c"; done; echo cleaned

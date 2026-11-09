@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 58";
+const VERSION: &str = "as4tainr services 59";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -1964,7 +1964,9 @@ SELECT
 /// SYSPARTITIONSTAT) takes the names as CHAR(10) values: unpadded names
 /// shorter than 10 find nothing (PUB400 2026-11-09, verify66-69: no row
 /// for 'GLD68T' or 'GLD69S', though SYSPARTITIONSTAT had GLD69S's members
-/// M1 and M2; Code for IBM i passes RPAD(name, 10)), so as here. It
+/// M1 and M2; Code for IBM i passes RPAD(name, 10)); padded or CHAR(10)
+/// names find the file, in upper case only (verify70 q70_mapepire
+/// "ps1"-"ps4"), so as here. It
 /// gives one row per member: a source file's members, with
 /// their type, text, lines and dates; a data file's one member, named as
 /// the file.
@@ -2097,8 +2099,10 @@ RETURNS SETOF qsys2.sysfiles LANGUAGE sql STABLE AS $$
    WHERE s.system_table_schema = upper(rtrim($1)) AND s.system_table_name = upper(rtrim($2))
 $$;
 
-DROP FUNCTION IF EXISTS qsys2.partition_statistics(varchar, varchar);
-CREATE FUNCTION qsys2.partition_statistics(table_schema varchar, table_name varchar)
+DROP FUNCTION IF EXISTS qsys2.partition_statistics(varchar, varchar) CASCADE;
+DROP FUNCTION IF EXISTS qsys2.partition_statistics(text, text) CASCADE;
+DROP FUNCTION IF EXISTS qsys2.partition_statistics(bpchar, bpchar) CASCADE;
+CREATE FUNCTION qsys2.partition_statistics(table_schema text, table_name text)
 RETURNS TABLE (
   table_partition varchar(128),
   system_table_member char(10),
@@ -2225,7 +2229,7 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
          CAST(NULL AS varchar(10))
     FROM as4tainr.source_members m
     LEFT JOIN as4tainr.source_files sf ON sf.library = m.library AND sf.name = m.file
-   WHERE m.library = upper(rtrim($1)) AND m.file = upper(rtrim($2))
+   WHERE m.library = rtrim($1) AND m.file = rtrim($2)
      AND length($1) = 10 AND length($2) = 10
   UNION ALL
   SELECT CAST(o.name AS varchar(128)),
@@ -2294,8 +2298,76 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
     FROM as4tainr.objects o
     JOIN qsys2.sysfiles f ON f.system_table_schema = o.library AND f.system_table_name = o.name
    WHERE o.objtype = '*FILE' AND f.file_type = 'DATA'
-     AND o.library = upper(rtrim($1)) AND o.name = upper(rtrim($2))
+     AND o.library = rtrim($1) AND o.name = rtrim($2)
      AND length($1) = 10 AND length($2) = 10
+$$;
+-- CHAR(10) arguments (CAST(... AS CHAR(10)): verify70 q70_mapepire
+-- "ps3") keep their blanks.
+CREATE FUNCTION qsys2.partition_statistics(table_schema bpchar, table_name bpchar)
+RETURNS TABLE (
+  table_partition varchar(128),
+  system_table_member char(10),
+  number_rows bigint,
+  number_row_pages bigint,
+  number_pages bigint,
+  overflow bigint,
+  clustered char(1),
+  active_blocks bigint,
+  avgrowsize bigint,
+  partition_type char(1),
+  partition_number integer,
+  number_distributed_partitions integer,
+  number_deleted_rows bigint,
+  data_size bigint,
+  variable_length_size bigint,
+  fixed_length_extents bigint,
+  variable_length_extents bigint,
+  column_stats_size bigint,
+  maintained_temporary_index_size bigint,
+  out_of_sync_data_space_entries bigint,
+  variable_length_segments bigint,
+  number_distinct_indexes smallint,
+  open_operations bigint,
+  close_operations bigint,
+  insert_operations bigint,
+  update_operations bigint,
+  delete_operations bigint,
+  logical_reads bigint,
+  physical_reads bigint,
+  sequential_reads bigint,
+  random_reads bigint,
+  blocked_insert_operations bigint,
+  blocked_insert_rows bigint,
+  clear_operations bigint,
+  copy_operations bigint,
+  reorganize_operations bigint,
+  index_builds bigint,
+  last_change_timestamp timestamp,
+  last_save_timestamp timestamp,
+  last_restore_timestamp timestamp,
+  last_used_timestamp timestamp,
+  days_used_count integer,
+  last_reset_timestamp timestamp,
+  file_cst_type char(11),
+  next_identity_value decimal(31,0),
+  low_inclusive char(1),
+  low_value varchar(1024),
+  high_inclusive char(1),
+  high_value varchar(1024),
+  number_partitioning_keys integer,
+  partitioning_keys varchar(2880),
+  keep_in_memory char(1),
+  media_preference smallint,
+  create_timestamp timestamp,
+  last_source_update_timestamp timestamp,
+  source_type varchar(10),
+  volatile char(1),
+  text varchar(50),
+  partial_transaction char(1),
+  apply_starting_receiver_library varchar(10),
+  apply_starting_receiver varchar(10))
+LANGUAGE sql STABLE AS $$
+  SELECT * FROM qsys2.partition_statistics(rpad(CAST($1 AS text), octet_length($1)), rpad(CAST($2 AS text), octet_length($2)))
 $$;
 -- SYSPARTITIONSTAT: the members of every database file, with the
 -- table function's columns (verify69 p69_mapepire "ps2": a source file's
@@ -2309,7 +2381,7 @@ SELECT CAST(o.library AS varchar(128)) COLLATE "C" AS table_schema,
        p.*
   FROM as4tainr.objects o
   LEFT JOIN qsys2.sysfiles f ON f.system_table_schema = o.library AND f.system_table_name = o.name
-  CROSS JOIN LATERAL qsys2.partition_statistics(CAST(rpad(o.library, 10) AS varchar), CAST(rpad(o.name, 10) AS varchar)) p
+  CROSS JOIN LATERAL qsys2.partition_statistics(rpad(o.library, 10), rpad(o.name, 10)) p
  WHERE o.objtype = '*FILE' AND o.attribute IN ('PF', 'PF-SRC', 'PF-DTA');
 "#;
 

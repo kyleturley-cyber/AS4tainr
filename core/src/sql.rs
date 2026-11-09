@@ -745,7 +745,14 @@ fn count_integer(toks: Vec<Tok>) -> Vec<Tok> {
                 ends.push(end);
             }
         }
-        out.push(toks[i].clone());
+        // COUNT_BIG: BIGINT, PostgreSQL's count (verify70 q70_mapepire
+        // "ar": COUNT_BIG(*) OVER () BIGINT).
+        match &toks[i] {
+            Tok::Word(w) if w.eq_ignore_ascii_case("COUNT_BIG") => {
+                out.push(Tok::Word("count".into()))
+            }
+            t => out.push(t.clone()),
+        }
         while ends.last() == Some(&i) {
             ends.pop();
             out.push(Tok::Space(" ".into()));
@@ -941,11 +948,25 @@ fn operand_type(toks: &[Tok], from: usize, to: usize) -> Option<(u32, u32, bool)
             None => Some((11, 0, false)),
         }
     };
+    let column = |w: &Tok| -> Option<(u32, u32, bool)> {
+        let n = match w {
+            Tok::Word(w) => w.to_ascii_uppercase(),
+            Tok::Quoted(q) => q.clone(),
+            _ => return None,
+        };
+        COLUMN_TYPES.with(|c| c.borrow().get(&n).copied())
+    };
     if let [one] = sig.as_slice() {
         if let Tok::Number(n) = &toks[*one] {
             return num(n);
         }
-        return None;
+        return column(&toks[*one]);
+    }
+    // A qualified column: T.COL.
+    if let [_, dot, col] = sig.as_slice() {
+        if toks[*dot] == Tok::Punct(".".into()) {
+            return column(&toks[*col]);
+        }
     }
     let first = word(&toks[*sig.first()?])?;
     let open = *sig.get(1)?;
@@ -1010,6 +1031,316 @@ fn operand_type(toks: &[Tok], from: usize, to: usize) -> Option<(u32, u32, bool)
     }
 }
 
+thread_local! {
+    /// The numeric columns of the files a statement names, for
+    /// `operand_type` while it is translated (`with_column_types`): name
+    /// (upper case) → precision, scale, decimal (false: an integer).
+    static COLUMN_TYPES: std::cell::RefCell<std::collections::HashMap<String, (u32, u32, bool)>> =
+        Default::default();
+}
+
+/// Translate with the numeric columns' types known (`numeric_columns`).
+pub(crate) fn translate_typed(
+    sql: &str,
+    is_library: &dyn Fn(&str) -> bool,
+    types: std::collections::HashMap<String, (u32, u32, bool)>,
+) -> Result<Translated> {
+    COLUMN_TYPES.with(|c| *c.borrow_mut() = types);
+    let r = translate(sql, is_library);
+    COLUMN_TYPES.with(|c| c.borrow_mut().clear());
+    r
+}
+
+/// The numeric columns of the files a statement names after FROM, JOIN,
+/// UPDATE and INTO: name → (precision, scale, decimal). A name two files
+/// give different types is left out. Integers are DECIMAL(5, 0),
+/// (11, 0) and (19, 0) in arithmetic (SQL Reference, "Arithmetic with an
+/// integer and a decimal operand").
+pub(crate) async fn numeric_columns(
+    client: &Client,
+    libl: &[String],
+    sql: &str,
+) -> std::collections::HashMap<String, (u32, u32, bool)> {
+    let mut out: std::collections::HashMap<String, (u32, u32, bool)> = Default::default();
+    let mut clash: std::collections::HashSet<String> = Default::default();
+    let Ok(toks) = tokenize(sql.trim()) else {
+        return out;
+    };
+    let sig: Vec<&Tok> = toks
+        .iter()
+        .filter(|t| !matches!(t, Tok::Space(_)))
+        .collect();
+    let mut names = Vec::new();
+    for (j, t) in sig.iter().enumerate() {
+        let Some(w) = word(t) else { continue };
+        if !matches!(w.as_str(), "FROM" | "JOIN" | "UPDATE" | "INTO") {
+            continue;
+        }
+        let mut name = match sig.get(j + 1) {
+            Some(Tok::Word(n)) => n.to_ascii_uppercase(),
+            _ => continue,
+        };
+        if let (Some(Tok::Punct(d)), Some(Tok::Word(f))) = (sig.get(j + 2), sig.get(j + 3)) {
+            if d == "." || d == "/" {
+                name = format!("{name}/{}", f.to_ascii_uppercase());
+            }
+        }
+        names.push(name);
+    }
+    for n in names {
+        let Ok(f) = crate::catalog::resolve_sql_file(client, libl, &n).await else {
+            continue;
+        };
+        for fd in &f.file.fields {
+            use crate::dds::DataType as D;
+            let ty = match fd.data_type {
+                D::Packed | D::Zoned => (fd.length, fd.decimals, true),
+                D::Binary if fd.decimals == 0 => match fd.length {
+                    0..=4 => (5, 0, false),
+                    5..=9 => (11, 0, false),
+                    _ => (19, 0, false),
+                },
+                _ => continue,
+            };
+            for key in [
+                Some(fd.name.to_ascii_uppercase()),
+                fd.alias.as_ref().map(|a| a.to_ascii_uppercase()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                match out.get(&key) {
+                    Some(t) if *t != ty => {
+                        clash.insert(key);
+                    }
+                    _ => {
+                        out.insert(key, ty);
+                    }
+                }
+            }
+        }
+    }
+    for k in clash {
+        out.remove(&k);
+    }
+    out
+}
+
+/// Where the operand ending at `pe` starts: a number, a column (T.COL),
+/// or a call.
+fn left_operand(toks: &[Tok], pe: usize) -> Option<usize> {
+    match &toks[pe] {
+        Tok::Number(_) => Some(pe),
+        // A column, or a qualified one (T.COL).
+        Tok::Word(_) | Tok::Quoted(_) => {
+            let before = (0..pe).rev().find(|&j| !matches!(toks[j], Tok::Space(_)));
+            match before {
+                Some(d) if toks[d] == Tok::Punct(".".into()) => {
+                    (0..d).rev().find(|&j| !matches!(toks[j], Tok::Space(_)))
+                }
+                _ => Some(pe),
+            }
+        }
+        Tok::Punct(p) if p == ")" => {
+            let mut depth = 0i32;
+            let open = (0..=pe).rev().find(|&j| {
+                match &toks[j] {
+                    Tok::Punct(p) if p == ")" => depth += 1,
+                    Tok::Punct(p) if p == "(" => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            });
+            open.and_then(|o| (0..o).rev().find(|&j| !matches!(toks[j], Tok::Space(_))))
+        }
+        _ => None,
+    }
+}
+
+/// Where the operand starting at `ns` ends: a number, a column (T.COL),
+/// or a call.
+fn right_operand(toks: &[Tok], ns: usize) -> Option<usize> {
+    match &toks[ns] {
+        Tok::Number(_) => Some(ns),
+        Tok::Word(_) | Tok::Quoted(_) => {
+            let after = (ns + 1..toks.len()).find(|&j| !matches!(toks[j], Tok::Space(_)));
+            match after {
+                Some(o) if toks[o] == Tok::Punct("(".into()) => paren_span(toks, o).map(|(c, _)| c),
+                // T.COL
+                Some(d) if toks[d] == Tok::Punct(".".into()) => {
+                    (d + 1..toks.len()).find(|&j| !matches!(toks[j], Tok::Space(_)))
+                }
+                _ => Some(ns),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// ` AS numeric(p, s))`: the end of a CAST.
+fn numeric_type_toks(p: u32, s: u32) -> Vec<Tok> {
+    vec![
+        Tok::Space(" ".into()),
+        Tok::Word("AS".into()),
+        Tok::Space(" ".into()),
+        Tok::Word("numeric".into()),
+        Tok::Punct("(".into()),
+        Tok::Number(p.to_string()),
+        Tok::Punct(",".into()),
+        Tok::Space(" ".into()),
+        Tok::Number(s.to_string()),
+        Tok::Punct(")".into()),
+        Tok::Punct(")".into()),
+    ]
+}
+
+/// Decimal addition, subtraction and multiplication typed as Db2 for i
+/// types them (SQL Reference, "Decimal arithmetic in SQL": a + b and
+/// a - b DECIMAL(min(31, max(p - s, p' - s') + max(s, s') + 1),
+/// max(s, s')), a * b DECIMAL(p + p', s + s'), an integer as DECIMAL(5,
+/// 0), (11, 0) or (19, 0); verify70 q70_mapepire "ar": D + D of
+/// DECIMAL(7, 2) DECIMAL(8, 2), D * D (14, 4), D + I (14, 2), I * 1.5
+/// (13, 1)): an operation that stands alone (a select list item, a
+/// function's argument) between operands whose types are known is cast
+/// to its type. The value is PostgreSQL's, which has the same digits.
+fn decimal_types(toks: Vec<Tok>) -> Vec<Tok> {
+    let mut toks = toks;
+    let sig_before =
+        |toks: &[Tok], at: usize| (0..at).rev().find(|&j| !matches!(toks[j], Tok::Space(_)));
+    let sig_after =
+        |toks: &[Tok], at: usize| (at + 1..toks.len()).find(|&j| !matches!(toks[j], Tok::Space(_)));
+    // ROUND, TRUNCATE, ABS, MIN and MAX of a decimal keep its type
+    // (verify70 "ar": ROUND(D / 3, 2) DECIMAL(31, 26), MIN(D) OVER ()
+    // DECIMAL(7, 2)).
+    let mut k = 0;
+    while k < toks.len() {
+        let f = match &toks[k] {
+            Tok::Word(w) => w.to_ascii_uppercase(),
+            _ => {
+                k += 1;
+                continue;
+            }
+        };
+        let after_dot =
+            matches!(sig_before(&toks, k).map(|j| &toks[j]), Some(Tok::Punct(p)) if p == ".");
+        let open = sig_after(&toks, k).filter(|&o| toks[o] == Tok::Punct("(".into()));
+        let (true, false, Some(o)) = (
+            matches!(
+                f.as_str(),
+                "ROUND" | "TRUNCATE" | "TRUNC" | "ABS" | "MIN" | "MAX"
+            ),
+            after_dot,
+            open,
+        ) else {
+            k += 1;
+            continue;
+        };
+        let Some((close, commas)) = paren_span(&toks, o) else {
+            k += 1;
+            continue;
+        };
+        let arg_end = commas.first().copied().unwrap_or(close);
+        let (Some(a), Some(b)) = (sig_after(&toks, o), sig_before(&toks, arg_end)) else {
+            k += 1;
+            continue;
+        };
+        let Some((p, sc, true)) = (if a <= b {
+            operand_type(&toks, a, b)
+        } else {
+            None
+        }) else {
+            k += 1;
+            continue;
+        };
+        let mut end = close;
+        if let Some(w) = sig_after(&toks, close) {
+            if matches!(&toks[w], Tok::Word(x) if x.eq_ignore_ascii_case("OVER")) {
+                if let Some(o2) =
+                    sig_after(&toks, w).filter(|&o2| toks[o2] == Tok::Punct("(".into()))
+                {
+                    if let Some((c2, _)) = paren_span(&toks, o2) {
+                        end = c2;
+                    }
+                }
+            }
+        }
+        let mut new: Vec<Tok> = toks[..k].to_vec();
+        new.push(Tok::Word("CAST".into()));
+        new.push(Tok::Punct("(".into()));
+        new.extend_from_slice(&toks[k..=end]);
+        new.extend(numeric_type_toks(p, sc));
+        let resume = new.len();
+        new.extend_from_slice(&toks[end + 1..]);
+        toks = new;
+        k = resume;
+    }
+    let mut k = 0;
+    while k < toks.len() {
+        let op = match &toks[k] {
+            Tok::Punct(p) if p == "+" || p == "-" || p == "*" => p.clone(),
+            _ => {
+                k += 1;
+                continue;
+            }
+        };
+        let (Some(pe), Some(ns)) = (sig_before(&toks, k), sig_after(&toks, k)) else {
+            k += 1;
+            continue;
+        };
+        let (Some(ls), Some(re)) = (left_operand(&toks, pe), right_operand(&toks, ns)) else {
+            k += 1;
+            continue;
+        };
+        let start_ok = match sig_before(&toks, ls) {
+            None => true,
+            Some(j) => match &toks[j] {
+                Tok::Punct(p) => p == "," || p == "(",
+                Tok::Word(w) => w.eq_ignore_ascii_case("SELECT"),
+                _ => false,
+            },
+        };
+        let end_ok = match sig_after(&toks, re) {
+            None => true,
+            Some(j) => match &toks[j] {
+                Tok::Punct(p) => p == "," || p == ")",
+                Tok::Word(_) => true,
+                _ => false,
+            },
+        };
+        let types = (operand_type(&toks, ls, pe), operand_type(&toks, ns, re));
+        let (true, true, (Some((p1, s1, d1)), Some((p2, s2, d2)))) = (start_ok, end_ok, types)
+        else {
+            k += 1;
+            continue;
+        };
+        if !d1 && !d2 {
+            k += 1;
+            continue;
+        }
+        let (p, sc) = if op == "*" {
+            (p1 + p2, s1 + s2)
+        } else {
+            let sc = s1.max(s2);
+            ((p1 - s1).max(p2 - s2) + sc + 1, sc)
+        };
+        if p > 31 || sc > p {
+            k += 1;
+            continue;
+        }
+        let p = p.min(31);
+        let mut new: Vec<Tok> = toks[..ls].to_vec();
+        new.push(Tok::Word("CAST".into()));
+        new.push(Tok::Punct("(".into()));
+        new.extend_from_slice(&toks[ls..=re]);
+        new.extend(numeric_type_toks(p, sc));
+        let resume = new.len();
+        new.extend_from_slice(&toks[re + 1..]);
+        toks = new;
+        k = resume;
+    }
+    toks
+}
+
 /// Decimal division as Db2 for i does it (IBM i SQL Reference, decimal
 /// arithmetic: "The precision of the result of division is 31"; the scale
 /// is 31 - p + s - s'): `a / b` of operands whose types are known here is
@@ -1029,32 +1360,8 @@ fn decimal_division(toks: Vec<Tok>) -> Vec<Tok> {
             k += 1;
             continue;
         };
-        // The left operand: a number, or a call ending at `pe`.
-        let ls = match &toks[pe] {
-            Tok::Number(_) => Some(pe),
-            Tok::Punct(p) if p == ")" => {
-                let mut depth = 0i32;
-                let open = (0..=pe).rev().find(|&j| {
-                    match &toks[j] {
-                        Tok::Punct(p) if p == ")" => depth += 1,
-                        Tok::Punct(p) if p == "(" => depth -= 1,
-                        _ => {}
-                    }
-                    depth == 0
-                });
-                open.and_then(|o| (0..o).rev().find(|&j| !matches!(toks[j], Tok::Space(_))))
-            }
-            _ => None,
-        };
-        // The right operand: a number, or a call starting at `ns`.
-        let re = match &toks[ns] {
-            Tok::Number(_) => Some(ns),
-            Tok::Word(_) => (ns + 1..toks.len())
-                .find(|&j| !matches!(toks[j], Tok::Space(_)))
-                .filter(|&o| toks[o] == Tok::Punct("(".into()))
-                .and_then(|o| paren_span(&toks, o).map(|(c, _)| c)),
-            _ => None,
-        };
+        let ls = left_operand(&toks, pe);
+        let re = right_operand(&toks, ns);
         let (Some(ls), Some(re)) = (ls, re) else {
             k += 1;
             continue;
@@ -1071,7 +1378,11 @@ fn decimal_division(toks: Vec<Tok>) -> Vec<Tok> {
             continue;
         }
         let scale = (31i64 - p as i64 + s as i64 - s2 as i64).max(0);
+        // DECIMAL(31, scale) (verify70 q70_mapepire "ar": D / D of
+        // DECIMAL(7, 2) is DECIMAL(31, 24)).
         let mut new: Vec<Tok> = toks[..ls].to_vec();
+        new.push(Tok::Word("CAST".into()));
+        new.push(Tok::Punct("(".into()));
         new.push(Tok::Word("as4tainr_svc.ddiv".into()));
         new.push(Tok::Punct("(".into()));
         new.extend_from_slice(&toks[ls..=pe]);
@@ -1080,6 +1391,7 @@ fn decimal_division(toks: Vec<Tok>) -> Vec<Tok> {
         new.push(Tok::Punct(",".into()));
         new.push(Tok::Number(scale.to_string()));
         new.push(Tok::Punct(")".into()));
+        new.extend(numeric_type_toks(31, scale as u32));
         let resume = new.len();
         new.extend_from_slice(&toks[re + 1..]);
         toks = new;
@@ -1153,9 +1465,11 @@ fn check_case_conditions(toks: &[Tok]) -> Result<()> {
 
 pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Translated> {
     check_case_conditions(&tokenize(sql.trim())?)?;
-    let mut toks = concat_strings(count_integer(listagg(decimal_division(sequence_values(
-        crate::sqljsonfn::rewrite(crate::sqljson::rewrite(tokenize(sql.trim())?)?)?,
-        is_library,
+    let mut toks = concat_strings(count_integer(listagg(decimal_types(decimal_division(
+        sequence_values(
+            crate::sqljsonfn::rewrite(crate::sqljson::rewrite(tokenize(sql.trim())?)?)?,
+            is_library,
+        ),
     )))));
     // QTEMP.X and QTEMP/X: the job's own library (qtemp.rs). SESSION.X
     // names a declared global temporary table, which lives in QTEMP.
@@ -2470,7 +2784,12 @@ pub async fn run_as(
     let libraries = catalog::list_libraries(client).await?;
     let sql = &crate::sqlvar::substitute(client, libl, sql).await?;
     let sql = &crate::temporal::rewrite(client, libl, sql).await?;
-    let t = translate(sql, &|n| libraries.iter().any(|l| l == n))?;
+    let types = if sql.contains('/') {
+        numeric_columns(client, libl, sql).await
+    } else {
+        Default::default()
+    };
+    let t = translate_typed(sql, &|n| libraries.iter().any(|l| l == n), types)?;
     let mut text = system_column_names(client, libl, &t.sql).await?;
     if let Some((target, at)) = &t.insert_needs_columns {
         // The file's fields, in order, as the column list.
@@ -3336,6 +3655,37 @@ mod tests {
     }
 
     #[test]
+    fn decimal_arithmetic_types() {
+        // Db2 for i SQL Reference, decimal arithmetic; verify70
+        // q70_mapepire "ar".
+        let types: std::collections::HashMap<String, (u32, u32, bool)> = [
+            ("D".to_string(), (7, 2, true)),
+            ("I".to_string(), (11, 0, false)),
+        ]
+        .into();
+        let t = translate_typed(
+            "SELECT D + D, D * D, D + I, I * 1.5, D / 7.0, ROUND(D / 3, 2), I + I, D - 1.5 FROM T",
+            &|_| false,
+            types,
+        )
+        .unwrap();
+        let q = t.sql;
+        // Each cast as translate writes a Db2 decimal cast (truncating).
+        for want in [
+            "(D + D ) AS numeric), 2) AS numeric(8, 2))",
+            "(D * D ) AS numeric), 4) AS numeric(14, 4))",
+            "(D + I ) AS numeric), 2) AS numeric(14, 2))",
+            "(I * 1.5 ) AS numeric), 1) AS numeric(13, 1))",
+            "ddiv(D,7.0,25) ) AS numeric), 25) AS numeric(31, 25))",
+            "ddiv(D,3,26) ) AS numeric), 26) AS numeric(31, 26))",
+            "(D - 1.5 ) AS numeric), 2) AS numeric(8, 2))",
+        ] {
+            assert!(q.contains(want), "{want} in {q}");
+        }
+        assert!(q.contains(", I + I,"), "{q}");
+    }
+
+    #[test]
     fn db2_datetime_string_forms() {
         // Db2 for i SQL Reference, "String representations of datetime
         // values"; verify68 o68_make inserted '13.14.15' and
@@ -3654,7 +4004,14 @@ impl Session {
     pub async fn exec(&self, catalog_client: &Client, sql: &str) -> Result<Exec> {
         let sql = &crate::sqlvar::substitute(catalog_client, &self.libl, sql).await?;
         let sql = &crate::temporal::rewrite(catalog_client, &self.libl, sql).await?;
-        let t = translate(sql, &|n| self.libraries.iter().any(|l| l == n))?;
+        // Column types change a division's value; for +, - and * only
+        // the described type, which Mapepire shows (describe_types).
+        let types = if sql.contains('/') || (self.describe_types && sql.contains(['+', '-', '*'])) {
+            numeric_columns(catalog_client, &self.libl, sql).await
+        } else {
+            Default::default()
+        };
+        let t = translate_typed(sql, &|n| self.libraries.iter().any(|l| l == n), types)?;
         let mut text = system_column_names(catalog_client, &self.libl, &t.sql).await?;
         if let Some((target, at)) = &t.insert_needs_columns {
             let name = if target.contains('.') {
@@ -3750,7 +4107,14 @@ impl Session {
         sql: &str,
     ) -> Result<Vec<ColType>> {
         let sql = &crate::temporal::rewrite(catalog_client, &self.libl, sql).await?;
-        let t = translate(sql, &|n| self.libraries.iter().any(|l| l == n))?;
+        // Column types change a division's value; for +, - and * only
+        // the described type, which Mapepire shows (describe_types).
+        let types = if sql.contains('/') || (self.describe_types && sql.contains(['+', '-', '*'])) {
+            numeric_columns(catalog_client, &self.libl, sql).await
+        } else {
+            Default::default()
+        };
+        let t = translate_typed(sql, &|n| self.libraries.iter().any(|l| l == n), types)?;
         let mut text = system_column_names(catalog_client, &self.libl, &t.sql).await?;
         if let Some((target, at)) = &t.insert_needs_columns {
             let name = if target.contains('.') {

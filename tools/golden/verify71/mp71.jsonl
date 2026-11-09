@@ -1,0 +1,7 @@
+{"id": "c", "type": "connect", "technique": "cli", "application": "as4tainr-golden", "props": "naming=sql;libraries=AS4TRAINR1"}
+{"id": "agg", "type": "sql", "sql": "SELECT SUM(D), AVG(D), SUM(I), AVG(I), SUM(Z), AVG(Z), MAX(C), MIN(V), SUM(S) FROM AS4TRAINR1.GLD71T"}
+{"id": "mix", "type": "sql", "sql": "SELECT D * 2 + 1, (D + 1) * 2, D + D + D, -D, D * I / 4, D / 0.5 FROM AS4TRAINR1.GLD71T ORDER BY I"}
+{"id": "vw", "type": "sql", "sql": "SELECT X + X, X / 3 FROM AS4TRAINR1.GLD71V ORDER BY X"}
+{"id": "ctas", "type": "sql", "sql": "CREATE TABLE AS4TRAINR1.GLD71U AS (SELECT D + 1, I FROM AS4TRAINR1.GLD71T) WITH DATA"}
+{"id": "ctcols", "type": "sql", "sql": "SELECT COLUMN_NAME, DATA_TYPE, LENGTH, NUMERIC_SCALE FROM QSYS2.SYSCOLUMNS WHERE TABLE_SCHEMA = 'AS4TRAINR1' AND TABLE_NAME = 'GLD71U' ORDER BY ORDINAL_POSITION"}
+{"id": "x", "type": "exit"}

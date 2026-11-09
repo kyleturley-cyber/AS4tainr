@@ -27211,6 +27211,56 @@ async fn mapepire_values_as_pub400_shows_them() {
         .collect();
     assert_eq!(names, ["00001", "00002", "I"], "{r}");
     assert_eq!(cols[0].get("type"), Some(&J::str("INTEGER")), "{r}");
+    // Decimal arithmetic typed as Db2 types it (verify70 q70_mapepire
+    // "ar": D + D of DECIMAL(7, 2) DECIMAL(8, 2), D / D DECIMAL(31, 24)
+    // with 24 decimals).
+    // Without a division in the statement too.
+    let r2 = ask(format!(
+        r#"{{"id":"ar2","type":"sql","sql":"SELECT D * D FROM {lib}.GLD68T WHERE I = 1"}}"#
+    ))
+    .await;
+    let c2 = r2.get("metadata").and_then(|m| m.get("columns")).unwrap();
+    let J::Arr(c2) = c2 else { panic!("{r2}") };
+    assert_eq!(c2[0].get("precision"), Some(&J::Num("14".into())), "{r2}");
+    assert_eq!(c2[0].get("scale"), Some(&J::Num("4".into())), "{r2}");
+    let r = ask(format!(
+        r#"{{"id":"ar","type":"sql","sql":"SELECT D + D, D / D FROM {lib}.GLD68T WHERE I = 1"}}"#
+    ))
+    .await;
+    let cols = r.get("metadata").and_then(|m| m.get("columns")).unwrap();
+    let J::Arr(cols) = cols else { panic!("{r}") };
+    let ps = |n: usize| {
+        (
+            cols[n].get("precision").cloned().unwrap(),
+            cols[n].get("scale").cloned().unwrap(),
+        )
+    };
+    assert_eq!(ps(0), (J::Num("8".into()), J::Num("2".into())), "{r}");
+    assert_eq!(ps(1), (J::Num("31".into()), J::Num("24".into())), "{r}");
+    let J::Arr(data) = r.get("data").expect("rows") else {
+        panic!("{r}")
+    };
+    assert_eq!(
+        data[0].get("00002"),
+        Some(&J::Num("1.000000000000000000000000".into())),
+        "{r}"
+    );
+    // PARTITION_STATISTICS takes CHAR(10) names: unpadded, no row
+    // (verify68 "parts"); padded, the member (verify70 "ps2").
+    let count = |r: &J| match r.get("data") {
+        Some(J::Arr(d)) => d.len(),
+        _ => panic!("{r}"),
+    };
+    let r = ask(format!(
+        r#"{{"id":"p1","type":"sql","sql":"SELECT * FROM TABLE(QSYS2.PARTITION_STATISTICS('{lib}', 'GLD68T'))"}}"#
+    ))
+    .await;
+    assert_eq!(count(&r), 0, "{r}");
+    let r = ask(format!(
+        r#"{{"id":"p2","type":"sql","sql":"SELECT NUMBER_ROWS FROM TABLE(QSYS2.PARTITION_STATISTICS(RPAD('{lib}', 10), RPAD('GLD68T', 10)))"}}"#
+    ))
+    .await;
+    assert_eq!(count(&r), 1, "{r}");
     // PROGRAM_INFO has IBM i 7.5's 107 columns (verify66 "pgmi").
     let r = ask(
         r#"{"id":"pi","type":"sql","sql":"SELECT * FROM QSYS2.PROGRAM_INFO FETCH FIRST 1 ROWS ONLY"}"#

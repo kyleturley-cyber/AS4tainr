@@ -1,0 +1,40 @@
+{"id": "v", "type": "getversion"}
+{"id": "hs", "type": "version"}
+{"id": "c", "type": "connect", "technique": "cli", "application": "as4tainr-golden", "props": "naming=system;libraries=AS4TRAINR1"}
+{"id": "j", "type": "getdbjob"}
+{"id": "p", "type": "ping"}
+{"id": "ts", "type": "sql", "sql": "VALUES CURRENT TIMESTAMP"}
+{"id": "mk", "type": "sql", "sql": "CREATE TABLE AS4TRAINR1/GLD64T (C CHAR(5), V VARCHAR(10), D DECIMAL(7, 2), Z NUMERIC(5, 0), I INTEGER, S SMALLINT, B BIGINT, DT DATE, TM TIME, TS TIMESTAMP, F DOUBLE, BN BINARY(2))"}
+{"id": "ins", "type": "sql", "sql": "INSERT INTO GLD64T VALUES ('ab', 'cd  ', -12.50, 7, 1, 2, 3, '2026-11-09', '13.14.15', '2026-11-09-13.14.15.123456', 1.5, BX'C1C2'), (NULL, NULL, NULL, NULL, 2, NULL, NULL, NULL, NULL, NULL, NULL, NULL)"}
+{"id": "sel", "type": "sql", "sql": "SELECT * FROM GLD64T ORDER BY I"}
+{"id": "exp", "type": "sql", "sql": "SELECT C, D + 1, CURRENT DATE, 'x' CONCAT C, I AS NUMBER FROM GLD64T ORDER BY I"}
+{"id": "blk", "type": "sql", "sql": "SELECT I FROM GLD64T ORDER BY I", "rows": 1}
+{"id": "more", "type": "sqlmore", "cont_id": "blk", "rows": 1}
+{"id": "more2", "type": "sqlmore", "cont_id": "blk", "rows": 1}
+{"id": "cls", "type": "sqlclose", "cont_id": "blk"}
+{"id": "terse", "type": "sql", "sql": "SELECT I, C FROM GLD64T ORDER BY I", "terse": true}
+{"id": "prep", "type": "prepare_sql", "sql": "SELECT C, D FROM GLD64T WHERE I = ?"}
+{"id": "exe", "type": "execute", "cont_id": "prep", "parameters": [1]}
+{"id": "pe", "type": "prepare_sql_execute", "sql": "INSERT INTO GLD64T (I, C) VALUES (?, ?)", "parameters": [[3, "x"], [4, "y"]]}
+{"id": "upd", "type": "sql", "sql": "UPDATE GLD64T SET S = 9 WHERE I >= 3"}
+{"id": "e1", "type": "sql", "sql": "SELECT * FROM NOPE64"}
+{"id": "e2", "type": "sql", "sql": "SELECT NOCOL FROM GLD64T"}
+{"id": "e3", "type": "sql", "sql": "SELEC 1"}
+{"id": "qc", "type": "sql", "sql": "WITH L (X) AS (VALUES 'QGPL', 'NOPE64') SELECT X, QSYS2.QCMDEXC('CHKOBJ OBJ(QSYS/' CONCAT X CONCAT ') OBJTYPE(*LIB)') FROM L"}
+{"id": "cl1", "type": "cl", "cmd": "CRTDTAARA DTAARA(AS4TRAINR1/GLD64A) TYPE(*CHAR) LEN(10)"}
+{"id": "cl2", "type": "cl", "cmd": "CRTDTAARA DTAARA(AS4TRAINR1/GLD64A) TYPE(*CHAR) LEN(10)"}
+{"id": "cl3", "type": "cl", "cmd": "CRTDTAARA FOO(1)"}
+{"id": "cl4", "type": "cl", "cmd": "DSPLIBL"}
+{"id": "cl5", "type": "cl", "cmd": "CHGLIBL CURLIB(AS4TRAINR1) LIBL(AS4TRAINR1)"}
+{"id": "lib", "type": "sql", "sql": "SELECT * FROM TABLE(QSYS2.QSQLIBL())"}
+{"id": "cl6", "type": "cl", "cmd": "CRTSRCPF FILE(AS4TRAINR1/GLD64S) RCDLEN(112)"}
+{"id": "cl7", "type": "cl", "cmd": "CPYFRMSTMF FROMSTMF('/home/AS4TRAINR/gld/gld64m.clle') TOMBR('/QSYS.LIB/AS4TRAINR1.LIB/GLD64S.FILE/GLD64M.MBR')"}
+{"id": "jl", "type": "sql", "sql": "SELECT MESSAGE_ID, MESSAGE_TYPE FROM TABLE(QSYS2.JOBLOG_INFO('*')) ORDER BY ORDINAL_POSITION DESC FETCH FIRST 6 ROWS ONLY"}
+{"id": "cl8", "type": "cl", "cmd": "DLTSPLF FILE(*SELECT) SELECT(*CURRENT *ALL *ALL NOSUCH64)"}
+{"id": "li", "type": "sql", "sql": "SELECT * FROM TABLE(QSYS2.LIBRARY_INFO('AS4TRAINR1', DETAILED_INFO => 'NO'))"}
+{"id": "sfi", "type": "sql", "sql": "SELECT * FROM TABLE(QSYS2.SPOOLED_FILE_INFO()) FETCH FIRST 1 ROWS ONLY"}
+{"id": "sysf", "type": "sql", "sql": "SELECT * FROM QSYS2.SYSFILES WHERE SYSTEM_TABLE_SCHEMA = 'AS4TRAINR1' ORDER BY SYSTEM_TABLE_NAME"}
+{"id": "ps", "type": "sql", "sql": "SELECT * FROM TABLE(QSYS2.PARTITION_STATISTICS('AS4TRAINR1', 'GLD64S'))"}
+{"id": "drop", "type": "sql", "sql": "DROP TABLE AS4TRAINR1/GLD64T"}
+not json
+{"id": "x", "type": "exit"}

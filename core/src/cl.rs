@@ -80,6 +80,24 @@ const fn p(
     }
 }
 
+const CPY_PARAMS: &[ParamDef] = &[
+    p("OBJ", Kind::Text, true, None, "Object").ch("Path name"),
+    p("TOOBJ", Kind::Text, false, Some("*NONE"), "To object").ch("Path name"),
+    p("TODIR", Kind::Text, false, Some("*NONE"), "To directory").ch("Path name, ."),
+    p("SUBTREE", Kind::Name, false, Some("*NONE"), "Subtree")
+        .ch("*NONE, *ALL, *DIR, *STG")
+        .keyword_only(),
+    p("REPLACE", Kind::Name, false, Some("*NO"), "Replace object")
+        .ch("*NO, *YES")
+        .keyword_only(),
+];
+
+const MOV_PARAMS: &[ParamDef] = &[
+    p("OBJ", Kind::Text, true, None, "Object").ch("Path name"),
+    p("TOOBJ", Kind::Text, false, Some("*NONE"), "To object").ch("Path name"),
+    p("TODIR", Kind::Text, false, Some("*NONE"), "To directory").ch("Path name, ."),
+];
+
 pub static COMMANDS: &[CommandDef] = &[
     CommandDef {
         name: "CRTLIB",
@@ -197,7 +215,7 @@ pub static COMMANDS: &[CommandDef] = &[
         name: "CHGLIBL",
         description: "Change Library List",
         params: &[
-            p("LIBL", Kind::List, true, None, "Libraries for current job").ch("Name, *SAME, *NONE"),
+            p("LIBL", Kind::List, false, Some("*SAME"), "Libraries for current job").ch("Name, *SAME, *NONE"),
             p(
                 "CURLIB",
                 Kind::Name,
@@ -1077,6 +1095,18 @@ pub static COMMANDS: &[CommandDef] = &[
             )
             .keyword_only(),
             p("USRDTA", Kind::Text, false, Some("*NONE"), "User data").keyword_only(),
+            p("SPOOL", Kind::Name, false, Some("*NONE"), "Spool the data")
+                .ch("*NONE, *YES, *NO")
+                .keyword_only(),
+            p(
+                "SPLFOWN",
+                Kind::Name,
+                false,
+                Some("*NONE"),
+                "Spooled file owner",
+            )
+            .ch("*NONE, *CURUSRPRF, *JOB, *CURGRPPRF, *JOBGRPPRF")
+            .keyword_only(),
             p(
                 "SECURE",
                 Kind::Name,
@@ -1826,7 +1856,7 @@ pub static COMMANDS: &[CommandDef] = &[
         name: "DLTSPLF",
         description: "Delete Spooled File",
         params: &[
-            p("FILE", Kind::Name, true, None, "Spooled file").ch("Name"),
+            p("FILE", Kind::Name, true, None, "Spooled file").ch("Name, *SELECT"),
             p("JOB", Kind::Text, false, Some("*"), "Job name").ch("*, number/user/name"),
             p(
                 "SPLNBR",
@@ -1836,6 +1866,9 @@ pub static COMMANDS: &[CommandDef] = &[
                 "Spooled file number",
             )
             .ch("1-999999, *LAST"),
+            p("SELECT", Kind::List, false, Some("*CURRENT"), "Select files for")
+                .ch("user device formtype usrdta")
+                .keyword_only(),
         ],
     },
     CommandDef {
@@ -3973,21 +4006,23 @@ pub static COMMANDS: &[CommandDef] = &[
     CommandDef {
         name: "CPY",
         description: "Copy Object",
-        params: &[
-            p("OBJ", Kind::Text, true, None, "Object").ch("Path name"),
-            p("TOOBJ", Kind::Text, false, Some("*NONE"), "To object").ch("Path name"),
-            p("TODIR", Kind::Text, false, Some("*NONE"), "To directory").ch("Path name, ."),
-            p("REPLACE", Kind::Name, false, Some("*NO"), "Replace object").ch("*NO, *YES").keyword_only(),
-        ],
+        params: CPY_PARAMS,
+    },
+    // COPY and MOVE: the same commands under other names (CL reference).
+    CommandDef {
+        name: "COPY",
+        description: "Copy Object",
+        params: CPY_PARAMS,
     },
     CommandDef {
         name: "MOV",
         description: "Move Object",
-        params: &[
-            p("OBJ", Kind::Text, true, None, "Object").ch("Path name"),
-            p("TOOBJ", Kind::Text, false, Some("*NONE"), "To object").ch("Path name"),
-            p("TODIR", Kind::Text, false, Some("*NONE"), "To directory").ch("Path name, ."),
-        ],
+        params: MOV_PARAMS,
+    },
+    CommandDef {
+        name: "MOVE",
+        description: "Move Object",
+        params: MOV_PARAMS,
     },
     CommandDef {
         name: "RNM",
@@ -5301,7 +5336,9 @@ pub static GROUPS: &[Group] = &[
             "ERASE",
             "RNM",
             "CPY",
+            "COPY",
             "MOV",
+            "MOVE",
             "CHGCURDIR",
             "CD",
             "CPYTOIMPF",

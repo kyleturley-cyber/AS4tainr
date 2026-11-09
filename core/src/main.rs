@@ -157,6 +157,31 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// PASE's attr: an IFS object's attributes shown or set
+    /// (`attr [-hp] path [name[=value] ...]`).
+    #[command(disable_help_flag = true)]
+    Attr {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// PASE's setccsid: stream files tagged with a CCSID
+    /// (`setccsid ccsid file ...`).
+    #[command(disable_help_flag = true)]
+    Setccsid {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Serve the Mapepire database protocol (Code for IBM i's SQL) to one
+    /// client on standard input and output, as the Mapepire server's
+    /// single mode does: JSON requests in, JSON replies out, one per
+    /// line. The job runs for AS4TAINR_USER (an SSH session's user), else
+    /// QSECOFR. Java's options before it (-D..., -jar FILE) are ignored,
+    /// so a `java` command on the PASE path can start it.
+    Mapepire {
+        /// Accepted and ignored: Java options, the server JAR, --single.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Run the TN5250 display server (5250 green-screen sessions).
     Tn5250 {
         /// Address to listen on.
@@ -169,6 +194,11 @@ enum Cmd {
         /// example 0.0.0.0:8080. Off unless set.
         #[arg(long, env = "AS4TAINR_WEB_LISTEN")]
         web_listen: Option<String>,
+        /// Also serve SSH (Code for IBM i, ssh, sftp) on this address, for
+        /// example 0.0.0.0:22. Off unless set: its commands run outside
+        /// as4tainr's object authorities (docs/ssh.md).
+        #[arg(long, env = "AS4TAINR_SSH_LISTEN")]
+        ssh_listen: Option<String>,
     },
     /// CALL: run a program (CL or RPG) as QSECOFR, outside any job.
     Call { program: String, args: Vec<String> },
@@ -241,7 +271,9 @@ async fn run(cli: Cli) -> Result<u8> {
     let libl: Vec<String> = cli
         .libl
         .iter()
-        .map(|l| catalog::validate_name("library", l))
+        // An empty list (Qshell's liblist took them all off) is none.
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| catalog::validate_name("library", &l.trim().to_ascii_uppercase()))
         .collect::<Result<_>>()?;
     let curlib = cli
         .curlib
@@ -547,10 +579,47 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             return Ok(out.status);
         }
+        cmd @ (Cmd::Attr { .. } | Cmd::Setccsid { .. }) => {
+            let (attr, args) = match cmd {
+                Cmd::Attr { args } => (true, args),
+                Cmd::Setccsid { args } => (false, args),
+                _ => unreachable!(),
+            };
+            let client = runtime::connect_db(&cli.database_url).await?;
+            let out = if attr {
+                as4tainr_core::pase_attr::attr(&client, &args).await
+            } else {
+                as4tainr_core::pase_attr::setccsid(&client, &args).await
+            };
+            for l in &out.stdout {
+                println!("{l}");
+            }
+            for l in &out.stderr {
+                eprintln!("{l}");
+            }
+            return Ok(out.status);
+        }
+        Cmd::Mapepire { args } => {
+            let client = runtime::connect_db(&cli.database_url).await?;
+            catalog::init(&client).await?;
+            let env = commands::Environment {
+                database_url: cli.database_url.clone(),
+            };
+            let user = std::env::var("AS4TAINR_USER")
+                .ok()
+                .map(|u| u.trim().to_ascii_uppercase())
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| "QSECOFR".into());
+            let legacy = as4tainr_core::mapepire::legacy_cl_for(&args);
+            as4tainr_core::mapepire::serve_stdio(&client, &env, &user, libl.clone(), legacy)
+                .await?;
+            return Ok(0);
+        }
         Cmd::Tn5250 {
             listen,
             system_name,
             web_listen,
+            ssh_listen,
         } => {
             // Make sure the catalog and QSECOFR exist before anyone signs on.
             let client = runtime::connect_db(&cli.database_url).await?;
@@ -589,6 +658,19 @@ async fn run(cli: Cli) -> Result<u8> {
                     None => std::future::pending().await,
                 }
             };
+            let ssh = match ssh_listen.filter(|s| !s.is_empty()) {
+                Some(s) => Some(tokio::spawn(as4tainr_core::sshd::run(
+                    cli.database_url.clone(),
+                    s,
+                ))),
+                None => None,
+            };
+            let ssh = async move {
+                match ssh {
+                    Some(t) => t.await?,
+                    None => std::future::pending().await,
+                }
+            };
             let cfg = tn5250::ServerConfig {
                 env: commands::Environment {
                     database_url: cli.database_url,
@@ -607,6 +689,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 r = tn5250::serve(listener, cfg) => r?,
                 r = qbatch => r??,
                 r = web => r?,
+                r = ssh => r?,
                 pd = power => {
                     let pd = pd?;
                     power_down(&db_url, &pd).await?;

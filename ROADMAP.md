@@ -312,4 +312,5 @@ The biggest risk is the size of the surface to cover. IBM i has thousands of CL 
 - [ ] Save extras: SAVCHGOBJ, saving journals and receivers, ALWOBJDIF checks.
 - [ ] Packaging: TLS on port 992, multi-arch images (amd64, arm64).
 - [ ] Get a trademark opinion on the name before the public launch.
+- [x] SSH server and Mapepire (Code for IBM i): sign-on with user profiles, commands on the IFS with PASE paths (`system`, `qsh` with `liblist`, `attr`, `uname`, Java), sftp on the IFS, Mapepire single mode (SQL, prepared statements, CL with job log and spooled output); Code for IBM i's own API tests 135/186 (docs/ssh.md).
 - [ ] Phase 4: ODBC/JDBC and ACS host servers, so existing tools connect.

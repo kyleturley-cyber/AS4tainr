@@ -124,7 +124,7 @@ impl Job<'_> {
             // CPY and MOV (CL reference): a stream file copied or moved
             // to TOOBJ, or into TODIR under its own name; CPY keeps a
             // target unless REPLACE(*YES). Directories are not copied.
-            "CPY" | "MOV" => {
+            "CPY" | "MOV" | "COPY" | "MOVE" => {
                 let obj = cmd.get("OBJ");
                 let from = ifs::normalize(obj)?;
                 let leaf = from.rsplit('/').next().unwrap_or("").to_string();
@@ -145,7 +145,7 @@ impl Job<'_> {
                 else {
                     return Err(cl_error(ifs::Errno(errno::ENOENT).into(), obj));
                 };
-                let moving = name == "MOV";
+                let moving = name == "MOV" || name == "MOVE";
                 if moving {
                     ifs::rename(self.client, &from, &to)
                         .await
@@ -153,10 +153,19 @@ impl Job<'_> {
                     // CPCA086, CPCA087 (PUB400, verify41 j41_mv, j41_cpy).
                     return msg(format!("CPCA086: Object {from} moved to {to}."));
                 }
-                if e.dir {
-                    bail!("CPFA0AB: {from} is a directory: as4tainr's CPY copies stream files.");
-                }
                 let replace = cmd.get("REPLACE").eq_ignore_ascii_case("*YES");
+                // A directory: with SUBTREE(*ALL), it and all in it
+                // (SUBTREE(*DIR): it and its own objects).
+                if e.dir {
+                    let subtree = cmd.get("SUBTREE").to_ascii_uppercase();
+                    if !matches!(subtree.as_str(), "*ALL" | "*DIR") {
+                        bail!("CPFA0AB: {from} is a directory: SUBTREE(*ALL) copies it.");
+                    }
+                    let n = self
+                        .copy_tree(&from, &to, replace, subtree == "*ALL")
+                        .await?;
+                    return msg(format!("CPCA087: {n} objects copied from {from} to {to}."));
+                }
                 if !replace && ifs::stat(self.client, &to).await?.is_some() {
                     return Err(cl_error(ifs::Errno(errno::EEXIST).into(), &to));
                 }
@@ -166,6 +175,7 @@ impl Job<'_> {
                 ifs::write_file(self.client, &to, &bytes, ccsid, e.mode, &self.user)
                     .await
                     .map_err(|e| cl_error(e, &to))?;
+                ifs::set_ccsid(self.client, &to, ccsid).await?;
                 msg(format!("CPCA087: Object {from} copied to {to}."))
             }
             "RNM" => {
@@ -525,17 +535,79 @@ impl Job<'_> {
                 crate::source::put_member(self.client, &m, true).await?;
                 crate::source::note_used(self.client, &lib, &file, &mbr).await;
                 let done = format!("CPCA081: Stream file {from} was copied to member {mbr}.");
+                // A member the copy made: CPC7305 in the job's log, not
+                // among the messages its caller gets (`system` shows only
+                // CPIA083/CPCA081: PUB400, verify49 r49_make; Code for IBM
+                // i sets the new member's type when it finds CPC7305 in
+                // the job log after CPYFRMSTMF: IBMiContent.ts
+                // uploadMemberContent).
+                if old.is_none() {
+                    if let Some(id) = &self.id {
+                        crate::jobs::log(
+                            self.client,
+                            id,
+                            "*COMP",
+                            &format!(
+                                "CPC7305: Member {mbr} was added to file {file} in library {lib}."
+                            ),
+                        )
+                        .await;
+                    }
+                }
+                let mut out = Vec::new();
                 if cut {
                     // CPIA083 first, then CPCA081 (r49_make).
-                    return Ok(Some(Outcome::Messages(vec![
-                        format!("CPIA083: Lines of stream file {from} longer than the records of member {mbr} were cut."),
-                        done,
-                    ])));
+                    out.push(format!("CPIA083: Lines of stream file {from} longer than the records of member {mbr} were cut."));
                 }
-                msg(done)
+                out.push(done);
+                if out.len() > 1 {
+                    return Ok(Some(Outcome::Messages(out)));
+                }
+                msg(out.pop().unwrap_or_default())
             }
             _ => Ok(None),
         }
+    }
+
+    /// Copy a directory and the objects in it (and in its directories,
+    /// `deep`): how many objects were copied.
+    async fn copy_tree(&self, from: &str, to: &str, replace: bool, deep: bool) -> Result<usize> {
+        let mut n = 0;
+        let mut todo = vec![(from.to_string(), to.to_string(), true)];
+        while let Some((f, t, top)) = todo.pop() {
+            let Some(e) = ifs::stat(self.client, &f).await? else {
+                continue;
+            };
+            if e.dir {
+                if ifs::stat(self.client, &t).await?.is_none() {
+                    ifs::mkdir(self.client, &t, e.mode, &self.user)
+                        .await
+                        .map_err(|x| cl_error(x, &t))?;
+                }
+                n += 1;
+                if top || deep {
+                    for (name, _) in ifs::list(self.client, &f).await? {
+                        todo.push((
+                            format!("{}/{name}", f.trim_end_matches('/')),
+                            format!("{}/{name}", t.trim_end_matches('/')),
+                            false,
+                        ));
+                    }
+                }
+            } else {
+                if !replace && ifs::stat(self.client, &t).await?.is_some() {
+                    return Err(cl_error(ifs::Errno(errno::EEXIST).into(), &t));
+                }
+                let (bytes, ccsid) = ifs::read_file(self.client, &f).await?;
+                ifs::write_file(self.client, &t, &bytes, ccsid, e.mode, &self.user)
+                    .await
+                    .map_err(|x| cl_error(x, &t))?;
+                // A file replaced takes the copy's CCSID too.
+                ifs::set_ccsid(self.client, &t, ccsid).await?;
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     /// CPYFRMSTMF into a database file's member: a record per line, the

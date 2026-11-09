@@ -26817,7 +26817,10 @@ async fn copy_file_selects_records() {
         (cmd, to)
     };
     let cases: Vec<(&str, Vec<&str>)> = vec![
-        ("FROMKEY(1 2) TOKEY(1 4)", vec!["2", "3", "4"]),
+        (
+            "FROMKEY(*BLDKEY (2)) TOKEY(*BLDKEY (4))",
+            vec!["2", "3", "4"],
+        ),
         ("FROMKEY(*BLDKEY (2)) NBRRCDS(2)", vec!["2", "3"]),
         (
             "INCREL((*IF CUSBAL *GT 0) (*AND CUSCTY *NE 'Chicago') (*OR CUSNO *EQ 5))",
@@ -26847,6 +26850,18 @@ async fn copy_file_selects_records() {
             .collect();
         assert_eq!(got, want, "{sel}");
     }
+    // The number-of-fields form on a packed key: its value is the key's
+    // bytes, so '2' is no packed number; CPF2951, CPD2967, CPF2968 (PUB400
+    // 2026-11-09, tools/golden/verify62.txt e62_key; this test expected
+    // the records 2-4 before that capture).
+    let e = job
+        .run(&format!(
+            "CPYF FROMFILE({lib}/CUSTMAST) TOFILE({lib}/SELK) CRTFILE(*YES) FROMKEY(1 2) TOKEY(1 4)"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("CPF2951") && e.contains("CPF2968"), "{e}");
     let e = job
         .run(&format!(
             "CPYF FROMFILE({lib}/CUSTMAST) TOFILE({lib}/SELX) CRTFILE(*YES) INCREL((*IF NOFIELD *EQ 1))"
@@ -26914,4 +26929,97 @@ async fn printer_stays_open_while_the_program_is_active() {
         .unwrap();
     let got: Vec<(String, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
     assert_eq!(got, [("RDY".to_string(), "A,B,L".to_string())]);
+}
+
+/// The Mapepire protocol as Code for IBM i uses it (mapepire.rs): replies
+/// keyed by the request's id; rows as objects keyed by column name, CHAR
+/// values without trailing blanks, numbers as JSON numbers with their own
+/// digits (the open-source Mapepire server's BlockRetrievableRequest);
+/// an unnamed expression's column named 00001 (Code for IBM i reads
+/// `Values Current TimeStamp` by that name: CompileTools.ts); an SQL
+/// error as "[SQLnnnn] text" with its SQLSTATE and SQLCODE; the QCMDEXC
+/// scalar function called for each row (IBMiContent.ts
+/// validateLibraryList: 1 for a library that exists, -1 for one that does
+/// not); `cl` with the command's messages (job log rows before 2.5).
+#[tokio::test]
+async fn mapepire_answers_code_for_ibm_i() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::mapepire::{parse, Server, J};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let mut s = Server::new(job);
+    let mut ask = async |line: String| -> J {
+        let (reply, _) = s.handle(&line).await.expect("a reply");
+        parse(&reply).unwrap()
+    };
+    let r = ask(format!(
+        r#"{{"id":"a","type":"sql","sql":"SELECT CUSNO, CUSNAM, 1 + 1 FROM {lib}.CUSTMAST ORDER BY CUSNO FETCH FIRST 1 ROWS ONLY"}}"#
+    ))
+    .await;
+    assert_eq!(r.get("id"), Some(&J::str("a")));
+    assert_eq!(r.get("success"), Some(&J::Bool(true)), "{r}");
+    let J::Arr(data) = r.get("data").unwrap() else {
+        panic!("{r}")
+    };
+    let row = &data[0];
+    assert!(matches!(row.get("CUSNO"), Some(J::Num(_))), "{r}");
+    let name = row.get("CUSNAM").and_then(J::text).unwrap();
+    assert_eq!(name, name.trim_end(), "{r}");
+    assert_eq!(row.get("00003"), Some(&J::Num("2".into())), "{r}");
+    let r = ask(r#"{"id":"b","type":"sql","sql":"SELECT * FROM NOPE"}"#.into()).await;
+    assert_eq!(r.get("success"), Some(&J::Bool(false)));
+    assert_eq!(r.get("sql_state"), Some(&J::str("42704")), "{r}");
+    assert_eq!(r.get("sql_rc"), Some(&J::Num("-204".into())), "{r}");
+    assert!(r
+        .get("error")
+        .and_then(J::text)
+        .unwrap()
+        .starts_with("[SQL0204] "));
+    let r = ask(format!(
+        r#"{{"id":"c","type":"sql","sql":"with L (X) as (values '{lib}', 'NOSUCHLIB') select X, QSYS2.QCMDEXC('CHKOBJ OBJ(QSYS/' concat X concat ') OBJTYPE(*LIB)') VALID from L"}}"#
+    ))
+    .await;
+    let J::Arr(data) = r.get("data").expect("rows") else {
+        panic!("{r}")
+    };
+    let valid: Vec<J> = data
+        .iter()
+        .map(|d| d.get("VALID").cloned().unwrap())
+        .collect();
+    assert_eq!(valid, [J::Num("1".into()), J::Num("-1".into())], "{r}");
+    let r = ask(format!(
+        r#"{{"id":"d","type":"cl","cmd":"CRTDTAARA DTAARA({lib}/MPDA) TYPE(*CHAR) LEN(5)"}}"#
+    ))
+    .await;
+    assert_eq!(r.get("success"), Some(&J::Bool(true)), "{r}");
+    let J::Arr(data) = r.get("data").unwrap() else {
+        panic!("{r}")
+    };
+    assert_eq!(data[0].get("MESSAGE_ID"), Some(&J::str("CPC0904")), "{r}");
+    let r = ask(format!(
+        r#"{{"id":"e","type":"cl","cmd":"CRTDTAARA DTAARA({lib}/MPDA) TYPE(*CHAR) LEN(5)"}}"#
+    ))
+    .await;
+    assert_eq!(r.get("success"), Some(&J::Bool(false)), "{r}");
+    assert!(r
+        .get("error")
+        .and_then(J::text)
+        .unwrap()
+        .starts_with("[CPF1023] "));
+    let r = ask(r#"{"id":"f","type":"nonsense"}"#.into()).await;
+    assert_eq!(r.get("success"), Some(&J::Bool(false)));
+    assert!(ask("not json".into()).await.get("unparseable").is_some());
 }

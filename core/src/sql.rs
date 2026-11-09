@@ -1109,6 +1109,13 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
     if toks.iter().any(|t| matches!(t, Tok::Punct(p) if p == ";")) {
         bail!("SQL0104: Only one statement can be run at a time.");
     }
+    // VALUES 'A', 'B': one row for each expression (Db2: VALUES with a
+    // list of expressions, none in parentheses); PostgreSQL wants each
+    // row in parentheses. Code for IBM i lists libraries so.
+    values_rows(&mut toks);
+    // CAST(... AS VARCHAR(10) FOR BIT DATA): the characters as they are
+    // (CCSID 65535 here is the job's: as4tainr keeps one code page).
+    drop_for_data(&mut toks);
     // Binary string constants BX'C1C2' and hexadecimal constants X'C1C2':
     // bytes, as PostgreSQL bytea constants.
     let mut i = 0;
@@ -1118,7 +1125,18 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
             if h.len() % 2 != 0 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
                 bail!("SQL0110: {h} is not a valid hexadecimal constant.");
             }
-            let lit = format!("'\\x{h}'::bytea");
+            // CAST(X'7B' AS VARCHAR(1)): characters, the bytes in the
+            // job's CCSID (37 here): Code for IBM i reads the system's
+            // variant characters so (X'7B7C5B' is "#@$" in CCSID 37).
+            let lit = if cast_to_character(&toks, i) {
+                let bytes: Vec<u8> = (0..h.len() / 2)
+                    .filter_map(|k| u8::from_str_radix(&h[2 * k..2 * k + 2], 16).ok())
+                    .collect();
+                let text = crate::ifs::codec::text(37, &bytes);
+                format!("'{}'", text.replace('\'', "''"))
+            } else {
+                format!("'\\x{h}'::bytea")
+            };
             toks.splice(i..i + 2, [Tok::Punct(lit)]);
         }
         i += 1;
@@ -2398,6 +2416,161 @@ pub async fn run_as(
     result
 }
 
+/// FOR BIT DATA, FOR SBCS DATA, FOR MIXED DATA after a character type:
+/// left out.
+fn drop_for_data(toks: &mut Vec<Tok>) {
+    let word = |t: &Tok, w: &str| matches!(t, Tok::Word(x) if x.eq_ignore_ascii_case(w));
+    let mut i = 0;
+    while i < toks.len() {
+        if word(&toks[i], "FOR") {
+            let sig: Vec<usize> = (i + 1..toks.len())
+                .filter(|&k| !matches!(toks[k], Tok::Space(_)))
+                .take(2)
+                .collect();
+            if let [a, b] = sig[..] {
+                let kind = ["BIT", "SBCS", "MIXED"].iter().any(|k| word(&toks[a], k));
+                if kind && word(&toks[b], "DATA") {
+                    toks.drain(i..=b);
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+/// VALUES e1, e2, ...: each expression a row of its own, in parentheses.
+fn values_rows(toks: &mut Vec<Tok>) {
+    let mut i = 0;
+    while i < toks.len() {
+        if !matches!(&toks[i], Tok::Word(w) if w.eq_ignore_ascii_case("VALUES")) {
+            i += 1;
+            continue;
+        }
+        // The expressions: to a closing parenthesis, the end or a clause.
+        let start = i + 1;
+        let mut depth = 0i32;
+        let mut commas = Vec::new();
+        let mut end = toks.len();
+        let mut j = start;
+        while j < toks.len() {
+            match &toks[j] {
+                Tok::Punct(p) if p == "(" => depth += 1,
+                Tok::Punct(p) if p == ")" => {
+                    if depth == 0 {
+                        end = j;
+                        break;
+                    }
+                    depth -= 1;
+                }
+                Tok::Punct(p) if p == "," && depth == 0 => commas.push(j),
+                Tok::Punct(p) if p == ";" && depth == 0 => {
+                    end = j;
+                    break;
+                }
+                Tok::Word(w)
+                    if depth == 0
+                        && matches!(
+                            w.to_ascii_uppercase().as_str(),
+                            "ORDER"
+                                | "FETCH"
+                                | "UNION"
+                                | "EXCEPT"
+                                | "INTERSECT"
+                                | "INTO"
+                                | "LIMIT"
+                                | "OFFSET"
+                                | "FOR"
+                        ) =>
+                {
+                    end = j;
+                    break;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let first = toks[start..end]
+            .iter()
+            .find(|t| !matches!(t, Tok::Space(_)));
+        let parenthesized = matches!(first, Some(Tok::Punct(p)) if p == "(");
+        if commas.is_empty() || parenthesized {
+            i = end.max(i + 1);
+            continue;
+        }
+        // Wrap each expression, from the last.
+        let mut bounds = vec![start];
+        bounds.extend(commas.iter().map(|c| c + 1));
+        let mut ends: Vec<usize> = commas.clone();
+        ends.push(end);
+        for (mut b, mut e) in bounds.into_iter().zip(ends).rev() {
+            // Inside the blanks around the expression.
+            while b < e && matches!(toks[b], Tok::Space(_)) {
+                b += 1;
+            }
+            while e > b && matches!(toks[e - 1], Tok::Space(_)) {
+                e -= 1;
+            }
+            toks.insert(e, Tok::Punct(")".into()));
+            toks.insert(b, Tok::Punct("(".into()));
+        }
+        i = end + 2 * (commas.len() + 1);
+    }
+}
+
+/// Is the token at `at` (a hexadecimal constant: X, then its string)
+/// the whole operand of CAST( ... AS CHAR/VARCHAR(n)) without FOR BIT
+/// DATA?
+fn cast_to_character(toks: &[Tok], at: usize) -> bool {
+    let sig = |from: isize, dir: isize| -> Option<usize> {
+        let mut j = from + dir;
+        while j >= 0 && (j as usize) < toks.len() {
+            if !matches!(toks[j as usize], Tok::Space(_)) {
+                return Some(j as usize);
+            }
+            j += dir;
+        }
+        None
+    };
+    let word = |j: Option<usize>| -> String {
+        match j.map(|j| &toks[j]) {
+            Some(Tok::Word(w)) => w.to_ascii_uppercase(),
+            Some(Tok::Punct(p)) => p.clone(),
+            _ => String::new(),
+        }
+    };
+    let open = sig(at as isize, -1);
+    if word(open) != "(" || word(open.and_then(|o| sig(o as isize, -1))) != "CAST" {
+        return false;
+    }
+    let as_ = sig(at as isize + 1, 1);
+    if word(as_) != "AS" {
+        return false;
+    }
+    let ty = word(as_.and_then(|a| sig(a as isize, 1)));
+    if !matches!(ty.as_str(), "CHAR" | "VARCHAR" | "CHARACTER") {
+        return false;
+    }
+    // Up to the CAST's closing parenthesis: no FOR BIT DATA.
+    let mut depth = 0;
+    let mut j = as_.unwrap_or(at);
+    while j < toks.len() {
+        match &toks[j] {
+            Tok::Punct(p) if p == "(" => depth += 1,
+            Tok::Punct(p) if p == ")" => {
+                if depth == 0 {
+                    return true;
+                }
+                depth -= 1;
+            }
+            Tok::Word(w) if w.eq_ignore_ascii_case("BIT") => return false,
+            _ => {}
+        }
+        j += 1;
+    }
+    true
+}
+
 /// SQL0443 for a trigger program's error (CPF502B); others as they are.
 fn trigger_failed_if(e: anyhow::Error) -> anyhow::Error {
     if format!("{e}").starts_with("CPF502B") {
@@ -2679,6 +2852,12 @@ mod tests {
             "values (1), ((2)), (as4tainr_svc.substr('ab', 1, 1))"
         );
         assert_eq!(tr("values (1, 2)").sql, "values (1, 2)");
+        // In a common table expression too (Code for IBM i's
+        // validateLibraryList: `with LIBRARIES (LIBRARY) as (values 'A','B')`).
+        assert_eq!(
+            tr("with l (x) as (values 'A','B') select x from l").sql,
+            "with l (x) as (values ('A'),('B')) select x from l"
+        );
         assert_eq!(tr("select a concat b from t").sql, "select a || b from t");
         assert_eq!(
             tr("select concat(a, b) from t").sql,

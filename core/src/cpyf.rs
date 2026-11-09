@@ -357,8 +357,15 @@ impl Job<'_> {
         // A selection that cannot be done ends the copy: CPF2817, as
         // CPYF's other errors (PUB400, verify56 y56_after's CPYF of a file
         // that is not there: CPF2802 then CPF2817).
-        (rrns, records) = select(&from.file, cmd, rrns, records)
-            .map_err(|e| anyhow!("{e:#}\nCPF2817: The copy was not done."))?;
+        (rrns, records) = select(&from.file, cmd, rrns, records).map_err(|e| {
+            let t = format!("{e:#}");
+            // CPF2968 is the escape message of a positioning error itself.
+            if t.contains("CPF2968") {
+                anyhow!("{t}")
+            } else {
+                anyhow!("{t}\nCPF2817: The copy was not done.")
+            }
+        })?;
         let fields: Vec<String> = from.file.fields.iter().map(|f| f.name.clone()).collect();
         // No records: CPC2957, to a file or *PRINT (PUB400 2026-10-27,
         // verify5 z_cpysplf_2f, verify8 c8_cpyf_empty).
@@ -868,7 +875,12 @@ fn key_bound(cmd: &Command, kw: &str) -> Result<Option<Vec<String>>> {
             if count != 1 {
                 bail!("{kw}: give a value for more than one key field with *BLDKEY; a key value string over several fields is not supported.");
             }
-            Ok(Some(vec![v]))
+            // The number-of-fields form gives the key's bytes as a
+            // character string: for a numeric key field that is not a
+            // value to compare (PUB400 2026-11-09, verify62 e62_key:
+            // FROMKEY(1 2) TOKEY(1 4) on a packed key gave CPF2951,
+            // CPD2967 and CPF2968; *BLDKEY is the way to give numbers).
+            Ok(Some(vec![format!("\u{0}{v}")]))
         }
     }
 }
@@ -880,8 +892,26 @@ fn select(
     rrns: Vec<i64>,
     records: Vec<rla::Record>,
 ) -> Result<(Vec<i64>, Vec<rla::Record>)> {
-    let from_key = key_bound(cmd, "FROMKEY")?;
-    let to_key = key_bound(cmd, "TOKEY")?;
+    let mut from_key = key_bound(cmd, "FROMKEY")?;
+    let mut to_key = key_bound(cmd, "TOKEY")?;
+    for (kw, b) in [("FROMKEY", &mut from_key), ("TOKEY", &mut to_key)] {
+        if let Some(v) = b.as_mut().and_then(|v| v.first_mut()) {
+            if let Some(raw) = v.strip_prefix('\u{0}') {
+                let numeric = match file.keys.first() {
+                    Some(k) => is_numeric(file, k)?,
+                    None => false,
+                };
+                if numeric {
+                    bail!(
+                        "CPF2951: The {kw} value is not a value of the from-file's key.\nCPD2967: The member of file {} could not be positioned to the key.\nCPF2968: The copy of file {} could not be positioned.",
+                        file.name,
+                        file.name
+                    );
+                }
+                *v = raw.to_string();
+            }
+        }
+    }
     if (from_key.is_some() || to_key.is_some()) && file.keys.is_empty() {
         bail!(
             "FROMKEY and TOKEY need a keyed from-file; {} has no key.",

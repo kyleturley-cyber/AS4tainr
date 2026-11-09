@@ -28,6 +28,9 @@ const LOCK: i64 = 0x5153_4846_5300; // "QSHFS"
 const SYSTEM_DIRS: &[&str] = &[
     "bin", "boot", "dev", "etc", "lib", "lib32", "lib64", "libx32", "media", "mnt", "opt", "proc",
     "root", "run", "sbin", "srv", "sys", "usr", "var",
+    // The PASE programs as4tainr provides (/QOpenSys/usr/bin/system,
+    // the Java command: sshd.rs) are in the container's /QOpenSys.
+    "QOpenSys",
 ];
 
 const MANIFEST: &str = ".as4tainr-manifest.json";
@@ -294,6 +297,18 @@ impl Mirror {
     /// directories are at their IFS paths, starting in `cwd`: the
     /// program and its arguments.
     pub fn command(&self, cwd: &str, line: &str) -> Option<(String, Vec<String>)> {
+        self.command_with(cwd, line, "/bin/sh", true)
+    }
+
+    /// `command`, run by this shell, with its standard error apart from
+    /// its standard output unless `merge` (an SSH command's are apart).
+    pub fn command_with(
+        &self,
+        cwd: &str,
+        line: &str,
+        shell: &str,
+        merge: bool,
+    ) -> Option<(String, Vec<String>)> {
         let (unshare, opts) = namespace().as_ref()?;
         let mut tops: Vec<String> = std::fs::read_dir(&self.root)
             .ok()?
@@ -309,7 +324,7 @@ impl Mirror {
         let mount = ["/usr/bin/mount", "/bin/mount"]
             .into_iter()
             .find(|p| Path::new(p).exists())?;
-        let mut script = String::from("exec 2>&1\n");
+        let mut script = String::from(if merge { "exec 2>&1\n" } else { "" });
         // A top-level directory the container does not have is made
         // first; where it cannot be (as4tainr not running as root: the
         // namespace's root cannot write in the container's /), the
@@ -322,7 +337,10 @@ impl Mirror {
                 s = sh_quote(&src.to_string_lossy()),
             ));
         }
-        script.push_str("cd \"$1\" 2>/dev/null || cd /\nexec /bin/sh -c \"$2\"\n");
+        script.push_str(&format!(
+            "cd \"$1\" 2>/dev/null || cd /\nexec {} -c \"$2\"\n",
+            sh_quote(shell)
+        ));
         let mut args = opts.clone();
         args.extend([
             "--".into(),
@@ -354,6 +372,16 @@ impl Mirror {
         let mut here = walk(&self.root);
         here.sort();
         let seen: BTreeSet<String> = here.iter().map(|(p, _)| p.clone()).collect();
+        // Files the command removed, by modification time and size: a new
+        // file with the same is the one moved (mv keeps both), so the IFS
+        // renames it, keeping its CCSID, mode and owner.
+        let mut moved_from: BTreeMap<(i128, u64), String> = self
+            .manifest
+            .entries
+            .iter()
+            .filter(|(p, r)| !r.dir && !seen.contains(*p))
+            .map(|(p, r)| ((r.mtime_ns, r.size), p.clone()))
+            .collect();
         for (p, dir) in &here {
             let known = self.manifest.entries.get(p).cloned();
             if *dir {
@@ -372,6 +400,14 @@ impl Mirror {
                 None => true,
                 Some(r) => r.dir || meta != Some((r.mtime_ns, r.size)),
             };
+            if known.is_none() {
+                if let Some(from) = meta.and_then(|m| moved_from.remove(&m)) {
+                    if crate::ifs::rename(client, &from, p).await.is_ok() {
+                        self.manifest.entries.remove(&from);
+                        continue;
+                    }
+                }
+            }
             if changed {
                 let data = std::fs::read(&l)?;
                 let mode = std::fs::metadata(&l)

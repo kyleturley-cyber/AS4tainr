@@ -1009,10 +1009,10 @@ fn check_deps(d: &Definition, bound: &[Bound]) -> Result<()> {
                 d.name,
                 what.join(", ")
             );
-            match &dep.msgid {
-                Some(id) => bail!("{id}: {text}\nCPF0006: The command has errors and was not run."),
-                None => bail!("{text}\nCPF0006: The command has errors and was not run."),
-            }
+            // Without MSGID: CPD0150 (PUB400 2026-11-09,
+            // tools/golden/verify62.txt e62_dep).
+            let id = dep.msgid.as_deref().unwrap_or("CPD0150");
+            bail!("{id}: {text}\nCPF0006: The command has errors and was not run.");
         }
     }
     Ok(())
@@ -1973,7 +1973,8 @@ Q1:          QUAL       TYPE(*NAME) LEN(10)
         assert!(e.starts_with("USR0001") && e.contains("CPF0006"), "{e}");
         assert!(bind(&d, "DEPT TYPE(*FILE) FILE(X)").is_ok());
         assert!(bind(&d, "DEPT A(Y)").is_ok());
+        // Without MSGID: CPD0150, then CPF0006 (PUB400, verify62 e62_dep).
         let e = bind(&d, "DEPT A(Y) B(N)").unwrap_err().to_string();
-        assert!(e.contains("CPF0006") && !e.starts_with("USR"), "{e}");
+        assert!(e.starts_with("CPD0150") && e.contains("CPF0006"), "{e}");
     }
 }

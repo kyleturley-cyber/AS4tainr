@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 44";
+const VERSION: &str = "as4tainr services 51";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -571,16 +571,19 @@ fn library_list_info() -> String {
     format!(
         "CREATE OR REPLACE VIEW qsys2.library_list_info AS
          SELECT CAST(x.n AS integer) AS ordinal_position,
-                CAST(upper(x.s) AS varchar(128)) COLLATE \"C\" AS schema_name,
-                CAST(upper(x.s) AS varchar(10)) COLLATE \"C\" AS system_schema_name,
-                CAST(CASE WHEN upper(x.s) IN ({sys}) THEN 'SYSTEM'
-                          WHEN upper(x.s) = current_setting('as4tainr.curlib', true) THEN 'CURRENT'
+                CAST(x.l AS varchar(128)) COLLATE \"C\" AS schema_name,
+                CAST(x.l AS varchar(10)) COLLATE \"C\" AS system_schema_name,
+                CAST(CASE WHEN x.l IN ({sys}) THEN 'SYSTEM'
+                          WHEN x.l = current_setting('as4tainr.curlib', true) THEN 'CURRENT'
                           ELSE 'USER' END AS varchar(15)) COLLATE \"C\" AS type,
                 CAST(0 AS smallint) AS iasp_number,
                 CAST(nullif(o.text, '') AS varchar(50)) COLLATE \"C\" AS text_description
-         FROM unnest(current_schemas(false)) WITH ORDINALITY AS x(s, n)
+         FROM (SELECT s, n,
+                      -- The job's QTEMP (qtemp.rs: #QTnnnnnn, #QPnnnnnnn) by its name.
+                      CASE WHEN upper(s) ~ '^#Q[TP][0-9]+$' THEN 'QTEMP' ELSE upper(s) END AS l
+                 FROM unnest(current_schemas(false)) WITH ORDINALITY AS u(s, n)) AS x
          LEFT JOIN as4tainr.objects o
-           ON o.library = 'QSYS' AND o.objtype = '*LIB' AND o.name = upper(x.s)
+           ON o.library = 'QSYS' AND o.objtype = '*LIB' AND o.name = x.l
          WHERE x.s <> 'as4tainr_cast';",
         sys = system.join(", ")
     )
@@ -752,7 +755,12 @@ BEGIN
     n := split_part(q, '/', 1)::bigint;
   END IF;
   SELECT s.id INTO f FROM as4tainr.spooled_files s
-   WHERE s.job = n AND s.user_name = split_part(q, '/', 2) AND s.job_name = split_part(q, '/', 3)
+   WHERE s.job = n
+     -- job_name is the qualified name (spool.rs open); a bare name with
+     -- the user in user_name is taken too.
+     AND ((split_part(s.job_name, '/', 2) = split_part(q, '/', 2)
+           AND split_part(s.job_name, '/', 3) = split_part(q, '/', 3))
+          OR (s.job_name = split_part(q, '/', 3) AND s.user_name = split_part(q, '/', 2)))
      AND s.file = upper(trim(spooled_file_name))
      AND (spooled_file_number IS NULL OR s.number = spooled_file_number)
    ORDER BY s.number DESC LIMIT 1;
@@ -1457,6 +1465,187 @@ FROM (SELECT library, name, '*PGM' AS objtype, binding::jsonb AS b
 CROSS JOIN LATERAL jsonb_array_elements(COALESCE(o.b->'srvpgms', '[]'::jsonb)) s;
 "#;
 
+/// The table functions under the LIBRARY_LIST_INFO and USER_INFO views
+/// (IBM i services: QSYS2.QSQLIBL() and QSYS2.QSYUSRINFO(USERNAME), which
+/// Code for IBM i calls by these names), with the views' columns.
+const VIEW_FUNCTIONS: &str = r#"
+CREATE OR REPLACE FUNCTION qsys2.qsqlibl() RETURNS SETOF qsys2.library_list_info
+LANGUAGE sql STABLE AS $$ SELECT * FROM qsys2.library_list_info $$;
+CREATE OR REPLACE FUNCTION qsys2.qsyusrinfo(username varchar) RETURNS SETOF qsys2.user_info
+LANGUAGE sql STABLE AS $$ SELECT * FROM qsys2.user_info WHERE authorization_name = username $$;
+"#;
+
+/// The QSYS2.QCMDEXC scalar function (IBM i services: 1 when the command
+/// ran, -1 when it failed) in a query that calls it for its rows, as
+/// Mapepire runs one (mapepire.rs): the statement runs once to gather the
+/// commands (each new one is recorded, its value null), as4tainr runs
+/// them, and the statement runs again with their results. A statement
+/// that is not run this way (no gathering row for its job) gets SQL0901.
+const QCMDEXC_FUNCTION: &str = r#"
+CREATE UNLOGGED TABLE IF NOT EXISTS as4tainr.qcmdexc_calls (
+    job  text NOT NULL,
+    seq  bigserial,
+    cmd  text NOT NULL,
+    rc   integer,
+    PRIMARY KEY (job, cmd)
+);
+CREATE OR REPLACE FUNCTION qsys2.qcmdexc(cmd varchar) RETURNS integer
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+  j text := coalesce(current_setting('as4tainr.job_key', true), '');
+  r integer;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM as4tainr.qcmdexc_calls c WHERE c.job = j AND c.cmd = '') THEN
+    RAISE EXCEPTION 'SQL0901: QSYS2.QCMDEXC is called for the rows of this statement: that is not supported here.'
+      USING ERRCODE = '58004';
+  END IF;
+  SELECT c.rc INTO r FROM as4tainr.qcmdexc_calls c WHERE c.job = j AND c.cmd = qcmdexc.cmd;
+  IF FOUND THEN
+    RETURN r;
+  END IF;
+  INSERT INTO as4tainr.qcmdexc_calls (job, cmd) VALUES (j, qcmdexc.cmd) ON CONFLICT DO NOTHING;
+  RETURN NULL;
+END $$;
+"#;
+
+/// QSYS2.SPOOLED_FILE_INFO (IBM i services): the spooled files of a user
+/// (*CURRENT: the statement's job's user; *ALL), created from a moment
+/// on, with a status (*READY, *HELD, *OPEN... or *ALL), on an output
+/// queue, with user data. The columns Code for IBM i reads, and the
+/// spooled file's own; the others IBM's function has are not here
+/// (docs/fidelity-gaps.md).
+const SPOOLED_FILE_INFO: &str = r#"
+DROP FUNCTION IF EXISTS qsys2.spooled_file_info(varchar, timestamp, timestamp, varchar, varchar, varchar, varchar, varchar);
+CREATE FUNCTION qsys2.spooled_file_info(
+  user_name varchar DEFAULT '*CURRENT', starting_timestamp timestamp DEFAULT NULL,
+  ending_timestamp timestamp DEFAULT NULL, status varchar DEFAULT '*ALL',
+  output_queue varchar DEFAULT '*ALL', user_data varchar DEFAULT '*ALL',
+  form_type varchar DEFAULT '*ALL', system_name varchar DEFAULT '*ALL')
+RETURNS TABLE (
+  creation_timestamp timestamp, spooled_file_name varchar(10), user_name varchar(10),
+  user_data varchar(10), status varchar(15), total_pages integer,
+  job_name varchar(10), job_user varchar(10), job_number varchar(6),
+  spooled_file_number integer, qualified_job_name varchar(28),
+  output_queue_library varchar(10), output_queue varchar(10))
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  SELECT s.created::timestamp, CAST(s.file AS varchar(10)), CAST(s.user_name AS varchar(10)),
+         CAST(nullif(s.user_data, '') AS varchar(10)),
+         CAST(CASE s.status WHEN 'RDY' THEN 'READY' WHEN 'HLD' THEN 'HELD' WHEN 'OPN' THEN 'OPEN'
+                            WHEN 'SAV' THEN 'SAVED' WHEN 'WTR' THEN 'WRITING' ELSE s.status END AS varchar(15)),
+         s.pages,
+         CAST(split_part(s.job_name, '/', 3) AS varchar(10)),
+         CAST(split_part(s.job_name, '/', 2) AS varchar(10)),
+         CAST(split_part(s.job_name, '/', 1) AS varchar(6)),
+         s.number, CAST(s.job_name AS varchar(28)),
+         CAST(s.outq_lib AS varchar(10)), CAST(s.outq AS varchar(10))
+    FROM as4tainr.spooled_files s
+   WHERE (upper($1) = '*ALL'
+          OR s.user_name = CASE WHEN upper($1) = '*CURRENT'
+                                THEN current_setting('as4tainr.user', true) ELSE upper($1) END)
+     AND ($2 IS NULL OR s.created::timestamp >= $2)
+     AND ($3 IS NULL OR s.created::timestamp <= $3)
+     AND (upper($4) = '*ALL'
+          OR s.status = CASE upper($4) WHEN '*READY' THEN 'RDY' WHEN '*HELD' THEN 'HLD'
+                                        WHEN '*OPEN' THEN 'OPN' WHEN '*SAVED' THEN 'SAV'
+                                        WHEN '*WRITING' THEN 'WTR' ELSE upper($4) END)
+     AND (upper($5) = '*ALL' OR s.outq = upper(split_part($5, '/', 2)) OR s.outq = upper($5))
+     AND (upper($6) = '*ALL' OR rtrim(s.user_data) = rtrim($6))
+   ORDER BY s.created, s.id
+$$;
+"#;
+
+/// QSYS2.LIBRARY_INFO(LIBRARY_NAME [, IGNORE_ERRORS] [, DETAILED_INFO])
+/// (IBM i services): a library's description. as4tainr has one ASP: the
+/// IASP name is *SYSBAS (Code for IBM i takes *SYSBAS as "not in an
+/// independent ASP"). The columns as4tainr can give; IBM's function has
+/// more (docs/fidelity-gaps.md).
+const LIBRARY_INFO: &str = r#"
+DROP FUNCTION IF EXISTS qsys2.library_info(varchar, varchar, varchar);
+CREATE FUNCTION qsys2.library_info(
+  library_name varchar, ignore_errors varchar DEFAULT 'NO', detailed_info varchar DEFAULT 'NO')
+RETURNS TABLE (
+  object_count integer, library_type varchar(7), text_description varchar(50),
+  iasp_name varchar(10), iasp_number smallint)
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+  lib text := upper(trim(library_name));
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM as4tainr.objects o
+                  WHERE o.library = 'QSYS' AND o.objtype = '*LIB' AND o.name = lib) THEN
+    IF upper(coalesce(ignore_errors, 'NO')) = 'YES' THEN
+      RETURN;
+    END IF;
+    RAISE EXCEPTION 'SQL0204: % in QSYS type *LIB not found.', lib USING ERRCODE = '42704';
+  END IF;
+  RETURN QUERY
+  SELECT CAST((SELECT count(*) FROM as4tainr.objects x WHERE x.library = lib) AS integer),
+         CAST(CASE WHEN o.attribute = 'TEST' THEN 'TEST' ELSE 'PROD' END AS varchar(7)),
+         CAST(nullif(o.text, '') AS varchar(50)),
+         CAST('*SYSBAS' AS varchar(10)), CAST(1 AS smallint)
+    FROM as4tainr.objects o
+   WHERE o.library = 'QSYS' AND o.objtype = '*LIB' AND o.name = lib;
+END $$;
+"#;
+
+/// QSYS2.SYSFILES (Db2 for i catalog: the database files) over the
+/// physical and logical files: FILE_TYPE SOURCE or DATA, the record
+/// length (a source file's RCDLEN). The columns Code for IBM i reads,
+/// with the names; IBM's view has more (docs/fidelity-gaps.md).
+///
+/// QSYS2.PARTITION_STATISTICS(schema, table) (the table function under
+/// SYSPARTITIONSTAT): one row per member: a source file's members, with
+/// their type, text, lines and dates; a data file's one member, named as
+/// the file.
+const FILE_CATALOG: &str = r#"
+CREATE OR REPLACE VIEW qsys2.sysfiles AS
+SELECT CAST(o.library AS varchar(128)) COLLATE "C" AS table_schema,
+       CAST(o.name AS varchar(128)) COLLATE "C" AS table_name,
+       CAST(o.library AS varchar(10)) COLLATE "C" AS system_table_schema,
+       CAST(o.name AS varchar(10)) COLLATE "C" AS system_table_name,
+       CAST(CASE WHEN sf.name IS NOT NULL OR o.attribute = 'PF-SRC' THEN 'SOURCE' ELSE 'DATA' END
+            AS varchar(6)) COLLATE "C" AS file_type,
+       CAST(CASE WHEN o.attribute = 'LF' THEN 'LOGICAL' ELSE 'PHYSICAL' END AS varchar(8)) COLLATE "C" AS native_type,
+       CAST(coalesce(sf.rcdlen, t.row_length) AS integer) AS record_length,
+       CAST(nullif(o.text, '') AS varchar(50)) COLLATE "C" AS text_description
+  FROM as4tainr.objects o
+  LEFT JOIN as4tainr.source_files sf ON sf.library = o.library AND sf.name = o.name
+  LEFT JOIN qsys2.systables t ON t.system_table_schema = o.library AND t.system_table_name = o.name
+ WHERE o.objtype = '*FILE' AND o.attribute IN ('PF', 'LF', 'PF-SRC', 'PF-DTA', 'LF-DTA');
+
+DROP FUNCTION IF EXISTS qsys2.partition_statistics(varchar, varchar);
+CREATE FUNCTION qsys2.partition_statistics(table_schema varchar, table_name varchar)
+RETURNS TABLE (
+  table_schema varchar(128), table_name varchar(128), table_partition varchar(128),
+  number_rows bigint, avgrowsize integer, create_timestamp timestamp,
+  last_change_timestamp timestamp, last_used_timestamp timestamp, days_used_count integer,
+  system_table_schema char(10), system_table_name char(10), system_table_member char(10),
+  source_type varchar(10), last_source_update_timestamp timestamp, text varchar(50))
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  SELECT CAST(m.library AS varchar(128)), CAST(m.file AS varchar(128)), CAST(m.member AS varchar(128)),
+         CAST(CASE WHEN m.source = '' THEN 0
+                   ELSE length(m.source) - length(replace(m.source, chr(10), ''))
+                        + CASE WHEN right(m.source, 1) = chr(10) THEN 0 ELSE 1 END END AS bigint),
+         CAST(coalesce(sf.rcdlen, 92) AS integer),
+         m.added::timestamp, m.changed::timestamp, m.last_used::timestamp, m.days_used,
+         CAST(m.library AS char(10)), CAST(m.file AS char(10)), CAST(m.member AS char(10)),
+         CAST(nullif(m.srctype, '') AS varchar(10)), m.changed::timestamp,
+         CAST(nullif(m.text, '') AS varchar(50))
+    FROM as4tainr.source_members m
+    LEFT JOIN as4tainr.source_files sf ON sf.library = m.library AND sf.name = m.file
+   WHERE m.library = upper(rtrim($1)) AND m.file = upper(rtrim($2))
+  UNION ALL
+  SELECT CAST(o.library AS varchar(128)), CAST(o.name AS varchar(128)), CAST(o.name AS varchar(128)),
+         CAST(0 AS bigint), CAST(f.record_length AS integer),
+         o.created::timestamp, o.created::timestamp, NULL::timestamp, 0,
+         CAST(o.library AS char(10)), CAST(o.name AS char(10)), CAST(o.name AS char(10)),
+         NULL::varchar(10), NULL::timestamp, CAST(nullif(o.text, '') AS varchar(50))
+    FROM as4tainr.objects o
+    JOIN qsys2.sysfiles f ON f.system_table_schema = o.library AND f.system_table_name = o.name
+   WHERE o.objtype = '*FILE' AND f.file_type = 'DATA'
+     AND o.library = upper(rtrim($1)) AND o.name = upper(rtrim($2))
+$$;
+"#;
+
 /// The services added with this version: definitions and grants.
 fn work_services() -> String {
     format!(
@@ -1472,6 +1661,12 @@ fn work_services() -> String {
          {IFS_READ}
          {ENV_VARS}
          {BOUND_SRVPGM_INFO}
+         {VIEW_FUNCTIONS}
+         {QCMDEXC_FUNCTION}
+         {SPOOLED_FILE_INFO}
+         {LIBRARY_INFO}
+         {FILE_CATALOG}
+         GRANT SELECT ON qsys2.sysfiles TO {SQL_ROLE};
          GRANT SELECT ON qsys2.bound_srvpgm_info TO {SQL_ROLE};
          GRANT SELECT ON qsys2.library_list_info, qsys2.user_info, qsys2.system_value_info,
                qsys2.sysroutines, qsys2.sysparms, qsys2.environment_variable_info,

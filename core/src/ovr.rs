@@ -38,6 +38,10 @@ pub struct Override {
     /// data.
     pub splfname: Option<String>,
     pub usrdta: Option<String>,
+    /// OVRPRTF HOLD(*YES): the spooled file is held; SPLFOWN: its owner
+    /// (*CURUSRPRF: the job's current user).
+    pub hold: bool,
+    pub splfown: Option<String>,
     /// OVRSCOPE(*ACTGRPDFN) from a program of a non-default activation
     /// group: the override is scoped to that activation group, so it
     /// stays when the program that made it returns.
@@ -136,6 +140,8 @@ mod tests {
             no_lvlchk: false,
             splfname: None,
             usrdta: None,
+            hold: false,
+            splfown: None,
             actgrp: None,
             mbr: None,
         }

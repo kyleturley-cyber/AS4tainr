@@ -233,6 +233,32 @@ pub async fn start_interactive(
     })
 }
 
+/// A host server job for a client (the database server's QZDASOINIT,
+/// a prestart job in QUSRWRK running under QUSER) starts serving `user`.
+pub async fn start_server_job(
+    client: &Client,
+    name: &str,
+    user: &str,
+    curlib: Option<&str>,
+    libl: &[String],
+) -> Result<JobId> {
+    let number = next_number(client).await?;
+    client
+        .execute(
+            "INSERT INTO as4tainr.jobs (number, name, user_name, type, subsystem, status, activity, curlib, libl, started)
+             VALUES ($1, $2, 'QUSER', 'BCI', 'QUSRWRK', 'ACTIVE', 'RUN', $3, $4, now())",
+            &[&number, &name, &curlib, &libl],
+        )
+        .await?;
+    crate::dtaara::lda_start(client, number, None).await?;
+    let _ = user;
+    Ok(JobId {
+        number,
+        user: "QUSER".to_string(),
+        name: name.to_string(),
+    })
+}
+
 /// The job ends: interactive jobs at sign-off, batch jobs when their
 /// command ends. Ended jobs keep their row and job log (status OUTQ).
 pub async fn end(client: &Client, id: &JobId, normal: bool) -> Result<()> {

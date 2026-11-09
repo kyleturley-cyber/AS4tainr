@@ -462,6 +462,21 @@ pub async fn set_mode(client: &Client, path: &str, mode: i32) -> Result<()> {
     Ok(())
 }
 
+/// Tag a stream file with a CCSID (its bytes stay as they are).
+pub async fn set_ccsid(client: &Client, path: &str, ccsid: i32) -> Result<()> {
+    let path = normalize(path)?;
+    let n = client
+        .execute(
+            "UPDATE as4tainr.ifs SET ccsid = $2, changed = now() WHERE path_key = $1",
+            &[&key(&path), &ccsid],
+        )
+        .await?;
+    if n == 0 {
+        return err(errno::ENOENT);
+    }
+    Ok(())
+}
+
 pub async fn set_owner(client: &Client, path: &str, owner: &str) -> Result<()> {
     let path = normalize(path)?;
     let n = client

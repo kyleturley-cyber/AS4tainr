@@ -367,6 +367,9 @@ pub const SYSTEM_LIBRARIES: &[(&str, &str)] = &[
     ("QSYS2", "System library for SQL objects"),
     ("QHLPSYS", "Library for help text"),
     ("QUSRSYS", "System library for user objects"),
+    // The Db2 for i services of SYSTOOLS (SPOOLED_FILE_DATA...): a
+    // library too (Code for IBM i's tests make it the current library).
+    ("SYSTOOLS", "System library for SQL tools"),
     ("QGPL", "General purpose library"),
     ("QTEMP", "Temporary library"),
 ];

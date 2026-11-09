@@ -401,8 +401,12 @@ impl Job<'_> {
         if let Some(c) = &self.curlib {
             out.push((c.clone(), "CUR"));
         }
+        // The current library can be in the user part too: it is shown
+        // twice (CUR, then USR), as Code for IBM i's tests see on IBM i
+        // (src/api/tests/suites/connection.test.ts, "runCommand (ILE,
+        // custom library list)": CURLIB(QSYSINC) LIBL(QSYSINC)).
         for l in &self.libl {
-            if !out.iter().any(|(x, _)| x == l) {
+            if !out.iter().any(|(x, t)| x == l && *t != "CUR") {
                 out.push((l.clone(), "USR"));
             }
         }
@@ -5469,6 +5473,11 @@ impl Job<'_> {
                     "" | "*NONE" => None,
                     d => Some(d.to_string()),
                 },
+                hold: cmd.get("HOLD").trim().eq_ignore_ascii_case("*YES"),
+                splfown: match cmd.get("SPLFOWN").trim() {
+                    "" | "*NONE" => None,
+                    o => Some(o.to_ascii_uppercase()),
+                },
                 actgrp,
                 mbr: match cmd.get("MBR") {
                     "" | "*FIRST" => None,
@@ -10137,6 +10146,42 @@ impl Job<'_> {
     }
 
     async fn dltsplf(&mut self, cmd: &Command) -> Result<Outcome> {
+        // FILE(*SELECT): the spooled files of a user (*CURRENT: this
+        // job's; *ALL), with this user data (*ALL: any); the device and
+        // form type elements are not kept by as4tainr's spooling.
+        if cmd.get("FILE").eq_ignore_ascii_case("*SELECT") {
+            let sel = cmd.list("SELECT");
+            let el = |i: usize| -> String {
+                sel.get(i)
+                    .map(|x| x.trim().trim_matches('\'').to_string())
+                    .filter(|x| !x.is_empty())
+                    .unwrap_or_else(|| "*ALL".into())
+            };
+            let user = match el(0).to_ascii_uppercase().as_str() {
+                "*CURRENT" => self.user.clone(),
+                u => u.to_string(),
+            };
+            let usrdta = el(3);
+            let ids: Vec<i64> = self
+                .client
+                .query(
+                    "SELECT id FROM as4tainr.spooled_files
+                      WHERE ($1 = '*ALL' OR user_name = $1)
+                        AND ($2 = '*ALL' OR rtrim(user_data) = rtrim($2))",
+                    &[&user, &usrdta],
+                )
+                .await?
+                .iter()
+                .map(|r| r.get(0))
+                .collect();
+            for id in &ids {
+                crate::spool::delete(self.client, *id).await?;
+            }
+            return Ok(Outcome::Messages(vec![format!(
+                "{} spooled files deleted.",
+                ids.len()
+            )]));
+        }
         let f = self.spooled_file(cmd).await?;
         crate::spool::delete(self.client, f.id).await?;
         Ok(Outcome::Messages(vec![format!(

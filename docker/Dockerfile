@@ -10,7 +10,8 @@ COPY samples samples
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends bash diffutils ca-certificates && rm -rf /var/lib/apt/lists/*
+# openssl and git: PASE tools Code for IBM i uses over SSH (docs/ssh.md).
+RUN apt-get update && apt-get install -y --no-install-recommends bash diffutils ca-certificates openssl git && rm -rf /var/lib/apt/lists/*
 COPY --from=core /src/target/release/as4tainr /usr/local/bin/as4tainr
 COPY samples /opt/as4tainr/samples
 COPY scripts/demo.sh scripts/samples.sh /opt/as4tainr/
@@ -22,4 +23,6 @@ ENV AS4TAINR_PGM_PATH=/opt/as4tainr/samples/qrpglesrc \
 EXPOSE 23
 # The browser 5250 terminal (HTTP). Map it to a free host port, e.g. 5250.
 EXPOSE 8080
+# SSH, when AS4TAINR_SSH_LISTEN is set (Code for IBM i, sftp): docs/ssh.md.
+EXPOSE 22
 ENTRYPOINT ["/opt/as4tainr/entrypoint.sh"]

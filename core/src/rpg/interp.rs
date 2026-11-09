@@ -30,7 +30,7 @@ mod cycle;
 #[path = "errors.rs"]
 mod errors;
 #[path = "exec_sql.rs"]
-mod exec_sql;
+pub(crate) mod exec_sql;
 pub use exec_sql::take_result_sets;
 #[path = "cli.rs"]
 pub mod cli;

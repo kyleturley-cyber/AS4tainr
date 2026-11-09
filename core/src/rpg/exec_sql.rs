@@ -221,7 +221,7 @@ impl Outcome {
 }
 
 /// SQLSTATE for an SQLCODE, as DB2 for i reports them.
-pub(super) fn sqlstate(code: i64) -> &'static str {
+pub(crate) fn sqlstate(code: i64) -> &'static str {
     match code {
         0 => "00000",
         100 => "02000",
@@ -247,7 +247,8 @@ pub(super) fn sqlstate(code: i64) -> &'static str {
         -811 => "21000",
         // Row or object in use (DB2 for i SQL Messages and Codes).
         -913 => "57033",
-        _ => "58004",
+        // The others SQL procedures know (sqlpl.rs: -438, -440, -802).
+        other => crate::sqlpl::sqlstate_for(other),
     }
 }
 

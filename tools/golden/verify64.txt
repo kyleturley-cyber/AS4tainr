@@ -1,0 +1,15 @@
+# Golden (batch 4): the Mapepire server (single mode, as Code for IBM i
+# starts it over SSH) answering requests about statements, results,
+# prepared statements, errors and CL commands (mp64.jsonl, one request per
+# line); PASE's uname and attr; COPY SUBTREE(*ALL).
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify64.txt -Files tools\golden\verify64
+m64_cleanup|!for c in "DLTF FILE(AS4TRAINR1/GLD64T)" "DLTF FILE(AS4TRAINR1/GLD64S)" "DLTDTAARA DTAARA(AS4TRAINR1/GLD64A)"; do system -q "$c"; done; rm -rf /home/AS4TRAINR/gld64c /home/AS4TRAINR/gld64d; echo cleaned
+m64_tag|!for f in mp64.jsonl gld64m.clle; do setccsid 819 /home/AS4TRAINR/gld/$f; done; ls /home/AS4TRAINR/gld | grep -E "mp64|gld64"
+m64_java|!ls /QOpenSys/pkgs/lib/mapepire/ /QOpenSys/QIBM/ProdData/JavaVM/ ~/.vscode/ ~/.mapepire/ 2>&1 | head -30
+m64_mapepire|!J=$(ls /QOpenSys/pkgs/lib/mapepire/mapepire-server.jar ~/.vscode/mapepire-server-*.jar ~/.mapepire/mapepire-server-*.jar 2>/dev/null | head -1); echo "jar=$J"; cd /home/AS4TRAINR && env QIBM_JAVA_STDIO_CONVERT=N QIBM_PASE_DESCRIPTOR_STDIO=B QIBM_USE_DESCRIPTOR_STDIO=Y QIBM_MULTI_THREADED=Y /QOpenSys/QIBM/ProdData/JavaVM/jdk80/64bit/bin/java -Djdbc.db2.restricted.local.connection.only=true -Dos400.stdio.convert=N -jar "$J" --single < /home/AS4TRAINR/gld/mp64.jsonl
+m64_uname|!uname -rv; uname -s; uname -a
+m64_attr|!mkdir -p /home/AS4TRAINR/gld64c/sub; echo "I am a test file" > /home/AS4TRAINR/gld64c/sub/t.txt; attr -p /home/AS4TRAINR/gld64c/sub/t.txt DATA_SIZE OBJTYPE CCSID; attr -p /home/AS4TRAINR/gld64c/sub DATA_SIZE OBJTYPE; attr /home/AS4TRAINR/gld64c/sub/t.txt CCSID; attr /home/AS4TRAINR/gld64c/sub/t.txt CCSID=37; attr /home/AS4TRAINR/gld64c/sub/t.txt CCSID
+m64_copy|COPY OBJ('/home/AS4TRAINR/gld64c') TODIR('/home/AS4TRAINR/gld64d') SUBTREE(*ALL) REPLACE(*YES)
+m64_copied|!mkdir -p /home/AS4TRAINR/gld64d; system "COPY OBJ('/home/AS4TRAINR/gld64c') TODIR('/home/AS4TRAINR/gld64d') SUBTREE(*ALL) REPLACE(*YES)"; find /home/AS4TRAINR/gld64d; attr /home/AS4TRAINR/gld64d/gld64c/sub/t.txt CCSID
+m64_mv|!mkdir -p /home/AS4TRAINR/gld64d/mv; mv /home/AS4TRAINR/gld64c/sub/t.txt /home/AS4TRAINR/gld64d/mv/; attr /home/AS4TRAINR/gld64d/mv/t.txt CCSID
+m64_end|!rm -rf /home/AS4TRAINR/gld64c /home/AS4TRAINR/gld64d; echo cleaned

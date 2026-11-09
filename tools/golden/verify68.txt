@@ -1,0 +1,11 @@
+# Golden (batch 8): verify67's reads with rows in the table: the table is
+# made and filled by RUNSQL COMMIT(*NONE) first (verify66/67's INSERT
+# through Mapepire got SQL7008: AS4TRAINR1 is not journaled and the
+# connection property did not turn commitment control off); the batch
+# INSERT and the UPDATE through Mapepire end WITH NC.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify68.txt -Files tools\golden\verify68
+o68_cleanup|!for c in "DLTF FILE(AS4TRAINR1/GLD68T)" "DLTF FILE(AS4TRAINR1/GLD68U)"; do system -q "$c"; done; echo cleaned
+o68_tag|!setccsid 819 /home/AS4TRAINR/gld/mp68.jsonl; ls /home/AS4TRAINR/gld | grep mp68
+o68_make|!system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD68T (C CHAR(5), V VARCHAR(10), D DECIMAL(7, 2), Z NUMERIC(5, 0), I INTEGER, S SMALLINT, B BIGINT, DT DATE, TM TIME, TS TIMESTAMP, F DOUBLE, BN BINARY(2))') COMMIT(*NONE)"; system "RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD68T VALUES (''ab'', ''cd  '', -12.50, 7, 1, 2, 3, ''2026-11-09'', ''13.14.15'', ''2026-11-09-13.14.15.123456'', 1.5, BX''C1C2''), (NULL, NULL, NULL, NULL, 2, NULL, NULL, NULL, NULL, NULL, NULL, NULL)') COMMIT(*NONE)"
+o68_mapepire|!cd /home/AS4TRAINR && while IFS= read -r l; do printf '%s\n' "$l"; sleep 2; done < /home/AS4TRAINR/gld/mp68.jsonl | env QIBM_JAVA_STDIO_CONVERT=N QIBM_PASE_DESCRIPTOR_STDIO=B QIBM_USE_DESCRIPTOR_STDIO=Y QIBM_MULTI_THREADED=Y /QOpenSys/QIBM/ProdData/JavaVM/jdk80/64bit/bin/java -Djdbc.db2.restricted.local.connection.only=true -Dos400.stdio.convert=N -jar /QOpenSys/pkgs/lib/mapepire/mapepire-server.jar --single
+o68_end|!for c in "DLTF FILE(AS4TRAINR1/GLD68T)" "DLTF FILE(AS4TRAINR1/GLD68U)"; do system -q "$c"; done; echo cleaned

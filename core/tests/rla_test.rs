@@ -8286,7 +8286,8 @@ async fn rpg_set_and_restore_directives() {
 /// elements the path names go into the handler's array parameter as many
 /// at a time as it holds; the handler gets the communication area, the
 /// array and how many were filled (here 2 and then 1), and a non-zero
-/// return ends the operation.
+/// return ends the operation. "9 2 abc" is PUB400's result for the same
+/// program (2026-11-09, tools/golden/verify65.txt g65_handler).
 #[tokio::test]
 async fn rpg_xml_into_handler() {
     let url = require_db!();
@@ -27037,4 +27038,63 @@ async fn mapepire_answers_code_for_ibm_i() {
     let r = ask(r#"{"id":"f","type":"nonsense"}"#.into()).await;
     assert_eq!(r.get("success"), Some(&J::Bool(false)));
     assert!(ask("not json".into()).await.get("unparseable").is_some());
+}
+
+/// QSYS2.SYSFILES, QSYUSRINFO and LIBRARY_INFO have the columns PUB400's
+/// give (2026-11-09, tools/golden/verify66.txt n66_mapepire "sysf": 104
+/// columns; "usr": 89, CHARACTER_CODE_SET_ID -2 for *SYSVAL;
+/// verify64 m64_mapepire "li": 18), and SYSFILES is a table function too
+/// (Code for IBM i's objectBrowser.ts: TABLE(QSYS2.SYSFILES(lib, file))).
+#[tokio::test]
+async fn services_have_ibm_columns() {
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let count = |rel: &str| {
+        format!(
+            "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'qsys2' AND table_name = '{rel}'"
+        )
+    };
+    let n: i64 = client
+        .query_one(&count("sysfiles"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 104);
+    let out = |o: as4tainr_core::sql::Outcome| match o {
+        as4tainr_core::sql::Outcome::Rows { columns, rows, .. } => (columns, rows),
+        other => panic!("{other:?}"),
+    };
+    let (cols, rows) = out(as4tainr_core::sql::run(
+        &client,
+        &url,
+        std::slice::from_ref(&lib),
+        "SELECT * FROM TABLE(QSYS2.QSYUSRINFO(USERNAME => 'QSECOFR'))",
+    )
+    .await
+    .unwrap());
+    assert_eq!(cols.len(), 89);
+    assert!(!cols.iter().any(|c| c == "AUTHORIZATION_NAME"));
+    let ccsid = cols
+        .iter()
+        .position(|c| c == "CHARACTER_CODE_SET_ID")
+        .unwrap();
+    assert_eq!(rows[0][ccsid].trim(), "-2");
+    let (cols, _) = out(as4tainr_core::sql::run(
+        &client,
+        &url,
+        std::slice::from_ref(&lib),
+        &format!("SELECT * FROM TABLE(QSYS2.LIBRARY_INFO('{lib}'))"),
+    )
+    .await
+    .unwrap());
+    assert_eq!(cols.len(), 18);
+    let (_, rows) = out(as4tainr_core::sql::run(
+        &client,
+        &url,
+        std::slice::from_ref(&lib),
+        &format!("SELECT FILE_TYPE FROM TABLE(QSYS2.SYSFILES('{lib}', 'CUSTMAST'))"),
+    )
+    .await
+    .unwrap());
+    assert_eq!(rows, [["DATA".to_string()]]);
 }

@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 52";
+const VERSION: &str = "as4tainr services 54";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -1465,14 +1465,240 @@ FROM (SELECT library, name, '*PGM' AS objtype, binding::jsonb AS b
 CROSS JOIN LATERAL jsonb_array_elements(COALESCE(o.b->'srvpgms', '[]'::jsonb)) s;
 "#;
 
-/// The table functions under the LIBRARY_LIST_INFO and USER_INFO views
-/// (IBM i services: QSYS2.QSQLIBL() and QSYS2.QSYUSRINFO(USERNAME), which
-/// Code for IBM i calls by these names), with the views' columns.
+/// QSYS2.QSQLIBL() (the table function under LIBRARY_LIST_INFO, with its
+/// columns), QSYS2.QSYUSRINFO(USERNAME) and QSYS2.PROGRAM_EXPORT_IMPORT_INFO
+/// with the columns and types PUB400's give (2026-11-09, verify66
+/// n66_mapepire "usr", "pei": QSYUSRINFO has no AUTHORIZATION_NAME, flags
+/// as Y/N, CHARACTER_CODE_SET_ID -2 for *SYSVAL). Values as4tainr does not
+/// keep are null or the system default; SPECIAL_AUTHORITIES is a Y/N flag
+/// per special authority in the order *ALLOBJ *SECADM *SAVSYS *JOBCTL
+/// *SPLCTL *SERVICE *AUDIT *IOSYSCFG (as4tainr's reading of the QSYRUSRI
+/// format). A service program's exports are *PROCEXP, its and a program's
+/// imports *PROCIMP.
 const VIEW_FUNCTIONS: &str = r#"
+DROP FUNCTION IF EXISTS qsys2.qsyusrinfo(varchar);
+CREATE FUNCTION qsys2.qsyusrinfo(username varchar)
+RETURNS TABLE (
+  previous_signon timestamp,
+  sign_on_attempts_not_valid integer,
+  maximum_sign_on_attempts varchar(7),
+  status varchar(10),
+  netserver_disabled varchar(3),
+  password_change_date timestamp,
+  no_password_indicator char(1),
+  password_level_0_1 char(1),
+  password_level_2_3 char(1),
+  password_level_4 char(1),
+  password_expiration_interval smallint,
+  date_password_expires timestamp,
+  days_until_password_expires smallint,
+  set_password_to_expire char(1),
+  user_class_name varchar(10),
+  special_authorities varchar(15),
+  group_profile_name varchar(10),
+  owner varchar(10),
+  group_authority varchar(10),
+  assistance_level varchar(10),
+  current_library_name varchar(10),
+  initial_menu_name varchar(10),
+  initial_menu_library_name varchar(10),
+  initial_program_name varchar(10),
+  initial_program_library_name varchar(10),
+  limit_capabilities varchar(10),
+  text_description varchar(50),
+  display_signon_information varchar(10),
+  limit_device_sessions varchar(10),
+  keyboard_buffering varchar(10),
+  maximum_allowed_storage bigint,
+  storage_used bigint,
+  highest_scheduling_priority char(1),
+  job_description_name varchar(10),
+  job_description_library_name varchar(10),
+  accounting_code varchar(15),
+  message_queue_name varchar(10),
+  message_queue_library_name varchar(10),
+  message_queue_delivery_method varchar(10),
+  message_queue_severity smallint,
+  output_queue_name varchar(10),
+  output_queue_library_name varchar(10),
+  print_device varchar(10),
+  special_environment varchar(10),
+  attention_key_handling_program_name varchar(10),
+  attention_key_handling_program_library_name varchar(10),
+  language_id varchar(10),
+  country_or_region_id varchar(10),
+  character_code_set_id integer,
+  user_options varchar(36),
+  sort_sequence_table_name varchar(10),
+  sort_sequence_table_library_name varchar(10),
+  object_auditing_value varchar(10),
+  user_action_audit_level varchar(64),
+  group_authority_type varchar(10),
+  user_id_number bigint,
+  group_id_number bigint,
+  locale_job_attributes varchar(16),
+  group_member_indicator char(1),
+  digital_certificate_indicator char(1),
+  character_identifier_control varchar(10),
+  local_password_management char(1),
+  block_password_change varchar(10),
+  user_entitlement_required char(1),
+  user_expiration_interval smallint,
+  user_expiration_date timestamp,
+  user_expiration_action varchar(8),
+  home_directory varchar(1024),
+  locale_path_name varchar(1024),
+  number_supplemental_groups smallint,
+  supplemental_groups varchar(150),
+  number_iasp_storage_usage_descriptors smallint,
+  iasp_storage_usage_descriptors text,
+  user_default_password char(1),
+  authority_collection_active_indicator char(1),
+  authority_collection_repository_exists_indicator char(1),
+  pase_shell varchar(1024),
+  available_profile_entries bigint,
+  total_profile_entries bigint,
+  owner_entries bigint,
+  private_authority_entries bigint,
+  authorized_user_entries bigint,
+  primary_group_entries bigint,
+  temp_available_profile_entries bigint,
+  temp_total_profile_entries bigint,
+  temp_owner_entries bigint,
+  temp_private_authority_entries bigint,
+  temp_authorized_user_entries bigint,
+  temp_primary_group_entries bigint)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  SELECT CAST(u.last_signon AS timestamp),
+         CAST(u.invalid_signons AS integer),
+         CAST('*SYSVAL' AS varchar(7)),
+         CAST(u.status AS varchar(10)),
+         CAST('NO' AS varchar(3)),
+         CAST(u.pwd_changed AS timestamp),
+         CAST(CASE WHEN u.password_hash = '*NONE' THEN 'Y' ELSE 'N' END AS char(1)),
+         CAST('N' AS char(1)),
+         CAST('Y' AS char(1)),
+         CAST('Y' AS char(1)),
+         CAST(0 AS smallint),
+         CAST(NULL AS timestamp),
+         CAST(-1 AS smallint),
+         CAST(CASE WHEN u.pwd_expired THEN 'Y' ELSE 'N' END AS char(1)),
+         CAST(u.usrcls AS varchar(10)),
+         CAST((SELECT string_agg(CASE WHEN a = ANY(u.special_auth) THEN 'Y' ELSE 'N' END, '' ORDER BY i) FROM unnest(ARRAY['*ALLOBJ','*SECADM','*SAVSYS','*JOBCTL','*SPLCTL','*SERVICE','*AUDIT','*IOSYSCFG']) WITH ORDINALITY AS x(a, i)) AS varchar(15)),
+         CAST('*NONE' AS varchar(10)),
+         CAST('*USRPRF' AS varchar(10)),
+         CAST('*NONE' AS varchar(10)),
+         CAST('*SYSVAL' AS varchar(10)),
+         CAST(u.curlib AS varchar(10)),
+         CAST(CASE WHEN position('/' IN u.inlmnu) > 0 THEN split_part(u.inlmnu, '/', 2) ELSE u.inlmnu END AS varchar(10)),
+         CAST(CASE WHEN position('/' IN u.inlmnu) > 0 THEN split_part(u.inlmnu, '/', 1) WHEN u.inlmnu = '*SIGNOFF' THEN NULL ELSE '*LIBL' END AS varchar(10)),
+         CAST(CASE WHEN position('/' IN u.inlpgm) > 0 THEN split_part(u.inlpgm, '/', 2) ELSE u.inlpgm END AS varchar(10)),
+         CAST(CASE WHEN position('/' IN u.inlpgm) > 0 THEN split_part(u.inlpgm, '/', 1) WHEN u.inlpgm = '*NONE' THEN NULL ELSE '*LIBL' END AS varchar(10)),
+         CAST('*NO' AS varchar(10)),
+         CAST(nullif(u.text, '') AS varchar(50)),
+         CAST('*SYSVAL' AS varchar(10)),
+         CAST('*SYSVAL' AS varchar(10)),
+         CAST('*SYSVAL' AS varchar(10)),
+         CAST(-1 AS bigint),
+         CAST(0 AS bigint),
+         CAST('3' AS char(1)),
+         CAST('QDFTJOBD' AS varchar(10)),
+         CAST('QGPL' AS varchar(10)),
+         CAST(NULL AS varchar(15)),
+         CAST(u.name AS varchar(10)),
+         CAST('QUSRSYS' AS varchar(10)),
+         CAST('*NOTIFY' AS varchar(10)),
+         CAST(0 AS smallint),
+         CAST(u.outq AS varchar(10)),
+         CAST(NULL AS varchar(10)),
+         CAST('*WRKSTN' AS varchar(10)),
+         CAST('*SYSVAL' AS varchar(10)),
+         CAST('*SYSVAL' AS varchar(10)),
+         CAST(NULL AS varchar(10)),
+         CAST('*SYSVAL' AS varchar(10)),
+         CAST('*SYSVAL' AS varchar(10)),
+         CAST(-2 AS integer),
+         CAST(NULL AS varchar(36)),
+         CAST('*SYSVAL' AS varchar(10)),
+         CAST(NULL AS varchar(10)),
+         CAST('*NONE' AS varchar(10)),
+         CAST(NULL AS varchar(64)),
+         CAST('*PRIVATE' AS varchar(10)),
+         CAST(NULL AS bigint),
+         CAST(0 AS bigint),
+         CAST(NULL AS varchar(16)),
+         CAST('0' AS char(1)),
+         CAST('0' AS char(1)),
+         CAST('*SYSVAL' AS varchar(10)),
+         CAST('Y' AS char(1)),
+         CAST('*SYSVAL' AS varchar(10)),
+         CAST('1' AS char(1)),
+         CAST(0 AS smallint),
+         CAST(NULL AS timestamp),
+         CAST('*NONE' AS varchar(8)),
+         CAST('/home/' || u.name AS varchar(1024)),
+         CAST('*SYSVAL' AS varchar(1024)),
+         CAST(0 AS smallint),
+         CAST(NULL AS varchar(150)),
+         CAST(0 AS smallint),
+         CAST(NULL AS text),
+         CAST(NULL AS char(1)),
+         CAST('0' AS char(1)),
+         CAST('0' AS char(1)),
+         CAST(NULL AS varchar(1024)),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint)
+    FROM as4tainr.user_profiles u
+   WHERE u.name = upper(rtrim($1))
+$$;
+DROP FUNCTION IF EXISTS qsys2.program_export_import_info(varchar, varchar, varchar);
+CREATE FUNCTION qsys2.program_export_import_info(
+  program_library varchar, program_name varchar, object_type varchar DEFAULT '*ALL')
+RETURNS TABLE (
+  program_library varchar(10), program_name varchar(10), object_type varchar(7),
+  symbol_name varchar(8192), symbol_usage varchar(10), argument_optimization varchar(4),
+  data_item_size integer)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  WITH lib AS (
+    -- QTEMP: the statement's job's own (qtemp.rs name_for: #QTnnnnnn, #QPnnnnnnn).
+    SELECT CASE WHEN upper(rtrim($1)) <> 'QTEMP' THEN upper(rtrim($1))
+                WHEN coalesce(current_setting('as4tainr.job_key', true), '') LIKE 'PID%'
+                THEN '#QP' || lpad((substr(current_setting('as4tainr.job_key', true), 4)::bigint % 10000000)::text, 7, '0')
+                ELSE '#QT' || lpad((split_part(coalesce(current_setting('as4tainr.job_key', true), '0'), '/', 1)::bigint % 1000000)::text, 6, '0')
+                END AS l),
+  objs AS (
+    SELECT p.library, p.name, '*SRVPGM' AS t, p.binding::jsonb AS b
+      FROM as4tainr.service_programs p, lib WHERE p.library = lib.l AND p.name = upper(rtrim($2))
+       AND upper($3) IN ('*SRVPGM', '*ALL')
+    UNION ALL
+    SELECT p.library, p.name, '*PGM', p.binding::jsonb
+      FROM as4tainr.programs p, lib WHERE p.library = lib.l AND p.name = upper(rtrim($2))
+       AND p.binding IS NOT NULL AND upper($3) IN ('*PGM', '*ALL'))
+  SELECT CAST(CASE WHEN upper(rtrim($1)) = 'QTEMP' THEN 'QTEMP' ELSE o.library END AS varchar(10)),
+         CAST(o.name AS varchar(10)), CAST(o.t AS varchar(7)),
+         CAST(e.value AS varchar(8192)), CAST('*PROCEXP' AS varchar(10)), CAST('*NO' AS varchar(4)),
+         CAST(NULL AS integer)
+    FROM objs o, jsonb_array_elements_text(coalesce(o.b->'exports', '[]'::jsonb)) AS e(value)
+  UNION ALL
+  SELECT CAST(CASE WHEN upper(rtrim($1)) = 'QTEMP' THEN 'QTEMP' ELSE o.library END AS varchar(10)),
+         CAST(o.name AS varchar(10)), CAST(o.t AS varchar(7)),
+         CAST(i.key AS varchar(8192)), CAST('*PROCIMP' AS varchar(10)), CAST('*NO' AS varchar(4)),
+         CAST(NULL AS integer)
+    FROM objs o, jsonb_each(coalesce(o.b->'imports', '{}'::jsonb)) AS i
+$$;
+
 CREATE OR REPLACE FUNCTION qsys2.qsqlibl() RETURNS SETOF qsys2.library_list_info
 LANGUAGE sql STABLE AS $$ SELECT * FROM qsys2.library_list_info $$;
-CREATE OR REPLACE FUNCTION qsys2.qsyusrinfo(username varchar) RETURNS SETOF qsys2.user_info
-LANGUAGE sql STABLE AS $$ SELECT * FROM qsys2.user_info WHERE authorization_name = username $$;
 "#;
 
 /// The QSYS2.QCMDEXC scalar function (IBM i services: 1 when the command
@@ -1604,29 +1830,135 @@ END $$;
 "#;
 
 /// QSYS2.SYSFILES (Db2 for i catalog: the database files) over the
-/// physical and logical files: FILE_TYPE SOURCE or DATA, the record
-/// length (a source file's RCDLEN). The columns Code for IBM i reads,
-/// with the names; IBM's view has more (docs/fidelity-gaps.md).
+/// physical and logical files, with the 104 columns and types of PUB400's
+/// (2026-11-09, verify66 n66_mapepire "sysf"): FILE_TYPE SOURCE or DATA,
+/// record length (a source file's RCDLEN), members, key fields, fields,
+/// CCSID 37; what as4tainr does not keep is null. Also as the table
+/// function SYSFILES(schema, file) Code for IBM i calls (objectBrowser.ts).
 ///
 /// QSYS2.PARTITION_STATISTICS(schema, table) (the table function under
 /// SYSPARTITIONSTAT): one row per member: a source file's members, with
 /// their type, text, lines and dates; a data file's one member, named as
 /// the file.
 const FILE_CATALOG: &str = r#"
-CREATE OR REPLACE VIEW qsys2.sysfiles AS
-SELECT CAST(o.library AS varchar(128)) COLLATE "C" AS table_schema,
-       CAST(o.name AS varchar(128)) COLLATE "C" AS table_name,
+DROP VIEW IF EXISTS qsys2.sysfiles CASCADE;
+CREATE VIEW qsys2.sysfiles AS
+SELECT
        CAST(o.library AS varchar(10)) COLLATE "C" AS system_table_schema,
        CAST(o.name AS varchar(10)) COLLATE "C" AS system_table_name,
-       CAST(CASE WHEN sf.name IS NOT NULL OR o.attribute = 'PF-SRC' THEN 'SOURCE' ELSE 'DATA' END
-            AS varchar(6)) COLLATE "C" AS file_type,
-       CAST(CASE WHEN o.attribute = 'LF' THEN 'LOGICAL' ELSE 'PHYSICAL' END AS varchar(8)) COLLATE "C" AS native_type,
+       CAST(o.library AS varchar(128)) COLLATE "C" AS table_schema,
+       CAST(coalesce(f.sql_name, o.name) AS varchar(128)) COLLATE "C" AS table_name,
+       CAST(1 AS integer) AS iasp_number,
+       CAST(nullif(o.text, '') AS varchar(50)) COLLATE "C" AS text_description,
+       CAST(CASE WHEN o.attribute LIKE 'LF%' THEN 'LOGICAL' ELSE 'PHYSICAL' END AS varchar(8)) COLLATE "C" AS native_type,
+       CAST(CASE WHEN sf.name IS NOT NULL OR o.attribute = 'PF-SRC' THEN 'SOURCE' ELSE 'DATA' END AS varchar(6)) COLLATE "C" AS file_type,
+       CAST(CASE WHEN f.view IS NOT NULL THEN 'VIEW' WHEN f.sql_type = 'TABLE' THEN 'TABLE' END AS varchar(5)) COLLATE "C" AS sql_object_type,
+       CAST(o.created AS timestamp(0)) AS last_altered_timestamp,
+       CAST(NULL AS char(13)) COLLATE "C" AS file_level_id,
+       CAST('YES' AS varchar(3)) COLLATE "C" AS level_check,
+       CAST(o.owner AS varchar(10)) COLLATE "C" AS file_owner,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS create_public_authority,
+       CAST(CASE WHEN sf.name IS NOT NULL THEN (SELECT count(*) FROM as4tainr.source_members m WHERE m.library = o.library AND m.file = o.name) ELSE 1 END AS integer) AS number_members,
+       CAST(CASE WHEN sf.name IS NOT NULL THEN NULL ELSE 1 END AS integer) AS maximum_members,
+       CAST(coalesce(sf.rcdlen, t.row_length) AS integer) AS maximum_record_length,
+       CAST((SELECT count(*) FROM as4tainr.file_keys k WHERE k.library = o.library AND k.file = o.name) AS integer) AS number_key_fields,
+       CAST(NULL AS integer) AS maximum_key_length,
+       CAST(0 AS integer) AS trigger_count,
+       CAST(0 AS integer) AS constraint_count,
+       CAST(NULL AS integer) AS number_based_on_files,
+       CAST(NULL AS text) AS based_on_files,
+       CAST('YES' AS varchar(3)) COLLATE "C" AS allow_read,
+       CAST('YES' AS varchar(3)) COLLATE "C" AS allow_write,
+       CAST('YES' AS varchar(3)) COLLATE "C" AS allow_update,
+       CAST('YES' AS varchar(3)) COLLATE "C" AS allow_delete,
+       CAST(30 AS integer) AS maximum_file_wait_time,
+       CAST(60 AS integer) AS maximum_record_wait_time,
+       CAST(NULL AS integer) AS force_write_ratio,
+       CAST(CASE WHEN t.select_omit = 'Y' THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS select_omit,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS program_described,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS distributed,
+       CAST(NULL AS char(6)) COLLATE "C" AS file_vrm,
+       CAST(NULL AS char(6)) COLLATE "C" AS earliest_possible_release,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS allow_null_keys,
+       CAST('YES' AS varchar(3)) COLLATE "C" AS allow_null_data,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS primary_key,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS unique_constraint,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS restrict_on_drop,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS volatile,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS keep_in_memory,
+       CAST('*ANY' AS varchar(4)) COLLATE "C" AS media_preference,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS source_file_library,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS source_file,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS source_file_member,
+       CAST(CASE WHEN EXISTS (SELECT 1 FROM as4tainr.file_keys k WHERE k.library = o.library AND k.file = o.name) THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS access_path_keyed,
+       CAST(NULL AS varchar(14)) COLLATE "C" AS access_path_type,
+       CAST(NULL AS varchar(6)) COLLATE "C" AS access_path_maintenance,
+       CAST(NULL AS varchar(7)) COLLATE "C" AS access_path_size,
+       CAST(NULL AS integer) AS logical_page_size,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS force_keyed_access_path,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS access_path_journaled,
+       CAST(NULL AS varchar(7)) COLLATE "C" AS access_path_recovery,
+       CAST(NULL AS integer) AS srtseq_ind,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS sort_sequence_library,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS sort_sequence,
+       CAST(NULL AS char(3)) COLLATE "C" AS language_identifier,
+       CAST(NULL AS varchar(8)) COLLATE "C" AS rounding_mode,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS decfloat_warnings,
+       CAST(1 AS integer) AS number_record_formats,
+       CAST(NULL AS char(13)) COLLATE "C" AS format_level_id,
+       CAST(coalesce(f.format, o.name) AS varchar(10)) COLLATE "C" AS format_name,
        CAST(coalesce(sf.rcdlen, t.row_length) AS integer) AS record_length,
-       CAST(nullif(o.text, '') AS varchar(50)) COLLATE "C" AS text_description
+       CAST(CASE WHEN sf.name IS NOT NULL THEN 3 ELSE (SELECT count(*) FROM as4tainr.file_fields ff WHERE ff.library = o.library AND ff.file = o.name) END AS integer) AS number_fields,
+       CAST(37 AS integer) AS common_ccsid,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_explicit_ccsid,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_multiple_ccsids,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_unicode,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_varying_length,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_datetime,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_graphic,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_lob,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_rowid,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_udt,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_datalink,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_datalink_file_link_control,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_null,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_default,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_identity,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_row_change_timestamp,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_user_defined_function,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS allocate_storage,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS contiguous_storage,
+       CAST(NULL AS integer) AS maximum_deleted_percentage,
+       CAST(NULL AS integer) AS initial_records,
+       CAST(NULL AS integer) AS increment_records,
+       CAST(NULL AS integer) AS maximum_increments,
+       CAST('YES' AS varchar(3)) COLLATE "C" AS reuse_deleted_records,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS materialized_query_table,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS partitioned_table,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS row_and_column_access_control,
+       CAST(NULL AS integer) AS total_select_omit,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS fmtslr_library,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS fmtslr_program,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS is_join_logical,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS dynamic_selection,
+       CAST(NULL AS varchar(8)) COLLATE "C" AS with_check_option,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS physical_lob,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS physical_datalink,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS index_column_is_expression,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS index_expression_has_udf,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS index_has_search_condition,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS index_search_condition_has_udf
   FROM as4tainr.objects o
+  LEFT JOIN as4tainr.files f ON f.library = o.library AND f.name = o.name
   LEFT JOIN as4tainr.source_files sf ON sf.library = o.library AND sf.name = o.name
   LEFT JOIN qsys2.systables t ON t.system_table_schema = o.library AND t.system_table_name = o.name
  WHERE o.objtype = '*FILE' AND o.attribute IN ('PF', 'LF', 'PF-SRC', 'PF-DTA', 'LF-DTA');
+DROP FUNCTION IF EXISTS qsys2.sysfiles(varchar, varchar);
+CREATE FUNCTION qsys2.sysfiles(table_schema varchar, table_name varchar)
+RETURNS SETOF qsys2.sysfiles LANGUAGE sql STABLE AS $$
+  SELECT * FROM qsys2.sysfiles s
+   WHERE s.system_table_schema = upper(rtrim($1)) AND s.system_table_name = upper(rtrim($2))
+$$;
 
 DROP FUNCTION IF EXISTS qsys2.partition_statistics(varchar, varchar);
 CREATE FUNCTION qsys2.partition_statistics(table_schema varchar, table_name varchar)

@@ -986,7 +986,21 @@ impl<'a> Server<'a> {
             let nulls = vec!["NULL".to_string(); markers];
             let text = bind(sql, &nulls)?;
             if let Done::Rows(r) = self.statement(&text).await? {
-                if let J::Obj(m) = self.metadata(&r, false) {
+                if let J::Obj(mut m) = self.metadata(&r, false) {
+                    // A prepared statement's columns are described with
+                    // name, type, display size and label only (PUB400's
+                    // 2.3.2, verify66 n66_mapepire "prep").
+                    if self.legacy_cl {
+                        for (k, v) in m.iter_mut() {
+                            if let (true, J::Arr(cols)) = (k == "columns", v) {
+                                for c in cols.iter_mut() {
+                                    if let J::Obj(f) = c {
+                                        f.truncate(4);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     meta = m;
                 }
             }

@@ -1,0 +1,29 @@
+{"id": "c", "type": "connect", "technique": "cli", "application": "as4tainr-golden", "props": "naming=sql;libraries=AS4TRAINR1;transaction isolation=none"}
+{"id": "mk", "type": "sql", "sql": "CREATE TABLE AS4TRAINR1.GLD67T (C CHAR(5), V VARCHAR(10), D DECIMAL(7, 2), Z NUMERIC(5, 0), I INTEGER, S SMALLINT, B BIGINT, DT DATE, TM TIME, TS TIMESTAMP, F DOUBLE, BN BINARY(2))"}
+{"id": "ins", "type": "sql", "sql": "INSERT INTO AS4TRAINR1.GLD67T VALUES ('ab', 'cd  ', -12.50, 7, 1, 2, 3, '2026-11-09', '13.14.15', '2026-11-09-13.14.15.123456', 1.5, BX'C1C2'), (NULL, NULL, NULL, NULL, 2, NULL, NULL, NULL, NULL, NULL, NULL, NULL)"}
+{"id": "sel", "type": "sql", "sql": "SELECT * FROM AS4TRAINR1.GLD67T ORDER BY I"}
+{"id": "exp", "type": "sql", "sql": "SELECT C, D + 1, CURRENT DATE, 'x' CONCAT C, I AS NUMBER, CAST(NULL AS INTEGER) FROM AS4TRAINR1.GLD67T ORDER BY I"}
+{"id": "terse", "type": "sql", "sql": "SELECT I, C FROM AS4TRAINR1.GLD67T ORDER BY I", "terse": true}
+{"id": "blk2", "type": "sql", "sql": "SELECT I FROM AS4TRAINR1.GLD67T ORDER BY I", "rows": 2}
+{"id": "blk1", "type": "sql", "sql": "SELECT I FROM AS4TRAINR1.GLD67T ORDER BY I", "rows": 1}
+{"id": "prep", "type": "prepare_sql", "sql": "SELECT C, D FROM AS4TRAINR1.GLD67T WHERE I = ?"}
+{"id": "pe", "type": "prepare_sql_execute", "sql": "SELECT C, D FROM AS4TRAINR1.GLD67T WHERE I = ?", "parameters": [1]}
+{"id": "e2", "type": "sql", "sql": "SELECT NOCOL FROM AS4TRAINR1.GLD67T"}
+{"id": "sysf", "type": "sql", "sql": "SELECT * FROM QSYS2.SYSFILES WHERE SYSTEM_TABLE_SCHEMA = 'AS4TRAINR1' AND SYSTEM_TABLE_NAME = 'GLD67T'"}
+{"id": "pgmi", "type": "sql", "sql": "SELECT * FROM QSYS2.PROGRAM_INFO WHERE PROGRAM_LIBRARY = 'QSYS' AND PROGRAM_NAME = 'QCMDEXC'"}
+{"id": "pei", "type": "sql", "sql": "SELECT * FROM TABLE(QSYS2.PROGRAM_EXPORT_IMPORT_INFO('QSYS', 'QC2SYS', '*SRVPGM')) FETCH FIRST 3 ROWS ONLY"}
+{"id": "usr", "type": "sql", "sql": "SELECT * FROM TABLE(QSYS2.QSYUSRINFO(USERNAME => 'AS4TRAINR'))"}
+{"id": "parts", "type": "sql", "sql": "SELECT * FROM TABLE(QSYS2.PARTITION_STATISTICS('AS4TRAINR1', 'GLD67T'))"}
+{"id": "blk", "type": "sql", "sql": "SELECT I FROM AS4TRAINR1.GLD67T ORDER BY I", "rows": 1}
+{"id": "more1", "type": "sqlmore", "cont_id": "blk", "rows": 1}
+{"id": "more2", "type": "sqlmore", "cont_id": "blk", "rows": 1}
+{"id": "more3", "type": "sqlmore", "cont_id": "blk", "rows": 1}
+{"id": "cls", "type": "sqlclose", "cont_id": "blk"}
+{"id": "prep2", "type": "prepare_sql", "sql": "SELECT C FROM AS4TRAINR1.GLD67T WHERE I = ?"}
+{"id": "exe", "type": "execute", "cont_id": "prep2", "parameters": [2]}
+{"id": "pins", "type": "prepare_sql_execute", "sql": "INSERT INTO AS4TRAINR1.GLD67T (I, C) VALUES (?, ?)", "parameters": [[3, "x"], [4, "y"]]}
+{"id": "upd", "type": "sql", "sql": "UPDATE AS4TRAINR1.GLD67T SET S = 9 WHERE I >= 3"}
+{"id": "ddl", "type": "sql", "sql": "CREATE TABLE AS4TRAINR1.GLD67U (K INTEGER)"}
+{"id": "call", "type": "sql", "sql": "CALL QSYS2.QCMDEXC('CHKOBJ OBJ(QSYS/QGPL) OBJTYPE(*LIB)')"}
+{"id": "sel2", "type": "sql", "sql": "SELECT I, C, S FROM AS4TRAINR1.GLD67T ORDER BY I"}
+{"id": "x", "type": "exit"}

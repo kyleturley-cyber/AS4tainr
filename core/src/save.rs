@@ -867,6 +867,8 @@ async fn save_library(
                JOIN pg_namespace n ON n.oid = ic.relnamespace
               WHERE n.nspname = $1
                 AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid AND c.contype IN ('p', 'u', 'x'))
+                -- An index another session dropped meanwhile has no definition.
+                AND pg_get_indexdef(i.indexrelid) IS NOT NULL
               ORDER BY ic.oid",
             &[&schema],
         )

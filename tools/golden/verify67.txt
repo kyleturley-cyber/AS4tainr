@@ -1,0 +1,13 @@
+# Golden (batch 7): verify66 again with `transaction isolation=none` (verify66's
+# INSERT got SQL7008: the library is not journaled). PUB400's Mapepire (2.3.2) on a table it can make (SQL
+# naming: verify64 asked for system naming, which the server did not
+# take): each column type's values and metadata, expressions, terse rows,
+# blocks and sqlmore, prepared statements, a batch insert, errors,
+# SYSFILES, PROGRAM_INFO, PROGRAM_EXPORT_IMPORT_INFO, QSYUSRINFO and
+# PARTITION_STATISTICS columns. Requests go one every 2 seconds (the
+# server answers on threads).
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify67.txt -Files tools\golden\verify67
+n67_cleanup|!for c in "DLTF FILE(AS4TRAINR1/GLD67T)" "DLTF FILE(AS4TRAINR1/GLD67U)"; do system -q "$c"; done; echo cleaned
+n67_tag|!setccsid 819 /home/AS4TRAINR/gld/mp67.jsonl; ls /home/AS4TRAINR/gld | grep mp67
+n67_mapepire|!cd /home/AS4TRAINR && while IFS= read -r l; do printf '%s\n' "$l"; sleep 2; done < /home/AS4TRAINR/gld/mp67.jsonl | env QIBM_JAVA_STDIO_CONVERT=N QIBM_PASE_DESCRIPTOR_STDIO=B QIBM_USE_DESCRIPTOR_STDIO=Y QIBM_MULTI_THREADED=Y /QOpenSys/QIBM/ProdData/JavaVM/jdk80/64bit/bin/java -Djdbc.db2.restricted.local.connection.only=true -Dos400.stdio.convert=N -jar /QOpenSys/pkgs/lib/mapepire/mapepire-server.jar --single
+n67_end|!for c in "DLTF FILE(AS4TRAINR1/GLD67T)" "DLTF FILE(AS4TRAINR1/GLD67U)"; do system -q "$c"; done; echo cleaned

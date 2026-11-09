@@ -27160,7 +27160,7 @@ async fn mapepire_values_as_pub400_shows_them() {
     let row = &data[0];
     assert_eq!(row.get("C"), Some(&J::str("ab")), "{r}");
     assert_eq!(row.get("V"), Some(&J::str("cd  ")), "{r}");
-    assert_eq!(row.get("D"), Some(&J::Num("-12.5".into())), "{r}");
+    assert_eq!(row.get("D"), Some(&J::Num("-12.50".into())), "{r}");
     assert_eq!(row.get("TM"), Some(&J::str("13.14.15")), "{r}");
     assert_eq!(
         row.get("TS"),
@@ -27197,6 +27197,20 @@ async fn mapepire_values_as_pub400_shows_them() {
     assert_eq!(p(0, "name"), J::str("?"), "{r}");
     assert_eq!(p(1, "type"), J::str("CHAR"), "{r}");
     assert_eq!(p(1, "precision"), J::Num("5".into()), "{r}");
+    // COUNT is INTEGER; aggregates are unnamed columns (verify69
+    // p69_mapepire "ps3": 00001 INTEGER; "num": SUM(D) OVER () 00004).
+    let r = ask(format!(
+        r#"{{"id":"cnt","type":"sql","sql":"SELECT COUNT(*), SUM(I), I FROM {lib}.GLD68T GROUP BY I ORDER BY I"}}"#
+    ))
+    .await;
+    let cols = r.get("metadata").and_then(|m| m.get("columns")).unwrap();
+    let J::Arr(cols) = cols else { panic!("{r}") };
+    let names: Vec<String> = cols
+        .iter()
+        .map(|c| c.get("name").and_then(J::text).unwrap())
+        .collect();
+    assert_eq!(names, ["00001", "00002", "I"], "{r}");
+    assert_eq!(cols[0].get("type"), Some(&J::str("INTEGER")), "{r}");
     // PROGRAM_INFO has IBM i 7.5's 107 columns (verify66 "pgmi").
     let r = ask(
         r#"{"id":"pi","type":"sql","sql":"SELECT * FROM QSYS2.PROGRAM_INFO FETCH FIRST 1 ROWS ONLY"}"#

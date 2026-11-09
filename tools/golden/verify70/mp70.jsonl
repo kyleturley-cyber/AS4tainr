@@ -1,0 +1,8 @@
+{"id": "c", "type": "connect", "technique": "cli", "application": "as4tainr-golden", "props": "naming=sql;libraries=AS4TRAINR1"}
+{"id": "ps1", "type": "sql", "sql": "SELECT SYSTEM_TABLE_MEMBER, NUMBER_ROWS, SOURCE_TYPE FROM TABLE(QSYS2.PARTITION_STATISTICS(RPAD('AS4TRAINR1', 10), RPAD('GLD70S', 10)))"}
+{"id": "ps2", "type": "sql", "sql": "SELECT SYSTEM_TABLE_MEMBER, NUMBER_ROWS FROM TABLE(QSYS2.PARTITION_STATISTICS(RPAD('AS4TRAINR1', 10), RPAD('GLD70T', 10)))"}
+{"id": "ps3", "type": "sql", "sql": "SELECT SYSTEM_TABLE_MEMBER FROM TABLE(QSYS2.PARTITION_STATISTICS(CAST('AS4TRAINR1' AS CHAR(10)), CAST('GLD70S' AS CHAR(10))))"}
+{"id": "ps4", "type": "sql", "sql": "SELECT SYSTEM_TABLE_MEMBER FROM TABLE(QSYS2.PARTITION_STATISTICS(RPAD('AS4TRAINR1', 10), RPAD('gld70s', 10)))"}
+{"id": "ps5", "type": "sql", "sql": "SELECT SYSTEM_TABLE_MEMBER FROM TABLE(QSYS2.PARTITION_STATISTICS(TABLE_SCHEMA => 'AS4TRAINR1', TABLE_NAME => 'GLD70S'))"}
+{"id": "ar", "type": "sql", "sql": "SELECT D + D, D - 1.5, D * D, D / D, D / 7.0, ROUND(D / 3, 2), I / 2, I * 1.5, D + I, Z + D, MIN(D) OVER (), COUNT_BIG(*) OVER (), DECIMAL(D, 5, 1), V CONCAT V, C CONCAT 'xy' FROM AS4TRAINR1.GLD70T ORDER BY I"}
+{"id": "x", "type": "exit"}

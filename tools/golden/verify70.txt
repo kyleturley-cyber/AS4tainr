@@ -1,0 +1,11 @@
+# Golden (batch 10): PARTITION_STATISTICS with names padded to 10 (RPAD,
+# CAST AS CHAR(10)), lowercase, and named arguments unpadded (verify66-69:
+# unpadded names gave no row); decimal arithmetic result types and values
+# (+, -, *, /, ROUND, integer mixes, MIN, COUNT_BIG, DECIMAL()), CONCAT
+# lengths.
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify70.txt -Files tools\golden\verify70
+q70_cleanup|!for c in "DLTF FILE(AS4TRAINR1/GLD70T)" "DLTF FILE(AS4TRAINR1/GLD70S)"; do system -q "$c"; done; echo cleaned
+q70_tag|!setccsid 819 /home/AS4TRAINR/gld/mp70.jsonl; ls /home/AS4TRAINR/gld | grep mp70
+q70_make|!system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD70T (I INTEGER, C CHAR(5), V VARCHAR(10), D DECIMAL(7, 2), Z NUMERIC(5, 0))') COMMIT(*NONE)"; system "RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD70T VALUES (1, ''ab'', ''cd'', 100.25, 3), (2, ''x'', '''', -7.10, -4)') COMMIT(*NONE)"; system "CRTSRCPF FILE(AS4TRAINR1/GLD70S) RCDLEN(92) MBR(M1)"; system "ADDPFM FILE(AS4TRAINR1/GLD70S) MBR(M2) SRCTYPE(RPGLE)"
+q70_mapepire|!cd /home/AS4TRAINR && while IFS= read -r l; do printf '%s\n' "$l"; sleep 2; done < /home/AS4TRAINR/gld/mp70.jsonl | env QIBM_JAVA_STDIO_CONVERT=N QIBM_PASE_DESCRIPTOR_STDIO=B QIBM_USE_DESCRIPTOR_STDIO=Y QIBM_MULTI_THREADED=Y /QOpenSys/QIBM/ProdData/JavaVM/jdk80/64bit/bin/java -Djdbc.db2.restricted.local.connection.only=true -Dos400.stdio.convert=N -jar /QOpenSys/pkgs/lib/mapepire/mapepire-server.jar --single
+q70_end|!for c in "DLTF FILE(AS4TRAINR1/GLD70T)" "DLTF FILE(AS4TRAINR1/GLD70S)"; do system -q "$c"; done; echo cleaned

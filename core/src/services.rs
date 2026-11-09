@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 56";
+const VERSION: &str = "as4tainr services 58";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -1961,7 +1961,11 @@ SELECT
 /// function SYSFILES(schema, file) Code for IBM i calls (objectBrowser.ts).
 ///
 /// QSYS2.PARTITION_STATISTICS(schema, table) (the table function under
-/// SYSPARTITIONSTAT): one row per member: a source file's members, with
+/// SYSPARTITIONSTAT) takes the names as CHAR(10) values: unpadded names
+/// shorter than 10 find nothing (PUB400 2026-11-09, verify66-69: no row
+/// for 'GLD68T' or 'GLD69S', though SYSPARTITIONSTAT had GLD69S's members
+/// M1 and M2; Code for IBM i passes RPAD(name, 10)), so as here. It
+/// gives one row per member: a source file's members, with
 /// their type, text, lines and dates; a data file's one member, named as
 /// the file.
 const FILE_CATALOG: &str = r#"
@@ -2222,10 +2226,13 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
     FROM as4tainr.source_members m
     LEFT JOIN as4tainr.source_files sf ON sf.library = m.library AND sf.name = m.file
    WHERE m.library = upper(rtrim($1)) AND m.file = upper(rtrim($2))
+     AND length($1) = 10 AND length($2) = 10
   UNION ALL
   SELECT CAST(o.name AS varchar(128)),
          CAST(o.name AS char(10)),
-         CAST(0 AS bigint),
+         -- The member's records (verify69 p69_mapepire "ps2": GLD69T 2).
+         CAST(CASE WHEN to_regclass(format('%I.%I', lower(o.library), lower(o.name))) IS NULL THEN 0
+                   ELSE CAST(CAST((xpath('/row/c/text()', query_to_xml(format('SELECT count(*) AS c FROM %I.%I', lower(o.library), lower(o.name)), false, true, '')))[1] AS text) AS bigint) END AS bigint),
          CAST(NULL AS bigint),
          CAST(NULL AS bigint),
          CAST(NULL AS bigint),
@@ -2288,7 +2295,22 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
     JOIN qsys2.sysfiles f ON f.system_table_schema = o.library AND f.system_table_name = o.name
    WHERE o.objtype = '*FILE' AND f.file_type = 'DATA'
      AND o.library = upper(rtrim($1)) AND o.name = upper(rtrim($2))
+     AND length($1) = 10 AND length($2) = 10
 $$;
+-- SYSPARTITIONSTAT: the members of every database file, with the
+-- table function's columns (verify69 p69_mapepire "ps2": a source file's
+-- members M1, M2 and a table's member named as the table).
+DROP VIEW IF EXISTS qsys2.syspartitionstat;
+CREATE VIEW qsys2.syspartitionstat AS
+SELECT CAST(o.library AS varchar(128)) COLLATE "C" AS table_schema,
+       CAST(coalesce(f.table_name, o.name) AS varchar(128)) COLLATE "C" AS table_name,
+       CAST(o.library AS char(10)) COLLATE "C" AS system_table_schema,
+       CAST(o.name AS char(10)) COLLATE "C" AS system_table_name,
+       p.*
+  FROM as4tainr.objects o
+  LEFT JOIN qsys2.sysfiles f ON f.system_table_schema = o.library AND f.system_table_name = o.name
+  CROSS JOIN LATERAL qsys2.partition_statistics(CAST(rpad(o.library, 10) AS varchar), CAST(rpad(o.name, 10) AS varchar)) p
+ WHERE o.objtype = '*FILE' AND o.attribute IN ('PF', 'PF-SRC', 'PF-DTA');
 "#;
 
 /// The services added with this version: definitions and grants.
@@ -2312,7 +2334,7 @@ fn work_services() -> String {
          {LIBRARY_INFO}
          {FILE_CATALOG}
          {PROGRAM_INFO}
-         GRANT SELECT ON qsys2.sysfiles, qsys2.program_info TO {SQL_ROLE};
+         GRANT SELECT ON qsys2.sysfiles, qsys2.program_info, qsys2.syspartitionstat TO {SQL_ROLE};
          GRANT SELECT ON qsys2.bound_srvpgm_info TO {SQL_ROLE};
          GRANT SELECT ON qsys2.library_list_info, qsys2.user_info, qsys2.system_value_info,
                qsys2.sysroutines, qsys2.sysparms, qsys2.environment_variable_info,

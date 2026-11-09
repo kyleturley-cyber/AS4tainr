@@ -340,8 +340,6 @@ struct Open {
     sql: Option<String>,
     results: Option<Results>,
     terse: bool,
-    /// Prepared by prepare_sql and not run yet.
-    prepared_only: bool,
 }
 
 /// What a statement did.
@@ -512,7 +510,6 @@ impl<'a> Server<'a> {
                     sql: None,
                     results: None,
                     terse,
-                    prepared_only: false,
                 };
                 self.reply_done(done, rows, &mut open, reply, false);
                 self.open.insert(id, open);
@@ -527,7 +524,6 @@ impl<'a> Server<'a> {
                     sql: Some(sql.clone()),
                     results: None,
                     terse,
-                    prepared_only: ty == "prepare_sql",
                 };
                 if ty == "prepare_sql_execute" {
                     let parms = r.get("parameters").cloned().unwrap_or(J::Arr(vec![]));
@@ -561,21 +557,15 @@ impl<'a> Server<'a> {
                         Ok(())
                     }
                     _ => match open.sql.clone() {
-                        // A query prepared alone (prepare_sql) and then run
-                        // with execute: the 2.3 server's native driver
-                        // fails it with SQLSTATE HY021, SQLCODE -99999
-                        // (verify66 and verify68 o68_mapepire "exe").
-                        Some(sql)
-                            if self.legacy_cl
-                                && open.prepared_only
-                                && is_query(&first_word(&sql)) =>
-                        {
-                            Err(anyhow::Error::new(Failure {
-                                text: "The call level interface could not run the statement."
-                                    .into(),
-                                sql: Some(("HY021".into(), -99999)),
-                            }))
-                        }
+                        // execute: the 2.3 server's native driver fails it
+                        // with SQLSTATE HY021, SQLCODE -99999, after
+                        // prepare_sql of a query or an UPDATE and after
+                        // prepare_sql_execute (verify66, verify68 "exe",
+                        // verify69 p69_mapepire "exe2", "exe3").
+                        Some(_) if self.legacy_cl => Err(anyhow::Error::new(Failure {
+                            text: "The call level interface could not run the statement.".into(),
+                            sql: Some(("HY021".into(), -99999)),
+                        })),
                         Some(sql) => {
                             let parms = r.get("parameters").cloned().unwrap_or(J::Arr(vec![]));
                             self.execute(&sql, &parms, rows, &mut open, reply).await
@@ -644,6 +634,7 @@ impl<'a> Server<'a> {
             let mut s =
                 crate::sql::Session::open(self.job.client, &self.job.env.database_url, &libl)
                     .await?;
+            s.describe_types = true;
             s.set_context(
                 &self.job.user,
                 Some(self.job.current_library()),
@@ -1487,12 +1478,48 @@ use crate::sql::Outcome as Outcome2;
 /// the statement selects `*` (whose names it does not write).
 fn unnamed_columns(sql: &str, columns: Vec<String>) -> Vec<String> {
     let up = sql.to_ascii_uppercase();
-    let words: std::collections::HashSet<String> = up
-        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '#' | '@' | '$' | '?')))
-        .filter(|w| !w.is_empty())
-        .map(str::to_string)
-        .collect();
-    let star = marker_positions_of(sql, '*') > 0;
+    // The words a column can be named by: not a function's name (SUM(...)
+    // makes an unnamed column: verify69 p69_mapepire "num", "ps3").
+    let is_word = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '#' | '@' | '$' | '?');
+    let mut words: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let b: Vec<char> = up.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        if is_word(b[i]) {
+            let st = i;
+            while i < b.len() && is_word(b[i]) {
+                i += 1;
+            }
+            let w: String = b[st..i].iter().collect();
+            let mut j = i;
+            while j < b.len() && b[j].is_whitespace() {
+                j += 1;
+            }
+            if b.get(j) != Some(&'(') {
+                words.insert(w);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    // SELECT * or T.*, not COUNT(*).
+    let star = {
+        let mut found = false;
+        for (k, c) in b.iter().enumerate() {
+            if *c == '*' {
+                let before: String = b[..k]
+                    .iter()
+                    .rev()
+                    .skip_while(|c| c.is_whitespace())
+                    .take(6)
+                    .collect();
+                if before.starts_with(',') || before.starts_with('.') || before == "TCELES" {
+                    found = true;
+                }
+            }
+        }
+        found && marker_positions_of(sql, '*') > 0
+    };
     columns
         .into_iter()
         .enumerate()
@@ -1525,13 +1552,6 @@ fn marker_positions_of(sql: &str, ch: char) -> usize {
         }
     }
     n
-}
-
-fn first_word(sql: &str) -> String {
-    sql.split(|c: char| c.is_whitespace() || c == '(')
-        .find(|w| !w.is_empty())
-        .unwrap_or("")
-        .to_ascii_uppercase()
 }
 
 fn is_query(first_word: &str) -> bool {
@@ -1622,20 +1642,82 @@ fn number(v: &str) -> J {
     }
 }
 
-/// A decimal's digits without the trailing zeros of its fraction
-/// (`-12.50` → `-12.5`, `100.00` → `100.0`), as text: no rounding.
+/// A decimal's digits as they are, without leading zeros (JSON has
+/// none): `-0012.50` → `-12.50`.
 fn decimal_text(v: &str) -> String {
     match v.split_once('.') {
         Some((int, frac)) if frac.bytes().all(|c| c.is_ascii_digit()) => {
-            let f = frac.trim_end_matches('0');
-            format!(
-                "{}.{}",
-                integer_text(int),
-                if f.is_empty() { "0" } else { f }
-            )
+            format!("{}.{frac}", integer_text(int))
         }
-        None if v.bytes().all(|c| c.is_ascii_digit() || c == b'-') => integer_text(v),
+        None if !v.is_empty() && v.bytes().all(|c| c.is_ascii_digit() || c == b'-') => {
+            integer_text(v)
+        }
         _ => v.to_string(),
+    }
+}
+
+/// PostgreSQL's text of a double (the shortest digits that read back as
+/// the same value: `12345678.5`, `1e-05`, `100`) in Java's
+/// Double.toString form: plain with at least one fraction digit from
+/// 10^-3 up to 10^7, else one digit, a point, the others and `E` with
+/// the exponent (`1.23456785E7`, `1.0E-5`). Text only: the digits are
+/// PostgreSQL's.
+fn java_double(v: &str) -> String {
+    let (neg, body) = match v.strip_prefix('-') {
+        Some(b) => ("-", b),
+        None => ("", v),
+    };
+    let (mant, exp) = match body.split_once(['e', 'E']) {
+        Some((m, e)) => match e.parse::<i32>() {
+            Ok(e) => (m, e),
+            Err(_) => return v.to_string(),
+        },
+        None => (body, 0),
+    };
+    let (ip, fp) = mant.split_once('.').unwrap_or((mant, ""));
+    if !(ip.bytes().all(|c| c.is_ascii_digit()) && fp.bytes().all(|c| c.is_ascii_digit()))
+        || ip.is_empty()
+    {
+        return v.to_string(); // NaN, Infinity
+    }
+    // All digits, and the position of the point after the first digit.
+    let all = format!("{ip}{fp}");
+    let lead = all.len() - all.trim_start_matches('0').len();
+    let digits = all.trim_start_matches('0').trim_end_matches('0');
+    if digits.is_empty() {
+        return format!("{neg}0.0");
+    }
+    // value = 0.digits × 10^point
+    let point = ip.len() as i32 - lead as i32 + exp;
+    if (-2..=7).contains(&point) {
+        let (i, f) = if point <= 0 {
+            (
+                "0".to_string(),
+                format!("{}{digits}", "0".repeat((-point) as usize)),
+            )
+        } else if digits.len() as i32 <= point {
+            (
+                format!(
+                    "{digits}{}",
+                    "0".repeat((point - digits.len() as i32) as usize)
+                ),
+                String::new(),
+            )
+        } else {
+            (
+                digits[..point as usize].to_string(),
+                digits[point as usize..].to_string(),
+            )
+        };
+        format!("{neg}{i}.{}", if f.is_empty() { "0" } else { &f })
+    } else {
+        let rest = &digits[1..];
+        format!(
+            "{neg}{}.{}E{}",
+            &digits[..1],
+            if rest.is_empty() { "0" } else { rest },
+            point - 1
+        )
     }
 }
 
@@ -1655,11 +1737,14 @@ fn cell(t: Option<&ColType>, v: Option<&str>) -> J {
         return J::Null;
     };
     match t.map(|t| t.pg.as_str()).unwrap_or("text") {
-        // A decimal as the server writes it: no trailing zeros after the
-        // point, one kept when it is a whole number (verify68 o68_mapepire
-        // "sel": DECIMAL(7, 2) -12.50 came as -12.5, NUMERIC(5, 0) 7 as 7).
+        // A decimal with all its digits, scale kept (verify68 o68_mapepire
+        // "sel": DECIMAL(7, 2) -12.50; verify69 p69_mapepire "num": 100.00,
+        // 0.50).
         "numeric" => number(&decimal_text(v)),
-        "int2" | "int4" | "int8" | "float4" | "float8" => number(v),
+        // DOUBLE as Java writes a double (verify69 "num": 12345678.5 as
+        // 1.23456785E7, 0.00001 as 1.0E-5, 1.5 as 1.5).
+        "float4" | "float8" => number(&java_double(v)),
+        "int2" | "int4" | "int8" => number(v),
         "bool" => J::Bool(matches!(v, "t" | "true" | "TRUE")),
         // CHAR: without trailing blanks.
         "bpchar" => J::str(v.trim_end()),
@@ -1736,6 +1821,11 @@ fn column_type(t: &ColType, longest: usize) -> (String, i64, i64, i64) {
         "int8" => ("BIGINT".into(), 19, 0, 20),
         "float4" => ("REAL".into(), 24, 0, 13),
         "float8" => ("DOUBLE".into(), 53, 0, 22),
+        // DECFLOAT(16) and (34) (verify69 p69_mapepire "num": DECFLOAT,
+        // display 23, precision 16).
+        "numeric" if t.db2.as_deref() == Some("DECFLOAT") => {
+            ("DECFLOAT".into(), m, 0, if m > 16 { 42 } else { 23 })
+        }
         // NUMERIC (zoned) and DECIMAL (packed) as the file has them
         // (verify68 o68_mapepire "sel": Z NUMERIC(5, 0), display 7).
         "numeric" if m >= 4 => {
@@ -1753,18 +1843,29 @@ fn column_type(t: &ColType, longest: usize) -> (String, i64, i64, i64) {
         "nvarchar" => ("NVARCHAR".into(), m, 0, m),
         "varbit_fbd" => ("VARCHAR () FOR BIT DATA".into(), m, 0, m),
         "binary" => ("BINARY".into(), m, 0, m),
+        // GRAPHIC and VARGRAPHIC in Unicode as JDBC names them; CLOB
+        // with its length (verify69 "oth").
+        "bpchar" if m >= 4 && t.db2.as_deref() == Some("NCHAR") => {
+            ("NCHAR".into(), m - 4, 0, m - 4)
+        }
+        "varchar" if m >= 4 && t.db2.as_deref() == Some("NVARCHAR") => {
+            ("NVARCHAR".into(), m - 4, 0, m - 4)
+        }
+        "text" if m >= 4 && t.db2.as_deref() == Some("CLOB") => ("CLOB".into(), m - 4, 0, m - 4),
         "bpchar" if m >= 4 => ("CHAR".into(), m - 4, 0, m - 4),
         "bpchar" => ("CHAR".into(), l, 0, l),
         "varchar" if m >= 4 => ("VARCHAR".into(), m - 4, 0, m - 4),
         "date" => ("DATE".into(), 10, 0, 10),
         "time" => ("TIME".into(), 8, 0, 8),
         "timestamp" => ("TIMESTAMP".into(), 26, 6, 26),
-        "bool" => ("BOOLEAN".into(), 1, 0, 5),
+        // BOOLEAN: display size 1 (verify69 "oth").
+        "bool" => ("BOOLEAN".into(), 1, 0, 1),
         // BINARY(n) (verify68 o68_mapepire "sel": BINARY, display 2,
         // precision 2).
         "bytea" if t.db2.as_deref() == Some("BINARY") && m >= 4 => {
             ("BINARY".into(), m - 4, 0, m - 4)
         }
+        "bytea" if m >= 4 => ("VARBINARY".into(), m - 4, 0, m - 4),
         "bytea" => ("VARBINARY".into(), l, 0, l * 2),
         "xml" => ("XML".into(), l, 0, l),
         _ => ("VARCHAR".into(), l, 0, l),
@@ -2033,11 +2134,41 @@ mod tests {
             typmod: -1,
             db2: None,
         };
-        // PUB400's 2.3.2 server wrote DECIMAL(7, 2) -12.50 as -12.5
+        // PUB400's 2.3.2 server wrote DECIMAL(7, 2) -12.50 with its scale
         // (verify68 o68_mapepire "sel"); JSON has no leading zeros.
         assert_eq!(
             cell(Some(&t("numeric")), Some("-0012.50")),
-            J::Num("-12.5".into())
+            J::Num("-12.50".into())
+        );
+        // Doubles as Java writes them (verify69 p69_mapepire "num").
+        assert_eq!(
+            cell(Some(&t("float8")), Some("12345678.5")),
+            J::Num("1.23456785E7".into())
+        );
+        assert_eq!(
+            cell(Some(&t("float8")), Some("1e-05")),
+            J::Num("1.0E-5".into())
+        );
+        assert_eq!(cell(Some(&t("float8")), Some("1.5")), J::Num("1.5".into()));
+        assert_eq!(
+            cell(Some(&t("float8")), Some("100")),
+            J::Num("100.0".into())
+        );
+        assert_eq!(
+            cell(Some(&t("float8")), Some("0.001")),
+            J::Num("0.001".into())
+        );
+        assert_eq!(
+            cell(Some(&t("float8")), Some("-0.0005")),
+            J::Num("-5.0E-4".into())
+        );
+        assert_eq!(
+            cell(Some(&t("float8")), Some("1e+07")),
+            J::Num("1.0E7".into())
+        );
+        assert_eq!(
+            cell(Some(&t("float8")), Some("9999999")),
+            J::Num("9999999.0".into())
         );
         assert_eq!(cell(Some(&t("numeric")), Some("7")), J::Num("7".into()));
         assert_eq!(cell(Some(&t("numeric")), Some(".5")), J::Num("0.5".into()));

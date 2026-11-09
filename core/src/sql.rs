@@ -669,6 +669,96 @@ async fn system_column_names(client: &Client, libl: &[String], sql: &str) -> Res
 /// built-in global variables): the job's qualified name, number/user/name.
 pub const JOB_NAME_SQL: &str = "as4tainr_svc.job_name()";
 
+/// A string constant concatenated (CONCAT, ||) is VARCHAR, as in Db2
+/// for i (verify68 o68_mapepire "exp": 'x' CONCAT C of a CHAR(5) is
+/// VARCHAR "xab   "): cast, so that PostgreSQL does not take it as the
+/// CHAR operand's type (whose blanks do not count).
+fn concat_strings(toks: Vec<Tok>) -> Vec<Tok> {
+    let is_concat = |toks: &[Tok], j: usize| match &toks[j] {
+        Tok::Punct(p) => p == "||",
+        Tok::Word(w) if w.eq_ignore_ascii_case("CONCAT") => !matches!(
+            (j + 1..toks.len()).find(|&k| !matches!(toks[k], Tok::Space(_))).map(|k| &toks[k]),
+            Some(Tok::Punct(p)) if p == "("
+        ),
+        _ => false,
+    };
+    let mut out = Vec::with_capacity(toks.len());
+    for (i, t) in toks.iter().enumerate() {
+        // Not X'..', BX'..', G'..' (a word right before the quote).
+        let prefixed = i > 0 && matches!(toks[i - 1], Tok::Word(_));
+        let joined = matches!(t, Tok::Str(_)) && !prefixed && {
+            let prev = (0..i).rev().find(|&k| !matches!(toks[k], Tok::Space(_)));
+            let next = (i + 1..toks.len()).find(|&k| !matches!(toks[k], Tok::Space(_)));
+            prev.is_some_and(|k| is_concat(&toks, k)) || next.is_some_and(|k| is_concat(&toks, k))
+        };
+        if joined {
+            out.extend([
+                Tok::Word("CAST".into()),
+                Tok::Punct("(".into()),
+                t.clone(),
+                Tok::Space(" ".into()),
+                Tok::Word("AS".into()),
+                Tok::Space(" ".into()),
+                Tok::Word("varchar".into()),
+                Tok::Punct(")".into()),
+            ]);
+        } else {
+            out.push(t.clone());
+        }
+    }
+    out
+}
+
+/// COUNT(...) [OVER (...)] is INTEGER in Db2 for i (SQL Reference,
+/// COUNT: "The result of the function is a large integer"; verify69
+/// p69_mapepire "ps3": INTEGER, display 11), BIGINT in PostgreSQL: cast.
+fn count_integer(toks: Vec<Tok>) -> Vec<Tok> {
+    let next_non_space =
+        |toks: &[Tok], from: usize| (from..toks.len()).find(|&j| !matches!(toks[j], Tok::Space(_)));
+    let mut out: Vec<Tok> = Vec::with_capacity(toks.len());
+    let mut i = 0;
+    let mut ends: Vec<usize> = Vec::new();
+    while i < toks.len() {
+        let is_count = matches!(&toks[i], Tok::Word(w) if w.eq_ignore_ascii_case("COUNT"))
+            && !matches!(out.iter().rev().find(|t| !matches!(t, Tok::Space(_))), Some(Tok::Punct(p)) if p == ".");
+        let open = if is_count {
+            next_non_space(&toks, i + 1)
+        } else {
+            None
+        };
+        if let Some(o) = open.filter(|&o| toks[o] == Tok::Punct("(".into())) {
+            if let Some((close, _)) = paren_span(&toks, o) {
+                let mut end = close;
+                if let Some(w) = next_non_space(&toks, close + 1) {
+                    if matches!(&toks[w], Tok::Word(x) if x.eq_ignore_ascii_case("OVER")) {
+                        if let Some(o2) = next_non_space(&toks, w + 1)
+                            .filter(|&o2| toks[o2] == Tok::Punct("(".into()))
+                        {
+                            if let Some((c2, _)) = paren_span(&toks, o2) {
+                                end = c2;
+                            }
+                        }
+                    }
+                }
+                out.push(Tok::Word("CAST".into()));
+                out.push(Tok::Punct("(".into()));
+                ends.push(end);
+            }
+        }
+        out.push(toks[i].clone());
+        while ends.last() == Some(&i) {
+            ends.pop();
+            out.push(Tok::Space(" ".into()));
+            out.push(Tok::Word("AS".into()));
+            out.push(Tok::Space(" ".into()));
+            out.push(Tok::Word("integer".into()));
+            out.push(Tok::Punct(")".into()));
+        }
+        i += 1;
+    }
+    out
+}
+
 /// LISTAGG(x [, separator]) WITHIN GROUP (ORDER BY ...) (Db2 for i SQL
 /// Reference, LISTAGG) as PostgreSQL's string_agg(x, separator ORDER BY
 /// ...); the separator is an empty string when there is none.
@@ -1063,10 +1153,10 @@ fn check_case_conditions(toks: &[Tok]) -> Result<()> {
 
 pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Translated> {
     check_case_conditions(&tokenize(sql.trim())?)?;
-    let mut toks = listagg(decimal_division(sequence_values(
+    let mut toks = concat_strings(count_integer(listagg(decimal_division(sequence_values(
         crate::sqljsonfn::rewrite(crate::sqljson::rewrite(tokenize(sql.trim())?)?)?,
         is_library,
-    )));
+    )))));
     // QTEMP.X and QTEMP/X: the job's own library (qtemp.rs). SESSION.X
     // names a declared global temporary table, which lives in QTEMP.
     for i in 0..toks.len() {
@@ -3045,6 +3135,72 @@ fn parameter_columns(text: &str, n: usize) -> Vec<Option<(Vec<String>, String)>>
     out
 }
 
+/// File columns' SQL types as SYSCOLUMNS has them, where PostgreSQL's
+/// type does not tell (one query for the statement): NUMERIC (zoned)
+/// and DECIMAL (packed), BINARY and VARBINARY (the length in `typmod`),
+/// DECFLOAT (`typmod` 16 or 34 digits), CLOB (the length in `typmod`),
+/// GRAPHIC and VARGRAPHIC in CCSID 1200 or 13488 (NCHAR and NVARCHAR,
+/// as JDBC names them: verify69 p69_mapepire "oth").
+async fn describe_types(client: &Client, cols: &[&tokio_postgres::Column], types: &mut [ColType]) {
+    let mut oids: Vec<u32> = Vec::new();
+    let mut nums: Vec<i16> = Vec::new();
+    let mut at: Vec<usize> = Vec::new();
+    for (j, c) in cols.iter().enumerate() {
+        if let (Some(o), Some(n), true) = (
+            c.table_oid(),
+            c.column_id(),
+            matches!(
+                c.type_().name(),
+                "numeric" | "bytea" | "bpchar" | "varchar" | "text"
+            ),
+        ) {
+            oids.push(o);
+            nums.push(n);
+            at.push(j);
+        }
+    }
+    if oids.is_empty() {
+        return;
+    }
+    let Ok(rows) = client
+        .query(
+            "SELECT CAST(k.i AS int4), CAST(s.data_type AS text), CAST(s.length AS int4), CAST(s.ccsid AS int4)
+               FROM unnest($1::oid[], $2::int2[]) WITH ORDINALITY k(o, a, i)
+               JOIN pg_catalog.pg_attribute pa ON pa.attrelid = k.o AND pa.attnum = k.a
+               JOIN pg_catalog.pg_class r ON r.oid = pa.attrelid
+               JOIN pg_catalog.pg_namespace n ON n.oid = r.relnamespace
+               JOIN qsys2.syscolumns s ON s.system_table_schema = upper(n.nspname) COLLATE \"C\"
+                AND s.system_table_name = upper(r.relname) COLLATE \"C\"
+                AND s.system_column_name = upper(pa.attname) COLLATE \"C\"",
+            &[&oids, &nums],
+        )
+        .await
+    else {
+        return;
+    };
+    for r in rows {
+        let i: i32 = r.get(0);
+        let Some(&j) = at.get(i as usize - 1) else {
+            continue;
+        };
+        let dt: String = r.get::<_, String>(1).trim().to_string();
+        let len: i32 = r.try_get::<_, Option<i32>>(2).ok().flatten().unwrap_or(0);
+        let ccsid: Option<i32> = r.try_get(3).ok().flatten();
+        let t = &mut types[j];
+        let unicode = matches!(ccsid, Some(1200 | 13488));
+        t.db2 = Some(match dt.as_str() {
+            "GRAPHIC" if unicode => "NCHAR".to_string(),
+            "VARG" if unicode => "NVARCHAR".to_string(),
+            other => other.to_string(),
+        });
+        match dt.as_str() {
+            "BINARY" | "VARBIN" | "CLOB" | "BLOB" => t.typmod = len + 4,
+            "DECFLOAT" => t.typmod = if len > 8 { 34 } else { 16 },
+            _ => {}
+        }
+    }
+}
+
 /// A value of a PostgreSQL type as Db2 for i shows it: timestamps in
 /// the Db2 form, binary data as hex digits.
 fn db2_text(pg_type: &str, v: &str) -> String {
@@ -3387,6 +3543,10 @@ pub struct Session {
     /// The program running the statements (journal entries name it).
     program: Option<(String, String)>,
     database_url: String,
+    /// Describe result columns by their files' SQL types (SYSCOLUMNS:
+    /// NUMERIC, BINARY, GRAPHIC, CLOB, DECFLOAT): one more query per
+    /// statement, for clients that show the types (Mapepire).
+    pub describe_types: bool,
 }
 
 impl Session {
@@ -3464,6 +3624,7 @@ impl Session {
             cmt: None,
             libraries: catalog::list_libraries(client).await?,
             libl: libl.to_vec(),
+            describe_types: false,
         })
     }
 
@@ -3719,8 +3880,11 @@ impl Session {
                 .filter(|(_, k)| **k)
                 .map(|(c, _)| c)
             {
-                let typmod = match (c.table_oid(), c.column_id()) {
-                    (Some(oid), Some(col)) => client
+                // The length from the statement's description, else from
+                // the column's table.
+                let typmod = match (c.type_modifier(), c.table_oid(), c.column_id()) {
+                    (m, _, _) if m >= 0 => m,
+                    (_, Some(oid), Some(col)) => client
                         .query_opt(
                             "SELECT atttypmod FROM pg_catalog.pg_attribute WHERE attrelid = $1 AND attnum = $2",
                             &[&oid, &col],
@@ -3732,39 +3896,21 @@ impl Session {
                         .unwrap_or(-1),
                     _ => -1,
                 };
-                // A numeric or binary column of a file: its SQL type as
-                // SYSCOLUMNS has it (NUMERIC zoned or DECIMAL packed,
-                // BINARY or VARBIN) and length.
-                let mut typmod = typmod;
-                let db2 = match (c.type_().name(), c.table_oid(), c.column_id()) {
-                    ("numeric" | "bytea", Some(oid), Some(col)) => client
-                        .query_opt(
-                            "SELECT CAST(s.data_type AS text), s.length FROM pg_catalog.pg_attribute a
-                               JOIN pg_catalog.pg_class r ON r.oid = a.attrelid
-                               JOIN pg_catalog.pg_namespace n ON n.oid = r.relnamespace
-                               JOIN qsys2.syscolumns s ON s.system_table_schema = upper(n.nspname) COLLATE \"C\"
-                                AND s.system_table_name = upper(r.relname) COLLATE \"C\"
-                                AND s.system_column_name = upper(a.attname) COLLATE \"C\"
-                              WHERE a.attrelid = $1 AND a.attnum = $2",
-                            &[&oid, &col],
-                        )
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|r| {
-                            let len: i32 = r.try_get(1).unwrap_or(0);
-                            if c.type_().name() == "bytea" {
-                                typmod = len + 4;
-                            }
-                            r.get::<_, String>(0).trim().to_string()
-                        }),
-                    _ => None,
-                };
                 types.push(ColType {
                     pg: c.type_().name().to_string(),
                     typmod,
-                    db2,
+                    db2: None,
                 });
+            }
+            if self.describe_types {
+                let cols: Vec<&tokio_postgres::Column> = stmt
+                    .columns()
+                    .iter()
+                    .zip(&keep)
+                    .filter(|(_, k)| **k)
+                    .map(|(c, _)| c)
+                    .collect();
+                describe_types(client, &cols, &mut types).await;
             }
             let mut rows = Vec::new();
             for m in client

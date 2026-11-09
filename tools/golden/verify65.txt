@@ -1,0 +1,8 @@
+# Golden (batch 5): XML-INTO %HANDLER (verify63's f63_handler again:
+# PUB400 has no `timeout`, so the CALL runs in the background and is
+# ended after 60 seconds if it has not ended).
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify65.txt -Files tools\golden\verify65
+g65_cleanup|!for c in "DLTF FILE(AS4TRAINR1/GLD65R)" "DLTPGM PGM(AS4TRAINR1/GLD65X)"; do system -q "$c"; done; echo cleaned
+g65_tag|!setccsid 819 /home/AS4TRAINR/gld/gld65x.rpgle; ls /home/AS4TRAINR/gld | grep gld65
+g65_handler|!system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD65R (RES CHAR(40) NOT NULL)') COMMIT(*NONE)"; system "CRTBNDRPG PGM(AS4TRAINR1/GLD65X) SRCSTMF('/home/AS4TRAINR/gld/gld65x.rpgle')" | grep -E "^RNS9304|^CPF"; system "CALL PGM(AS4TRAINR1/GLD65X)" > /tmp/gld65call.txt 2>&1 & p=$!; n=0; while kill -0 $p 2>/dev/null && [ $n -lt 60 ]; do sleep 1; n=$((n+1)); done; kill $p 2>/dev/null; echo "waited=$n"; cat /tmp/gld65call.txt | cut -c1-120; system "CPYF FROMFILE(AS4TRAINR1/GLD65R) TOFILE(*PRINT)" | grep -E "^ +[0-9]+ +[0-9]"
+g65_end|!for c in "DLTF FILE(AS4TRAINR1/GLD65R)" "DLTPGM PGM(AS4TRAINR1/GLD65X)"; do system -q "$c"; done; echo cleaned

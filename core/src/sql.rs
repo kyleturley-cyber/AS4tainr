@@ -1967,6 +1967,15 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
                     None => false,
                 };
                 if let Some(o) = next_non_space(&toks, i + 1).filter(|_| in_from) {
+                    // TABLE(VALUES ...) AS t(x), TABLE(SELECT ...): a
+                    // subquery, which keeps its parentheses.
+                    let inner = next_non_space(&toks, o + 1).and_then(|k| word(&toks[k]));
+                    if toks[o] == Tok::Punct("(".into())
+                        && matches!(inner.as_deref(), Some("VALUES" | "SELECT" | "WITH"))
+                    {
+                        i += 1;
+                        continue;
+                    }
                     if toks[o] == Tok::Punct("(".into()) {
                         let mut depth = 0i32;
                         let close = (o..toks.len()).find(|&j| {
@@ -2164,6 +2173,15 @@ pub(crate) fn map_error(e: &tokio_postgres::Error, sql: &str) -> anyhow::Error {
     };
     let msg = db.message().to_string();
     let code = db.code().code();
+    // A service function's own error ("SQL0204: ..." raised by
+    // QSYS2.LIBRARY_INFO): as it is.
+    if msg.len() > 8
+        && msg.starts_with("SQL")
+        && msg[3..7].chars().all(|c| c.is_ascii_digit())
+        && &msg[7..8] == ":"
+    {
+        return anyhow!("{msg}");
+    }
     let upper = |s: &str| s.to_ascii_uppercase().replace('"', "");
     match code {
         "42P01" => anyhow!(
@@ -2494,7 +2512,10 @@ fn values_rows(toks: &mut Vec<Tok>) {
             .iter()
             .find(|t| !matches!(t, Tok::Space(_)));
         let parenthesized = matches!(first, Some(Tok::Punct(p)) if p == "(");
-        if commas.is_empty() || parenthesized {
+        // One expression in a nested VALUES (`TABLE(VALUES 'A') AS t(x)`)
+        // is a row too; a statement's own VALUES is left to `translate`.
+        let nested = toks[..i].iter().any(|t| !matches!(t, Tok::Space(_)));
+        if parenthesized || (commas.is_empty() && !nested) {
             i = end.max(i + 1);
             continue;
         }
@@ -2857,6 +2878,12 @@ mod tests {
         assert_eq!(
             tr("with l (x) as (values 'A','B') select x from l").sql,
             "with l (x) as (values ('A'),('B')) select x from l"
+        );
+        // One value (Code for IBM i's getLibraryList: `TABLE(VALUES 'LIB')
+        // AS libs(ELEMENT)`).
+        assert_eq!(
+            tr("select x from table(values 'A') as l(x)").sql,
+            "select x from (values ('A')) as l(x)"
         );
         assert_eq!(tr("select a concat b from t").sql, "select a || b from t");
         assert_eq!(

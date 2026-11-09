@@ -366,6 +366,21 @@ impl Job<'_> {
                 anyhow!("{t}\nCPF2817: The copy was not done.")
             }
         })?;
+        // TOKEY(*BLDKEY ...) on a numeric key: the copy is done, after a
+        // CPF2951 diagnostic (PUB400 2026-11-09, verify63 f63_bldkey:
+        // FROMKEY(*BLDKEY (2)) TOKEY(*BLDKEY (4)) on a packed key copied
+        // keys 2 to 4 with CPF2951 first).
+        let tokey_note = cmd
+            .list("TOKEY")
+            .first()
+            .is_some_and(|w| w.trim().eq_ignore_ascii_case("*BLDKEY"))
+            && from
+                .file
+                .keys
+                .first()
+                .map(|k| is_numeric(&from.file, k))
+                .transpose()?
+                .unwrap_or(false);
         let fields: Vec<String> = from.file.fields.iter().map(|f| f.name.clone()).collect();
         // No records: CPC2957, to a file or *PRINT (PUB400 2026-10-27,
         // verify5 z_cpysplf_2f, verify8 c8_cpyf_empty).
@@ -440,6 +455,12 @@ impl Job<'_> {
         // CPF2889 when CRTFILE(*YES) creates the to-file, CPF4011 when the
         // from-records are shorter).
         let mut infos = Vec::new();
+        if tokey_note {
+            infos.push(format!(
+                "CPF2951: The TOKEY values were not compared as the key of {}.",
+                from.file.name
+            ));
+        }
         let mut created = false;
         let to = match catalog::resolve_file(self.client, &to_libs, &to_name).await {
             Ok(t) => t,
@@ -978,6 +999,11 @@ fn select(
             w[2].to_ascii_uppercase(),
             unquote(&w[3]),
         );
+        // A field the from-file does not have: CPF2842 (then CPF2817:
+        // PUB400 2026-11-09, verify63 f63_bad).
+        if is_numeric(file, &test.0).is_err() {
+            bail!("CPF2842: INCREL field {} is not in the from-file.", test.0);
+        }
         match first.as_str() {
             "*IF" | "*OR" => increl.push(vec![test]),
             "*AND" => match increl.last_mut() {

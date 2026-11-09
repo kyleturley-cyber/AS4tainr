@@ -26869,7 +26869,22 @@ async fn copy_file_selects_records() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(e.contains("CPF2817"), "{e}");
+    // CPF2842, then CPF2817 (PUB400 2026-11-09, verify63 f63_bad).
+    assert!(e.starts_with("CPF2842") && e.contains("CPF2817"), "{e}");
+    // TOKEY(*BLDKEY ...) on the packed key: copied, after CPF2951 (verify63
+    // f63_bldkey: CPF2951, CPF2880, CPF2889, CPC2955).
+    let m = match job
+        .run(&format!(
+            "CPYF FROMFILE({lib}/CUSTMAST) TOFILE({lib}/SELB) CRTFILE(*YES) FROMKEY(*BLDKEY (2)) TOKEY(*BLDKEY (4))"
+        ))
+        .await
+        .unwrap()
+    {
+        as4tainr_core::commands::Outcome::Messages(m) => m,
+        other => panic!("{other:?}"),
+    };
+    let ids: Vec<&str> = m.iter().map(|l| &l[..7]).collect();
+    assert_eq!(ids, ["CPF2951", "CPF2880", "CPF2889", "CPC2955"], "{m:?}");
 }
 
 // A program that returns without LR stays active with its printer file
@@ -26983,11 +26998,12 @@ async fn mapepire_answers_code_for_ibm_i() {
     assert_eq!(r.get("success"), Some(&J::Bool(false)));
     assert_eq!(r.get("sql_state"), Some(&J::str("42704")), "{r}");
     assert_eq!(r.get("sql_rc"), Some(&J::Num("-204".into())), "{r}");
-    assert!(r
-        .get("error")
-        .and_then(J::text)
-        .unwrap()
-        .starts_with("[SQL0204] "));
+    // The message's text alone (PUB400's Mapepire, verify64 m64_mapepire
+    // "e1": the text, then 42704 and -204 apart).
+    assert!(
+        !r.get("error").and_then(J::text).unwrap().starts_with('['),
+        "{r}"
+    );
     let r = ask(format!(
         r#"{{"id":"c","type":"sql","sql":"with L (X) as (values '{lib}', 'NOSUCHLIB') select X, QSYS2.QCMDEXC('CHKOBJ OBJ(QSYS/' concat X concat ') OBJTYPE(*LIB)') VALID from L"}}"#
     ))
@@ -27013,12 +27029,11 @@ async fn mapepire_answers_code_for_ibm_i() {
         r#"{{"id":"e","type":"cl","cmd":"CRTDTAARA DTAARA({lib}/MPDA) TYPE(*CHAR) LEN(5)"}}"#
     ))
     .await;
+    // A command that fails: QCMDEXC's SQL error, 38501 / -443, with the
+    // escape message's text (verify64 m64_mapepire "cl2").
     assert_eq!(r.get("success"), Some(&J::Bool(false)), "{r}");
-    assert!(r
-        .get("error")
-        .and_then(J::text)
-        .unwrap()
-        .starts_with("[CPF1023] "));
+    assert_eq!(r.get("sql_state"), Some(&J::str("38501")), "{r}");
+    assert_eq!(r.get("sql_rc"), Some(&J::Num("-443".into())), "{r}");
     let r = ask(r#"{"id":"f","type":"nonsense"}"#.into()).await;
     assert_eq!(r.get("success"), Some(&J::Bool(false)));
     assert!(ask("not json".into()).await.get("unparseable").is_some());

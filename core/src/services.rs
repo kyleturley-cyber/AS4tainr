@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 51";
+const VERSION: &str = "as4tainr services 52";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -1511,9 +1511,9 @@ END $$;
 /// QSYS2.SPOOLED_FILE_INFO (IBM i services): the spooled files of a user
 /// (*CURRENT: the statement's job's user; *ALL), created from a moment
 /// on, with a status (*READY, *HELD, *OPEN... or *ALL), on an output
-/// queue, with user data. The columns Code for IBM i reads, and the
-/// spooled file's own; the others IBM's function has are not here
-/// (docs/fidelity-gaps.md).
+/// queue, with user data. The columns, their order and types as PUB400's
+/// function gives them (2026-11-09, verify64 m64_mapepire "sfi"); size,
+/// system and IPP job id are null here, priority 5, copies 1, form *STD.
 const SPOOLED_FILE_INFO: &str = r#"
 DROP FUNCTION IF EXISTS qsys2.spooled_file_info(varchar, timestamp, timestamp, varchar, varchar, varchar, varchar, varchar);
 CREATE FUNCTION qsys2.spooled_file_info(
@@ -1522,22 +1522,26 @@ CREATE FUNCTION qsys2.spooled_file_info(
   output_queue varchar DEFAULT '*ALL', user_data varchar DEFAULT '*ALL',
   form_type varchar DEFAULT '*ALL', system_name varchar DEFAULT '*ALL')
 RETURNS TABLE (
-  creation_timestamp timestamp, spooled_file_name varchar(10), user_name varchar(10),
-  user_data varchar(10), status varchar(15), total_pages integer,
+  spooled_file_name varchar(10), spooled_file_number integer, status varchar(15),
+  output_priority integer, creation_timestamp timestamp(0), user_data varchar(10),
+  size bigint, total_pages integer, copies integer, qualified_job_name varchar(28),
   job_name varchar(10), job_user varchar(10), job_number varchar(6),
-  spooled_file_number integer, qualified_job_name varchar(28),
-  output_queue_library varchar(10), output_queue varchar(10))
+  file_available varchar(8), form_type varchar(10), output_queue_library varchar(10),
+  output_queue varchar(10), asp_number integer, system varchar(8),
+  internet_print_protocol_job_id integer)
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
-  SELECT s.created::timestamp, CAST(s.file AS varchar(10)), CAST(s.user_name AS varchar(10)),
-         CAST(nullif(s.user_data, '') AS varchar(10)),
+  SELECT CAST(s.file AS varchar(10)), s.number,
          CAST(CASE s.status WHEN 'RDY' THEN 'READY' WHEN 'HLD' THEN 'HELD' WHEN 'OPN' THEN 'OPEN'
                             WHEN 'SAV' THEN 'SAVED' WHEN 'WTR' THEN 'WRITING' ELSE s.status END AS varchar(15)),
-         s.pages,
+         5, CAST(s.created AS timestamp(0)), CAST(nullif(s.user_data, '') AS varchar(10)),
+         CAST(NULL AS bigint), s.pages, 1, CAST(s.job_name AS varchar(28)),
          CAST(split_part(s.job_name, '/', 3) AS varchar(10)),
          CAST(split_part(s.job_name, '/', 2) AS varchar(10)),
          CAST(split_part(s.job_name, '/', 1) AS varchar(6)),
-         s.number, CAST(s.job_name AS varchar(28)),
-         CAST(s.outq_lib AS varchar(10)), CAST(s.outq AS varchar(10))
+         CAST(CASE WHEN s.status = 'OPN' THEN '*FILEEND' ELSE '*FILEEND' END AS varchar(8)),
+         CAST('*STD' AS varchar(10)),
+         CAST(s.outq_lib AS varchar(10)), CAST(s.outq AS varchar(10)), 1,
+         CAST(NULL AS varchar(8)), CAST(NULL AS integer)
     FROM as4tainr.spooled_files s
    WHERE (upper($1) = '*ALL'
           OR s.user_name = CASE WHEN upper($1) = '*CURRENT'
@@ -1557,15 +1561,21 @@ $$;
 /// QSYS2.LIBRARY_INFO(LIBRARY_NAME [, IGNORE_ERRORS] [, DETAILED_INFO])
 /// (IBM i services): a library's description. as4tainr has one ASP: the
 /// IASP name is *SYSBAS (Code for IBM i takes *SYSBAS as "not in an
-/// independent ASP"). The columns as4tainr can give; IBM's function has
-/// more (docs/fidelity-gaps.md).
+/// independent ASP"). The columns and their types as PUB400's function
+/// gives them (2026-11-09, verify64 m64_mapepire "li"); journaling and
+/// create authority values are as4tainr's (*SYSVAL, NO).
 const LIBRARY_INFO: &str = r#"
 DROP FUNCTION IF EXISTS qsys2.library_info(varchar, varchar, varchar);
 CREATE FUNCTION qsys2.library_info(
   library_name varchar, ignore_errors varchar DEFAULT 'NO', detailed_info varchar DEFAULT 'NO')
 RETURNS TABLE (
-  object_count integer, library_type varchar(7), text_description varchar(50),
-  iasp_name varchar(10), iasp_number smallint)
+  object_count integer, library_size bigint, library_size_complete varchar(3),
+  library_type char(4), text_description varchar(50), iasp_name varchar(10),
+  iasp_number integer, create_authority varchar(10), object_audit_create varchar(7),
+  journaled varchar(3), journal_library varchar(10), journal_name varchar(10),
+  inherit_journaling varchar(3), journal_inherit_rules integer,
+  journal_start_timestamp timestamp, apply_starting_receiver_library varchar(10),
+  apply_starting_receiver varchar(10), apply_starting_receiver_asp varchar(10))
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
   lib text := upper(trim(library_name));
@@ -1577,11 +1587,17 @@ BEGIN
     END IF;
     RAISE EXCEPTION 'SQL0204: % in QSYS type *LIB not found.', lib USING ERRCODE = '42704';
   END IF;
+  -- DETAILED_INFO NO: the size is not worked out (null), as on PUB400.
   RETURN QUERY
   SELECT CAST((SELECT count(*) FROM as4tainr.objects x WHERE x.library = lib) AS integer),
-         CAST(CASE WHEN o.attribute = 'TEST' THEN 'TEST' ELSE 'PROD' END AS varchar(7)),
+         CAST(NULL AS bigint), CAST(NULL AS varchar(3)),
+         CAST(CASE WHEN o.attribute = 'TEST' THEN 'TEST' ELSE 'PROD' END AS char(4)),
          CAST(nullif(o.text, '') AS varchar(50)),
-         CAST('*SYSBAS' AS varchar(10)), CAST(1 AS smallint)
+         CAST('*SYSBAS' AS varchar(10)), 1,
+         CAST('*SYSVAL' AS varchar(10)), CAST(NULL AS varchar(7)),
+         CAST('NO' AS varchar(3)), CAST(NULL AS varchar(10)), CAST(NULL AS varchar(10)),
+         CAST('NO' AS varchar(3)), 0, CAST(NULL AS timestamp),
+         CAST(NULL AS varchar(10)), CAST(NULL AS varchar(10)), CAST(NULL AS varchar(10))
     FROM as4tainr.objects o
    WHERE o.library = 'QSYS' AND o.objtype = '*LIB' AND o.name = lib;
 END $$;
@@ -1615,30 +1631,194 @@ SELECT CAST(o.library AS varchar(128)) COLLATE "C" AS table_schema,
 DROP FUNCTION IF EXISTS qsys2.partition_statistics(varchar, varchar);
 CREATE FUNCTION qsys2.partition_statistics(table_schema varchar, table_name varchar)
 RETURNS TABLE (
-  table_schema varchar(128), table_name varchar(128), table_partition varchar(128),
-  number_rows bigint, avgrowsize integer, create_timestamp timestamp,
-  last_change_timestamp timestamp, last_used_timestamp timestamp, days_used_count integer,
-  system_table_schema char(10), system_table_name char(10), system_table_member char(10),
-  source_type varchar(10), last_source_update_timestamp timestamp, text varchar(50))
+  table_partition varchar(128),
+  system_table_member char(10),
+  number_rows bigint,
+  number_row_pages bigint,
+  number_pages bigint,
+  overflow bigint,
+  clustered char(1),
+  active_blocks bigint,
+  avgrowsize bigint,
+  partition_type char(1),
+  partition_number integer,
+  number_distributed_partitions integer,
+  number_deleted_rows bigint,
+  data_size bigint,
+  variable_length_size bigint,
+  fixed_length_extents bigint,
+  variable_length_extents bigint,
+  column_stats_size bigint,
+  maintained_temporary_index_size bigint,
+  out_of_sync_data_space_entries bigint,
+  variable_length_segments bigint,
+  number_distinct_indexes smallint,
+  open_operations bigint,
+  close_operations bigint,
+  insert_operations bigint,
+  update_operations bigint,
+  delete_operations bigint,
+  logical_reads bigint,
+  physical_reads bigint,
+  sequential_reads bigint,
+  random_reads bigint,
+  blocked_insert_operations bigint,
+  blocked_insert_rows bigint,
+  clear_operations bigint,
+  copy_operations bigint,
+  reorganize_operations bigint,
+  index_builds bigint,
+  last_change_timestamp timestamp,
+  last_save_timestamp timestamp,
+  last_restore_timestamp timestamp,
+  last_used_timestamp timestamp,
+  days_used_count integer,
+  last_reset_timestamp timestamp,
+  file_cst_type char(11),
+  next_identity_value decimal(31,0),
+  low_inclusive char(1),
+  low_value varchar(1024),
+  high_inclusive char(1),
+  high_value varchar(1024),
+  number_partitioning_keys integer,
+  partitioning_keys varchar(2880),
+  keep_in_memory char(1),
+  media_preference smallint,
+  create_timestamp timestamp,
+  last_source_update_timestamp timestamp,
+  source_type varchar(10),
+  volatile char(1),
+  text varchar(50),
+  partial_transaction char(1),
+  apply_starting_receiver_library varchar(10),
+  apply_starting_receiver varchar(10))
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
-  SELECT CAST(m.library AS varchar(128)), CAST(m.file AS varchar(128)), CAST(m.member AS varchar(128)),
-         CAST(CASE WHEN m.source = '' THEN 0
-                   ELSE length(m.source) - length(replace(m.source, chr(10), ''))
-                        + CASE WHEN right(m.source, 1) = chr(10) THEN 0 ELSE 1 END END AS bigint),
-         CAST(coalesce(sf.rcdlen, 92) AS integer),
-         m.added::timestamp, m.changed::timestamp, m.last_used::timestamp, m.days_used,
-         CAST(m.library AS char(10)), CAST(m.file AS char(10)), CAST(m.member AS char(10)),
-         CAST(nullif(m.srctype, '') AS varchar(10)), m.changed::timestamp,
-         CAST(nullif(m.text, '') AS varchar(50))
+  SELECT CAST(m.member AS varchar(128)),
+         CAST(m.member AS char(10)),
+         CAST(CASE WHEN m.source = '' THEN 0 ELSE length(m.source) - length(replace(m.source, chr(10), '')) + CASE WHEN right(m.source, 1) = chr(10) THEN 0 ELSE 1 END END AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS char(1)),
+         CAST(NULL AS bigint),
+         CAST(coalesce(sf.rcdlen, 92) AS bigint),
+         CAST(' ' AS char(1)),
+         CAST(0 AS integer),
+         CAST(0 AS integer),
+         CAST(0 AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS smallint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(m.changed AS timestamp),
+         CAST(NULL AS timestamp),
+         CAST(NULL AS timestamp),
+         CAST(m.last_used AS timestamp),
+         CAST(m.days_used AS integer),
+         CAST(NULL AS timestamp),
+         CAST(NULL AS char(11)),
+         CAST(NULL AS decimal(31,0)),
+         CAST(NULL AS char(1)),
+         CAST(NULL AS varchar(1024)),
+         CAST(NULL AS char(1)),
+         CAST(NULL AS varchar(1024)),
+         CAST(NULL AS integer),
+         CAST(NULL AS varchar(2880)),
+         CAST('0' AS char(1)),
+         CAST(NULL AS smallint),
+         CAST(m.added AS timestamp),
+         CAST(m.changed AS timestamp),
+         CAST(nullif(m.srctype, '') AS varchar(10)),
+         CAST('0' AS char(1)),
+         CAST(nullif(m.text, '') AS varchar(50)),
+         CAST(NULL AS char(1)),
+         CAST(NULL AS varchar(10)),
+         CAST(NULL AS varchar(10))
     FROM as4tainr.source_members m
     LEFT JOIN as4tainr.source_files sf ON sf.library = m.library AND sf.name = m.file
    WHERE m.library = upper(rtrim($1)) AND m.file = upper(rtrim($2))
   UNION ALL
-  SELECT CAST(o.library AS varchar(128)), CAST(o.name AS varchar(128)), CAST(o.name AS varchar(128)),
-         CAST(0 AS bigint), CAST(f.record_length AS integer),
-         o.created::timestamp, o.created::timestamp, NULL::timestamp, 0,
-         CAST(o.library AS char(10)), CAST(o.name AS char(10)), CAST(o.name AS char(10)),
-         NULL::varchar(10), NULL::timestamp, CAST(nullif(o.text, '') AS varchar(50))
+  SELECT CAST(o.name AS varchar(128)),
+         CAST(o.name AS char(10)),
+         CAST(0 AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS char(1)),
+         CAST(NULL AS bigint),
+         CAST(f.record_length AS bigint),
+         CAST(' ' AS char(1)),
+         CAST(0 AS integer),
+         CAST(0 AS integer),
+         CAST(0 AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS smallint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(NULL AS bigint),
+         CAST(o.created AS timestamp),
+         CAST(NULL AS timestamp),
+         CAST(NULL AS timestamp),
+         CAST(NULL AS timestamp),
+         CAST(0 AS integer),
+         CAST(NULL AS timestamp),
+         CAST(NULL AS char(11)),
+         CAST(NULL AS decimal(31,0)),
+         CAST(NULL AS char(1)),
+         CAST(NULL AS varchar(1024)),
+         CAST(NULL AS char(1)),
+         CAST(NULL AS varchar(1024)),
+         CAST(NULL AS integer),
+         CAST(NULL AS varchar(2880)),
+         CAST('0' AS char(1)),
+         CAST(NULL AS smallint),
+         CAST(o.created AS timestamp),
+         CAST(NULL AS timestamp),
+         CAST(NULL AS varchar(10)),
+         CAST('0' AS char(1)),
+         CAST(nullif(o.text, '') AS varchar(50)),
+         CAST(NULL AS char(1)),
+         CAST(NULL AS varchar(10)),
+         CAST(NULL AS varchar(10))
     FROM as4tainr.objects o
     JOIN qsys2.sysfiles f ON f.system_table_schema = o.library AND f.system_table_name = o.name
    WHERE o.objtype = '*FILE' AND f.file_type = 'DATA'

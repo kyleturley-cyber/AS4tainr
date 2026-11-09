@@ -63,7 +63,7 @@ Create a connection with the host, the SSH port you mapped, a user
 profile and its password. Leave "Mapepire: use server" off (the default):
 the extension uploads its Mapepire JAR to `~/.vscode` and starts it over
 SSH, and as4tainr answers. The SQL job is a database server job
-(`nnnnnn/QUSER/QZDASOINIT`), with the connection's library list.
+(`nnnnnn-QUSER-QP0ZSPWT`, as Mapepire 2.3 names it), with the connection's library list.
 
 What works: browsing libraries, objects and source members; opening,
 editing and saving members (CPYTOSTMF and CPYFRMSTMF through the IFS);

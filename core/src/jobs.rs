@@ -233,8 +233,8 @@ pub async fn start_interactive(
     })
 }
 
-/// A host server job for a client (the database server's QZDASOINIT,
-/// a prestart job in QUSRWRK running under QUSER) starts serving `user`.
+/// A server job for a client (QP0ZSPWT for a program started over SSH,
+/// in QUSRWRK, running under QUSER) starts serving `user`.
 pub async fn start_server_job(
     client: &Client,
     name: &str,

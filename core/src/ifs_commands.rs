@@ -161,10 +161,17 @@ impl Job<'_> {
                     if !matches!(subtree.as_str(), "*ALL" | "*DIR") {
                         bail!("CPFA0AB: {from} is a directory: SUBTREE(*ALL) copies it.");
                     }
-                    let n = self
-                        .copy_tree(&from, &to, replace, subtree == "*ALL")
-                        .await?;
-                    return msg(format!("CPCA087: {n} objects copied from {from} to {to}."));
+                    // CPFA0BB with the counts, as an escape message when one
+                    // failed (PUB400 2026-11-09, verify64 m64_copied: "3
+                    // objects copied, 0 failed" for a directory, a directory
+                    // in it and a file; m64_copy: a TODIR that is not there,
+                    // 0 copied, 1 failed, exit status 255).
+                    return match self.copy_tree(&from, &to, replace, subtree == "*ALL").await {
+                        Ok(n) => msg(format!(
+                            "CPFA0BB: Objects copied: {n}; objects not copied: 0."
+                        )),
+                        Err(_) => bail!("CPFA0BB: Objects copied: 0; objects not copied: 1."),
+                    };
                 }
                 if !replace && ifs::stat(self.client, &to).await?.is_some() {
                     return Err(cl_error(ifs::Errno(errno::EEXIST).into(), &to));

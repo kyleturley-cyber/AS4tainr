@@ -136,12 +136,29 @@ pub async fn attr(client: &Client, args: &[String]) -> Output {
             return out;
         }
     };
-    let all = ["CCSID", "DATA_SIZE", "OBJTYPE"];
-    let wanted: Vec<String> = if names.is_empty() {
+    let all = ["OBJTYPE", "DATA_SIZE", "CCSID"];
+    let mut wanted: Vec<String> = if names.is_empty() {
         all.iter().map(|s| s.to_string()).collect()
     } else {
         names.iter().map(|s| s.to_string()).collect()
     };
+    // Shown in attr's own order, not the order asked (PUB400 2026-11-09,
+    // verify64 m64_attr: asked DATA_SIZE OBJTYPE CCSID, shown OBJTYPE,
+    // DATA_SIZE, CCSID).
+    let rank = |n: &str| match n
+        .split('=')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "OBJTYPE" => 0,
+        "DATA_SIZE" => 1,
+        "CCSID" => 2,
+        _ => 3,
+    };
+    wanted.sort_by_key(|n| rank(n));
     for w in wanted {
         if let Some((name, v)) = w.split_once('=') {
             let name = name.trim().to_ascii_uppercase();

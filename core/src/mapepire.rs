@@ -19,7 +19,8 @@
 //!
 //! The statements run as as4tainr's STRSQL runs them (data definition,
 //! object locks, the job's library list); the job is a database server
-//! job (QZDASOINIT in QUSRWRK, under QUSER, for the signed-on user).
+//! job (QP0ZSPWT under QUSER, as the Java server started over SSH runs:
+//! PUB400 2026-11-09, verify64 m64_mapepire, for the signed-on user).
 //! What as4tainr does differently from IBM's server is listed in
 //! docs/fidelity-gaps.md ("Mapepire").
 
@@ -289,9 +290,10 @@ fn fail(text: impl Into<String>) -> anyhow::Error {
     })
 }
 
-/// An error from as4tainr's SQL ("SQL0204: text") as the IBM i JDBC
-/// driver words it ("[SQL0204] text"), with its SQLSTATE and SQLCODE;
-/// other messages ("CPF9801: text") as "[CPF9801] text".
+/// An error from as4tainr's SQL ("SQL0204: text") as Mapepire's server
+/// reports it: the message's text alone, with its SQLSTATE and SQLCODE
+/// (PUB400 2026-11-09, verify64 m64_mapepire: "error":"NOPE64 in
+/// AS4TRAINR type *FILE not found.", "sql_state":"42704", "sql_rc":-204).
 fn sql_failure(e: &anyhow::Error) -> anyhow::Error {
     if let Some(f) = e.downcast_ref::<Failure>() {
         return anyhow::Error::new(Failure {
@@ -322,10 +324,7 @@ fn sql_failure(e: &anyhow::Error) -> anyhow::Error {
                 code,
             )
         });
-    anyhow::Error::new(Failure {
-        text: format!("[{id}] {text}"),
-        sql,
-    })
+    anyhow::Error::new(Failure { text, sql })
 }
 
 /// The rows of a result not yet sent.
@@ -382,12 +381,20 @@ impl<'a> Server<'a> {
     }
 
     /// The job's name as the client sees it: NUMBER/USER/NAME.
+    /// Servers before 2.5 name it NUMBER-USER-NAME (PUB400's 2.3.2:
+    /// "902549-QUSER-QP0ZSPWT", verify64 m64_mapepire).
     pub fn job_name(&self) -> String {
-        self.job
+        let name = self
+            .job
             .id
             .as_ref()
             .map(|i| i.to_string())
-            .unwrap_or_else(|| self.job.job_key())
+            .unwrap_or_else(|| self.job.job_key());
+        if self.legacy_cl {
+            name.replace('/', "-")
+        } else {
+            name
+        }
     }
 
     /// Answer one request line: the reply line (None for an empty line or
@@ -1064,13 +1071,20 @@ impl<'a> Server<'a> {
                     ("label".to_string(), J::str(name.clone())),
                     ("precision".to_string(), J::Num(precision.to_string())),
                     ("scale".to_string(), J::Num(scale.to_string())),
+                ];
+                // Servers before 2.5 describe a column with those six
+                // (PUB400's 2.3.2, verify64 m64_mapepire).
+                if self.legacy_cl {
+                    return J::Obj(m);
+                }
+                m.extend([
                     ("autoIncrement".to_string(), J::Bool(false)),
                     // JDBC's columnNullableUnknown: as4tainr does not say.
                     ("nullable".to_string(), J::Num("2".into())),
                     ("readOnly".to_string(), J::Bool(false)),
                     ("writeable".to_string(), J::Bool(true)),
                     ("table".to_string(), J::str("")),
-                ];
+                ]);
                 if blob_flag {
                     m.push(("blob_as_url".to_string(), J::Bool(false)));
                 }
@@ -1210,15 +1224,20 @@ impl<'a> Server<'a> {
         }
         if failed {
             let escape = with_id.iter().rev().find(|(_, _, t)| *t == "ESCAPE");
-            return Err(match escape {
-                // Servers from 2.5 report the last escape message other
-                // than CPF0006 (a command not valid has none).
+            // The escape message's text, as the SQL error of QSYS2.QCMDEXC:
+            // SQLSTATE 38501, SQLCODE -443 (verify64 m64_mapepire cl2,
+            // cl3: "Errors occurred in command." for a command not valid).
+            let text = match escape {
                 Some((id, _, _)) if id == "CPF0006" && !self.legacy_cl => {
-                    fail("CL command execution failed: Unknown error")
+                    "CL command execution failed: Unknown error".to_string()
                 }
-                Some((id, text, _)) => fail(format!("[{id}] {text}")),
-                None => fail(lines.join(" ")),
-            });
+                Some((_, text, _)) => text.clone(),
+                None => lines.join(" "),
+            };
+            return Err(anyhow::Error::new(Failure {
+                text,
+                sql: Some(("38501".into(), -443)),
+            }));
         }
         Ok(())
     }
@@ -1304,45 +1323,66 @@ impl<'a> Server<'a> {
             let ((y, mo, d), (h, mi, sec), us) = crate::rpg::dates::from_epoch_us(now_us as i64);
             format!("{y:04}-{mo:02}-{d:02}-{h:02}.{mi:02}.{sec:02}.{us:06}")
         };
+        // QSYS2.JOBLOG_INFO's columns as the 2.3 server selects them, with
+        // their types (verify64 m64_mapepire's metadata: SUMMARY is
+        // "ID [TYPE]: text" with the type's first four letters and a
+        // blank; MESSAGE_SECOND_LEVEL_TEXT and SEVERITY twice).
         let cols: &[(&str, &str, i32)] = &[
-            ("SUMMARY", "varchar", 1050),
+            ("SUMMARY", "nvarchar", 1041),
             ("SEVERITY", "int2", -1),
-            ("MESSAGE_SECOND_LEVEL_TEXT", "varchar", 4100),
-            ("MESSAGE_ID", "varchar", 11),
-            ("MESSAGE_TYPE", "varchar", 17),
-            ("MESSAGE_SUBTYPE", "varchar", 26),
+            ("MESSAGE_SECOND_LEVEL_TEXT", "nvarchar", 4096),
+            ("MESSAGE_ID", "varchar", 7),
+            ("MESSAGE_TYPE", "varchar", 13),
+            ("MESSAGE_SUBTYPE", "varchar", 22),
+            ("SEVERITY", "int2", -1),
             ("MESSAGE_TIMESTAMP", "timestamp", -1),
-            ("FROM_LIBRARY", "varchar", 14),
-            ("FROM_PROGRAM", "varchar", 260),
-            ("FROM_MODULE", "varchar", 14),
-            ("FROM_PROCEDURE", "varchar", 4100),
-            ("FROM_INSTRUCTION", "varchar", 14),
-            ("TO_LIBRARY", "varchar", 14),
-            ("TO_PROGRAM", "varchar", 14),
-            ("TO_MODULE", "varchar", 14),
-            ("TO_PROCEDURE", "varchar", 4100),
-            ("TO_INSTRUCTION", "varchar", 14),
-            ("FROM_USER", "varchar", 14),
-            ("MESSAGE_LIBRARY", "varchar", 14),
-            ("MESSAGE_FILE", "varchar", 14),
+            ("FROM_LIBRARY", "varchar", 10),
+            ("FROM_PROGRAM", "varchar", 256),
+            ("FROM_MODULE", "varchar", 10),
+            ("FROM_PROCEDURE", "varchar", 4096),
+            ("FROM_INSTRUCTION", "varchar", 10),
+            ("TO_LIBRARY", "varchar", 10),
+            ("TO_PROGRAM", "varchar", 10),
+            ("TO_MODULE", "varchar", 10),
+            ("TO_PROCEDURE", "varchar", 4096),
+            ("TO_INSTRUCTION", "varchar", 10),
+            ("FROM_USER", "varchar", 10),
+            ("MESSAGE_LIBRARY", "varchar", 10),
+            ("MESSAGE_FILE", "varchar", 10),
             ("MESSAGE_TOKEN_LENGTH", "int2", -1),
-            ("MESSAGE_TOKENS", "bytea", -1),
-            ("MESSAGE_TEXT", "varchar", 1028),
-            ("MESSAGE_KEY", "bytea", -1),
+            ("MESSAGE_TOKENS", "varbit_fbd", 12000),
+            ("MESSAGE_TEXT", "nvarchar", 1024),
+            ("MESSAGE_SECOND_LEVEL_TEXT", "nvarchar", 4096),
+            ("MESSAGE_KEY", "binary", 4),
+            ("QUALIFIED_JOB_NAME", "varchar", 28),
         ];
+        let job = self
+            .job
+            .id
+            .as_ref()
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| self.job.job_key());
         let rows: VecDeque<Vec<Option<String>>> = msgs
             .iter()
             .enumerate()
             .map(|(k, (id, text, ty))| {
                 let (lib, file) = message_file(id);
-                let sev = crate::pgmmsg::system_severity(id).to_string();
+                // Escape messages 40 and diagnostics 30 as PUB400's were
+                // (CPF1023, CPD0043); others as pgmmsg.rs knows them.
+                let sev = match *ty {
+                    "ESCAPE" => 40,
+                    "DIAGNOSTIC" => 30,
+                    _ => crate::pgmmsg::system_severity(id),
+                }
+                .to_string();
                 vec![
-                    Some(format!("{id} [{}]: {text}", &ty[..4])),
-                    Some(sev),
+                    Some(format!("{id} [{} ]: {text}", &ty[..4])),
+                    Some(sev.clone()),
                     None,
                     Some(id.clone()),
                     Some(ty.to_string()),
-                    None,
+                    (*ty == "ESCAPE").then(|| "EXCEPTION HANDLED".to_string()),
+                    Some(sev),
                     Some(stamp.clone()),
                     None,
                     None,
@@ -1360,7 +1400,9 @@ impl<'a> Server<'a> {
                     None,
                     None,
                     Some(text.clone()),
+                    None,
                     Some(format!("\\x{:08x}", k + 1)),
+                    Some(job.clone()),
                 ]
             })
             .collect();
@@ -1486,7 +1528,12 @@ fn block(r: &mut Results, n: usize, terse: bool) -> (Vec<J>, bool) {
         data.push(if terse {
             J::Arr(cells)
         } else {
-            J::Obj(r.columns.iter().cloned().zip(cells).collect())
+            // A name twice: one key, the later value (as a map keeps it).
+            let mut obj: Vec<(String, J)> = Vec::new();
+            for (c, v) in r.columns.iter().cloned().zip(cells) {
+                put(&mut obj, &c, v);
+            }
+            J::Obj(obj)
         });
     }
     (data, r.done)
@@ -1533,6 +1580,17 @@ fn cell(t: Option<&ColType>, v: Option<&str>) -> J {
                 .filter_map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok())
                 .collect();
             J::str(base64::engine::general_purpose::STANDARD.encode(bytes))
+        }
+        // Binary job log columns: each byte a character, as the server
+        // gives them (verify64: MESSAGE_KEY "\u0000\u0000\u0001\r").
+        "binary" | "varbit_fbd" => {
+            let hex = v.trim_start_matches("\\x");
+            J::str(
+                (0..hex.len() / 2)
+                    .filter_map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok())
+                    .map(char::from)
+                    .collect::<String>(),
+            )
         }
         // TIMESTAMP: as JDBC writes it (yyyy-mm-dd hh:mm:ss.ffffff).
         "timestamp" => J::str(jdbc_timestamp(v)),
@@ -1583,6 +1641,10 @@ fn column_type(t: &ColType, longest: usize) -> (String, i64, i64, i64) {
             ("DECIMAL".into(), p, s, p + 2)
         }
         "numeric" => ("DECIMAL".into(), 31, 0, 33),
+        // The job log's own columns (cl_job_log_rows): typmod is the length.
+        "nvarchar" => ("NVARCHAR".into(), m, 0, m),
+        "varbit_fbd" => ("VARCHAR () FOR BIT DATA".into(), m, 0, m),
+        "binary" => ("BINARY".into(), m, 0, m),
         "bpchar" if m >= 4 => ("CHAR".into(), m - 4, 0, m - 4),
         "bpchar" => ("CHAR".into(), l, 0, l),
         "varchar" if m >= 4 => ("VARCHAR".into(), m - 4, 0, m - 4),
@@ -1773,7 +1835,7 @@ where
         .ok_or_else(|| anyhow!("CPF2204: There is no user profile {user}."))?;
     let curlib = Some(profile.curlib.clone()).filter(|c| !c.is_empty() && c != "*CRTDFT");
     let id =
-        crate::jobs::start_server_job(client, "QZDASOINIT", user, curlib.as_deref(), &libl).await?;
+        crate::jobs::start_server_job(client, "QP0ZSPWT", user, curlib.as_deref(), &libl).await?;
     let job = Job {
         client,
         env,

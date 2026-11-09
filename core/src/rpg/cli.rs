@@ -1129,6 +1129,7 @@ impl Machine<'_> {
                             let t = crate::sql::ColType {
                                 pg: "text".into(),
                                 typmod: -1,
+                                db2: None,
                             };
                             let (sqltype, size, scale) = col_type(&t, &vals);
                             Col {
@@ -1176,6 +1177,7 @@ impl Machine<'_> {
                         let t = types.get(j).cloned().unwrap_or(crate::sql::ColType {
                             pg: "text".into(),
                             typmod: -1,
+                            db2: None,
                         });
                         let (sqltype, size, scale) = col_type(&t, &vals);
                         Col {

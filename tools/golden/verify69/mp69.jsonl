@@ -1,0 +1,15 @@
+{"id": "c", "type": "connect", "technique": "cli", "application": "as4tainr-golden", "props": "naming=sql;libraries=AS4TRAINR1"}
+{"id": "num", "type": "sql", "sql": "SELECT D, D * 2, D / 3, SUM(D) OVER (), AVG(D) OVER (), N, F, DF, BIG FROM AS4TRAINR1.GLD69T ORDER BY I"}
+{"id": "cc", "type": "sql", "sql": "SELECT C CONCAT C, C CONCAT V, V CONCAT C, RTRIM(C) CONCAT '!' FROM AS4TRAINR1.GLD69T ORDER BY I"}
+{"id": "oth", "type": "sql", "sql": "SELECT VB, G, NV, CL, BO FROM AS4TRAINR1.GLD69T ORDER BY I"}
+{"id": "tmcmp", "type": "sql", "sql": "SELECT I FROM AS4TRAINR1.GLD69T WHERE TM > '12.00.00' AND TS < '2027-01-01-00.00.00.000000' AND DT = '09.11.2026' ORDER BY I"}
+{"id": "chcmp", "type": "sql", "sql": "SELECT I FROM AS4TRAINR1.GLD69T WHERE C = '13.14' ORDER BY I"}
+{"id": "pse", "type": "prepare_sql_execute", "sql": "SELECT I FROM AS4TRAINR1.GLD69T WHERE I = ?", "parameters": [1]}
+{"id": "exe2", "type": "execute", "cont_id": "pse", "parameters": [2]}
+{"id": "pin", "type": "prepare_sql", "sql": "UPDATE AS4TRAINR1.GLD69T SET N = ? WHERE I = ? WITH NC"}
+{"id": "exe3", "type": "execute", "cont_id": "pin", "parameters": [1.25, 1]}
+{"id": "after", "type": "sql", "sql": "SELECT I, N FROM AS4TRAINR1.GLD69T ORDER BY I"}
+{"id": "ps1", "type": "sql", "sql": "SELECT * FROM TABLE(QSYS2.PARTITION_STATISTICS('AS4TRAINR1', 'GLD69S'))"}
+{"id": "ps2", "type": "sql", "sql": "SELECT SYSTEM_TABLE_MEMBER, NUMBER_ROWS FROM QSYS2.SYSPARTITIONSTAT WHERE SYSTEM_TABLE_SCHEMA = 'AS4TRAINR1' AND SYSTEM_TABLE_NAME IN ('GLD69T', 'GLD69S')"}
+{"id": "ps3", "type": "sql", "sql": "SELECT COUNT(*) FROM TABLE(QSYS2.PARTITION_STATISTICS('AS4TRAINR1', '*ALL'))"}
+{"id": "x", "type": "exit"}

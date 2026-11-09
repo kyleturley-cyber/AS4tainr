@@ -2619,6 +2619,7 @@ async fn run_in_transaction(
         qtemp_setting(true)
     ))
     .await?;
+    let text = &db2_datetime_literals(tx, text.to_string(), true).await;
     let stmt = tx.prepare(text).await.map_err(|e| map_error(&e, text))?;
     let outcome = if t.kind == Kind::Query {
         let cols = stmt.columns();
@@ -2718,6 +2719,330 @@ async fn run_in_transaction(
         Outcome::Count(t.kind, n)
     };
     Ok(outcome)
+}
+
+/// Db2 for i's string forms of dates, times and timestamps that
+/// PostgreSQL does not read (SQL reference, "String representations of
+/// datetime values": time hh.mm.ss or hh.mm (ISO, EUR), date dd.mm.yyyy
+/// (EUR), timestamp yyyy-mm-dd-hh.mm.ss.nnnnnn, PUB400 2026-11-09
+/// verify68 o68_make): written in PostgreSQL's form where the statement
+/// uses the string as a date, time or timestamp. Which literals those are
+/// is what PostgreSQL infers for them: each candidate is made a parameter
+/// and the statement prepared (a string compared with or put into a
+/// character column stays as it is). `in_tx`: the client is in a
+/// transaction, so the trial runs in a savepoint of its own.
+async fn db2_datetime_literals(client: &Client, text: String, in_tx: bool) -> String {
+    let lits = string_literals(&text);
+    let cands: Vec<(usize, usize, String)> = lits
+        .into_iter()
+        .filter_map(|(a, b)| {
+            let v = text[a + 1..b - 1].to_string();
+            pg_datetime_form(&v).map(|_| (a, b, v))
+        })
+        .collect();
+    if cands.is_empty() {
+        return text;
+    }
+    let base = max_parameter(&text);
+    let mut probe = String::new();
+    let mut at = 0;
+    for (i, (a, b, _)) in cands.iter().enumerate() {
+        probe.push_str(&text[at..*a]);
+        probe.push_str(&format!("${}", base + i + 1));
+        at = *b;
+    }
+    probe.push_str(&text[at..]);
+    if in_tx
+        && client
+            .batch_execute("SAVEPOINT as4tainr_dtprobe")
+            .await
+            .is_err()
+    {
+        return text;
+    }
+    let types: Option<Vec<String>> = client
+        .prepare(&probe)
+        .await
+        .ok()
+        .map(|st| st.params().iter().map(|t| t.name().to_string()).collect());
+    if in_tx {
+        let end = if types.is_some() {
+            "RELEASE SAVEPOINT as4tainr_dtprobe"
+        } else {
+            "ROLLBACK TO SAVEPOINT as4tainr_dtprobe; RELEASE SAVEPOINT as4tainr_dtprobe"
+        };
+        let _ = client.batch_execute(end).await;
+    }
+    let Some(types) = types else {
+        return text;
+    };
+    let mut out = String::new();
+    let mut at = 0;
+    for (i, (a, b, v)) in cands.iter().enumerate() {
+        out.push_str(&text[at..*a]);
+        let ty = types.get(base + i).map(String::as_str).unwrap_or("");
+        match pg_datetime_form(v) {
+            Some(f) if matches!(ty, "date" | "time" | "timestamp" | "timestamptz" | "timetz") => {
+                out.push_str(&format!("'{f}'"))
+            }
+            _ => out.push_str(&text[*a..*b]),
+        }
+        at = *b;
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+/// The byte ranges of a statement's string constants, quotes included
+/// (not in double-quoted names or comments).
+fn string_literals(text: &str) -> Vec<(usize, usize)> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                let start = i;
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\'' {
+                        if b.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                // X'..', BX'..', N'..' and E'..' constants are not strings
+                // of characters.
+                let prefixed = start > 0 && b[start - 1].is_ascii_alphanumeric();
+                if !prefixed && i <= b.len() {
+                    out.push((start, i));
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// The highest `$n` parameter in a statement (outside its strings).
+fn max_parameter(text: &str) -> usize {
+    let lits = string_literals(text);
+    let b = text.as_bytes();
+    let mut max = 0;
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(&(_, e)) = lits.iter().find(|(a, _)| *a == i) {
+            i = e;
+            continue;
+        }
+        if b[i] == b'$' {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if let Ok(n) = text[i + 1..j].parse::<usize>() {
+                max = max.max(n);
+            }
+            i = j.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    max
+}
+
+/// A Db2 string form of a date, time or timestamp in PostgreSQL's form,
+/// when PostgreSQL would not read it as it is.
+fn pg_datetime_form(v: &str) -> Option<String> {
+    let digits = |s: &str, n: std::ops::RangeInclusive<usize>| {
+        n.contains(&s.len()) && s.bytes().all(|c| c.is_ascii_digit())
+    };
+    let time = |t: &str| -> Option<String> {
+        let p: Vec<&str> = t.split('.').collect();
+        match p.as_slice() {
+            [h, m] if digits(h, 1..=2) && digits(m, 2..=2) => Some(format!("{h}:{m}:00")),
+            [h, m, s] if digits(h, 1..=2) && digits(m, 2..=2) && digits(s, 2..=2) => {
+                Some(format!("{h}:{m}:{s}"))
+            }
+            [h, m, s, f]
+                if digits(h, 1..=2)
+                    && digits(m, 2..=2)
+                    && digits(s, 2..=2)
+                    && digits(f, 0..=12) =>
+            {
+                Some(format!("{h}:{m}:{s}.{f}"))
+            }
+            _ => None,
+        }
+    };
+    let v = v.trim();
+    // Timestamp: yyyy-mm-dd-hh.mm.ss[.n...] (or a blank for the dash).
+    if v.len() > 11 && v.is_char_boundary(10) && v.is_char_boundary(11) {
+        let (d, rest) = v.split_at(10);
+        let dp: Vec<&str> = d.split('-').collect();
+        if let [y, m, dd] = dp.as_slice() {
+            if digits(y, 4..=4)
+                && digits(m, 2..=2)
+                && digits(dd, 2..=2)
+                && (rest.starts_with('-') || rest.starts_with(' '))
+            {
+                let t = &rest[1..];
+                if t.contains('.') && !t.contains(':') {
+                    let p: Vec<&str> = t.split('.').collect();
+                    if p.len() >= 3 {
+                        return time(t).map(|t| format!("{d} {t}"));
+                    }
+                }
+            }
+        }
+        return None;
+    }
+    // Date dd.mm.yyyy.
+    let p: Vec<&str> = v.split('.').collect();
+    if let [d, m, y] = p.as_slice() {
+        if digits(d, 2..=2) && digits(m, 2..=2) && digits(y, 4..=4) {
+            return Some(format!("{y}-{m}-{d}"));
+        }
+    }
+    time(v)
+}
+
+/// For each parameter `$1`..`$n` of a translated statement, the tables
+/// it may belong to and the column it is compared with or put into
+/// (`col = $k`, `$k = col`, an INSERT's column list), lowercase.
+fn parameter_columns(text: &str, n: usize) -> Vec<Option<(Vec<String>, String)>> {
+    // Words and symbols outside strings.
+    let lits = string_literals(text);
+    let b = text.as_bytes();
+    let mut toks: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(&(_, e)) = lits.iter().find(|(a, _)| *a == i) {
+            toks.push("'".into());
+            i = e;
+            continue;
+        }
+        let c = b[i] as char;
+        if c.is_whitespace() {
+            i += 1;
+        } else if c.is_ascii_alphanumeric() || "_#@$\".".contains(c) {
+            let st = i;
+            while i < b.len()
+                && ((b[i] as char).is_ascii_alphanumeric() || "_#@$\".".contains(b[i] as char))
+            {
+                i += 1;
+            }
+            toks.push(text[st..i].to_string());
+        } else if "<>=!".contains(c) {
+            let st = i;
+            while i < b.len() && "<>=!".contains(b[i] as char) {
+                i += 1;
+            }
+            toks.push(text[st..i].to_string());
+        } else {
+            toks.push(c.to_string());
+            i += 1;
+        }
+    }
+    let up: Vec<String> = toks.iter().map(|t| t.to_ascii_uppercase()).collect();
+    let mut tables = Vec::new();
+    for (j, t) in up.iter().enumerate() {
+        if matches!(t.as_str(), "FROM" | "INTO" | "UPDATE" | "JOIN") {
+            if let Some(nx) = toks.get(j + 1) {
+                if nx != "(" {
+                    tables.push(nx.clone());
+                }
+            }
+        }
+    }
+    let unq = |s: &str| {
+        let s = s.rsplit('.').next().unwrap_or(s);
+        if s.starts_with('"') {
+            s.trim_matches('"').to_string()
+        } else {
+            s.to_ascii_lowercase()
+        }
+    };
+    let mut out = vec![None; n];
+    // An INSERT's column list and its VALUES.
+    if let Some(ins) = up.iter().position(|t| t == "INSERT") {
+        let open = up.iter().skip(ins).position(|t| t == "(").map(|p| p + ins);
+        let vals = up.iter().position(|t| t == "VALUES");
+        if let (Some(o), Some(v)) = (open, vals) {
+            if o < v {
+                let cols: Vec<String> = toks[o + 1..v]
+                    .iter()
+                    .filter(|t| !matches!(t.as_str(), "," | "(" | ")"))
+                    .map(|t| unq(t))
+                    .collect();
+                let mut pos = 0;
+                let mut depth = 0;
+                for t in &toks[v + 1..] {
+                    match t.as_str() {
+                        "(" => {
+                            depth += 1;
+                            if depth == 1 {
+                                pos = 0;
+                            }
+                        }
+                        ")" => depth -= 1,
+                        "," if depth == 1 => pos += 1,
+                        p if p.starts_with('$') && depth == 1 => {
+                            if let Ok(k) = p[1..].parse::<usize>() {
+                                if (1..=n).contains(&k) {
+                                    if let Some(c) = cols.get(pos) {
+                                        out[k - 1] = Some((tables.clone(), c.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    let is_cmp = |t: &str| matches!(t, "=" | "<>" | "<" | ">" | "<=" | ">=" | "!=");
+    for (j, t) in toks.iter().enumerate() {
+        let Some(k) = t.strip_prefix('$').and_then(|d| d.parse::<usize>().ok()) else {
+            continue;
+        };
+        if !(1..=n).contains(&k) || out[k - 1].is_some() {
+            continue;
+        }
+        let col = if j >= 2 && is_cmp(&toks[j - 1]) {
+            Some(&toks[j - 2])
+        } else if is_cmp(toks.get(j + 1).map(String::as_str).unwrap_or("")) {
+            toks.get(j + 2)
+        } else {
+            None
+        };
+        if let Some(c) = col {
+            if c.chars()
+                .next()
+                .is_some_and(|x| x.is_ascii_alphabetic() || x == '"')
+            {
+                out[k - 1] = Some((tables.clone(), unq(c)));
+            }
+        }
+    }
+    out
 }
 
 /// A value of a PostgreSQL type as Db2 for i shows it: timestamps in
@@ -2852,6 +3177,41 @@ mod tests {
             tr("select cast(x as clob(10M)), cast(y as blob(1K)), cast(z as dbclob) from t").sql,
             "select cast(x as text), cast(y as bytea), cast(z as text) from t"
         );
+    }
+
+    #[test]
+    fn db2_datetime_string_forms() {
+        // Db2 for i SQL Reference, "String representations of datetime
+        // values"; verify68 o68_make inserted '13.14.15' and
+        // '2026-11-09-13.14.15.123456'.
+        assert_eq!(pg_datetime_form("13.14.15").as_deref(), Some("13:14:15"));
+        assert_eq!(pg_datetime_form("8.05").as_deref(), Some("8:05:00"));
+        assert_eq!(
+            pg_datetime_form("2026-11-09-13.14.15.123456").as_deref(),
+            Some("2026-11-09 13:14:15.123456")
+        );
+        assert_eq!(
+            pg_datetime_form("2026-11-09-13.14.15").as_deref(),
+            Some("2026-11-09 13:14:15")
+        );
+        assert_eq!(
+            pg_datetime_form("09.11.2026").as_deref(),
+            Some("2026-11-09")
+        );
+        // Forms PostgreSQL reads itself, and other strings.
+        assert_eq!(pg_datetime_form("13:14:15"), None);
+        assert_eq!(pg_datetime_form("2026-11-09"), None);
+        assert_eq!(pg_datetime_form("2026-11-09 13:14:15"), None);
+        assert_eq!(pg_datetime_form("abc"), None);
+        assert_eq!(pg_datetime_form("1.5"), None);
+        let t = "SELECT 'a''b', X'C1', \"x'y\" FROM t WHERE c = '13.14' -- 'no'";
+        let l: Vec<&str> = string_literals(t).iter().map(|(a, b)| &t[*a..*b]).collect();
+        assert_eq!(l, ["'a''b'", "'13.14'"]);
+        assert_eq!(max_parameter("SELECT $2, '$9' FROM t WHERE a = $10"), 10);
+        let cols = parameter_columns("INSERT INTO lib.t (i, c) VALUES ($1, $2)", 2);
+        assert_eq!(cols[1], Some((vec!["lib.t".to_string()], "c".to_string())));
+        let cols = parameter_columns("SELECT c FROM lib.t WHERE i = $1", 1);
+        assert_eq!(cols[0], Some((vec!["lib.t".to_string()], "i".to_string())));
     }
 
     #[test]
@@ -3005,6 +3365,11 @@ pub enum Exec {
 pub struct ColType {
     pub pg: String,
     pub typmod: i32,
+    /// A file column's SQL data type as SYSCOLUMNS shows it, where
+    /// PostgreSQL's type does not tell (NUMERIC zoned and DECIMAL packed
+    /// are both numeric; BINARY and VARBIN both bytea, with the length in
+    /// `typmod` as for the character types).
+    pub db2: Option<String>,
 }
 
 /// The SQL session of a running program (embedded SQL): one connection as
@@ -3213,6 +3578,79 @@ impl Session {
         r
     }
 
+    /// The types of a statement's parameters (`$1`, `$2`... where its
+    /// markers are) as PostgreSQL infers them from where they are: the
+    /// type, and the length (typmod) of the column a parameter is put
+    /// into or compared with, when the statement shows it (`COL = $n`,
+    /// an INSERT's column list), else -1.
+    pub async fn parameter_types(
+        &self,
+        catalog_client: &Client,
+        sql: &str,
+    ) -> Result<Vec<ColType>> {
+        let sql = &crate::temporal::rewrite(catalog_client, &self.libl, sql).await?;
+        let t = translate(sql, &|n| self.libraries.iter().any(|l| l == n))?;
+        let mut text = system_column_names(catalog_client, &self.libl, &t.sql).await?;
+        if let Some((target, at)) = &t.insert_needs_columns {
+            let name = if target.contains('.') {
+                target
+                    .replace('"', "")
+                    .replace('.', "/")
+                    .to_ascii_uppercase()
+            } else {
+                target.to_ascii_uppercase()
+            };
+            let cols = insert_columns(catalog_client, &self.libl, &name).await?;
+            text.insert_str(*at, &format!(" ({})", cols.join(", ")));
+        }
+        let stmt = self
+            .client
+            .prepare(&text)
+            .await
+            .map_err(|e| map_error(&e, &text))?;
+        let names = parameter_columns(&text, stmt.params().len());
+        let mut out = Vec::new();
+        for (k, ty) in stmt.params().iter().enumerate() {
+            let mut typmod = -1;
+            let mut db2 = None;
+            if let Some((tables, col)) = names.get(k).cloned().flatten() {
+                for tb in tables {
+                    let r = self
+                        .client
+                        .query_opt(
+                            "SELECT a.atttypmod,
+                                    EXISTS (SELECT 1 FROM qsys2.syscolumns s
+                                     WHERE s.system_table_schema = upper(n.nspname) COLLATE \"C\"
+                                       AND s.system_table_name = upper(r.relname) COLLATE \"C\"
+                                       AND s.system_column_name = upper(a.attname) COLLATE \"C\"
+                                       AND s.data_type = 'NUMERIC')
+                               FROM pg_catalog.pg_attribute a
+                               JOIN pg_catalog.pg_class r ON r.oid = a.attrelid
+                               JOIN pg_catalog.pg_namespace n ON n.oid = r.relnamespace
+                              WHERE a.attrelid = to_regclass($1) AND a.attname = $2",
+                            &[&tb, &col],
+                        )
+                        .await
+                        .ok()
+                        .flatten();
+                    if let Some(r) = r {
+                        typmod = r.get(0);
+                        if r.get::<_, bool>(1) {
+                            db2 = Some("NUMERIC".to_string());
+                        }
+                        break;
+                    }
+                }
+            }
+            out.push(ColType {
+                pg: ty.name().to_string(),
+                typmod,
+                db2,
+            });
+        }
+        Ok(out)
+    }
+
     /// Make a change with the trigger programs of its files (ADDPFTRG):
     /// the result, and whether to keep the change though it is an error.
     async fn exec_change(
@@ -3249,6 +3687,8 @@ impl Session {
     }
 
     async fn exec_on(&self, client: &Client, t: &Translated, text: String) -> Result<Exec> {
+        let in_tx = t.kind != Kind::Query || self.cmt.is_some();
+        let text = db2_datetime_literals(client, text, in_tx).await;
         if t.kind == Kind::Query {
             let stmt = client
                 .prepare(&text)
@@ -3292,9 +3732,38 @@ impl Session {
                         .unwrap_or(-1),
                     _ => -1,
                 };
+                // A numeric or binary column of a file: its SQL type as
+                // SYSCOLUMNS has it (NUMERIC zoned or DECIMAL packed,
+                // BINARY or VARBIN) and length.
+                let mut typmod = typmod;
+                let db2 = match (c.type_().name(), c.table_oid(), c.column_id()) {
+                    ("numeric" | "bytea", Some(oid), Some(col)) => client
+                        .query_opt(
+                            "SELECT CAST(s.data_type AS text), s.length FROM pg_catalog.pg_attribute a
+                               JOIN pg_catalog.pg_class r ON r.oid = a.attrelid
+                               JOIN pg_catalog.pg_namespace n ON n.oid = r.relnamespace
+                               JOIN qsys2.syscolumns s ON s.system_table_schema = upper(n.nspname) COLLATE \"C\"
+                                AND s.system_table_name = upper(r.relname) COLLATE \"C\"
+                                AND s.system_column_name = upper(a.attname) COLLATE \"C\"
+                              WHERE a.attrelid = $1 AND a.attnum = $2",
+                            &[&oid, &col],
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|r| {
+                            let len: i32 = r.try_get(1).unwrap_or(0);
+                            if c.type_().name() == "bytea" {
+                                typmod = len + 4;
+                            }
+                            r.get::<_, String>(0).trim().to_string()
+                        }),
+                    _ => None,
+                };
                 types.push(ColType {
                     pg: c.type_().name().to_string(),
                     typmod,
+                    db2,
                 });
             }
             let mut rows = Vec::new();

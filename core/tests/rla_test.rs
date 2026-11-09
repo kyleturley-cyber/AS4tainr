@@ -27098,3 +27098,114 @@ async fn services_have_ibm_columns() {
     .unwrap());
     assert_eq!(rows, [["DATA".to_string()]]);
 }
+
+/// Mapepire's values and metadata as PUB400's Mapepire 2.3.2 gave them
+/// for a table of every column type (2026-11-09, verify68 o68_mapepire),
+/// and Db2's string forms of times and timestamps in an INSERT
+/// (verify68 o68_make: RUNSQL INSERT of '13.14.15' and
+/// '2026-11-09-13.14.15.123456' into TIME and TIMESTAMP columns).
+#[tokio::test]
+async fn mapepire_values_as_pub400_shows_them() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::mapepire::{parse, Server, J};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let libl = vec![lib.clone()];
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: libl.clone(),
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let mut s = Server::new(job);
+    let mut ask = async |line: String| -> J {
+        let (reply, _) = s.handle(&line).await.expect("a reply");
+        parse(&reply).unwrap()
+    };
+    let r = ask(format!(
+        r#"{{"id":"mk","type":"sql","sql":"CREATE TABLE {lib}.GLD68T (C CHAR(5), V VARCHAR(10), D DECIMAL(7, 2), Z NUMERIC(5, 0), I INTEGER, TM TIME, TS TIMESTAMP, BN BINARY(2))"}}"#
+    ))
+    .await;
+    assert_eq!(r.get("success"), Some(&J::Bool(true)), "{r}");
+    as4tainr_core::sql::run(
+        &client,
+        &url,
+        &libl,
+        &format!("INSERT INTO {lib}.GLD68T VALUES ('ab', 'cd  ', -12.50, 7, 1, '13.14.15', '2026-11-09-13.14.15.123456', BX'C1C2'), (NULL, NULL, NULL, NULL, 2, NULL, NULL, NULL)"),
+    )
+    .await
+    .unwrap();
+    // A string in a character column stays as it is, though it looks like
+    // a time or a date (Db2 casts a string to a time only where a time is
+    // wanted).
+    let r = ask(format!(
+        r#"{{"id":"ins","type":"sql","sql":"INSERT INTO {lib}.GLD68T (I, C, V) VALUES (3, '13.14', '01.02.2026')"}}"#
+    ))
+    .await;
+    assert_eq!(r.get("success"), Some(&J::Bool(true)), "{r}");
+    let r = ask(format!(
+        r#"{{"id":"sel","type":"sql","sql":"SELECT C, V, D, Z, TM, TS, BN, 'x' CONCAT C FROM {lib}.GLD68T ORDER BY I"}}"#
+    ))
+    .await;
+    let J::Arr(data) = r.get("data").expect("rows") else {
+        panic!("{r}")
+    };
+    let row = &data[0];
+    assert_eq!(row.get("C"), Some(&J::str("ab")), "{r}");
+    assert_eq!(row.get("V"), Some(&J::str("cd  ")), "{r}");
+    assert_eq!(row.get("D"), Some(&J::Num("-12.5".into())), "{r}");
+    assert_eq!(row.get("TM"), Some(&J::str("13.14.15")), "{r}");
+    assert_eq!(
+        row.get("TS"),
+        Some(&J::str("2026-11-09 13:14:15.123456")),
+        "{r}"
+    );
+    assert_eq!(row.get("BN"), Some(&J::str("\u{fffd}\u{fffd}")), "{r}");
+    // CONCAT keeps a CHAR value's trailing blanks ("exp": "xab   ").
+    assert_eq!(row.get("00008"), Some(&J::str("xab   ")), "{r}");
+    assert_eq!(data[1].get("TM"), Some(&J::Null), "{r}");
+    assert_eq!(data[2].get("C"), Some(&J::str("13.14")), "{r}");
+    assert_eq!(data[2].get("V"), Some(&J::str("01.02.2026")), "{r}");
+    let cols = r.get("metadata").and_then(|m| m.get("columns")).unwrap();
+    let J::Arr(cols) = cols else { panic!("{r}") };
+    let ty = |n: usize| {
+        (
+            cols[n].get("type").and_then(J::text).unwrap(),
+            cols[n].get("precision").cloned().unwrap(),
+        )
+    };
+    assert_eq!(ty(3), ("NUMERIC".into(), J::Num("5".into())), "{r}");
+    assert_eq!(ty(6), ("BINARY".into(), J::Num("2".into())), "{r}");
+    // A prepared INSERT's parameters: typed by their columns, named "?"
+    // ("pins": INTEGER 10, CHAR 5).
+    let r = ask(format!(
+        r#"{{"id":"p","type":"prepare_sql","sql":"INSERT INTO {lib}.GLD68T (I, C) VALUES (?, ?)"}}"#
+    ))
+    .await;
+    let parms = r.get("metadata").and_then(|m| m.get("parameters")).unwrap();
+    let J::Arr(parms) = parms else { panic!("{r}") };
+    let p = |n: usize, k: &str| parms[n].get(k).cloned().unwrap();
+    assert_eq!(p(0, "type"), J::str("INTEGER"), "{r}");
+    assert_eq!(p(0, "precision"), J::Num("10".into()), "{r}");
+    assert_eq!(p(0, "name"), J::str("?"), "{r}");
+    assert_eq!(p(1, "type"), J::str("CHAR"), "{r}");
+    assert_eq!(p(1, "precision"), J::Num("5".into()), "{r}");
+    // PROGRAM_INFO has IBM i 7.5's 107 columns (verify66 "pgmi").
+    let r = ask(
+        r#"{"id":"pi","type":"sql","sql":"SELECT * FROM QSYS2.PROGRAM_INFO FETCH FIRST 1 ROWS ONLY"}"#
+            .into(),
+    )
+    .await;
+    assert_eq!(
+        r.get("metadata").and_then(|m| m.get("column_count")),
+        Some(&J::Num("107".into())),
+        "{r}"
+    );
+}

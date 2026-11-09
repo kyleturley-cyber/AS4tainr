@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 54";
+const VERSION: &str = "as4tainr services 56";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -1829,11 +1829,135 @@ BEGIN
 END $$;
 "#;
 
+/// QSYS2.PROGRAM_INFO: a program's or service program's facts, in the
+/// 107 columns and types of IBM i 7.5's view (PUB400 2026-11-09, verify66
+/// n66_mapepire and verify68 o68_mapepire "pgmi": QSYS/QCMDEXC). What
+/// as4tainr keeps (library, name, type, attribute, owner, text, created,
+/// source member) is filled in; the rest, which describes the compiled
+/// object IBM's compilers make, is null.
+const PROGRAM_INFO: &str = r#"
+DROP VIEW IF EXISTS qsys2.program_info CASCADE;
+CREATE VIEW qsys2.program_info AS
+SELECT
+       CAST(o.library AS varchar(10)) COLLATE "C" AS program_library,
+       CAST(o.name AS varchar(10)) COLLATE "C" AS program_name,
+       CAST(CASE WHEN (o.objtype = '*SRVPGM' OR o.attribute IN ('RPGLE', 'SQLRPGLE', 'CLLE', 'CBLLE', 'SQLCBLLE', 'CLE', 'CPPLE')) THEN 'ILE' ELSE 'OPM' END AS varchar(3)) COLLATE "C" AS program_type,
+       CAST(o.objtype AS varchar(7)) COLLATE "C" AS object_type,
+       CAST(o.created AS timestamp(0)) AS create_timestamp,
+       CAST(nullif(o.text, '') AS varchar(50)) COLLATE "C" AS text_description,
+       CAST(o.owner AS varchar(10)) COLLATE "C" AS program_owner,
+       CAST(nullif(o.attribute, '') AS varchar(10)) COLLATE "C" AS program_attribute,
+       CAST('*USER' AS varchar(6)) COLLATE "C" AS user_profile,
+       CAST('*YES' AS varchar(4)) COLLATE "C" AS use_adopted_authority,
+       CAST('*USER' AS varchar(8)) COLLATE "C" AS program_state,
+       CAST('*USER' AS varchar(7)) COLLATE "C" AS program_domain,
+       CAST('V7R5M0' AS char(6)) COLLATE "C" AS earliest_possible_release,
+       CAST(NULL AS char(6)) COLLATE "C" AS release_created_on,
+       CAST(NULL AS char(6)) COLLATE "C" AS target_release,
+       CAST(NULL AS integer) AS minimum_number_parms,
+       CAST(NULL AS integer) AS maximum_number_parms,
+       CAST(NULL AS integer) AS associated_space_size,
+       CAST('*USER' AS varchar(8)) COLLATE "C" AS paging_pool,
+       CAST('*BLOCK' AS varchar(8)) COLLATE "C" AS paging_amount,
+       CAST(NULL AS varchar(4)) COLLATE "C" AS allow_rtvclsrc,
+       CAST('*NO' AS varchar(4)) COLLATE "C" AS conversion_required,
+       CAST(NULL AS varchar(8)) COLLATE "C" AS conversion_detail,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS program_entry_procedure_module_library,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS program_entry_procedure_module,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS activation_group,
+       CAST(NULL AS varchar(4)) COLLATE "C" AS shared_activation_group,
+       CAST(NULL AS varchar(4)) COLLATE "C" AS observable_info_compressed,
+       CAST(NULL AS varchar(4)) COLLATE "C" AS runtime_info_compressed,
+       CAST(NULL AS varchar(4)) COLLATE "C" AS allow_update,
+       CAST(NULL AS varchar(4)) COLLATE "C" AS allow_bound_srvpgm_library_update,
+       CAST(NULL AS varchar(6)) COLLATE "C" AS all_creation_data,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS profiling_data,
+       CAST(NULL AS varchar(5)) COLLATE "C" AS teraspace_storage_enabled_modules,
+       CAST(NULL AS varchar(4)) COLLATE "C" AS teraspace_storage_enabled_pep,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS storage_model,
+       CAST(NULL AS varchar(4)) COLLATE "C" AS argument_optimization,
+       CAST(NULL AS integer) AS number_of_unresolved_references,
+       CAST(NULL AS varchar(4)) COLLATE "C" AS allow_static_storage_reinit,
+       CAST(NULL AS bigint) AS minimum_static_storage_size,
+       CAST(NULL AS bigint) AS maximum_static_storage_size,
+       CAST(NULL AS integer) AS auxiliary_storage_segments,
+       CAST(NULL AS integer) AS maximum_auxiliary_storage_segments,
+       CAST(NULL AS integer) AS program_size,
+       CAST(NULL AS integer) AS maximum_program_size,
+       CAST(NULL AS integer) AS modules,
+       CAST(NULL AS integer) AS maximum_modules,
+       CAST(NULL AS integer) AS service_programs,
+       CAST(NULL AS integer) AS maximum_service_programs,
+       CAST(NULL AS integer) AS string_directory_size,
+       CAST(NULL AS integer) AS maximum_string_directory_size,
+       CAST(NULL AS integer) AS copyrights,
+       CAST(NULL AS text) AS copyright_strings,
+       CAST(NULL AS integer) AS copyright_string_size,
+       CAST(NULL AS integer) AS maximum_copyright_string_size,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS export_source_library,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS export_source_file,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS export_source_file_member,
+       CAST(NULL AS varchar(5000)) COLLATE "C" AS export_source_stream_file,
+       CAST(NULL AS integer) AS procedure_exports,
+       CAST(NULL AS integer) AS maximum_procedure_exports,
+       CAST(NULL AS integer) AS data_exports,
+       CAST(NULL AS integer) AS maximum_data_exports,
+       CAST(NULL AS integer) AS signatures,
+       CAST(NULL AS bytea) AS export_signatures,
+       CAST(NULL AS integer) AS maximum_signatures,
+       CAST(nullif(coalesce(nullif(p.src_lib, ''), o.src_lib), '') AS varchar(10)) COLLATE "C" AS source_file_library,
+       CAST(nullif(coalesce(nullif(p.src_file, ''), o.src_file), '') AS varchar(10)) COLLATE "C" AS source_file,
+       CAST(nullif(coalesce(nullif(p.src_mbr, ''), o.src_mbr), '') AS varchar(10)) COLLATE "C" AS source_file_member,
+       CAST(p.src_changed AS timestamp(0)) AS source_file_change_timestamp,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS sort_sequence_library,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS sort_sequence,
+       CAST(NULL AS varchar(7)) COLLATE "C" AS language_id,
+       CAST('*NONE' AS varchar(6)) COLLATE "C" AS observable,
+       CAST(NULL AS varchar(11)) COLLATE "C" AS optimization,
+       CAST(NULL AS varchar(4)) COLLATE "C" AS log_commands,
+       CAST(NULL AS varchar(4)) COLLATE "C" AS fix_decimal_data,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS update_pasa,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS clear_pasa,
+       CAST(NULL AS varchar(14)) COLLATE "C" AS compiler_id,
+       CAST(NULL AS varchar(4)) COLLATE "C" AS teraspace_storage_enabled_program,
+       CAST(NULL AS integer) AS opm_program_size,
+       CAST(NULL AS integer) AS static_storage_size,
+       CAST(NULL AS integer) AS automatic_storage_size,
+       CAST(NULL AS integer) AS number_mi_instructions,
+       CAST(NULL AS integer) AS number_mi_odt_entries,
+       CAST(NULL AS integer) AS sql_statement_count,
+       CAST(NULL AS varchar(18)) COLLATE "C" AS sql_relational_database,
+       CAST(NULL AS varchar(5)) COLLATE "C" AS sql_commitment_control,
+       CAST(NULL AS varchar(4)) COLLATE "C" AS sql_naming,
+       CAST(NULL AS varchar(4)) COLLATE "C" AS sql_date_format,
+       CAST(NULL AS char(1)) COLLATE "C" AS sql_date_separator,
+       CAST(NULL AS varchar(4)) COLLATE "C" AS sql_time_format,
+       CAST(NULL AS char(1)) COLLATE "C" AS sql_time_separator,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS sql_sort_sequence_library,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS sql_sort_sequence,
+       CAST(NULL AS varchar(7)) COLLATE "C" AS sql_language_id,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS sql_default_schema,
+       CAST(NULL AS varchar(3483)) COLLATE "C" AS sql_path,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS sql_dynamic_user_profile,
+       CAST(NULL AS varchar(9)) COLLATE "C" AS sql_allow_copy_data,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS sql_close_sql_cursor,
+       CAST(NULL AS varchar(4)) COLLATE "C" AS sql_delay_prepare,
+       CAST(NULL AS varchar(8)) COLLATE "C" AS sql_allow_block,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS sql_package_library,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS sql_package,
+       CAST(NULL AS varchar(4)) COLLATE "C" AS sql_rdb_connection_method
+  FROM as4tainr.objects o
+  LEFT JOIN as4tainr.programs p ON p.library = o.library AND p.name = o.name
+ WHERE o.objtype IN ('*PGM', '*SRVPGM');
+"#;
+
 /// QSYS2.SYSFILES (Db2 for i catalog: the database files) over the
 /// physical and logical files, with the 104 columns and types of PUB400's
 /// (2026-11-09, verify66 n66_mapepire "sysf"): FILE_TYPE SOURCE or DATA,
 /// record length (a source file's RCDLEN), members, key fields, fields,
-/// CCSID 37; what as4tainr does not keep is null. Also as the table
+/// CCSID 37, the CONTAINS_ columns from the fields, release V7R5M0 and
+/// language ENU (verify68 o68_mapepire "sysf"); what as4tainr does not
+/// keep is null. Also as the table
 /// function SYSFILES(schema, file) Code for IBM i calls (objectBrowser.ts).
 ///
 /// QSYS2.PARTITION_STATISTICS(schema, table) (the table function under
@@ -1862,7 +1986,7 @@ SELECT
        CAST(CASE WHEN sf.name IS NOT NULL THEN NULL ELSE 1 END AS integer) AS maximum_members,
        CAST(coalesce(sf.rcdlen, t.row_length) AS integer) AS maximum_record_length,
        CAST((SELECT count(*) FROM as4tainr.file_keys k WHERE k.library = o.library AND k.file = o.name) AS integer) AS number_key_fields,
-       CAST(NULL AS integer) AS maximum_key_length,
+       CAST(CASE WHEN sf.name IS NULL AND NOT EXISTS (SELECT 1 FROM as4tainr.file_keys k WHERE k.library = o.library AND k.file = o.name) THEN 0 END AS integer) AS maximum_key_length,
        CAST(0 AS integer) AS trigger_count,
        CAST(0 AS integer) AS constraint_count,
        CAST(NULL AS integer) AS number_based_on_files,
@@ -1877,13 +2001,13 @@ SELECT
        CAST(CASE WHEN t.select_omit = 'Y' THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS select_omit,
        CAST('NO' AS varchar(3)) COLLATE "C" AS program_described,
        CAST('NO' AS varchar(3)) COLLATE "C" AS distributed,
-       CAST(NULL AS char(6)) COLLATE "C" AS file_vrm,
+       CAST('V7R5M0' AS char(6)) COLLATE "C" AS file_vrm,
        CAST(NULL AS char(6)) COLLATE "C" AS earliest_possible_release,
        CAST(NULL AS varchar(3)) COLLATE "C" AS allow_null_keys,
        CAST('YES' AS varchar(3)) COLLATE "C" AS allow_null_data,
        CAST(NULL AS varchar(3)) COLLATE "C" AS primary_key,
        CAST(NULL AS varchar(3)) COLLATE "C" AS unique_constraint,
-       CAST(NULL AS varchar(3)) COLLATE "C" AS restrict_on_drop,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS restrict_on_drop,
        CAST('NO' AS varchar(3)) COLLATE "C" AS volatile,
        CAST('NO' AS varchar(3)) COLLATE "C" AS keep_in_memory,
        CAST('*ANY' AS varchar(4)) COLLATE "C" AS media_preference,
@@ -1901,7 +2025,7 @@ SELECT
        CAST(NULL AS integer) AS srtseq_ind,
        CAST(NULL AS varchar(10)) COLLATE "C" AS sort_sequence_library,
        CAST(NULL AS varchar(10)) COLLATE "C" AS sort_sequence,
-       CAST(NULL AS char(3)) COLLATE "C" AS language_identifier,
+       CAST('ENU' AS char(3)) COLLATE "C" AS language_identifier,
        CAST(NULL AS varchar(8)) COLLATE "C" AS rounding_mode,
        CAST(NULL AS varchar(3)) COLLATE "C" AS decfloat_warnings,
        CAST(1 AS integer) AS number_record_formats,
@@ -1910,23 +2034,23 @@ SELECT
        CAST(coalesce(sf.rcdlen, t.row_length) AS integer) AS record_length,
        CAST(CASE WHEN sf.name IS NOT NULL THEN 3 ELSE (SELECT count(*) FROM as4tainr.file_fields ff WHERE ff.library = o.library AND ff.file = o.name) END AS integer) AS number_fields,
        CAST(37 AS integer) AS common_ccsid,
-       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_explicit_ccsid,
-       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_multiple_ccsids,
-       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_unicode,
-       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_varying_length,
-       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_datetime,
-       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_graphic,
-       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_lob,
-       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_rowid,
-       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_udt,
-       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_datalink,
-       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_datalink_file_link_control,
-       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_null,
-       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_default,
-       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_identity,
-       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_row_change_timestamp,
-       CAST(NULL AS varchar(3)) COLLATE "C" AS contains_user_defined_function,
-       CAST(NULL AS varchar(3)) COLLATE "C" AS allocate_storage,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS contains_explicit_ccsid,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS contains_multiple_ccsids,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS contains_unicode,
+       CAST(CASE WHEN fx.varying THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS contains_varying_length,
+       CAST(CASE WHEN fx.datetime THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS contains_datetime,
+       CAST(CASE WHEN fx.graphic THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS contains_graphic,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS contains_lob,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS contains_rowid,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS contains_udt,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS contains_datalink,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS contains_datalink_file_link_control,
+       CAST(CASE WHEN fx.nulls THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS contains_null,
+       CAST(CASE WHEN fx.defaults THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS contains_default,
+       CAST(CASE WHEN fx.identities THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS contains_identity,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS contains_row_change_timestamp,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS contains_user_defined_function,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS allocate_storage,
        CAST(NULL AS varchar(3)) COLLATE "C" AS contiguous_storage,
        CAST(NULL AS integer) AS maximum_deleted_percentage,
        CAST(NULL AS integer) AS initial_records,
@@ -1952,6 +2076,15 @@ SELECT
   LEFT JOIN as4tainr.files f ON f.library = o.library AND f.name = o.name
   LEFT JOIN as4tainr.source_files sf ON sf.library = o.library AND sf.name = o.name
   LEFT JOIN qsys2.systables t ON t.system_table_schema = o.library AND t.system_table_name = o.name
+  LEFT JOIN LATERAL (
+       SELECT coalesce(bool_or(ff.varlen), false) AS varying,
+              coalesce(bool_or(ff.data_type IN ('L', 'T', 'Z')), false) AS datetime,
+              coalesce(bool_or(ff.data_type = 'G'), false) AS graphic,
+              coalesce(bool_or(ff.null_capable), false) AS nulls,
+              coalesce(bool_or(ff.dft IS NOT NULL), false) AS defaults,
+              coalesce(bool_or(ff.identity IS NOT NULL), false) AS identities
+         FROM as4tainr.file_fields ff
+        WHERE ff.library = o.library AND ff.file = o.name) fx ON true
  WHERE o.objtype = '*FILE' AND o.attribute IN ('PF', 'LF', 'PF-SRC', 'PF-DTA', 'LF-DTA');
 DROP FUNCTION IF EXISTS qsys2.sysfiles(varchar, varchar);
 CREATE FUNCTION qsys2.sysfiles(table_schema varchar, table_name varchar)
@@ -2178,7 +2311,8 @@ fn work_services() -> String {
          {SPOOLED_FILE_INFO}
          {LIBRARY_INFO}
          {FILE_CATALOG}
-         GRANT SELECT ON qsys2.sysfiles TO {SQL_ROLE};
+         {PROGRAM_INFO}
+         GRANT SELECT ON qsys2.sysfiles, qsys2.program_info TO {SQL_ROLE};
          GRANT SELECT ON qsys2.bound_srvpgm_info TO {SQL_ROLE};
          GRANT SELECT ON qsys2.library_list_info, qsys2.user_info, qsys2.system_value_info,
                qsys2.sysroutines, qsys2.sysparms, qsys2.environment_variable_info,

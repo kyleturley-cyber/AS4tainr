@@ -1,0 +1,13 @@
+# Golden (batch 9): Mapepire 2.3.2's number forms (whole decimals,
+# arithmetic and aggregate types, DECFLOAT, BIGINT), CONCAT with CHAR and
+# VARCHAR (blanks and result types), VARBINARY/GRAPHIC/NVARCHAR/CLOB/
+# BOOLEAN values, Db2 datetime strings in comparisons, execute after
+# prepare_sql_execute and after prepare_sql of an UPDATE, and
+# PARTITION_STATISTICS of a source file (verify66-68 got no row for an
+# SQL table).
+# Capture with: .\tools\golden\golden.ps1 -List tools\golden\verify69.txt -Files tools\golden\verify69
+p69_cleanup|!for c in "DLTF FILE(AS4TRAINR1/GLD69T)" "DLTF FILE(AS4TRAINR1/GLD69S)"; do system -q "$c"; done; echo cleaned
+p69_tag|!setccsid 819 /home/AS4TRAINR/gld/mp69.jsonl; ls /home/AS4TRAINR/gld | grep mp69
+p69_make|!system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD69T (I INTEGER, C CHAR(5), V VARCHAR(10), D DECIMAL(7, 2), N NUMERIC(5, 2), F DOUBLE, DF DECFLOAT(16), BIG BIGINT, VB VARBINARY(4), G GRAPHIC(3) CCSID 1200, NV NVARCHAR(5), CL CLOB(100), BO BOOLEAN, DT DATE, TM TIME, TS TIMESTAMP)') COMMIT(*NONE)"; system "RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD69T VALUES (1, ''ab'', ''cd  '', 100.00, 0.50, 12345678.5, 1.50, 9007199254740993, BX''C1C2'', ''xyz'', ''nv'', ''clob'', TRUE, ''2026-11-09'', ''13.14.15'', ''2026-11-09-13.14.15.123456''), (2, ''13.14'', '''', -0.01, 0, 1E-5, 100, -1, BX'''', ''a'', '''', '''', FALSE, ''2026-11-10'', ''11.00.00'', ''2026-11-10-00.00.00'')') COMMIT(*NONE)"; system "CRTSRCPF FILE(AS4TRAINR1/GLD69S) RCDLEN(92) MBR(M1)"; system "ADDPFM FILE(AS4TRAINR1/GLD69S) MBR(M2)"
+p69_mapepire|!cd /home/AS4TRAINR && while IFS= read -r l; do printf '%s\n' "$l"; sleep 2; done < /home/AS4TRAINR/gld/mp69.jsonl | env QIBM_JAVA_STDIO_CONVERT=N QIBM_PASE_DESCRIPTOR_STDIO=B QIBM_USE_DESCRIPTOR_STDIO=Y QIBM_MULTI_THREADED=Y /QOpenSys/QIBM/ProdData/JavaVM/jdk80/64bit/bin/java -Djdbc.db2.restricted.local.connection.only=true -Dos400.stdio.convert=N -jar /QOpenSys/pkgs/lib/mapepire/mapepire-server.jar --single
+p69_end|!for c in "DLTF FILE(AS4TRAINR1/GLD69T)" "DLTF FILE(AS4TRAINR1/GLD69S)"; do system -q "$c"; done; echo cleaned

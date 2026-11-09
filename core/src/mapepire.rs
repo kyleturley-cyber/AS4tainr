@@ -340,6 +340,8 @@ struct Open {
     sql: Option<String>,
     results: Option<Results>,
     terse: bool,
+    /// Prepared by prepare_sql and not run yet.
+    prepared_only: bool,
 }
 
 /// What a statement did.
@@ -510,6 +512,7 @@ impl<'a> Server<'a> {
                     sql: None,
                     results: None,
                     terse,
+                    prepared_only: false,
                 };
                 self.reply_done(done, rows, &mut open, reply, false);
                 self.open.insert(id, open);
@@ -524,6 +527,7 @@ impl<'a> Server<'a> {
                     sql: Some(sql.clone()),
                     results: None,
                     terse,
+                    prepared_only: ty == "prepare_sql",
                 };
                 if ty == "prepare_sql_execute" {
                     let parms = r.get("parameters").cloned().unwrap_or(J::Arr(vec![]));
@@ -557,6 +561,21 @@ impl<'a> Server<'a> {
                         Ok(())
                     }
                     _ => match open.sql.clone() {
+                        // A query prepared alone (prepare_sql) and then run
+                        // with execute: the 2.3 server's native driver
+                        // fails it with SQLSTATE HY021, SQLCODE -99999
+                        // (verify66 and verify68 o68_mapepire "exe").
+                        Some(sql)
+                            if self.legacy_cl
+                                && open.prepared_only
+                                && is_query(&first_word(&sql)) =>
+                        {
+                            Err(anyhow::Error::new(Failure {
+                                text: "The call level interface could not run the statement."
+                                    .into(),
+                                sql: Some(("HY021".into(), -99999)),
+                            }))
+                        }
                         Some(sql) => {
                             let parms = r.get("parameters").cloned().unwrap_or(J::Arr(vec![]));
                             self.execute(&sql, &parms, rows, &mut open, reply).await
@@ -951,10 +970,28 @@ impl<'a> Server<'a> {
                 routine_parms = Some(r.parms.clone());
             }
         }
+        // Other statements' parameters: typed by where they are, named
+        // "?" (PUB400's 2.3.2, verify68 o68_mapepire "prep", "pins":
+        // `I = ?` INTEGER 10, an INSERT's CHAR(5) column CHAR 5).
+        let mut inferred = Vec::new();
+        if call.is_none() && markers > 0 {
+            let numbered: Vec<String> = (1..=markers).map(|k| format!("${k}")).collect();
+            if let Ok(text) = bind(sql, &numbered) {
+                let catalog = self.job.client;
+                if let Ok(s) = self.session().await {
+                    inferred = s.parameter_types(catalog, &text).await.unwrap_or_default();
+                }
+            }
+        }
         for i in 0..markers {
             let p = routine_parms.as_ref().and_then(|ps| ps.get(i));
+            let guess = inferred.get(i).map(|t| {
+                let (ty, precision, scale, _) = column_type(t, 0);
+                (ty, precision, scale)
+            });
             let (ty, precision, scale) =
                 p.map(|p| written(&p.ty))
+                    .or(guess)
                     .unwrap_or(("VARCHAR".into(), 0, 0));
             parameters.push(J::Obj(vec![
                 ("type".into(), J::str(ty)),
@@ -970,7 +1007,7 @@ impl<'a> Server<'a> {
                 (
                     "name".into(),
                     p.map(|p| J::str(p.name.to_ascii_uppercase()))
-                        .unwrap_or(J::Null),
+                        .unwrap_or_else(|| if call.is_none() { J::str("?") } else { J::Null }),
                 ),
             ]));
         }
@@ -1427,6 +1464,7 @@ impl<'a> Server<'a> {
                 .map(|c| ColType {
                     pg: c.1.to_string(),
                     typmod: c.2,
+                    db2: None,
                 })
                 .collect(),
             rows,
@@ -1489,6 +1527,13 @@ fn marker_positions_of(sql: &str, ch: char) -> usize {
     n
 }
 
+fn first_word(sql: &str) -> String {
+    sql.split(|c: char| c.is_whitespace() || c == '(')
+        .find(|w| !w.is_empty())
+        .unwrap_or("")
+        .to_ascii_uppercase()
+}
+
 fn is_query(first_word: &str) -> bool {
     matches!(first_word, "SELECT" | "WITH" | "VALUES")
 }
@@ -1504,6 +1549,7 @@ fn text_type() -> ColType {
     ColType {
         pg: "text".into(),
         typmod: -1,
+        db2: None,
     }
 }
 
@@ -1576,24 +1622,56 @@ fn number(v: &str) -> J {
     }
 }
 
+/// A decimal's digits without the trailing zeros of its fraction
+/// (`-12.50` → `-12.5`, `100.00` → `100.0`), as text: no rounding.
+fn decimal_text(v: &str) -> String {
+    match v.split_once('.') {
+        Some((int, frac)) if frac.bytes().all(|c| c.is_ascii_digit()) => {
+            let f = frac.trim_end_matches('0');
+            format!(
+                "{}.{}",
+                integer_text(int),
+                if f.is_empty() { "0" } else { f }
+            )
+        }
+        None if v.bytes().all(|c| c.is_ascii_digit() || c == b'-') => integer_text(v),
+        _ => v.to_string(),
+    }
+}
+
+/// An integer part without leading zeros (`-0012` → `-12`, `000` → `0`).
+fn integer_text(v: &str) -> String {
+    let (sign, digits) = match v.strip_prefix('-') {
+        Some(d) => ("-", d),
+        None => ("", v),
+    };
+    let d = digits.trim_start_matches('0');
+    format!("{sign}{}", if d.is_empty() { "0" } else { d })
+}
+
 /// A value of a column, as the reply carries it.
 fn cell(t: Option<&ColType>, v: Option<&str>) -> J {
     let Some(v) = v else {
         return J::Null;
     };
     match t.map(|t| t.pg.as_str()).unwrap_or("text") {
-        "int2" | "int4" | "int8" | "numeric" | "float4" | "float8" => number(v),
+        // A decimal as the server writes it: no trailing zeros after the
+        // point, one kept when it is a whole number (verify68 o68_mapepire
+        // "sel": DECIMAL(7, 2) -12.50 came as -12.5, NUMERIC(5, 0) 7 as 7).
+        "numeric" => number(&decimal_text(v)),
+        "int2" | "int4" | "int8" | "float4" | "float8" => number(v),
         "bool" => J::Bool(matches!(v, "t" | "true" | "TRUE")),
         // CHAR: without trailing blanks.
         "bpchar" => J::str(v.trim_end()),
-        // Binary: Base64 (single mode carries it inline).
+        // Binary: the bytes read as UTF-8, a byte that is not UTF-8 as
+        // U+FFFD (verify68 o68_mapepire "sel": BINARY(2) X'C1C2' came as
+        // two U+FFFD).
         "bytea" => {
-            use base64::Engine;
             let hex = v.trim_start_matches("\\x");
             let bytes: Vec<u8> = (0..hex.len() / 2)
                 .filter_map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok())
                 .collect();
-            J::str(base64::engine::general_purpose::STANDARD.encode(bytes))
+            J::str(String::from_utf8_lossy(&bytes).into_owned())
         }
         // Binary job log columns: each byte a character, as the server
         // gives them (verify64: MESSAGE_KEY "\u0000\u0000\u0001\r").
@@ -1607,7 +1685,16 @@ fn cell(t: Option<&ColType>, v: Option<&str>) -> J {
             )
         }
         // TIMESTAMP: as JDBC writes it (yyyy-mm-dd hh:mm:ss.ffffff).
+        // TIMESTAMP(0): no fraction (verify68 o68_mapepire "sysf":
+        // LAST_ALTERED_TIMESTAMP "2026-11-09 20:17:56").
+        "timestamp" if t.is_some_and(|t| t.typmod == 0) => {
+            let s = jdbc_timestamp(v);
+            J::str(s.split_once('.').map(|(a, _)| a.to_string()).unwrap_or(s))
+        }
         "timestamp" => J::str(jdbc_timestamp(v)),
+        // TIME: hh.mm.ss, the job's ISO time format (verify68 o68_mapepire
+        // "sel": "13.14.15").
+        "time" => J::str(v.replace(':', ".")),
         _ => J::str(v),
     }
 }
@@ -1649,10 +1736,17 @@ fn column_type(t: &ColType, longest: usize) -> (String, i64, i64, i64) {
         "int8" => ("BIGINT".into(), 19, 0, 20),
         "float4" => ("REAL".into(), 24, 0, 13),
         "float8" => ("DOUBLE".into(), 53, 0, 22),
+        // NUMERIC (zoned) and DECIMAL (packed) as the file has them
+        // (verify68 o68_mapepire "sel": Z NUMERIC(5, 0), display 7).
         "numeric" if m >= 4 => {
             let p = (m - 4) >> 16;
             let s = (m - 4) & 0xFFFF;
-            ("DECIMAL".into(), p, s, p + 2)
+            let name = if t.db2.as_deref() == Some("NUMERIC") {
+                "NUMERIC"
+            } else {
+                "DECIMAL"
+            };
+            (name.into(), p, s, p + 2)
         }
         "numeric" => ("DECIMAL".into(), 31, 0, 33),
         // The job log's own columns (cl_job_log_rows): typmod is the length.
@@ -1666,6 +1760,11 @@ fn column_type(t: &ColType, longest: usize) -> (String, i64, i64, i64) {
         "time" => ("TIME".into(), 8, 0, 8),
         "timestamp" => ("TIMESTAMP".into(), 26, 6, 26),
         "bool" => ("BOOLEAN".into(), 1, 0, 5),
+        // BINARY(n) (verify68 o68_mapepire "sel": BINARY, display 2,
+        // precision 2).
+        "bytea" if t.db2.as_deref() == Some("BINARY") && m >= 4 => {
+            ("BINARY".into(), m - 4, 0, m - 4)
+        }
         "bytea" => ("VARBINARY".into(), l, 0, l * 2),
         "xml" => ("XML".into(), l, 0, l),
         _ => ("VARCHAR".into(), l, 0, l),
@@ -1932,17 +2031,27 @@ mod tests {
         let t = |pg: &str| ColType {
             pg: pg.into(),
             typmod: -1,
+            db2: None,
         };
+        // PUB400's 2.3.2 server wrote DECIMAL(7, 2) -12.50 as -12.5
+        // (verify68 o68_mapepire "sel"); JSON has no leading zeros.
         assert_eq!(
             cell(Some(&t("numeric")), Some("-0012.50")),
-            J::Num("-0012.50".into())
+            J::Num("-12.5".into())
         );
+        assert_eq!(cell(Some(&t("numeric")), Some("7")), J::Num("7".into()));
         assert_eq!(cell(Some(&t("numeric")), Some(".5")), J::Num("0.5".into()));
         assert_eq!(cell(Some(&t("numeric")), Some("NaN")), J::str("NaN"));
         assert_eq!(cell(Some(&t("bpchar")), Some("AB  ")), J::str("AB"));
         assert_eq!(cell(Some(&t("varchar")), Some("AB  ")), J::str("AB  "));
         assert_eq!(cell(Some(&t("bool")), Some("t")), J::Bool(true));
-        assert_eq!(cell(Some(&t("bytea")), Some("\\x4142")), J::str("QUI="));
+        // Binary: the bytes as UTF-8 (verify68 "sel": X'C1C2' as two
+        // U+FFFD).
+        assert_eq!(cell(Some(&t("bytea")), Some("\\x4142")), J::str("AB"));
+        assert_eq!(
+            cell(Some(&t("bytea")), Some("\\xc1c2")),
+            J::str("\u{fffd}\u{fffd}")
+        );
         assert_eq!(
             cell(Some(&t("timestamp")), Some("2026-11-09-12.34.56.000001")),
             J::str("2026-11-09 12:34:56.000001")

@@ -68,6 +68,26 @@ LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, pg_temp AS $as4tainr$ SELEC
 "
         ));
     }
+    // CONCAT (||) of fixed-length strings keeps their trailing blanks
+    // (Db2 for i SQL Reference, "With the concatenation operator";
+    // verify68 o68_mapepire "exp": 'x' CONCAT C, C CHAR(5) 'ab', is
+    // "xab   "); PostgreSQL's text || text drops them, so CHAR operands
+    // come here, where concat keeps them. Null when either is null.
+    for (left, right, tag) in [
+        ("bpchar", "bpchar", "cc"),
+        ("bpchar", "text", "ct"),
+        ("text", "bpchar", "tc"),
+    ] {
+        out.push_str(&format!(
+            "CREATE OR REPLACE FUNCTION {s}.concat_{tag}({left}, {right}) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT SET search_path = pg_catalog, pg_temp AS $as4tainr$ SELECT concat($1, $2) $as4tainr$;
+DO $as4tainr$ BEGIN
+  CREATE OPERATOR {s}.|| (LEFTARG = {left}, RIGHTARG = {right}, FUNCTION = {s}.concat_{tag});
+EXCEPTION WHEN duplicate_function OR duplicate_object THEN NULL;
+END $as4tainr$;
+"
+        ));
+    }
     out
 }
 

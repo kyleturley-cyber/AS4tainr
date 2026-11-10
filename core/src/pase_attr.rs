@@ -83,6 +83,10 @@ async fn value(
                 meta.len().to_string()
             }
         }
+        // The auxiliary storage pool: as4tainr has the system ASP only
+        // (Code for IBM i's content.test.ts "should get attributes": ASP
+        // 1 for /QSYS.LIB/QSYSINC.LIB).
+        "ASP" => "1".into(),
         "CCSID" => {
             if let Some(c) = noted(path) {
                 c.to_string()
@@ -374,6 +378,7 @@ async fn qsys_attr(client: &Client, path: &str, names: &[&String], pairs: bool) 
             "OBJTYPE" => objtype.clone(),
             "DATA_SIZE" => size.clone(),
             "CCSID" => ccsid.clone(),
+            "ASP" => "1".into(),
             _ => {
                 out.stderr
                     .push(format!("attr: {name}: not a valid attribute."));

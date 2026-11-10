@@ -27788,3 +27788,85 @@ async fn dspmod_output_files_of_a_cl_module() {
     .unwrap();
     assert!(m[0].contains("QTEMP"), "{m:?}");
 }
+
+#[tokio::test]
+async fn schemas_named_by_sql_names() {
+    // Db2 for i SQL Reference, CREATE SCHEMA: a schema name up to 128
+    // characters; FOR SCHEMA names its library (Code for IBM i's
+    // content.test.ts "should handle long library name": a source file
+    // made in the short name, the schema dropped by its long name).
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let short = format!("S{}", &lib[lib.len().saturating_sub(8)..]);
+    let long = format!("Long_{short}_Schema");
+    cl_cmd(
+        &mut job,
+        format!("RUNSQL 'create schema \"{long}\" for {short}' COMMIT(*NONE)"),
+    )
+    .await
+    .unwrap();
+    cl_cmd(&mut job, format!("CRTSRCPF FILE({short}/SFILE) MBR(MBR)"))
+        .await
+        .unwrap();
+    // A second schema of the same SQL name: SQL0601.
+    let e = cl_cmd(
+        &mut job,
+        format!("RUNSQL 'create schema \"{long}\" for X{short}' COMMIT(*NONE)"),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("SQL0601"), "{e}");
+    cl_cmd(
+        &mut job,
+        format!("RUNSQL 'drop schema \"{long}\"' COMMIT(*NONE)"),
+    )
+    .await
+    .unwrap();
+    assert!(!as4tainr_core::catalog::library_exists(&client, &short)
+        .await
+        .unwrap());
+    // Without FOR SCHEMA: a generated system name, dropped by the SQL
+    // name.
+    let long2 = format!("GENERATED_{short}_NAME");
+    cl_cmd(
+        &mut job,
+        format!("RUNSQL 'create schema {long2}' COMMIT(*NONE)"),
+    )
+    .await
+    .unwrap();
+    let lib2: String = client
+        .query_one(
+            "SELECT library FROM as4tainr.schema_names WHERE sql_name = $1",
+            &[&long2],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(lib2.starts_with("GENER") && lib2.len() == 10, "{lib2}");
+    assert!(as4tainr_core::catalog::library_exists(&client, &lib2)
+        .await
+        .unwrap());
+    cl_cmd(
+        &mut job,
+        format!("RUNSQL 'drop schema {long2}' COMMIT(*NONE)"),
+    )
+    .await
+    .unwrap();
+    assert!(!as4tainr_core::catalog::library_exists(&client, &lib2)
+        .await
+        .unwrap());
+}

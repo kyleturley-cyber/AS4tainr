@@ -1,0 +1,28 @@
+# Golden (batch 18): LIBRARY_INFO of a library that is not there (Code
+# for IBM i's getLibraryIAsp), SELECT without a select list (SQL0104's
+# tokens), the db2 utility's columns of other types, nulls, messages;
+# attr ASP; DSPMOD of an RPG module (exports, imports, *BASIC, *SIZE,
+# the whole report) and of a module that is not there.
+u75_cleanup|!system -q "DLTMOD MODULE(AS4TRAINR1/GLD75R)"; for f in GLD75X GLD75I GLD75B GLD75S GLD75T; do system -q "DLTF FILE(AS4TRAINR1/$f)"; done; rm -f /tmp/gld75.rpgle; echo cleaned
+u75_libinfo|!/QOpenSys/usr/bin/qsh -c "db2 \"SELECT IASP_NAME FROM TABLE(QSYS2.LIBRARY_INFO('NOEXIST75', DETAILED_INFO => 'NO')) X\""
+u75_libinfo2|!/QOpenSys/usr/bin/qsh -c "db2 \"SELECT * FROM TABLE(QSYS2.LIBRARY_INFO('AS4TRAINR1', DETAILED_INFO => 'NO')) X\""
+u75_badsel|!/QOpenSys/usr/bin/qsh -c "db2 \"select from qiws.qcustcdt\""
+u75_db2crt|!/QOpenSys/usr/bin/qsh -c "db2 \"CREATE TABLE AS4TRAINR1.GLD75T (A INT, B VARCHAR(5), C DATE, D TIMESTAMP, E SMALLINT, F BIGINT, G DOUBLE, H TIME, I DECIMAL(7, 2))\""
+u75_db2ins|!/QOpenSys/usr/bin/qsh -c "db2 \"INSERT INTO AS4TRAINR1.GLD75T VALUES (1, NULL, '2026-11-10', '2026-11-10-12.00.00', 2, 3, 1.5, '12.30.00', -12.5)\""
+u75_db2sel|!/QOpenSys/usr/bin/qsh -c "db2 \"SELECT T.*, COUNT(*) OVER () FROM AS4TRAINR1.GLD75T T\""
+u75_db2bad|!/QOpenSys/usr/bin/qsh -c "db2 \"SELECT * FROM AS4TRAINR1.NOSUCH75\""
+u75_db2drop|!/QOpenSys/usr/bin/qsh -c "db2 \"DROP TABLE AS4TRAINR1.GLD75T\""
+u75_attr|!attr -p /QSYS.LIB/AS4TRAINR1.LIB ASP OBJTYPE; attr -p /home/AS4TRAINR ASP OBJTYPE DATA_SIZE
+u75_make|!printf '**FREE\nctl-opt nomain;\ndcl-pr Other75 int(10) extproc(\047OTHER75\047);\nend-pr;\ndcl-proc Hello75 export;\n  dcl-pi *n int(10) end-pi;\n  return Other75();\nend-proc;\n' > /tmp/gld75.rpgle; system "CRTRPGMOD MODULE(AS4TRAINR1/GLD75R) SRCSTMF('/tmp/gld75.rpgle')"
+u75_nomod|DSPMOD MODULE(AS4TRAINR1/NOMOD75)
+u75_exp|DSPMOD MODULE(AS4TRAINR1/GLD75R) DETAIL(*EXPORT) OUTPUT(*OUTFILE) OUTFILE(AS4TRAINR1/GLD75X)
+u75_exprows|!/QOpenSys/usr/bin/qsh -c "db2 \"SELECT * FROM AS4TRAINR1.GLD75X\""
+u75_imp|DSPMOD MODULE(AS4TRAINR1/GLD75R) DETAIL(*IMPORT) OUTPUT(*OUTFILE) OUTFILE(AS4TRAINR1/GLD75I)
+u75_improws|!/QOpenSys/usr/bin/qsh -c "db2 \"SELECT * FROM AS4TRAINR1.GLD75I\""
+u75_bas|DSPMOD MODULE(AS4TRAINR1/GLD75R) DETAIL(*BASIC) OUTPUT(*OUTFILE) OUTFILE(AS4TRAINR1/GLD75B)
+u75_basrows|!/QOpenSys/usr/bin/qsh -c "db2 \"SELECT * FROM AS4TRAINR1.GLD75B\""
+u75_size|DSPMOD MODULE(AS4TRAINR1/GLD75R) DETAIL(*SIZE) OUTPUT(*OUTFILE) OUTFILE(AS4TRAINR1/GLD75S)
+u75_sizeffd|DSPFFD FILE(AS4TRAINR1/GLD75S)
+u75_sizerows|!/QOpenSys/usr/bin/qsh -c "db2 \"SELECT * FROM AS4TRAINR1.GLD75S\""
+u75_print|DSPMOD MODULE(AS4TRAINR1/GLD75R) DETAIL(*ALL) OUTPUT(*PRINT)
+u75_end|!system -q "DLTMOD MODULE(AS4TRAINR1/GLD75R)"; for f in GLD75X GLD75I GLD75B GLD75S GLD75T; do system -q "DLTF FILE(AS4TRAINR1/$f)"; done; rm -f /tmp/gld75.rpgle; echo cleaned

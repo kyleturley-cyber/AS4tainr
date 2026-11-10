@@ -1950,6 +1950,21 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
     if toks.iter().any(|t| matches!(t, Tok::Punct(p) if p == ";")) {
         bail!("SQL0104: Only one statement can be run at a time.");
     }
+    // SELECT FROM: Db2 wants a select list (PostgreSQL takes an empty
+    // one). Its SQL0104 names the tokens that could have come next
+    // (Code for IBM i's content.test.ts "Test runSQL (bad basic select)",
+    // run against IBM i: the message ends ": , FROM INTO.", 42601, -104).
+    let words: Vec<String> = toks.iter().filter_map(word).collect();
+    if words.windows(2).any(|w| w[0] == "SELECT" && w[1] == "FROM")
+        && toks
+            .iter()
+            .filter(|t| !matches!(t, Tok::Space(_)))
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|w| matches!((word(w[0]), word(w[1])), (Some(a), Some(b)) if a == "SELECT" && b == "FROM"))
+    {
+        bail!("SQL0104: FROM is not expected after SELECT; what can come there: , FROM INTO.");
+    }
     // VALUES 'A', 'B': one row for each expression (Db2: VALUES with a
     // list of expressions, none in parentheses); PostgreSQL wants each
     // row in parentheses. Code for IBM i lists libraries so.
@@ -4298,6 +4313,13 @@ mod tests {
         let err = |s: &str| translate(s, &|_| false).unwrap_err().to_string();
         assert!(err("drop table t").starts_with("SQL0084"));
         assert!(err("select 1; drop table t").starts_with("SQL0104"));
+        // Code for IBM i's "Test runSQL (bad basic select)" (IBM i's
+        // message ends with the tokens ", FROM INTO").
+        let e = err("select from qiws.qcustcdt");
+        assert!(
+            e.starts_with("SQL0104") && e.ends_with(": , FROM INTO."),
+            "{e}"
+        );
         assert!(err("select * from as4tainr.user_profiles").starts_with("SQL0551"));
         assert!(err("select * from pg_shadow").starts_with("SQL0551"));
         assert!(err("select 'abc").starts_with("SQL0010"));

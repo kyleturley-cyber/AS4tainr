@@ -501,6 +501,9 @@ pub async fn init(client: &Client) -> Result<()> {
                 &[],
             )
             .await?;
+        client
+            .batch_execute(crate::ddl::SCHEMA_NAMES_DDL)
+            .await?;
         for (lib, text) in SYSTEM_LIBRARIES {
             create_library(client, lib, text).await?;
             // Catalogs made by older versions gave every one the same text.

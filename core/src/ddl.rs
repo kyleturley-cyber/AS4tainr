@@ -44,8 +44,20 @@ impl std::fmt::Display for Name {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ddl {
-    /// CREATE SCHEMA: a library.
-    CreateSchema(String),
+    /// CREATE SCHEMA: a library. `sql_name` is the schema's SQL name when
+    /// it is not a system name (longer than 10 characters, or delimited
+    /// with lower case or special characters); `library` its system name
+    /// (FOR SCHEMA, else generated when it runs), or the name.
+    CreateSchema {
+        library: Option<String>,
+        sql_name: Option<String>,
+    },
+    /// DROP SCHEMA name [CASCADE | RESTRICT]: the library, by its system
+    /// or SQL name.
+    DropSchema {
+        name: String,
+        if_exists: bool,
+    },
     /// CREATE [OR REPLACE] ALIAS name FOR table [(member)] (Db2 for i SQL
     /// Reference, CREATE ALIAS): a name for a table, or for one member of
     /// a source file.
@@ -265,18 +277,35 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
             }
             let unique = p.eat("UNIQUE");
             if !replace && !unique && p.eat("SCHEMA") {
-                // CREATE SCHEMA name [AUTHORIZATION user]: the
-                // authorization name is accepted.
+                // CREATE SCHEMA name [FOR SCHEMA system-name]
+                // [AUTHORIZATION user]: the authorization name is
+                // accepted. A name that is not a system name (an SQL name
+                // up to 128 characters) gets the FOR SCHEMA name, or a
+                // generated one (Db2 for i SQL Reference, CREATE SCHEMA;
+                // Code for IBM i's content.test.ts "should handle long
+                // library name" writes FOR without SCHEMA).
                 let name = p.ident()?;
+                let mut system = None;
+                if p.eat("FOR") {
+                    p.eat("SCHEMA");
+                    system = Some(p.system_name("library")?);
+                }
                 if p.eat("AUTHORIZATION") {
                     p.ident()?;
                 }
                 if let Some(t) = p.t.get(p.i) {
                     bail!("SQL0104: Token {} not valid here.", show(t));
                 }
-                return Ok(Some(Ddl::CreateSchema(
-                    validate_name("library", &name).map_err(sql0104)?,
-                )));
+                let (library, sql_name) = match validate_name("library", &name) {
+                    Ok(l) if l == name.to_ascii_uppercase() && system.is_none() => (Some(l), None),
+                    _ => {
+                        if name.chars().count() > 128 || name.is_empty() {
+                            bail!("SQL0107: The name {name} is too long; 128 characters at most.");
+                        }
+                        (system, Some(name))
+                    }
+                };
+                return Ok(Some(Ddl::CreateSchema { library, sql_name }));
             }
             match p.word().as_deref() {
                 Some("TABLE") if !unique => {
@@ -387,6 +416,18 @@ pub fn parse(sql: &str) -> Result<Option<Ddl>> {
                     bail!("SQL0104: Token {} not valid here.", show(t));
                 }
                 return Ok(Some(Ddl::DropAlias { name, if_exists }));
+            }
+            if p.eat("SCHEMA") {
+                let if_exists = p.eat("IF");
+                if if_exists {
+                    p.expect("EXISTS")?;
+                }
+                let name = p.ident()?;
+                let _ = p.eat("CASCADE") || p.eat("RESTRICT");
+                if let Some(t) = p.t.get(p.i) {
+                    bail!("SQL0104: Token {} not valid here.", show(t));
+                }
+                return Ok(Some(Ddl::DropSchema { name, if_exists }));
             }
             let kind = match p.word().as_deref() {
                 Some("TABLE") => "TABLE",
@@ -641,6 +682,29 @@ fn sql_name(kind: &str, n: &str) -> Result<String> {
         bail!("SQL0084: {kind} name \"{n}\": names with lower case letters or special characters are not supported yet.");
     }
     Ok(n.to_string())
+}
+
+/// Libraries DROP SCHEMA does not drop.
+const SYSTEM_SCHEMAS: &[&str] = &[
+    "QSYS", "QSYS2", "QGPL", "QTEMP", "QUSRSYS", "QSYSINC", "QSQL",
+];
+
+/// The schema names that are not system names, with their libraries.
+pub const SCHEMA_NAMES_DDL: &str = "CREATE TABLE IF NOT EXISTS as4tainr.schema_names (
+    sql_name text PRIMARY KEY,
+    library  text NOT NULL UNIQUE
+)";
+
+/// The library of a schema named by its SQL name (as written when
+/// delimited, in capitals when not: `name` as the parser gives it).
+pub async fn schema_library(client: &Client, name: &str) -> Result<Option<String>> {
+    Ok(client
+        .query_opt(
+            "SELECT library FROM as4tainr.schema_names WHERE sql_name = $1",
+            &[&name],
+        )
+        .await?
+        .map(|r| r.get(0)))
 }
 
 /// A generated system name (Db2 for i, rules for system names of SQL
@@ -3694,7 +3758,32 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
                 false => bail!("SQL0204: {} in {lib} type *TRIGGER not found.", name.name),
             }
         }
-        Ddl::CreateSchema(lib) => {
+        Ddl::CreateSchema { library, sql_name } => {
+            if let Some(n) = sql_name {
+                if schema_library(ctx.client, n).await?.is_some() {
+                    bail!("SQL0601: {n} in QSYS type *LIB already exists.");
+                }
+            }
+            let lib = match library {
+                Some(l) => l.clone(),
+                None => {
+                    // The first five characters that make a system name.
+                    let n = sql_name.as_deref().unwrap_or("");
+                    let base: String = n
+                        .to_ascii_uppercase()
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric() || "_$#@".contains(*c))
+                        .collect();
+                    let base = if base.starts_with(|c: char| c.is_ascii_digit() || c == '_') {
+                        format!("Q{base}")
+                    } else {
+                        base
+                    };
+                    let libs = catalog::list_libraries(ctx.client).await?;
+                    generated_name(&base, &|c| libs.iter().any(|l| l == c))?
+                }
+            };
+            let lib = &lib;
             if catalog::library_exists(ctx.client, lib).await? {
                 bail!("SQL0601: {lib} in QSYS type *LIB already exists.");
             }
@@ -3703,7 +3792,47 @@ pub async fn run(ctx: &mut Ctx<'_>, ddl: &Ddl) -> Result<String> {
             // The schema's journal QSQJRN, which its tables are journaled
             // to (journal::create_schema_journal).
             crate::journal::create_schema_journal(ctx.client, lib, ctx.user).await?;
+            if let Some(n) = sql_name {
+                ctx.client
+                    .execute(
+                        "INSERT INTO as4tainr.schema_names (sql_name, library) VALUES ($1, $2)",
+                        &[n, lib],
+                    )
+                    .await?;
+                return Ok(format!("Schema {n} created (system name {lib})."));
+            }
             Ok(format!("Schema {lib} created."))
+        }
+        Ddl::DropSchema { name, if_exists } => {
+            let lib = match schema_library(ctx.client, name).await? {
+                Some(l) => l,
+                None => {
+                    let l = validate_name("library", name).ok();
+                    match l {
+                        Some(l) if catalog::library_exists(ctx.client, &l).await? => l,
+                        _ if *if_exists => {
+                            return Ok(format!("{name} does not exist; nothing dropped."))
+                        }
+                        _ => bail!("SQL0204: {name} in QSYS type *LIB not found."),
+                    }
+                }
+            };
+            if crate::qtemp::is_qtemp(&lib)
+                || lib.starts_with('Q') && SYSTEM_SCHEMAS.contains(&lib.as_str())
+            {
+                bail!("SQL0901: {lib} is a system library and cannot be dropped.");
+            }
+            authority::check(
+                ctx.client,
+                ctx.user,
+                "QSYS",
+                &lib,
+                "*LIB",
+                authority::Aut::All,
+            )
+            .await?;
+            crate::save::clear_library(ctx.client, &lib, true).await?;
+            Ok(format!("Schema {name} dropped."))
         }
         Ddl::Grant {
             revoke,
@@ -5391,6 +5520,42 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn schemas_with_sql_names() {
+        // Db2 for i SQL Reference, CREATE SCHEMA: a schema name up to 128
+        // characters, its system name given by FOR SCHEMA (Code for IBM
+        // i's "should handle long library name" writes FOR alone) or
+        // generated.
+        assert_eq!(
+            parse("create schema \"O_LWsjSQ3A6hO2y5TZQU\" for OLWS1").unwrap(),
+            Some(Ddl::CreateSchema {
+                library: Some("OLWS1".into()),
+                sql_name: Some("O_LWsjSQ3A6hO2y5TZQU".into())
+            })
+        );
+        assert_eq!(
+            parse("CREATE SCHEMA SALESDATA2026 FOR SCHEMA SALES26").unwrap(),
+            Some(Ddl::CreateSchema {
+                library: Some("SALES26".into()),
+                sql_name: Some("SALESDATA2026".into())
+            })
+        );
+        assert_eq!(
+            parse("create schema mylib").unwrap(),
+            Some(Ddl::CreateSchema {
+                library: Some("MYLIB".into()),
+                sql_name: None
+            })
+        );
+        assert_eq!(
+            parse("drop schema \"O_LWsjSQ3A6hO2y5TZQU\" cascade").unwrap(),
+            Some(Ddl::DropSchema {
+                name: "O_LWsjSQ3A6hO2y5TZQU".into(),
+                if_exists: false
+            })
+        );
+    }
 
     #[test]
     fn alter_table_with_several_alterations() {

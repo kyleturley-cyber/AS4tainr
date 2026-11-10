@@ -92,10 +92,11 @@ def printed(lines):
 
 def shell_for(cmd, sandbox):
     if cmd.startswith("!"):
-        line = cmd[1:].replace("/home/", sandbox + "/home/")
-        # IBM i's /tmp too: the sandbox's, put into the IFS's /tmp by the
-        # shims (verify74 writes its CL source there).
-        line = re.sub(r"(?<![\w/])/tmp/", sandbox + "/tmp/", line)
+        # IBM i's /tmp: the sandbox's, put into the IFS's /tmp by the
+        # `system` shim (verify74 writes its CL source there); first, as
+        # the sandbox is itself in /tmp.
+        line = re.sub(r"(?<![\w/])/tmp/", sandbox + "/tmp/", cmd[1:])
+        line = line.replace("/home/", sandbox + "/home/")
         # IBM i's path to the `system` utility is the shim here (as QSH
         # and PASE commands in as4tainr take it, qsh.rs).
         line = re.sub(r"(?<![\w/])(/QOpenSys)?/usr/bin/system(?=[\s'\";|&)]|$)", "system", line)
@@ -114,7 +115,7 @@ def shell_for(cmd, sandbox):
 
 
 SHIM = """#!/bin/sh
-# `system` (or `setccsid`) for golden.py: the sandbox's /home and /tmp go
+# `system` (or `db2`) for golden.py: the sandbox's /home and /tmp go
 # to the IFS first, and paths into the sandbox in the command become IFS
 # paths again.
 # Only when something there changed since the last put: a put takes
@@ -207,10 +208,15 @@ def main():
             if os.path.isfile(src):
                 shutil.copy(src, gld)
     os.makedirs(os.path.join(sb, "tmp"))
-    for sub in ("system", "setccsid", "db2"):
+    for sub in ("system", "db2", "setccsid", "attr"):
         shim = os.path.join(sb, "bin", sub)
         with open(shim, "w") as f:
-            f.write(SHIM.replace("{sb}", sb).replace("{bin}", bin_).replace("{sub}", sub))
+            if sub in ("system", "db2"):
+                f.write(SHIM.replace("{sb}", sb).replace("{bin}", bin_).replace("{sub}", sub))
+            else:
+                # PASE's attr and setccsid work on the files where they
+                # are (the sandbox's), as they do on the IFS's mirror.
+                f.write('#!/bin/sh\nexec "%s" %s "$@"\n' % (bin_, sub))
         os.chmod(shim, 0o755)
     env = dict(os.environ, PATH=os.path.join(sb, "bin") + ":" + os.environ["PATH"])
     env["AS4TAINR_LIBL"] = env.get("AS4TAINR_LIBL", "QGPL,QTEMP")

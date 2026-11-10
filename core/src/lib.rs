@@ -54,6 +54,7 @@ pub mod jobs;
 pub mod jobscde;
 pub mod journal;
 pub mod mapepire;
+pub mod mapepire_ws;
 pub mod mbrdesc;
 pub mod menus;
 pub mod msgf;

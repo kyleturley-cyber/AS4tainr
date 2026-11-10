@@ -37,6 +37,7 @@ services:
       # AS4TAINR_QPWDLVL: "2"   # case-sensitive passwords (default 0: not case sensitive, like IBM i as shipped)
       # AS4TAINR_QSH: "1"   # QSH runs shell commands in this container (outside as4tainr's authorities): docs/qshell.md
       # AS4TAINR_SSH_LISTEN: 0.0.0.0:22   # SSH for Code for IBM i, ssh and sftp (outside as4tainr's authorities): docs/ssh.md
+      # AS4TAINR_MAPEPIRE_LISTEN: 0.0.0.0:8076   # Mapepire server (wss): docs/ssh.md
     # With AS4TAINR_QSH, QSH commands see the IFS when mounts are allowed:
     # cap_add: [SYS_ADMIN]
     # security_opt: ["apparmor:unconfined"]
@@ -44,6 +45,7 @@ services:
       - "2323:23"   # 5250 emulators (telnet)
       - "5250:8080" # browser 5250 terminal: http://localhost:5250
       # - "2222:22"   # SSH (with AS4TAINR_SSH_LISTEN above)
+      # - "8076:8076" # Mapepire (with AS4TAINR_MAPEPIRE_LISTEN above)
 
   demo:
     image: ghcr.io/as4tainr/as4tainr:dev

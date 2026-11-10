@@ -25,4 +25,6 @@ EXPOSE 23
 EXPOSE 8080
 # SSH, when AS4TAINR_SSH_LISTEN is set (Code for IBM i, sftp): docs/ssh.md.
 EXPOSE 22
+# Mapepire over secure WebSockets, when AS4TAINR_MAPEPIRE_LISTEN is set.
+EXPOSE 8076
 ENTRYPOINT ["/opt/as4tainr/entrypoint.sh"]

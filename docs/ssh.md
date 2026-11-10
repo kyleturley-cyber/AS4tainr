@@ -86,6 +86,22 @@ as4tainr is tested against Code for IBM i's own API test suite
 (`src/api/tests` in the extension's repository, run against IBM i by its
 authors): see "Testing with Code for IBM i" below.
 
+## The Mapepire server (port 8076)
+
+Mapepire clients can also connect without SSH, to Mapepire's server mode:
+`wss://host:8076/db/` with a user profile and its password (HTTP Basic),
+as IBM's Mapepire server daemon serves it. Turn it on with
+`AS4TAINR_MAPEPIRE_LISTEN: 0.0.0.0:8076` (or `as4tainr tn5250
+--mapepire-listen 0.0.0.0:8076`) and map the port. TLS uses the PEM files in
+`AS4TAINR_MAPEPIRE_CERT` and `AS4TAINR_MAPEPIRE_KEY`, else a self-signed
+certificate made the first time and kept in the database
+(`as4tainr.tls_certificates`): clients must trust it or turn verification
+off (`rejectUnauthorized: false` in mapepire-js). Each connection is a
+database server job as over SSH; the replies are those of a 2.3 server
+(`AS4TAINR_MAPEPIRE_VERSION` names another version).
+
+In Code for IBM i, turn "Mapepire: use server" on for the connection.
+
 ## IBM ACS
 
 ACS's 5250 emulator connects to as4tainr's TN5250 server (port 23 in the

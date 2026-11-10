@@ -27371,3 +27371,119 @@ async fn qsh_commands_see_qsys_lib() {
         .unwrap();
     assert_eq!(m2.source, "new");
 }
+
+#[tokio::test]
+async fn mapepire_server_over_websockets() {
+    // Mapepire's server mode (mapepire-js WebSocketTransport: GET /db/ with
+    // HTTP Basic credentials, RFC 6455's upgrade, a request and its reply
+    // a text message each); without the right password, 401.
+    use as4tainr_core::users;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let url = require_db!();
+    let client = runtime::connect_db(&url).await.unwrap();
+    catalog::init(&client).await.unwrap();
+    let name = format!("W{}", std::process::id() % 1_000_000);
+    users::delete(&client, &name).await.unwrap();
+    users::create(
+        &client,
+        users::NewProfile {
+            name: name.clone(),
+            password: users::NewPassword::SameAsProfile,
+            expired: false,
+            enabled: true,
+            usrcls: "*PGMR".into(),
+            special: users::class_special_authorities("*PGMR"),
+            curlib: "QGPL".into(),
+            text: String::new(),
+            inlpgm: users::DEFAULT_INLPGM.into(),
+            inlmnu: users::DEFAULT_INLMNU.into(),
+        },
+    )
+    .await
+    .unwrap();
+    let b64 = |s: &str| as4tainr_core::web::ws::base64(s.as_bytes());
+    let request = |pw: &str| {
+        format!(
+            "GET /db/ HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nAuthorization: Basic {}\r\n\r\n",
+            b64(&format!("{name}:{pw}"))
+        )
+    };
+    // Wrong password: 401.
+    let (mut c, s) = tokio::io::duplex(1 << 16);
+    let u = url.clone();
+    let srv = tokio::spawn(async move { as4tainr_core::mapepire_ws::connection(&u, s).await });
+    c.write_all(request("WRONG").as_bytes()).await.unwrap();
+    let mut head = String::new();
+    let mut b = [0u8; 1];
+    while !head.ends_with("\r\n\r\n") {
+        c.read_exact(&mut b).await.unwrap();
+        head.push(b[0] as char);
+    }
+    assert!(head.starts_with("HTTP/1.1 401"), "{head}");
+    srv.await.unwrap().unwrap();
+    // The right one: 101 with RFC 6455's accept key, then a request.
+    let (mut c, s) = tokio::io::duplex(1 << 16);
+    let u = url.clone();
+    let srv = tokio::spawn(async move { as4tainr_core::mapepire_ws::connection(&u, s).await });
+    c.write_all(request(&name).as_bytes()).await.unwrap();
+    let mut head = String::new();
+    while !head.ends_with("\r\n\r\n") {
+        c.read_exact(&mut b).await.unwrap();
+        head.push(b[0] as char);
+    }
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    assert!(
+        head.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+        "{head}"
+    );
+    // A masked client text frame.
+    let send = |text: &str| {
+        let p = text.as_bytes();
+        let mask = [1u8, 2, 3, 4];
+        let mut f = vec![0x81u8];
+        if p.len() < 126 {
+            f.push(0x80 | p.len() as u8);
+        } else {
+            f.push(0x80 | 126);
+            f.extend_from_slice(&(p.len() as u16).to_be_bytes());
+        }
+        f.extend_from_slice(&mask);
+        f.extend(p.iter().enumerate().map(|(i, x)| x ^ mask[i % 4]));
+        f
+    };
+    let recv = async |c: &mut tokio::io::DuplexStream| -> String {
+        let mut h = [0u8; 2];
+        c.read_exact(&mut h).await.unwrap();
+        let len = match h[1] & 0x7f {
+            126 => {
+                let mut l = [0u8; 2];
+                c.read_exact(&mut l).await.unwrap();
+                u16::from_be_bytes(l) as usize
+            }
+            127 => {
+                let mut l = [0u8; 8];
+                c.read_exact(&mut l).await.unwrap();
+                u64::from_be_bytes(l) as usize
+            }
+            n => n as usize,
+        };
+        let mut p = vec![0u8; len];
+        c.read_exact(&mut p).await.unwrap();
+        String::from_utf8(p).unwrap()
+    };
+    c.write_all(&send(
+        r#"{"id":"q","type":"sql","sql":"SELECT CURRENT USER FROM SYSIBM.SYSDUMMY1"}"#,
+    ))
+    .await
+    .unwrap();
+    let reply = recv(&mut c).await;
+    assert!(reply.contains(r#""id":"q""#), "{reply}");
+    assert!(reply.contains(&format!(r#""00001":"{name}""#)), "{reply}");
+    c.write_all(&send(r#"{"id":"x","type":"exit"}"#))
+        .await
+        .unwrap();
+    let _ = recv(&mut c).await;
+    drop(c);
+    let _ = srv.await;
+    users::delete(&client, &name).await.unwrap();
+}

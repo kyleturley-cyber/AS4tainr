@@ -199,6 +199,10 @@ enum Cmd {
         /// as4tainr's object authorities (docs/ssh.md).
         #[arg(long, env = "AS4TAINR_SSH_LISTEN")]
         ssh_listen: Option<String>,
+        /// Also serve Mapepire over secure WebSockets (its server mode,
+        /// port 8076 on IBM i) on this address, for example 0.0.0.0:8076.
+        #[arg(long, env = "AS4TAINR_MAPEPIRE_LISTEN")]
+        mapepire_listen: Option<String>,
     },
     /// CALL: run a program (CL or RPG) as QSECOFR, outside any job.
     Call { program: String, args: Vec<String> },
@@ -620,6 +624,7 @@ async fn run(cli: Cli) -> Result<u8> {
             system_name,
             web_listen,
             ssh_listen,
+            mapepire_listen,
         } => {
             // Make sure the catalog and QSECOFR exist before anyone signs on.
             let client = runtime::connect_db(&cli.database_url).await?;
@@ -671,6 +676,19 @@ async fn run(cli: Cli) -> Result<u8> {
                     None => std::future::pending().await,
                 }
             };
+            let mp = match mapepire_listen.filter(|s| !s.is_empty()) {
+                Some(s) => Some(tokio::spawn(as4tainr_core::mapepire_ws::run(
+                    cli.database_url.clone(),
+                    s,
+                ))),
+                None => None,
+            };
+            let mp = async move {
+                match mp {
+                    Some(t) => t.await?,
+                    None => std::future::pending().await,
+                }
+            };
             let cfg = tn5250::ServerConfig {
                 env: commands::Environment {
                     database_url: cli.database_url,
@@ -690,6 +708,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 r = qbatch => r??,
                 r = web => r?,
                 r = ssh => r?,
+                r = mp => r?,
                 pd = power => {
                     let pd = pd?;
                     power_down(&db_url, &pd).await?;

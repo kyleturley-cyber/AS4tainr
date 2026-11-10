@@ -1,0 +1,10 @@
+# Golden (batch 13): QSYS.LIB members through Qshell (which converts to
+# text, unlike PASE's cat: verify72 s72_cat) and what writing a member
+# with cp leaves in its records (sequence numbers, dates).
+t73_cleanup|!system -q "DLTF FILE(AS4TRAINR1/GLD73S)"; rm -f /tmp/gld73*; echo cleaned
+t73_make|!system "CRTSRCPF FILE(AS4TRAINR1/GLD73S) RCDLEN(92) MBR(M1)"; system "RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD73S (SRCSEQ, SRCDAT, SRCDTA) VALUES (1.5, 261110, ''line one''), (2.5, 261110, ''line two  '')') COMMIT(*NONE)"
+t73_qcat|!/QOpenSys/usr/bin/qsh -c "cat /QSYS.LIB/AS4TRAINR1.LIB/GLD73S.FILE/M1.MBR" | od -c | head; echo rc=$?
+t73_qgrep|!cd /QSYS.LIB/AS4TRAINR1.LIB/GLD73S.FILE && /QOpenSys/usr/bin/qsh -c "grep -inH two M1.MBR"; echo rc=$?
+t73_cp|!printf 'new one\nnew two\nnew three\n' > /tmp/gld73in.txt; cp /tmp/gld73in.txt /QSYS.LIB/AS4TRAINR1.LIB/GLD73S.FILE/M1.MBR; echo rc=$?; /QOpenSys/usr/bin/qsh -c "db2 \"SELECT SRCSEQ, SRCDAT, SRCDTA FROM AS4TRAINR1.GLD73S\""; echo rc=$?
+t73_qcp|!/QOpenSys/usr/bin/qsh -c "cp /tmp/gld73in.txt /QSYS.LIB/AS4TRAINR1.LIB/GLD73S.FILE/M2.MBR"; echo rc=$?; /QOpenSys/usr/bin/qsh -c "db2 \"SELECT SRCSEQ, SRCDAT, SRCDTA FROM AS4TRAINR1.GLD73S\""; ls -la /QSYS.LIB/AS4TRAINR1.LIB/GLD73S.FILE; echo rc=$?
+t73_end|!system -q "DLTF FILE(AS4TRAINR1/GLD73S)"; rm -f /tmp/gld73*; echo cleaned

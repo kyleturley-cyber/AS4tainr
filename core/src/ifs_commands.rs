@@ -29,11 +29,22 @@ fn savf_path(p: &str) -> Option<(String, String)> {
     let parts: Vec<&str> = up.trim_start_matches('/').split('/').collect();
     match parts.as_slice() {
         ["QSYS.LIB", lib, file] => Some((
-            lib.strip_suffix(".LIB")?.to_string(),
-            file.strip_suffix(".FILE")?.to_string(),
+            unquote(lib.strip_suffix(".LIB")?),
+            unquote(file.strip_suffix(".FILE")?),
         )),
         _ => None,
     }
+}
+
+/// A name in a QSYS.LIB path may be in quotes (a name with characters
+/// that need them, such as `"#O_9DIC".FILE`: IBM i documentation, "Path
+/// names in the QSYS.LIB file system"; Code for IBM i quotes names that
+/// start with # in CPYFRMSTMF TOMBR): the name without them.
+fn unquote(s: &str) -> String {
+    s.strip_prefix('"')
+        .and_then(|x| x.strip_suffix('"'))
+        .unwrap_or(s)
+        .to_string()
 }
 
 fn member_path(p: &str) -> Result<(String, String, String)> {
@@ -41,7 +52,7 @@ fn member_path(p: &str) -> Result<(String, String, String)> {
     let parts: Vec<&str> = up.trim_start_matches('/').split('/').collect();
     match parts.as_slice() {
         ["QSYS.LIB", lib, file, mbr] => {
-            let strip = |s: &str, ext: &str| s.strip_suffix(ext).map(|x| x.to_string());
+            let strip = |s: &str, ext: &str| s.strip_suffix(ext).map(unquote);
             match (strip(lib, ".LIB"), strip(file, ".FILE"), strip(mbr, ".MBR")) {
                 (Some(l), Some(f), Some(m)) => Ok((l, f, m)),
                 _ => bail!(
@@ -1162,6 +1173,19 @@ pub fn dspaut_report(e: &ifs::Entry, stamp: &crate::report::Stamp) -> Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quoted_names_in_member_paths() {
+        // IBM i documentation, QSYS.LIB path names: a quoted name.
+        assert_eq!(
+            member_path("/QSYS.LIB/ILEDITOR.LIB/\"#O_9DIC\".FILE/\"#O_MPCF\".MBR").unwrap(),
+            ("ILEDITOR".into(), "#O_9DIC".into(), "#O_MPCF".into())
+        );
+        assert_eq!(
+            member_path("/QSYS.LIB/A.LIB/B.FILE/C.MBR").unwrap(),
+            ("A".into(), "B".into(), "C".into())
+        );
+    }
 
     // DSPAUT OUTPUT(*PRINT): PUB400 (IBM i 7.5), verify43 l43_dspaut (a
     // stream file with mode 0644 owned by AS4TRAINR; header lines left

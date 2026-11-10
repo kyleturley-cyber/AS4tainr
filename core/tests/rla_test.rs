@@ -27488,3 +27488,66 @@ async fn mapepire_server_over_websockets() {
     let _ = srv.await;
     users::delete(&client, &name).await.unwrap();
 }
+
+#[tokio::test]
+async fn attr_of_qsys_lib_objects() {
+    // PASE attr of QSYS.LIB paths (PUB400 2026-11-10, verify72 s72_attr:
+    // a member OBJTYPE=*MBR, a source file OBJTYPE=*FILE DATA_SIZE=16384);
+    // a quoted name ("#M2".MBR, as Code for IBM i writes names with #);
+    // and QSYS2's own catalog views in SYSTABLES (Code for IBM i's
+    // encoding.test.ts finds QSYS2.SYSCOLUMNS there).
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    as4tainr_core::source::create_file(&client, &lib, "QSRCA", "")
+        .await
+        .unwrap();
+    for (m, src) in [("M1", "line one\nline two"), ("#M2", "")] {
+        as4tainr_core::source::put_member(
+            &client,
+            &as4tainr_core::source::Member {
+                library: lib.clone(),
+                file: "QSRCA".into(),
+                name: m.into(),
+                srctype: "TXT".into(),
+                text: String::new(),
+                source: src.into(),
+                stmf: String::new(),
+                ccsid: 37,
+                changed_us: None,
+            },
+            true,
+        )
+        .await
+        .unwrap();
+    }
+    let attr = |path: String| {
+        let client = &client;
+        async move {
+            as4tainr_core::pase_attr::attr(
+                client,
+                &["-p".to_string(), path, "OBJTYPE".into(), "CCSID".into()],
+            )
+            .await
+        }
+    };
+    let o = attr(format!("/QSYS.LIB/{lib}.LIB/QSRCA.FILE/M1.MBR")).await;
+    assert_eq!(o.stdout, ["OBJTYPE=*MBR", "CCSID=37"], "{:?}", o.stderr);
+    let o = attr(format!("/qsys.lib/{lib}.lib/QSRCA.FILE/\"#M2\".MBR")).await;
+    assert_eq!(o.stdout, ["OBJTYPE=*MBR", "CCSID=37"], "{:?}", o.stderr);
+    let o = attr(format!("/QSYS.LIB/{lib}.LIB/QSRCA.FILE")).await;
+    assert_eq!(o.stdout, ["OBJTYPE=*FILE", "CCSID=37"], "{:?}", o.stderr);
+    let o = attr(format!("/QSYS.LIB/{lib}.LIB/NOPE.FILE/X.MBR")).await;
+    assert_eq!(o.status, 1);
+    let out = as4tainr_core::sql::run(
+        &client,
+        &url,
+        std::slice::from_ref(&lib),
+        "SELECT TABLE_OWNER, TABLE_TYPE FROM QSYS2.SYSTABLES WHERE TABLE_SCHEMA = 'QSYS2' AND TABLE_NAME = 'SYSCOLUMNS'",
+    )
+    .await
+    .unwrap();
+    match out {
+        as4tainr_core::sql::Outcome::Rows { rows, .. } => assert_eq!(rows, [["QSYS", "V"]]),
+        other => panic!("{other:?}"),
+    }
+}

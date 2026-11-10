@@ -346,6 +346,17 @@ impl Mirror {
         // first; where it cannot be (as4tainr not running as root: the
         // namespace's root cannot write in the container's /), the
         // command does not see that IFS directory (docs/qshell.md).
+        // PASE's iconv at /usr/bin/iconv (Code for IBM i runs it there with
+        // PASE's code set names, IBM-273): as4tainr's wrapper (sshd.rs
+        // ICONV), the container's iconv still reachable at iconv-real.
+        if Path::new("/QOpenSys/usr/bin/iconv").exists()
+            && Path::new("/QOpenSys/usr/lib/iconv-real").exists()
+            && Path::new("/usr/bin/iconv").exists()
+        {
+            script.push_str(&format!(
+                "{mount} --bind /usr/bin/iconv /QOpenSys/usr/lib/iconv-real 2>/dev/null && {mount} --bind /QOpenSys/usr/bin/iconv /usr/bin/iconv 2>/dev/null\n"
+            ));
+        }
         // /QSYS.LIB first: its tree is beside the mirror, which an IFS
         // directory (/tmp) may cover once mounted.
         if let Some(q) = &self.qsys {

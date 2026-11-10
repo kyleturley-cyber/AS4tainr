@@ -165,7 +165,6 @@ fn pase_files() -> Vec<(String, PaseFile)> {
         "getconf",
         "grep",
         "head",
-        "iconv",
         "id",
         "ln",
         "ls",
@@ -212,6 +211,18 @@ fn pase_files() -> Vec<(String, PaseFile)> {
             v.push((format!("/QOpenSys/pkgs/bin/{t}"), PaseFile::Link(p)));
         }
     }
+    // iconv: PASE's names its code sets IBM-NNN (IBM-273, IBM-1208, as
+    // Code for IBM i passes them: IBMiContent.ts convertFromUTF8); the
+    // container's iconv knows them as IBM273, IBM037, UTF-8.
+    v.push((
+        "/QOpenSys/usr/bin/iconv".into(),
+        PaseFile::Script(ICONV.to_string()),
+    ));
+    // Where the container's iconv is bound in a command's namespace.
+    v.push((
+        "/QOpenSys/usr/lib/iconv-real".into(),
+        PaseFile::IfAbsent(String::new()),
+    ));
     // Java: the Mapepire server it is asked to run is as4tainr's.
     for jdk in ["jdk80", "jdk11", "jdk17", "jdk21"] {
         v.push((
@@ -285,6 +296,33 @@ if [ $# -gt 0 ]; then
   exit $?
 fi
 eval "$(cat)"
+"#;
+
+const ICONV: &str = r#"#!/bin/sh
+# PASE's iconv code set names (IBM-NNN) as the container's iconv has them.
+name() {
+  case "$1" in
+    IBM-1208|ibm-1208|UTF8|utf8) echo UTF-8;;
+    IBM-819|ibm-819|ISO8859-1|iso8859-1) echo ISO-8859-1;;
+    IBM-1200|ibm-1200|UCS-2|ucs-2) echo UTF-16BE;;
+    IBM-*|ibm-*) n=${1#*-}
+      case "$n" in ??) n=0$n;; ?) n=00$n;; esac
+      echo IBM$n;;
+    *) echo "$1";;
+  esac
+}
+first=1; conv=""
+for a; do
+  if [ -n "$first" ]; then set --; first=""; fi
+  if [ -n "$conv" ]; then set -- "$@" "$(name "$a")"; conv=""; continue; fi
+  case "$a" in -f|-t) conv=1;; esac
+  set -- "$@" "$a"
+done
+# In a command's namespace /usr/bin/iconv is this script (qshfs.rs) and
+# the container's iconv is bound at iconv-real.
+real=/QOpenSys/usr/lib/iconv-real
+[ -s "$real" ] || real=/usr/bin/iconv
+exec "$real" "$@"
 "#;
 
 const UNAME: &str = r#"#!/bin/sh

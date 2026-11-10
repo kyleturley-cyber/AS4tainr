@@ -127,6 +127,12 @@ pub async fn attr(client: &Client, args: &[String]) -> Output {
         return out;
     };
     let path = absolute(path);
+    // A QSYS.LIB object: its attributes from the catalog (a command
+    // through Qshell's standard input has no /QSYS.LIB tree: Code for IBM
+    // i's getAttributes of a member).
+    if path.to_ascii_uppercase().starts_with("/QSYS.LIB") {
+        return qsys_attr(client, &path, names, pairs).await;
+    }
     let meta = match std::fs::symlink_metadata(&path) {
         Ok(m) => m,
         Err(_) => {
@@ -238,4 +244,132 @@ pub async fn apply_notes(client: &Client, notes: &std::path::Path) {
         }
     }
     let _ = std::fs::remove_file(notes);
+}
+
+/// `attr` of a QSYS.LIB path: OBJTYPE (*LIB, *FILE, *MBR, the object's
+/// type), DATA_SIZE and CCSID (PUB400 2026-11-10, verify72 s72_attr: a
+/// member OBJTYPE=*MBR, a source file OBJTYPE=*FILE DATA_SIZE=16384, the
+/// CCSID the file's data has; as4tainr's source files are CCSID 37).
+async fn qsys_attr(client: &Client, path: &str, names: &[&String], pairs: bool) -> Output {
+    let mut out = Output::default();
+    let parts: Vec<String> = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let p = p.to_ascii_uppercase();
+            let (n, ext) = p
+                .rsplit_once('.')
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .unwrap_or((p.clone(), String::new()));
+            (n.trim_matches('"').to_string(), ext)
+        })
+        .map(|(n, e)| if e.is_empty() { n } else { format!("{n}.{e}") })
+        .collect();
+    let split = |p: &str| -> (String, String) {
+        p.rsplit_once('.')
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .unwrap_or((p.to_string(), String::new()))
+    };
+    let missing = |out: &mut Output| {
+        out.stderr
+            .push(format!("attr: {path}: No such path or directory."));
+        out.status = 1;
+    };
+    let found: Option<(String, String, String)> = match parts.as_slice() {
+        [q] if q == "QSYS.LIB" => Some(("*LIB".into(), "8192".into(), "37".into())),
+        [_, lib] => {
+            let (l, e) = split(lib);
+            let lib = crate::qtemp::real(&l);
+            let n = client
+                .query_opt(
+                    "SELECT 1 FROM as4tainr.objects WHERE library = 'QSYS' AND objtype = '*LIB' AND name = $1",
+                    &[&lib],
+                )
+                .await
+                .ok()
+                .flatten();
+            (e == "LIB" && n.is_some()).then(|| ("*LIB".into(), "8192".into(), "37".into()))
+        }
+        [_, lib, obj] => {
+            let (l, _) = split(lib);
+            let (o, t) = split(obj);
+            let ty = format!("*{t}");
+            let lib = crate::qtemp::real(&l);
+            client
+                .query_opt(
+                    "SELECT 1 FROM as4tainr.objects WHERE library = $1 AND name = $2 AND objtype = $3",
+                    &[&lib, &o, &ty],
+                )
+                .await
+                .ok()
+                .flatten()
+                .map(|_| {
+                    let size = if t == "FILE" { "16384" } else { "8192" };
+                    (ty.clone(), size.to_string(), "37".to_string())
+                })
+        }
+        [_, lib, file, mbr] => {
+            let (l, _) = split(lib);
+            let (f, _) = split(file);
+            let (m, e) = split(mbr);
+            let lib = crate::qtemp::real(&l);
+            let r = client
+                .query_opt(
+                    "SELECT m.source, coalesce(sf.rcdlen, 92) FROM as4tainr.source_members m
+                       LEFT JOIN as4tainr.source_files sf ON sf.library = m.library AND sf.name = m.file
+                      WHERE m.library = $1 AND m.file = $2 AND m.member = $3",
+                    &[&lib, &f, &m],
+                )
+                .await
+                .ok()
+                .flatten();
+            match (e.as_str(), r) {
+                ("MBR", Some(r)) => {
+                    let source: String = r.get(0);
+                    let rcdlen: i32 = r.get(1);
+                    let n = source.lines().count() as i64;
+                    let size = n * (rcdlen as i64 - 12).max(0);
+                    Some(("*MBR".into(), size.to_string(), "37".into()))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let Some((objtype, size, ccsid)) = found else {
+        missing(&mut out);
+        return out;
+    };
+    let mut wanted: Vec<String> = if names.is_empty() {
+        vec!["OBJTYPE".into(), "DATA_SIZE".into(), "CCSID".into()]
+    } else {
+        names
+            .iter()
+            .map(|s| s.trim().to_ascii_uppercase())
+            .collect()
+    };
+    let rank = |n: &str| match n {
+        "OBJTYPE" => 0,
+        "DATA_SIZE" => 1,
+        "CCSID" => 2,
+        _ => 3,
+    };
+    wanted.sort_by_key(|n| rank(n));
+    for name in wanted {
+        let v = match name.as_str() {
+            "OBJTYPE" => objtype.clone(),
+            "DATA_SIZE" => size.clone(),
+            "CCSID" => ccsid.clone(),
+            _ => {
+                out.stderr
+                    .push(format!("attr: {name}: not a valid attribute."));
+                out.status = 1;
+                continue;
+            }
+        };
+        out.stdout
+            .push(if pairs { format!("{name}={v}") } else { v });
+    }
+    out
 }

@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 59";
+const VERSION: &str = "as4tainr services 60";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -159,7 +159,45 @@ SELECT CAST(coalesce(f.sql_name, o.name) AS varchar(128)) COLLATE "C" AS table_n
 FROM as4tainr.objects o
 LEFT JOIN as4tainr.files f ON f.library = o.library AND f.name = o.name
 WHERE o.objtype = '*FILE' AND o.attribute IN ('PF', 'LF', 'PF-SRC')
-  AND coalesce(f.sql_type, '') <> 'INDEX';
+  AND coalesce(f.sql_type, '') <> 'INDEX'
+UNION ALL
+-- The catalog views and services of QSYS2 and SYSTOOLS themselves (IBM i's
+-- SYSTABLES lists them: Code for IBM i's encoding.test.ts looks up
+-- QSYS2.SYSCOLUMNS there).
+SELECT
+       CAST(upper(v.viewname) AS varchar(128)) COLLATE "C" AS table_name,
+       CAST('QSYS' AS varchar(128)) COLLATE "C" AS table_owner,
+       CAST('V' AS char(1)) COLLATE "C" AS table_type,
+       CAST(NULL AS integer) AS column_count,
+       CAST(NULL AS integer) AS row_length,
+       CAST(NULL AS varchar(50)) COLLATE "C" AS table_text,
+       CAST(NULL AS varchar(2000)) COLLATE "C" AS long_comment,
+       CAST(upper(v.schemaname) AS varchar(128)) COLLATE "C" AS table_schema,
+       CAST(NULL AS timestamp) AS last_altered_timestamp,
+       CAST(upper(left(v.viewname, 10)) AS char(10)) COLLATE "C" AS system_table_name,
+       CAST(upper(v.schemaname) AS char(10)) COLLATE "C" AS system_table_schema,
+       CAST('D' AS char(1)) COLLATE "C" AS file_type,
+       CAST(NULL AS varchar(18)) COLLATE "C" AS base_table_catalog,
+       CAST(NULL AS varchar(128)) COLLATE "C" AS base_table_schema,
+       CAST(NULL AS varchar(128)) COLLATE "C" AS base_table_name,
+       CAST(NULL AS varchar(10)) COLLATE "C" AS base_table_member,
+       CAST('Y' AS char(1)) COLLATE "C" AS system_table,
+       CAST('N' AS char(1)) COLLATE "C" AS select_omit,
+       CAST('NO' AS varchar(3)) COLLATE "C" AS is_insertable_into,
+       CAST(0 AS smallint) AS iasp_number,
+       CAST(NULL AS varchar(3)) COLLATE "C" AS enabled,
+       CAST(NULL AS varchar(6)) COLLATE "C" AS maintenance,
+       CAST(NULL AS varchar(9)) COLLATE "C" AS refresh,
+       CAST(NULL AS timestamp) AS refresh_time,
+       CAST(NULL AS text) AS mqt_definition,
+       CAST(NULL AS char(2)) COLLATE "C" AS isolation,
+       CAST('NO' AS varchar(11)) COLLATE "C" AS partition_table,
+       CAST('QSYS' AS varchar(128)) COLLATE "C" AS table_definer,
+       CAST(NULL AS char(1)) COLLATE "C" AS mqt_restore_deferred,
+       CAST(NULL AS char(1)) COLLATE "C" AS rounding_mode,
+       CAST(' ' AS char(1)) COLLATE "C" AS control
+FROM pg_catalog.pg_views v
+WHERE v.schemaname IN ('qsys2', 'systools');
 
 -- SYSCOLUMNS: the columns of tables, physical and logical files and views.
 CREATE OR REPLACE VIEW qsys2.syscolumns AS

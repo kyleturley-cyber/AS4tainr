@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS as4tainr.source_files (
     rcdlen   int NOT NULL,
     PRIMARY KEY (library, name)
 );
+-- CRTSRCPF CCSID (37: the job's, as as4tainr's jobs are).
+ALTER TABLE as4tainr.source_files ADD COLUMN IF NOT EXISTS ccsid int NOT NULL DEFAULT 37;
 CREATE TABLE IF NOT EXISTS as4tainr.source_members (
     library  text NOT NULL,
     file     text NOT NULL,
@@ -145,6 +147,35 @@ pub async fn set_record_length(
                 &library.to_ascii_uppercase(),
                 &name.to_ascii_uppercase(),
                 &rcdlen,
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
+/// A source file's CCSID (CRTSRCPF CCSID; 37 when not kept).
+pub async fn file_ccsid(client: &Client, library: &str, name: &str) -> i32 {
+    client
+        .query_opt(
+            "SELECT ccsid FROM as4tainr.source_files WHERE library=$1 AND name=$2",
+            &[&library.to_ascii_uppercase(), &name.to_ascii_uppercase()],
+        )
+        .await
+        .ok()
+        .flatten()
+        .map(|r| r.get(0))
+        .unwrap_or(37)
+}
+
+/// Keep a source file's CCSID.
+pub async fn set_file_ccsid(client: &Client, library: &str, name: &str, ccsid: i32) -> Result<()> {
+    client
+        .execute(
+            "UPDATE as4tainr.source_files SET ccsid = $3 WHERE library=$1 AND name=$2",
+            &[
+                &library.to_ascii_uppercase(),
+                &name.to_ascii_uppercase(),
+                &ccsid,
             ],
         )
         .await?;

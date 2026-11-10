@@ -306,7 +306,7 @@ async fn qsys_attr(client: &Client, path: &str, names: &[&String], pairs: bool) 
                 .flatten()
                 .map(|_| {
                     let size = if t == "FILE" { "16384" } else { "8192" };
-                    (ty.clone(), size.to_string(), "37".to_string())
+                    (ty.clone(), size.to_string(), String::new())
                 })
         }
         [_, lib, file, mbr] => {
@@ -337,10 +337,23 @@ async fn qsys_attr(client: &Client, path: &str, names: &[&String], pairs: bool) 
         }
         _ => None,
     };
-    let Some((objtype, size, ccsid)) = found else {
+    let Some((objtype, size, mut ccsid)) = found else {
         missing(&mut out);
         return out;
     };
+    // A file's and its members' CCSID: CRTSRCPF's (37 by default).
+    if ccsid.is_empty() || objtype == "*MBR" {
+        ccsid = match parts.as_slice() {
+            [_, lib, file, ..] => {
+                let l = lib.rsplit_once('.').map(|(a, _)| a).unwrap_or(lib);
+                let f = file.rsplit_once('.').map(|(a, _)| a).unwrap_or(file);
+                crate::source::file_ccsid(client, &crate::qtemp::real(l), f)
+                    .await
+                    .to_string()
+            }
+            _ => "37".into(),
+        };
+    }
     let mut wanted: Vec<String> = if names.is_empty() {
         vec!["OBJTYPE".into(), "DATA_SIZE".into(), "CCSID".into()]
     } else {

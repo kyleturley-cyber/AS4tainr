@@ -3080,6 +3080,20 @@ impl Job<'_> {
         crate::source::create_file(self.client, &lib, &name, cmd.get("TEXT")).await?;
         let name = name.to_ascii_uppercase();
         crate::source::set_record_length(self.client, &lib, &name, rcdlen as i32).await?;
+        // CCSID (CL reference, CRTSRCPF): *JOB is the job's (37), *HEX
+        // 65535, else the number given.
+        let ccsid = match cmd.get("CCSID").trim().to_ascii_uppercase().as_str() {
+            "" | "*JOB" => 37,
+            "*HEX" => 65535,
+            v => v
+                .parse::<i32>()
+                .ok()
+                .filter(|c| (1..=65535).contains(c))
+                .ok_or_else(|| {
+                    anyhow!("CPD0084: {v} is not a valid CCSID.\n{}", crate::cl::CPF0006)
+                })?,
+        };
+        crate::source::set_file_ccsid(self.client, &lib, &name, ccsid).await?;
         authority::set_owner(self.client, &lib, &name, "*FILE", &self.user).await?;
         // MBR: a member added with the file (*FILE: named like it).
         let mbr = match cmd.get("MBR") {

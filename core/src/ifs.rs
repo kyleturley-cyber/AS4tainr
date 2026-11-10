@@ -589,12 +589,53 @@ fn like_escape(s: &str) -> String {
 
 /// Text conversion between CCSIDs: 37 (EBCDIC), 1208 (UTF-8), 819, 367
 /// and 1252 (ASCII and Latin-1; 1252's extra characters at 0x80-0x9F are
-/// taken as Latin-1's), 1200 and 13488 (UTF-16).
+/// taken as Latin-1's), 1200 and 13488 (UTF-16), and the single-byte EBCDIC
+/// CCSIDs of codepages.rs (273, 277, 278, 280, 284, 285, 297, 500, 871,
+/// 420, 424, 870, 875, 1025, 1026, 1047, 1140-1149; 8612 and 62211 as 420
+/// and 424).
 pub mod codec {
     use crate::tn5250::ebcdic;
 
     pub fn supported(ccsid: i32) -> bool {
-        matches!(ccsid, 37 | 1208 | 819 | 367 | 1252 | 1200 | 13488)
+        matches!(ccsid, 37 | 1208 | 819 | 367 | 1252 | 1200 | 13488) || table(ccsid).is_some()
+    }
+
+    /// The code page of a single-byte EBCDIC CCSID other than 37
+    /// (codepages.rs): 8612 and 62211 are the Arabic and Hebrew code
+    /// pages 420 and 424 with another BiDi string type (IBM i
+    /// globalization, CCSID values), the same bytes.
+    fn table(ccsid: i32) -> Option<&'static [u16; 256]> {
+        let cp = match ccsid {
+            8612 => 420,
+            62211 => 424,
+            c => c,
+        };
+        crate::codepages::TABLES
+            .iter()
+            .find(|(c, _)| *c == cp)
+            .map(|(_, t)| t)
+    }
+
+    /// The byte of a character in a code page (the substitute 0x3F when
+    /// it has none).
+    fn table_byte(ccsid: i32, c: char) -> u8 {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static REV: OnceLock<Mutex<HashMap<i32, HashMap<u32, u8>>>> = OnceLock::new();
+        let m = REV.get_or_init(Default::default);
+        let mut m = m.lock().unwrap_or_else(|e| e.into_inner());
+        let rev = m.entry(ccsid).or_insert_with(|| {
+            let mut r = HashMap::new();
+            if let Some(t) = table(ccsid) {
+                for (b, &u) in t.iter().enumerate().rev() {
+                    if u != 0xFFFD {
+                        r.insert(u as u32, b as u8);
+                    }
+                }
+            }
+            r
+        });
+        rev.get(&(c as u32)).copied().unwrap_or(0x3F)
     }
 
     /// The next character at the start of `b` and its length in bytes
@@ -606,6 +647,10 @@ pub mod codec {
                     char::from_u32(ebcdic::TO_UNICODE[x as usize] as u32).unwrap_or('?'),
                     1,
                 )
+            }),
+            c if table(c).is_some() => b.first().map(|&x| {
+                let u = table(c).map(|t| t[x as usize]).unwrap_or(0xFFFD);
+                (char::from_u32(u as u32).unwrap_or('\u{FFFD}'), 1)
             }),
             1208 => {
                 let n = match b.first()? {
@@ -645,6 +690,7 @@ pub mod codec {
     pub fn encode_char(ccsid: i32, c: char, out: &mut Vec<u8>) {
         match ccsid {
             37 => out.extend(ebcdic::encode(&c.to_string())),
+            t if table(t).is_some() => out.push(table_byte(t, c)),
             1208 => {
                 let mut buf = [0u8; 4];
                 out.extend(c.encode_utf8(&mut buf).as_bytes());
@@ -709,5 +755,13 @@ mod tests {
         assert_eq!(codec::convert(1208, 37, "Aé".as_bytes()), [0xC1, 0x51]);
         assert_eq!(codec::convert(1208, 1200, b"A"), [0x00, 0x41]);
         assert_eq!(codec::decode_char(1208, &[0xC3]), None);
+        // CCSID 273 (German): 0x4A is Ä, 0xC0 ä (IBM code page 273);
+        // 37's [ (0xBA) is not in 273's place.
+        assert_eq!(codec::convert(273, 1208, &[0x4A, 0xC0]), "Ää".as_bytes());
+        assert_eq!(codec::convert(1208, 273, "Ää".as_bytes()), [0x4A, 0xC0]);
+        // 62211 is code page 424 (Hebrew): 0x41 is alef.
+        assert_eq!(codec::convert(62211, 1208, &[0x41]), "\u{05D0}".as_bytes());
+        // A character the code page lacks: the substitute 0x3F.
+        assert_eq!(codec::convert(1208, 273, "\u{05D0}".as_bytes()), [0x3F]);
     }
 }

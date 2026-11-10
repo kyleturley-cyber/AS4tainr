@@ -27551,3 +27551,95 @@ async fn attr_of_qsys_lib_objects() {
         other => panic!("{other:?}"),
     }
 }
+
+#[tokio::test]
+async fn source_file_ccsid_and_text_copies() {
+    // CRTSRCPF CCSID (CL reference): a member holds what its CCSID can;
+    // CPYTOSTMF's default STMFCCSID is the file's. CPY TOCCSID with
+    // DTAFMT(*TEXT) converts a stream file's data (CL reference, CPY);
+    // CHGATR ATR(*CCSID) tags it without converting. CCSID 424 is code
+    // page 424, Hebrew (alef 0x41); 273 has no Hebrew (its substitute
+    // is 0x3F).
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let dir = format!("/tmp/{lib}c");
+    as4tainr_core::ifs::mkdir_all(&client, &dir, "QSECOFR")
+        .await
+        .unwrap();
+    let hebrew = "\u{05D0}b\n";
+    as4tainr_core::ifs::write_file(
+        &client,
+        &format!("{dir}/in.txt"),
+        hebrew.as_bytes(),
+        1208,
+        0o644,
+        "QSECOFR",
+    )
+    .await
+    .unwrap();
+    for (f, ccsid) in [("QHEB", 424), ("QGER", 273)] {
+        cl_cmd(
+            &mut job,
+            format!("CRTSRCPF FILE({lib}/{f}) RCDLEN(92) MBR(M) CCSID({ccsid})"),
+        )
+        .await
+        .unwrap();
+        cl_cmd(
+            &mut job,
+            format!("CPYFRMSTMF FROMSTMF('{dir}/in.txt') TOMBR('/QSYS.LIB/{lib}.LIB/{f}.FILE/M.MBR') MBROPT(*REPLACE) STMFCCSID(1208)"),
+        )
+        .await
+        .unwrap();
+        cl_cmd(
+            &mut job,
+            format!("CPYTOSTMF FROMMBR('/QSYS.LIB/{lib}.LIB/{f}.FILE/M.MBR') TOSTMF('{dir}/{f}.txt') STMFOPT(*REPLACE)"),
+        )
+        .await
+        .unwrap();
+    }
+    let read = |p: String| {
+        let client = &client;
+        async move { as4tainr_core::ifs::read_file(client, &p).await.unwrap() }
+    };
+    // In 424 the alef stays, written in 424 (0x41; b is 0x82).
+    let (b, c) = read(format!("{dir}/QHEB.txt")).await;
+    assert_eq!(c, 424);
+    assert_eq!(&b[..2], [0x41, 0x82]);
+    // In 273 it is gone: the substitute.
+    let (b, c) = read(format!("{dir}/QGER.txt")).await;
+    assert_eq!(c, 273);
+    assert_eq!(&b[..2], [0x3F, 0x82]);
+    // CPY TOCCSID(1208) DTAFMT(*TEXT) in place: UTF-8.
+    cl_cmd(
+        &mut job,
+        format!("CPY OBJ('{dir}/QHEB.txt') TOOBJ('{dir}/QHEB.txt') TOCCSID(1208) DTAFMT(*TEXT) REPLACE(*YES)"),
+    )
+    .await
+    .unwrap();
+    let (b, c) = read(format!("{dir}/QHEB.txt")).await;
+    assert_eq!(c, 1208);
+    assert!(b.starts_with("\u{05D0}b".as_bytes()), "{b:?}");
+    // CHGATR ATR(*CCSID): the tag only.
+    cl_cmd(
+        &mut job,
+        format!("CHGATR OBJ('{dir}/QGER.txt') ATR(*CCSID) VALUE(819)"),
+    )
+    .await
+    .unwrap();
+    let (b, c) = read(format!("{dir}/QGER.txt")).await;
+    assert_eq!((c, &b[..2]), (819, &[0x3Fu8, 0x82][..]));
+}

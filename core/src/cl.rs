@@ -90,6 +90,20 @@ const CPY_PARAMS: &[ParamDef] = &[
     p("REPLACE", Kind::Name, false, Some("*NO"), "Replace object")
         .ch("*NO, *YES")
         .keyword_only(),
+    // CL reference, CPY: the copy's CCSID (*OBJ: the object's) and, with
+    // DTAFMT(*TEXT), its data converted to it.
+    p("FROMCCSID", Kind::Text, false, Some("*OBJ"), "From CCSID")
+        .ch("*OBJ, *PCASCII, *JOBCCSID, 1-65533")
+        .keyword_only(),
+    p("TOCCSID", Kind::Text, false, Some("*OBJ"), "To CCSID")
+        .ch("*OBJ, *CALC, *STDASCII, *PCASCII, *JOBCCSID, 1-65533")
+        .keyword_only(),
+    p("DTAFMT", Kind::Name, false, Some("*BINARY"), "Data format")
+        .ch("*BINARY, *TEXT")
+        .keyword_only(),
+    p("OWNER", Kind::Name, false, Some("*NEW"), "Owner")
+        .ch("*NEW, *KEEP")
+        .keyword_only(),
 ];
 
 const MOV_PARAMS: &[ParamDef] = &[
@@ -4024,6 +4038,24 @@ pub static COMMANDS: &[CommandDef] = &[
         description: "Move Object",
         params: MOV_PARAMS,
     },
+    // CL reference, CHGATR: one attribute of an object (OBJ), changed to
+    // VALUE; SUBTREE for a directory's objects.
+    CommandDef {
+        name: "CHGATR",
+        description: "Change Attribute",
+        params: &[
+            p("OBJ", Kind::Text, true, None, "Object").ch("Path name"),
+            p("ATR", Kind::Name, true, None, "Attribute name")
+                .ch("*CCSID, *READONLY, *HIDDEN, *ALWSAV, *DISKSTGOPT, *SETUID, *SETGID, ..."),
+            p("VALUE", Kind::Text, true, None, "New value"),
+            p("SUBTREE", Kind::Name, false, Some("*NONE"), "Subtree")
+                .ch("*NONE, *ALL, *DIR")
+                .keyword_only(),
+            p("SYMLNK", Kind::Name, false, Some("*NO"), "Symbolic link")
+                .ch("*NO, *YES")
+                .keyword_only(),
+        ],
+    },
     CommandDef {
         name: "RNM",
         description: "Rename Object",
@@ -5322,6 +5354,7 @@ pub static GROUPS: &[Group] = &[
             "DSPATR",
             "DSPAUT",
             "CHGAUT",
+            "CHGATR",
             "CHGOWN",
             "WRKLNK",
             "DSPLNK",

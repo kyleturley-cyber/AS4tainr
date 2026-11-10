@@ -26,6 +26,7 @@ pub mod cmd;
 pub mod cmdlist;
 pub mod cmppfm;
 pub mod cmtctl;
+pub mod codepages;
 pub mod collate;
 pub mod commands;
 pub mod cpyf;

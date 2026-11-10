@@ -190,11 +190,53 @@ impl Job<'_> {
                 let (bytes, ccsid) = ifs::read_file(self.client, &from)
                     .await
                     .map_err(|e| cl_error(e, obj))?;
-                ifs::write_file(self.client, &to, &bytes, ccsid, e.mode, &self.user)
+                // FROMCCSID and TOCCSID (CL reference, CPY): the copy is
+                // tagged TOCCSID; with DTAFMT(*TEXT) its data is converted
+                // from the object's CCSID to it (Code for IBM i converts a
+                // member copied to a stream file in place to 1208:
+                // IBMiContent.ts downloadMemberContent).
+                let from_ccsid = match cmd.get("FROMCCSID").trim().to_ascii_uppercase().as_str() {
+                    "" | "*OBJ" => ccsid,
+                    v => ccsid_param(v, ccsid)?,
+                };
+                let to_ccsid = match cmd.get("TOCCSID").trim().to_ascii_uppercase().as_str() {
+                    "" | "*OBJ" | "*CALC" => from_ccsid,
+                    v => ccsid_param(v, from_ccsid)?,
+                };
+                let text = cmd.get("DTAFMT").eq_ignore_ascii_case("*TEXT");
+                let bytes = if text && from_ccsid != to_ccsid {
+                    codec::convert(from_ccsid, to_ccsid, &bytes)
+                } else {
+                    bytes
+                };
+                ifs::write_file(self.client, &to, &bytes, to_ccsid, e.mode, &self.user)
                     .await
                     .map_err(|e| cl_error(e, &to))?;
-                ifs::set_ccsid(self.client, &to, ccsid).await?;
+                ifs::set_ccsid(self.client, &to, to_ccsid).await?;
                 msg(format!("CPCA087: Object {from} copied to {to}."))
+            }
+            // CHGATR (CL reference): ATR(*CCSID) tags a stream file with
+            // the CCSID (its data unchanged); the other attributes as4tainr
+            // does not keep are taken and do nothing.
+            "CHGATR" => {
+                let obj = cmd.get("OBJ");
+                let path = ifs::normalize(obj)?;
+                if ifs::stat(self.client, &path)
+                    .await
+                    .map_err(|e| cl_error(e, obj))?
+                    .is_none()
+                {
+                    return Err(cl_error(ifs::Errno(errno::ENOENT).into(), obj));
+                }
+                if cmd.get("ATR").eq_ignore_ascii_case("*CCSID") {
+                    let v = cmd.get("VALUE").trim();
+                    let c = ccsid_param(v, 0)?;
+                    if c == 0 {
+                        bail!("CPFA0AB: CCSID {v} is not valid here.");
+                    }
+                    ifs::set_ccsid(self.client, &path, c).await?;
+                }
+                msg(format!("Attribute of {obj} changed."))
             }
             "RNM" => {
                 let obj = cmd.get("OBJ");
@@ -431,10 +473,11 @@ impl Job<'_> {
                     bail!("CPFA097: Member {mbr} not copied: stream file {to} exists (STMFOPT(*NONE)).");
                 }
                 // STMFCCSID(*STMF): an existing file's CCSID, else the
-                // database file's (37).
+                // database file's (CRTSRCPF CCSID, 37 by default).
+                let dbf = crate::source::file_ccsid(self.client, &m.library, &m.file).await;
                 let file_ccsid = match &existing {
                     Some(e) => ccsid_param(stmf_ccsid(cmd), e.ccsid)?,
-                    None => ccsid_param(stmf_ccsid(cmd), 37)?,
+                    None => ccsid_param(stmf_ccsid(cmd), dbf)?,
                 };
                 let fixed = cmd.get("ENDLINFMT").eq_ignore_ascii_case("*FIXED");
                 // Trailing blanks go, except with *FIXED (no line ends).
@@ -536,6 +579,14 @@ impl Job<'_> {
                 if old.is_some() && !(opt == "*REPLACE" || opt == "*ADD") {
                     // CPDA089, then CPFA095 (observed on IBM i 7.5).
                     bail!("CPDA089: Member {mbr} is already in file {lib}/{file}; MBROPT(*NONE) does not replace it.\nCPFA095: Stream file {from} was not copied.");
+                }
+                // The records hold what the file's CCSID can: a character
+                // it has not is its substitute (CRTSRCPF CCSID; Code for
+                // IBM i's encoding tests: Arabic into a CCSID 420 file
+                // keeps it, into 37 does not).
+                let dbf = crate::source::file_ccsid(self.client, &lib, &file).await;
+                if dbf != 37 && dbf != 65535 && codec::supported(dbf) {
+                    body = codec::text(dbf, &codec::convert(1208, dbf, body.as_bytes()));
                 }
                 let source = match (&old, opt.as_str()) {
                     (Some(o), "*ADD") if !o.source.is_empty() => format!("{}\n{body}", o.source),

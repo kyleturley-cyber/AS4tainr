@@ -21,6 +21,10 @@ Mount namespaces need a privilege containers do not have by default. With Docker
 
 One QSH command at a time uses the copy of the IFS. The command can read every stream file, whatever the user's authority to it. See docs/fidelity-gaps.md for the rest.
 
+## The `db2` utility
+
+Qshell's `db2` utility (`db2 [-v] 'statement'`, `as4tainr db2`, at `/usr/bin/db2` in SSH and QSH commands) runs one SQL statement with the library list and writes a query's rows as IBM i 7.5's utility does (PUB400, verify74 u74_exprows): an empty line, the column names over lines of dashes (a column as wide as its data, and at least one more than its name; a decimal column its precision and two), the rows (numbers on the right), and the count of rows. A statement that is not a query writes DB20000I in as4tainr's words; an error writes its message and ends with status 1 (neither captured). Its other options are taken and not acted on.
+
 ## The `system` utility
 
 In a QSH command (and in a PASE command XMLSERVICE runs), `system` runs a CL command as IBM i's Qshell and PASE `system` utility does: it is `as4tainr system`, for the job's user, its messages and printed output on standard output. as4tainr puts a small script for it first on the command's PATH (in `/var/tmp/as4tainr-bin`), and `/usr/bin/system` or `/QOpenSys/usr/bin/system` written as a command word is taken as `system`. A shell script file that names those paths runs only where the container has them.

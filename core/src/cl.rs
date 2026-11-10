@@ -3517,6 +3517,18 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "DSPMOD",
+        description: "Display Module",
+        params: &[
+            p("MODULE", Kind::Qualified, true, None, "Module").ch("Name"),
+            p("DETAIL", Kind::List, false, Some("*BASIC"), "Detail")
+                .ch("*BASIC, *ALL, *SIZE, *EXPORT, *IMPORT, *PROCLIST, *REFSYSOBJ, *COPYRIGHT"),
+            p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT, *OUTFILE"),
+            p("OUTFILE", Kind::Qualified, false, None, "File to receive output").keyword_only(),
+            p("OUTMBR", Kind::List, false, Some("*FIRST *REPLACE"), "Output member options").keyword_only(),
+        ],
+    },
+    CommandDef {
         name: "DSPSRVPGM",
         description: "Display Service Program",
         params: &[
@@ -5284,6 +5296,7 @@ pub static GROUPS: &[Group] = &[
             "RCLRSC",
             "DSPPGM",
             "DSPSRVPGM",
+            "DSPMOD",
             "RTVBNDSRC",
             "UPDPGM",
             "UPDSRVPGM",

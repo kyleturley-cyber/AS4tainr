@@ -140,6 +140,11 @@ fn pase_files() -> Vec<(String, PaseFile)> {
         // unless the container has a program of that name.
         v.push((format!("/usr/bin/{name}"), PaseFile::IfAbsent(body)));
     }
+    // Qshell's db2 utility (qshdb2.rs), at its Qshell path.
+    v.push((
+        "/usr/bin/db2".into(),
+        PaseFile::IfAbsent(format!("#!/bin/sh\nexec {exe} db2 \"$@\"\n")),
+    ));
     v.push(("/QOpenSys/usr/bin/qsh".into(), PaseFile::Script(QSH.into())));
     for sh in ["sh", "bsh", "ksh"] {
         v.push((

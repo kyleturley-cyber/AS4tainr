@@ -552,6 +552,9 @@ impl Job<'_> {
         if let Some(o) = Box::pin(self.autl_command(&cmd)).await? {
             return Ok(o);
         }
+        if let Some(o) = Box::pin(self.dspmod_command(&cmd)).await? {
+            return Ok(o);
+        }
         if let Some(o) = Box::pin(self.pgmref_command(&cmd)).await? {
             return Ok(o);
         }
@@ -1684,7 +1687,12 @@ impl Job<'_> {
 
     /// (library, name) pairs of BNDSRVPGM, and BNDDIR names.
     /// A program or service program named on a command: (library, name).
-    async fn ile_object(&self, q: &str, objtype: &str, aut: Aut) -> Result<(String, String)> {
+    pub(crate) async fn ile_object(
+        &self,
+        q: &str,
+        objtype: &str,
+        aut: Aut,
+    ) -> Result<(String, String)> {
         let (libs, name) = self.search(q);
         let name = name.to_ascii_uppercase();
         for l in &libs {

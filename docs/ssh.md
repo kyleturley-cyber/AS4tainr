@@ -44,7 +44,8 @@ a 5250 session first. Only passwords are taken (no keys yet).
 - PASE's programs at their paths: `/QOpenSys/usr/bin/system` (runs a CL
   command as the user), `qsh` (with Qshell's `liblist`), `attr` and
   `setccsid` (an IFS file's CCSID), `uname` (answers as IBM i 7.5's PASE:
-  `uname -rv` is `5 7`), and the usual tools in `/QOpenSys/usr/bin` and
+  `uname -rv` is `5 7`), Qshell's `db2` at `/usr/bin/db2`
+  (docs/qshell.md), and the usual tools in `/QOpenSys/usr/bin` and
   `/QOpenSys/pkgs/bin`.
 - `/QSYS.LIB`: libraries, and the objects and members of the libraries
   a command names (docs/qshell.md, "The IFS"); source members read and

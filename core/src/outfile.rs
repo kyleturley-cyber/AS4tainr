@@ -342,6 +342,137 @@ const QWHDRPPR: &[Field] = &[
     ("WHRFNB", 'S', 5, 0),
 ];
 
+/// DSPMOD DETAIL(*EXPORT) OUTPUT(*OUTFILE)'s file (PUB400 2026-11-10,
+/// verify74 u74_expffd: format QBNDMEXP, 10 fields, 318 bytes). The
+/// file DSPMOD makes is not made from a model in QSYS here: `file` is
+/// not used.
+pub const DSPMOD_EXPORT: Model = Model {
+    file: "",
+    format: "QBNDMEXP",
+    text: "Output file for DSPMOD",
+    fields: QBNDMEXP,
+};
+
+const QBNDMEXP: &[Field] = &[
+    ("EXDCEN", 'A', 1, 0),
+    ("EXDDAT", 'A', 6, 0),
+    ("EXDTIM", 'A', 6, 0),
+    ("EXLBNM", 'A', 10, 0),
+    ("EXMONM", 'A', 10, 0),
+    ("EXMOAT", 'A', 10, 0),
+    ("EXMOSY", 'A', 8, 0),
+    ("EXSYNM", 'A', 256, 0),
+    ("EXSYTY", 'A', 1, 0),
+    ("EXOPPP", 'A', 10, 0),
+];
+
+/// DSPMOD DETAIL(*IMPORT) OUTPUT(*OUTFILE)'s file (verify74
+/// u74_impffd: format QBNDMIMP, 10 fields, 318 bytes).
+pub const DSPMOD_IMPORT: Model = Model {
+    file: "",
+    format: "QBNDMIMP",
+    text: "Output file for DSPMOD",
+    fields: QBNDMIMP,
+};
+
+const QBNDMIMP: &[Field] = &[
+    ("IMDCEN", 'A', 1, 0),
+    ("IMDDAT", 'A', 6, 0),
+    ("IMDTIM", 'A', 6, 0),
+    ("IMLBNM", 'A', 10, 0),
+    ("IMMONM", 'A', 10, 0),
+    ("IMMOAT", 'A', 10, 0),
+    ("IMMOSY", 'A', 8, 0),
+    ("IMSYNM", 'A', 256, 0),
+    ("IMSYTY", 'A', 1, 0),
+    ("IMOPPP", 'A', 10, 0),
+];
+
+/// DSPMOD DETAIL(*BASIC) OUTPUT(*OUTFILE)'s file (verify74
+/// u74_basffd: format QBNDMBAS, 73 fields, 13983 bytes).
+pub const DSPMOD_BASIC: Model = Model {
+    file: "",
+    format: "QBNDMBAS",
+    text: "Output file for DSPMOD",
+    fields: QBNDMBAS,
+};
+
+const QBNDMBAS: &[Field] = &[
+    ("BADCEN", 'A', 1, 0),
+    ("BADDAT", 'A', 6, 0),
+    ("BADTIM", 'A', 6, 0),
+    ("BALBNM", 'A', 10, 0),
+    ("BAMONM", 'A', 10, 0),
+    ("BAMOAT", 'A', 10, 0),
+    ("BAMOSY", 'A', 8, 0),
+    ("BACCEN", 'A', 1, 0),
+    ("BACDAT", 'A', 6, 0),
+    ("BACTIM", 'A', 6, 0),
+    ("BASRCF", 'A', 10, 0),
+    ("BASRCL", 'A', 10, 0),
+    ("BASRCM", 'A', 10, 0),
+    ("BASRCC", 'A', 1, 0),
+    ("BASRCD", 'A', 6, 0),
+    ("BASRCT", 'A', 6, 0),
+    ("BAMOWN", 'A', 10, 0),
+    ("BACCSI", 'P', 5, 0),
+    ("BATEXT", 'A', 50, 0),
+    ("BAMIT", 'A', 4, 0),
+    ("BASRTT", 'A', 10, 0),
+    ("BASRTL", 'A', 10, 0),
+    ("BALGID", 'A', 10, 0),
+    ("BAOPLV", 'A', 10, 0),
+    ("BAOPLX", 'A', 10, 0),
+    ("BADBLV", 'A', 10, 0),
+    ("BACOMP", 'A', 10, 0),
+    ("BAPEPN", 'A', 256, 0),
+    ("BAMINP", 'P', 5, 0),
+    ("BAMAXP", 'P', 5, 0),
+    ("BASTAT", 'A', 10, 0),
+    ("BADOMN", 'A', 10, 0),
+    ("BANEXS", 'P', 11, 0),
+    ("BANIMS", 'P', 11, 0),
+    ("BACMCO", 'A', 6, 0),
+    ("BACMCF", 'A', 6, 0),
+    ("BACERT", 'A', 6, 0),
+    ("BASQLN", 'P', 11, 0),
+    ("BASQLR", 'A', 18, 0),
+    ("BASQLC", 'A', 10, 0),
+    ("BASQLA", 'A', 10, 0),
+    ("BASQLU", 'A', 10, 0),
+    ("BASQNO", 'A', 10, 0),
+    ("BASQLD", 'A', 10, 0),
+    ("BASQLE", 'A', 1, 0),
+    ("BASQLT", 'A', 10, 0),
+    ("BASQLP", 'A', 1, 0),
+    ("BASQLY", 'A', 10, 0),
+    ("BASQLB", 'A', 10, 0),
+    ("BASQDC", 'A', 10, 0),
+    ("BASQPN", 'A', 10, 0),
+    ("BASQPL", 'A', 10, 0),
+    ("BASQDU", 'A', 10, 0),
+    ("BASQSS", 'A', 10, 0),
+    ("BASQSL", 'A', 10, 0),
+    ("BASQLI", 'A', 10, 0),
+    ("BASQCM", 'A', 10, 0),
+    ("BASEPL", 'A', 10, 0),
+    ("BASEPP", 'A', 10, 0),
+    ("BASCNV", 'A', 10, 0),
+    ("BAPRFD", 'A', 10, 0),
+    ("BAILD", 'A', 4, 0),
+    ("BATERA", 'A', 10, 0),
+    ("BASQPA", 'V', 558, 0),
+    ("BALICO", 'V', 4096, 0),
+    ("BASTGM", 'A', 10, 0),
+    ("BASQSZ", 'P', 11, 0),
+    ("BASQPX", 'V', 3483, 0),
+    ("BACNVD", 'A', 10, 0),
+    ("BAARCS", 'A', 4, 0),
+    ("BASCCD", 'P', 11, 0),
+    ("BASLEN", 'P', 11, 0),
+    ("BASTMF", 'V', 5000, 0),
+];
+
 pub const QADSPDBR: Model = Model {
     file: "QADSPDBR",
     format: "QWHDRDBR",
@@ -964,7 +1095,13 @@ pub async fn write(
                     .iter()
                     .find(|(n, _)| n.eq_ignore_ascii_case(&f.name))
                     .map(|(_, v)| v.clone());
-                if f.data_type == crate::dds::DataType::Char {
+                if f.data_type == crate::dds::DataType::Char && f.varlen {
+                    given
+                        .unwrap_or_default()
+                        .chars()
+                        .take(f.length as usize)
+                        .collect()
+                } else if f.data_type == crate::dds::DataType::Char {
                     let v = given.unwrap_or_default();
                     let n = f.length as usize;
                     let mut v: String = v.chars().take(n).collect();

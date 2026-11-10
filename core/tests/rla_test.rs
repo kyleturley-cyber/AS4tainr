@@ -27643,3 +27643,148 @@ async fn source_file_ccsid_and_text_copies() {
     let (b, c) = read(format!("{dir}/QGER.txt")).await;
     assert_eq!((c, &b[..2]), (819, &[0x3Fu8, 0x82][..]));
 }
+
+#[tokio::test]
+async fn dspmod_output_files_of_a_cl_module() {
+    // DSPMOD OUTPUT(*OUTFILE) (PUB400 2026-11-10, verify74): a CL module
+    // made from a stream file exports one procedure named as the module,
+    // symbol type '0', ARGOPT *NO (u74_exprows); it imports the ILE CL
+    // run time's six procedures (u74_improws); the files made get
+    // CPF9861 and CPF9862 and nothing more (u74_exp); *BASIC's record
+    // (u74_basrows). Code for IBM i's getModuleExports reads EXSYNM.
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let dir = format!("/tmp/{lib}m");
+    as4tainr_core::ifs::mkdir_all(&client, &dir, "QSECOFR")
+        .await
+        .unwrap();
+    let src = format!("{dir}/gld74.clle");
+    as4tainr_core::ifs::write_file(
+        &client,
+        &src,
+        b"PGM\r\nDCL VAR(&X) TYPE(*CHAR) LEN(5)\r\nCALL PGM(QCMDEXC) PARM(X 1)\r\nENDPGM\r\n",
+        819,
+        0o644,
+        "QSECOFR",
+    )
+    .await
+    .unwrap();
+    cl_cmd(
+        &mut job,
+        format!("CRTCLMOD MODULE({lib}/GLD74M) SRCSTMF('{src}')"),
+    )
+    .await
+    .unwrap();
+    let m = cl_cmd(
+        &mut job,
+        format!(
+            "DSPMOD MODULE({lib}/GLD74M) DETAIL(*EXPORT) OUTPUT(*OUTFILE) OUTFILE({lib}/GLD74X)"
+        ),
+    )
+    .await
+    .unwrap();
+    let ids: Vec<&str> = m.iter().map(|l| &l[..7]).collect();
+    assert_eq!(ids, ["CPF9861", "CPF9862"], "{m:?}");
+    let q = |sql: String| {
+        let client = &client;
+        async move {
+            client
+                .query(&sql, &[])
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    (0..r.len())
+                        .map(|i| r.get::<_, String>(i))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    let t = |f: &str| format!("{}.{}", as4tainr_core::catalog::ident(&lib), f);
+    assert_eq!(
+        q(format!(
+            "SELECT exdcen, rtrim(exlbnm), rtrim(exmonm), rtrim(exmoat), rtrim(exsynm), exsyty, rtrim(exoppp) FROM {}",
+            t("gld74x")
+        ))
+        .await,
+        [format!("1|{lib}|GLD74M|CLLE|GLD74M|0|*NO")]
+    );
+    // Again: the file is there, no messages.
+    let m = cl_cmd(
+        &mut job,
+        format!(
+            "DSPMOD MODULE({lib}/GLD74M) DETAIL(*EXPORT) OUTPUT(*OUTFILE) OUTFILE({lib}/GLD74X)"
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(m.is_empty(), "{m:?}");
+    cl_cmd(
+        &mut job,
+        format!(
+            "DSPMOD MODULE({lib}/GLD74M) DETAIL(*IMPORT) OUTPUT(*OUTFILE) OUTFILE({lib}/GLD74I)"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        q(format!(
+            "SELECT rtrim(imsynm), imsyty, rtrim(imoppp) FROM {} ORDER BY rrn",
+            t("gld74i")
+        ))
+        .await,
+        [
+            "CEEGOTO|0|*NO",
+            "Qcl_CHKBI|0|*UNKNOWN",
+            "Qcl_LkLDA|0|*NO",
+            "Q LE leDefaultEh2|0|*UNKNOWN",
+            "Q LE leBdyCh2|0|*UNKNOWN",
+            "Q LE leBdyEpilog2|0|*NO",
+        ]
+    );
+    cl_cmd(
+        &mut job,
+        format!(
+            "DSPMOD MODULE({lib}/GLD74M) DETAIL(*BASIC) OUTPUT(*OUTFILE) OUTFILE({lib}/GLD74B)"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        q(format!(
+            "SELECT rtrim(bapepn), bamaxp::text, banexs::text, banims::text, rtrim(bamoat), bastmf, baslen::text, rtrim(baarcs), rtrim(bastgm) FROM {}",
+            t("gld74b")
+        ))
+        .await,
+        [format!(
+            "_CL_PEP|255|1|6|CLLE|{src}|{}|*YES|*INHERIT",
+            src.len()
+        )]
+    );
+    // The QTEMP file Code for IBM i uses (QTEMP may be an earlier
+    // process's with the same PID: the file deleted first).
+    cl_cmd(&mut job, "DLTF FILE(QTEMP/C4IX)".into()).await.ok();
+    let m = cl_cmd(
+        &mut job,
+        format!("DSPMOD MODULE({lib}/GLD74M) DETAIL(*EXPORT) OUTPUT(*OUTFILE) OUTFILE(QTEMP/C4IX)"),
+    )
+    .await
+    .unwrap();
+    assert!(m[0].contains("QTEMP"), "{m:?}");
+}

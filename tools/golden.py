@@ -93,6 +93,9 @@ def printed(lines):
 def shell_for(cmd, sandbox):
     if cmd.startswith("!"):
         line = cmd[1:].replace("/home/", sandbox + "/home/")
+        # IBM i's /tmp too: the sandbox's, put into the IFS's /tmp by the
+        # shims (verify74 writes its CL source there).
+        line = re.sub(r"(?<![\w/])/tmp/", sandbox + "/tmp/", line)
         # IBM i's path to the `system` utility is the shim here (as QSH
         # and PASE commands in as4tainr take it, qsh.rs).
         line = re.sub(r"(?<![\w/])(/QOpenSys)?/usr/bin/system(?=[\s'\";|&)]|$)", "system", line)
@@ -111,22 +114,24 @@ def shell_for(cmd, sandbox):
 
 
 SHIM = """#!/bin/sh
-# `system` for golden.py: the sandbox's /home goes to the IFS first, and
-# paths into the sandbox in the command become IFS paths again.
+# `system` (or `setccsid`) for golden.py: the sandbox's /home and /tmp go
+# to the IFS first, and paths into the sandbox in the command become IFS
+# paths again.
 # Only when something there changed since the last put: a put takes
 # seconds, and a test that times one job against another (verify52's
 # 60-second hold) needs `system` to start quickly.
-if [ -d "{sb}/home" ] && { [ ! -e "{sb}/.put" ] || [ -n "$(find "{sb}/home" -newer "{sb}/.put" -print -quit)" ]; }; then
+if [ -d "{sb}/home" ] && { [ ! -e "{sb}/.put" ] || [ -n "$(find "{sb}/home" "{sb}/tmp" -newer "{sb}/.put" -print -quit)" ]; }; then
   touch "{sb}/.put"
   for d in "{sb}"/home/*; do
     [ -d "$d" ] && "{bin}" put "$d" "/home/$(basename "$d")" >/dev/null 2>&1
   done
+  [ -n "$(ls -A "{sb}/tmp")" ] && "{bin}" put "{sb}/tmp" /tmp >/dev/null 2>&1
 fi
 for a in "$@"; do
-  set -- "$@" "$(printf '%s' "$a" | sed 's#{sb}/home/#/home/#g')"
+  set -- "$@" "$(printf '%s' "$a" | sed -e 's#{sb}/home/#/home/#g' -e 's#{sb}/tmp/#/tmp/#g')"
   shift
 done
-exec "{bin}" system "$@"
+exec "{bin}" {sub} "$@"
 """
 
 
@@ -201,10 +206,12 @@ def main():
             src = os.path.join(a.files, f)
             if os.path.isfile(src):
                 shutil.copy(src, gld)
-    shim = os.path.join(sb, "bin", "system")
-    with open(shim, "w") as f:
-        f.write(SHIM.replace("{sb}", sb).replace("{bin}", bin_))
-    os.chmod(shim, 0o755)
+    os.makedirs(os.path.join(sb, "tmp"))
+    for sub in ("system", "setccsid", "db2"):
+        shim = os.path.join(sb, "bin", sub)
+        with open(shim, "w") as f:
+            f.write(SHIM.replace("{sb}", sb).replace("{bin}", bin_).replace("{sub}", sub))
+        os.chmod(shim, 0o755)
     env = dict(os.environ, PATH=os.path.join(sb, "bin") + ":" + os.environ["PATH"])
     env["AS4TAINR_LIBL"] = env.get("AS4TAINR_LIBL", "QGPL,QTEMP")
     # The capture's library and home directory.

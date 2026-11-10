@@ -60,6 +60,11 @@ BEGIN
                                  ADD COLUMN IF NOT EXISTS src_changed timestamptz;
     ALTER TABLE as4tainr.programs ADD COLUMN IF NOT EXISTS src_changed timestamptz;
   END IF;
+  -- A module made from a stream file: its path (DSPMOD).
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='as4tainr' AND table_name='modules' AND column_name='src_stmf') THEN
+    ALTER TABLE as4tainr.modules ADD COLUMN IF NOT EXISTS src_stmf text NOT NULL DEFAULT '';
+  END IF;
 END $$;
 "#;
 
@@ -98,6 +103,14 @@ pub async fn set_source(
             &[&library, &name, &file, &lib, &mbr, &secs],
         )
         .await?;
+    if objtype == "*MODULE" {
+        client
+            .execute(
+                "UPDATE as4tainr.modules SET src_stmf=$3 WHERE library=$1 AND name=$2",
+                &[&library, &name, &m.stmf],
+            )
+            .await?;
+    }
     Ok(())
 }
 
@@ -194,6 +207,8 @@ pub struct ModuleInfo {
     /// Exports named in mixed case (EXTPROC('Name')): the name in
     /// capitals, as bound here, and as written.
     pub spelled: BTreeMap<String, String>,
+    /// Exports and imports that are data, not procedures.
+    pub data: std::collections::BTreeSet<String>,
 }
 
 /// Compile a module and say what it exports and imports.
@@ -212,6 +227,7 @@ pub async fn module_info(client: &Client, libl: &[String], m: &ModuleCopy) -> Re
             cycle_main: false,
             bnddir: Vec::new(),
             spelled: BTreeMap::new(),
+            data: Default::default(),
         });
     }
     let prog = crate::rpg::compile_with(client, libl, &m.name, &m.source, &m.options)
@@ -233,9 +249,16 @@ pub async fn module_info(client: &Client, libl: &[String], m: &ModuleCopy) -> Re
                 .map(|w| (k.clone(), w.clone()))
         })
         .collect();
+    let data = prog
+        .data_exports
+        .iter()
+        .chain(prog.data_imports.iter())
+        .map(|x| x.0.clone())
+        .collect();
     Ok(ModuleInfo {
         name: m.name.clone(),
         spelled,
+        data,
         exports,
         imports,
         has_main: !prog.nomain,

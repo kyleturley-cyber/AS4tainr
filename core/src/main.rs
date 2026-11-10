@@ -171,6 +171,13 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Qshell's db2 utility: an SQL statement run, a query's rows as a
+    /// table (`db2 [-v] 'statement'`).
+    #[command(disable_help_flag = true)]
+    Db2 {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Serve the Mapepire database protocol (Code for IBM i's SQL) to one
     /// client on standard input and output, as the Mapepire server's
     /// single mode does: JSON requests in, JSON replies out, one per
@@ -595,6 +602,18 @@ async fn run(cli: Cli) -> Result<u8> {
             } else {
                 as4tainr_core::pase_attr::setccsid(&client, &args).await
             };
+            for l in &out.stdout {
+                println!("{l}");
+            }
+            for l in &out.stderr {
+                eprintln!("{l}");
+            }
+            return Ok(out.status);
+        }
+        Cmd::Db2 { args } => {
+            let client = runtime::connect_db(&cli.database_url).await?;
+            catalog::init(&client).await?;
+            let out = as4tainr_core::qshdb2::run(&client, &cli.database_url, &libl, &args).await;
             for l in &out.stdout {
                 println!("{l}");
             }

@@ -125,3 +125,8 @@ VITE_TEMP_LIB=ILEDITOR npx vitest run --config vitest.config.ts connection
 request and reply to that file. Tests that need objects IBM ships
 (QSYSINC's include members, QIWS.QCUSTCDT's sample rows) cannot pass:
 as4tainr has no IBM code or data.
+`AS4TAINR_SSH_TRACE=/path/file` adds each SSH command's exit status and
+line to that file. Code for IBM i's getFileList tests run at the same
+time and name their directories `/tmp/<Date.now()>`: on a fast server
+two of them can get the same name and remove each other's files, so
+they fail now and then.

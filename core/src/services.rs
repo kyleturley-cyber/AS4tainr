@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 60";
+const VERSION: &str = "as4tainr services 61";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -1846,10 +1846,9 @@ DECLARE
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM as4tainr.objects o
                   WHERE o.library = 'QSYS' AND o.objtype = '*LIB' AND o.name = lib) THEN
-    IF upper(coalesce(ignore_errors, 'NO')) = 'YES' THEN
-      RETURN;
-    END IF;
-    RAISE EXCEPTION 'SQL0204: % in QSYS type *LIB not found.', lib USING ERRCODE = '42704';
+    -- No rows, and no error, whatever IGNORE_ERRORS says (PUB400
+    -- 2026-11-10, verify75 u75_libinfo: NOEXIST75 with the default NO).
+    RETURN;
   END IF;
   -- DETAILED_INFO NO: the size is not worked out (null), as on PUB400.
   RETURN QUERY

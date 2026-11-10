@@ -806,6 +806,18 @@ async fn exec(
             m.close(&client, user).await?;
         }
         crate::pase_attr::apply_notes(&client, &notes).await;
+        // AS4TAINR_SSH_TRACE: each command and its exit status, appended
+        // to that file (for following what a client runs).
+        if let Ok(f) = std::env::var("AS4TAINR_SSH_TRACE") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(f)
+            {
+                let _ = writeln!(f, "{code}\t{line}");
+            }
+        }
         code
     };
     wr.exit_status(code).await?;

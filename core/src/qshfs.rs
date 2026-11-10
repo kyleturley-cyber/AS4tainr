@@ -208,7 +208,7 @@ impl Mirror {
             .unwrap_or_default();
         let rows = client
             .query(
-                "SELECT path, kind = 'D', (extract(epoch FROM changed) * 1000000)::bigint, mode
+                "SELECT path, kind = 'D', (extract(epoch FROM changed) * 1000000)::bigint, mode, owner
                    FROM as4tainr.ifs WHERE path <> '/' ORDER BY path",
                 &[],
             )
@@ -216,6 +216,10 @@ impl Mirror {
         let ifs: BTreeMap<String, (bool, i64, i32)> = rows
             .iter()
             .map(|r| (r.get::<_, String>(0), (r.get(1), r.get(2), r.get(3))))
+            .collect();
+        let owners: BTreeMap<String, String> = rows
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, String>(4)))
             .collect();
         // What is on disk and no longer in the IFS (or not of its kind)
         // goes, deepest first.
@@ -291,6 +295,15 @@ impl Mirror {
                 );
             }
         }
+        // Each entry owned by its owner's user ID, the user profiles in
+        // the passwd file the command sees (`passwd`): `ls -l` and
+        // `stat %U` show the owner's name in lower case, as PASE does.
+        let mut names: BTreeSet<String> = owners.values().map(|o| o.to_ascii_lowercase()).collect();
+        names.insert("qsys".into());
+        for (p, o) in &owners {
+            let _ = std::os::unix::fs::lchown(local(&root, p), Some(uid_of(o)), None);
+        }
+        write_passwd(&root, &names);
         std::fs::write(root.join(MANIFEST), serde_json::to_vec(&manifest)?)?;
         Ok(Mirror {
             root,
@@ -357,6 +370,15 @@ impl Mirror {
                 "{mount} --bind /usr/bin/iconv /QOpenSys/usr/lib/iconv-real 2>/dev/null && {mount} --bind /QOpenSys/usr/bin/iconv /usr/bin/iconv 2>/dev/null\n"
             ));
         }
+        // The user profiles as users (sync_in), before the IFS's
+        // directories cover the mirror's (/tmp).
+        let pw = passwd_path(&self.root);
+        if pw.exists() && Path::new("/etc/passwd").exists() {
+            script.push_str(&format!(
+                "{mount} --bind {} /etc/passwd 2>/dev/null\n",
+                sh_quote(&pw.to_string_lossy())
+            ));
+        }
         // /QSYS.LIB first: its tree is beside the mirror, which an IFS
         // directory (/tmp) may cover once mounted.
         if let Some(q) = &self.qsys {
@@ -373,6 +395,12 @@ impl Mirror {
                 s = sh_quote(&src.to_string_lossy()),
             ));
         }
+        // /QSYS.LIB owned by QSYS (Code for IBM i's content.test.ts "Test
+        // getFileList": its owner is qsys).
+        script.push_str(&format!(
+            "chown -h {} /QSYS.LIB 2>/dev/null\n",
+            uid_of("QSYS")
+        ));
         script.push_str(&format!(
             "cd \"$1\" 2>/dev/null || cd /\nexec {} -c \"$2\"\n",
             sh_quote(shell)
@@ -486,6 +514,46 @@ impl Mirror {
 }
 
 /// `s` in single quotes for /bin/sh.
+/// The user ID a user profile's files have in the mirror: the same
+/// for a name every time (FNV-1a of the name in lower case), above the
+/// IDs the container's own users have.
+pub fn uid_of(profile: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in profile.trim().to_ascii_lowercase().bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    100_000 + h % 1_000_000
+}
+
+fn passwd_path(root: &Path) -> PathBuf {
+    PathBuf::from(format!("{}-passwd", root.to_string_lossy()))
+}
+
+/// The passwd file QSH commands see: the container's users, then a user
+/// for each profile that owns something in the IFS (and QSYS).
+fn write_passwd(root: &Path, names: &BTreeSet<String>) {
+    let mut text = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let taken: BTreeSet<String> = text
+        .lines()
+        .filter_map(|l| l.split(':').next().map(str::to_string))
+        .collect();
+    for n in names {
+        if n.is_empty() || taken.contains(n) || n.contains(':') || n.contains('\n') {
+            continue;
+        }
+        text.push_str(&format!(
+            "{n}:x:{}:0::/home/{}:/bin/sh\n",
+            uid_of(n),
+            n.to_ascii_uppercase()
+        ));
+    }
+    let _ = std::fs::write(passwd_path(root), text);
+}
+
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }

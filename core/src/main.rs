@@ -613,7 +613,25 @@ async fn run(cli: Cli) -> Result<u8> {
         Cmd::Db2 { args } => {
             let client = runtime::connect_db(&cli.database_url).await?;
             catalog::init(&client).await?;
-            let out = as4tainr_core::qshdb2::run(&client, &cli.database_url, &libl, &args).await;
+            let env = commands::Environment {
+                database_url: cli.database_url.clone(),
+            };
+            let user = std::env::var("AS4TAINR_USER")
+                .ok()
+                .map(|u| u.trim().to_ascii_uppercase())
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| "QSECOFR".into());
+            let mut job = commands::Job {
+                client: &client,
+                env: &env,
+                user,
+                curlib: curlib.clone(),
+                libl: libl.clone(),
+                display: None,
+                id: None,
+                calls: Default::default(),
+            };
+            let out = as4tainr_core::qshdb2::run(&mut job, &args).await;
             for l in &out.stdout {
                 println!("{l}");
             }

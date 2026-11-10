@@ -27870,3 +27870,65 @@ async fn schemas_named_by_sql_names() {
         .await
         .unwrap());
 }
+
+#[tokio::test]
+async fn dspmod_outfile_of_a_missing_module_and_library_info() {
+    // PUB400 2026-11-10, verify75: DSPMOD OUTPUT(*OUTFILE) of a module
+    // that is not there makes the file first (CPF9861, CPF9862), then
+    // CPF9801, and the file has no records (u75_exp, u75_exprows);
+    // QSYS2.LIBRARY_INFO of a library that is not there gives no rows
+    // and no error (u75_libinfo).
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let e = cl_cmd(
+        &mut job,
+        format!(
+            "DSPMOD MODULE({lib}/NOMOD75) DETAIL(*SIZE) OUTPUT(*OUTFILE) OUTFILE({lib}/GLD75S)"
+        ),
+    )
+    .await
+    .unwrap_err();
+    let ids: Vec<&str> = e
+        .lines()
+        .filter_map(|l| l.find("CP").map(|i| &l[i..i + 7]))
+        .collect();
+    assert_eq!(ids, ["CPF9861", "CPF9862", "CPF9801"], "{e}");
+    let n: i64 = client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM {}.gld75s",
+                as4tainr_core::catalog::ident(&lib)
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 0);
+    let r = as4tainr_core::sql::run(
+        &client,
+        &url,
+        std::slice::from_ref(&lib),
+        "SELECT IASP_NAME FROM TABLE(QSYS2.LIBRARY_INFO('NOEXIST75', DETAILED_INFO => 'NO')) X",
+    )
+    .await
+    .unwrap();
+    match r {
+        as4tainr_core::sql::Outcome::Rows { rows, .. } => assert!(rows.is_empty()),
+        other => panic!("{other:?}"),
+    }
+}

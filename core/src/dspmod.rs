@@ -413,6 +413,25 @@ pub fn basic_record(
     ]
 }
 
+/// The record of DETAIL(*SIZE): the module's names; as4tainr has no
+/// sizes of compiled code and data to give, so they are zero
+/// (u75_sizeffd's format; values not captured).
+pub fn size_record(
+    m: &ModuleFacts,
+    now: &(String, String, String),
+    system: &str,
+) -> crate::outfile::Record {
+    vec![
+        ("SIDCEN", now.0.clone()),
+        ("SIDDAT", crate::outfile::job_date(&now.1)),
+        ("SIDTIM", now.2.clone()),
+        ("SILBNM", m.library.clone()),
+        ("SIMONM", m.name.clone()),
+        ("SIMOAT", m.attribute.clone()),
+        ("SIMOSY", system.to_string()),
+    ]
+}
+
 impl Job<'_> {
     pub(crate) async fn dspmod_command(&mut self, cmd: &Command) -> Result<Option<Outcome>> {
         Ok(Some(match cmd.def.name {
@@ -499,7 +518,6 @@ impl Job<'_> {
     }
 
     async fn dspmod(&mut self, cmd: &Command) -> Result<Outcome> {
-        let m = self.module_facts(cmd.get("MODULE")).await?;
         let details: Vec<String> = cmd
             .list("DETAIL")
             .iter()
@@ -539,28 +557,40 @@ impl Job<'_> {
                 .await?;
             let now = (r.get(0), r.get(1), r.get(2));
             let system: String = crate::report::system_name().chars().take(8).collect();
-            let (model, recs) = match details[0].as_str() {
-                "*EXPORT" => (
-                    &crate::outfile::DSPMOD_EXPORT,
-                    symbol_records(&m, "EX", &m.exports, &now, &system),
-                ),
-                "*IMPORT" => (
-                    &crate::outfile::DSPMOD_IMPORT,
-                    symbol_records(&m, "IM", &m.imports, &now, &system),
-                ),
-                "*BASIC" => (
-                    &crate::outfile::DSPMOD_BASIC,
-                    vec![basic_record(&m, &now, &system)],
-                ),
+            let model = match details[0].as_str() {
+                "*EXPORT" => &crate::outfile::DSPMOD_EXPORT,
+                "*IMPORT" => &crate::outfile::DSPMOD_IMPORT,
+                "*BASIC" => &crate::outfile::DSPMOD_BASIC,
+                "*SIZE" => &crate::outfile::DSPMOD_SIZE,
                 d => {
                     return Err(crate::cl::value_error(&format!(
                         "DETAIL({d}) with OUTPUT(*OUTFILE) is not available here."
                     )))
                 }
             };
+            // The file is made (or its member cleared) before the module
+            // is looked for: a module that is not there leaves an empty
+            // file, its CPF9861 and CPF9862 before the CPF9801 (PUB400
+            // 2026-11-10, verify75 u75_exp).
+            let m = match self.module_facts(cmd.get("MODULE")).await {
+                Ok(m) => m,
+                Err(e) => {
+                    let w = crate::outfile::write(self, &outfile, &option, model, &[]).await?;
+                    let mut lines = w.messages;
+                    lines.push(format!("{e:#}"));
+                    bail!(lines.join("\n"));
+                }
+            };
+            let recs = match details[0].as_str() {
+                "*EXPORT" => symbol_records(&m, "EX", &m.exports, &now, &system),
+                "*IMPORT" => symbol_records(&m, "IM", &m.imports, &now, &system),
+                "*SIZE" => vec![size_record(&m, &now, &system)],
+                _ => vec![basic_record(&m, &now, &system)],
+            };
             let w = crate::outfile::write(self, &outfile, &option, model, &recs).await?;
             return Ok(Outcome::Messages(w.messages));
         }
+        let m = self.module_facts(cmd.get("MODULE")).await?;
         let print = report(&m, &details, &crate::report::Stamp::now());
         let fmt = |n: &str, t: &str, a: &str| format!("{n:<48}  {t:<10}  {a}");
         let mut rows = Vec::new();

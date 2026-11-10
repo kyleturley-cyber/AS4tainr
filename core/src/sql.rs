@@ -825,6 +825,11 @@ fn word(t: &Tok) -> Option<String> {
     }
 }
 
+/// A token as an error message names it.
+fn show_tok(t: &Tok) -> String {
+    render(std::slice::from_ref(t))
+}
+
 fn render(toks: &[Tok]) -> String {
     toks.iter()
         .map(|t| match t {
@@ -1950,20 +1955,29 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
     if toks.iter().any(|t| matches!(t, Tok::Punct(p) if p == ";")) {
         bail!("SQL0104: Only one statement can be run at a time.");
     }
-    // SELECT FROM: Db2 wants a select list (PostgreSQL takes an empty
-    // one). Its SQL0104 names the tokens that could have come next
-    // (Code for IBM i's content.test.ts "Test runSQL (bad basic select)",
-    // run against IBM i: the message ends ": , FROM INTO.", 42601, -104).
-    let words: Vec<String> = toks.iter().filter_map(word).collect();
-    if words.windows(2).any(|w| w[0] == "SELECT" && w[1] == "FROM")
-        && toks
+    // SELECT FROM: Db2 takes FROM as a column and the next name as its
+    // correlation name, and refuses the token after them, naming the
+    // tokens that could come there (PUB400 2026-11-10, verify75
+    // u75_badsel: "select from qiws.qcustcdt" refuses ".", tokens ", FROM
+    // INTO"; Code for IBM i's "Test runSQL (bad basic select)"; PostgreSQL
+    // takes an empty select list).
+    {
+        let solid: Vec<&Tok> = toks
             .iter()
             .filter(|t| !matches!(t, Tok::Space(_)))
-            .collect::<Vec<_>>()
-            .windows(2)
-            .any(|w| matches!((word(w[0]), word(w[1])), (Some(a), Some(b)) if a == "SELECT" && b == "FROM"))
-    {
-        bail!("SQL0104: FROM is not expected after SELECT; what can come there: , FROM INTO.");
+            .collect();
+        if let Some(k) = solid.windows(2).position(|w| {
+            matches!((word(w[0]), word(w[1])), (Some(a), Some(b)) if a == "SELECT" && b == "FROM")
+        }) {
+            let bad = match solid.get(k + 2) {
+                Some(t) if word(t).is_some() => solid.get(k + 3).map(|t| show_tok(t)),
+                Some(t) => Some(show_tok(t)),
+                None => None,
+            };
+            if let Some(bad) = bad {
+                bail!("SQL0104: {bad} is not expected here; what can come there: , FROM INTO.");
+            }
+        }
     }
     // VALUES 'A', 'B': one row for each expression (Db2: VALUES with a
     // list of expressions, none in parentheses); PostgreSQL wants each

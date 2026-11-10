@@ -1,0 +1,18 @@
+# Golden (batch 19): DSPMOD of an RPG module (verify75's did not compile:
+# its stream file is tagged 819 here): exports, imports, *BASIC and *SIZE
+# rows, the *ALL report; a CL module with a CALLPRC (which run-time
+# imports a CL module has besides the procedure it calls).
+u76_cleanup|!for m in GLD76R GLD76C; do system -q "DLTMOD MODULE(AS4TRAINR1/$m)"; done; for f in GLD76X GLD76I GLD76B GLD76S; do system -q "DLTF FILE(AS4TRAINR1/$f)"; done; rm -f /tmp/gld76.rpgle /tmp/gld76c.clle; echo cleaned
+u76_make|!printf '**FREE\nctl-opt nomain;\ndcl-pr Other76 int(10) end-pr;\ndcl-proc Hello76 export;\n  dcl-pi *n int(10) end-pi;\n  return Other76();\nend-proc;\n' > /tmp/gld76.rpgle; setccsid 819 /tmp/gld76.rpgle; system "CRTRPGMOD MODULE(AS4TRAINR1/GLD76R) SRCSTMF('/tmp/gld76.rpgle')"
+u76_exp|DSPMOD MODULE(AS4TRAINR1/GLD76R) DETAIL(*EXPORT) OUTPUT(*OUTFILE) OUTFILE(AS4TRAINR1/GLD76X)
+u76_exprows|!/QOpenSys/usr/bin/qsh -c "db2 \"SELECT * FROM AS4TRAINR1.GLD76X\""
+u76_imp|DSPMOD MODULE(AS4TRAINR1/GLD76R) DETAIL(*IMPORT) OUTPUT(*OUTFILE) OUTFILE(AS4TRAINR1/GLD76I)
+u76_improws|!/QOpenSys/usr/bin/qsh -c "db2 \"SELECT * FROM AS4TRAINR1.GLD76I\""
+u76_bas|DSPMOD MODULE(AS4TRAINR1/GLD76R) DETAIL(*BASIC) OUTPUT(*OUTFILE) OUTFILE(AS4TRAINR1/GLD76B)
+u76_basrows|!/QOpenSys/usr/bin/qsh -c "db2 \"SELECT * FROM AS4TRAINR1.GLD76B\""
+u76_size|DSPMOD MODULE(AS4TRAINR1/GLD76R) DETAIL(*SIZE) OUTPUT(*OUTFILE) OUTFILE(AS4TRAINR1/GLD76S)
+u76_sizerows|!/QOpenSys/usr/bin/qsh -c "db2 \"SELECT * FROM AS4TRAINR1.GLD76S\""
+u76_print|DSPMOD MODULE(AS4TRAINR1/GLD76R) DETAIL(*ALL) OUTPUT(*PRINT)
+u76_makecl|!printf 'PGM\r\nCALLPRC PRC(OTHER76C)\r\nENDPGM\r\n' > /tmp/gld76c.clle; setccsid 819 /tmp/gld76c.clle; system "CRTCLMOD MODULE(AS4TRAINR1/GLD76C) SRCSTMF('/tmp/gld76c.clle')"
+u76_climp|DSPMOD MODULE(AS4TRAINR1/GLD76C) DETAIL(*EXPORT *IMPORT) OUTPUT(*PRINT)
+u76_end|!for m in GLD76R GLD76C; do system -q "DLTMOD MODULE(AS4TRAINR1/$m)"; done; for f in GLD76X GLD76I GLD76B GLD76S; do system -q "DLTF FILE(AS4TRAINR1/$f)"; done; rm -f /tmp/gld76.rpgle /tmp/gld76c.clle; echo cleaned

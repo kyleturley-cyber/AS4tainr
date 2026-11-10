@@ -27361,8 +27361,9 @@ async fn qsh_commands_see_qsys_lib() {
             "QDA.DTAARA",
             "QSRCQ.FILE",
             "M1.MBR",
-            "line one",
-            "line two",
+            // Each record's 80 characters (verify73 t73_qcat).
+            "line one                                                                        ",
+            "line two                                                                        ",
             "QSH0005: The command ended with exit status 0."
         ]
     );

@@ -789,6 +789,8 @@ async fn shell_command(
     std::path::PathBuf,
 )> {
     let line = replace_word(line, "/usr/bin/uname", "/QOpenSys/usr/bin/uname");
+    let line = crate::qsyslib::upper_paths(&line);
+    let cwd = &crate::qsyslib::upper_paths(cwd);
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let notes = std::path::PathBuf::from(format!(
         "/var/tmp/as4tainr-attr-{}-{}",

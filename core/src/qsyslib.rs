@@ -74,14 +74,46 @@ fn meta(p: &Path) -> Option<(i128, u64)> {
     Some((t, m.len()))
 }
 
-/// A source member's text: its lines, each ending in a newline.
-fn member_text(source: &str) -> String {
+/// A source member's text as Qshell reads it: each record's SRCDTA
+/// (`width` characters, blank-padded) and a newline (PUB400 2026-11-10,
+/// verify73 t73_qcat: "line one" in a 92-byte source file read as 80
+/// characters and a newline).
+fn member_text(source: &str, width: usize) -> String {
     let mut s = String::new();
     for l in source.lines() {
-        s.push_str(l.trim_end());
+        let l = l.trim_end();
+        s.push_str(l);
+        let n = l.chars().count();
+        if n < width {
+            s.push_str(&" ".repeat(width - n));
+        }
         s.push('\n');
     }
     s
+}
+
+/// QSYS.LIB names are not case-sensitive (IBM i documentation, "QSYS.LIB
+/// file system": object names are stored in upper case): the
+/// `/QSYS.LIB/...` paths of a command line in upper case, so that the
+/// tree (upper case) has them (Code for IBM i counts a source file's
+/// members by a path with the name as typed: content.test.ts "should
+/// count members").
+pub fn upper_paths(line: &str) -> String {
+    let up = line.to_ascii_uppercase();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while let Some(k) = up[i..].find("/QSYS.LIB") {
+        let start = i + k;
+        out.push_str(&line[i..start]);
+        let rest = &line[start..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || "'\";&|),<>`".contains(c))
+            .unwrap_or(rest.len());
+        out.push_str(&rest[..end].to_ascii_uppercase());
+        i = start + end;
+    }
+    out.push_str(&line[i..]);
+    out
 }
 
 /// Whether a command reaches /QSYS.LIB (names it in its line or starts
@@ -164,7 +196,7 @@ pub async fn build(client: &Client, root: &Path, cwd: &str, line: &str) -> Resul
         std::fs::create_dir_all(&dir)?;
         let objects = client
             .query(
-                "SELECT o.name, o.objtype, (sf.name IS NOT NULL)
+                "SELECT o.name, o.objtype, (sf.name IS NOT NULL), coalesce(sf.rcdlen, 92)
                    FROM as4tainr.objects o
                    LEFT JOIN as4tainr.source_files sf ON sf.library = o.library AND sf.name = o.name
                   WHERE o.library = $1 ORDER BY o.name, o.objtype",
@@ -175,6 +207,8 @@ pub async fn build(client: &Client, root: &Path, cwd: &str, line: &str) -> Resul
             let name: String = o.get(0);
             let ty: String = o.get(1);
             let source: bool = o.get(2);
+            let rcdlen: i32 = o.get(3);
+            let width = (rcdlen - 12).max(0) as usize;
             let ty = ty.trim_start_matches('*');
             let p = dir.join(format!("{name}.{ty}"));
             if ty != "FILE" {
@@ -196,7 +230,7 @@ pub async fn build(client: &Client, root: &Path, cwd: &str, line: &str) -> Resul
                     let member: String = m.get(0);
                     let text: String = m.get(1);
                     let f = p.join(format!("{member}.MBR"));
-                    std::fs::write(&f, member_text(&text))?;
+                    std::fs::write(&f, member_text(&text, width))?;
                     let (mtime_ns, size) = meta(&f).unwrap_or((0, 0));
                     tree.members.insert(
                         f,
@@ -244,7 +278,15 @@ pub async fn write_back(client: &Client, tree: &Tree) -> Result<()> {
             }
             let data = std::fs::read(&p)?;
             let text = String::from_utf8_lossy(&data).replace("\r\n", "\n");
-            let source = text.strip_suffix('\n').unwrap_or(&text).to_string();
+            // Each line a record, its trailing blanks not kept (the padding
+            // the member was read with).
+            let source = text
+                .strip_suffix('\n')
+                .unwrap_or(&text)
+                .split('\n')
+                .map(str::trim_end)
+                .collect::<Vec<_>>()
+                .join("\n");
             let member = member.to_ascii_uppercase();
             let (srctype, mtext) = match known {
                 Some(w) => client
@@ -297,8 +339,19 @@ mod tests {
     }
 
     #[test]
+    fn qsys_lib_paths_in_upper_case() {
+        assert_eq!(
+            upper_paths("cd \"/QSYS.LIB/ileditor.LIB/ab3Xy.FILE\" && ls -A | wc -l"),
+            "cd \"/QSYS.LIB/ILEDITOR.LIB/AB3XY.FILE\" && ls -A | wc -l"
+        );
+        assert_eq!(upper_paths("ls /home/me"), "ls /home/me");
+    }
+
+    #[test]
     fn a_member_as_text() {
-        assert_eq!(member_text("a  \n  b\n"), "a\n  b\n");
-        assert_eq!(member_text(""), "");
+        // verify73 t73_qcat: records of 80 characters and a newline.
+        assert_eq!(member_text("a  \n  b\n", 3), "a  \n  b\n");
+        assert_eq!(member_text("line one", 80).len(), 81);
+        assert_eq!(member_text("", 80), "");
     }
 }

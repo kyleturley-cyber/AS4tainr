@@ -304,7 +304,7 @@ impl Job<'_> {
     /// variables: what QSH CMD and PASE popen (rpg/pase.rs) run. Its
     /// standard output (and error) and exit status.
     pub(crate) async fn shell_run(&mut self, line: &str) -> Result<std::process::Output> {
-        let line = system_utility_paths(line);
+        let line = crate::qsyslib::upper_paths(&system_utility_paths(line));
         let job = self.job_key();
         let vars = envvar::for_process(self.client, &job).await?;
         let setting = |n: &str| vars.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());

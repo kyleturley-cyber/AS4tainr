@@ -176,6 +176,8 @@ fn local(root: &Path, ifs: &str) -> PathBuf {
 pub struct Mirror {
     root: PathBuf,
     manifest: Manifest,
+    /// The QSYS.LIB tree for the command (qsyslib.rs), when made.
+    qsys: Option<crate::qsyslib::Tree>,
 }
 
 impl Mirror {
@@ -290,7 +292,22 @@ impl Mirror {
             }
         }
         std::fs::write(root.join(MANIFEST), serde_json::to_vec(&manifest)?)?;
-        Ok(Mirror { root, manifest })
+        Ok(Mirror {
+            root,
+            manifest,
+            qsys: None,
+        })
+    }
+
+    /// Make /QSYS.LIB for a command starting in `cwd` (qsyslib.rs): the
+    /// libraries, and the objects and members of those it names.
+    pub async fn prepare_qsys(&mut self, client: &Client, cwd: &str, line: &str) -> Result<()> {
+        if !crate::qsyslib::wanted(cwd, line) {
+            return Ok(());
+        }
+        let dir = PathBuf::from(format!("{}-qsyslib", self.root.to_string_lossy()));
+        self.qsys = Some(crate::qsyslib::build(client, &dir, cwd, line).await?);
+        Ok(())
     }
 
     /// The command to run in a namespace where the mirror's top-level
@@ -329,6 +346,14 @@ impl Mirror {
         // first; where it cannot be (as4tainr not running as root: the
         // namespace's root cannot write in the container's /), the
         // command does not see that IFS directory (docs/qshell.md).
+        // /QSYS.LIB first: its tree is beside the mirror, which an IFS
+        // directory (/tmp) may cover once mounted.
+        if let Some(q) = &self.qsys {
+            script.push_str(&format!(
+                "mkdir -p /QSYS.LIB 2>/dev/null; if [ -d /QSYS.LIB ]; then {mount} --bind {s} /QSYS.LIB || exit 126; fi\n",
+                s = sh_quote(&q.root.join("QSYS.LIB").to_string_lossy()),
+            ));
+        }
         for n in &tops {
             let src = self.root.join(n);
             script.push_str(&format!(
@@ -357,7 +382,13 @@ impl Mirror {
     /// Write back what the command changed, added or removed, and let
     /// the next QSH command have the mirror.
     pub async fn close(mut self, client: &Client, user: &str) -> Result<()> {
-        let r = self.sync_out(client, user).await;
+        let mut r = self.sync_out(client, user).await;
+        if let Some(q) = &self.qsys {
+            let w = crate::qsyslib::write_back(client, q).await;
+            if r.is_ok() {
+                r = w;
+            }
+        }
         let _ = std::fs::write(
             self.root.join(MANIFEST),
             serde_json::to_vec(&self.manifest).unwrap_or_default(),

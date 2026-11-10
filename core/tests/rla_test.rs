@@ -27245,6 +27245,22 @@ async fn mapepire_values_as_pub400_shows_them() {
         Some(&J::Num("1.000000000000000000000000".into())),
         "{r}"
     );
+    // AVG and SUM of an INTEGER are INTEGER, AVG cut off; AVG of a
+    // decimal DECIMAL(31, 31 - p + s) (verify71 r71_mapepire "agg": AVG(I)
+    // of 1, 2, 4 is 2; AVG(D) of DECIMAL(7, 2) DECIMAL(31, 26)).
+    let r = ask(format!(
+        r#"{{"id":"avg","type":"sql","sql":"SELECT AVG(I), SUM(I), AVG(D) FROM {lib}.GLD68T WHERE I <= 2"}}"#
+    ))
+    .await;
+    let cols = r.get("metadata").and_then(|m| m.get("columns")).unwrap();
+    let J::Arr(cols) = cols else { panic!("{r}") };
+    assert_eq!(cols[0].get("type"), Some(&J::str("INTEGER")), "{r}");
+    assert_eq!(cols[1].get("type"), Some(&J::str("INTEGER")), "{r}");
+    assert_eq!(cols[2].get("scale"), Some(&J::Num("26".into())), "{r}");
+    let J::Arr(data) = r.get("data").expect("rows") else {
+        panic!("{r}")
+    };
+    assert_eq!(data[0].get("00001"), Some(&J::Num("1".into())), "{r}");
     // PARTITION_STATISTICS takes CHAR(10) names: unpadded, no row
     // (verify68 "parts"); padded, the member (verify70 "ps2").
     let count = |r: &J| match r.get("data") {
@@ -27272,4 +27288,86 @@ async fn mapepire_values_as_pub400_shows_them() {
         Some(&J::Num("107".into())),
         "{r}"
     );
+}
+
+#[tokio::test]
+async fn qsh_commands_see_qsys_lib() {
+    // The QSYS.LIB file system (IBM i documentation, "QSYS.LIB file
+    // system"): /QSYS.LIB/LIB.LIB holds a library's objects as NAME.TYPE,
+    // a file is a directory of its members (MBR.MBR); a source member
+    // reads as its lines, and a member written there is the member.
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    if !as4tainr_core::qshfs::available() {
+        eprintln!("skipped: no mount namespaces here");
+        return;
+    }
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    std::env::set_var("AS4TAINR_QSH", "1");
+    cl_cmd(&mut job, "RMVENVVAR ENVVAR(QIBM_QSH_CMD_OUTPUT)".into())
+        .await
+        .ok();
+    for c in [
+        format!("CRTSRCPF FILE({lib}/QSRCQ) RCDLEN(92) MBR(M1)"),
+        format!("CRTDTAARA DTAARA({lib}/QDA) TYPE(*CHAR) LEN(5)"),
+    ] {
+        cl_cmd(&mut job, c).await.unwrap();
+    }
+    as4tainr_core::source::put_member(
+        &client,
+        &as4tainr_core::source::Member {
+            library: lib.clone(),
+            file: "QSRCQ".into(),
+            name: "M1".into(),
+            srctype: "TXT".into(),
+            text: String::new(),
+            source: "line one\nline two  ".into(),
+            stmf: String::new(),
+            ccsid: 37,
+            changed_us: None,
+        },
+        true,
+    )
+    .await
+    .unwrap();
+    let d = format!("/QSYS.LIB/{lib}.LIB");
+    let m = cl_cmd(
+        &mut job,
+        format!(
+            "QSH CMD('ls {d} && ls {d}/QSRCQ.FILE && cat {d}/QSRCQ.FILE/M1.MBR && printf \"new\\n\" > {d}/QSRCQ.FILE/M2.MBR')"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        m,
+        [
+            // setup's files, then those made here.
+            "CUSTMAST.FILE",
+            "ORDLIN.FILE",
+            "QDA.DTAARA",
+            "QSRCQ.FILE",
+            "M1.MBR",
+            "line one",
+            "line two",
+            "QSH0005: The command ended with exit status 0."
+        ]
+    );
+    let m2 = as4tainr_core::source::find_member(&client, std::slice::from_ref(&lib), "QSRCQ", "M2")
+        .await
+        .unwrap();
+    assert_eq!(m2.source, "new");
 }

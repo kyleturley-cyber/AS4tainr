@@ -1476,7 +1476,7 @@ use crate::sql::Outcome as Outcome2;
 /// taken for one an expression gave when the statement does not write
 /// it (PostgreSQL's ?column?, VALUES' COLUMN1, a function's name), unless
 /// the statement selects `*` (whose names it does not write).
-fn unnamed_columns(sql: &str, columns: Vec<String>) -> Vec<String> {
+pub(crate) fn unnamed_columns(sql: &str, columns: Vec<String>) -> Vec<String> {
     let up = sql.to_ascii_uppercase();
     // The words a column can be named by: not a function's name (SUM(...)
     // makes an unnamed column: verify69 p69_mapepire "num", "ps3").

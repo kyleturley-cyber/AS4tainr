@@ -73,6 +73,7 @@ pub mod prtf;
 pub mod qsh;
 pub mod qshfs;
 pub mod qsysinc;
+pub mod qsyslib;
 pub mod qtemp;
 pub mod report;
 pub mod rexx;

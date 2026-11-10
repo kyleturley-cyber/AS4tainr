@@ -874,7 +874,12 @@ async fn save_library(
         )
         .await?
     {
-        let (iname, tname, def, own): (String, String, String, String) = (r.get(0), r.get(1), r.get(2), r.get(3));
+        // The definition can still go between the filter and the select
+        // list (another session's DROP): such an index is left out.
+        let Some(def): Option<String> = r.get(2) else {
+            continue;
+        };
+        let (iname, tname, own): (String, String, String) = (r.get(0), r.get(1), r.get(3));
         let lf_owner = lf_names
             .contains(&iname)
             .then(|| {

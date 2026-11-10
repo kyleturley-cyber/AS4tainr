@@ -1,0 +1,19 @@
+# Golden (batch 12): the QSYS.LIB file system as PASE's shell sees it
+# (Code for IBM i's member and object browsing over SSH): ls of a
+# library, a source file and its members, stat and attr of a member,
+# cat of a member, a data file, a program, writing a member with cp,
+# a name with # and $.
+s72_cleanup|!for c in "DLTF FILE(AS4TRAINR1/GLD72S)" "DLTF FILE(AS4TRAINR1/GLD72T)" "DLTDTAARA DTAARA(AS4TRAINR1/GLD72A)"; do system -q "$c"; done; rm -f /tmp/gld72*; echo cleaned
+s72_make|!system "CRTSRCPF FILE(AS4TRAINR1/GLD72S) RCDLEN(92) MBR(M1) TEXT('Golden 72')"; system "ADDPFM FILE(AS4TRAINR1/GLD72S) MBR(#M2) SRCTYPE(RPGLE) TEXT('hash')"; system "RUNSQL SQL('INSERT INTO AS4TRAINR1/GLD72S (SRCSEQ, SRCDAT, SRCDTA) VALUES (1, 261110, ''line one''), (2, 261110, ''line two  '')') COMMIT(*NONE)"; system "RUNSQL SQL('CREATE TABLE AS4TRAINR1/GLD72T (K INTEGER, N CHAR(4))') COMMIT(*NONE)"; system "CRTDTAARA DTAARA(AS4TRAINR1/GLD72A) TYPE(*CHAR) LEN(5)"
+s72_lslib|!ls /QSYS.LIB/AS4TRAINR1.LIB | grep -i gld72; echo rc=$?
+s72_lsfile|!ls -la /QSYS.LIB/AS4TRAINR1.LIB/GLD72S.FILE; echo rc=$?
+s72_lsld|!ls -ld /QSYS.LIB/AS4TRAINR1.LIB/GLD72S.FILE /QSYS.LIB/AS4TRAINR1.LIB/GLD72T.FILE /QSYS.LIB/AS4TRAINR1.LIB/GLD72A.DTAARA /QSYS.LIB/AS4TRAINR1.LIB; echo rc=$?
+s72_cat|!cat /QSYS.LIB/AS4TRAINR1.LIB/GLD72S.FILE/M1.MBR | od -c | head -12; echo rc=$?
+s72_attr|!attr -p /QSYS.LIB/AS4TRAINR1.LIB/GLD72S.FILE/M1.MBR; echo rc=$?; attr -p /QSYS.LIB/AS4TRAINR1.LIB/GLD72S.FILE; echo rc=$?
+s72_stat|!/QOpenSys/pkgs/bin/stat --printf="%A\t%h\t%U\t%G\t%s\t%n\n" /QSYS.LIB/AS4TRAINR1.LIB/GLD72S.FILE/* ; echo rc=$?
+s72_hash|!ls /QSYS.LIB/AS4TRAINR1.LIB/GLD72S.FILE/ | od -c | head -4; cat '/QSYS.LIB/AS4TRAINR1.LIB/GLD72S.FILE/#M2.MBR' | wc -c; echo rc=$?
+s72_data|!cat /QSYS.LIB/AS4TRAINR1.LIB/GLD72T.FILE/GLD72T.MBR | wc -c; echo rc=$?; ls -la /QSYS.LIB/AS4TRAINR1.LIB/GLD72T.FILE; echo rc=$?
+s72_write|!printf 'new one\nnew two\n' > /tmp/gld72in.txt; cp /tmp/gld72in.txt /QSYS.LIB/AS4TRAINR1.LIB/GLD72S.FILE/M1.MBR; echo rc=$?; system "DSPPFM FILE(AS4TRAINR1/GLD72S) MBR(M1)" | grep -i new; echo rc=$?
+s72_new|!cp /tmp/gld72in.txt /QSYS.LIB/AS4TRAINR1.LIB/GLD72S.FILE/M3.MBR; echo rc=$?; ls /QSYS.LIB/AS4TRAINR1.LIB/GLD72S.FILE; echo rc=$?
+s72_nolib|!ls /QSYS.LIB/NOSUCH72.LIB; echo rc=$?; cat /QSYS.LIB/AS4TRAINR1.LIB/GLD72S.FILE/NOPE.MBR; echo rc=$?
+s72_end|!for c in "DLTF FILE(AS4TRAINR1/GLD72S)" "DLTF FILE(AS4TRAINR1/GLD72T)" "DLTDTAARA DTAARA(AS4TRAINR1/GLD72A)"; do system -q "$c"; done; rm -f /tmp/gld72*; echo cleaned

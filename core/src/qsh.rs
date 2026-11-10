@@ -310,7 +310,7 @@ impl Job<'_> {
         let setting = |n: &str| vars.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
         // The IFS at its paths, when this system can (qshfs.rs); the
         // command starts in the user's home directory if there is one.
-        let mirror = if crate::qshfs::available() {
+        let mut mirror = if crate::qshfs::available() {
             Some(crate::qshfs::Mirror::open(self.client, &self.env.database_url).await?)
         } else {
             None
@@ -325,6 +325,9 @@ impl Job<'_> {
             Some(_) => crate::ifs::current_dir(),
             None => std::env::temp_dir().to_string_lossy().to_string(),
         };
+        if let Some(m) = mirror.as_mut() {
+            m.prepare_qsys(self.client, &start, &line).await?;
+        }
         let mut p = match mirror.as_ref().and_then(|m| m.command(&start, &line)) {
             Some((prog, args)) => {
                 let mut c = tokio::process::Command::new(prog);

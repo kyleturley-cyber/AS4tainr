@@ -46,6 +46,10 @@ a 5250 session first. Only passwords are taken (no keys yet).
   `setccsid` (an IFS file's CCSID), `uname` (answers as IBM i 7.5's PASE:
   `uname -rv` is `5 7`), and the usual tools in `/QOpenSys/usr/bin` and
   `/QOpenSys/pkgs/bin`.
+- `/QSYS.LIB`: libraries, and the objects and members of the libraries
+  a command names (docs/qshell.md, "The IFS"); source members read and
+  written as text, so Code for IBM i's member search (`grep` in a source
+  file's directory) and object lookup (`ls /QSYS.LIB/LIB.LIB/OBJ.*`) work.
 - `sftp` (and `scp -s`) reads and writes the IFS, with the owner's and
   the public's permission bits checked (*ALLOBJ passes).
 - Mapepire: the Java command at
@@ -55,7 +59,13 @@ a 5250 session first. Only passwords are taken (no keys yet).
   answered by it directly. `as4tainr mapepire` serves it on standard input
   and output too.
 
-Interactive shells (`ssh host` without a command) are not available yet.
+`ssh host` without a command (and Code for IBM i's terminal) gets an
+interactive session: each line typed runs as a command, as above, in the
+directory the one before ended in (`cd` carries over); `exit` or Ctrl-D
+ends it. With a terminal the session echoes, edits (backspace, Ctrl-C)
+and shows a prompt. A command does not read the terminal (its standard
+input is empty: no editors or `read`), its output comes when it ends,
+and variables set by one line are gone for the next.
 
 ## Code for IBM i
 

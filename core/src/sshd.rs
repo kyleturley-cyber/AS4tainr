@@ -266,6 +266,15 @@ liblist() {
   esac
   AS4TAINR_LIBL="$_l"; export AS4TAINR_LIBL AS4TAINR_CURLIB
 }
+# Started through a link with a utility's name (ln -s .../qsh grep), qsh
+# runs that Qshell utility (Code for IBM i's member search,
+# SearchTools.ts): here the container's.
+_me="${0##*/}"
+case "$_me" in
+  qsh|qsh_inout|qsh_out|sh) ;;
+  *) for _d in /usr/bin /bin; do [ -x "$_d/$_me" ] && exec "$_d/$_me" "$@"; done
+     echo "qsh: $_me: not found" >&2; exit 127;;
+esac
 if [ "$1" = "-c" ]; then
   shift
   eval "$1"
@@ -368,6 +377,7 @@ impl russh::server::Server for Server {
             user: None,
             channels: HashMap::new(),
             env: HashMap::new(),
+            ptys: Default::default(),
         }
     }
 }
@@ -379,6 +389,8 @@ struct Connection {
     channels: HashMap<ChannelId, Channel<Msg>>,
     /// Environment variables the client set for a channel.
     env: HashMap<ChannelId, Vec<(String, String)>>,
+    /// Channels a terminal (pty) was asked for.
+    ptys: std::collections::HashSet<ChannelId>,
 }
 
 impl russh::server::Handler for Connection {
@@ -437,6 +449,7 @@ impl russh::server::Handler for Connection {
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<()> {
+        self.ptys.insert(channel);
         session.channel_success(channel)?;
         Ok(())
     }
@@ -464,24 +477,18 @@ impl russh::server::Handler for Connection {
     }
 
     async fn shell_request(&mut self, channel: ChannelId, session: &mut Session) -> Result<()> {
-        // An interactive shell would hold the IFS mirror for as long as
-        // it runs: not provided (docs/fidelity-gaps.md).
-        let Some(ch) = self.channels.remove(&channel) else {
+        let (Some(ch), Some(user)) = (self.channels.remove(&channel), self.user.clone()) else {
             session.channel_failure(channel)?;
             return Ok(());
         };
         session.channel_success(channel)?;
+        let env = self.env.remove(&channel).unwrap_or_default();
+        let terminal = self.ptys.remove(&channel);
+        let url = self.database_url.clone();
         tokio::spawn(async move {
-            let (_r, w) = ch.split();
-            let _ = w
-                .extended_data_bytes(
-                    1,
-                    &b"as4tainr: interactive shells are not available; run a command (ssh host 'command').\r\n"[..],
-                )
-                .await;
-            let _ = w.exit_status(1).await;
-            let _ = w.eof().await;
-            let _ = w.close().await;
+            if let Err(e) = interactive(&url, &user, ch, env, terminal).await {
+                eprintln!("as4tainr: SSH session of {user} ended: {e:#}");
+            }
         });
         Ok(())
     }
@@ -698,55 +705,9 @@ async fn exec(
             }
         }
     } else {
-        let line = replace_word(line, "/usr/bin/uname", "/QOpenSys/usr/bin/uname");
         let home = home_dir(&client, user).await;
-        // CCSIDs `attr` and `setccsid` set, applied after the mirror is
-        // written back (pase_attr.rs).
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let notes = std::path::PathBuf::from(format!(
-            "/var/tmp/as4tainr-attr-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let mirror = if crate::qshfs::available() {
-            Some(crate::qshfs::Mirror::open(&client, url).await?)
-        } else {
-            None
-        };
-        let mut p = match mirror
-            .as_ref()
-            .and_then(|m| m.command_with(&home, &line, SHELL, false))
-        {
-            Some((prog, args)) => {
-                let mut c = tokio::process::Command::new(prog);
-                c.args(args);
-                c
-            }
-            None => {
-                let mut c = tokio::process::Command::new(SHELL);
-                c.arg("-c").arg(&line).current_dir(std::env::temp_dir());
-                c
-            }
-        };
-        p.env_clear()
-            .env(
-                "PATH",
-                "/QOpenSys/pkgs/bin:/QOpenSys/usr/bin:/usr/local/bin:/usr/bin:/bin",
-            )
-            .env("HOME", &home)
-            .env("USER", user)
-            .env("LOGNAME", user)
-            .env("SHELL", SHELL)
-            .env("LANG", "C.UTF-8")
-            .env("AS4TAINR_EXE", format!("/proc/{}/exe", std::process::id()))
-            .env("AS4TAINR_DATABASE_URL", url)
-            .env("AS4TAINR_USER", user)
-            .env("AS4TAINR_ATTR_NOTES", &notes);
-        for (k, v) in &vars {
-            if !k.starts_with("AS4TAINR_") && k != "PATH" {
-                p.env(k, v);
-            }
-        }
+        let (mut p, mirror, notes) =
+            shell_command(&client, url, user, &home, &home, line, &vars).await?;
         p.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -805,6 +766,226 @@ async fn exec(
         code
     };
     wr.exit_status(code).await?;
+    wr.eof().await?;
+    wr.close().await?;
+    Ok(())
+}
+
+/// A shell command line as an SSH session runs it: on the IFS mirror with
+/// /QSYS.LIB (qshfs.rs, qsyslib.rs), starting in `cwd`, with the
+/// session's environment; the mirror to close after it, and the file of
+/// CCSIDs `attr` and `setccsid` set (pase_attr.rs).
+async fn shell_command(
+    client: &tokio_postgres::Client,
+    url: &str,
+    user: &str,
+    home: &str,
+    cwd: &str,
+    line: &str,
+    vars: &[(String, String)],
+) -> Result<(
+    tokio::process::Command,
+    Option<crate::qshfs::Mirror>,
+    std::path::PathBuf,
+)> {
+    let line = replace_word(line, "/usr/bin/uname", "/QOpenSys/usr/bin/uname");
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let notes = std::path::PathBuf::from(format!(
+        "/var/tmp/as4tainr-attr-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mirror = if crate::qshfs::available() {
+        let mut m = crate::qshfs::Mirror::open(client, url).await?;
+        m.prepare_qsys(client, cwd, &line).await?;
+        Some(m)
+    } else {
+        None
+    };
+    let mut p = match mirror
+        .as_ref()
+        .and_then(|m| m.command_with(cwd, &line, SHELL, false))
+    {
+        Some((prog, args)) => {
+            let mut c = tokio::process::Command::new(prog);
+            c.args(args);
+            c
+        }
+        None => {
+            let mut c = tokio::process::Command::new(SHELL);
+            c.arg("-c").arg(&line).current_dir(std::env::temp_dir());
+            c
+        }
+    };
+    p.env_clear()
+        .env(
+            "PATH",
+            "/QOpenSys/pkgs/bin:/QOpenSys/usr/bin:/usr/local/bin:/usr/bin:/bin",
+        )
+        .env("HOME", home)
+        .env("USER", user)
+        .env("LOGNAME", user)
+        .env("SHELL", SHELL)
+        .env("LANG", "C.UTF-8")
+        .env("AS4TAINR_EXE", format!("/proc/{}/exe", std::process::id()))
+        .env("AS4TAINR_DATABASE_URL", url)
+        .env("AS4TAINR_USER", user)
+        .env("AS4TAINR_ATTR_NOTES", &notes);
+    for (k, v) in vars {
+        if !k.starts_with("AS4TAINR_") && k != "PATH" {
+            p.env(k, v);
+        }
+    }
+    Ok((p, mirror, notes))
+}
+
+/// An interactive session (`ssh host` with no command): each line typed
+/// is run as a command (as `exec` runs one), in the directory the one
+/// before ended in, so `cd` carries over; `exit` ends it. With a
+/// terminal (a pty was asked for) the session echoes what is typed and
+/// shows a prompt, as a shell does; commands do not read the terminal
+/// (their standard input is empty) and their output comes when they end.
+async fn interactive(
+    url: &str,
+    user: &str,
+    ch: Channel<Msg>,
+    vars: Vec<(String, String)>,
+    terminal: bool,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let client = crate::runtime::connect_db(url).await?;
+    let (mut rd, wr) = ch.split();
+    let mut input = rd.make_reader();
+    let mut out = wr.make_writer();
+    let home = home_dir(&client, user).await;
+    let mut cwd = home.clone();
+    let nl = |b: &[u8]| -> Vec<u8> {
+        if !terminal {
+            return b.to_vec();
+        }
+        let mut v = Vec::with_capacity(b.len());
+        for &c in b {
+            if c == b'\n' {
+                v.push(b'\r');
+            }
+            v.push(c);
+        }
+        v
+    };
+    let prompt = |cwd: &str| format!("{}$ ", if cwd == home { "~" } else { cwd });
+    if terminal {
+        out.write_all(prompt(&cwd).as_bytes()).await?;
+        out.flush().await?;
+    }
+    let mut line: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 1024];
+    let mut last = 0u32;
+    let mut prev_cr = false;
+    'session: loop {
+        let n = input.read(&mut buf).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        for &c in &buf[..n] {
+            match c {
+                // The \n of a \r\n ends nothing more.
+                b'\n' if prev_cr => prev_cr = false,
+                b'\r' | b'\n' => {
+                    prev_cr = c == b'\r';
+                    if terminal {
+                        out.write_all(b"\r\n").await?;
+                    }
+                    let text = String::from_utf8_lossy(&line).trim().to_string();
+                    line.clear();
+                    if text == "exit" || text.starts_with("exit ") {
+                        last = text[4..].trim().parse().unwrap_or(last);
+                        break 'session;
+                    }
+                    if !text.is_empty() {
+                        let marker = format!(
+                            "/var/tmp/as4tainr-cwd-{}-{}",
+                            std::process::id(),
+                            rand::random::<u32>()
+                        );
+                        let wrapped = format!(
+                            "{text}\n__as4tainr_rc=$?; pwd > {marker} 2>/dev/null; exit $__as4tainr_rc"
+                        );
+                        let (mut p, mirror, notes) =
+                            shell_command(&client, url, user, &home, &cwd, &wrapped, &vars).await?;
+                        p.stdin(std::process::Stdio::null());
+                        let o = p.output().await;
+                        if let Some(m) = mirror {
+                            m.close(&client, user).await?;
+                        }
+                        crate::pase_attr::apply_notes(&client, &notes).await;
+                        match o {
+                            Ok(o) => {
+                                out.write_all(&nl(&o.stdout)).await?;
+                                let mut err = wr.make_writer_ext(Some(1));
+                                err.write_all(&nl(&o.stderr)).await?;
+                                err.flush().await?;
+                                last = o
+                                    .status
+                                    .code()
+                                    .map(|c| c as u32)
+                                    .unwrap_or_else(|| 128 + signal_of(&o.status));
+                            }
+                            Err(e) => {
+                                out.write_all(nl(format!("as4tainr: {e}\n").as_bytes()).as_slice())
+                                    .await?;
+                                last = 127;
+                            }
+                        }
+                        if let Ok(d) = std::fs::read_to_string(&marker) {
+                            let d = d.trim();
+                            if !d.is_empty() {
+                                cwd = d.to_string();
+                            }
+                        }
+                        let _ = std::fs::remove_file(&marker);
+                    }
+                    if terminal {
+                        out.write_all(prompt(&cwd).as_bytes()).await?;
+                    }
+                    out.flush().await?;
+                }
+                // Backspace and delete.
+                0x7f | 0x08 => {
+                    prev_cr = false;
+                    if line.pop().is_some() && terminal {
+                        out.write_all(b"\x08 \x08").await?;
+                        out.flush().await?;
+                    }
+                }
+                // Ctrl-C: the line is dropped.
+                0x03 => {
+                    line.clear();
+                    if terminal {
+                        out.write_all(b"^C\r\n").await?;
+                        out.write_all(prompt(&cwd).as_bytes()).await?;
+                        out.flush().await?;
+                    }
+                }
+                // Ctrl-D on an empty line ends the session.
+                0x04 if line.is_empty() => break 'session,
+                c if c >= 0x20 || c == b'\t' => {
+                    prev_cr = false;
+                    line.push(c);
+                    if terminal {
+                        out.write_all(&[c]).await?;
+                        out.flush().await?;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if terminal {
+        let _ = out.write_all(b"\r\n").await;
+    }
+    let _ = out.flush().await;
+    drop(out);
+    wr.exit_status(last).await?;
     wr.eof().await?;
     wr.close().await?;
     Ok(())

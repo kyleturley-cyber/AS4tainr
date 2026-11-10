@@ -17,6 +17,8 @@ The command works on the integrated file system at its paths (`/home/...`, `/tmp
 
 Mount namespaces need a privilege containers do not have by default. With Docker, add `cap_add: [SYS_ADMIN]` to the as4tainr service (and `security_opt: [apparmor:unconfined]` on hosts whose AppArmor profile forbids mounts). Without it QSH still runs, on the container's own files, and as4tainr says so once on standard error. When as4tainr does not run as root, the namespace is a user namespace whose root cannot make directories in the container's `/`: a top-level IFS directory the container does not have (`/mydir`) is then not seen by the command; directories under ones the container has (`/home/...`, `/tmp/...`) are. `AS4TAINR_QSH_IFS=0` turns the IFS copy off; `AS4TAINR_QSH_MIRROR` names the directory for it (default: one per database in the temporary directory).
 
+`/QSYS.LIB` is there too (as for an SSH command, docs/ssh.md): a directory `LIB.LIB` for each library, and in the libraries the command names (`/QSYS.LIB/LIB.LIB` in its line or its starting directory) their objects as `NAME.TYPE`, a file as a directory of its members (`MBR.MBR`). A source member reads as text, a line for each record without its sequence number and date and without trailing blanks; what the command writes to a member of a source file (a changed member, or a new `MBR.MBR`) is that member afterwards, a line for each record. A data file's member is there empty.
+
 One QSH command at a time uses the copy of the IFS. The command can read every stream file, whatever the user's authority to it. See docs/fidelity-gaps.md for the rest.
 
 ## The `system` utility

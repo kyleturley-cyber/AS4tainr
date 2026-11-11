@@ -237,3 +237,10 @@ The harness sets `TERM=xterm-r6`, because ncurses uses the "repeat character" es
 ## Not yet
 
 These are tracked in [fidelity-gaps.md](fidelity-gaps.md): TLS (port 992), automatic sign-on and device names from NEW-ENVIRON ([RFC 4777](https://www.rfc-editor.org/rfc/rfc4777)), 27x132 screens, prompt help (F1) and list-parameter prompting, WRKOBJ options, disabling profiles after repeated failures, and job logs.
+
+## Tracing a client
+
+`AS4TAINR_TN5250_TRACE=1` writes every byte the server sends (`>`) and
+receives (`<`) to standard error in hexadecimal: the telnet negotiation
+and the 5250 records. Use it to see what an emulator that does not show
+a screen is doing.

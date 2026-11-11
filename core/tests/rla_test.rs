@@ -28536,6 +28536,119 @@ async fn host_servers_sign_on_and_database_attributes() {
     let r = read(&mut s).await;
     assert_eq!(u16::from_be_bytes([r[20], r[21]]), 0xF001);
     assert_eq!(as4tainr_core::hostsrv::text37(&r[28..35]), "CPF9801");
+    // The file server (JTOpen IFS*Req and IFS*Rep, IFSFileDescriptor-
+    // ImplRemote): exchange attributes (0x8009, level at 22), a directory
+    // made, a file created, written and closed, the directory listed (an
+    // attributes reply 0x8005 for the file, chained, then return code 18,
+    // no more files), the file read back, deleted, the directory deleted.
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let u2 = url.clone();
+    tokio::spawn(async move {
+        let (s, _) = l.accept().await.unwrap();
+        as4tainr_core::hostcmd::serve_as(&u2, s, 0xE002).await
+    });
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(&ds(&[], 0xE002, 0x7001, &client_seed))
+        .await
+        .unwrap();
+    let r = read(&mut s).await;
+    let server_seed = r[24..32].to_vec();
+    let mut p = cp(0x1105, &substitute("PW123", &server_seed, &client_seed));
+    p.extend(cp(0x1104, &uid37));
+    s.write_all(&ds(&p, 0xE002, 0x7002, &[3, 1])).await.unwrap();
+    assert_eq!(u32_at(&read(&mut s).await, 20), 0);
+    let u16b = |r: &[u8], at: usize| u16::from_be_bytes([r[at], r[at + 1]]);
+    let name = |n: &str| -> Vec<u8> { n.encode_utf16().flat_map(|c| c.to_be_bytes()).collect() };
+    let mut t = vec![0, 0, 0, 16, 0, 4];
+    t.extend(0xFFFF_FFFFu32.to_be_bytes());
+    s.write_all(&ds(&cp(0x000A, &1200u16.to_be_bytes()), 0xE002, 0x0016, &t))
+        .await
+        .unwrap();
+    let r = read(&mut s).await;
+    assert_eq!((u16b(&r, 18), u16b(&r, 22)), (0x8009, 16));
+    let dir = format!("/h{}", lib.to_lowercase());
+    let mut t = vec![0, 0, 0x04, 0xB0, 0, 0, 0, 1];
+    s.write_all(&ds(&cp(0x0001, &name(&dir)), 0xE002, 0x000D, &t))
+        .await
+        .unwrap();
+    let r = read(&mut s).await;
+    assert_eq!((u16b(&r, 18), u16b(&r, 22)), (0x8001, 0), "directory made");
+    // Open: create or open (option 1), read and write access.
+    let mut o = vec![0u8; 44];
+    o[2..4].copy_from_slice(&1200u16.to_be_bytes());
+    o[4..8].copy_from_slice(&1u32.to_be_bytes());
+    o[8..10].copy_from_slice(&1208u16.to_be_bytes());
+    o[10..12].copy_from_slice(&3u16.to_be_bytes());
+    o[16..18].copy_from_slice(&1u16.to_be_bytes());
+    o[26..28].copy_from_slice(&1u16.to_be_bytes());
+    let file = format!("{dir}/a.txt");
+    s.write_all(&ds(&cp(0x0002, &name(&file)), 0xE002, 0x0002, &o))
+        .await
+        .unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(u16b(&r, 18), 0x8002);
+    let handle = r[22..26].to_vec();
+    let mut w = vec![0u8; 34];
+    w[2..6].copy_from_slice(&handle);
+    w[14..16].copy_from_slice(&2u16.to_be_bytes());
+    s.write_all(&ds(&cp(0x0020, b"hello"), 0xE002, 0x0004, &w))
+        .await
+        .unwrap();
+    let r = read(&mut s).await;
+    assert_eq!((u16b(&r, 18), u16b(&r, 22)), (0x800B, 0), "written");
+    let mut c = vec![0u8; 24];
+    c[2..6].copy_from_slice(&handle);
+    s.write_all(&ds(&[], 0xE002, 0x0009, &c)).await.unwrap();
+    assert_eq!(u16b(&read(&mut s).await, 18), 0x8004);
+    let mut lst = vec![0u8; 20];
+    lst[6..8].copy_from_slice(&1200u16.to_be_bytes());
+    lst[8..12].copy_from_slice(&1u32.to_be_bytes());
+    lst[14..16].copy_from_slice(&0xFFFFu16.to_be_bytes());
+    lst[16..18].copy_from_slice(&0x0101u16.to_be_bytes());
+    s.write_all(&ds(
+        &cp(0x0002, &name(&format!("{dir}/*"))),
+        0xE002,
+        0x000A,
+        &lst,
+    ))
+    .await
+    .unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(u16b(&r, 18), 0x8005);
+    assert_eq!(u16b(&r, 20) & 1, 1, "more replies follow");
+    assert_eq!((u32_at(&r, 46), u16b(&r, 54)), (5, 1), "a file of 5 bytes");
+    let r = read(&mut s).await;
+    assert_eq!(
+        (u16b(&r, 18), u16b(&r, 20), u16b(&r, 22)),
+        (0x8001, 0, 18),
+        "no more files"
+    );
+    o[10..12].copy_from_slice(&1u16.to_be_bytes());
+    o[16..18].copy_from_slice(&8u16.to_be_bytes());
+    s.write_all(&ds(&cp(0x0002, &name(&file)), 0xE002, 0x0002, &o))
+        .await
+        .unwrap();
+    let handle = read(&mut s).await[22..26].to_vec();
+    let mut rd = vec![0u8; 38];
+    rd[2..6].copy_from_slice(&handle);
+    rd[14..18].copy_from_slice(&100u32.to_be_bytes());
+    s.write_all(&ds(&[], 0xE002, 0x0003, &rd)).await.unwrap();
+    let r = read(&mut s).await;
+    assert_eq!((u16b(&r, 18), u16b(&r, 28)), (0x8003, 0x0020));
+    assert_eq!(&r[30..], b"hello");
+    c[2..6].copy_from_slice(&handle);
+    s.write_all(&ds(&[], 0xE002, 0x0009, &c)).await.unwrap();
+    read(&mut s).await;
+    s.write_all(&ds(&cp(0x0002, &name(&file)), 0xE002, 0x000C, &t))
+        .await
+        .unwrap();
+    assert_eq!(u16b(&read(&mut s).await, 22), 0, "file deleted");
+    t.extend([0, 0]);
+    s.write_all(&ds(&cp(0x0001, &name(&dir)), 0xE002, 0x000E, &t))
+        .await
+        .unwrap();
+    assert_eq!(u16b(&read(&mut s).await, 22), 0, "directory deleted");
     // The database server.
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();

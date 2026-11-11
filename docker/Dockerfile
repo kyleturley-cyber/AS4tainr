@@ -29,5 +29,5 @@ EXPOSE 22
 EXPOSE 8076
 # IBM i host servers (ACS, the IBM Toolbox for Java's JDBC driver), when
 # AS4TAINR_HOSTSERVER_LISTEN is set: port mapper, sign-on, database.
-EXPOSE 449 8476 8471 8475 8472
+EXPOSE 449 8476 8471 8475 8472 8473
 ENTRYPOINT ["/opt/as4tainr/entrypoint.sh"]

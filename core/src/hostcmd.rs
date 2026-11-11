@@ -49,9 +49,10 @@ pub async fn serve(url: &str, sock: TcpStream) -> Result<()> {
     serve_as(url, sock, 0xE008).await
 }
 
-/// Serve one connection of the remote command server (0xE008) or the
-/// data queue server (0xE007, hostdtaq.rs): the start of a connection is
-/// the same, the job the requests run in too.
+/// Serve one connection of the remote command server (0xE008), the data
+/// queue server (0xE007, hostdtaq.rs) or the file server (0xE002,
+/// hostifs.rs): the start of a connection is the same, the job the
+/// requests run in too.
 pub async fn serve_as(url: &str, mut sock: TcpStream, server_id: u16) -> Result<()> {
     let client = crate::runtime::connect_db(url).await?;
     let env = crate::commands::Environment {
@@ -60,6 +61,7 @@ pub async fn serve_as(url: &str, mut sock: TcpStream, server_id: u16) -> Result<
     let server_seed = seed();
     let mut client_seed: Vec<u8> = Vec::new();
     let mut server: Option<crate::mapepire::Server> = None;
+    let mut files = crate::hostifs::Files::default();
     while let Some(ds) = read_ds(&mut sock).await? {
         let corr = ds.correlation();
         let out = match ds.req_id() {
@@ -113,16 +115,25 @@ pub async fn serve_as(url: &str, mut sock: TcpStream, server_id: u16) -> Result<
                     let mut u = 37u32.to_be_bytes().to_vec();
                     u.extend(ebcdic(&name.to_ascii_uppercase(), 10));
                     p.extend(param(0x1104, &u));
-                    let job = if server_id == 0xE007 {
-                        "QZHQSSRV"
-                    } else {
-                        "QZRCSRVS"
+                    let job = match server_id {
+                        0xE007 => "QZHQSSRV",
+                        0xE002 => "QPWFSERVSO",
+                        _ => "QZRCSRVS",
                     };
                     p.extend(job_name_param(job, "QUSER"));
                 }
                 reply(0, 0, server_id, corr, 0xF002, &rc.to_be_bytes(), &p)
             }
             _ if server.is_none() => break,
+            _ if server_id == 0xE002 => {
+                let srv = server.as_mut().expect("signed on");
+                let replies = crate::hostifs::request(srv, &mut files, &ds).await;
+                for r in replies {
+                    sock.write_all(&r).await?;
+                }
+                sock.flush().await?;
+                continue;
+            }
             _ if server_id == 0xE007 => {
                 let srv = server.as_mut().expect("signed on");
                 match crate::hostdtaq::request(srv, &ds).await {

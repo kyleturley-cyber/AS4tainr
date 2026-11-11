@@ -13,6 +13,7 @@ well-known ports:
 | Database (as-database) | 8471 | Exchange of seeds, start server with a password, server attributes, SQL statements, parameter markers, CALL, commitment control, the SYSIBM metadata procedures (below) |
 | Remote command (as-rmtcmd) | 8475 | Exchange of seeds, start server, exchange attributes (data stream level 10), CL commands run with their messages (Toolbox `CommandCall`), programs called with their parameters (`ProgramCall`: RPG and CL programs, the data queue, user space and retrieve APIs done here) |
 | Data queue (as-dtaq) | 8472 | Exchange of seeds, start server, data queues created, deleted, written, read (waiting, peeking, by key), cleared, their attributes (Toolbox `DataQueue`, `KeyedDataQueue`) |
+| File (as-file) | 8473 | Exchange of seeds, start server, the IFS: attributes and lists (patterns), files opened, read, written, their size changed, closed, directories made and deleted, files deleted and renamed (Toolbox `IFSFile`, `IFSFileInputStream`, `IFSFileOutputStream`, `IFSRandomAccessFile`) |
 
 The data streams are the ones JTOpen's client side builds and reads; the
 server side is as4tainr's own (`core/src/hostsrv.rs`, `core/src/hostdb.rs`).
@@ -143,6 +144,17 @@ entry in its wait is answered 0xF006 (the Toolbox returns null).
 Create takes the queue's largest entry, sequence, key length, sender
 information, force and text; the authority asked for is not used (the
 queue gets the library's, as CRTDTAQ's default *LIBCRTAUT).
+
+## The file server
+
+The file server answers at data stream level 16 (8-byte sizes and
+offsets) with names in CCSID 1200, dates in GMT. A file opened is read
+into the connection; the handles a connection has on one file share its
+bytes (the Toolbox opens a second handle to change a file's size), and
+they are written back to the IFS when a handle is committed or closed.
+Lists take a pattern (`*` and `?`) in the last part of the name and end
+with return code 18 (no more files). `AS4TAINR_HOSTIFS_TRACE=1` prints
+each request to standard error.
 
 ## Passwords
 

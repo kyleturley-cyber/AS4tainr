@@ -237,14 +237,18 @@ pub fn seed() -> [u8; 8] {
     s
 }
 
-/// The job a server connection says it is: "number/user/name" as a
-/// 26-character qualified job name (name, user, number) in EBCDIC.
+/// The job a server connection says it is (CP 0x111F): its CCSID, then
+/// "number/user/name" in EBCDIC.
 pub fn job_name_param(name: &str, user: &str) -> Vec<u8> {
+    // The qualified job name as number/user/name (JTOpen
+    // RemoteCommandImplRemote getJobInfo splits the job string at the
+    // slashes: number, user, name).
     let number = format!("{:06}", std::process::id() % 1_000_000);
     let mut d = 37u32.to_be_bytes().to_vec();
-    d.extend(ebcdic(name, 10));
-    d.extend(ebcdic(user, 10));
-    d.extend(ebcdic(&number, 6));
+    d.extend(crate::ifs::codec::bytes(
+        37,
+        &format!("{number}/{user}/{name}"),
+    ));
     param(0x111F, &d)
 }
 

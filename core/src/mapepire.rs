@@ -1717,6 +1717,11 @@ fn text_type() -> ColType {
 
 /// The message file of a message ID (as the IBM i message files are
 /// named: QCPFMSG for CPx, QSQLMSG for SQL, QRNXMSG for RNx).
+/// The message file (library, file) a message ID is in.
+pub(crate) fn message_file_of(id: &str) -> (Option<&'static str>, Option<&'static str>) {
+    message_file(id)
+}
+
 fn message_file(id: &str) -> (Option<&'static str>, Option<&'static str>) {
     if id.starts_with("CP") {
         (Some("QSYS"), Some("QCPFMSG"))

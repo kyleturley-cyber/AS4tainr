@@ -20,9 +20,17 @@
 //!   severity, type, ID, message file and library, text, substitution
 //!   data, help).
 //!
-//! The command runs in the connection's job (one for the connection, as
-//! the server job QZRCSRVS of IBM i serves one client). Program calls
-//! (0x1003) are not done yet: return code 0x0500 (docs/fidelity-gaps.md).
+//! - call program (0x1003, JTOpen RCCallProgramRequest/ReplyDataStream:
+//!   the program at 20 and its library at 30, 10 bytes each in the job's
+//!   CCSID, the message option at 40, the number of parameters at 41,
+//!   then from 43 each parameter as CP 0x1103: its length (4), usage
+//!   (2) and data; reply 0x8003: return code at 20, then (0) the output
+//!   and input-output parameters in order, each CP 0x1103 with its
+//!   length, usage and data, or the messages (0x0500 the program was not
+//!   found, 0x0501 it failed).
+//!
+//! Commands and programs run in the connection's job (one for the
+//! connection, as the server job QZRCSRVS of IBM i serves one client).
 
 use crate::hostsrv::{ebcdic, job_name_param, param, read_ds, reply, seed, text37, Ds};
 use anyhow::Result;
@@ -108,9 +116,10 @@ pub async fn serve(url: &str, mut sock: TcpStream) -> Result<()> {
                 let srv = server.as_mut().expect("signed on");
                 run_command(srv, &ds).await
             }
-            // Call program: not done yet (0x0500, an error resolving the
-            // program).
-            0x1003 => command_reply(0x8003, corr, 0x0500, &[]),
+            0x1003 => {
+                let srv = server.as_mut().expect("signed on");
+                call_program(srv, &ds).await
+            }
             // End: no reply.
             0x1004 => break,
             _ => command_reply(0x8002, corr, 0x0205, &[]),
@@ -119,6 +128,169 @@ pub async fn serve(url: &str, mut sock: TcpStream) -> Result<()> {
         sock.flush().await?;
     }
     Ok(())
+}
+
+/// A parameter of a program call: its length, whether the program's
+/// value goes back, its bytes.
+struct Parm {
+    max: usize,
+    out: bool,
+    data: Vec<u8>,
+}
+
+/// The parameters of a call program request. Usage (JTOpen
+/// RCCallProgramRequestDataStream): 11 input, 12 output, 13 and 33 input
+/// and output (trailing zeros left off, the data is the start of the
+/// parameter), 21, 22 and 23 the same with the data run-length
+/// compressed (22: output, no data), 255 null.
+fn call_parms(ds: &Ds) -> Vec<Parm> {
+    let v = &ds.0;
+    let n = ds.u16(41) as usize;
+    let mut out = Vec::with_capacity(n);
+    let mut at = 43;
+    for _ in 0..n {
+        let Some(h) = v.get(at..at + 12) else { break };
+        let ll = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
+        let max = u32::from_be_bytes([h[6], h[7], h[8], h[9]]) as usize;
+        let usage = u16::from_be_bytes([h[10], h[11]]);
+        let body = v.get(at + 12..at + ll.max(12)).unwrap_or_default();
+        let mut data = match usage {
+            21 | 23 => rle_expand(body, max),
+            22 | 0xFF => Vec::new(),
+            _ => body.to_vec(),
+        };
+        data.resize(max, 0);
+        out.push(Parm {
+            max,
+            out: matches!(usage % 10, 2 | 3),
+            data,
+        });
+        at += ll.max(12);
+    }
+    out
+}
+
+/// Run-length compressed bytes expanded (JTOpen DataStreamCompression:
+/// 0x1B 0x1B is 0x1B; 0x1B, two bytes and a 2-byte count repeats them).
+fn rle_expand(b: &[u8], max: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(max);
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != 0x1B {
+            out.push(b[i]);
+            i += 1;
+        } else if b.get(i + 1) == Some(&0x1B) {
+            out.push(0x1B);
+            i += 2;
+        } else if i + 4 < b.len() {
+            let count = u16::from_be_bytes([b[i + 3], b[i + 4]]) as usize;
+            for _ in 0..count {
+                out.extend([b[i + 1], b[i + 2]]);
+            }
+            i += 5;
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Call a program: return code 0 with the output parameters, 0x0500
+/// with the messages when it was not found (or not authorized), 0x0501
+/// when it failed.
+async fn call_program(srv: &mut crate::mapepire::Server<'_>, ds: &Ds) -> Vec<u8> {
+    let corr = ds.correlation();
+    let name = text37(ds.0.get(20..30).unwrap_or_default())
+        .trim()
+        .to_string();
+    let lib = text37(ds.0.get(30..40).unwrap_or_default())
+        .trim()
+        .to_string();
+    let parms = call_parms(ds);
+    let bytes: Vec<Vec<u8>> = parms.iter().map(|p| p.data.clone()).collect();
+    match srv.job.call_program_bytes(&lib, &name, bytes).await {
+        Ok((_, back)) => {
+            let mut t = 0u16.to_be_bytes().to_vec();
+            t.extend(0u16.to_be_bytes());
+            let mut p = Vec::new();
+            for (parm, b) in parms.iter().zip(back) {
+                if !parm.out {
+                    continue;
+                }
+                let mut d = (parm.max as u32).to_be_bytes().to_vec();
+                d.extend(12u16.to_be_bytes());
+                let mut b = b;
+                b.resize(parm.max, 0);
+                d.extend(b);
+                p.extend(param(0x1103, &d));
+            }
+            reply(0, 0, 0xE008, corr, 0x8003, &t, &p)
+        }
+        Err(e) => {
+            let text = format!("{e:#}");
+            let lines: Vec<&str> = text
+                .lines()
+                .filter(|l| crate::jobs::message_id(l).len() == 7)
+                .collect();
+            // The program (or its library) not there: MCH3401, its
+            // substitution data the object's type (02 01 a program, 04 01
+            // a library) and its name in 30 bytes, as JTOpen's
+            // RemoteCommandImplRemote runProgramOffThread reads it to
+            // throw ObjectDoesNotExistException.
+            if lines
+                .iter()
+                .any(|l| crate::jobs::message_id(l) == "CPD0170")
+            {
+                let lib_missing = !matches!(lib.as_str(), "" | "*LIBL" | "*CURLIB")
+                    && !crate::catalog::library_exists(srv.job.client, &lib)
+                        .await
+                        .unwrap_or(true);
+                let (code, object) = if lib_missing {
+                    ([0x04, 0x01], lib.clone())
+                } else {
+                    ([0x02, 0x01], name.clone())
+                };
+                let mut subst = code.to_vec();
+                subst.extend(ebcdic(&object, 30));
+                let m = crate::mapepire::ClMessage {
+                    id: "MCH3401".into(),
+                    text: format!("Object {object} cannot be found to be used."),
+                    kind: "ESCAPE".into(),
+                    severity: crate::pgmmsg::system_severity("MCH3401") as i64,
+                    file: Some("QCPFMSG"),
+                    library: Some("QSYS"),
+                };
+                return command_reply(0x8003, corr, 0x0500, &[message(&m, &subst)]);
+            }
+            let n = lines.len();
+            let messages: Vec<Vec<u8>> = lines
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let id = crate::jobs::message_id(l).to_string();
+                    let (library, file) = crate::mapepire::message_file_of(&id);
+                    let m = crate::mapepire::ClMessage {
+                        severity: crate::pgmmsg::system_severity(&id) as i64,
+                        text: crate::jobs::message_text(l).trim().to_string(),
+                        kind: if i + 1 == n { "ESCAPE" } else { "DIAGNOSTIC" }.into(),
+                        id,
+                        file,
+                        library,
+                    };
+                    message(&m, &[])
+                })
+                .collect();
+            let refused = lines
+                .iter()
+                .any(|l| matches!(crate::jobs::message_id(l), "CPF9801" | "CPF9802"));
+            command_reply(
+                0x8003,
+                corr,
+                if refused { 0x0500 } else { 0x0501 },
+                &messages,
+            )
+        }
+    }
 }
 
 /// Reply 0x8001: return code 0, the job's CCSID, its NLV (2924), version
@@ -178,7 +350,7 @@ async fn run_command(srv: &mut crate::mapepire::Server<'_>, ds: &Ds) -> Vec<u8> 
         return command_reply(0x8002, corr, 0x0301, &[]);
     };
     let (ok, messages) = srv.run_command(cmd.trim()).await;
-    let list: Vec<Vec<u8>> = messages.iter().map(message).collect();
+    let list: Vec<Vec<u8>> = messages.iter().map(|m| message(m, &[])).collect();
     command_reply(0x8002, corr, if ok { 0 } else { 0x0400 }, &list)
 }
 
@@ -188,7 +360,7 @@ async fn run_command(srv: &mut crate::mapepire::Server<'_>, ds: &Ds) -> Vec<u8> 
 /// completion, 02 diagnostic, 04 informational, 14 notify, 15 escape),
 /// the ID, the message file, its library, the text, the substitution
 /// data (none) and the help (none).
-fn message(m: &crate::mapepire::ClMessage) -> Vec<u8> {
+fn message(m: &crate::mapepire::ClMessage, subst: &[u8]) -> Vec<u8> {
     let field = |d: &mut Vec<u8>, b: &[u8]| {
         d.extend((b.len() as u32).to_be_bytes());
         d.extend(b);
@@ -208,7 +380,7 @@ fn message(m: &crate::mapepire::ClMessage) -> Vec<u8> {
     field(&mut d, &ebcdic(m.file.unwrap_or(""), 10));
     field(&mut d, &ebcdic(m.library.unwrap_or(""), 10));
     field(&mut d, &crate::ifs::codec::bytes(JOB_CCSID as i32, &m.text));
-    field(&mut d, &[]);
+    field(&mut d, subst);
     field(&mut d, &[]);
     param(0x1106, &d)
 }
@@ -216,6 +388,34 @@ fn message(m: &crate::mapepire::ClMessage) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_call_parameters_as_jtopen_sends_them() {
+        // RCCallProgramRequestDataStream: the template's program (20),
+        // library (30), message option (40), count (41); parameters
+        // from 43: LL, CP 0x1103, length, usage, data (input with its
+        // trailing zeros left off; 22 output with none; 21 compressed).
+        let mut v = vec![0u8; 43];
+        v[41..43].copy_from_slice(&3u16.to_be_bytes());
+        for (max, usage, data) in [
+            (6u32, 11u16, vec![0xC1, 0xC2]),
+            (4, 22, vec![]),
+            (8, 21, vec![0x1B, 0x40, 0x40, 0x00, 0x04]),
+        ] {
+            let mut d = max.to_be_bytes().to_vec();
+            d.extend(usage.to_be_bytes());
+            d.extend(data);
+            v.extend(param(0x1103, &d));
+        }
+        let p = call_parms(&Ds(v));
+        assert_eq!(p.len(), 3);
+        assert_eq!(
+            (p[0].data.as_slice(), p[0].out),
+            (&[0xC1, 0xC2, 0, 0, 0, 0][..], false)
+        );
+        assert_eq!((p[1].data.as_slice(), p[1].out), (&[0u8; 4][..], true));
+        assert_eq!(p[2].data, vec![0x40; 8]);
+    }
 
     #[test]
     fn exchange_attributes_where_jtopen_reads_them() {
@@ -238,7 +438,7 @@ mod tests {
             file: Some("QCPFMSG"),
             library: Some("QSYS"),
         };
-        let p = message(&m);
+        let p = message(&m, &[]);
         // LL, CP 0x1106 (byte 5 is 0x06), then the fields.
         assert_eq!(&p[4..6], &[0x11, 0x06]);
         let d = &p[6..];

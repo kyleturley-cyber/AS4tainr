@@ -28367,6 +28367,85 @@ async fn host_servers_sign_on_and_database_attributes() {
         "escape"
     );
     assert_eq!(as4tainr_core::hostsrv::text37(&m[20..27]), "CPF9801");
+    // Program calls (JTOpen RCCallProgramRequest/ReplyDataStream): the
+    // data queue APIs by reference (Send Data Queue: name, library,
+    // length packed(5,0), data; Receive Data Queue: name, library, length
+    // and data returned, wait), the output parameters back in order; a
+    // program that is not there: return code 0x0500 and MCH3401 with the
+    // object type 02 01 and its name in the substitution data (what
+    // RemoteCommandImplRemote turns into ObjectDoesNotExistException).
+    s.write_all(&command(&format!("CRTDTAQ DTAQ({lib}/HQ) MAXLEN(64)")))
+        .await
+        .unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(u16::from_be_bytes([r[20], r[21]]), 0);
+    let e = as4tainr_core::hostsrv::ebcdic;
+    let call = |pgm: &str, parms: &[(u32, u16, Vec<u8>)]| {
+        let mut t = e(pgm, 10);
+        t.extend(e("QSYS", 10));
+        t.push(0);
+        t.extend((parms.len() as u16).to_be_bytes());
+        let mut p = Vec::new();
+        for (max, usage, data) in parms {
+            let mut d = max.to_be_bytes().to_vec();
+            d.extend(usage.to_be_bytes());
+            d.extend(data);
+            p.extend(cp(0x1103, &d));
+        }
+        ds(&p, 0xE008, 0x1003, &t)
+    };
+    let send = call(
+        "QSNDDTAQ",
+        &[
+            (10, 11, e("HQ", 10)),
+            (10, 11, e(&lib, 10)),
+            (3, 11, vec![0x00, 0x00, 0x5F]),
+            (5, 11, e("HELLO", 5)),
+        ],
+    );
+    s.write_all(&send).await.unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(
+        (
+            u16::from_be_bytes([r[18], r[19]]),
+            u16::from_be_bytes([r[20], r[21]])
+        ),
+        (0x8003, 0)
+    );
+    let receive = call(
+        "QRCVDTAQ",
+        &[
+            (10, 11, e("HQ", 10)),
+            (10, 11, e(&lib, 10)),
+            (3, 22, vec![]),
+            (8, 22, vec![]),
+            (3, 11, vec![0x00, 0x00, 0x0F]),
+        ],
+    );
+    s.write_all(&receive).await.unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(u16::from_be_bytes([r[20], r[21]]), 0);
+    // Two output parameters from 24: the length, then the data.
+    assert_eq!(&r[28..30], &[0x11, 0x03]);
+    assert_eq!(&r[36..39], &[0x00, 0x00, 0x5F], "length 5");
+    let at = 24 + u32_at(&r, 24) as usize;
+    assert_eq!(&r[at + 12..at + 17], &e("HELLO", 5)[..]);
+    s.write_all(&call("NOSUCHPGM", &[])).await.unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(u16::from_be_bytes([r[20], r[21]]), 0x0500);
+    let m = &r[30..];
+    assert_eq!(as4tainr_core::hostsrv::text37(&m[20..27]), "MCH3401");
+    // After the ID, file, library and text: the substitution data.
+    let mut at = 27;
+    for _ in 0..3 {
+        at += 4 + u32_at(m, at) as usize;
+    }
+    let sub = &m[at + 4..at + 4 + u32_at(m, at) as usize];
+    assert_eq!(&sub[..2], &[0x02, 0x01]);
+    assert_eq!(
+        as4tainr_core::hostsrv::text37(&sub[2..32]).trim(),
+        "NOSUCHPGM"
+    );
     // The database server.
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();

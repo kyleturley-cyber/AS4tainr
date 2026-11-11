@@ -11,7 +11,7 @@ well-known ports:
 | Port mapper (as-svrmap) | 449 | Answers the ports of as-central 8470, as-database 8471, as-dtaq 8472, as-file 8473, as-netprt 8474, as-rmtcmd 8475, as-signon 8476 |
 | Sign-on (as-signon) | 8476 | Exchange of attributes (V7R5M0, server level 10, password level 2), sign-on with a password |
 | Database (as-database) | 8471 | Exchange of seeds, start server with a password, server attributes, SQL statements, parameter markers, CALL, commitment control, the SYSIBM metadata procedures (below) |
-| Remote command (as-rmtcmd) | 8475 | Exchange of seeds, start server, exchange attributes (data stream level 10), CL commands run with their messages (Toolbox `CommandCall`); program calls not yet |
+| Remote command (as-rmtcmd) | 8475 | Exchange of seeds, start server, exchange attributes (data stream level 10), CL commands run with their messages (Toolbox `CommandCall`), programs called with their parameters (`ProgramCall`: RPG and CL programs, the data queue, user space and retrieve APIs done here) |
 
 The data streams are the ones JTOpen's client side builds and reads; the
 server side is as4tainr's own (`core/src/hostsrv.rs`, `core/src/hostdb.rs`).
@@ -118,6 +118,17 @@ the command sent (completions, diagnostics, the escape message last),
 each with its ID, type, message file (QCPFMSG for CPx, QSQLMSG for
 SQL) and as4tainr's text. Severities are known only for the messages a
 capture showed (others are 0).
+
+A program call passes its parameters by reference: an RPG program gets
+their bytes; a CL program its variables from them (*CHAR and *LGL in
+EBCDIC, *DEC packed, *INT binary) and back; the APIs done in as4tainr
+(`sysapi.rs`) the storage, the packed decimal parameters of the data
+queue APIs typed as for PASE's `_PGMCALL`. The output and input-output
+parameters come back. A program or library that is not there is
+answered as JTOpen expects it (MCH3401 with the object's type and name
+in the substitution data: `ObjectDoesNotExistException`). The server
+says its job is number/QUSER/QZRCSRVS, so `ProgramCall.getServerJob`
+needs no API call.
 
 ## Passwords
 

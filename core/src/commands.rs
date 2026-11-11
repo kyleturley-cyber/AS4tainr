@@ -11214,6 +11214,149 @@ impl Job<'_> {
         }
     }
 
+    /// A program called with its parameters as bytes, by reference (as
+    /// the remote command server's program call passes them): the
+    /// parameters as the program left them. An RPG program gets the
+    /// bytes; a CL program its variables from them (*CHAR and *LGL in
+    /// EBCDIC, *DEC packed, *INT binary) and back; the system APIs done
+    /// here (sysapi.rs) the storage (their packed decimal parameters
+    /// typed, as for PASE's _PGMCALL).
+    pub async fn call_program_bytes(
+        &mut self,
+        lib: &str,
+        name: &str,
+        mut parms: Vec<Vec<u8>>,
+    ) -> Result<(Outcome, Vec<Vec<u8>>)> {
+        use crate::rpg::data::{a, e, load, store, DType, Fit, Value as RValue};
+        let name = name.trim().to_ascii_uppercase();
+        let lib = lib.trim().to_ascii_uppercase();
+        if crate::sysapi::is_api(&name) {
+            let mut types: Vec<DType> = parms.iter().map(|b| DType::Char(b.len() as u32)).collect();
+            for (k, digits) in crate::dtaq::packed_params(&name) {
+                if let Some(t) = types.get_mut(*k) {
+                    *t = DType::Packed(*digits, 0);
+                }
+            }
+            let mut args = crate::dtaq::RpgArgs(parms.into_iter().zip(types).collect());
+            let caller = self.dtaq_caller();
+            crate::sysapi::call_api(self.client, &caller, &name, &mut args).await?;
+            return Ok((
+                Outcome::Messages(Vec::new()),
+                args.0.into_iter().map(|(b, _)| b).collect(),
+            ));
+        }
+        let libs = match lib.as_str() {
+            "" | "*LIBL" => self.library_list(),
+            "*CURLIB" => vec![self.current_library()],
+            l => vec![crate::qtemp::real(l)],
+        };
+        let p = catalog::find_program(self.client, &libs, &name)
+            .await?
+            .ok_or_else(|| {
+                crate::cl::diag_error(
+                    "CPD0170",
+                    &format!(
+                        "Program {name} was not found in library {}.",
+                        if lib.is_empty() { "*LIBL" } else { &lib }
+                    ),
+                )
+            })?;
+        authority::check(self.client, &self.user, &p.library, &name, "*PGM", Aut::Use).await?;
+        if matches!(p.attribute.as_str(), "CLLE" | "CLP") {
+            let mut libl = self.library_list();
+            if !libl.contains(&p.library) {
+                libl.push(p.library.clone());
+            }
+            let mut program =
+                crate::clpgm::compile_in(self.client, &libl, &name, &p.source).await?;
+            program.object = format!("{}/{}", p.library, name);
+            program.binding = p.binding.clone();
+            program.pep = p.attribute == "CLLE";
+            // Each parameter's variable: its type for the bytes.
+            let types: Vec<DType> = program
+                .params
+                .iter()
+                .map(|n| {
+                    let v = program.decls.iter().find(|(d, _)| d == n).map(|(_, v)| v);
+                    match v.map(|v| (&v.ty, v.len, v.decimals)) {
+                        Some((crate::clpgm::VarType::Dec, len, dec)) => DType::Packed(len, dec),
+                        Some((crate::clpgm::VarType::Int, len, _)) => DType::Int(match len {
+                            2 => 5,
+                            8 => 20,
+                            _ => 10,
+                        }),
+                        Some((_, len, _)) => DType::Char(len),
+                        None => DType::Char(0),
+                    }
+                })
+                .collect();
+            let mut texts = Vec::new();
+            for (b, t) in parms.iter().zip(&types) {
+                texts.push(match t {
+                    DType::Char(_) => a(b),
+                    t => match load(t, &b[..t.size().min(b.len())]) {
+                        Ok(RValue::Num(d)) => d.to_string(),
+                        _ => "0".to_string(),
+                    },
+                });
+            }
+            let out = crate::clpgm::run(self, &program, &texts).await;
+            let back = self.calls.returned.take().unwrap_or(texts);
+            for ((b, t), v) in parms.iter_mut().zip(&types).zip(back) {
+                match t {
+                    DType::Char(_) => {
+                        let new = e(&v);
+                        let n = new.len().min(b.len());
+                        b[..n].copy_from_slice(&new[..n]);
+                    }
+                    t => {
+                        if let Ok(d) = crate::rpg::dec::Dec::parse(v.trim()) {
+                            let n = t.size().min(b.len());
+                            let _ = store(
+                                t,
+                                &RValue::Num(d),
+                                &mut b[..n],
+                                Fit::Truncate { half_adjust: false },
+                                false,
+                            );
+                        }
+                    }
+                }
+            }
+            return out.map(|o| (o, parms));
+        }
+        let code = crate::rpg::ProgramCode {
+            library: Some(p.library.clone()),
+            source: p.source,
+            options: p.options,
+            binding: p.binding,
+        };
+        let (r, back) = crate::rpg::call_bytes(
+            &self.env.database_url,
+            self.library_list(),
+            self.user.clone(),
+            self.id.as_ref().map(|i| i.to_string()),
+            Some(crate::rpg::ClContext {
+                env: self.env.clone(),
+                curlib: self.curlib.clone(),
+                user_libl: self.libl.clone(),
+                overrides: self.calls.overrides.clone(),
+                caller_group: None,
+            }),
+            name.clone(),
+            code,
+            parms,
+            None,
+        )
+        .await?;
+        self.calls.log_from_program(r.logged.clone());
+        if let Some(err) = r.error {
+            bail!("{err:#}\nProgram {name} ended abnormally.");
+        }
+        let msgs = r.messages.iter().map(|m| format!("DSPLY  {m}")).collect();
+        Ok((Outcome::Messages(msgs), back))
+    }
+
     /// The job as the data queue APIs see it.
     fn dtaq_caller(&self) -> crate::dtaq::Caller {
         crate::dtaq::Caller {

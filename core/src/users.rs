@@ -31,6 +31,10 @@ CREATE TABLE IF NOT EXISTS as4tainr.user_profiles (
     last_signon   timestamptz,
     created       timestamptz NOT NULL DEFAULT now()
 );
+-- The host servers' password tokens (hostsrv.rs): SHA-1 of the user ID
+-- and the password, as the client computes them for password level 2
+-- and up; kept when a password is set or used to sign on.
+ALTER TABLE as4tainr.user_profiles ADD COLUMN IF NOT EXISTS host_tokens bytea[] NOT NULL DEFAULT '{}';
 ALTER TABLE as4tainr.user_profiles ADD COLUMN IF NOT EXISTS usrcls text NOT NULL DEFAULT '*USER';
 UPDATE as4tainr.user_profiles SET usrcls = '*SECOFR' WHERE name = 'QSECOFR' AND usrcls = '*USER';
 -- QSECOFR is shipped without a current library (*CRTDFT); profiles made
@@ -279,7 +283,126 @@ pub async fn create(client: &Client, p: NewProfile) -> Result<()> {
     if n == 0 {
         bail!("User profile {name} already exists.");
     }
+    match &p.password {
+        NewPassword::SameAsProfile => store_host_tokens(client, &name, &name).await?,
+        NewPassword::Value(pw) => store_host_tokens(client, &name, pw).await?,
+        NewPassword::None => {}
+    }
     Ok(())
+}
+
+/// A host server password token (password level 2 and up): SHA-1 of the
+/// user ID (10 characters, blank-padded) and the password (trailing
+/// blanks dropped), both as UTF-16 big-endian characters (JTOpen
+/// AS400ImplRemote generateShaToken, the client side of the exchange).
+pub fn host_token(user: &str, password: &str) -> Vec<u8> {
+    let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(|c| c.to_be_bytes()).collect() };
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
+    ctx.update(&utf16(&format!("{:<10}", user.trim().to_ascii_uppercase())));
+    ctx.update(&utf16(password.trim_end_matches([' ', '\0', '\u{3000}'])));
+    ctx.finish().as_ref().to_vec()
+}
+
+/// Keep the host server tokens of a password: as given, and at password
+/// levels 0 and 1, where passwords are not case-sensitive, in upper and
+/// lower case too (the client sends the password as typed).
+pub async fn store_host_tokens(client: &Client, user: &str, password: &str) -> Result<()> {
+    let user = user.trim().to_ascii_uppercase();
+    let mut forms = vec![password.to_string()];
+    if password_level() <= 1 {
+        forms.push(password.to_uppercase());
+        forms.push(password.to_lowercase());
+    }
+    forms.dedup();
+    let mut tokens: Vec<Vec<u8>> = Vec::new();
+    for f in forms {
+        let t = host_token(&user, &f);
+        if !tokens.contains(&t) {
+            tokens.push(t);
+        }
+    }
+    client
+        .execute(
+            "UPDATE as4tainr.user_profiles SET host_tokens = $2 WHERE name = $1",
+            &[&user, &tokens],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Sign on with a host server's password substitute (password level 2
+/// and up): SHA-1 of a kept token, the server's seed, the client's seed,
+/// the user ID (UTF-16, blank-padded to 10) and the sequence number 1
+/// (JTOpen AS400ImplRemote generateShaSubstitute). The profile, or the
+/// host server return code: 0x00020001 user unknown, 0x00020002 disabled,
+/// 0x0003000B password not correct, 0x0003000D expired, 0x00030010 no
+/// password (JTOpen returnSecurityException).
+pub async fn host_signon(
+    client: &Client,
+    user: &str,
+    client_seed: &[u8],
+    server_seed: &[u8],
+    substitute: &[u8],
+) -> std::result::Result<Profile, u32> {
+    let user = user.trim().to_ascii_uppercase();
+    let row = client
+        .query_opt(
+            "SELECT host_tokens, password_hash, pwd_expired, special_auth, curlib, text, status, inlpgm, inlmnu
+             FROM as4tainr.user_profiles WHERE name = $1",
+            &[&user],
+        )
+        .await
+        .map_err(|_| 0x0002_0001u32)?
+        .ok_or(0x0002_0001u32)?;
+    let status: String = row.get(6);
+    if status != "*ENABLED" {
+        return Err(0x0002_0002);
+    }
+    let hash: String = row.get(1);
+    if hash == NO_PASSWORD {
+        return Err(0x0003_0010);
+    }
+    let tokens: Vec<Vec<u8>> = row.get(0);
+    let uid: Vec<u8> = format!("{:<10}", user)
+        .encode_utf16()
+        .flat_map(|c| c.to_be_bytes())
+        .collect();
+    let ok = tokens.iter().any(|t| {
+        let mut ctx = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
+        ctx.update(t);
+        ctx.update(server_seed);
+        ctx.update(client_seed);
+        ctx.update(&uid);
+        ctx.update(&[0, 0, 0, 0, 0, 0, 0, 1]);
+        ctx.finish().as_ref() == substitute
+    });
+    if !ok {
+        let _ = client
+            .execute(
+                "UPDATE as4tainr.user_profiles SET invalid_signons = invalid_signons + 1 WHERE name = $1",
+                &[&user],
+            )
+            .await;
+        return Err(0x0003_000B);
+    }
+    if row.get::<_, bool>(2) {
+        return Err(0x0003_000D);
+    }
+    let _ = client
+        .execute(
+            "UPDATE as4tainr.user_profiles SET last_signon = now(), invalid_signons = 0 WHERE name = $1",
+            &[&user],
+        )
+        .await;
+    Ok(Profile {
+        name: user,
+        pwd_expired: false,
+        special_auth: row.get(3),
+        curlib: row.get(4),
+        text: row.get(5),
+        inlpgm: row.get(7),
+        inlmnu: row.get(8),
+    })
 }
 
 /// A profile's description, or None if it does not exist.
@@ -325,7 +448,8 @@ pub async fn reset_password(client: &Client, name: &str) -> Result<bool> {
             &[&name, &hash_password(&normalized(&name))?],
         )
         .await?
-        > 0)
+        > 0
+        && store_host_tokens(client, &name, &name).await.is_ok())
 }
 
 /// CHGUSRPRF: the attributes to change (None = leave as is).
@@ -471,6 +595,9 @@ pub async fn authenticate(client: &Client, user: &str, password: &str) -> Result
             &[&user],
         )
         .await?;
+    // The host servers' tokens of the password just used (profiles made
+    // before they were kept get them at their next sign-on).
+    let _ = store_host_tokens(client, &user, password).await;
     // QPWDEXPITV: a password older than that many days must be changed.
     let days = crate::clpgm::system_value_text("QPWDEXPITV")
         .and_then(|v| v.ok())
@@ -522,6 +649,7 @@ pub async fn change_password(client: &Client, user: &str, current: &str, new: &s
             &[&user, &hash_password(&normalized(new))?],
         )
         .await?;
+    store_host_tokens(client, user, new).await?;
     Ok(())
 }
 

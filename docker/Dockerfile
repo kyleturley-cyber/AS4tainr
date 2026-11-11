@@ -27,4 +27,7 @@ EXPOSE 8080
 EXPOSE 22
 # Mapepire over secure WebSockets, when AS4TAINR_MAPEPIRE_LISTEN is set.
 EXPOSE 8076
+# IBM i host servers (ACS, the IBM Toolbox for Java's JDBC driver), when
+# AS4TAINR_HOSTSERVER_LISTEN is set: port mapper, sign-on, database.
+EXPOSE 449 8476 8471
 ENTRYPOINT ["/opt/as4tainr/entrypoint.sh"]

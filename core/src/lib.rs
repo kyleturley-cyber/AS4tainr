@@ -42,6 +42,8 @@ pub mod dtaara;
 pub mod dtaq;
 pub mod envvar;
 pub mod fdout;
+pub mod hostdb;
+pub mod hostsrv;
 pub mod ibmcmds;
 pub mod ifs;
 pub mod ifs_commands;

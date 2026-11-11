@@ -28181,3 +28181,152 @@ async fn data_members_in_qsys_lib_and_the_reply_list() {
     .unwrap_err();
     assert!(e.contains("CPD0032") && e.contains("CPF0006"), "{e}");
 }
+
+#[tokio::test]
+async fn host_servers_sign_on_and_database_attributes() {
+    // The sign-on and database host servers as JTOpen's client side
+    // drives them (IBM Toolbox for Java, open source: SignonExchange-
+    // AttributeReq/Rep, SignonInfoReq/Rep, AS400XChgRandSeedDS,
+    // AS400StrSvrDS, DBSQLAttributesDS, DBReplyServerAttributes): the
+    // password substitute of password level 2 (SHA-1 of the token, the
+    // server's and the client's seeds, the user ID and sequence 1),
+    // return code 0x0003000B for a wrong password, the server attributes,
+    // and error class 7, return code -201 for function 0x0000 (what
+    // Connection.isValid takes as a live connection).
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let user = format!("H{}", &lib[lib.len().saturating_sub(8)..]);
+    as4tainr_core::users::create(
+        &client,
+        as4tainr_core::users::NewProfile {
+            name: user.clone(),
+            password: as4tainr_core::users::NewPassword::Value("PW123".into()),
+            expired: false,
+            enabled: true,
+            usrcls: "*USER".into(),
+            special: vec![],
+            curlib: "*CRTDFT".into(),
+            text: String::new(),
+            inlpgm: "*NONE".into(),
+            inlmnu: "MAIN".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let ds = |len_extra: &[u8], server: u16, req: u16, template: &[u8]| -> Vec<u8> {
+        let len = 20 + template.len() + len_extra.len();
+        let mut v = (len as u32).to_be_bytes().to_vec();
+        v.extend([0, 0]);
+        v.extend(server.to_be_bytes());
+        v.extend(0u32.to_be_bytes());
+        v.extend(9u32.to_be_bytes());
+        v.extend((template.len() as u16).to_be_bytes());
+        v.extend(req.to_be_bytes());
+        v.extend(template);
+        v.extend(len_extra);
+        v
+    };
+    let cp = |c: u16, d: &[u8]| as4tainr_core::hostsrv::param(c, d);
+    async fn read(s: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut len = [0u8; 4];
+        s.read_exact(&mut len).await.unwrap();
+        let mut v = vec![0u8; u32::from_be_bytes(len) as usize];
+        v[..4].copy_from_slice(&len);
+        s.read_exact(&mut v[4..]).await.unwrap();
+        v
+    }
+    let u32_at = |v: &[u8], i: usize| u32::from_be_bytes([v[i], v[i + 1], v[i + 2], v[i + 3]]);
+    let substitute = |pw: &str, server_seed: &[u8], client_seed: &[u8]| -> Vec<u8> {
+        let token = as4tainr_core::users::host_token(&user, pw);
+        let uid: Vec<u8> = format!("{:<10}", user)
+            .encode_utf16()
+            .flat_map(|c| c.to_be_bytes())
+            .collect();
+        let mut c = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
+        c.update(&token);
+        c.update(server_seed);
+        c.update(client_seed);
+        c.update(&uid);
+        c.update(&[0, 0, 0, 0, 0, 0, 0, 1]);
+        c.finish().as_ref().to_vec()
+    };
+    let uid37 = as4tainr_core::hostsrv::ebcdic(&user, 10);
+    let client_seed = [1u8, 2, 3, 4, 5, 6, 7, 8];
+    // The sign-on server.
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let u2 = url.clone();
+    tokio::spawn(async move {
+        for _ in 0..2 {
+            let (s, _) = l.accept().await.unwrap();
+            let u = u2.clone();
+            tokio::spawn(async move { as4tainr_core::hostsrv::signon(&u, s).await });
+        }
+    });
+    for (pw, want) in [("PW123", 0u32), ("WRONG", 0x0003_000B)] {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut p = cp(0x1101, &1u32.to_be_bytes());
+        p.extend(cp(0x1102, &10u16.to_be_bytes()));
+        p.extend(cp(0x1103, &client_seed));
+        s.write_all(&ds(&p, 0xE009, 0x7003, &[])).await.unwrap();
+        let r = read(&mut s).await;
+        assert_eq!(u32_at(&r, 20), 0);
+        assert_eq!(u32_at(&r, 30), 0x0007_0500);
+        let mut server_seed = Vec::new();
+        let mut at = 42;
+        while at + 6 <= r.len() {
+            let ll = u32_at(&r, at) as usize;
+            if u16::from_be_bytes([r[at + 4], r[at + 5]]) == 0x1103 {
+                server_seed = r[at + 6..at + ll].to_vec();
+            }
+            at += ll;
+        }
+        assert_eq!(server_seed.len(), 8);
+        let mut p = cp(0x1113, &1200u32.to_be_bytes());
+        p.extend(cp(0x1105, &substitute(pw, &server_seed, &client_seed)));
+        p.extend(cp(0x1104, &uid37));
+        s.write_all(&ds(&p, 0xE009, 0x7004, &[3])).await.unwrap();
+        let r = read(&mut s).await;
+        assert_eq!(u32_at(&r, 20), want, "{pw}");
+    }
+    // The database server.
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let u2 = url.clone();
+    tokio::spawn(async move {
+        let (s, _) = l.accept().await.unwrap();
+        as4tainr_core::hostdb::serve(&u2, s).await
+    });
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(&ds(&[], 0xE004, 0x7001, &client_seed))
+        .await
+        .unwrap();
+    let r = read(&mut s).await;
+    assert_eq!((u32_at(&r, 20), r[5]), (0, 2), "password level 2 in byte 5");
+    let server_seed = r[24..32].to_vec();
+    let mut p = cp(0x1105, &substitute("PW123", &server_seed, &client_seed));
+    p.extend(cp(0x1104, &uid37));
+    s.write_all(&ds(&p, 0xE004, 0x7002, &[3, 1])).await.unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(u32_at(&r, 20), 0);
+    let mut t = vec![0u8; 20];
+    t[..4].copy_from_slice(&0x8100_0000u32.to_be_bytes());
+    s.write_all(&ds(&cp(0x3807, &1u16.to_be_bytes()), 0xE004, 0x1F80, &t))
+        .await
+        .unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(u16::from_be_bytes([r[18], r[19]]), 0x2800);
+    assert_eq!(u16::from_be_bytes([r[40 + 4], r[40 + 5]]), 0x3804);
+    // The date format asked for comes back (first field of the data).
+    assert_eq!(u16::from_be_bytes([r[48], r[49]]), 1);
+    s.write_all(&ds(&[], 0xE004, 0x0000, &t)).await.unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(
+        (
+            u16::from_be_bytes([r[34], r[35]]),
+            i32::from_be_bytes([r[36], r[37], r[38], r[39]])
+        ),
+        (7, -201)
+    );
+}

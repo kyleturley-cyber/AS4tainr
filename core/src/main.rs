@@ -210,6 +210,11 @@ enum Cmd {
         /// port 8076 on IBM i) on this address, for example 0.0.0.0:8076.
         #[arg(long, env = "AS4TAINR_MAPEPIRE_LISTEN")]
         mapepire_listen: Option<String>,
+        /// Also serve the IBM i host servers ACS and the JDBC driver of
+        /// the IBM Toolbox for Java use (port mapper 449, sign-on 8476,
+        /// database 8471) on this IP address, for example 0.0.0.0.
+        #[arg(long, env = "AS4TAINR_HOSTSERVER_LISTEN")]
+        hostserver_listen: Option<String>,
     },
     /// CALL: run a program (CL or RPG) as QSECOFR, outside any job.
     Call { program: String, args: Vec<String> },
@@ -662,6 +667,7 @@ async fn run(cli: Cli) -> Result<u8> {
             web_listen,
             ssh_listen,
             mapepire_listen,
+            hostserver_listen,
         } => {
             // Make sure the catalog and QSECOFR exist before anyone signs on.
             let client = runtime::connect_db(&cli.database_url).await?;
@@ -726,6 +732,19 @@ async fn run(cli: Cli) -> Result<u8> {
                     None => std::future::pending().await,
                 }
             };
+            let hs = match hostserver_listen.filter(|s| !s.is_empty()) {
+                Some(ip) => Some(tokio::spawn(as4tainr_core::hostsrv::run(
+                    cli.database_url.clone(),
+                    ip,
+                ))),
+                None => None,
+            };
+            let hs = async move {
+                match hs {
+                    Some(t) => t.await?,
+                    None => std::future::pending().await,
+                }
+            };
             let cfg = tn5250::ServerConfig {
                 env: commands::Environment {
                     database_url: cli.database_url,
@@ -746,6 +765,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 r = web => r?,
                 r = ssh => r?,
                 r = mp => r?,
+                r = hs => r?,
                 pd = power => {
                     let pd = pd?;
                     power_down(&db_url, &pd).await?;

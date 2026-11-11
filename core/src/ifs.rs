@@ -725,6 +725,15 @@ pub mod codec {
     }
 
     /// Text in a CCSID as a Rust string.
+    /// Text as bytes in a CCSID.
+    pub fn bytes(ccsid: i32, s: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(s.len());
+        for c in s.chars() {
+            encode_char(ccsid, c, &mut out);
+        }
+        out
+    }
+
     pub fn text(ccsid: i32, b: &[u8]) -> String {
         String::from_utf8_lossy(&convert(ccsid, 1208, b)).into_owned()
     }

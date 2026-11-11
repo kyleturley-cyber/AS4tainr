@@ -99,6 +99,7 @@ pub mod sqlcat;
 pub mod sqlfn;
 pub mod sqljson;
 pub mod sqljsonfn;
+pub mod sqlmeta;
 pub mod sqlpl;
 pub mod sqlstmlist;
 pub mod sqlvar;

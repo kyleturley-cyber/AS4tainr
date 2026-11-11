@@ -383,6 +383,7 @@ async fn sql_request(
                 Err(e) => return fail(ds, e, last),
             };
             let mut count = 0u64;
+            let mut results = 0;
             for values in rows {
                 let q = if values.is_empty() {
                     Ok(sql.clone())
@@ -391,11 +392,18 @@ async fn sql_request(
                 };
                 match async { run(srv, &q?, dt, false).await }.await {
                     Ok(Ran::Count(n)) => count += n,
-                    Ok(Ran::Rows(_)) => {}
+                    // A CALL's result set: SQLERRD(2) says there is one,
+                    // the client opens it (open and describe).
+                    Ok(Ran::Rows(c)) => {
+                        let s = stmts.entry(rpb).or_default();
+                        s.result = Some(c);
+                        s.described = None;
+                        results = 1;
+                    }
                     Err(e) => return fail(ds, e, last),
                 }
             }
-            db_reply(ds, 0, 0, &sqlca(0, "00000", count as i32))
+            db_reply(ds, 0, 0, &sqlca_with(0, "00000", count as i32, results))
         }
         // Open and describe (0x1804), open, describe and fetch (0x180E),
         // execute or open and describe (0x1812): the cursor over the
@@ -1591,6 +1599,11 @@ fn zoned(v: &str, p: usize, s: usize) -> Vec<u8> {
 /// SQLCODE at 12, SQLERRMC, SQLERRP, SQLERRD at 96 (rows changed in the
 /// third), SQLWARN at 120, SQLSTATE at 131 in EBCDIC).
 fn sqlca(code: i32, state: &str, rows: i32) -> Vec<u8> {
+    sqlca_with(code, state, rows, 0)
+}
+
+/// An SQLCA with the number of result sets of a CALL in SQLERRD(2).
+fn sqlca_with(code: i32, state: &str, rows: i32, results: i32) -> Vec<u8> {
     let mut d = ebcdic("SQLCA", 8);
     d.extend(136u32.to_be_bytes());
     d.extend(code.to_be_bytes());
@@ -1598,7 +1611,12 @@ fn sqlca(code: i32, state: &str, rows: i32) -> Vec<u8> {
     d.extend([0u8; 70]); // SQLERRMC
     d.extend(ebcdic("QSQ", 8)); // SQLERRP
     for i in 0..6 {
-        d.extend(if i == 2 { rows } else { 0 }.to_be_bytes());
+        let v = match i {
+            1 => results,
+            2 => rows,
+            _ => 0,
+        };
+        d.extend(v.to_be_bytes());
     }
     d.extend(ebcdic("", 11)); // SQLWARN
     d.extend(ebcdic(state, 5));

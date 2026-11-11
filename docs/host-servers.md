@@ -61,6 +61,29 @@ length is described as VARCHAR(32739), a decimal expression as
 DECIMAL(31, 10). Values come as the client lays them out (dates and
 times in ISO form) and are put into the statement as literals.
 
+### Database metadata
+
+At V7R5 the JDBC driver answers `DatabaseMetaData` by calling the
+catalog procedures of SYSIBM (`CALL SYSIBM.SQLTABLES(?, ?, ?, ?, ?)`
+and so on). as4tainr answers them (`core/src/sqlmeta.rs`, from any SQL
+client: the host servers, Mapepire, `db2`) with a query of the QSYS2
+catalog views that returns the result set the JDBC API defines:
+
+| Procedure | DatabaseMetaData | From |
+| --- | --- | --- |
+| SQLTABLES | getTables, getSchemas, getCatalogs, getTableTypes | SYSTABLES, SYSSCHEMAS |
+| SQLCOLUMNS | getColumns | SYSCOLUMNS |
+| SQLPRIMARYKEYS | getPrimaryKeys | SYSCST, SYSKEYCST |
+| SQLFOREIGNKEYS | getImportedKeys, getExportedKeys, getCrossReference | SYSREFCST, SYSKEYCST |
+| SQLSTATISTICS | getIndexInfo | SYSINDEXES, SYSKEYS, primary key and unique constraints |
+| SQLSPECIALCOLUMNS | getBestRowIdentifier (the primary key), getVersionColumns (none) | SYSKEYCST, SYSCOLUMNS |
+| SQLPROCEDURES, SQLPROCEDURECOLS, SQLFUNCTIONS | getProcedures, getProcedureColumns, getFunctions | SYSROUTINES, SYSPARMS |
+| SQLGETTYPEINFO | getTypeInfo | the types as4tainr's SQL has |
+| SQLTABLEPRIVILEGES, SQLCOLPRIVILEGES, SQLUDTS, SQLFUNCTIONCOLS, SQLPSEUDOCOLUMNS | | no rows |
+
+A CALL's result set is reported in the SQLCA (SQLERRD(2), the number
+of result sets) and the client opens it with open and describe.
+
 ## Passwords
 
 The servers announce password level 2: the client sends a SHA-1 password

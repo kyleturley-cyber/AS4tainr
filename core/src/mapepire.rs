@@ -834,6 +834,14 @@ impl<'a> Server<'a> {
                 }
             };
         }
+        // The catalog procedures of SYSIBM a JDBC client calls for its
+        // metadata: their result set (sqlmeta.rs).
+        if let Some(q) = crate::sqlmeta::query(&up, args) {
+            return match Box::pin(self.statement(&q)).await? {
+                Done::Rows(r) => Ok(Done::Call(Some(r), Vec::new())),
+                other => Ok(other),
+            };
+        }
         let libl = self.libl();
         let curlib = Some(self.job.current_library());
         let client = self.job.client;

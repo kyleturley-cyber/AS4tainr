@@ -28520,6 +28520,36 @@ async fn host_servers_sign_on_and_database_attributes() {
     let d = find(&r, 0x380E);
     assert_eq!(u32_at(&d, 4), 1, "rows");
     assert_eq!(&d[22..26], b"d'  ");
+    // A catalog procedure (JDBC DatabaseMetaData.getColumns): one result
+    // set (SQLERRD(2) of the SQLCA), opened by open and describe, its
+    // columns those java.sql.DatabaseMetaData lists.
+    let call = format!("CALL SYSIBM.SQLCOLUMNS(NULL, '{lib}', 'HT', '%', 'DATATYPE=''JDBC''')");
+    let r = exchange(&mut s, msg(0x1806, 0x0200_0000, &call)).await;
+    assert_eq!(class_rc(&r), (0, 0));
+    let ca = find(&r, 0x3807);
+    assert_eq!(
+        i32::from_be_bytes([ca[100], ca[101], ca[102], ca[103]]),
+        1,
+        "SQLERRD(2)"
+    );
+    let r = exchange(&mut s, msg(0x1804, 0x8C00_0000, "")).await;
+    let f = find(&r, 0x380C);
+    assert_eq!(u32f(&f, 4), 24, "getColumns' columns");
+    let name = |i: usize| {
+        let at = 16 + 64 * i;
+        let n = u16::from_be_bytes([f[at + 30], f[at + 31]]) as usize;
+        String::from_utf8_lossy(&f[at + 34..at + 34 + n]).into_owned()
+    };
+    assert_eq!(
+        (name(3), name(4), name(23)),
+        (
+            "COLUMN_NAME".into(),
+            "DATA_TYPE".into(),
+            "IS_GENERATEDCOLUMN".into()
+        )
+    );
+    let d = find(&r, 0x380E);
+    assert_eq!(u32_at(&d, 4), 3, "ID, AMT, NM");
     let r = exchange(
         &mut s,
         msg(0x1803, 0x8200_0000, &format!("SELECT * FROM {lib}.NOPE")),

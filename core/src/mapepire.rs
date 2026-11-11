@@ -370,6 +370,18 @@ pub struct Server<'a> {
     pub(crate) more_results: Vec<Results>,
 }
 
+/// A message a CL command sent: its ID, text, type (COMPLETION,
+/// DIAGNOSTIC, ESCAPE...), severity and message file.
+#[derive(Debug, Clone)]
+pub(crate) struct ClMessage {
+    pub id: String,
+    pub text: String,
+    pub kind: String,
+    pub severity: i64,
+    pub file: Option<&'static str>,
+    pub library: Option<&'static str>,
+}
+
 /// The version `getversion` reports: as4tainr's own.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -970,6 +982,37 @@ impl<'a> Server<'a> {
             })
             .collect();
         Ok(Done::Call(results, parms))
+    }
+
+    /// Run a CL command in the job: whether it ran, and the messages it
+    /// sent (as the `cl` request returns them).
+    pub(crate) async fn run_command(&mut self, cmd: &str) -> (bool, Vec<ClMessage>) {
+        let legacy = self.legacy_cl;
+        self.legacy_cl = false;
+        let mut reply = Vec::new();
+        let r = self.cl(cmd, &mut reply).await;
+        self.legacy_cl = legacy;
+        let data = reply.into_iter().find(|(k, _)| k == "data").map(|(_, v)| v);
+        let messages = match data {
+            Some(J::Arr(list)) => list
+                .iter()
+                .map(|m| {
+                    let s = |k: &str| m.get(k).and_then(J::text).unwrap_or_default();
+                    let id = s("id");
+                    let (library, file) = message_file(&id);
+                    ClMessage {
+                        severity: s("severity").parse().unwrap_or(0),
+                        text: s("text"),
+                        kind: s("type"),
+                        id,
+                        file,
+                        library,
+                    }
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        (r.is_ok(), messages)
     }
 
     /// The procedure a CALL names, found as CALL finds it (the library

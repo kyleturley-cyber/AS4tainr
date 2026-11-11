@@ -28290,6 +28290,83 @@ async fn host_servers_sign_on_and_database_attributes() {
         let r = read(&mut s).await;
         assert_eq!(u32_at(&r, 20), want, "{pw}");
     }
+    // The remote command server (JTOpen RCExchangeAttributes and
+    // RCRunCommand data streams, RemoteCommandImplRemote): the command in
+    // CCSID 1200 (data stream level 10), return code 0x0400 when it
+    // failed, its messages (CP 0x1106; type 15 escape). CPF9801 for
+    // CHKOBJ of an object that is not there (CL reference, CHKOBJ).
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let u2 = url.clone();
+    tokio::spawn(async move {
+        let (s, _) = l.accept().await.unwrap();
+        as4tainr_core::hostcmd::serve(&u2, s).await
+    });
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(&ds(&[], 0xE008, 0x7001, &client_seed))
+        .await
+        .unwrap();
+    let r = read(&mut s).await;
+    let server_seed = r[24..32].to_vec();
+    let mut p = cp(0x1105, &substitute("PW123", &server_seed, &client_seed));
+    p.extend(cp(0x1104, &uid37));
+    s.write_all(&ds(&p, 0xE008, 0x7002, &[3, 1])).await.unwrap();
+    assert_eq!(u32_at(&read(&mut s).await, 20), 0);
+    let mut t = 37u32.to_be_bytes().to_vec();
+    t.extend(as4tainr_core::hostsrv::ebcdic("2924", 4));
+    t.extend(1u32.to_be_bytes());
+    s.write_all(&ds(&[], 0xE008, 0x1001, &t)).await.unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(
+        (
+            u16::from_be_bytes([r[18], r[19]]),
+            u16::from_be_bytes([r[20], r[21]])
+        ),
+        (0x8001, 0)
+    );
+    let level = u16::from_be_bytes([r[34], r[35]]);
+    assert!(level >= 10, "{level}");
+    let command = |c: &str| {
+        let mut d = 1200u32.to_be_bytes().to_vec();
+        d.extend(c.encode_utf16().flat_map(|u| u.to_be_bytes()));
+        ds(&cp(0x1104, &d), 0xE008, 0x1002, &[4])
+    };
+    s.write_all(&command(&format!(
+        "CRTDTAARA DTAARA({lib}/CMDA) TYPE(*CHAR) LEN(5)"
+    )))
+    .await
+    .unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(
+        (
+            u16::from_be_bytes([r[18], r[19]]),
+            u16::from_be_bytes([r[20], r[21]])
+        ),
+        (0x8002, 0)
+    );
+    let n: i64 = client
+        .query_one(
+            "SELECT count(*) FROM as4tainr.objects WHERE library = $1 AND name = 'CMDA'",
+            &[&lib],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 1, "the data area made");
+    s.write_all(&command(&format!("CHKOBJ OBJ({lib}/NOPE) OBJTYPE(*FILE)")))
+        .await
+        .unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(u16::from_be_bytes([r[20], r[21]]), 0x0400, "failed");
+    assert_eq!(u16::from_be_bytes([r[22], r[23]]), 1, "one message");
+    assert_eq!(&r[28..30], &[0x11, 0x06]);
+    let m = &r[30..];
+    assert_eq!(
+        &m[14..16],
+        &as4tainr_core::hostsrv::ebcdic("15", 2)[..],
+        "escape"
+    );
+    assert_eq!(as4tainr_core::hostsrv::text37(&m[20..27]), "CPF9801");
     // The database server.
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();

@@ -59,6 +59,7 @@ pub async fn run(database_url: String, ip: String) -> Result<()> {
         ("as-svrmap", 449u16),
         ("as-signon", 8476),
         ("as-database", 8471),
+        ("as-rmtcmd", 8475),
     ] {
         let addr = format!("{ip}:{port}");
         let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -80,6 +81,7 @@ pub async fn run(database_url: String, ip: String) -> Result<()> {
                     let r = match name {
                         "as-svrmap" => port_mapper(sock).await,
                         "as-signon" => signon(&url, sock).await,
+                        "as-rmtcmd" => crate::hostcmd::serve(&url, sock).await,
                         _ => crate::hostdb::serve(&url, sock).await,
                     };
                     if let Err(e) = r {

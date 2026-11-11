@@ -10,7 +10,8 @@ well-known ports:
 | --- | --- | --- |
 | Port mapper (as-svrmap) | 449 | Answers the ports of as-central 8470, as-database 8471, as-dtaq 8472, as-file 8473, as-netprt 8474, as-rmtcmd 8475, as-signon 8476 |
 | Sign-on (as-signon) | 8476 | Exchange of attributes (V7R5M0, server level 10, password level 2), sign-on with a password |
-| Database (as-database) | 8471 | Exchange of seeds, start server with a password, server attributes (the JDBC driver connects, `Connection.isValid` answers true), SQL statements without parameter markers: queries with their columns and rows, updates with their counts, errors with their SQLCODE and message |
+| Database (as-database) | 8471 | Exchange of seeds, start server with a password, server attributes, SQL statements, parameter markers, CALL, commitment control, the SYSIBM metadata procedures (below) |
+| Remote command (as-rmtcmd) | 8475 | Exchange of seeds, start server, exchange attributes (data stream level 10), CL commands run with their messages (Toolbox `CommandCall`); program calls not yet |
 
 The data streams are the ones JTOpen's client side builds and reads; the
 server side is as4tainr's own (`core/src/hostsrv.rs`, `core/src/hostdb.rs`).
@@ -106,6 +107,17 @@ catalog views that returns the result set the JDBC API defines:
 
 A CALL's result set is reported in the SQLCA (SQLERRD(2), the number
 of result sets) and the client opens it with open and describe.
+
+## Remote commands
+
+A connection's commands run in a job of its own (the user, its current
+library and the user library list), one after another, as IBM i's
+QZRCSRVS server job runs a client's. The reply's return code is 0 when
+the command ran and 0x0400 when it failed; the messages are the ones
+the command sent (completions, diagnostics, the escape message last),
+each with its ID, type, message file (QCPFMSG for CPx, QSQLMSG for
+SQL) and as4tainr's text. Severities are known only for the messages a
+capture showed (others are 0).
 
 ## Passwords
 

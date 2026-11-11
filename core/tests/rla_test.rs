@@ -27932,3 +27932,133 @@ async fn dspmod_outfile_of_a_missing_module_and_library_info() {
         other => panic!("{other:?}"),
     }
 }
+
+#[tokio::test]
+async fn dspmod_imports_of_rpg_and_cl_modules() {
+    // PUB400 2026-11-10, verify76: a NOMAIN RPG module exports its
+    // procedure (HELLO76), imports its prototyped call (OTHER76, ARGOPT
+    // *NO) then the RPG run time's six procedures (u76_improws); a CL
+    // module's CALLPRC comes after CEEGOTO, Qcl_CHKBI and Qcl_LkLDA, with
+    // ARGOPT *NO (u76_climp).
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    let dir = format!("/tmp/{lib}d76");
+    as4tainr_core::ifs::mkdir_all(&client, &dir, "QSECOFR")
+        .await
+        .unwrap();
+    for (f, text) in [
+        (
+            "gld76.rpgle",
+            "**FREE\nctl-opt nomain;\ndcl-pr Other76 int(10) end-pr;\ndcl-proc Hello76 export;\n  dcl-pi *n int(10) end-pi;\n  return Other76();\nend-proc;\n",
+        ),
+        ("gld76c.clle", "PGM\r\nCALLPRC PRC(OTHER76C)\r\nENDPGM\r\n"),
+    ] {
+        as4tainr_core::ifs::write_file(
+            &client,
+            &format!("{dir}/{f}"),
+            text.as_bytes(),
+            819,
+            0o644,
+            "QSECOFR",
+        )
+        .await
+        .unwrap();
+    }
+    cl_cmd(
+        &mut job,
+        format!("CRTRPGMOD MODULE({lib}/GLD76R) SRCSTMF('{dir}/gld76.rpgle')"),
+    )
+    .await
+    .unwrap();
+    cl_cmd(
+        &mut job,
+        format!("CRTCLMOD MODULE({lib}/GLD76C) SRCSTMF('{dir}/gld76c.clle')"),
+    )
+    .await
+    .unwrap();
+    let rows = |file: &str| {
+        let client = &client;
+        let sql = format!(
+            "SELECT rtrim(imsynm) || '|' || rtrim(imoppp) FROM {}.{} ORDER BY rrn",
+            as4tainr_core::catalog::ident(&lib),
+            file
+        );
+        async move {
+            client
+                .query(&sql, &[])
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get::<_, String>(0))
+                .collect::<Vec<_>>()
+        }
+    };
+    for (m, f) in [("GLD76R", "GLD76I"), ("GLD76C", "GLD76J")] {
+        cl_cmd(
+            &mut job,
+            format!("DSPMOD MODULE({lib}/{m}) DETAIL(*IMPORT) OUTPUT(*OUTFILE) OUTFILE({lib}/{f})"),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        rows("gld76i").await,
+        [
+            "OTHER76|*NO",
+            "_QRNX_SUBP_EXCP|*NO",
+            "_QRNX_INIT_H|*UNKNOWN",
+            "_QRNX_INIT|*NO",
+            "_QRNX_GET_ASSOC_CCSID|*NO",
+            "_QRNX_SIGNAL_EXCP|*NO",
+            "Q LE leDefaultEh2|*UNKNOWN",
+        ]
+    );
+    assert_eq!(
+        rows("gld76j").await,
+        [
+            "CEEGOTO|*NO",
+            "Qcl_CHKBI|*UNKNOWN",
+            "Qcl_LkLDA|*NO",
+            "OTHER76C|*NO",
+            "Q LE leDefaultEh2|*UNKNOWN",
+            "Q LE leBdyCh2|*UNKNOWN",
+            "Q LE leBdyEpilog2|*NO",
+        ]
+    );
+    cl_cmd(
+        &mut job,
+        format!(
+            "DSPMOD MODULE({lib}/GLD76R) DETAIL(*EXPORT) OUTPUT(*OUTFILE) OUTFILE({lib}/GLD76X)"
+        ),
+    )
+    .await
+    .unwrap();
+    let e: Vec<String> = client
+        .query(
+            &format!(
+                "SELECT rtrim(exsynm) FROM {}.gld76x",
+                as4tainr_core::catalog::ident(&lib)
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(e, ["HELLO76"]);
+}

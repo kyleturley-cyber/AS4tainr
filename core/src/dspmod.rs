@@ -37,6 +37,26 @@ const CL_IMPORTS: [(&str, &str); 6] = [
 /// restored to (u74_basrows BACMCO, BACMCF, BACERT).
 const RELEASE: &str = "V7R5M0";
 
+/// The procedures an ILE RPG module without a main procedure imports
+/// after its own (PUB400 2026-11-10, verify76 u76_improws and u76_print:
+/// a NOMAIN module with one exported procedure and one prototyped call).
+const RPG_IMPORTS: [(&str, &str); 6] = [
+    ("_QRNX_SUBP_EXCP", "*NO"),
+    ("_QRNX_INIT_H", "*UNKNOWN"),
+    ("_QRNX_INIT", "*NO"),
+    ("_QRNX_GET_ASSOC_CCSID", "*NO"),
+    ("_QRNX_SIGNAL_EXCP", "*NO"),
+    ("Q LE leDefaultEh2", "*UNKNOWN"),
+];
+
+/// The procedures an ILE RPG NOMAIN module has besides its own
+/// (verify76 u76_print, *PROCLIST).
+const RPG_NOMAIN_PROCS: [&str; 2] = ["_QRNI_NOMAIN", "_QRNI_SOFT_ERR"];
+
+/// The binding directories an ILE RPG module names for binding
+/// (verify76 u76_print, *REFSYSOBJ).
+const RPG_BNDDIRS: [&str; 3] = ["QRNXLE", "QILE", "QUSAPIBD"];
+
 /// A symbol a module exports or imports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Symbol {
@@ -66,6 +86,8 @@ pub struct ModuleFacts {
     pub text: String,
     pub exports: Vec<Symbol>,
     pub imports: Vec<Symbol>,
+    /// An RPG module has a main procedure (not NOMAIN).
+    pub has_main: bool,
 }
 
 impl ModuleFacts {
@@ -74,21 +96,62 @@ impl ModuleFacts {
     }
 
     /// The program entry procedure: a CL module's is _CL_PEP
-    /// (u74_basrows BAPEPN); an RPG module's is not known here.
+    /// (u74_basrows BAPEPN), a NOMAIN RPG module has none (u76_basrows
+    /// *NONE); an RPG main procedure's is not known here.
     fn pep(&self) -> &'static str {
         if self.cl() {
             "_CL_PEP"
+        } else if !self.has_main {
+            "*NONE"
         } else {
             ""
         }
     }
 
-    /// The fewest and most parameters (u74_basrows: 0 and 255 for CL).
-    fn parms(&self) -> (u32, u32) {
+    /// The fewest and most parameters (u74_basrows: 0 and 255 for CL;
+    /// u76_basrows: -1 and -1 for a module with no entry procedure, whose
+    /// report has no line for them).
+    fn parms(&self) -> (i32, i32) {
         if self.cl() {
             (0, 255)
+        } else if !self.has_main {
+            (-1, -1)
         } else {
             (0, 0)
+        }
+    }
+
+    /// The highest optimization the module can be changed to: *FULL for
+    /// RPG (u76_basrows BAOPLX), *NONE for CL (u74_basrows).
+    fn max_opt(&self) -> &'static str {
+        if self.cl() {
+            "*NONE"
+        } else {
+            "*FULL"
+        }
+    }
+
+    /// The module's procedures (*PROCLIST): its exported ones, and an
+    /// RPG NOMAIN module's run-time ones.
+    fn procedures(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .exports
+            .iter()
+            .filter(|s| !s.data)
+            .map(|s| s.name.clone())
+            .collect();
+        if !self.cl() && !self.has_main {
+            v.extend(RPG_NOMAIN_PROCS.iter().map(|p| p.to_string()));
+        }
+        v
+    }
+
+    /// The system objects the module refers to for binding (*REFSYSOBJ).
+    fn bind_objects(&self) -> &'static [&'static str] {
+        if self.cl() {
+            &[]
+        } else {
+            &RPG_BNDDIRS
         }
     }
 }
@@ -177,7 +240,7 @@ pub fn report(m: &ModuleFacts, details: &[String], stamp: &crate::report::Stamp)
                 line("Intermediate language data", "*NO"),
                 line(
                     "Allow RTVCLSRC (CL module)",
-                    if m.cl() { "*YES" } else { "" },
+                    if m.cl() { "*YES" } else { "*NO" },
                 ),
                 line("Sort sequence table", "*HEX"),
                 line("Language identifier", "*JOBRUN"),
@@ -185,15 +248,19 @@ pub fn report(m: &ModuleFacts, details: &[String], stamp: &crate::report::Stamp)
         ));
         let (lo, hi) = m.parms();
         let parms = format!("{lo:<8}{hi}");
+        let mut page = vec![
+            line("Optimization level", "*NONE"),
+            line("Maximum optimization level", m.max_opt()),
+            line("Debug data", "*YES"),
+            line("Compressed", yes_no(false)),
+            line("Program entry procedure name", m.pep()),
+        ];
+        if lo >= 0 {
+            page.push(line("Number of parameters", &parms));
+        }
         pages.push((
             "*BASIC",
             vec![
-                line("Optimization level", "*NONE"),
-                line("Maximum optimization level", "*NONE"),
-                line("Debug data", "*YES"),
-                line("Compressed", yes_no(false)),
-                line("Program entry procedure name", m.pep()),
-                line("Number of parameters", &parms),
                 line("Module state", "*USER"),
                 line("Module domain", "*SYSTEM"),
                 line(
@@ -210,6 +277,11 @@ pub fn report(m: &ModuleFacts, details: &[String], stamp: &crate::report::Stamp)
                 line("Storage model", "*INHERIT"),
             ],
         ));
+        // The second page: its first lines, then the rest.
+        let n = pages.len() - 1;
+        let rest = std::mem::take(&mut pages[n].1);
+        page.extend(rest);
+        pages[n].1 = page;
         pages.push((
             "*BASIC",
             vec![
@@ -222,6 +294,45 @@ pub fn report(m: &ModuleFacts, details: &[String], stamp: &crate::report::Stamp)
                 line("Conversion details", "*COMMON"),
             ],
         ));
+    }
+    if want("*SIZE") {
+        let size = |label_: &str, cur: &str, max: &str, name: Option<&str>| {
+            let mut v = vec![
+                at(&[(4, label_)]),
+                format!("{:<44}{cur}", label(6, "Current size", 39)),
+                format!("{:<44}{max}", label(6, "Maximum size limit", 39)),
+            ];
+            if let Some(n) = name {
+                v.push(
+                    format!("{:<44}{n}", label(6, "Procedure name", 39))
+                        .trim_end()
+                        .to_string(),
+                );
+            }
+            v
+        };
+        let mut first = vec![at(&[(
+            2,
+            "Module size (decompressed) and limit information:",
+        )])];
+        let mut second = Vec::new();
+        for (i, (l, _, max)) in SIZES.iter().enumerate() {
+            let part = size(l, "0", &max.to_string(), None);
+            if i < 17 {
+                first.extend(part);
+            } else {
+                second.extend(part);
+            }
+        }
+        second.push(at(&[(
+            2,
+            "Procedure size (decompressed) and limit information:",
+        )]));
+        for (l, _, max) in PROC_SIZES.iter() {
+            second.extend(size(l, "0", &max.to_string(), Some("")));
+        }
+        pages.push(("*SIZE", first));
+        pages.push(("*SIZE", second));
     }
     let symbols = |title: (usize, &str), list: &[Symbol]| {
         let mut v = vec![
@@ -245,6 +356,36 @@ pub fn report(m: &ModuleFacts, details: &[String], stamp: &crate::report::Stamp)
         pages.push((
             "*IMPORT",
             symbols((52, "Imported (unresolved) symbols:"), &m.imports),
+        ));
+    }
+    if want("*PROCLIST") {
+        let mut v = vec![
+            at(&[(59, "Procedure list:")]),
+            at(&[(2, "Procedure"), (51, "Procedure")]),
+            at(&[(2, "Name"), (51, "Type"), (70, "ARGOPT")]),
+        ];
+        for p in m.procedures() {
+            v.push(at(&[(2, &p), (51, "REGULAR"), (70, "*NO")]));
+        }
+        pages.push(("*PROCLIST", v));
+    }
+    if want("*REFSYSOBJ") {
+        let mut v = vec![
+            at(&[(47, "Reference system objects for bind time:")]),
+            at(&[(2, "Object"), (17, "Library"), (32, "Type")]),
+        ];
+        for o in m.bind_objects() {
+            v.push(at(&[(2, o), (17, "*LIBL"), (32, "*BNDDIR")]));
+        }
+        pages.push(("*REFSYSOBJ", v));
+    }
+    if want("*COPYRIGHT") {
+        pages.push((
+            "*COPYRIGHT",
+            vec![
+                at(&[(56, "Copyright information:")]),
+                at(&[(4, "(No copyright information)")]),
+            ],
         ));
     }
     let mut out = Vec::new();
@@ -383,7 +524,7 @@ pub fn basic_record(
         ("BASRTT", s("*HEX")),
         ("BALGID", s("*JOBRUN")),
         ("BAOPLV", s("*NONE")),
-        ("BAOPLX", s("*NONE")),
+        ("BAOPLX", s(m.max_opt())),
         ("BADBLV", s("*YES")),
         ("BACOMP", s("*NO")),
         ("BAPEPN", s(m.pep())),
@@ -406,7 +547,7 @@ pub fn basic_record(
         ("BASTGM", s("*INHERIT")),
         ("BASQSZ", s("0")),
         ("BACNVD", s("*COMMON")),
-        ("BAARCS", s(if m.cl() { "*YES" } else { "" })),
+        ("BAARCS", s(if m.cl() { "*YES" } else { "*NO" })),
         ("BASCCD", m.ccsid.to_string()),
         ("BASLEN", m.src_stmf.chars().count().to_string()),
         ("BASTMF", m.src_stmf.clone()),
@@ -430,7 +571,64 @@ pub fn size_record(
         ("SIMOAT", m.attribute.clone()),
         ("SIMOSY", system.to_string()),
     ]
+    .into_iter()
+    .chain(SIZES.iter().map(|(_, f, max)| (*f, max.to_string())))
+    .chain(PROC_SIZES.iter().map(|(_, f, max)| (*f, max.to_string())))
+    .chain([("SISTSL8", "2147483648".to_string())])
+    .collect()
 }
+
+/// DETAIL(*SIZE)'s sizes: the report's label, the outfile's limit field
+/// and the limit (PUB400 2026-11-10, verify76 u76_print and u76_sizerows:
+/// IBM i 7.5's limits; the current sizes are as4tainr's, 0, as it has no
+/// compiled module to measure).
+const SIZES: [(&str, &str, u64); 23] = [
+    ("Total module size (KB):", "SITMSL", 268435456),
+    ("Procedures and constants (KB):", "SIPCOL", 268435387),
+    ("Debug space (bytes):", "SIDBSL", 16777216),
+    ("Associated space (bytes):", "SIASPL", 16777216),
+    ("Module constants (bytes):", "SIMOCL", 16772608),
+    ("Static storage (bytes):", "SISTSL", 2147483648),
+    ("Dictionary mapping table (bytes):", "SIDMTL", 16777184),
+    ("Exception mapping table (bytes):", "SIEHTL", 16777184),
+    (
+        "Exception mapping table list area (bytes):",
+        "SIEMLL",
+        16777184,
+    ),
+    (
+        "Binding specifications component (bytes):",
+        "SIBNSL",
+        16777184,
+    ),
+    ("String directory component (bytes):", "SISTDL", 16777184),
+    ("Dictionary component (bytes):", "SIDICL", 16777184),
+    ("Instructions component (bytes):", "SIINCL", 16777184),
+    ("Initialization component (bytes):", "SIIZCL", 16777184),
+    ("Alias component (bytes):", "SIALIL", 16777184),
+    ("Type information component (bytes):", "SITYPL", 16777184),
+    ("Literal pool component (bytes):", "SILITL", 16777184),
+    ("Static storage work area (bytes):", "SISWAL", 16777184),
+    ("Binding work area (bytes):", "SIBWAL", 16777184),
+    ("Number of auxiliary storage segments:", "SIAXSL", 16384),
+    ("Number of static storage allocations:", "SISSFL", 190649),
+    ("Number of procedures:", "SIPROL", 116508),
+    ("Number of copyrights:", "SICOPL", 1024),
+];
+
+/// The procedure sizes of DETAIL(*SIZE) (u76_print, u76_sizerows).
+const PROC_SIZES: [(&str, &str, u64); 6] = [
+    ("Automatic storage allocation:", "SIPASL", 16776704),
+    (
+        "Licensed Internal Code stack allocation:",
+        "SIPVSL",
+        16777184,
+    ),
+    ("Debug statement mapping table:", "SIPDSL", 16777184),
+    ("Exception statement mapping table:", "SIPESL", 16777184),
+    ("Machine instruction range mapping:", "SIPMIL", 16777184),
+    ("Largest procedure:", "SIPLPL", 16711616),
+];
 
 impl Job<'_> {
     pub(crate) async fn dspmod_command(&mut self, cmd: &Command) -> Result<Option<Outcome>> {
@@ -459,23 +657,38 @@ impl Job<'_> {
                 argopt: "*NO".into(),
             })
             .collect();
-        let mut imports: Vec<Symbol> = Vec::new();
-        if cl {
-            imports.extend(CL_IMPORTS.iter().map(|(n, a)| Symbol {
-                name: n.to_string(),
-                data: false,
-                argopt: a.to_string(),
-            }));
-        }
-        for i in &info.imports {
-            if !imports.iter().any(|s| &s.name == i) {
-                imports.push(Symbol {
-                    name: i.clone(),
-                    data: info.data.contains(i),
-                    argopt: "*UNKNOWN".into(),
-                });
-            }
-        }
+        // The module's own imports (ARGOPT *NO: verify76 u76_improws for
+        // an RPG prototype, u76_climp for a CL CALLPRC) among the run
+        // time's: a CL module's after the first three of CL_IMPORTS
+        // (u76_climp), an RPG module's before RPG_IMPORTS (u76_improws).
+        let own: Vec<Symbol> = info
+            .imports
+            .iter()
+            .map(|i| Symbol {
+                name: i.clone(),
+                data: info.data.contains(i),
+                argopt: "*NO".into(),
+            })
+            .collect();
+        let rt = |l: &[(&str, &str)]| -> Vec<Symbol> {
+            l.iter()
+                .map(|(n, a)| Symbol {
+                    name: n.to_string(),
+                    data: false,
+                    argopt: a.to_string(),
+                })
+                .collect()
+        };
+        let imports: Vec<Symbol> = if cl {
+            let mut v = rt(&CL_IMPORTS[..3]);
+            v.extend(own);
+            v.extend(rt(&CL_IMPORTS[3..]));
+            v
+        } else {
+            let mut v = own;
+            v.extend(rt(&RPG_IMPORTS));
+            v
+        };
         let when = "CASE WHEN t < '2000-01-01' THEN '0' ELSE '1' END, to_char(t, 'YYMMDD'), to_char(t, 'HH24MISS')";
         let r = self
             .client
@@ -514,6 +727,7 @@ impl Job<'_> {
             text: r.get(1),
             exports,
             imports,
+            has_main: info.has_main,
         })
     }
 
@@ -749,5 +963,116 @@ mod tests {
         assert_eq!(v("BACNVD"), "*COMMON");
         assert_eq!(v("BAARCS"), "*YES");
         assert_eq!(v("BACMCO"), "V7R5M0");
+    }
+
+    fn rpg_nomain() -> ModuleFacts {
+        let sym = |n: &str, a: &str| Symbol {
+            name: n.into(),
+            data: false,
+            argopt: a.into(),
+        };
+        let mut imports = vec![sym("OTHER76", "*NO")];
+        imports.extend(RPG_IMPORTS.iter().map(|(n, a)| sym(n, a)));
+        ModuleFacts {
+            library: "AS4TRAINR1".into(),
+            name: "GLD76R".into(),
+            attribute: "RPGLE".into(),
+            created: ("1".into(), "261110".into(), "225649".into()),
+            src_stmf: "/tmp/gld76.rpgle".into(),
+            owner: "AS4TRAINR".into(),
+            ccsid: 273,
+            exports: vec![sym("HELLO76", "*NO")],
+            imports,
+            has_main: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn printed_report_of_an_rpg_nomain_module() {
+        // verify76 u76_print (PUB400 2026-11-10): DETAIL(*ALL) of a NOMAIN
+        // RPG module: *BASIC (no line for the parameters), *SIZE (two
+        // pages), *EXPORT, *IMPORT, *PROCLIST, *REFSYSOBJ, *COPYRIGHT.
+        let stamp = crate::report::Stamp {
+            date: "26-11-10".into(),
+            time: "22:56:50".into(),
+            zone: "UTC".into(),
+        };
+        let r = report(&rpg_nomain(), &["*ALL".into()], &stamp);
+        let has = |l: &str| r.iter().any(|x| x == l);
+        assert_eq!(
+            r.iter()
+                .filter(|l| l.contains("Display Module Information"))
+                .count(),
+            10
+        );
+        assert!(has(
+            "   Program entry procedure name . . . . . . . . . . . . . . :   *NONE"
+        ));
+        assert!(has(
+            "   Maximum optimization level . . . . . . . . . . . . . . . :   *FULL"
+        ));
+        assert!(has(
+            "   Allow RTVCLSRC (CL module) . . . . . . . . . . . . . . . :   *NO"
+        ));
+        assert!(!r.iter().any(|l| l.contains("Number of parameters")));
+        assert!(has(
+            "   Number of imported (unresolved) symbols  . . . . . . . . :   7"
+        ));
+        assert!(has(" Module size (decompressed) and limit information:"));
+        assert!(has("   Exception mapping table list area (bytes):"));
+        assert!(has("     Maximum size limit . . . . . . . . :   268435456"));
+        assert!(has("     Maximum size limit . . . . . . . . :   190649"));
+        assert!(has(" Procedure size (decompressed) and limit information:"));
+        assert!(has(
+            " OTHER76                                          PROCEDURE          *NO"
+        ));
+        assert!(has(
+            " _QRNX_INIT_H                                     PROCEDURE          *UNKNOWN"
+        ));
+        assert!(has(
+            "                                                          Procedure list:"
+        ));
+        assert!(has(
+            " _QRNI_SOFT_ERR                                   REGULAR            *NO"
+        ));
+        assert!(has(
+            "                                              Reference system objects for bind time:"
+        ));
+        assert!(has(" Object         Library        Type"));
+        assert!(has(" QUSAPIBD       *LIBL          *BNDDIR"));
+        assert!(has(
+            "                                                       Copyright information:"
+        ));
+        assert!(has("   (No copyright information)"));
+        // The *SIZE pages: 17 sizes on the first (u76_print page 4).
+        let p4 = r.iter().position(|l| l.ends_with("Page     4")).unwrap();
+        let p5 = r.iter().position(|l| l.ends_with("Page     5")).unwrap();
+        assert!(r[p4..p5]
+            .iter()
+            .any(|l| l == "   Literal pool component (bytes):"));
+        assert!(r[p5..]
+            .iter()
+            .any(|l| l == "   Static storage work area (bytes):"));
+    }
+
+    #[test]
+    fn basic_and_size_records_of_an_rpg_nomain_module() {
+        // verify76 u76_basrows, u76_sizerows.
+        let now = ("1".into(), "261110".into(), "225649".into());
+        let b = basic_record(&rpg_nomain(), &now, "PUB400");
+        let v = |r: &crate::outfile::Record, k: &str| {
+            r.iter().find(|(n, _)| *n == k).unwrap().1.clone()
+        };
+        assert_eq!(v(&b, "BAPEPN"), "*NONE");
+        assert_eq!(v(&b, "BAMINP"), "-1");
+        assert_eq!(v(&b, "BAMAXP"), "-1");
+        assert_eq!(v(&b, "BAOPLX"), "*FULL");
+        assert_eq!(v(&b, "BAARCS"), "*NO");
+        assert_eq!(v(&b, "BANIMS"), "7");
+        let z = size_record(&rpg_nomain(), &now, "PUB400");
+        assert_eq!(v(&z, "SITMSL"), "268435456");
+        assert_eq!(v(&z, "SIPLPL"), "16711616");
+        assert_eq!(v(&z, "SISTSL8"), "2147483648");
     }
 }

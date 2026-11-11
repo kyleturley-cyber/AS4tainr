@@ -28328,5 +28328,129 @@ async fn host_servers_sign_on_and_database_attributes() {
             i32::from_be_bytes([r[36], r[37], r[38], r[39]])
         ),
         (7, -201)
+    ); // SQL statements (JTOpen DBSQLRequestDS, DBOriginalDataFormat,
+       // DBOriginalData, DBReplySQLCA): the statement in CP 0x3831 (CCSID
+       // 13488, a 4-byte length, UTF-16), the rows changed in the SQLCA's
+       // third SQLERRD, a query's data format (54 bytes a field) and rows
+       // (indicators, then fixed-length rows), end of data as error class
+       // 2, return code 701, an error as class 1 with the SQLCODE.
+    let stmt = |sql: &str| {
+        let text: Vec<u8> = sql.encode_utf16().flat_map(|c| c.to_be_bytes()).collect();
+        let mut d = 13488u16.to_be_bytes().to_vec();
+        d.extend((text.len() as u32).to_be_bytes());
+        d.extend(text);
+        cp(0x3831, &d)
+    };
+    let tmpl = |ors: u32| {
+        let mut t = vec![0u8; 20];
+        t[..4].copy_from_slice(&ors.to_be_bytes());
+        t[14..16].copy_from_slice(&1u16.to_be_bytes()); // RPB handle
+        t
+    };
+    let class_rc = |r: &[u8]| {
+        (
+            u16::from_be_bytes([r[34], r[35]]),
+            i32::from_be_bytes([r[36], r[37], r[38], r[39]]),
+        )
+    };
+    let find = |r: &[u8], want: u16| -> Vec<u8> {
+        let mut at = 40;
+        while at + 6 <= r.len() {
+            let ll = u32_at(r, at) as usize;
+            if u16::from_be_bytes([r[at + 4], r[at + 5]]) == want {
+                return r[at + 6..at + ll].to_vec();
+            }
+            at += ll;
+        }
+        panic!("no CP {want:04X}")
+    };
+    let msg = |req: u16, ors: u32, text: &str| {
+        ds(
+            &if text.is_empty() { vec![] } else { stmt(text) },
+            0xE004,
+            req,
+            &tmpl(ors),
+        )
+    };
+    async fn exchange(s: &mut tokio::net::TcpStream, m: Vec<u8>) -> Vec<u8> {
+        s.write_all(&m).await.unwrap();
+        let mut len = [0u8; 4];
+        s.read_exact(&mut len).await.unwrap();
+        let mut v = vec![0u8; u32::from_be_bytes(len) as usize];
+        v[..4].copy_from_slice(&len);
+        s.read_exact(&mut v[4..]).await.unwrap();
+        v
+    }
+    let r = exchange(
+        &mut s,
+        msg(
+            0x1806,
+            0x0200_0000,
+            &format!("CREATE TABLE {lib}.HT (ID INTEGER, AMT DECIMAL(7,2), NM CHAR(4))"),
+        ),
+    )
+    .await;
+    assert_eq!(class_rc(&r), (0, 0));
+    let r = exchange(
+        &mut s,
+        msg(
+            0x1806,
+            0x0200_0000,
+            &format!("INSERT INTO {lib}.HT VALUES (1, -12.34, 'ab'), (2, NULL, NULL)"),
+        ),
+    )
+    .await;
+    assert_eq!(class_rc(&r), (0, 0));
+    let ca = find(&r, 0x3807);
+    assert_eq!(&ca[..5], &as4tainr_core::hostsrv::ebcdic("SQLCA", 5)[..]);
+    assert_eq!(
+        i32::from_be_bytes([ca[104], ca[105], ca[106], ca[107]]),
+        2,
+        "SQLERRD(3)"
+    );
+    let r = exchange(
+        &mut s,
+        msg(
+            0x1803,
+            0x8A00_0000,
+            &format!("SELECT ID, AMT, NM FROM {lib}.HT ORDER BY ID"),
+        ),
+    )
+    .await;
+    assert_eq!(class_rc(&r), (0, 0));
+    let f = find(&r, 0x3805);
+    assert_eq!(u16::from_be_bytes([f[4], f[5]]), 3, "fields");
+    assert_eq!(u16::from_be_bytes([f[6], f[7]]), 4 + 4 + 4, "record size");
+    let field = |i: usize, at: usize| u16::from_be_bytes([f[8 + 54 * i + at], f[9 + 54 * i + at]]);
+    assert_eq!((field(0, 2), field(0, 4)), (497, 4), "INTEGER");
+    assert_eq!(
+        (field(1, 2), field(1, 4), field(1, 6), field(1, 8)),
+        (485, 4, 2, 7),
+        "DECIMAL(7,2)"
+    );
+    assert_eq!((field(2, 2), field(2, 4)), (453, 4), "CHAR(4)");
+    assert_eq!(&f[8 + 24..8 + 26], b"ID");
+    let r = exchange(&mut s, msg(0x180E, 0x8400_0000, "")).await;
+    assert_eq!(class_rc(&r), (2, 701), "the last block");
+    let d = find(&r, 0x3806);
+    assert_eq!(u32_at(&d, 4), 2, "rows");
+    let ind = &d[14..14 + 12];
+    assert_eq!(ind, &[0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]);
+    let rows = &d[26..];
+    assert_eq!(
+        &rows[..12],
+        &[0, 0, 0, 1, 0x00, 0x01, 0x23, 0x4D, b'a', b'b', b' ', b' ']
+    );
+    assert_eq!(&rows[12..16], &[0, 0, 0, 2]);
+    let r = exchange(
+        &mut s,
+        msg(0x1803, 0x8200_0000, &format!("SELECT * FROM {lib}.NOPE")),
+    )
+    .await;
+    assert_eq!(class_rc(&r), (1, -204));
+    let r = exchange(&mut s, msg(0x1F00, 0xE000_0000, "")).await;
+    assert_eq!(
+        &find(&r, 0x3801)[2..],
+        &as4tainr_core::hostsrv::ebcdic("SQL0204", 7)[..]
     );
 }

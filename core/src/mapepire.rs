@@ -294,7 +294,7 @@ fn fail(text: impl Into<String>) -> anyhow::Error {
 /// reports it: the message's text alone, with its SQLSTATE and SQLCODE
 /// (PUB400 2026-11-09, verify64 m64_mapepire: "error":"NOPE64 in
 /// AS4TRAINR type *FILE not found.", "sql_state":"42704", "sql_rc":-204).
-fn sql_failure(e: &anyhow::Error) -> anyhow::Error {
+pub(crate) fn sql_failure(e: &anyhow::Error) -> anyhow::Error {
     if let Some(f) = e.downcast_ref::<Failure>() {
         return anyhow::Error::new(Failure {
             text: f.text.clone(),
@@ -328,10 +328,10 @@ fn sql_failure(e: &anyhow::Error) -> anyhow::Error {
 }
 
 /// The rows of a result not yet sent.
-struct Results {
-    columns: Vec<String>,
-    types: Vec<ColType>,
-    rows: VecDeque<Vec<Option<String>>>,
+pub(crate) struct Results {
+    pub(crate) columns: Vec<String>,
+    pub(crate) types: Vec<ColType>,
+    pub(crate) rows: VecDeque<Vec<Option<String>>>,
     done: bool,
 }
 
@@ -343,7 +343,7 @@ struct Open {
 }
 
 /// What a statement did.
-enum Done {
+pub(crate) enum Done {
     Rows(Results),
     Count(u64),
     /// CALL: its first result set, and its parameters.
@@ -368,6 +368,12 @@ pub struct Server<'a> {
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 impl<'a> Server<'a> {
+    /// The default schema for unqualified names (a JDBC client's
+    /// default library), as SET SCHEMA sets it.
+    pub(crate) fn set_schema(&mut self, schema: Option<String>) {
+        self.schema = schema;
+    }
+
     pub fn new(job: Job<'a>) -> Server<'a> {
         Server {
             job,
@@ -647,7 +653,7 @@ impl<'a> Server<'a> {
     }
 
     /// Run one statement.
-    async fn statement(&mut self, sql: &str) -> Result<Done> {
+    pub(crate) async fn statement(&mut self, sql: &str) -> Result<Done> {
         let sql = sql.trim().trim_end_matches(';').trim();
         if !crate::sqlpl::is_compound(sql) {
             if let Some((name, args)) = crate::sqlpl::parse_call(sql)? {
@@ -1812,7 +1818,7 @@ fn is_numeric_name(ty: &str) -> bool {
 
 /// A column's type name, precision, scale and display size (the JDBC
 /// driver's: a decimal shows its digits, sign and point).
-fn column_type(t: &ColType, longest: usize) -> (String, i64, i64, i64) {
+pub(crate) fn column_type(t: &ColType, longest: usize) -> (String, i64, i64, i64) {
     let m = t.typmod as i64;
     let l = longest as i64;
     match t.pg.as_str() {

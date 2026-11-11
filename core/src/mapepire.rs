@@ -1928,7 +1928,7 @@ fn literals(vals: &[J]) -> Vec<String> {
 
 /// The parameter markers (`?`) of a statement, outside strings,
 /// delimited names and comments.
-fn marker_positions(sql: &str) -> Vec<usize> {
+pub(crate) fn marker_positions(sql: &str) -> Vec<usize> {
     let b = sql.as_bytes();
     let mut at = Vec::new();
     let mut i = 0;
@@ -1973,7 +1973,7 @@ fn marker_count(sql: &str) -> usize {
 
 /// The statement with its markers replaced by the values (SQL0313 when
 /// there are fewer values than markers).
-fn bind(sql: &str, values: &[String]) -> Result<String> {
+pub(crate) fn bind(sql: &str, values: &[String]) -> Result<String> {
     let at = marker_positions(sql);
     if values.len() < at.len() {
         return Err(sql_failure(&anyhow!(

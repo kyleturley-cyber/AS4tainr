@@ -22,25 +22,44 @@ user, current library and library list of the profile; the client's
 default library as the default schema) with the same statement engine
 as the Mapepire server (`core/src/mapepire.rs`). Requests done: create,
 change, reset and delete an RPB, prepare, prepare and describe,
-execute, execute immediate, open and describe, open, describe and
-fetch, fetch, close, and the last error's message ID, text and SQLCA.
+execute (a batch: a run for each row of values), execute immediate,
+open and describe, open, describe and fetch, fetch, close, change
+descriptor, and the last error's message ID, text and SQLCA. Requests
+compressed by the client (run-length) are expanded; replies are not
+compressed.
 
-A query runs when it is prepared; its rows are kept for the open and
-sent 2048 rows a block. Columns are described as:
+Formats are the extended ones (data format CP 0x380C, parameter marker
+format 0x380D, result data 0x380E), which the JDBC driver uses with a
+server of V5R4 or later. A query without parameter markers runs when
+it is prepared; its rows are kept for the open and sent 2048 rows (at
+most about 1 MB) a block. Columns are described as:
 
 | Column | SQL type | Bytes |
 | --- | --- | --- |
 | SMALLINT, INTEGER, BIGINT | 500, 496, 492 | 2, 4, 8 |
 | REAL, DOUBLE | 480 | 8 |
 | DECIMAL(p,s) | 484 (packed) | p/2+1 |
+| A decimal expression | 484, DECIMAL(31, s), s the most decimals of its values | 16 |
 | NUMERIC(p,s) | 488 (zoned) | p |
 | CHAR(n) | 452, CCSID 1208 | n |
+| DATE, TIME, TIMESTAMP | 384, 388, 392, CCSID 1208 | in the connection's date and time formats: 6, 8 or 10; 8; 26 |
 | BINARY, VARBINARY | 912, 908 | n, n+2 |
-| Others (VARCHAR, dates, times, timestamps) | 448, CCSID 1208 | the declared or longest length + 2 |
+| Others (VARCHAR...) | 448, CCSID 1208 | the declared length + 2, else the longest value's |
 
-All columns are described as nullable (type + 1). Dates, times and
-timestamps come as text in Db2's form (`2026-11-10`, `12.34.56`,
-`2026-11-10-12.34.56.123456`).
+All columns are described as nullable (type + 1).
+
+### Parameter markers
+
+A marker is described as the column it stands for: the column of an
+INSERT's VALUES (listed, or the table's in that position), the column
+it is compared with (`col = ?`, `? < col`, `LIKE`, `BETWEEN`, `IN`,
+`SET col = ?`), its type from a query of the statement's table or FROM
+clause that returns no rows. Any other marker is VARCHAR(32739). A
+query with markers is described when it is prepared by running it
+with nulls for its markers: a varying-length column of no declared
+length is described as VARCHAR(32739), a decimal expression as
+DECIMAL(31, 10). Values come as the client lays them out (dates and
+times in ISO form) and are put into the statement as literals.
 
 ## Passwords
 

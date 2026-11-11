@@ -82,6 +82,7 @@ pub async fn serve(url: &str, mut sock: TcpStream) -> Result<()> {
     let mut stmts: std::collections::HashMap<u16, Stmt> = Default::default();
     let mut last_error: Option<SqlError> = None;
     while let Some(ds) = read_ds(&mut sock).await? {
+        let ds = decompressed(ds);
         let corr = ds.correlation();
         trace(&ds, "in");
         let out = match ds.req_id() {
@@ -166,7 +167,7 @@ pub async fn serve(url: &str, mut sock: TcpStream) -> Result<()> {
             0x0000 => db_reply(&ds, 7, -201, &[]),
             id if ds.server_id() == 0xE004 => {
                 let srv = sql.as_mut().expect("signed on");
-                sql_request(srv, &ds, id, &mut stmts, &mut last_error).await
+                sql_request(srv, &ds, id, &mut stmts, &mut last_error, Dt::of(&attrs)).await
             }
             _ => db_reply(&ds, 0, 0, &[]),
         };
@@ -177,8 +178,51 @@ pub async fn serve(url: &str, mut sock: TcpStream) -> Result<()> {
     Ok(())
 }
 
-/// The most rows one reply carries; the client fetches the rest.
+/// A request as sent, its data run-length compressed (JTOpen
+/// DBBaseRequestDS with the request RLE compression bit, 0x00080000, of
+/// the bitmap): after the header and template (40 bytes) comes CP
+/// 0x3832 with the data's length and the compressed data, where escape
+/// 0x1B, 0x1B stands for 0x1B and 0x1B, two bytes, a 2-byte count for
+/// the two bytes that many times (JTOpen DataStreamCompression).
+fn decompressed(ds: Ds) -> Ds {
+    let v = &ds.0;
+    if v.len() < 50
+        || ds.server_id() != 0xE004
+        || ds.u32(20) & 0x0008_0000 == 0
+        || ds.u16(44) != 0x3832
+    {
+        return ds;
+    }
+    let full = ds.u32(46) as usize;
+    let mut out = Vec::with_capacity(40 + full);
+    out.extend(&v[..40]);
+    let mut i = 50;
+    while i < v.len() {
+        if v[i] != 0x1B {
+            out.push(v[i]);
+            i += 1;
+        } else if v.get(i + 1) == Some(&0x1B) {
+            out.push(0x1B);
+            i += 2;
+        } else if i + 4 < v.len() {
+            let count = u16::from_be_bytes([v[i + 3], v[i + 4]]) as usize;
+            for _ in 0..count {
+                out.extend([v[i + 1], v[i + 2]]);
+            }
+            i += 5;
+        } else {
+            break;
+        }
+    }
+    let len = out.len() as u32;
+    out[..4].copy_from_slice(&len.to_be_bytes());
+    Ds(out)
+}
+
+/// The most rows one reply carries, and about the most bytes; the
+/// client fetches the rest.
 const BLOCK_ROWS: usize = 2048;
+const BLOCK_BYTES: usize = 1 << 20;
 
 /// A statement of an RPB (request parameter block): its text, and the
 /// rows of its open cursor.
@@ -187,6 +231,12 @@ struct Stmt {
     sql: String,
     /// The query's result: column descriptions and rows not yet sent.
     result: Option<Cursor>,
+    /// The columns of a query with parameter markers, described when
+    /// it was prepared (its rows come when it is opened with values).
+    described: Option<Vec<Col>>,
+    /// Its parameter markers as described, or as the client's
+    /// descriptor (change descriptor) has them since.
+    params: Vec<Col>,
 }
 
 struct Cursor {
@@ -211,6 +261,7 @@ async fn sql_request(
     id: u16,
     stmts: &mut std::collections::HashMap<u16, Stmt>,
     last: &mut Option<SqlError>,
+    dt: Dt,
 ) -> Vec<u8> {
     let rpb = ds.u16(34);
     let ors = ds.u32(20);
@@ -248,6 +299,20 @@ async fn sql_request(
             db_reply(ds, 0, 0, &p)
         }
         0x1F01 => db_reply(ds, 0, 0, &[]),
+        // Change descriptor (JTOpen DBSQLDescriptorDS): the parameter
+        // markers' format as the client lays out their values.
+        0x1E00 => {
+            let cols = ds.params(20 + tl).into_iter().find_map(|(cp, d)| match cp {
+                0x381E => Some(descriptor(d, true)),
+                0x3801 => Some(descriptor(d, false)),
+                _ => None,
+            });
+            if let Some(cols) = cols {
+                stmts.entry(rpb).or_default().params = cols;
+            }
+            db_reply(ds, 0, 0, &[])
+        }
+        0x1E01 => db_reply(ds, 0, 0, &[]),
         // Prepare (0x1800), prepare and describe (0x1803): a query is run
         // now and its rows kept for the open, its columns described.
         0x1800 | 0x1803 => {
@@ -255,35 +320,82 @@ async fn sql_request(
             let s = stmts.entry(rpb).or_default();
             s.sql = sql.clone();
             s.result = None;
-            if !is_query(&sql) {
-                return db_reply(ds, 0, 0, &sqlca(0, "00000", 0));
+            s.described = None;
+            let markers = crate::mapepire::marker_positions(&sql).len();
+            s.params = if markers > 0 {
+                marker_cols(srv, &sql).await
+            } else {
+                Vec::new()
+            };
+            let mut p = Vec::new();
+            if markers > 0 && ors & ORS_PARAMETER_MARKER_FORMAT != 0 {
+                p.extend(format(0x380D, &s.params, 0xF0));
             }
-            match run(srv, &sql).await {
-                Ok(Ran::Rows(c)) => {
-                    let mut p = Vec::new();
+            if !is_query(&sql) {
+                p.extend(sqlca(0, "00000", 0));
+                return db_reply(ds, 0, 0, &p);
+            }
+            // A query with markers is described by running it with nulls
+            // for them; its rows come when it is opened with its values.
+            let probe = if markers > 0 {
+                match crate::mapepire::bind(&sql, &vec!["NULL".to_string(); markers]) {
+                    Ok(q) => q,
+                    Err(e) => return fail(ds, e, last),
+                }
+            } else {
+                sql.clone()
+            };
+            match run(srv, &probe, dt, markers > 0).await {
+                Ok(Ran::Rows(mut c)) => {
+                    if markers > 0 {
+                        c.rows.clear();
+                        s.described = Some(c.cols.clone());
+                    }
                     if ors & ORS_DATA_FORMAT != 0 {
-                        p.extend(data_format(&c.cols));
+                        p.extend(format(0x380C, &c.cols, 0));
                     }
                     p.extend(sqlca(0, "00000", 0));
-                    s.result = Some(c);
+                    if markers == 0 {
+                        s.result = Some(c);
+                    }
                     db_reply(ds, 0, 0, &p)
                 }
-                Ok(Ran::Count(_)) => db_reply(ds, 0, 0, &sqlca(0, "00000", 0)),
+                Ok(Ran::Count(_)) => {
+                    p.extend(sqlca(0, "00000", 0));
+                    db_reply(ds, 0, 0, &p)
+                }
                 Err(e) => fail(ds, e, last),
             }
         }
         // Execute (0x1805), execute immediate (0x1806): the statement run,
         // the rows it changed in the SQLCA (errd 3).
         0x1805 | 0x1806 => {
-            let sql = match (id, text) {
-                (0x1806, Some(t)) => t,
-                _ => stmts.get(&rpb).map(|s| s.sql.clone()).unwrap_or_default(),
+            let (sql, cols) = match (id, text) {
+                (0x1806, Some(t)) => (t, Vec::new()),
+                _ => stmts
+                    .get(&rpb)
+                    .map(|s| (s.sql.clone(), s.params.clone()))
+                    .unwrap_or_default(),
             };
-            match run(srv, &sql).await {
-                Ok(Ran::Count(n)) => db_reply(ds, 0, 0, &sqlca(0, "00000", n as i32)),
-                Ok(Ran::Rows(_)) => db_reply(ds, 0, 0, &sqlca(0, "00000", 0)),
-                Err(e) => fail(ds, e, last),
+            // A row of values for each run (more than one: a batch).
+            let rows = match marker_values(ds, 20 + tl, &cols) {
+                Ok(r) => r,
+                Err(e) => return fail(ds, e, last),
+            };
+            let mut count = 0u64;
+            for values in rows {
+                let q = if values.is_empty() {
+                    Ok(sql.clone())
+                } else {
+                    crate::mapepire::bind(&sql, &values)
+                };
+                match async { run(srv, &q?, dt, false).await }.await {
+                    Ok(Ran::Count(n)) => count += n,
+                    Ok(Ran::Rows(_)) => {}
+                    Err(e) => return fail(ds, e, last),
+                }
             }
+            db_reply(ds, 0, 0, &sqlca(0, "00000", count as i32))
         }
         // Open and describe (0x1804), open, describe and fetch (0x180E),
         // execute or open and describe (0x1812): the cursor over the
@@ -294,10 +406,26 @@ async fn sql_request(
                 s.sql = t;
                 s.result = None;
             }
-            if s.result.is_none() {
-                let sql = s.sql.clone();
-                match run(srv, &sql).await {
-                    Ok(Ran::Rows(c)) => s.result = Some(c),
+            let values = match marker_values(ds, 20 + tl, &s.params) {
+                Ok(mut r) => r.pop().unwrap_or_default(),
+                Err(e) => return fail(ds, e, last),
+            };
+            if s.result.is_none() || !values.is_empty() {
+                let sql = if values.is_empty() {
+                    Ok(s.sql.clone())
+                } else {
+                    crate::mapepire::bind(&s.sql, &values)
+                };
+                match async { run(srv, &sql?, dt, false).await }.await {
+                    Ok(Ran::Rows(mut c)) => {
+                        // The columns as the prepare described them.
+                        if let Some(d) = &s.described {
+                            if d.len() == c.cols.len() {
+                                c.cols = d.clone();
+                            }
+                        }
+                        s.result = Some(c)
+                    }
                     Ok(Ran::Count(n)) => return db_reply(ds, 0, 0, &sqlca(0, "00000", n as i32)),
                     Err(e) => return fail(ds, e, last),
                 }
@@ -305,7 +433,7 @@ async fn sql_request(
             let c = s.result.as_mut().expect("result");
             let mut p = Vec::new();
             if ors & ORS_DATA_FORMAT != 0 {
-                p.extend(data_format(&c.cols));
+                p.extend(format(0x380C, &c.cols, 0));
             }
             let (class, rc) = if id == 0x180E || ors & ORS_RESULT_DATA != 0 {
                 let (data, more) = result_data(c);
@@ -354,6 +482,7 @@ async fn sql_request(
 const ORS_DATA_FORMAT: u32 = 0x0800_0000;
 const ORS_RESULT_DATA: u32 = 0x0400_0000;
 const ORS_SQLCA: u32 = 0x0200_0000;
+const ORS_PARAMETER_MARKER_FORMAT: u32 = 0x0080_0000;
 
 enum Ran {
     Rows(Cursor),
@@ -361,10 +490,12 @@ enum Ran {
 }
 
 /// Run a statement on the connection's job.
-async fn run(srv: &mut crate::mapepire::Server<'_>, sql: &str) -> Result<Ran> {
+/// A probe (a query run to describe its columns before its rows)
+/// describes them as `col_for` does without values.
+async fn run(srv: &mut crate::mapepire::Server<'_>, sql: &str, dt: Dt, probe: bool) -> Result<Ran> {
     Ok(match srv.statement(sql).await? {
-        crate::mapepire::Done::Rows(r) => Ran::Rows(cursor(r)),
-        crate::mapepire::Done::Call(Some(r), _) => Ran::Rows(cursor(r)),
+        crate::mapepire::Done::Rows(r) => Ran::Rows(cursor(r, dt, probe)),
+        crate::mapepire::Done::Call(Some(r), _) => Ran::Rows(cursor(r, dt, probe)),
         crate::mapepire::Done::Call(None, _) => Ran::Count(0),
         crate::mapepire::Done::Count(n) => Ran::Count(n),
     })
@@ -440,6 +571,418 @@ struct Col {
     precision: u16,
     scale: u16,
     ccsid: u16,
+    /// How a date or time column is written.
+    dt: Dt,
+}
+
+impl Col {
+    /// A parameter marker whose column is not worked out: VARCHAR(32739)
+    /// in UTF-8, the client's values converted to text.
+    fn marker(dt: Dt) -> Col {
+        Col {
+            name: String::new(),
+            sql_type: 449,
+            length: 32741,
+            precision: 32739,
+            scale: 0,
+            ccsid: 1208,
+            dt,
+        }
+    }
+}
+
+/// The parameter markers of a statement described as the columns they
+/// stand for: an INSERT's values (the columns listed, else the table's
+/// in order), and the column compared with a marker (`col = ?`, `? <
+/// col`, `col LIKE ?`, `col BETWEEN ? AND ?`, `col IN (?, ?)`, `SET col
+/// = ?`), its type from a query of the statement's table (or FROM
+/// clause) that returns no rows. Other markers are VARCHAR.
+async fn marker_cols(srv: &mut crate::mapepire::Server<'_>, sql: &str) -> Vec<Col> {
+    let at = crate::mapepire::marker_positions(sql);
+    let mut cols: Vec<Col> = at.iter().map(|_| Col::marker(Dt::default())).collect();
+    let m = masked(sql);
+    let (from, targets) = match insert_targets(&m, sql, &at) {
+        Some(x) => x,
+        None => (
+            from_clause(&m, sql),
+            at.iter().map(|p| comparand(&m, sql, *p)).collect(),
+        ),
+    };
+    let Some((prefix, from)) = from else {
+        return cols;
+    };
+    let mut names: Vec<String> = Vec::new();
+    for t in targets.iter().flatten() {
+        if t != "*" && !names.contains(t) {
+            names.push(t.clone());
+        }
+    }
+    let star = targets.iter().any(|t| t.as_deref() == Some("*"));
+    if names.is_empty() && !star {
+        return cols;
+    }
+    let list = if star {
+        "*".to_string()
+    } else {
+        names.join(", ")
+    };
+    let probe = format!("{prefix}SELECT {list} FROM {from} WHERE 1 = 0");
+    let probe = match crate::mapepire::bind(
+        &probe,
+        &vec!["NULL".to_string(); crate::mapepire::marker_positions(&probe).len()],
+    ) {
+        Ok(q) => q,
+        Err(_) => return cols,
+    };
+    let Ok(crate::mapepire::Done::Rows(r)) = srv.statement(&probe).await else {
+        return cols;
+    };
+    for (i, t) in targets.iter().enumerate() {
+        let k = match t.as_deref() {
+            // An INSERT without its columns: the table's i-th column.
+            Some("*") => insert_ordinal(&m, &at, i),
+            Some(name) => names.iter().position(|n| n == name),
+            None => None,
+        };
+        if let Some(t) = k.and_then(|k| r.types.get(k)) {
+            // The client sends dates and times in ISO form whatever the
+            // connection's format (JTOpen SQLDate, SQLTime
+            // convertToRawBytes).
+            let mut c = col_for("", t, None, Dt::default());
+            c.name.clear();
+            cols[i] = c;
+        }
+    }
+    cols
+}
+
+/// A statement with its strings' contents blanked (so that a keyword or
+/// parenthesis in a string is not taken for one) and in upper case.
+fn masked(sql: &str) -> Vec<u8> {
+    let mut b = sql.as_bytes().to_ascii_uppercase();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\'' {
+                    if b.get(i + 1) == Some(&b'\'') {
+                        b[i] = b'_';
+                        b[i + 1] = b'_';
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                b[i] = b'_';
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    b
+}
+
+fn is_name_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$' | b'#' | b'@' | b'.' | b'"') || c >= 0x80
+}
+
+const NOT_NAMES: &[&str] = &[
+    "AND", "OR", "NOT", "WHERE", "SET", "ON", "WHEN", "THEN", "ELSE", "HAVING", "SELECT", "VALUES",
+    "BY", "IS", "NULL", "CASE", "END", "IN", "LIKE", "BETWEEN",
+];
+
+/// The name (a column, perhaps qualified) that ends where `end` is, after
+/// blanks.
+fn name_before(m: &[u8], sql: &str, end: usize) -> Option<String> {
+    let mut e = end;
+    while e > 0 && m[e - 1].is_ascii_whitespace() {
+        e -= 1;
+    }
+    let mut b = e;
+    while b > 0 && is_name_byte(m[b - 1]) {
+        b -= 1;
+    }
+    name_at(m, sql, b, e)
+}
+
+fn name_at(m: &[u8], sql: &str, b: usize, e: usize) -> Option<String> {
+    if b >= e || m[b].is_ascii_digit() || m[b] == b'.' {
+        return None;
+    }
+    let w = std::str::from_utf8(&m[b..e]).ok()?;
+    if NOT_NAMES.contains(&w) {
+        return None;
+    }
+    Some(sql[b..e].to_string())
+}
+
+/// The word ending where `end` is (after blanks), and where it starts.
+fn word_before(m: &[u8], end: usize) -> (usize, String) {
+    let mut e = end;
+    while e > 0 && m[e - 1].is_ascii_whitespace() {
+        e -= 1;
+    }
+    let mut b = e;
+    while b > 0 && (m[b - 1].is_ascii_alphanumeric() || m[b - 1] == b'_') {
+        b -= 1;
+    }
+    (b, String::from_utf8_lossy(&m[b..e]).into_owned())
+}
+
+/// The column a marker at `p` is compared with.
+fn comparand(m: &[u8], sql: &str, p: usize) -> Option<String> {
+    let mut e = p;
+    while e > 0 && m[e - 1].is_ascii_whitespace() {
+        e -= 1;
+    }
+    let ops: [&[u8]; 7] = [b"<=", b">=", b"<>", b"!=", b"=", b"<", b">"];
+    if let Some(op) = ops.iter().find(|op| m[..e].ends_with(op)) {
+        if let Some(n) = name_before(m, sql, e - op.len()) {
+            return Some(n);
+        }
+    }
+    let (b, w) = word_before(m, e);
+    let skip_not = |b: usize| {
+        let (nb, nw) = word_before(m, b);
+        if nw == "NOT" {
+            nb
+        } else {
+            b
+        }
+    };
+    match w.as_str() {
+        "LIKE" | "BETWEEN" => return name_before(m, sql, skip_not(b)),
+        "AND" => {
+            // col BETWEEN x AND ?
+            let mut x = b;
+            while x > 0 && m[x - 1].is_ascii_whitespace() {
+                x -= 1;
+            }
+            while x > 0 && !m[x - 1].is_ascii_whitespace() {
+                x -= 1;
+            }
+            let (bb, bw) = word_before(m, x);
+            if bw == "BETWEEN" {
+                return name_before(m, sql, skip_not(bb));
+            }
+        }
+        _ => {}
+    }
+    // col IN (?, ?)
+    if e > 0 && matches!(m[e - 1], b'(' | b',') {
+        let mut depth = 0i32;
+        let mut x = e;
+        while x > 0 {
+            x -= 1;
+            match m[x] {
+                b')' => depth += 1,
+                b'(' if depth == 0 => {
+                    let (ib, iw) = word_before(m, x);
+                    if iw == "IN" {
+                        return name_before(m, sql, skip_not(ib));
+                    }
+                    break;
+                }
+                b'(' => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    // ? = col
+    let mut a = p + 1;
+    while a < m.len() && m[a].is_ascii_whitespace() {
+        a += 1;
+    }
+    if let Some(op) = ops.iter().find(|op| m[a..].starts_with(op)) {
+        let mut b = a + op.len();
+        while b < m.len() && m[b].is_ascii_whitespace() {
+            b += 1;
+        }
+        let mut e = b;
+        while e < m.len() && is_name_byte(m[e]) {
+            e += 1;
+        }
+        return name_at(m, sql, b, e);
+    }
+    None
+}
+
+/// Where each top-level word of a statement starts (outside
+/// parentheses).
+fn top_words(m: &[u8]) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < m.len() {
+        match m[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'"' => {
+                i += 1;
+                while i < m.len() && m[i] != b'"' {
+                    i += 1;
+                }
+            }
+            c if depth == 0 && (c.is_ascii_alphabetic()) && (i == 0 || !is_name_byte(m[i - 1])) => {
+                let b = i;
+                while i < m.len() && (m[i].is_ascii_alphanumeric() || m[i] == b'_') {
+                    i += 1;
+                }
+                out.push((b, String::from_utf8_lossy(&m[b..i]).into_owned()));
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The tables a statement's markers' columns are in: an UPDATE's table,
+/// a DELETE's, a query's FROM clause (with the common table expressions
+/// before it).
+fn from_clause(m: &[u8], sql: &str) -> Option<(String, String)> {
+    let words = top_words(m);
+    let first = words.first()?.1.as_str();
+    let end_of = |from: usize, stops: &[&str]| {
+        words
+            .iter()
+            .find(|(at, w)| *at > from && stops.contains(&w.as_str()))
+            .map_or(sql.len(), |(at, _)| *at)
+    };
+    const STOPS: &[&str] = &[
+        "WHERE",
+        "GROUP",
+        "HAVING",
+        "ORDER",
+        "FETCH",
+        "LIMIT",
+        "OFFSET",
+        "FOR",
+        "UNION",
+        "EXCEPT",
+        "INTERSECT",
+        "WINDOW",
+        "OPTIMIZE",
+        "WITH",
+        "SET",
+    ];
+    match first {
+        "UPDATE" => {
+            let b = words[0].0 + 6;
+            Some((
+                String::new(),
+                sql[b..end_of(b, &["SET"])].trim().to_string(),
+            ))
+        }
+        "DELETE" => {
+            let (fb, _) = words.iter().find(|(_, w)| w == "FROM")?;
+            let b = fb + 4;
+            Some((String::new(), sql[b..end_of(b, STOPS)].trim().to_string()))
+        }
+        "SELECT" | "WITH" => {
+            let (fb, _) = words.iter().find(|(_, w)| w == "FROM")?;
+            let (sb, _) = words
+                .iter()
+                .rev()
+                .find(|(at, w)| at < fb && w == "SELECT")?;
+            let b = fb + 4;
+            // The common table expressions before the final SELECT.
+            let from = sql[b..end_of(b, STOPS)].trim();
+            Some((sql[..*sb].to_string(), from.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// An INSERT's markers in its VALUES: the table, and each marker's
+/// column ("*" for the table's column in the marker's position).
+#[allow(clippy::type_complexity)]
+fn insert_targets(
+    m: &[u8],
+    sql: &str,
+    at: &[usize],
+) -> Option<(Option<(String, String)>, Vec<Option<String>>)> {
+    let words = top_words(m);
+    if words.first()?.1 != "INSERT" || words.get(1)?.1 != "INTO" {
+        return None;
+    }
+    let tb = words[1].0 + 4;
+    let mut i = tb;
+    while i < m.len() && m[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let ts = i;
+    while i < m.len() && is_name_byte(m[i]) {
+        i += 1;
+    }
+    let table = sql[ts..i].to_string();
+    while i < m.len() && m[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let listed: Option<Vec<String>> = if m.get(i) == Some(&b'(') {
+        let close = i + m[i..].iter().position(|c| *c == b')')?;
+        let list = sql[i + 1..close]
+            .split(',')
+            .map(|c| c.trim().to_string())
+            .collect();
+        Some(list)
+    } else {
+        None
+    };
+    let vb = words.iter().find(|(_, w)| w == "VALUES")?.0;
+    let targets = at
+        .iter()
+        .map(|p| {
+            if *p < vb {
+                return None;
+            }
+            let k = value_position(m, vb, *p)?;
+            match &listed {
+                Some(l) => l.get(k).cloned(),
+                None => Some("*".to_string()),
+            }
+        })
+        .collect();
+    Some((Some((String::new(), table)), targets))
+}
+
+/// The position of the value at `p` in its row of a VALUES clause
+/// starting at `vb`, when the marker is a value by itself.
+fn value_position(m: &[u8], vb: usize, p: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut k = 0;
+    let mut start = vb;
+    for (i, c) in m.iter().enumerate().take(p).skip(vb) {
+        match c {
+            b'(' => {
+                depth += 1;
+                if depth == 1 {
+                    k = 0;
+                    start = i + 1;
+                }
+            }
+            b')' => depth -= 1,
+            b',' if depth == 1 => {
+                k += 1;
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let before = std::str::from_utf8(&m[start..p]).ok()?.trim();
+    let mut e = p + 1;
+    while e < m.len() && m[e].is_ascii_whitespace() {
+        e += 1;
+    }
+    (depth == 1 && before.is_empty() && matches!(m.get(e), Some(b',' | b')'))).then_some(k)
+}
+
+/// The column position of an INSERT marker without a column list.
+fn insert_ordinal(m: &[u8], at: &[usize], i: usize) -> Option<usize> {
+    let vb = top_words(m).iter().find(|(_, w)| w == "VALUES")?.0;
+    value_position(m, vb, at[i])
 }
 
 /// The rows of a statement's result as a cursor: each column's type
@@ -447,7 +990,7 @@ struct Col {
 /// floating point, 484 DECIMAL packed, 488 NUMERIC zoned, 452 CHAR, 448
 /// VARCHAR, 912 BINARY, 908 VARBINARY; nullable +1), its length from its
 /// type and its longest value.
-fn cursor(r: crate::mapepire::Results) -> Cursor {
+fn cursor(r: crate::mapepire::Results, dt: Dt, probe: bool) -> Cursor {
     let rows: std::collections::VecDeque<Vec<Option<String>>> = r.rows;
     let cols = r
         .columns
@@ -455,45 +998,246 @@ fn cursor(r: crate::mapepire::Results) -> Cursor {
         .zip(&r.types)
         .enumerate()
         .map(|(i, (name, t))| {
-            let longest = rows
+            let values: Vec<&str> = rows
                 .iter()
-                .filter_map(|row| row.get(i).cloned().flatten())
-                .map(|v| shown(t, &v).len())
-                .max()
-                .unwrap_or(0);
-            let (ty, p, s, _) = crate::mapepire::column_type(t, longest);
-            let (sql_type, length, precision, scale, ccsid) = match ty.as_str() {
-                "SMALLINT" => (500, 2, 5, 0, 0),
-                "INTEGER" => (496, 4, 10, 0, 0),
-                "BIGINT" => (492, 8, 19, 0, 0),
-                "REAL" | "DOUBLE" => (480, 8, 53, 0, 0),
-                "DECIMAL" => (484, (p as usize) / 2 + 1, p as u16, s as u16, 0),
-                "NUMERIC" => (488, p as usize, p as u16, s as u16, 0),
-                "CHAR" | "NCHAR" => {
-                    let n = (p as usize).max(longest).max(1);
-                    (452, n, n as u16, 0, 1208)
-                }
-                "BINARY" => (912, (p as usize).max(longest).max(1), p as u16, 0, 65535),
-                "VARBINARY" | "VARCHAR () FOR BIT DATA" => {
-                    let n = (p as usize).max(longest).max(1);
-                    (908, n + 2, n as u16, 0, 65535)
-                }
-                _ => {
-                    let n = (p as usize).max(longest).clamp(1, 32739);
-                    (448, n + 2, n as u16, 0, 1208)
-                }
-            };
-            Col {
-                name: name.clone(),
-                sql_type: sql_type + 1,
-                length,
-                precision,
-                scale,
-                ccsid,
-            }
+                .filter_map(|row| row.get(i).and_then(|v| v.as_deref()))
+                .collect();
+            col_for(name, t, (!probe).then_some(&values[..]), dt)
         })
         .collect();
     Cursor { cols, rows }
+}
+
+/// A column's description from its type and, when its rows are known,
+/// its values (the length of a column of no declared length, the scale
+/// of a decimal of no declared precision); before its rows, the longest
+/// a varying-length column can be and DECIMAL(31, 10).
+fn col_for(name: &str, t: &crate::sql::ColType, values: Option<&[&str]>, dt: Dt) -> Col {
+    let longest = match values {
+        Some(v) => v.iter().map(|v| shown(t, v).len()).max().unwrap_or(0),
+        None => 32739,
+    };
+    let (ty, p, s, _) = crate::mapepire::column_type(t, longest);
+    let (sql_type, length, precision, scale, ccsid) = match ty.as_str() {
+        "SMALLINT" => (500, 2, 5, 0, 0),
+        "INTEGER" => (496, 4, 10, 0, 0),
+        "BIGINT" => (492, 8, 19, 0, 0),
+        "REAL" | "DOUBLE" => (480, 8, 53, 0, 0),
+        // A decimal of no declared precision (an expression):
+        // DECIMAL(31, s), s the most decimals of its values.
+        "DECIMAL" if t.typmod < 4 && t.pg == "numeric" => {
+            let s = match values {
+                Some(v) => v
+                    .iter()
+                    .map(|v| v.split_once('.').map_or(0, |(_, f)| f.len()))
+                    .max()
+                    .unwrap_or(0)
+                    .min(30),
+                None => 10,
+            };
+            (484, 16, 31, s as u16, 0)
+        }
+        "DECIMAL" => (484, (p as usize) / 2 + 1, p as u16, s as u16, 0),
+        "NUMERIC" => (488, p as usize, p as u16, s as u16, 0),
+        "DATE" => (384, dt.date_len(), 0, 0, 1208),
+        "TIME" => (388, 8, 0, 0, 1208),
+        "TIMESTAMP" => (392, 26, 26, 6, 1208),
+        "CHAR" | "NCHAR" => {
+            let n = (p as usize).max(1);
+            (452, n, n as u16, 0, 1208)
+        }
+        "BINARY" => (912, (p as usize).max(1), p as u16, 0, 65535),
+        "VARBINARY" | "VARCHAR () FOR BIT DATA" => {
+            let n = (p as usize).clamp(1, 32739);
+            (908, n + 2, n as u16, 0, 65535)
+        }
+        _ => {
+            let n = (p as usize).clamp(1, 32739);
+            (448, n + 2, n as u16, 0, 1208)
+        }
+    };
+    Col {
+        name: name.to_string(),
+        sql_type: sql_type + 1,
+        length,
+        precision,
+        scale,
+        ccsid,
+        dt,
+    }
+}
+
+/// How the connection writes dates and times (its date format and
+/// separator, time format and separator, as the set attributes request
+/// agreed them; JTOpen SQLConversionSettings: date formats 0 JUL, 1 MDY,
+/// 2 DMY, 3 YMD, 4 USA, 5 ISO, 6 EUR, 7 JIS; separators 0 /, 1 -, 2 .,
+/// 3 ,, 4 blank; time formats 0 HMS, 1 USA, 2 ISO, 3 EUR, 4 JIS;
+/// separators 0 :, 1 ., 2 ,, 3 blank).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Dt {
+    date: u16,
+    date_sep: u16,
+    time: u16,
+    time_sep: u16,
+}
+
+impl Default for Dt {
+    fn default() -> Self {
+        Dt {
+            date: 5,
+            date_sep: 1,
+            time: 2,
+            time_sep: 1,
+        }
+    }
+}
+
+impl Dt {
+    fn of(a: &Attributes) -> Dt {
+        Dt {
+            date: a.date_format,
+            date_sep: a.date_separator,
+            time: a.time_format,
+            time_sep: a.time_separator,
+        }
+    }
+
+    fn date_len(&self) -> usize {
+        match self.date {
+            0 => 6,
+            1..=3 => 8,
+            _ => 10,
+        }
+    }
+
+    fn dsep(&self) -> char {
+        ['/', '-', '.', ',', ' '][(self.date_sep as usize).min(4)]
+    }
+
+    fn tsep(&self) -> char {
+        [':', '.', ',', ' '][(self.time_sep as usize).min(3)]
+    }
+
+    /// An ISO date (yyyy-mm-dd) in the connection's format.
+    fn date_text(&self, iso: &str) -> String {
+        let d: Vec<u32> = iso
+            .split(|c: char| !c.is_ascii_digit())
+            .filter_map(|x| x.parse().ok())
+            .collect();
+        let (y, m, day) = match d[..] {
+            [y, m, day, ..] => (y, m, day),
+            _ => return iso.to_string(),
+        };
+        let s = self.dsep();
+        match self.date {
+            0 => {
+                let n = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+                let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+                let doy = n[(m as usize).clamp(1, 12) - 1] + day + u32::from(leap && m > 2);
+                format!("{:02}{s}{doy:03}", y % 100)
+            }
+            1 => format!("{m:02}{s}{day:02}{s}{:02}", y % 100),
+            2 => format!("{day:02}{s}{m:02}{s}{:02}", y % 100),
+            3 => format!("{:02}{s}{m:02}{s}{day:02}", y % 100),
+            4 => format!("{m:02}/{day:02}/{y:04}"),
+            6 => format!("{day:02}.{m:02}.{y:04}"),
+            _ => format!("{y:04}-{m:02}-{day:02}"),
+        }
+    }
+
+    /// A date in the connection's format as ISO (yyyy-mm-dd); two-digit
+    /// years 40-99 in the 1900s, 00-39 in the 2000s.
+    fn date_iso(&self, t: &str) -> String {
+        let d: Vec<u32> = t
+            .split(|c: char| !c.is_ascii_digit())
+            .filter_map(|x| x.parse().ok())
+            .collect();
+        let year = |y: u32| {
+            if y >= 100 {
+                y
+            } else if y >= 40 {
+                1900 + y
+            } else {
+                2000 + y
+            }
+        };
+        let iso = t
+            .trim_start()
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .map(str::len)
+            == Some(4);
+        let (y, m, day) = match (if iso { 5 } else { self.date }, &d[..]) {
+            (0, [y, doy, ..]) => {
+                let n = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365];
+                let y = year(*y);
+                let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+                let mut m = 1;
+                while m < 12 && *doy > n[m] + u32::from(leap && m >= 2) {
+                    m += 1;
+                }
+                let before = n[m - 1] + u32::from(leap && m > 2);
+                (y, m as u32, doy - before)
+            }
+            (1 | 4, [m, day, y, ..]) => (year(*y), *m, *day),
+            (2 | 6, [day, m, y, ..]) => (year(*y), *m, *day),
+            (3, [y, m, day, ..]) => (year(*y), *m, *day),
+            (_, [y, m, day, ..]) => (*y, *m, *day),
+            _ => return t.to_string(),
+        };
+        format!("{y:04}-{m:02}-{day:02}")
+    }
+
+    /// A time (hh.mm.ss or hh:mm:ss) in the connection's format.
+    fn time_text(&self, v: &str) -> String {
+        let d: Vec<u32> = v
+            .split(|c: char| !c.is_ascii_digit())
+            .filter_map(|x| x.parse().ok())
+            .collect();
+        let (h, m, sec) = match d[..] {
+            [h, m, sec, ..] => (h, m, sec),
+            [h, m] => (h, m, 0),
+            _ => return v.to_string(),
+        };
+        match self.time {
+            0 => {
+                let s = self.tsep();
+                format!("{h:02}{s}{m:02}{s}{sec:02}")
+            }
+            1 => {
+                let (h12, ap) = match h {
+                    0 => (12, "AM"),
+                    1..=11 => (h, "AM"),
+                    12 => (12, "PM"),
+                    _ => (h - 12, "PM"),
+                };
+                format!("{h12:02}:{m:02} {ap}")
+            }
+            4 => format!("{h:02}:{m:02}:{sec:02}"),
+            _ => format!("{h:02}.{m:02}.{sec:02}"),
+        }
+    }
+
+    /// A time in the connection's format as hh:mm:ss.
+    fn time_iso(&self, t: &str) -> String {
+        let d: Vec<u32> = t
+            .split(|c: char| !c.is_ascii_digit())
+            .filter_map(|x| x.parse().ok())
+            .collect();
+        let pm = t.to_ascii_uppercase().contains("PM");
+        let (mut h, m, sec) = match d[..] {
+            [h, m, sec, ..] => (h, m, sec),
+            [h, m] => (h, m, 0),
+            _ => return t.to_string(),
+        };
+        if self.time == 1 || t.to_ascii_uppercase().contains('M') {
+            h %= 12;
+            if pm {
+                h += 12;
+            }
+        }
+        format!("{h:02}:{m:02}:{sec:02}")
+    }
 }
 
 /// A value as Db2 shows it: dates ISO, times hh.mm.ss, timestamps
@@ -517,26 +1261,29 @@ fn shown(t: &crate::sql::ColType, v: &str) -> String {
     }
 }
 
-/// The data format (CP 0x3805, JTOpen DBOriginalDataFormat): a
-/// consistency token (4), the number of fields (2), the record size (2),
-/// then 54 bytes for each field: its description's length, SQL type,
-/// length, scale, precision, CCSID, parameter type, reserved, the name's
-/// length, its CCSID and the name (30 bytes).
-fn data_format(cols: &[Col]) -> Vec<u8> {
+/// A data format (JTOpen DBExtendedDataFormat), of a result (CP
+/// 0x380C) or of parameter markers (0x380D, parameter type 0xF0 input):
+/// a consistency token (4), the number of fields (4), reserved (4), the
+/// record size (4), then 64 bytes for each field: its description's
+/// length, SQL type, length (4), scale, precision, CCSID, parameter type,
+/// LOB locator and maximum size, the name's length, its CCSID and the
+/// name (30 bytes).
+fn format(cp: u16, cols: &[Col], ptype: u8) -> Vec<u8> {
     let size: usize = cols.iter().map(|c| c.length).sum();
     let mut d = 1u32.to_be_bytes().to_vec();
-    d.extend((cols.len() as u16).to_be_bytes());
-    d.extend((size as u16).to_be_bytes());
+    d.extend((cols.len() as u32).to_be_bytes());
+    d.extend([0u8; 4]);
+    d.extend((size as u32).to_be_bytes());
     for c in cols {
-        let mut f = Vec::with_capacity(54);
-        f.extend(54u16.to_be_bytes());
+        let mut f = Vec::with_capacity(64);
+        f.extend(64u16.to_be_bytes());
         f.extend(c.sql_type.to_be_bytes());
-        f.extend((c.length as u16).to_be_bytes());
+        f.extend((c.length as u32).to_be_bytes());
         f.extend(c.scale.to_be_bytes());
         f.extend(c.precision.to_be_bytes());
         f.extend(c.ccsid.to_be_bytes());
-        f.push(0); // parameter type
-        f.extend([0u8; 7]);
+        f.push(ptype);
+        f.extend([0u8; 15]);
         let mut name = c.name.as_bytes().to_vec();
         name.truncate(30);
         f.extend((name.len() as u16).to_be_bytes());
@@ -545,16 +1292,183 @@ fn data_format(cols: &[Col]) -> Vec<u8> {
         f.extend(name);
         d.extend(f);
     }
-    param(0x3805, &d)
+    param(cp, &d)
 }
 
-/// The next block of rows (CP 0x3806, JTOpen DBOriginalData): a
+/// The fields of a client's descriptor: extended (CP 0x381E, as
+/// `format` lays it out) or original (0x3801: a 2-byte count and record
+/// size, 54 bytes a field with a 2-byte length).
+fn descriptor(d: &[u8], extended: bool) -> Vec<Col> {
+    let u16_at = |i: usize| {
+        d.get(i..i + 2)
+            .map_or(0, |b| u16::from_be_bytes([b[0], b[1]]))
+    };
+    let u32_at = |i: usize| {
+        d.get(i..i + 4)
+            .map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let (n, start, each) = if extended {
+        (u32_at(4) as usize, 16, 64)
+    } else {
+        (u16_at(4) as usize, 8, 54)
+    };
+    (0..n)
+        .map(|i| {
+            let f = start + i * each;
+            let length = if extended {
+                u32_at(f + 4) as usize
+            } else {
+                u16_at(f + 4) as usize
+            };
+            let (scale, precision, ccsid) = if extended {
+                (u16_at(f + 8), u16_at(f + 10), u16_at(f + 12))
+            } else {
+                (u16_at(f + 6), u16_at(f + 8), u16_at(f + 10))
+            };
+            Col {
+                name: String::new(),
+                sql_type: u16_at(f + 2),
+                length,
+                precision,
+                scale,
+                ccsid,
+                // Dates and times come in ISO form (`marker_cols`).
+                dt: Dt::default(),
+            }
+        })
+        .collect()
+}
+
+/// The values of a request's parameter markers (JTOpen DBExtendedData,
+/// CP 0x381F: a consistency token (4), the row count (4), the column
+/// count (2), the indicator size (2), reserved (4), the row size (4);
+/// DBOriginalData, 0x3811: the same without the reserved bytes and with
+/// a 2-byte row size), then the indicators (-1: null) and the rows laid
+/// out as the descriptor says: a row of SQL literals for each row.
+fn marker_values(ds: &Ds, from: usize, cols: &[Col]) -> Result<Vec<Vec<String>>> {
+    let Some((cp, d)) = ds
+        .params(from)
+        .into_iter()
+        .find(|(cp, _)| matches!(cp, 0x381F | 0x3811))
+    else {
+        return Ok(vec![Vec::new()]);
+    };
+    let bad = || anyhow::anyhow!("SQL0313: Number of host variables not valid.");
+    let u16_at = |i: usize| d.get(i..i + 2).map(|b| u16::from_be_bytes([b[0], b[1]]));
+    let u32_at = |i: usize| {
+        d.get(i..i + 4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let rows = u32_at(4).ok_or_else(bad)? as usize;
+    let ncols = u16_at(8).ok_or_else(bad)? as usize;
+    let ind = u16_at(10).ok_or_else(bad)? as usize;
+    let (row_size, head) = if cp == 0x381F {
+        (u32_at(16).ok_or_else(bad)? as usize, 20)
+    } else {
+        (u16_at(12).ok_or_else(bad)? as usize, 14)
+    };
+    if ncols != cols.len() {
+        return Err(crate::mapepire::sql_failure(&bad()));
+    }
+    let data = head + rows * ncols * ind;
+    let mut out = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let mut at = data + r * row_size;
+        let mut row = Vec::with_capacity(ncols);
+        for (c, col) in cols.iter().enumerate() {
+            let null =
+                ind > 0 && u16_at(head + (r * ncols + c) * ind).is_some_and(|v| (v as i16) < 0);
+            let bytes = d.get(at..at + col.length).ok_or_else(bad)?;
+            row.push(if null {
+                "NULL".into()
+            } else {
+                literal(col, bytes)
+            });
+            at += col.length;
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
+/// A value in its descriptor's form as an SQL literal.
+fn literal(c: &Col, b: &[u8]) -> String {
+    let quote = |t: &str| format!("'{}'", t.replace('\'', "''"));
+    let hex = |b: &[u8]| {
+        format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        )
+    };
+    let varying = || {
+        let n = b
+            .get(..2)
+            .map_or(0, |l| u16::from_be_bytes([l[0], l[1]]) as usize);
+        &b[2.min(b.len())..(2 + n).min(b.len())]
+    };
+    match c.sql_type & !1 {
+        500 if b.len() >= 2 => i16::from_be_bytes([b[0], b[1]]).to_string(),
+        496 if b.len() >= 4 => i32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string(),
+        492 if b.len() >= 8 => i64::from_be_bytes(b[..8].try_into().unwrap_or([0; 8])).to_string(),
+        480 if b.len() == 4 => f32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string(),
+        480 if b.len() >= 8 => f64::from_be_bytes(b[..8].try_into().unwrap_or([0; 8])).to_string(),
+        484 => unpacked(b, c.scale as usize),
+        384 => quote(&c.dt.date_iso(&decode(c.ccsid, b))),
+        388 => quote(&c.dt.time_iso(&decode(c.ccsid, b))),
+        488 => unzoned(b, c.scale as usize),
+        912 => hex(b),
+        908 => hex(varying()),
+        448 | 456 | 464 | 472 if c.ccsid == 65535 => hex(varying()),
+        452 | 468 if c.ccsid == 65535 => hex(b),
+        448 | 456 | 464 | 472 => quote(&decode(c.ccsid, varying())),
+        _ => quote(decode(c.ccsid, b).trim_end_matches([' ', '\0'])),
+    }
+}
+
+/// A packed decimal's value as text.
+fn unpacked(b: &[u8], scale: usize) -> String {
+    let mut digits = String::new();
+    for (i, x) in b.iter().enumerate() {
+        digits.push(char::from(b'0' + (x >> 4)));
+        if i + 1 < b.len() {
+            digits.push(char::from(b'0' + (x & 0x0F)));
+        }
+    }
+    let neg = b.last().is_some_and(|x| matches!(x & 0x0F, 0xB | 0xD));
+    decimal_text(&digits, scale, neg)
+}
+
+/// A zoned decimal's value as text.
+fn unzoned(b: &[u8], scale: usize) -> String {
+    let digits: String = b.iter().map(|x| char::from(b'0' + (x & 0x0F))).collect();
+    let neg = b.last().is_some_and(|x| matches!(x >> 4, 0xB | 0xD));
+    decimal_text(&digits, scale, neg)
+}
+
+fn decimal_text(digits: &str, scale: usize, neg: bool) -> String {
+    let scale = scale.min(digits.len());
+    let (i, f) = digits.split_at(digits.len() - scale);
+    let i = i.trim_start_matches('0');
+    let i = if i.is_empty() { "0" } else { i };
+    let sign = if neg { "-" } else { "" };
+    if f.is_empty() {
+        format!("{sign}{i}")
+    } else {
+        format!("{sign}{i}.{f}")
+    }
+}
+
+/// The next block of rows (CP 0x380E, JTOpen DBExtendedData): a
 /// consistency token (4), the row count (4), the column count (2), the
-/// indicator size (2), the row size (2), each row's indicators (0, or
-/// -1 for null), then the rows. Whether rows remain.
+/// indicator size (2), reserved (4), the row size (4), each row's
+/// indicators (0, or -1 for null), then the rows. Whether rows remain.
 fn result_data(c: &mut Cursor) -> (Vec<u8>, bool) {
-    let n = c.rows.len().min(BLOCK_ROWS);
     let row_size: usize = c.cols.iter().map(|c| c.length).sum();
+    let n = c
+        .rows
+        .len()
+        .min(BLOCK_ROWS)
+        .min((BLOCK_BYTES / row_size.max(1)).max(1));
     let mut ind = Vec::with_capacity(n * c.cols.len() * 2);
     let mut data = Vec::with_capacity(n * row_size);
     for _ in 0..n {
@@ -569,10 +1483,11 @@ fn result_data(c: &mut Cursor) -> (Vec<u8>, bool) {
     d.extend((n as u32).to_be_bytes());
     d.extend((c.cols.len() as u16).to_be_bytes());
     d.extend(2u16.to_be_bytes());
-    d.extend((row_size as u16).to_be_bytes());
+    d.extend([0u8; 4]);
+    d.extend((row_size as u32).to_be_bytes());
     d.extend(ind);
     d.extend(data);
-    (param(0x3806, &d), !c.rows.is_empty())
+    (param(0x380E, &d), !c.rows.is_empty())
 }
 
 /// One value in its column's form (blanks or zeros for null).
@@ -595,6 +1510,8 @@ fn field_bytes(c: &Col, v: Option<&str>) -> Vec<u8> {
             b.truncate(c.length);
             b
         }
+        384 => c.dt.date_text(v).into_bytes(),
+        388 => c.dt.time_text(v).into_bytes(),
         912 => decode_hex(v),
         908 | 448 => {
             let mut body = if c.sql_type & !1 == 908 {
@@ -609,7 +1526,11 @@ fn field_bytes(c: &Col, v: Option<&str>) -> Vec<u8> {
         }
         _ => v.as_bytes().to_vec(),
     };
-    let pad = if c.sql_type & !1 == 452 { b' ' } else { 0 };
+    let pad = if matches!(c.sql_type & !1, 452 | 384 | 388 | 392) {
+        b' '
+    } else {
+        0
+    };
     b.resize(c.length, pad);
     b
 }
@@ -781,6 +1702,144 @@ fn trace(ds: &Ds, dir: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_columns_markers_stand_for() {
+        let cmp = |sql: &str| -> Vec<Option<String>> {
+            let m = masked(sql);
+            crate::mapepire::marker_positions(sql)
+                .into_iter()
+                .map(|p| comparand(&m, sql, p))
+                .collect()
+        };
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            cmp("SELECT * FROM T WHERE A = ? AND B.X<>? AND ? <= C"),
+            vec![s("A"), s("B.X"), s("C")]
+        );
+        assert_eq!(
+            cmp("SELECT * FROM T WHERE N NOT LIKE ? OR D BETWEEN ? AND ? OR E IN (?, ?)"),
+            vec![s("N"), s("D"), s("D"), s("E"), s("E")]
+        );
+        assert_eq!(
+            cmp("UPDATE T SET A = ?, B = SUBSTR(?, 1, 2) WHERE '=?' = 'x'"),
+            vec![s("A"), None]
+        );
+        let m = masked("SELECT A FROM T X JOIN U ON X.K = U.K WHERE X.A = ? ORDER BY 1");
+        assert_eq!(
+            from_clause(
+                &m,
+                "SELECT A FROM T X JOIN U ON X.K = U.K WHERE X.A = ? ORDER BY 1"
+            ),
+            Some((String::new(), "T X JOIN U ON X.K = U.K".into()))
+        );
+        let w = "WITH Q AS (SELECT * FROM T WHERE A > 1) SELECT B FROM Q WHERE B = ?";
+        assert_eq!(
+            from_clause(&masked(w), w),
+            Some((
+                "WITH Q AS (SELECT * FROM T WHERE A > 1) ".into(),
+                "Q".into()
+            ))
+        );
+        let u = "update lib.t set a = ? where b = ?";
+        assert_eq!(
+            from_clause(&masked(u), u),
+            Some((String::new(), "lib.t".into()))
+        );
+        let i = "INSERT INTO L.T (A, B, C) VALUES (?, 1, ?), (?, ?, CAST(? AS INT))";
+        let at = crate::mapepire::marker_positions(i);
+        let (from, t) = insert_targets(&masked(i), i, &at).unwrap();
+        assert_eq!(from, Some((String::new(), "L.T".into())));
+        assert_eq!(t, vec![s("A"), s("C"), s("A"), s("B"), None]);
+        let i = "INSERT INTO T VALUES (?, ?)";
+        let at = crate::mapepire::marker_positions(i);
+        assert_eq!(
+            insert_targets(&masked(i), i, &at).unwrap().1,
+            vec![s("*"), s("*")]
+        );
+        assert_eq!(insert_ordinal(&masked(i), &at, 1), Some(1));
+    }
+
+    #[test]
+    fn dates_and_times_in_the_connections_formats() {
+        // JTOpen SQLDate and SQLTime: MDY mm/dd/yy, JUL yy/ddd, USA
+        // mm/dd/yyyy, EUR dd.mm.yyyy; times USA hh:mm AM, ISO hh.mm.ss.
+        let dt = |date, date_sep, time, time_sep| Dt {
+            date,
+            date_sep,
+            time,
+            time_sep,
+        };
+        assert_eq!(dt(1, 0, 2, 0).date_text("2026-11-10"), "11/10/26");
+        assert_eq!(dt(0, 0, 2, 0).date_text("2024-03-01"), "24/061");
+        assert_eq!(dt(4, 1, 2, 0).date_text("2026-01-05"), "01/05/2026");
+        assert_eq!(dt(6, 0, 2, 0).date_text("2026-01-05"), "05.01.2026");
+        assert_eq!(Dt::default().date_text("2026-01-05"), "2026-01-05");
+        assert_eq!(dt(1, 0, 2, 0).date_iso("11/10/26"), "2026-11-10");
+        assert_eq!(dt(0, 0, 2, 0).date_iso("24/061"), "2024-03-01");
+        assert_eq!(dt(1, 0, 2, 0).date_iso("2026-11-10"), "2026-11-10");
+        assert_eq!(dt(2, 2, 2, 0).date_iso("10.11.99"), "1999-11-10");
+        assert_eq!(dt(5, 1, 1, 0).time_text("13:05:09"), "01:05 PM");
+        assert_eq!(dt(5, 1, 0, 3).time_text("13.05.09"), "13 05 09");
+        assert_eq!(Dt::default().time_text("13:05:09"), "13.05.09");
+        assert_eq!(dt(5, 1, 1, 0).time_iso("01:05 PM"), "13:05:00");
+        assert_eq!(Dt::default().time_iso("13.05.09"), "13:05:09");
+    }
+
+    #[test]
+    fn values_of_markers_as_literals() {
+        let col = |sql_type, length, scale, ccsid| Col {
+            name: String::new(),
+            sql_type,
+            length,
+            precision: 0,
+            scale,
+            ccsid,
+            dt: Dt::default(),
+        };
+        assert_eq!(literal(&col(497, 4, 0, 0), &[0xFF, 0xFF, 0xFF, 0xFE]), "-2");
+        assert_eq!(
+            literal(&col(485, 4, 2, 0), &[0x00, 0x01, 0x23, 0x4D]),
+            "-12.34"
+        );
+        assert_eq!(literal(&col(489, 3, 1, 0), &[0xF0, 0xF4, 0xD5]), "-4.5");
+        assert_eq!(
+            literal(&col(449, 7, 0, 1208), &[0, 4, b'a', b'\'', b'b', b'c', 0]),
+            "'a''bc'"
+        );
+        assert_eq!(
+            literal(&col(453, 4, 0, 37), &[0xC1, 0x40, 0x40, 0x40]),
+            "'A'"
+        );
+        assert_eq!(literal(&col(909, 4, 0, 65535), &[0, 2, 1, 0xAB]), "X'01AB'");
+        assert_eq!(
+            literal(&col(385, 10, 0, 1208), b"2026-11-10"),
+            "'2026-11-10'"
+        );
+    }
+
+    #[test]
+    fn run_length_compressed_requests() {
+        // JTOpen DataStreamCompression: 0x1B 0x1B is 0x1B; 0x1B, two
+        // bytes and a count repeats them.
+        let mut v = vec![0u8; 40];
+        v[6..8].copy_from_slice(&0xE004u16.to_be_bytes());
+        v[16..18].copy_from_slice(&20u16.to_be_bytes());
+        v[20..24].copy_from_slice(&0x0008_0000u32.to_be_bytes());
+        let data = [9u8, 0x1B, 0x1B, 0x1B, 0, 7, 0, 3, 5];
+        v.extend(((data.len() + 10) as u32).to_be_bytes());
+        v.extend(0x3832u16.to_be_bytes());
+        v.extend(9u32.to_be_bytes());
+        v.extend(data);
+        let l = v.len() as u32;
+        v[..4].copy_from_slice(&l.to_be_bytes());
+        let d = decompressed(Ds(v));
+        assert_eq!(&d.0[40..], &[9, 0x1B, 0, 7, 0, 7, 0, 7, 5]);
+        assert_eq!(
+            d.0.len() as u32,
+            u32::from_be_bytes([d.0[0], d.0[1], d.0[2], d.0[3]])
+        );
+    }
 
     #[test]
     fn decimals_packed_and_zoned() {

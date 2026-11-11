@@ -28418,30 +28418,108 @@ async fn host_servers_sign_on_and_database_attributes() {
     )
     .await;
     assert_eq!(class_rc(&r), (0, 0));
-    let f = find(&r, 0x3805);
-    assert_eq!(u16::from_be_bytes([f[4], f[5]]), 3, "fields");
-    assert_eq!(u16::from_be_bytes([f[6], f[7]]), 4 + 4 + 4, "record size");
-    let field = |i: usize, at: usize| u16::from_be_bytes([f[8 + 54 * i + at], f[9 + 54 * i + at]]);
-    assert_eq!((field(0, 2), field(0, 4)), (497, 4), "INTEGER");
+    let f = find(&r, 0x380C);
+    let u32f = |f: &[u8], at: usize| u32::from_be_bytes([f[at], f[at + 1], f[at + 2], f[at + 3]]);
+    let field = |f: &[u8], i: usize, at: usize| {
+        u16::from_be_bytes([f[16 + 64 * i + at], f[17 + 64 * i + at]])
+    };
+    assert_eq!(u32f(&f, 4), 3, "fields");
+    assert_eq!(u32f(&f, 12), 4 + 4 + 4, "record size");
+    assert_eq!((field(&f, 0, 2), u32f(&f, 16 + 4)), (497, 4), "INTEGER");
     assert_eq!(
-        (field(1, 2), field(1, 4), field(1, 6), field(1, 8)),
+        (
+            field(&f, 1, 2),
+            u32f(&f, 16 + 64 + 4),
+            field(&f, 1, 8),
+            field(&f, 1, 10)
+        ),
         (485, 4, 2, 7),
         "DECIMAL(7,2)"
     );
-    assert_eq!((field(2, 2), field(2, 4)), (453, 4), "CHAR(4)");
-    assert_eq!(&f[8 + 24..8 + 26], b"ID");
+    assert_eq!(
+        (field(&f, 2, 2), u32f(&f, 16 + 128 + 4)),
+        (453, 4),
+        "CHAR(4)"
+    );
+    assert_eq!(&f[16 + 34..16 + 36], b"ID");
     let r = exchange(&mut s, msg(0x180E, 0x8400_0000, "")).await;
     assert_eq!(class_rc(&r), (2, 701), "the last block");
-    let d = find(&r, 0x3806);
+    let d = find(&r, 0x380E);
     assert_eq!(u32_at(&d, 4), 2, "rows");
-    let ind = &d[14..14 + 12];
+    assert_eq!(u32_at(&d, 16), 12, "row size");
+    let ind = &d[20..20 + 12];
     assert_eq!(ind, &[0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]);
-    let rows = &d[26..];
+    let rows = &d[32..];
     assert_eq!(
         &rows[..12],
         &[0, 0, 0, 1, 0x00, 0x01, 0x23, 0x4D, b'a', b'b', b' ', b' ']
     );
     assert_eq!(&rows[12..16], &[0, 0, 0, 2]);
+    // Parameter markers: described as the columns they stand for
+    // (0x380D, parameter type 0xF0), their values in CP 0x381F (a row
+    // for each run: a batch).
+    let values = |rows: &[&[u8]], ncols: u16, row_size: u32| {
+        let mut d = 1u32.to_be_bytes().to_vec();
+        d.extend((rows.len() as u32).to_be_bytes());
+        d.extend(ncols.to_be_bytes());
+        d.extend(2u16.to_be_bytes());
+        d.extend([0u8; 4]);
+        d.extend(row_size.to_be_bytes());
+        d.extend(vec![0u8; rows.len() * ncols as usize * 2]);
+        for r in rows {
+            d.extend(*r);
+        }
+        cp(0x381F, &d)
+    };
+    let r = exchange(
+        &mut s,
+        msg(
+            0x1803,
+            0x8280_0000,
+            &format!("INSERT INTO {lib}.HT (ID, NM) VALUES (?, ?)"),
+        ),
+    )
+    .await;
+    assert_eq!(class_rc(&r), (0, 0));
+    let f = find(&r, 0x380D);
+    assert_eq!(
+        (field(&f, 0, 2), field(&f, 1, 2), f[16 + 14]),
+        (497, 453, 0xF0)
+    );
+    let rows: [&[u8]; 2] = [
+        &[0, 0, 0, 3, b'c', b' ', b' ', b' '],
+        &[0, 0, 0, 4, b'd', b'\'', b' ', b' '],
+    ];
+    let run = ds(&values(&rows, 2, 8), 0xE004, 0x1805, &tmpl(0x0200_0000));
+    let r = exchange(&mut s, run).await;
+    assert_eq!(class_rc(&r), (0, 0));
+    let ca = find(&r, 0x3807);
+    assert_eq!(
+        i32::from_be_bytes([ca[104], ca[105], ca[106], ca[107]]),
+        2,
+        "two rows"
+    );
+    let r = exchange(
+        &mut s,
+        msg(
+            0x1803,
+            0x8A80_0000,
+            &format!("SELECT NM FROM {lib}.HT WHERE ID = ?"),
+        ),
+    )
+    .await;
+    assert_eq!(class_rc(&r), (0, 0));
+    assert_eq!(field(&find(&r, 0x380D), 0, 2), 497);
+    let open = ds(
+        &values(&[&[0, 0, 0, 4]], 1, 4),
+        0xE004,
+        0x180E,
+        &tmpl(0x8400_0000),
+    );
+    let r = exchange(&mut s, open).await;
+    let d = find(&r, 0x380E);
+    assert_eq!(u32_at(&d, 4), 1, "rows");
+    assert_eq!(&d[22..26], b"d'  ");
     let r = exchange(
         &mut s,
         msg(0x1803, 0x8200_0000, &format!("SELECT * FROM {lib}.NOPE")),

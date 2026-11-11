@@ -1,0 +1,15 @@
+# Golden (batch 21): the system reply list (QSYS2.REPLY_LIST_INFO's
+# columns and IBM's shipped entries; ADDRPYLE without authority), and a
+# data file's member in /QSYS.LIB from PASE and Qshell (what cat, od, wc
+# and ls -l show of its records).
+u77_cleanup|!system -q "DLTF FILE(AS4TRAINR1/GLD77D)"; echo cleaned
+u77_rpyl|!/QOpenSys/usr/bin/qsh -c "db2 \"SELECT * FROM QSYS2.REPLY_LIST_INFO\""
+u77_addrpyle|ADDRPYLE SEQNBR(9977) MSGID(CPA7025) RPY('I')
+u77_rmvrpyle|RMVRPYLE SEQNBR(9977)
+u77_mkdata|!system "CRTPF FILE(AS4TRAINR1/GLD77D) RCDLEN(12)"; /QOpenSys/usr/bin/qsh -c "db2 \"INSERT INTO AS4TRAINR1.GLD77D VALUES ('ABC'), ('hello world!')\""
+u77_ls|!ls -l /QSYS.LIB/AS4TRAINR1.LIB/GLD77D.FILE
+u77_cat|!cat /QSYS.LIB/AS4TRAINR1.LIB/GLD77D.FILE/GLD77D.MBR | od -c
+u77_qcat|!/QOpenSys/usr/bin/qsh -c "cat /QSYS.LIB/AS4TRAINR1.LIB/GLD77D.FILE/GLD77D.MBR | od -c"
+u77_qwc|!/QOpenSys/usr/bin/qsh -c "wc -c /QSYS.LIB/AS4TRAINR1.LIB/GLD77D.FILE/GLD77D.MBR"
+u77_attr|!attr -p /QSYS.LIB/AS4TRAINR1.LIB/GLD77D.FILE/GLD77D.MBR OBJTYPE DATA_SIZE CCSID
+u77_end|!system -q "DLTF FILE(AS4TRAINR1/GLD77D)"; echo cleaned

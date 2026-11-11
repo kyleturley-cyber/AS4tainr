@@ -77,6 +77,8 @@ pub struct Files {
     handles: HashMap<u32, String>,
     open: HashMap<String, (OpenFile, usize)>,
     next: u32,
+    /// Object handles of lookups, by handle the path.
+    looked: HashMap<u32, String>,
 }
 
 impl Files {
@@ -138,6 +140,37 @@ pub async fn request(
         0x000D => rc(on_name(client, ds, 28, Op::CreateDir, &user).await),
         0x000E => rc(on_name(client, ds, 30, Op::DeleteDir, &user).await),
         0x000F => rc(rename(client, ds).await),
+        // User handles (JTOpen AS400ImplRemote createUserHandle): a seed
+        // (0x0023, reply 0x8010 with the server's at 22), then the user
+        // handle (0x0024, reply 0x8011: return code 22, handle 24). The
+        // connection is signed on already: its user is the handle's.
+        0x0023 => {
+            let mut t = vec![0u8; 2];
+            t.extend(crate::hostsrv::seed());
+            vec![reply(0, 0, 0xE002, corr, 0x8010, &t, &[])]
+        }
+        0x0024 | 0x002B => {
+            let mut t = vec![0u8; 2];
+            t.extend(0u16.to_be_bytes());
+            t.extend(1u32.to_be_bytes());
+            let id = if ds.req_id() == 0x0024 {
+                0x8011
+            } else {
+                0x802B
+            };
+            vec![reply(0, 0, 0xE002, corr, id, &t, &[])]
+        }
+        0x001A => vec![lookup(client, files, ds).await],
+        // Get file system (0x0021; reply 0x800F: from 22 an LL and CP and
+        // the type, 4 bytes), free handle (0x001D).
+        0x0021 => {
+            let p = param(0x0001, &0u32.to_be_bytes());
+            vec![reply(0, 0, 0xE002, corr, 0x800F, &[0, 0], &p)]
+        }
+        0x001D => {
+            files.looked.remove(&ds.u32(22));
+            rc(0)
+        }
         _ => rc(NOT_SUPPORTED),
     }
 }
@@ -281,7 +314,7 @@ async fn list(client: &tokio_postgres::Client, files: &Files, ds: &Ds) -> Vec<Ve
         let Some(f) = files.get(handle) else {
             return vec![return_code(corr, INVALID_HANDLE)];
         };
-        return match crate::ifs::stat(client, &f.path).await {
+        return match stat(client, &f.path).await {
             Ok(Some(mut e)) => {
                 e.size = f.data.len() as i64;
                 let name = f.path.rsplit('/').next().unwrap_or("").to_string();
@@ -301,10 +334,10 @@ async fn list(client: &tokio_postgres::Client, files: &Files, ds: &Ds) -> Vec<Ve
         None => (crate::ifs::current_dir(), path.clone()),
     };
     if !last.contains(['*', '?']) {
-        return match crate::ifs::stat(client, &path).await {
+        return match stat(client, &path).await {
             Ok(Some(e)) => vec![attrs_reply(corr, &e, &last, false)],
             Ok(None) => {
-                let parent = crate::ifs::stat(client, &dir).await.ok().flatten();
+                let parent = stat(client, &dir).await.ok().flatten();
                 let code = if parent.is_some_and(|p| p.dir) {
                     FILE_NOT_FOUND
                 } else {
@@ -315,10 +348,13 @@ async fn list(client: &tokio_postgres::Client, files: &Files, ds: &Ds) -> Vec<Ve
             Err(e) => vec![return_code(corr, code_of(&e))],
         };
     }
-    let names = match crate::ifs::list(client, &dir).await {
+    let names = match list_dir(client, &dir).await {
         Ok(n) => n,
         Err(_) => return vec![return_code(corr, PATH_NOT_FOUND)],
     };
+    if std::env::var_os("AS4TAINR_HOSTIFS_TRACE").is_some() {
+        eprintln!("as-file list {dir} {last}: {names:?}");
+    }
     let max = match ds.u16(34) {
         0xFFFF | 0 => usize::MAX,
         n => n as usize,
@@ -330,7 +366,7 @@ async fn list(client: &tokio_postgres::Client, files: &Files, ds: &Ds) -> Vec<Ve
         } else {
             format!("{dir}/{name}")
         };
-        if let Ok(Some(e)) = crate::ifs::stat(client, &full).await {
+        if let Ok(Some(e)) = stat(client, &full).await {
             out.push(attrs_reply(corr, &e, name, true));
         }
     }
@@ -349,7 +385,7 @@ async fn open(client: &tokio_postgres::Client, files: &mut Files, ds: &Ds, user:
         return return_code(corr, INVALID_NAME);
     };
     let path = name_text(ccsid, &raw);
-    let existing = match crate::ifs::stat(client, &path).await {
+    let existing = match stat(client, &path).await {
         Ok(e) => e,
         Err(e) => return return_code(corr, code_of(&e)),
     };
@@ -377,7 +413,7 @@ async fn open(client: &tokio_postgres::Client, files: &mut Files, ds: &Ds, user:
         (Some(_), 4) => return return_code(corr, DUPLICATE),
         (None, 8 | 16) => return return_code(corr, FILE_NOT_FOUND),
         (Some(e), 2 | 16) => (Vec::new(), e.ccsid, 3u16),
-        (Some(_), _) => match crate::ifs::read_file(client, &path).await {
+        (Some(_), _) => match read_file(client, &path).await {
             Ok((d, c)) => (d, c, 1),
             Err(e) => return return_code(corr, code_of(&e)),
         },
@@ -386,7 +422,7 @@ async fn open(client: &tokio_postgres::Client, files: &mut Files, ds: &Ds, user:
                 0 | 0xFFFF => 819,
                 c => c as i32,
             };
-            if let Err(e) = crate::ifs::write_file(client, &path, &[], c, 0o644, user).await {
+            if let Err(e) = write_file(client, &path, &[], c, user).await {
                 return return_code(corr, code_of(&e));
             }
             (Vec::new(), c, 2)
@@ -493,7 +529,7 @@ async fn flush(client: &tokio_postgres::Client, files: &mut Files, handle: u32, 
     if !f.changed {
         return 0;
     }
-    match crate::ifs::write_file(client, &f.path, &f.data, f.ccsid, 0o644, user).await {
+    match write_file(client, &f.path, &f.data, f.ccsid, user).await {
         Ok(()) => {
             f.changed = false;
             0
@@ -536,9 +572,13 @@ async fn on_name(client: &tokio_postgres::Client, ds: &Ds, at: usize, op: Op, us
         return INVALID_NAME;
     };
     let path = name_text(ccsid, raw);
+    // Libraries, objects and members are made and deleted by commands.
+    if qsys(&path).is_some() {
+        return ACCESS_DENIED;
+    }
     let r = match op {
         Op::CreateDir => crate::ifs::mkdir(client, &path, 0o755, user).await,
-        Op::DeleteFile => match crate::ifs::stat(client, &path).await {
+        Op::DeleteFile => match stat(client, &path).await {
             Ok(Some(e)) if e.dir => return ACCESS_DENIED,
             _ => crate::ifs::unlink(client, &path).await,
         },
@@ -557,7 +597,10 @@ async fn rename(client: &tokio_postgres::Client, ds: &Ds) -> u16 {
         return INVALID_NAME;
     };
     let (from, to) = (name_text(ccsid, &from), name_text(ccsid, &to));
-    if let Ok(Some(_)) = crate::ifs::stat(client, &to).await {
+    if qsys(&from).is_some() || qsys(&to).is_some() {
+        return ACCESS_DENIED;
+    }
+    if let Ok(Some(_)) = stat(client, &to).await {
         if !replace {
             return DUPLICATE;
         }
@@ -569,6 +612,322 @@ async fn rename(client: &tokio_postgres::Client, ds: &Ds) -> u16 {
         Ok(()) => 0,
         Err(e) => code_of(&e),
     }
+}
+
+/// Lookup (0x001A: the name's CCSID at 30, the attribute list level 36,
+/// CP 0x0002 the name at 42): an object handle (reply 0x800C: the handle
+/// at 22, then CP 0x0010 the object's attributes 1 (its ASP at 220 and
+/// owner at 224, JTOpen IFSObjAttrs1) and CP 0x000F its attributes 2 (its
+/// CCSID at 134, IFSObjAttrs2 for data stream level 16)).
+async fn lookup(client: &tokio_postgres::Client, files: &mut Files, ds: &Ds) -> Vec<u8> {
+    let corr = ds.correlation();
+    let Some(raw) = cp_at(ds, 42, 0x0002) else {
+        return return_code(corr, INVALID_NAME);
+    };
+    let path = name_text(ds.u16(30), &raw);
+    let e = match stat(client, &path).await {
+        Ok(Some(e)) => e,
+        Ok(None) => return return_code(corr, FILE_NOT_FOUND),
+        Err(e) => return return_code(corr, code_of(&e)),
+    };
+    files.next += 1;
+    let handle = files.next;
+    files.looked.insert(handle, path);
+    let mut oa1 = vec![0u8; 256];
+    oa1[220..222].copy_from_slice(&1u16.to_be_bytes());
+    oa1[224..234].copy_from_slice(&crate::hostsrv::ebcdic(&e.owner, 10));
+    let mut oa2 = vec![0u8; 160];
+    oa2[134..136].copy_from_slice(&(e.ccsid as u16).to_be_bytes());
+    let mut p = param(0x0010, &oa1);
+    p.extend(param(0x000F, &oa2));
+    let mut t = vec![0u8; 2];
+    t.extend(handle.to_be_bytes());
+    reply(0, 0, 0xE002, corr, 0x800C, &t, &p)
+}
+
+// ------------------------------------------------------------ QSYS.LIB
+
+/// A /QSYS.LIB path's parts (QSYS.LIB, LIB.LIB, OBJ.TYPE, MBR.MBR), in
+/// upper case (object names are kept in upper case: IBM i documentation,
+/// "QSYS.LIB file system"); None for another file system.
+fn qsys(path: &str) -> Option<Vec<String>> {
+    let up = path.to_ascii_uppercase();
+    let parts: Vec<String> = up
+        .trim_matches('/')
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    (parts.first().map(String::as_str) == Some("QSYS.LIB")).then_some(parts)
+}
+
+fn split_dot<'a>(p: &'a str, ty: &str) -> Option<&'a str> {
+    p.strip_suffix(&format!(".{ty}"))
+}
+
+fn entry(path: &str, dir: bool, size: i64, changed_us: i64) -> crate::ifs::Entry {
+    crate::ifs::Entry {
+        path: path.to_string(),
+        dir,
+        ccsid: 37,
+        mode: if dir { 0o755 } else { 0o644 },
+        owner: "QSYS".into(),
+        size,
+        changed_us,
+    }
+}
+
+/// A library's or object's last change in microseconds.
+async fn object_time(
+    client: &tokio_postgres::Client,
+    lib: &str,
+    name: &str,
+    ty: &str,
+) -> Option<i64> {
+    client
+        .query_opt(
+            "SELECT (extract(epoch FROM coalesce(changed, created)) * 1000000)::bigint
+               FROM as4tainr.objects WHERE library = $1 AND name = $2 AND objtype = $3",
+            &[&lib, &name, &format!("*{ty}")],
+        )
+        .await
+        .ok()
+        .flatten()
+        .map(|r| r.get::<_, Option<i64>>(0).unwrap_or(0))
+}
+
+/// The record length's text width of a source file, or None for a data
+/// file (or no file).
+async fn source_width(client: &tokio_postgres::Client, lib: &str, file: &str) -> Option<usize> {
+    client
+        .query_opt(
+            "SELECT rcdlen FROM as4tainr.source_files WHERE library = $1 AND name = $2",
+            &[&lib, &file],
+        )
+        .await
+        .ok()
+        .flatten()
+        .map(|r| (r.get::<_, i32>(0) - 12).max(0) as usize)
+}
+
+/// A member's bytes as the file server reads it: the text Qshell reads
+/// (qsyslib.rs), in CCSID 37.
+async fn member_bytes(
+    client: &tokio_postgres::Client,
+    lib: &str,
+    file: &str,
+    mbr: &str,
+) -> Option<Vec<u8>> {
+    let text = match source_width(client, lib, file).await {
+        Some(width) => {
+            let src: String = client
+                .query_opt(
+                    "SELECT source FROM as4tainr.source_members
+                      WHERE library = $1 AND file = $2 AND member = $3",
+                    &[&lib, &file, &mbr],
+                )
+                .await
+                .ok()
+                .flatten()?
+                .get(0);
+            crate::qsyslib::member_text(&src, width)
+        }
+        None if mbr == file => crate::qsyslib::data_member_text(client, lib, file)
+            .await
+            .ok()?,
+        None => return None,
+    };
+    Some(crate::ifs::codec::bytes(37, &text))
+}
+
+/// stat() over the IFS and /QSYS.LIB.
+async fn stat(
+    client: &tokio_postgres::Client,
+    path: &str,
+) -> anyhow::Result<Option<crate::ifs::Entry>> {
+    let Some(p) = qsys(path) else {
+        return crate::ifs::stat(client, path).await;
+    };
+    Ok(match p.as_slice() {
+        [_] => Some(entry("/QSYS.LIB", true, 0, 0)),
+        [_, l] => {
+            let Some(lib) = split_dot(l, "LIB") else {
+                return Ok(None);
+            };
+            object_time(client, "QSYS", lib, "LIB")
+                .await
+                .map(|t| entry(path, true, 0, t))
+        }
+        [_, l, o] => {
+            let Some(lib) = split_dot(l, "LIB") else {
+                return Ok(None);
+            };
+            let Some((name, ty)) = o.rsplit_once('.') else {
+                return Ok(None);
+            };
+            object_time(client, lib, name, ty)
+                .await
+                .map(|t| entry(path, ty == "FILE", 0, t))
+        }
+        [_, l, f, m] => {
+            let (Some(lib), Some(file), Some(mbr)) = (
+                split_dot(l, "LIB"),
+                split_dot(f, "FILE"),
+                split_dot(m, "MBR"),
+            ) else {
+                return Ok(None);
+            };
+            let t = object_time(client, lib, file, "FILE").await.unwrap_or(0);
+            member_bytes(client, lib, file, mbr)
+                .await
+                .map(|b| entry(path, false, b.len() as i64, t))
+        }
+        _ => None,
+    })
+}
+
+/// A directory's names over the IFS and /QSYS.LIB (libraries, a
+/// library's objects, a file's members).
+async fn list_dir(
+    client: &tokio_postgres::Client,
+    dir: &str,
+) -> anyhow::Result<Vec<(String, bool)>> {
+    let Some(p) = qsys(dir) else {
+        return crate::ifs::list(client, dir).await;
+    };
+    let names =
+        |rows: Vec<tokio_postgres::Row>| -> Vec<String> { rows.iter().map(|r| r.get(0)).collect() };
+    Ok(match p.as_slice() {
+        [_] => names(
+            client
+                .query(
+                    "SELECT name || '.LIB' FROM as4tainr.objects WHERE library = 'QSYS'
+                      AND objtype = '*LIB' AND name NOT LIKE '#Q%' ORDER BY name",
+                    &[],
+                )
+                .await?,
+        )
+        .into_iter()
+        .map(|n| (n, true))
+        .collect(),
+        [_, l] => {
+            let lib = split_dot(l, "LIB").unwrap_or("");
+            client
+                .query(
+                    "SELECT name || '.' || substr(objtype, 2), objtype = '*FILE'
+                       FROM as4tainr.objects WHERE library = $1 ORDER BY name, objtype",
+                    &[&lib],
+                )
+                .await?
+                .iter()
+                .map(|r| (r.get(0), r.get(1)))
+                .collect()
+        }
+        [_, l, f] => {
+            let lib = split_dot(l, "LIB").unwrap_or("");
+            let file = split_dot(f, "FILE").unwrap_or("");
+            if source_width(client, lib, file).await.is_some() {
+                names(
+                    client
+                        .query(
+                            "SELECT member || '.MBR' FROM as4tainr.source_members
+                              WHERE library = $1 AND file = $2 ORDER BY member",
+                            &[&lib, &file],
+                        )
+                        .await?,
+                )
+                .into_iter()
+                .map(|n| (n, false))
+                .collect()
+            } else {
+                vec![(format!("{file}.MBR"), false)]
+            }
+        }
+        _ => vec![],
+    })
+}
+
+/// A file's bytes and CCSID over the IFS and /QSYS.LIB members.
+async fn read_file(client: &tokio_postgres::Client, path: &str) -> anyhow::Result<(Vec<u8>, i32)> {
+    let Some(p) = qsys(path) else {
+        return crate::ifs::read_file(client, path).await;
+    };
+    if let [_, l, f, m] = p.as_slice() {
+        if let (Some(lib), Some(file), Some(mbr)) = (
+            split_dot(l, "LIB"),
+            split_dot(f, "FILE"),
+            split_dot(m, "MBR"),
+        ) {
+            if let Some(b) = member_bytes(client, lib, file, mbr).await {
+                return Ok((b, 37));
+            }
+        }
+    }
+    Err(anyhow::Error::new(crate::ifs::Errno(
+        crate::ifs::errno::EISDIR,
+    )))
+}
+
+/// A file written over the IFS and /QSYS.LIB: a source member's lines
+/// (CCSID 37 text, each line a record, as CPYFRMSTMF puts them), made
+/// when it is not there.
+async fn write_file(
+    client: &tokio_postgres::Client,
+    path: &str,
+    data: &[u8],
+    ccsid: i32,
+    user: &str,
+) -> anyhow::Result<()> {
+    let Some(p) = qsys(path) else {
+        return crate::ifs::write_file(client, path, data, ccsid, 0o644, user).await;
+    };
+    let denied = || anyhow::Error::new(crate::ifs::Errno(crate::ifs::errno::EACCES));
+    let [_, l, f, m] = p.as_slice() else {
+        return Err(denied());
+    };
+    let (Some(lib), Some(file), Some(mbr)) = (
+        split_dot(l, "LIB"),
+        split_dot(f, "FILE"),
+        split_dot(m, "MBR"),
+    ) else {
+        return Err(denied());
+    };
+    if source_width(client, lib, file).await.is_none() {
+        return Err(denied());
+    }
+    let text = crate::ifs::codec::text(37, data).replace("\r\n", "\n");
+    let source = text
+        .strip_suffix('\n')
+        .unwrap_or(&text)
+        .split('\n')
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (srctype, mtext): (String, String) = client
+        .query_opt(
+            "SELECT srctype, text FROM as4tainr.source_members
+              WHERE library = $1 AND file = $2 AND member = $3",
+            &[&lib, &file, &mbr],
+        )
+        .await?
+        .map(|r| (r.get(0), r.get(1)))
+        .unwrap_or_default();
+    crate::source::put_member(
+        client,
+        &crate::source::Member {
+            library: lib.to_string(),
+            file: file.to_string(),
+            name: mbr.to_string(),
+            srctype,
+            text: mtext,
+            source,
+            stmf: String::new(),
+            ccsid: 37,
+            changed_us: None,
+        },
+        true,
+    )
+    .await
 }
 
 #[cfg(test)]

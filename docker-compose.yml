@@ -53,6 +53,7 @@ services:
       # - "8475:8475" # remote command server
       # - "8472:8472" # data queue server
       # - "8473:8473" # file server (IFS)
+      # - "8470:8470" # central server
 
   demo:
     image: ghcr.io/as4tainr/as4tainr:dev

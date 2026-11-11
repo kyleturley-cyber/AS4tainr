@@ -78,7 +78,7 @@ fn meta(p: &Path) -> Option<(i128, u64)> {
 /// (`width` characters, blank-padded) and a newline (PUB400 2026-11-10,
 /// verify73 t73_qcat: "line one" in a 92-byte source file read as 80
 /// characters and a newline).
-fn member_text(source: &str, width: usize) -> String {
+pub fn member_text(source: &str, width: usize) -> String {
     let mut s = String::new();
     for l in source.lines() {
         let l = l.trim_end();
@@ -94,7 +94,7 @@ fn member_text(source: &str, width: usize) -> String {
 
 /// A data file's member as Qshell reads it: each record's image (cpyf.rs
 /// `record_image`, EBCDIC) as characters of CCSID 37, and a newline.
-async fn data_member_text(client: &Client, lib: &str, file: &str) -> Result<String> {
+pub async fn data_member_text(client: &Client, lib: &str, file: &str) -> Result<String> {
     let f = crate::catalog::resolve_file(client, &[lib.to_string()], file).await?;
     let recs = crate::catalog::member_records(client, &f, 1_000_000).await?;
     let mut out = String::new();

@@ -50,8 +50,8 @@ pub async fn serve(url: &str, sock: TcpStream) -> Result<()> {
 }
 
 /// Serve one connection of the remote command server (0xE008), the data
-/// queue server (0xE007, hostdtaq.rs) or the file server (0xE002,
-/// hostifs.rs): the start of a connection is the same, the job the
+/// queue server (0xE007, hostdtaq.rs), the file server (0xE002,
+/// hostifs.rs) or the central server (0xE000, hostcentral.rs): the start of a connection is the same, the job the
 /// requests run in too.
 pub async fn serve_as(url: &str, mut sock: TcpStream, server_id: u16) -> Result<()> {
     let client = crate::runtime::connect_db(url).await?;
@@ -118,6 +118,7 @@ pub async fn serve_as(url: &str, mut sock: TcpStream, server_id: u16) -> Result<
                     let job = match server_id {
                         0xE007 => "QZHQSSRV",
                         0xE002 => "QPWFSERVSO",
+                        0xE000 => "QZSCSRVS",
                         _ => "QZRCSRVS",
                     };
                     p.extend(job_name_param(job, "QUSER"));
@@ -125,6 +126,7 @@ pub async fn serve_as(url: &str, mut sock: TcpStream, server_id: u16) -> Result<
                 reply(0, 0, server_id, corr, 0xF002, &rc.to_be_bytes(), &p)
             }
             _ if server.is_none() => break,
+            _ if server_id == 0xE000 => crate::hostcentral::request(&ds),
             _ if server_id == 0xE002 => {
                 let srv = server.as_mut().expect("signed on");
                 let replies = crate::hostifs::request(srv, &mut files, &ds).await;

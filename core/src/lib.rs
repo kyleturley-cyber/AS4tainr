@@ -42,6 +42,7 @@ pub mod dtaara;
 pub mod dtaq;
 pub mod envvar;
 pub mod fdout;
+pub mod hostcentral;
 pub mod hostcmd;
 pub mod hostdb;
 pub mod hostdtaq;

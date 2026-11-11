@@ -13,7 +13,8 @@ well-known ports:
 | Database (as-database) | 8471 | Exchange of seeds, start server with a password, server attributes, SQL statements, parameter markers, CALL, commitment control, the SYSIBM metadata procedures (below) |
 | Remote command (as-rmtcmd) | 8475 | Exchange of seeds, start server, exchange attributes (data stream level 10), CL commands run with their messages (Toolbox `CommandCall`), programs called with their parameters (`ProgramCall`: RPG and CL programs, the data queue, user space and retrieve APIs done here) |
 | Data queue (as-dtaq) | 8472 | Exchange of seeds, start server, data queues created, deleted, written, read (waiting, peeking, by key), cleared, their attributes (Toolbox `DataQueue`, `KeyedDataQueue`) |
-| File (as-file) | 8473 | Exchange of seeds, start server, the IFS: attributes and lists (patterns), files opened, read, written, their size changed, closed, directories made and deleted, files deleted and renamed (Toolbox `IFSFile`, `IFSFileInputStream`, `IFSFileOutputStream`, `IFSRandomAccessFile`) |
+| File (as-file) | 8473 | Exchange of seeds, start server, the IFS: attributes and lists (patterns), files opened, read, written, their size changed, closed, directories made and deleted, files deleted and renamed, /QSYS.LIB (libraries, objects, members: source members read and written), user handles and lookups (Toolbox `IFSFile`, `IFSFileInputStream`, `IFSFileOutputStream`, `IFSRandomAccessFile`) |
+| Central (as-central) | 8470 | Exchange of seeds, start server, the system's CCSID, conversion tables of single-byte CCSIDs (the Toolbox's `NLSTableDownload`); double-byte tables and license requests not done |
 
 The data streams are the ones JTOpen's client side builds and reads; the
 server side is as4tainr's own (`core/src/hostsrv.rs`, `core/src/hostdb.rs`).
@@ -155,6 +156,17 @@ they are written back to the IFS when a handle is committed or closed.
 Lists take a pattern (`*` and `?`) in the last part of the name and end
 with return code 18 (no more files). `AS4TAINR_HOSTIFS_TRACE=1` prints
 each request to standard error.
+
+/QSYS.LIB is there too (IBM i documentation, "QSYS.LIB file system"):
+`/QSYS.LIB` lists the libraries as `LIB.LIB`, a library its objects as
+`NAME.TYPE` (a file is a directory), a file its members as `MBR.MBR`.
+A member reads as the text Qshell reads (`qsyslib.rs`: each record's
+data and a newline) in CCSID 37; a source member written is put back
+a record for each line (a new member is made). Libraries, objects and
+members are not made, deleted or renamed through the file server.
+The user handle requests (seed, create user handle) are answered for
+the connection's user, and lookups give an object handle with the
+object's owner, ASP and CCSID (JTOpen IFSObjAttrs1, IFSObjAttrs2).
 
 ## Passwords
 

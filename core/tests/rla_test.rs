@@ -28649,6 +28649,59 @@ async fn host_servers_sign_on_and_database_attributes() {
         .await
         .unwrap();
     assert_eq!(u16b(&read(&mut s).await, 22), 0, "directory deleted");
+    // /QSYS.LIB through the file server (IBM i documentation, "QSYS.LIB
+    // file system": a library LIB.LIB, its objects NAME.TYPE, a file a
+    // directory of its members): the test library's file CUSTMAST as
+    // CUSTMAST.FILE, a directory (type 2).
+    s.write_all(&ds(
+        &cp(0x0002, &name(&format!("/QSYS.LIB/{lib}.LIB/CUSTMAST.*"))),
+        0xE002,
+        0x000A,
+        &lst,
+    ))
+    .await
+    .unwrap();
+    let r = read(&mut s).await;
+    assert_eq!((u16b(&r, 18), u16b(&r, 54)), (0x8005, 2));
+    let at = 20 + u16b(&r, 16) as usize;
+    let n = u32_at(&r, at) as usize - 6;
+    let got: Vec<u16> = r[at + 6..at + 6 + n]
+        .chunks(2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .collect();
+    assert_eq!(String::from_utf16_lossy(&got), "CUSTMAST.FILE");
+    assert_eq!(u16b(&read(&mut s).await, 22), 18);
+    // The central server (JTOpen NLSGetTableRequest/Reply): CCSID 37's
+    // characters in UTF-16, 0xC1 'A' (the code page 37 chart).
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let u2 = url.clone();
+    tokio::spawn(async move {
+        let (s, _) = l.accept().await.unwrap();
+        as4tainr_core::hostcmd::serve_as(&u2, s, 0xE000).await
+    });
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(&ds(&[], 0xE000, 0x7001, &client_seed))
+        .await
+        .unwrap();
+    let r = read(&mut s).await;
+    let server_seed = r[24..32].to_vec();
+    let mut p = cp(0x1105, &substitute("PW123", &server_seed, &client_seed));
+    p.extend(cp(0x1104, &uid37));
+    s.write_all(&ds(&p, 0xE000, 0x7002, &[3, 1])).await.unwrap();
+    assert_eq!(u32_at(&read(&mut s).await, 20), 0);
+    let mut t = vec![0u8; 14];
+    t[2..6].copy_from_slice(&37u32.to_be_bytes());
+    t[6..10].copy_from_slice(&13488u32.to_be_bytes());
+    t[10..12].copy_from_slice(&2u16.to_be_bytes());
+    t[12..14].copy_from_slice(&1u16.to_be_bytes());
+    let all: Vec<u8> = (0..=255u8).collect();
+    s.write_all(&ds(&cp(4, &all), 0xE000, 0x1201, &t))
+        .await
+        .unwrap();
+    let r = read(&mut s).await;
+    assert_eq!((u16b(&r, 18), u16b(&r, 22)), (0x1201, 0));
+    assert_eq!(u16b(&r, 34 + 2 * 0xC1), 'A' as u16);
     // The database server.
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();

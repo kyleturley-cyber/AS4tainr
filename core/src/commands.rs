@@ -2951,6 +2951,15 @@ impl Job<'_> {
         if !users::change(self.client, &name, &changes).await? {
             bail!("CPF2204: There is no user profile {name}.");
         }
+        let password = match cmd.get("PASSWORD") {
+            "" | "*SAME" => None,
+            "*USRPRF" => Some(users::NewPassword::SameAsProfile),
+            "*NONE" => Some(users::NewPassword::None),
+            pw => Some(users::NewPassword::Value(pw.to_string())),
+        };
+        if let Some(pw) = password {
+            users::set_password(self.client, &name, &pw).await?;
+        }
         if !outq.is_empty() && outq != "*SAME" {
             crate::outq::set_user_outq(self.client, &name, &outq, &self.library_list()).await?;
         }

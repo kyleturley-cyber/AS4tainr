@@ -173,7 +173,7 @@ object's owner, ASP and CCSID (JTOpen IFSObjAttrs1, IFSObjAttrs2).
 The servers announce password level 2: the client sends a SHA-1 password
 substitute made from a token of the user ID and the password. as4tainr
 keeps that token for a profile when its password is set (CRTUSRPRF,
-CHGPWD, `as4tainr rstpwd`) and when it signs on with it (5250, SSH):
+CHGUSRPRF PASSWORD, CHGPWD, `as4tainr rstpwd`) and when it signs on with it (5250, SSH):
 a profile made before this version signs on to the host servers after it
 has signed on once another way or its password has been changed. At
 QPWDLVL 0 and 1, where passwords are not case-sensitive, the tokens of
@@ -189,3 +189,24 @@ With the Toolbox's jar, `jdbc:as400://HOST;prompt=false` and a user
 profile connect. The port mapper needs port 449 (root in the
 container); without it, set the client's ports to the defaults
 (`AS400.setServicePortsToDefault()`).
+
+## IBM i Access Client Solutions
+
+With Docker Compose, publish the host server ports and turn the servers
+on (`AS4TAINR_HOSTSERVER_LISTEN: 0.0.0.0` and the port lines in
+docker-compose.yml). In ACS:
+
+- System name: `127.0.0.1` rather than `localhost`. On Windows with WSL,
+  WSL's relay can hold the IPv6 loopback (`::1`) on the same ports, and
+  Java tries `localhost` there first, so connections are refused.
+- Connection tab: Use SSL off (the TLS ports are not served).
+- Console tab: no console. With a LAN console set, Verify Connection
+  checks only the console ports (2300, 3001, 3002), which as4tainr does
+  not have.
+- 5250 sessions: port 2323 (Compose maps it to the container's 23).
+  Before a session starts, ACS signs on to the host servers and calls
+  QSYCKUFU (Check User Function Usage) through the remote command server.
+
+`AS4TAINR_QSECOFR_PASSWORD` sets QSECOFR's password only when the
+catalog is first made; with an existing database volume, change it with
+`CHGUSRPRF USRPRF(QSECOFR) PASSWORD(...)` or `as4tainr rstpwd`.

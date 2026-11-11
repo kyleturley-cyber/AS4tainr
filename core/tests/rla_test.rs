@@ -11510,6 +11510,35 @@ dsply %char(qwcld);
             .to_string(),
             vec!["1", "SYSNAME", "8"],
         ),
+        // QSYCKUFU (Check User Function Usage, User Function Registration
+        // APIs): the usage indicator is '2' when the user may use the
+        // function, '1' when not; an unknown user profile is CPF2204 in
+        // the error code. IBM i Access Client Solutions calls it before it
+        // opens a 5250 session.
+        (
+            "UFU",
+            "**FREE
+dcl-pr qsyckufu extpgm('QSYCKUFU');
+  usage char(1);
+  fcn char(30) const;
+  user char(10) const;
+  err char(16);
+end-pr;
+dcl-ds err len(16) qualified;
+  prov int(10) pos(1) inz(16);
+  avail int(10) pos(5);
+  msgid char(7) pos(9);
+end-ds;
+dcl-s usage char(1);
+qsyckufu(usage : 'QIBM_XE1_OPNAV' : '*CURRENT' : err);
+dsply usage;
+qsyckufu(usage : 'QIBM_XE1_OPNAV' : 'NOSUCHUSR' : err);
+dsply err.msgid;
+*inlr = *on;
+"
+            .to_string(),
+            vec!["2", "CPF2204"],
+        ),
     ];
     for (name, source, want) in programs {
         let r = rpg::call(
@@ -24227,6 +24256,34 @@ async fn sign_on_attempts_disable_a_profile() {
     .await
     .unwrap();
     users::authenticate(&client, &name, &name).await.unwrap();
+    // CHGUSRPRF PASSWORD (CL reference: a new password, *SAME, *USRPRF
+    // or *NONE) as a security officer: the old one no longer signs on,
+    // the new one does; PASSWORD(*NONE) lets no one sign on.
+    use as4tainr_core::commands::{Environment, Job};
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut admin = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: None,
+        libl: vec!["QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    admin
+        .run(&format!("CHGUSRPRF USRPRF({name}) PASSWORD(NEWPW1)"))
+        .await
+        .unwrap();
+    assert!(users::authenticate(&client, &name, &name).await.is_err());
+    users::authenticate(&client, &name, "NEWPW1").await.unwrap();
+    admin
+        .run(&format!("CHGUSRPRF USRPRF({name}) PASSWORD(*NONE)"))
+        .await
+        .unwrap();
+    assert!(users::authenticate(&client, &name, "NEWPW1").await.is_err());
     users::delete(&client, &name).await.unwrap();
 }
 

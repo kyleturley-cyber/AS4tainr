@@ -5,7 +5,8 @@
 # Then open http://localhost:5250 for the 5250 terminal in your browser, or
 # connect a 5250 emulator (tn5250, tn5250j, IBM ACS) to localhost:2323,
 # and sign on as QSECOFR. On first start the password is QSECOFR and must be
-# changed, unless AS4TAINR_QSECOFR_PASSWORD is set below.
+# changed, unless AS4TAINR_QSECOFR_PASSWORD is set below (it applies only
+# when the database is first made, not to an existing pgdata volume).
 #
 # The spike demo (sample programs checked against golden output):
 #   docker compose run --rm demo

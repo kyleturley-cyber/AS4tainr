@@ -1,6 +1,6 @@
 //! The system APIs done here, called from CL (`CALL PGM(QUSROBJD)`) and
 //! RPG (EXTPGM prototypes): which module does each, and the retrieve
-//! APIs QUSROBJD, QUSRMBRD and QUSRSPLA.
+//! APIs QUSROBJD, QUSRMBRD and QUSRSPLA, and QSYCKUFU.
 //!
 //! Written from IBM's documentation (Object APIs: "Retrieve Object
 //! Description (QUSROBJD)"; Database and File APIs: "Retrieve Member
@@ -50,6 +50,7 @@ pub fn is_api(name: &str) -> bool {
                 | "QSZRTVPR"
                 | "QWDRJOBD"
                 | "QWCRSSTS"
+                | "QSYCKUFU"
         )
 }
 
@@ -100,6 +101,7 @@ pub async fn call_api(
         "QSZRTVPR" => (product_information(args), 4),
         "QWDRJOBD" => (job_description(client, caller, args).await, 4),
         "QWCRSSTS" => (system_status(client, args).await, 4),
+        "QSYCKUFU" => (check_function_usage(client, caller, args).await, 3),
         _ => bail!("{name} is not a system API done here."),
     };
     crate::dtaq::error_code(args, Some(ec), r)
@@ -1362,6 +1364,30 @@ pub const PRODUCTS: &[(&str, &str, &str)] = &[
 /// symbolic load state *INSTALLED, load error indicator *NONE, load
 /// state 90; the rest of PRDR0100 blank or zero. Other products are
 /// CPF0C1F (not installed here).
+/// Check User Function Usage (QSYCKUFU; User Function Registration
+/// APIs): 1 usage indicator (output, CHAR(1): '1' the user is not
+/// allowed to use the function, '2' allowed), 2 function ID (CHAR(30)),
+/// 3 user profile (CHAR(10), or *CURRENT), 4 error code. as4tainr has no
+/// registration facility (docs/fidelity-gaps.md): every function is
+/// taken as registered with usage allowed. IBM i Access Client Solutions
+/// calls it before it opens a 5250 session.
+async fn check_function_usage(
+    client: &Client,
+    caller: &Caller,
+    args: &mut dyn ApiArgs,
+) -> Result<()> {
+    need(args, 4)?;
+    let mut user = text(args, 2);
+    if user == "*CURRENT" {
+        user = caller.user.to_ascii_uppercase();
+    }
+    if crate::users::get(client, &user).await?.is_none() {
+        bail!("CPF2204: There is no user profile {user}.");
+    }
+    args.set_bytes(0, &e("2"));
+    Ok(())
+}
+
 fn product_information(args: &mut dyn ApiArgs) -> Result<()> {
     need(args, 4)?;
     let format = text(args, 2);

@@ -452,6 +452,42 @@ pub async fn reset_password(client: &Client, name: &str) -> Result<bool> {
         && store_host_tokens(client, &name, &name).await.is_ok())
 }
 
+/// CHGUSRPRF PASSWORD: a new password (a value, *USRPRF or *NONE) set
+/// by a security officer, without the current one. Returns false if the
+/// profile does not exist.
+pub async fn set_password(client: &Client, name: &str, pw: &NewPassword) -> Result<bool> {
+    let name = name.trim().to_ascii_uppercase();
+    let (hash, token) = match pw {
+        NewPassword::None => (NO_PASSWORD.to_string(), None),
+        NewPassword::SameAsProfile => (hash_password(&normalized(&name))?, Some(name.clone())),
+        NewPassword::Value(v) => {
+            check_password_rules(&name, v)?;
+            (hash_password(&normalized(v))?, Some(v.clone()))
+        }
+    };
+    let n = client
+        .execute(
+            "UPDATE as4tainr.user_profiles SET password_hash = $2, pwd_changed = now() WHERE name = $1",
+            &[&name, &hash],
+        )
+        .await?;
+    if n == 0 {
+        return Ok(false);
+    }
+    match token {
+        Some(t) => store_host_tokens(client, &name, &t).await?,
+        None => {
+            client
+                .execute(
+                    "UPDATE as4tainr.user_profiles SET host_tokens = '{}' WHERE name = $1",
+                    &[&name],
+                )
+                .await?;
+        }
+    }
+    Ok(true)
+}
+
 /// CHGUSRPRF: the attributes to change (None = leave as is).
 #[derive(Debug, Default)]
 pub struct ProfileChanges {

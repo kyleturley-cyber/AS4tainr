@@ -388,6 +388,8 @@ pub static COMMANDS: &[CommandDef] = &[
         description: "Change User Profile",
         params: &[
             p("USRPRF", Kind::Name, true, None, "User profile").ch("Name"),
+            p("PASSWORD", Kind::Password, false, Some("*SAME"), "User password")
+                .ch("Name, *SAME, *USRPRF, *NONE"),
             p(
                 "PWDEXP",
                 Kind::Name,

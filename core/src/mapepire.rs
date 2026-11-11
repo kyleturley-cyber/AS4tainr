@@ -362,6 +362,9 @@ pub struct Server<'a> {
     /// Answer `cl` as Mapepire servers before 2.5 do (job log rows), as
     /// the server Code for IBM i installs (2.3) does.
     pub legacy_cl: bool,
+    /// The result sets of the last CALL after its first (the database
+    /// host server returns them one after another).
+    pub(crate) more_results: Vec<Results>,
 }
 
 /// The version `getversion` reports: as4tainr's own.
@@ -383,6 +386,7 @@ impl<'a> Server<'a> {
             unparseable: 0,
             incomplete: 0,
             legacy_cl: true,
+            more_results: Vec::new(),
         }
     }
 
@@ -857,16 +861,14 @@ impl<'a> Server<'a> {
             curlib,
         };
         let (routine, out) = crate::sqlpl::call_exprs(&env, name, args).await?;
-        let results = out
-            .result_sets
-            .into_iter()
-            .next()
-            .map(|(columns, rows)| Results {
-                types: columns.iter().map(|_| text_type()).collect(),
-                columns,
-                rows: rows.into(),
-                done: false,
-            });
+        let mut sets = out.result_sets.into_iter().map(|(columns, rows)| Results {
+            types: columns.iter().map(|_| text_type()).collect(),
+            columns,
+            rows: rows.into(),
+            done: false,
+        });
+        let results = sets.next();
+        self.more_results = sets.collect();
         let parms = routine
             .parms
             .iter()
@@ -895,6 +897,16 @@ impl<'a> Server<'a> {
             })
             .collect();
         Ok(Done::Call(results, parms))
+    }
+
+    /// The procedure a CALL names, found as CALL finds it (the library
+    /// list for an unqualified name).
+    pub(crate) async fn procedure(&mut self, name: &str) -> Option<crate::sqlpl::Routine> {
+        let libl = self.libl();
+        crate::sqlpl::find(self.job.client, &libl, name, "PROCEDURE")
+            .await
+            .ok()
+            .flatten()
     }
 
     /// An argument's value as text (a string constant, or an expression
@@ -1888,7 +1900,7 @@ pub(crate) fn column_type(t: &ColType, longest: usize) -> (String, i64, i64, i64
 
 /// A parameter type as written (`DECIMAL(9, 2)`): its name, precision
 /// and scale.
-fn written(ty: &str) -> (String, i64, i64) {
+pub(crate) fn written(ty: &str) -> (String, i64, i64) {
     let t = ty.trim().to_ascii_uppercase();
     let (base, args) = match t.split_once('(') {
         Some((b, r)) => (b.trim().to_string(), r.trim_end_matches(')').to_string()),

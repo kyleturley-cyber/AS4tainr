@@ -237,6 +237,12 @@ struct Stmt {
     /// Its parameter markers as described, or as the client's
     /// descriptor (change descriptor) has them since.
     params: Vec<Col>,
+    /// A CALL's markers: the parameter each is the argument for.
+    marker_args: Vec<Option<usize>>,
+    /// A CALL's result sets after the open one, opened in turn (JTOpen
+    /// AS400JDBCStatement getMoreResults: close, then open and
+    /// describe).
+    more: std::collections::VecDeque<Cursor>,
 }
 
 struct Cursor {
@@ -307,8 +313,13 @@ async fn sql_request(
                 0x3801 => Some(descriptor(d, false)),
                 _ => None,
             });
-            if let Some(cols) = cols {
-                stmts.entry(rpb).or_default().params = cols;
+            if let Some(mut cols) = cols {
+                // The directions stay as the prepare described them.
+                let s = stmts.entry(rpb).or_default();
+                for (c, old) in cols.iter_mut().zip(&s.params) {
+                    c.ptype = old.ptype;
+                }
+                s.params = cols;
             }
             db_reply(ds, 0, 0, &[])
         }
@@ -321,15 +332,19 @@ async fn sql_request(
             s.sql = sql.clone();
             s.result = None;
             s.described = None;
+            s.more.clear();
             let markers = crate::mapepire::marker_positions(&sql).len();
-            s.params = if markers > 0 {
-                marker_cols(srv, &sql).await
+            (s.params, s.marker_args) = if markers > 0 {
+                match call_markers(srv, &sql).await {
+                    Some(x) => x,
+                    None => (marker_cols(srv, &sql).await, Vec::new()),
+                }
             } else {
-                Vec::new()
+                Default::default()
             };
             let mut p = Vec::new();
             if markers > 0 && ors & ORS_PARAMETER_MARKER_FORMAT != 0 {
-                p.extend(format(0x380D, &s.params, 0xF0));
+                p.extend(format(0x380D, &s.params));
             }
             if !is_query(&sql) {
                 p.extend(sqlca(0, "00000", 0));
@@ -352,7 +367,7 @@ async fn sql_request(
                         s.described = Some(c.cols.clone());
                     }
                     if ors & ORS_DATA_FORMAT != 0 {
-                        p.extend(format(0x380C, &c.cols, 0));
+                        p.extend(format(0x380C, &c.cols));
                     }
                     p.extend(sqlca(0, "00000", 0));
                     if markers == 0 {
@@ -360,7 +375,7 @@ async fn sql_request(
                     }
                     db_reply(ds, 0, 0, &p)
                 }
-                Ok(Ran::Count(_)) => {
+                Ok(Ran::Count(_)) | Ok(Ran::Call(..)) => {
                     p.extend(sqlca(0, "00000", 0));
                     db_reply(ds, 0, 0, &p)
                 }
@@ -370,13 +385,14 @@ async fn sql_request(
         // Execute (0x1805), execute immediate (0x1806): the statement run,
         // the rows it changed in the SQLCA (errd 3).
         0x1805 | 0x1806 => {
-            let (sql, cols) = match (id, text) {
-                (0x1806, Some(t)) => (t, Vec::new()),
+            let (sql, cols, args) = match (id, text) {
+                (0x1806, Some(t)) => (t, Vec::new(), Vec::new()),
                 _ => stmts
                     .get(&rpb)
-                    .map(|s| (s.sql.clone(), s.params.clone()))
+                    .map(|s| (s.sql.clone(), s.params.clone(), s.marker_args.clone()))
                     .unwrap_or_default(),
             };
+            let mut outputs: Option<Vec<Option<String>>> = None;
             // A row of values for each run (more than one: a batch).
             let rows = match marker_values(ds, 20 + tl, &cols) {
                 Ok(r) => r,
@@ -400,10 +416,47 @@ async fn sql_request(
                         s.described = None;
                         results = 1;
                     }
+                    Ok(Ran::Call(r, vals)) => {
+                        if let Some(c) = r {
+                            let s = stmts.entry(rpb).or_default();
+                            s.result = Some(c);
+                            s.described = None;
+                            s.more = std::mem::take(&mut srv.more_results)
+                                .into_iter()
+                                .map(|r| cursor(r, dt, false))
+                                .collect();
+                            results = 1 + s.more.len() as i32;
+                        }
+                        outputs = Some(vals);
+                    }
                     Err(e) => return fail(ds, e, last),
                 }
             }
-            db_reply(ds, 0, 0, &sqlca_with(0, "00000", count as i32, results))
+            let mut p = Vec::new();
+            // A CALL's output parameters: a row of the markers' format,
+            // the OUT and INOUT values in their places (JTOpen
+            // AS400JDBCPreparedStatementImpl commonExecuteAfter).
+            if let Some(vals) = outputs {
+                if ors & ORS_RESULT_DATA != 0 && cols.iter().any(|c| c.ptype != 0xF0) {
+                    let row: Vec<Option<String>> = cols
+                        .iter()
+                        .zip(args.iter().chain(std::iter::repeat(&None)))
+                        .map(|(c, a)| {
+                            if c.ptype == 0xF0 {
+                                return None;
+                            }
+                            a.and_then(|a| vals.get(a).cloned().flatten())
+                        })
+                        .collect();
+                    let mut out = Cursor {
+                        cols: cols.clone(),
+                        rows: std::iter::once(row).collect(),
+                    };
+                    p.extend(result_data(&mut out).0);
+                }
+            }
+            p.extend(sqlca_with(0, "00000", count as i32, results));
+            db_reply(ds, 0, 0, &p)
         }
         // Open and describe (0x1804), open, describe and fetch (0x180E),
         // execute or open and describe (0x1812): the cursor over the
@@ -418,6 +471,9 @@ async fn sql_request(
                 Ok(mut r) => r.pop().unwrap_or_default(),
                 Err(e) => return fail(ds, e, last),
             };
+            if s.result.is_none() && values.is_empty() && !s.more.is_empty() {
+                s.result = s.more.pop_front();
+            }
             if s.result.is_none() || !values.is_empty() {
                 let sql = if values.is_empty() {
                     Ok(s.sql.clone())
@@ -434,14 +490,16 @@ async fn sql_request(
                         }
                         s.result = Some(c)
                     }
+                    Ok(Ran::Call(Some(c), _)) => s.result = Some(c),
                     Ok(Ran::Count(n)) => return db_reply(ds, 0, 0, &sqlca(0, "00000", n as i32)),
+                    Ok(Ran::Call(None, _)) => return db_reply(ds, 0, 0, &sqlca(0, "00000", 0)),
                     Err(e) => return fail(ds, e, last),
                 }
             }
             let c = s.result.as_mut().expect("result");
             let mut p = Vec::new();
             if ors & ORS_DATA_FORMAT != 0 {
-                p.extend(format(0x380C, &c.cols, 0));
+                p.extend(format(0x380C, &c.cols));
             }
             let (class, rc) = if id == 0x180E || ors & ORS_RESULT_DATA != 0 {
                 let (data, more) = result_data(c);
@@ -495,6 +553,9 @@ const ORS_PARAMETER_MARKER_FORMAT: u32 = 0x0080_0000;
 enum Ran {
     Rows(Cursor),
     Count(u64),
+    /// A CALL: its result set, the values of its parameters (OUT and
+    /// INOUT; None for IN and null).
+    Call(Option<Cursor>, Vec<Option<String>>),
 }
 
 /// Run a statement on the connection's job.
@@ -503,8 +564,19 @@ enum Ran {
 async fn run(srv: &mut crate::mapepire::Server<'_>, sql: &str, dt: Dt, probe: bool) -> Result<Ran> {
     Ok(match srv.statement(sql).await? {
         crate::mapepire::Done::Rows(r) => Ran::Rows(cursor(r, dt, probe)),
-        crate::mapepire::Done::Call(Some(r), _) => Ran::Rows(cursor(r, dt, probe)),
-        crate::mapepire::Done::Call(None, _) => Ran::Count(0),
+        crate::mapepire::Done::Call(r, parms) => {
+            let values = parms
+                .iter()
+                .map(|p| match p.get("value") {
+                    Some(crate::mapepire::J::Num(n)) | Some(crate::mapepire::J::Str(n)) => {
+                        Some(n.clone())
+                    }
+                    Some(crate::mapepire::J::Bool(b)) => Some(if *b { "1" } else { "0" }.into()),
+                    _ => None,
+                })
+                .collect();
+            Ran::Call(r.map(|r| cursor(r, dt, probe)), values)
+        }
         crate::mapepire::Done::Count(n) => Ran::Count(n),
     })
 }
@@ -581,6 +653,9 @@ struct Col {
     ccsid: u16,
     /// How a date or time column is written.
     dt: Dt,
+    /// A parameter marker's direction: 0xF0 input, 0xF1 output, 0xF2
+    /// both (JTOpen JDServerRow isInput, isOutput).
+    ptype: u8,
 }
 
 impl Col {
@@ -595,6 +670,7 @@ impl Col {
             scale: 0,
             ccsid: 1208,
             dt,
+            ptype: 0xF0,
         }
     }
 }
@@ -662,6 +738,80 @@ async fn marker_cols(srv: &mut crate::mapepire::Server<'_>, sql: &str) -> Vec<Co
         }
     }
     cols
+}
+
+/// A CALL's parameter markers described as the procedure's parameters
+/// they are the arguments for (their types, and 0xF1 output or 0xF2
+/// input and output for OUT and INOUT), and the parameter of each. None
+/// when the statement is not a CALL of a procedure found.
+async fn call_markers(
+    srv: &mut crate::mapepire::Server<'_>,
+    sql: &str,
+) -> Option<(Vec<Col>, Vec<Option<usize>>)> {
+    let m = masked(sql);
+    let words = top_words(&m);
+    if words.first()?.1 != "CALL" {
+        return None;
+    }
+    let mut i = words[0].0 + 4;
+    while i < m.len() && m[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let ns = i;
+    while i < m.len() && (is_name_byte(m[i]) || m[i] == b'/') {
+        i += 1;
+    }
+    let name = sql[ns..i].to_string();
+    let routine = srv.procedure(&name).await?;
+    let at = crate::mapepire::marker_positions(sql);
+    let open = i + m[i..].iter().position(|c| *c == b'(')?;
+    let mut cols = Vec::new();
+    let mut args = Vec::new();
+    for p in at {
+        let k = (p > open).then(|| value_position(&m, open, p)).flatten();
+        let parm = k.and_then(|k| routine.parms.get(k));
+        let mut c = match parm {
+            Some(parm) => written_col(&parm.ty),
+            None => Col::marker(Dt::default()),
+        };
+        c.ptype = match parm.map(|p| p.mode.as_str()) {
+            Some("OUT") => 0xF1,
+            Some("INOUT") => 0xF2,
+            _ => 0xF0,
+        };
+        cols.push(c);
+        args.push(if parm.is_some() { k } else { None });
+    }
+    Some((cols, args))
+}
+
+/// A column of a type as written (`DECIMAL(9, 2)`).
+fn written_col(ty: &str) -> Col {
+    let (name, p, s) = crate::mapepire::written(ty);
+    let t = crate::sql::ColType {
+        pg: match name.as_str() {
+            "SMALLINT" => "int2",
+            "INTEGER" => "int4",
+            "BIGINT" => "int8",
+            "REAL" => "float4",
+            "DOUBLE" | "FLOAT" => "float8",
+            "DECIMAL" | "NUMERIC" => "numeric",
+            "DATE" => "date",
+            "TIME" => "time",
+            "TIMESTAMP" => "timestamp",
+            "CHAR" => "bpchar",
+            "BINARY" | "VARBINARY" => "bytea",
+            _ => "varchar",
+        }
+        .into(),
+        typmod: match name.as_str() {
+            "DECIMAL" | "NUMERIC" => (((p << 16) | s) + 4) as i32,
+            "CHAR" | "VARCHAR" | "BINARY" | "VARBINARY" if p > 0 => (p + 4) as i32,
+            _ => -1,
+        },
+        db2: matches!(name.as_str(), "NUMERIC" | "BINARY").then(|| name.clone()),
+    };
+    col_for("", &t, None, Dt::default())
 }
 
 /// A statement with its strings' contents blanked (so that a keyword or
@@ -1072,6 +1222,7 @@ fn col_for(name: &str, t: &crate::sql::ColType, values: Option<&[&str]>, dt: Dt)
         scale,
         ccsid,
         dt,
+        ptype: 0xF0,
     }
 }
 
@@ -1276,7 +1427,7 @@ fn shown(t: &crate::sql::ColType, v: &str) -> String {
 /// length, SQL type, length (4), scale, precision, CCSID, parameter type,
 /// LOB locator and maximum size, the name's length, its CCSID and the
 /// name (30 bytes).
-fn format(cp: u16, cols: &[Col], ptype: u8) -> Vec<u8> {
+fn format(cp: u16, cols: &[Col]) -> Vec<u8> {
     let size: usize = cols.iter().map(|c| c.length).sum();
     let mut d = 1u32.to_be_bytes().to_vec();
     d.extend((cols.len() as u32).to_be_bytes());
@@ -1290,7 +1441,7 @@ fn format(cp: u16, cols: &[Col], ptype: u8) -> Vec<u8> {
         f.extend(c.scale.to_be_bytes());
         f.extend(c.precision.to_be_bytes());
         f.extend(c.ccsid.to_be_bytes());
-        f.push(ptype);
+        f.push(if cp == 0x380D { c.ptype } else { 0 });
         f.extend([0u8; 15]);
         let mut name = c.name.as_bytes().to_vec();
         name.truncate(30);
@@ -1342,6 +1493,7 @@ fn descriptor(d: &[u8], extended: bool) -> Vec<Col> {
                 ccsid,
                 // Dates and times come in ISO form (`marker_cols`).
                 dt: Dt::default(),
+                ptype: 0xF0,
             }
         })
         .collect()
@@ -1722,6 +1874,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parameters_described_from_their_types_as_written() {
+        let t = |ty: &str| {
+            let c = written_col(ty);
+            (c.sql_type, c.length, c.precision, c.scale)
+        };
+        assert_eq!(t("INTEGER"), (497, 4, 10, 0));
+        assert_eq!(t("DEC(9, 2)"), (485, 5, 9, 2));
+        assert_eq!(t("NUMERIC(5)"), (489, 5, 5, 0));
+        assert_eq!(t("VARCHAR(20)"), (449, 22, 20, 0));
+        assert_eq!(t("CHAR(3)"), (453, 3, 3, 0));
+        assert_eq!(t("DATE"), (385, 10, 0, 0));
+        assert_eq!(t("TIMESTAMP"), (393, 26, 26, 6));
+    }
+
+    #[test]
     fn the_columns_markers_stand_for() {
         let cmp = |sql: &str| -> Vec<Option<String>> {
             let m = masked(sql);
@@ -1814,6 +1981,7 @@ mod tests {
             scale,
             ccsid,
             dt: Dt::default(),
+            ptype: 0xF0,
         };
         assert_eq!(literal(&col(497, 4, 0, 0), &[0xFF, 0xFF, 0xFF, 0xFE]), "-2");
         assert_eq!(

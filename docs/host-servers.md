@@ -61,6 +61,17 @@ length is described as VARCHAR(32739), a decimal expression as
 DECIMAL(31, 10). Values come as the client lays them out (dates and
 times in ISO form) and are put into the statement as literals.
 
+### CALL
+
+A CALL's markers are described as the procedure's parameters (their
+types; parameter type 0xF0 input, 0xF1 output, 0xF2 input and output),
+so that `CallableStatement.registerOutParameter` and `getXxx` work: the
+execute reply carries the OUT and INOUT values in a row of result data
+(IN parameters null). The number of result sets is in SQLERRD(2); the
+client opens the first with open and describe and each next one after
+closing the one before (`getMoreResults`). Result set columns of a
+procedure are described as VARCHAR.
+
 ### Database metadata
 
 At V7R5 the JDBC driver answers `DatabaseMetaData` by calling the

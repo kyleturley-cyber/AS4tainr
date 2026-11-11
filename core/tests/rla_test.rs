@@ -28550,6 +28550,56 @@ async fn host_servers_sign_on_and_database_attributes() {
     );
     let d = find(&r, 0x380E);
     assert_eq!(u32_at(&d, 4), 3, "ID, AMT, NM");
+    // A CALL: its markers described as the procedure's parameters (0xF1
+    // output), the OUT values in a row of result data, the number of
+    // result sets in SQLERRD(2), each opened in turn (open and describe,
+    // close, open and describe: JTOpen getMoreResults).
+    let create = format!(
+        "CREATE PROCEDURE {lib}.HP (IN A INTEGER, OUT B VARCHAR(20)) LANGUAGE SQL \
+         DYNAMIC RESULT SETS 2 BEGIN \
+         DECLARE C1 CURSOR WITH RETURN FOR SELECT ID FROM {lib}.HT ORDER BY ID; \
+         DECLARE C2 CURSOR WITH RETURN FOR SELECT 'x' AS X FROM SYSIBM.SYSDUMMY1; \
+         SET B = 'n' CONCAT CHAR(A); OPEN C1; OPEN C2; END"
+    );
+    let r = exchange(&mut s, msg(0x1806, 0x0200_0000, &create)).await;
+    assert_eq!(class_rc(&r), (0, 0));
+    let r = exchange(
+        &mut s,
+        msg(0x1803, 0x8280_0000, &format!("CALL {lib}.HP(?, ?)")),
+    )
+    .await;
+    assert_eq!(class_rc(&r), (0, 0));
+    let f = find(&r, 0x380D);
+    assert_eq!((field(&f, 0, 2), f[16 + 14]), (497, 0xF0), "IN INTEGER");
+    assert_eq!(
+        (field(&f, 1, 2), f[16 + 64 + 14]),
+        (449, 0xF1),
+        "OUT VARCHAR"
+    );
+    let mut row = vec![0, 0, 0, 7];
+    row.extend([0u8; 22]);
+    let call = ds(&values(&[&row], 2, 26), 0xE004, 0x1805, &tmpl(0x8600_0000));
+    let r = exchange(&mut s, call).await;
+    assert_eq!(class_rc(&r), (0, 0));
+    let ca = find(&r, 0x3807);
+    assert_eq!(
+        i32::from_be_bytes([ca[100], ca[101], ca[102], ca[103]]),
+        2,
+        "result sets"
+    );
+    let d = find(&r, 0x380E);
+    assert_eq!(&d[22..24], &[0, 0], "B not null");
+    assert_eq!(&d[28..28 + 4], &[0, 2, b'n', b'7'], "B");
+    let r = exchange(&mut s, msg(0x1804, 0x8C00_0000, "")).await;
+    assert_eq!(u32_at(&find(&r, 0x380E), 4), 4, "the rows of HT");
+    exchange(&mut s, msg(0x180A, 0, "")).await;
+    let r = exchange(&mut s, msg(0x1804, 0x8C00_0000, "")).await;
+    let d = find(&r, 0x380E);
+    assert_eq!(
+        (u32_at(&d, 4), &d[22..25]),
+        (1, &[0, 1, b'x'][..]),
+        "the second set"
+    );
     let r = exchange(
         &mut s,
         msg(0x1803, 0x8200_0000, &format!("SELECT * FROM {lib}.NOPE")),

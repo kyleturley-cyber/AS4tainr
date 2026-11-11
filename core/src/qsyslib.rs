@@ -92,6 +92,27 @@ fn member_text(source: &str, width: usize) -> String {
     s
 }
 
+/// A data file's member as Qshell reads it: each record's image (cpyf.rs
+/// `record_image`, EBCDIC) as characters of CCSID 37, and a newline.
+async fn data_member_text(client: &Client, lib: &str, file: &str) -> Result<String> {
+    let f = crate::catalog::resolve_file(client, &[lib.to_string()], file).await?;
+    let recs = crate::catalog::member_records(client, &f, 1_000_000).await?;
+    let mut out = String::new();
+    for (_, vals) in recs {
+        let rec: crate::rla::Record = f
+            .file
+            .fields
+            .iter()
+            .zip(vals)
+            .map(|(fd, v)| (fd.name.clone(), v))
+            .collect();
+        let img = crate::cpyf::record_image(&f.file, &rec);
+        out.push_str(&crate::ifs::codec::text(37, &img));
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 /// QSYS.LIB names are not case-sensitive (IBM i documentation, "QSYS.LIB
 /// file system": object names are stored in upper case): the
 /// `/QSYS.LIB/...` paths of a command line in upper case, so that the
@@ -244,8 +265,14 @@ pub async fn build(client: &Client, root: &Path, cwd: &str, line: &str) -> Resul
                     );
                 }
             } else {
-                // A data file: its member, named as the file.
-                std::fs::write(p.join(format!("{name}.MBR")), b"")?;
+                // A data file: its member, named as the file, its records
+                // as text (Qshell's view: each record's bytes in the
+                // file's CCSID as characters, blanks kept, and a newline;
+                // PUB400 2026-11-10, verify77 u77_qcat).
+                let text = data_member_text(client, &lib, &name)
+                    .await
+                    .unwrap_or_default();
+                std::fs::write(p.join(format!("{name}.MBR")), text)?;
             }
         }
     }

@@ -83,6 +83,7 @@ pub mod report;
 pub mod rexx;
 pub mod rla;
 pub mod rpg;
+pub mod rpyl;
 pub mod rtvclsrc;
 pub mod runtime;
 pub mod save;

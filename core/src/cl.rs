@@ -2305,6 +2305,40 @@ pub static COMMANDS: &[CommandDef] = &[
         ],
     },
     CommandDef {
+        name: "ADDRPYLE",
+        description: "Add Reply List Entry",
+        params: &[
+            p("SEQNBR", Kind::Text, true, None, "Sequence number").ch("1-9999"),
+            p("MSGID", Kind::Name, false, Some("*ANY"), "Message identifier").ch("Name, *ANY"),
+            p("CMPDTA", Kind::List, false, Some("*NONE"), "Compare data").ch("Character value, *NONE"),
+            p("RPY", Kind::Text, false, Some("*DFT"), "Message reply").ch("*DFT, *RQD, *IGNORE"),
+            p("DUMP", Kind::Name, false, Some("*NO"), "Dump the sending job").ch("*NO, *YES"),
+            p("CCSID", Kind::Name, false, Some("*HEX"), "Coded character set ID").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "CHGRPYLE",
+        description: "Change Reply List Entry",
+        params: &[
+            p("SEQNBR", Kind::Text, true, None, "Sequence number").ch("1-9999"),
+            p("MSGID", Kind::Name, false, Some("*SAME"), "Message identifier").ch("Name, *SAME, *ANY"),
+            p("CMPDTA", Kind::List, false, Some("*SAME"), "Compare data").ch("Character value, *SAME, *NONE"),
+            p("RPY", Kind::Text, false, Some("*SAME"), "Message reply").ch("*SAME, *DFT, *RQD, *IGNORE"),
+            p("DUMP", Kind::Name, false, Some("*SAME"), "Dump the sending job").ch("*SAME, *NO, *YES"),
+            p("CCSID", Kind::Name, false, Some("*SAME"), "Coded character set ID").keyword_only(),
+        ],
+    },
+    CommandDef {
+        name: "RMVRPYLE",
+        description: "Remove Reply List Entry",
+        params: &[p("SEQNBR", Kind::Text, true, None, "Sequence number").ch("1-9999, *ALL")],
+    },
+    CommandDef {
+        name: "WRKRPYLE",
+        description: "Work with System Reply List Entries",
+        params: &[p("SEQNBR", Kind::Text, false, Some("*ALL"), "Sequence number").ch("1-9999, *ALL")],
+    },
+    CommandDef {
         name: "CRTJOBQ",
         description: "Create Job Queue",
         params: &[
@@ -5247,6 +5281,10 @@ pub static GROUPS: &[Group] = &[
             "HLDJOBSCDE",
             "RLSJOBSCDE",
             "WRKJOBSCDE",
+            "ADDRPYLE",
+            "CHGRPYLE",
+            "RMVRPYLE",
+            "WRKRPYLE",
             "ADDENVVAR",
             "CHGENVVAR",
             "RMVENVVAR",

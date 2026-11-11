@@ -28062,3 +28062,122 @@ async fn dspmod_imports_of_rpg_and_cl_modules() {
         .collect();
     assert_eq!(e, ["HELLO76"]);
 }
+
+#[tokio::test]
+async fn data_members_in_qsys_lib_and_the_reply_list() {
+    // PUB400 2026-11-10, verify77: a data file's member read through
+    // Qshell is each record's characters, blanks kept, and a newline
+    // (u77_qcat: "ABC" and "hello world!" in a 12-byte file); attr's
+    // DATA_SIZE is the records' bytes and 4 (u77_attr: 28). The system
+    // reply list: IBM's entries 10-40 (u77_rpyl), changed only with
+    // *ALLOBJ (u77_addrpyle: CPD0032, CPF0006).
+    use as4tainr_core::commands::{Environment, Job};
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    cl_cmd(&mut job, format!("CRTPF FILE({lib}/GLD77D) RCDLEN(12)"))
+        .await
+        .unwrap();
+    as4tainr_core::sql::run(
+        &client,
+        &url,
+        std::slice::from_ref(&lib),
+        &format!("INSERT INTO {lib}.GLD77D VALUES ('ABC'), ('hello world!')"),
+    )
+    .await
+    .unwrap();
+    let dir = std::env::temp_dir().join(format!("qsyslib-{lib}"));
+    let tree = as4tainr_core::qsyslib::build(
+        &client,
+        &dir,
+        "/home",
+        &format!("cat /QSYS.LIB/{lib}.LIB/GLD77D.FILE/GLD77D.MBR"),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(
+        tree.root
+            .join(format!("QSYS.LIB/{lib}.LIB/GLD77D.FILE/GLD77D.MBR")),
+    )
+    .unwrap();
+    assert_eq!(text, "ABC         \nhello world!\n");
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = as4tainr_core::pase_attr::attr(
+        &client,
+        &[
+            "-p".into(),
+            format!("/QSYS.LIB/{lib}.LIB/GLD77D.FILE/GLD77D.MBR"),
+            "DATA_SIZE".into(),
+        ],
+    )
+    .await;
+    assert_eq!(out.stdout, ["DATA_SIZE=28"], "{:?}", out.stderr);
+    // The reply list.
+    let rows = |sql: &'static str| {
+        let client = &client;
+        let url = &url;
+        let lib = &lib;
+        async move {
+            match as4tainr_core::sql::run(client, url, std::slice::from_ref(lib), sql)
+                .await
+                .unwrap()
+            {
+                as4tainr_core::sql::Outcome::Rows { rows, .. } => {
+                    rows.into_iter().map(|r| r.join("|")).collect::<Vec<_>>()
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    };
+    let shipped = rows(
+        "SELECT SEQUENCE_NUMBER, MESSAGE_ID, MESSAGE_REPLY, DUMP_JOB FROM QSYS2.REPLY_LIST_INFO WHERE SEQUENCE_NUMBER <= 40 ORDER BY 1",
+    )
+    .await;
+    assert_eq!(
+        shipped,
+        [
+            "10|CPA0700|D|YES",
+            "20|RPG0000|D|YES",
+            "30|CBE0000|D|YES",
+            "40|PLI0000|D|YES"
+        ]
+    );
+    cl_cmd(&mut job, "RMVRPYLE SEQNBR(9977)".into()).await.ok();
+    cl_cmd(
+        &mut job,
+        "ADDRPYLE SEQNBR(9977) MSGID(CPA7025) RPY('I')".into(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows("SELECT MESSAGE_ID, MESSAGE_REPLY, DUMP_JOB FROM QSYS2.REPLY_LIST_INFO WHERE SEQUENCE_NUMBER = 9977").await,
+        ["CPA7025|I|NO"]
+    );
+    cl_cmd(&mut job, "RMVRPYLE SEQNBR(9977)".into())
+        .await
+        .unwrap();
+    // A user without *ALLOBJ.
+    cl_cmd(&mut job, "CRTUSRPRF USRPRF(RPYL77) PASSWORD(*NONE)".into())
+        .await
+        .ok();
+    job.user = "RPYL77".into();
+    let e = cl_cmd(
+        &mut job,
+        "ADDRPYLE SEQNBR(9977) MSGID(CPA7025) RPY('I')".into(),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("CPD0032") && e.contains("CPF0006"), "{e}");
+}

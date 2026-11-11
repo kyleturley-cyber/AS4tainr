@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 61";
+const VERSION: &str = "as4tainr services 62";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -1866,6 +1866,22 @@ BEGIN
 END $$;
 "#;
 
+/// QSYS2.REPLY_LIST_INFO: the system reply list (rpyl.rs), in the
+/// columns PUB400's view has (2026-11-10, verify77 u77_rpyl: SEQUENCE_NUMBER,
+/// MESSAGE_ID, MESSAGE_REPLY, COMPARISON_DATA, COMPARISON_DATA_OFFSET,
+/// DUMP_JOB YES/NO; no comparison data shows null).
+const REPLY_LIST_INFO: &str = r#"
+CREATE OR REPLACE VIEW qsys2.reply_list_info AS
+SELECT seqnbr AS sequence_number,
+       CAST(msgid AS varchar(7)) COLLATE "C" AS message_id,
+       CAST(rpy AS varchar(32)) COLLATE "C" AS message_reply,
+       CAST(cmpdta AS varchar(28)) COLLATE "C" AS comparison_data,
+       CASE WHEN cmpdta IS NULL THEN NULL ELSE start END AS comparison_data_offset,
+       CAST(CASE WHEN dump THEN 'YES' ELSE 'NO' END AS varchar(3)) COLLATE "C" AS dump_job
+  FROM as4tainr.reply_list;
+GRANT SELECT ON qsys2.reply_list_info TO as4tainr_sql;
+"#;
+
 /// QSYS2.PROGRAM_INFO: a program's or service program's facts, in the
 /// 107 columns and types of IBM i 7.5's view (PUB400 2026-11-09, verify66
 /// n66_mapepire and verify68 o68_mapepire "pgmi": QSYS/QCMDEXC). What
@@ -2443,6 +2459,7 @@ fn work_services() -> String {
          {LIBRARY_INFO}
          {FILE_CATALOG}
          {PROGRAM_INFO}
+         {REPLY_LIST_INFO}
          GRANT SELECT ON qsys2.sysfiles, qsys2.program_info, qsys2.syspartitionstat TO {SQL_ROLE};
          GRANT SELECT ON qsys2.bound_srvpgm_info TO {SQL_ROLE};
          GRANT SELECT ON qsys2.library_list_info, qsys2.user_info, qsys2.system_value_info,

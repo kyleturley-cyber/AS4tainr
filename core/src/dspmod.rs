@@ -634,6 +634,12 @@ impl Job<'_> {
     pub(crate) async fn dspmod_command(&mut self, cmd: &Command) -> Result<Option<Outcome>> {
         Ok(Some(match cmd.def.name {
             "DSPMOD" => self.dspmod(cmd).await?,
+            // The reply list's commands, dispatched here: one more arm in
+            // Job::run's chain made its future overflow the stack of
+            // deeply nested commands (rla verify12_message_keys...).
+            "ADDRPYLE" | "CHGRPYLE" | "RMVRPYLE" | "WRKRPYLE" => {
+                return Box::pin(self.rpyl_command(cmd)).await
+            }
             _ => return Ok(None),
         }))
     }

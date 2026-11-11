@@ -328,13 +328,31 @@ async fn qsys_attr(client: &Client, path: &str, names: &[&String], pairs: bool) 
                 .await
                 .ok()
                 .flatten();
+            // DATA_SIZE: the records' data and 4 bytes (PUB400 2026-11-10:
+            // verify72 s72_attr 164 for two 80-byte SRCDTA, verify77
+            // u77_attr 28 for two 12-byte data records).
             match (e.as_str(), r) {
                 ("MBR", Some(r)) => {
                     let source: String = r.get(0);
                     let rcdlen: i32 = r.get(1);
                     let n = source.lines().count() as i64;
-                    let size = n * (rcdlen as i64 - 12).max(0);
+                    let size = n * (rcdlen as i64 - 12).max(0) + 4;
                     Some(("*MBR".into(), size.to_string(), "37".into()))
+                }
+                // A data file's member, named as the file.
+                ("MBR", None) if m == f => {
+                    match crate::catalog::resolve_file(client, std::slice::from_ref(&lib), &f).await
+                    {
+                        Ok(fr) => {
+                            let n = crate::catalog::member_records(client, &fr, 1_000_000)
+                                .await
+                                .map(|r| r.len() as i64)
+                                .unwrap_or(0);
+                            let size = n * crate::cpyf::record_length(&fr.file) as i64 + 4;
+                            Some(("*MBR".into(), size.to_string(), "37".into()))
+                        }
+                        Err(_) => None,
+                    }
                 }
                 _ => None,
             }

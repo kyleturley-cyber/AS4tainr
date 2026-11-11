@@ -44,6 +44,7 @@ pub mod envvar;
 pub mod fdout;
 pub mod hostcmd;
 pub mod hostdb;
+pub mod hostdtaq;
 pub mod hostsrv;
 pub mod ibmcmds;
 pub mod ifs;

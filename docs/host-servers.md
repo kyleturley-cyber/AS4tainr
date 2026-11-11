@@ -12,6 +12,7 @@ well-known ports:
 | Sign-on (as-signon) | 8476 | Exchange of attributes (V7R5M0, server level 10, password level 2), sign-on with a password |
 | Database (as-database) | 8471 | Exchange of seeds, start server with a password, server attributes, SQL statements, parameter markers, CALL, commitment control, the SYSIBM metadata procedures (below) |
 | Remote command (as-rmtcmd) | 8475 | Exchange of seeds, start server, exchange attributes (data stream level 10), CL commands run with their messages (Toolbox `CommandCall`), programs called with their parameters (`ProgramCall`: RPG and CL programs, the data queue, user space and retrieve APIs done here) |
+| Data queue (as-dtaq) | 8472 | Exchange of seeds, start server, data queues created, deleted, written, read (waiting, peeking, by key), cleared, their attributes (Toolbox `DataQueue`, `KeyedDataQueue`) |
 
 The data streams are the ones JTOpen's client side builds and reads; the
 server side is as4tainr's own (`core/src/hostsrv.rs`, `core/src/hostdb.rs`).
@@ -129,6 +130,19 @@ answered as JTOpen expects it (MCH3401 with the object's type and name
 in the substitution data: `ObjectDoesNotExistException`). The server
 says its job is number/QUSER/QZRCSRVS, so `ProgramCall.getServerJob`
 needs no API call.
+
+## Data queues
+
+The data queue server's requests are done by the data queue APIs
+(`dtaq.rs`: Send, Receive, Clear Data Queue) in the connection's job,
+with their messages: an error comes back as a command check (0xF001)
+with "CPFnnnn: text", which the Toolbox turns into its exceptions
+(CPF9801 `ObjectDoesNotExistException`, CPF9506 a keyed queue read
+without a key: `IllegalObjectTypeException`). A read that finds no
+entry in its wait is answered 0xF006 (the Toolbox returns null).
+Create takes the queue's largest entry, sequence, key length, sender
+information, force and text; the authority asked for is not used (the
+queue gets the library's, as CRTDTAQ's default *LIBCRTAUT).
 
 ## Passwords
 

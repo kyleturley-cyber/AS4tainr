@@ -51,6 +51,7 @@ services:
       # - "8476:8476" # sign-on server
       # - "8471:8471" # database server
       # - "8475:8475" # remote command server
+      # - "8472:8472" # data queue server
 
   demo:
     image: ghcr.io/as4tainr/as4tainr:dev

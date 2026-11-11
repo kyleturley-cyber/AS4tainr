@@ -11358,7 +11358,7 @@ impl Job<'_> {
     }
 
     /// The job as the data queue APIs see it.
-    fn dtaq_caller(&self) -> crate::dtaq::Caller {
+    pub fn dtaq_caller(&self) -> crate::dtaq::Caller {
         crate::dtaq::Caller {
             user: self.user.clone(),
             job: self.id.clone(),

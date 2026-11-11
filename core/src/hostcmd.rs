@@ -45,7 +45,14 @@ const DS_LEVEL: u16 = 10;
 const JOB_CCSID: u32 = 37;
 
 /// Serve one remote command connection.
-pub async fn serve(url: &str, mut sock: TcpStream) -> Result<()> {
+pub async fn serve(url: &str, sock: TcpStream) -> Result<()> {
+    serve_as(url, sock, 0xE008).await
+}
+
+/// Serve one connection of the remote command server (0xE008) or the
+/// data queue server (0xE007, hostdtaq.rs): the start of a connection is
+/// the same, the job the requests run in too.
+pub async fn serve_as(url: &str, mut sock: TcpStream, server_id: u16) -> Result<()> {
     let client = crate::runtime::connect_db(url).await?;
     let env = crate::commands::Environment {
         database_url: url.to_string(),
@@ -61,7 +68,7 @@ pub async fn serve(url: &str, mut sock: TcpStream) -> Result<()> {
                 let mut t = 0u32.to_be_bytes().to_vec();
                 t.extend(server_seed);
                 // Byte 5 of the header: the password level.
-                reply(0, 2, 0xE008, corr, 0xF001, &t, &[])
+                reply(0, 2, server_id, corr, 0xF001, &t, &[])
             }
             0x7002 => {
                 let mut name = String::new();
@@ -106,11 +113,23 @@ pub async fn serve(url: &str, mut sock: TcpStream) -> Result<()> {
                     let mut u = 37u32.to_be_bytes().to_vec();
                     u.extend(ebcdic(&name.to_ascii_uppercase(), 10));
                     p.extend(param(0x1104, &u));
-                    p.extend(job_name_param("QZRCSRVS", "QUSER"));
+                    let job = if server_id == 0xE007 {
+                        "QZHQSSRV"
+                    } else {
+                        "QZRCSRVS"
+                    };
+                    p.extend(job_name_param(job, "QUSER"));
                 }
-                reply(0, 0, 0xE008, corr, 0xF002, &rc.to_be_bytes(), &p)
+                reply(0, 0, server_id, corr, 0xF002, &rc.to_be_bytes(), &p)
             }
             _ if server.is_none() => break,
+            _ if server_id == 0xE007 => {
+                let srv = server.as_mut().expect("signed on");
+                match crate::hostdtaq::request(srv, &ds).await {
+                    Some(out) => out,
+                    None => continue,
+                }
+            }
             0x1001 => exchange_attributes(corr),
             0x1002 => {
                 let srv = server.as_mut().expect("signed on");

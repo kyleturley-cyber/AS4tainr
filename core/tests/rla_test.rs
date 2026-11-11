@@ -28446,6 +28446,96 @@ async fn host_servers_sign_on_and_database_attributes() {
         as4tainr_core::hostsrv::text37(&sub[2..32]).trim(),
         "NOSUCHPGM"
     );
+    // The data queue server (JTOpen DQ*DataStream, BaseDataQueueImpl-
+    // Remote): create, write, attributes (0x8001: largest entry at 22,
+    // type at 27), read (0x8003: the entry in CP 0x5001 after the 36
+    // bytes of sender information), read of an empty queue (common reply
+    // 0xF006), a queue that is not there (0xF001, CPF9801).
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let u2 = url.clone();
+    tokio::spawn(async move {
+        let (s, _) = l.accept().await.unwrap();
+        as4tainr_core::hostcmd::serve_as(&u2, s, 0xE007).await
+    });
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(&ds(&[], 0xE007, 0x7001, &client_seed))
+        .await
+        .unwrap();
+    let r = read(&mut s).await;
+    let server_seed = r[24..32].to_vec();
+    let mut p = cp(0x1105, &substitute("PW123", &server_seed, &client_seed));
+    p.extend(cp(0x1104, &uid37));
+    s.write_all(&ds(&p, 0xE007, 0x7002, &[3, 1])).await.unwrap();
+    assert_eq!(u32_at(&read(&mut s).await, 20), 0);
+    s.write_all(&ds(&[], 0xE007, 0x0000, &1u32.to_be_bytes()))
+        .await
+        .unwrap();
+    assert_eq!(
+        u16::from_be_bytes(read(&mut s).await[18..20].try_into().unwrap()),
+        0x8000
+    );
+    let q = |name: &str| {
+        let mut t = e(name, 10);
+        t.extend(e(&lib, 10));
+        t
+    };
+    let mut t = q("JQ");
+    t.extend(64u32.to_be_bytes());
+    t.extend([0xF3, 0xF0, 0xF0, 0, 0, 0xF0]);
+    t.extend(e("test queue", 50));
+    s.write_all(&ds(&[], 0xE007, 0x0003, &t)).await.unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(
+        (
+            u16::from_be_bytes([r[18], r[19]]),
+            u16::from_be_bytes([r[20], r[21]])
+        ),
+        (0x8002, 0xF000)
+    );
+    let mut t = q("JQ");
+    t.extend([0xF0, 0xF1]);
+    s.write_all(&ds(&cp(0x5001, &e("ENTRY1", 6)), 0xE007, 0x0005, &t))
+        .await
+        .unwrap();
+    assert_eq!(
+        u16::from_be_bytes(read(&mut s).await[20..22].try_into().unwrap()),
+        0xF000
+    );
+    s.write_all(&ds(&[], 0xE007, 0x0001, &q("JQ")))
+        .await
+        .unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(
+        (u16::from_be_bytes([r[18], r[19]]), u32_at(&r, 22), r[27]),
+        (0x8001, 64, 0xF0)
+    );
+    let rd = |name: &str| {
+        let mut t = q(name);
+        t.push(0xF0);
+        t.extend(e("EQ", 2));
+        t.extend(0i32.to_be_bytes());
+        t.push(0xF0);
+        ds(&[], 0xE007, 0x0002, &t)
+    };
+    s.write_all(&rd("JQ")).await.unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(u16::from_be_bytes([r[18], r[19]]), 0x8003);
+    assert_eq!(&r[62..64], &[0x50, 0x01]);
+    assert_eq!(&r[64..70], &e("ENTRY1", 6)[..]);
+    s.write_all(&rd("JQ")).await.unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(
+        (
+            u16::from_be_bytes([r[18], r[19]]),
+            u16::from_be_bytes([r[20], r[21]])
+        ),
+        (0x8002, 0xF006)
+    );
+    s.write_all(&rd("NOQ")).await.unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(u16::from_be_bytes([r[20], r[21]]), 0xF001);
+    assert_eq!(as4tainr_core::hostsrv::text37(&r[28..35]), "CPF9801");
     // The database server.
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();

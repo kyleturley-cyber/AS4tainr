@@ -69,8 +69,20 @@ so that `CallableStatement.registerOutParameter` and `getXxx` work: the
 execute reply carries the OUT and INOUT values in a row of result data
 (IN parameters null). The number of result sets is in SQLERRD(2); the
 client opens the first with open and describe and each next one after
-closing the one before (`getMoreResults`). Result set columns of a
-procedure are described as VARCHAR.
+closing the one before (`getMoreResults`). The columns of an SQL
+procedure's result sets have their queries' types.
+
+### Commitment control
+
+With autocommit off (`Connection.setAutoCommit(false)`: CP 0x3824
+0xD5 in set attributes) and a commit level (CP 0x380E: 1 *CHG, 2 *CS,
+3 *ALL, 4 *RR from the transaction isolation), the connection's
+statements run in a unit of work of their own (a commitment
+definition of the connection, as RUNSQLSTM's with a commit level) that
+commit (function 0x1807), rollback (0x1808) and the COMMIT and
+ROLLBACK statements end. Turning autocommit back on commits what is
+pending; a connection that ends rolls it back. SQL DDL statements run
+committed, outside the unit of work.
 
 ### Database metadata
 

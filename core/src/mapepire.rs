@@ -356,6 +356,9 @@ pub struct Server<'a> {
     /// SET SCHEMA's schema (unqualified names), else the library list.
     schema: Option<String>,
     session: Option<(Vec<String>, crate::sql::Session)>,
+    /// The unit of work statements run in when the client has turned
+    /// commitment control on (JDBC autocommit off): its own definition.
+    cmt: Option<std::sync::Arc<crate::cmtctl::Definition>>,
     open: HashMap<String, Open>,
     unparseable: u32,
     incomplete: u32,
@@ -382,6 +385,7 @@ impl<'a> Server<'a> {
             job,
             schema: None,
             session: None,
+            cmt: None,
             open: HashMap::new(),
             unparseable: 0,
             incomplete: 0,
@@ -641,9 +645,21 @@ impl<'a> Server<'a> {
     async fn session(&mut self) -> Result<&crate::sql::Session> {
         let libl = self.libl();
         if self.session.as_ref().map(|(l, _)| l) != Some(&libl) {
-            let mut s =
-                crate::sql::Session::open(self.job.client, &self.job.env.database_url, &libl)
-                    .await?;
+            let mut s = match &self.cmt {
+                Some(d) => {
+                    crate::sql::Session::open_in(
+                        self.job.client,
+                        &self.job.env.database_url,
+                        &libl,
+                        d.clone(),
+                    )
+                    .await?
+                }
+                None => {
+                    crate::sql::Session::open(self.job.client, &self.job.env.database_url, &libl)
+                        .await?
+                }
+            };
             s.describe_types = true;
             s.set_context(
                 &self.job.user,
@@ -656,9 +672,57 @@ impl<'a> Server<'a> {
         Ok(&self.session.as_ref().expect("session").1)
     }
 
+    /// Statements from now on run under commitment control at this lock
+    /// level (*CHG, *CS, *ALL, *RR), or (None) each committed as it ends;
+    /// turning it off commits what is pending (JDBC setAutoCommit(true)).
+    pub(crate) async fn set_commit_level(&mut self, lcklvl: Option<&str>) -> Result<()> {
+        match (lcklvl, &self.cmt) {
+            (None, None) => return Ok(()),
+            (Some(l), Some(d)) if d.lcklvl == l => return Ok(()),
+            (_, Some(d)) => d.commit().await?,
+            _ => {}
+        }
+        self.cmt = match lcklvl {
+            Some(l) => Some(
+                crate::cmtctl::private(
+                    self.job.client,
+                    &self.job.env.database_url,
+                    Some(&self.job.job_key()),
+                    l,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        self.session = None;
+        Ok(())
+    }
+
+    /// COMMIT (true) or ROLLBACK of the unit of work, when there is one.
+    pub(crate) async fn end_unit(&mut self, commit: bool) -> Result<()> {
+        match &self.cmt {
+            Some(d) if commit => d.commit().await,
+            Some(d) => d.rollback().await,
+            None => Ok(()),
+        }
+    }
+
     /// Run one statement.
     pub(crate) async fn statement(&mut self, sql: &str) -> Result<Done> {
         let sql = sql.trim().trim_end_matches(';').trim();
+        // COMMIT and ROLLBACK [WORK]: the unit of work.
+        let words: Vec<String> = sql
+            .split_whitespace()
+            .map(|w| w.to_ascii_uppercase())
+            .collect();
+        if let [w] | [w, _] = words.as_slice() {
+            if (w == "COMMIT" || w == "ROLLBACK")
+                && words.get(1).is_none_or(|x| x == "WORK" || x == "HOLD")
+            {
+                self.end_unit(w == "COMMIT").await?;
+                return Ok(Done::Count(0));
+            }
+        }
         if !crate::sqlpl::is_compound(sql) {
             if let Some((name, args)) = crate::sqlpl::parse_call(sql)? {
                 return self.call(&name, &args).await;
@@ -861,11 +925,20 @@ impl<'a> Server<'a> {
             curlib,
         };
         let (routine, out) = crate::sqlpl::call_exprs(&env, name, args).await?;
-        let mut sets = out.result_sets.into_iter().map(|(columns, rows)| Results {
-            types: columns.iter().map(|_| text_type()).collect(),
-            columns,
-            rows: rows.into(),
-            done: false,
+        // A result set's column types as its query had them (else
+        // text).
+        let mut types = out.result_types.into_iter();
+        let mut sets = out.result_sets.into_iter().map(|(columns, rows)| {
+            let types = match types.next() {
+                Some(t) if t.len() == columns.len() => t,
+                _ => columns.iter().map(|_| text_type()).collect(),
+            };
+            Results {
+                types,
+                columns,
+                rows: rows.into(),
+                done: false,
+            }
         });
         let results = sets.next();
         self.more_results = sets.collect();

@@ -28600,6 +28600,32 @@ async fn host_servers_sign_on_and_database_attributes() {
         (1, &[0, 1, b'x'][..]),
         "the second set"
     );
+    // Commitment control (JTOpen JDTransactionManager: autocommit off,
+    // CP 0x3824 0xD5, and a commit level, 0x380E 2 *CS): changes wait
+    // for commit (0x1807) or rollback (0x1808).
+    let mut p = cp(0x3824, &[0xD5]);
+    p.extend(cp(0x380E, &2u16.to_be_bytes()));
+    let r = exchange(&mut s, ds(&p, 0xE004, 0x1F80, &tmpl(0x8000_0000))).await;
+    assert_eq!(class_rc(&r), (0, 0));
+    let ins = format!("INSERT INTO {lib}.HT (ID) VALUES (9)");
+    let r = exchange(&mut s, msg(0x1806, 0x0200_0000, &ins)).await;
+    assert_eq!(class_rc(&r), (0, 0));
+    let count = format!(
+        "SELECT count(*) FROM {}.ht WHERE id = 9",
+        lib.to_lowercase()
+    );
+    let rows = client.query(&count, &[]).await.unwrap();
+    assert_eq!(rows[0].get::<_, i64>(0), 0, "not committed yet");
+    exchange(&mut s, msg(0x1808, 0x0200_0000, "")).await;
+    let r = exchange(&mut s, msg(0x1806, 0x0200_0000, &ins)).await;
+    assert_eq!(class_rc(&r), (0, 0));
+    exchange(&mut s, msg(0x1807, 0x0200_0000, "")).await;
+    let rows = client.query(&count, &[]).await.unwrap();
+    assert_eq!(
+        rows[0].get::<_, i64>(0),
+        1,
+        "the second committed, the first rolled back"
+    );
     let r = exchange(
         &mut s,
         msg(0x1803, 0x8200_0000, &format!("SELECT * FROM {lib}.NOPE")),

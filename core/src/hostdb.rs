@@ -45,6 +45,8 @@ struct Attributes {
     naming: u16,
     ignore_decimal_errors: u16,
     commit_level: u16,
+    /// Autocommit (CP 0x3824: 0xE8 on, 0xD5 off).
+    autocommit: bool,
     package_size: u16,
     translate: u8,
     default_library: String,
@@ -61,6 +63,7 @@ impl Default for Attributes {
             naming: 0,
             ignore_decimal_errors: 0,
             commit_level: 0,
+            autocommit: true,
             package_size: 0,
             translate: 0,
             default_library: String::new(),
@@ -147,13 +150,35 @@ pub async fn serve(url: &str, mut sock: TcpStream) -> Result<()> {
                 break;
             }
             0x1F80 | 0x1F81 => {
+                let mut failed = None;
                 if ds.req_id() == 0x1F80 {
                     set_attributes(&ds, &mut attrs);
                     if let Some(s) = sql.as_mut() {
                         if !attrs.default_library.is_empty() {
                             s.set_schema(Some(attrs.default_library.clone()));
                         }
+                        // Commitment control: autocommit off and a commit
+                        // level (JTOpen JDTransactionManager: 1 *CHG read
+                        // uncommitted, 2 *CS read committed, 3 *ALL
+                        // repeatable read, 4 *RR serializable).
+                        let level = match attrs.commit_level {
+                            _ if attrs.autocommit => None,
+                            1 => Some("*CHG"),
+                            2 => Some("*CS"),
+                            3 => Some("*ALL"),
+                            4 => Some("*RR"),
+                            _ => None,
+                        };
+                        if let Err(e) = s.set_commit_level(level).await {
+                            failed = Some(e);
+                        }
                     }
+                }
+                if let Some(e) = failed {
+                    let out = fail(&ds, e, &mut last_error);
+                    trace(&Ds(out.clone()), "out");
+                    sock.write_all(&out).await?;
+                    continue;
                 }
                 let mut p = Vec::new();
                 if ds.u32(20) & ORS_SERVER_ATTRIBUTES != 0 {
@@ -174,6 +199,10 @@ pub async fn serve(url: &str, mut sock: TcpStream) -> Result<()> {
         trace(&Ds(out.clone()), "out");
         sock.write_all(&out).await?;
         sock.flush().await?;
+    }
+    // The connection ended: what is pending is rolled back.
+    if let Some(s) = sql.as_mut() {
+        let _ = s.end_unit(false).await;
     }
     Ok(())
 }
@@ -540,7 +569,12 @@ async fn sql_request(
             }
             db_reply(ds, 0, 0, &[])
         }
-        // Commit, rollback: statements run committed (autocommit).
+        // Commit (0x1807), rollback (0x1808): the unit of work, when the
+        // client runs under commitment control.
+        0x1807 | 0x1808 => match srv.end_unit(id == 0x1807).await {
+            Ok(()) => db_reply(ds, 0, 0, &sqlca(0, "00000", 0)),
+            Err(e) => fail(ds, e, last),
+        },
         _ => db_reply(ds, 0, 0, &sqlca(0, "00000", 0)),
     }
 }
@@ -1789,6 +1823,7 @@ fn set_attributes(ds: &Ds, a: &mut Attributes) {
             0x380C => a.naming = v16().unwrap_or(a.naming),
             0x380D => a.ignore_decimal_errors = v16().unwrap_or(a.ignore_decimal_errors),
             0x380E => a.commit_level = v16().unwrap_or(a.commit_level),
+            0x3824 => a.autocommit = d.first() != Some(&0xD5),
             0x3806 => a.package_size = v16().unwrap_or(a.package_size),
             0x3805 => a.translate = d.first().copied().unwrap_or(a.translate),
             // Default library: CCSID (2), length (2), the name.

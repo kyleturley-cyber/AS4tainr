@@ -1314,6 +1314,8 @@ struct Cursor {
     query: String,
     returns: bool,
     rows: Option<ResultSet>,
+    /// The column types of the open cursor's query.
+    types: Vec<crate::sql::ColType>,
     pos: usize,
 }
 
@@ -1369,6 +1371,9 @@ pub struct CallResult {
     /// parameters; IN ones as passed).
     pub values: Vec<Option<String>>,
     pub result_sets: Vec<ResultSet>,
+    /// The column types of each result set where they are known (an SQL
+    /// procedure's cursors); empty otherwise.
+    pub result_types: Vec<Vec<crate::sql::ColType>>,
     /// RETURN's value (DB2_RETURN_STATUS).
     pub status: i64,
 }
@@ -1386,6 +1391,8 @@ struct Run<'a, 'e> {
     /// condition in a handler goes to the compounds around it).
     handler_floor: usize,
     result_sets: Vec<ResultSet>,
+    /// The column types of each result set.
+    result_types: Vec<Vec<crate::sql::ColType>>,
     depth: usize,
 }
 
@@ -1476,6 +1483,18 @@ impl<'a, 'e> Run<'a, 'e> {
             i += 1;
         }
         Ok(out)
+    }
+
+    /// A query's rows and its columns' types.
+    async fn query_typed(&self, sql: &str) -> Result<(ResultSet, Vec<crate::sql::ColType>)> {
+        match self.env.session.exec(self.env.catalog, sql).await? {
+            Exec::Rows {
+                columns,
+                rows,
+                types,
+            } => Ok(((columns, rows), types)),
+            Exec::Count(..) => bail!("SQL0104: a query was expected: {sql}"),
+        }
     }
 
     async fn query(&self, sql: &str) -> Result<(Vec<String>, Vec<Vec<Option<String>>>)> {
@@ -1918,11 +1937,11 @@ impl<'a, 'e> Run<'a, 'e> {
                     };
                     let r = async {
                         let q = self.subst(&q)?;
-                        self.query(&q).await
+                        self.query_typed(&q).await
                     }
                     .await;
                     match r {
-                        Ok(rows) => {
+                        Ok((rows, types)) => {
                             if let Some(cur) = self
                                 .frames
                                 .iter_mut()
@@ -1935,6 +1954,7 @@ impl<'a, 'e> Run<'a, 'e> {
                                         .await;
                                 }
                                 cur.rows = Some(rows);
+                                cur.types = types;
                                 cur.pos = 0;
                             }
                             self.guarded(Ok(())).await
@@ -2057,6 +2077,7 @@ impl<'a, 'e> Run<'a, 'e> {
                         query: q.clone(),
                         returns: *r,
                         rows: None,
+                        types: vec![],
                         pos: 0,
                     },
                 );
@@ -2115,6 +2136,7 @@ impl<'a, 'e> Run<'a, 'e> {
                 if let Some((cols, rows)) = cur.rows {
                     let rest = rows.into_iter().skip(cur.pos).collect();
                     self.result_sets.push((cols, rest));
+                    self.result_types.push(cur.types);
                 }
             }
             result
@@ -2423,6 +2445,7 @@ pub async fn run_procedure(
         row_count: 0,
         handler_floor: 0,
         result_sets: vec![],
+        result_types: vec![],
         depth,
     };
     // The parameters: a frame labelled with the procedure's name.
@@ -2466,6 +2489,7 @@ pub async fn run_procedure(
     Ok(CallResult {
         values,
         result_sets: std::mem::take(&mut run.result_sets),
+        result_types: std::mem::take(&mut run.result_types),
         status,
     })
 }
@@ -2514,6 +2538,7 @@ async fn call_external(
     Ok(CallResult {
         values: back.into_iter().map(Some).collect(),
         result_sets: vec![],
+        result_types: vec![],
         status: 0,
     })
 }
@@ -2666,6 +2691,7 @@ async fn call_external_procedure(
     Ok(CallResult {
         values: out,
         result_sets: sets.into_iter().take(r.result_sets as usize).collect(),
+        result_types: vec![],
         status: 0,
     })
 }
@@ -2849,6 +2875,7 @@ pub async fn call_exprs(
         row_count: 0,
         handler_floor: 0,
         result_sets: vec![],
+        result_types: vec![],
         depth: 0,
     };
     let mut values = Vec::new();
@@ -2950,6 +2977,7 @@ async fn run_service(
         row_count: 0,
         handler_floor: 0,
         result_sets: vec![],
+        result_types: vec![],
         depth: 0,
     };
     // Arguments by position, or by name (PATH_NAME => ...).
@@ -3139,6 +3167,7 @@ pub async fn run_dynamic(env: &Env<'_>, sql: &str) -> Result<Option<Vec<ResultSe
         row_count: 0,
         handler_floor: 0,
         result_sets: vec![],
+        result_types: vec![],
         depth: 0,
     };
     run.exec(&body).await?;

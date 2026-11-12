@@ -490,3 +490,143 @@ pub fn spfr0300(data: &[u8], page_starts: &[usize], requested: i32) -> Vec<u8> {
     b.extend(data);
     b
 }
+
+/// The list APIs a program calls by name with its parameters as bytes
+/// (the remote command server's program call: JTOpen SpooledFileOpenList
+/// calls QGYOLSPL, then QGYGTLE and QGYCLST, as IBM i Access Client
+/// Solutions' printer output does): None for another program. The same
+/// layouts as the RPG engine's (`rpg/interp.rs` system_program).
+pub async fn host_call(
+    client: &Client,
+    name: &str,
+    user: &str,
+    job: Option<i64>,
+    p: &mut [Vec<u8>],
+) -> Option<Result<()>> {
+    let bin = |b: &[u8]| -> i64 {
+        b.get(..4)
+            .map(|x| i32::from_be_bytes(x.try_into().unwrap()) as i64)
+            .unwrap_or(0)
+    };
+    let put = |dst: &mut Vec<u8>, src: &[u8]| {
+        let k = dst.len().min(src.len());
+        dst[..k].copy_from_slice(&src[..k]);
+    };
+    match name {
+        // QGYOLSPL (receiver, its length, list information, number of
+        // records to return, sort information, filter information,
+        // qualified job name, format, error code, filter format).
+        "QGYOLSPL" => Some(
+            async {
+                if p.len() < 8 {
+                    anyhow::bail!(
+                        "CPF3C36: Number of parameters, {}, entered for this API was not valid.",
+                        p.len()
+                    );
+                }
+                let format = crate::rpg::data::a(&p[7]).trim().to_ascii_uppercase();
+                if format != "OSPL0300" {
+                    anyhow::bail!("CPF3C21: Format name {format} is not valid.");
+                }
+                let ffmt = p
+                    .get(9)
+                    .map(|b| crate::rpg::data::a(b).trim().to_ascii_uppercase())
+                    .unwrap_or_default();
+                let f = if ffmt == "OSPF0200" {
+                    parse_filter_0200(&p[5])
+                } else {
+                    parse_filter(&p[5])
+                };
+                let jt = crate::rpg::data::a(&p[6]);
+                let job = if jt.trim().is_empty() {
+                    None
+                } else if jt.trim() == "*" {
+                    Some(job.unwrap_or(-1))
+                } else {
+                    Some(
+                        jt.get(20..26)
+                            .and_then(|n| n.trim().parse().ok())
+                            .unwrap_or(-1),
+                    )
+                };
+                let files = select(client, &f, user, job).await?;
+                let records: Vec<Vec<u8>> = files.iter().map(ospl0300).collect();
+                let total = records.len();
+                let room = (bin(&p[1]).max(0) as usize).min(p[0].len());
+                let want = bin(&p[3]);
+                let mut out = Vec::new();
+                let mut returned = 0usize;
+                for r in &records {
+                    if (want >= 0 && returned as i64 >= want) || out.len() + r.len() > room {
+                        break;
+                    }
+                    out.extend(r);
+                    returned += 1;
+                }
+                put(&mut p[0], &out);
+                let h = list_open(records);
+                let li = list_info(
+                    total,
+                    returned,
+                    h,
+                    136,
+                    usize::from(returned > 0),
+                    out.len(),
+                );
+                put(&mut p[2], &li);
+                Ok(())
+            }
+            .await,
+        ),
+        // QGYGTLE (receiver, its length, request handle, list information,
+        // number of records, starting record, error code).
+        "QGYGTLE" => Some((|| {
+            if p.len() < 6 {
+                anyhow::bail!(
+                    "CPF3C36: Number of parameters, {}, entered for this API was not valid.",
+                    p.len()
+                );
+            }
+            let h = bin(&p[2]) as u32;
+            let n = bin(&p[4]) as i32;
+            let s = bin(&p[5]) as i32;
+            let Some((total, recs)) = list_get(h, s, n) else {
+                anyhow::bail!("The request handle is not valid.");
+            };
+            let room = (bin(&p[1]).max(0) as usize).min(p[0].len());
+            let mut out = Vec::new();
+            let mut returned = 0;
+            for r in &recs {
+                let k = r.len().min(room - out.len());
+                if k == 0 {
+                    break;
+                }
+                out.extend(&r[..k]);
+                returned += 1;
+                if k < r.len() {
+                    break;
+                }
+            }
+            put(&mut p[0], &out);
+            let rl = recs.first().map_or(0, |r| r.len());
+            let li = list_info(
+                total,
+                returned,
+                h,
+                rl,
+                if returned > 0 { s.max(1) as usize } else { 0 },
+                out.len(),
+            );
+            put(&mut p[3], &li);
+            Ok(())
+        })()),
+        // QGYCLST (request handle, error code).
+        "QGYCLST" => {
+            if let Some(h) = p.first() {
+                list_close(bin(h) as u32);
+            }
+            Some(Ok(()))
+        }
+        _ => None,
+    }
+}

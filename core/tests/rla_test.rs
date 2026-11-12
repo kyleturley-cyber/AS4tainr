@@ -12114,6 +12114,71 @@ async fn spooled_file_apis_and_printed_output_of_system() {
         "{:02X?}",
         &sp[sp.len().saturating_sub(want.len() + 8)..]
     );
+    // The same list through a program call by name with byte parameters,
+    // as the remote command server runs it (JTOpen SpooledFileOpenList,
+    // which IBM i Access Client Solutions' printer output uses: QGYOLSPL
+    // with a receiver of length 0 and number of records -1, filter
+    // OSPF0100 *ALL, format OSPL0300, then QGYGTLE and QGYCLST; the
+    // OSPL0300 layout of the Open List of Spooled Files API: the spooled
+    // file name at offset 26).
+    let all = |n: usize| {
+        let mut b = e("*ALL");
+        b.resize(n, 0x40);
+        b
+    };
+    let mut filter = 1i32.to_be_bytes().to_vec();
+    filter.extend(all(10));
+    filter.extend([0, 0]);
+    filter.extend(1i32.to_be_bytes());
+    filter.extend(all(10));
+    filter.extend(vec![0x40; 10]);
+    filter.extend(all(10));
+    filter.extend(all(10));
+    filter.extend(1i32.to_be_bytes());
+    filter.extend(all(10));
+    filter.extend([0, 0]);
+    let mut p = vec![
+        vec![],
+        0i32.to_be_bytes().to_vec(),
+        vec![0; 80],
+        (-1i32).to_be_bytes().to_vec(),
+        vec![0; 4],
+        filter,
+        vec![0x40; 26],
+        e("OSPL0300"),
+        vec![0; 8],
+    ];
+    as4tainr_core::spoolapi::host_call(&client, "QGYOLSPL", "QSECOFR", None, &mut p)
+        .await
+        .expect("an API")
+        .unwrap();
+    let total = i32::from_be_bytes(p[2][0..4].try_into().unwrap());
+    assert!(total >= 1, "the spooled files are listed");
+    let handle = p[2][8..12].to_vec();
+    let size = total as usize * 136;
+    let mut g = vec![
+        vec![0; size],
+        (size as i32).to_be_bytes().to_vec(),
+        handle.clone(),
+        vec![0; 80],
+        total.to_be_bytes().to_vec(),
+        1i32.to_be_bytes().to_vec(),
+        vec![0; 8],
+    ];
+    as4tainr_core::spoolapi::host_call(&client, "QGYGTLE", "QSECOFR", None, &mut g)
+        .await
+        .expect("an API")
+        .unwrap();
+    assert_eq!(i32::from_be_bytes(g[3][4..8].try_into().unwrap()), total);
+    assert!(
+        g[0].chunks(136).any(|r| r[26..36] == e("GLDSPL    ")[..]),
+        "GLDSPL is in the list"
+    );
+    let mut c = vec![handle, vec![0; 8]];
+    as4tainr_core::spoolapi::host_call(&client, "QGYCLST", "QSECOFR", None, &mut c)
+        .await
+        .expect("an API")
+        .unwrap();
 }
 
 #[tokio::test]

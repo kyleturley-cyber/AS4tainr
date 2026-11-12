@@ -141,6 +141,10 @@ in the substitution data: `ObjectDoesNotExistException`). The server
 says its job is number/QUSER/QZRCSRVS, so `ProgramCall.getServerJob`
 needs no API call.
 
+Program calls reach the spooled file list APIs too (QGYOLSPL with
+format OSPL0300, QGYGTLE, QGYCLST), which JTOpen's SpooledFileOpenList
+and so ACS's printer output use.
+
 ## Data queues
 
 The data queue server's requests are done by the data queue APIs

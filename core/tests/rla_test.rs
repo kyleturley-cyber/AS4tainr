@@ -14991,6 +14991,98 @@ endmon;
     assert_eq!(r.messages, ["excp RNX0100 100"]);
 }
 
+/// %SUBST and %SCAN take a start from 1 to the string's length (issue
+/// #6). Expected values: PUB400, IBM i 7.5, 2026-11-12, the same program
+/// with each line written to a stream file instead of DSPLY.
+#[tokio::test]
+async fn subst_and_scan_start_within_the_string() {
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = r#"**free
+ctl-opt dftactgrp(*no);
+dcl-s a char(10) inz('ABCDEFGHIJ');
+dcl-s v varchar(10) inz('');
+dcl-s c char(5);
+dcl-s n packed(3:0);
+dcl-s s0 packed(3:0) inz(0);
+dcl-s s1 packed(3:0) inz(1);
+dcl-s s2 packed(3:0) inz(2);
+dcl-s s10 packed(3:0) inz(10);
+dcl-s s11 packed(3:0) inz(11);
+dcl-s l0 packed(3:0) inz(0);
+monitor;
+  c = %subst(a:s11:l0);
+  dsply ('SUBST PAST 0 [' + c + ']');
+on-error;
+  dsply ('SUBST PAST 0 ERR ' + %char(%status));
+endmon;
+monitor;
+  c = %subst(v:s1:l0);
+  dsply ('SUBST EMPTY ERR? [' + c + ']');
+on-error;
+  dsply ('SUBST EMPTY ERR ' + %char(%status));
+endmon;
+monitor;
+  c = %subst(a:s10:l0);
+  dsply ('SUBST LAST 0 [' + c + ']');
+on-error;
+  dsply ('SUBST LAST 0 ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %scan('A':a:s11);
+  dsply ('SCAN PAST ' + %char(n));
+on-error;
+  dsply ('SCAN PAST ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %scan('A':a:s0);
+  dsply ('SCAN ZERO ' + %char(n));
+on-error;
+  dsply ('SCAN ZERO ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %scan('J':a:s10);
+  dsply ('SCAN AT LEN ' + %char(n));
+on-error;
+  dsply ('SCAN AT LEN ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %scan('A':v:s2);
+  dsply ('SCAN EMPTY ' + %char(n));
+on-error;
+  dsply ('SCAN EMPTY ERR ' + %char(%status));
+endmon;
+*inlr = *on;
+"#;
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        None,
+        "SUBSCAN".into(),
+        src.into(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "SUBST PAST 0 ERR 100",
+            "SUBST EMPTY ERR 100",
+            "SUBST LAST 0 [     ]",
+            "SCAN PAST ERR 100",
+            "SCAN ZERO ERR 100",
+            "SCAN AT LEN 10",
+            "SCAN EMPTY 0",
+        ]
+    );
+}
+
 /// OPTIONS(*TRIM) (ILE RPG Reference, OPTIONS keyword): a CONST or VALUE
 /// character argument is passed without its leading and trailing blanks,
 /// also a variable of the parameter's own type (iRPGUnit's parseNum

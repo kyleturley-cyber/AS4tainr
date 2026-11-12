@@ -10,7 +10,8 @@
 //! library list is the search path. Supported:
 //!
 //! - SELECT, WITH, VALUES, INSERT, UPDATE, DELETE; one statement at a time
-//! - system naming `LIB/FILE` (when LIB is a library) and SQL naming
+//! - system naming `LIB/FILE` (when LIB is a library; either name may be
+//!   delimited, `"QGPL"/"CUSTMAST"`) and SQL naming
 //!   `LIB.FILE`; unqualified names are found through the library list
 //! - `CURRENT DATE`, `CURRENT TIME`, `CURRENT TIMESTAMP`, the `CONCAT`
 //!   operator, `UCASE`/`LCASE`, `RRN(t)`, `SYSIBM.SYSDUMMY1`, and the
@@ -2064,12 +2065,20 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
         }
         let t = &toks[i];
         let w = word(t);
-        // System naming: LIB/FILE, written without blanks.
-        if let (Tok::Word(lib), Some(Tok::Punct(p)), Some(Tok::Word(file))) =
-            (t, toks.get(i + 1), toks.get(i + 2))
+        // System naming: LIB/FILE, written without blanks; either name
+        // may be a delimited identifier ("QGPL"/"CUSTMAST", as IBM i
+        // Access Client Solutions' Data Transfer writes them; Db2 for i
+        // SQL Reference, naming conventions).
+        let part = |t: Option<&Tok>| match t {
+            Some(Tok::Word(w)) => Some(w.to_ascii_uppercase()),
+            Some(Tok::Quoted(q)) => Some(q.clone()),
+            _ => None,
+        };
+        if let (Some(lib), Some(Tok::Punct(p)), Some(file)) =
+            (part(Some(t)), toks.get(i + 1), part(toks.get(i + 2)))
         {
-            if p == "/" && is_library(&lib.to_ascii_uppercase()) {
-                out.push(Tok::Word(format!("{}.{}", ident(lib), ident(file))));
+            if p == "/" && is_library(&lib) {
+                out.push(Tok::Word(format!("{}.{}", ident(&lib), ident(&file))));
                 i += 3;
                 continue;
             }
@@ -4098,6 +4107,12 @@ mod tests {
         assert_eq!(
             tr("SELECT * FROM QGPL.CUSTMAST").sql,
             "SELECT * FROM QGPL.CUSTMAST"
+        );
+        // Delimited names in system naming (Db2 for i SQL Reference,
+        // naming conventions), as ACS Data Transfer writes a file.
+        assert_eq!(
+            tr("SELECT * FROM \"QGPL\"/\"CUSTMAST\" FOR FETCH ONLY").sql,
+            "SELECT * FROM \"qgpl\".\"custmast\""
         );
         // Division stays division when the left side is not a library.
         assert_eq!(

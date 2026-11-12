@@ -92,7 +92,8 @@ committed, outside the unit of work.
 
 Retrieve library information (server 0xE006, function 0x1800) lists the
 libraries of `*LIBL`, `*USRLIBL` or a name or pattern, one row per
-library with its name. JDBC's `getSchemas` with `metadata source=0` uses
+library with its name, and an empty column for each other bit of the
+information bitmap the client asks for (they are not documented). JDBC's `getSchemas` with `metadata source=0` uses
 it, and so does ACS Data Transfer's library browser.
 
 ### Database metadata

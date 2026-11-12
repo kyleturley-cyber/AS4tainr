@@ -2388,6 +2388,24 @@ CREATE TABLE {lib}.OBJS AS (SELECT OBJNAME, OBJTYPE, CURRENT TIMESTAMP AS TS FRO
         .await,
         ["CHEAP|V|D|2", "CUSTMAST|P|D|4", "ITEMS|T|D|3"]
     );
+    // QSYS/QADBXFIL, the cross-reference by file, as IBM i Access Client
+    // Solutions' Data Transfer reads it (system naming, FOR FETCH ONLY):
+    // DBXATR PF physical, TB table, VW view; DBXTYP D data; DBXNFL the
+    // number of fields (the field texts and rows of DSPFFD QSYS/QADBXFIL
+    // and a query of it on PUB400, 2026-11-12, tools/golden/xref.txt).
+    assert_eq!(
+        rows(format!(
+            "SELECT DBXLIB, DBXFIL, DBXLB2, DBXLFI, DBXNFL, DBXATR, DBXTYP FROM QSYS/QADBXFIL
+              WHERE DBXLIB = '{lib}' AND DBXFIL IN ('CHEAP', 'CUSTMAST', 'ITEMS')
+              ORDER BY DBXLFI FOR FETCH ONLY"
+        ))
+        .await,
+        [
+            format!("{lib}|CHEAP|{lib}|CHEAP|2|VW|D"),
+            format!("{lib}|CUSTMAST|{lib}|CUSTMAST|4|PF|D"),
+            format!("{lib}|ITEMS|{lib}|ITEMS|3|TB|D"),
+        ]
+    );
     assert_eq!(
         rows(format!(
             "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, HAS_DEFAULT FROM QSYS2.SYSCOLUMNS
@@ -29195,16 +29213,16 @@ async fn host_servers_sign_on_and_database_attributes() {
     // information bitmap CP 0x381D (0x80000000 the name); the reply's
     // data format and result data give one row per library, error class
     // 0 (getLibraries takes any other class as an error).
-    let roi = |name: &str, ind: u8| {
+    let roi = |name: &str, ind: u8, bits: u32| {
         let mut d = 37u16.to_be_bytes().to_vec();
         d.extend((name.len() as u16).to_be_bytes());
         d.extend(as4tainr_core::hostsrv::ebcdic(name, name.len()));
         let mut p = cp(0x3801, &d);
         p.extend(cp(0x3816, &[ind]));
-        p.extend(cp(0x381D, &0x8000_0000u32.to_be_bytes()));
+        p.extend(cp(0x381D, &bits.to_be_bytes()));
         ds(&p, 0xE006, 0x1800, &tmpl(0x8C00_0000))
     };
-    let r = exchange(&mut s, roi(&lib, 0xF1)).await;
+    let r = exchange(&mut s, roi(&lib, 0xF1, 0x8000_0000)).await;
     assert_eq!(class_rc(&r), (0, 0));
     let d = find(&r, 0x380E);
     assert_eq!(u32_at(&d, 4), 1, "one library");
@@ -29215,7 +29233,14 @@ async fn host_servers_sign_on_and_database_attributes() {
                 .any(|w| w == &as4tainr_core::hostsrv::ebcdic(&lib, lib.len())[..]),
         "the library's name"
     );
-    let r = exchange(&mut s, roi(&format!("{lib}X%"), 0xF1)).await;
+    let r = exchange(&mut s, roi(&format!("{lib}X%"), 0xF1, 0x8000_0000)).await;
     assert_eq!(class_rc(&r), (0, 0));
     assert_eq!(u32_at(&find(&r, 0x380E), 4), 0, "no library matches");
+    // A field for each bit of the bitmap, in its order (the extended
+    // data format, JTOpen DBExtendedDataFormat: the number of fields at
+    // offset 4); IBM i Access Client Solutions asks for 0xE0000000 and
+    // reads three.
+    let r = exchange(&mut s, roi(&lib, 0xF1, 0xE000_0000)).await;
+    assert_eq!(class_rc(&r), (0, 0));
+    assert_eq!(u32_at(&find(&r, 0x380C), 4), 3, "three fields");
 }

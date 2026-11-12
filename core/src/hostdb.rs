@@ -626,13 +626,14 @@ async fn run(srv: &mut crate::mapepire::Server<'_>, sql: &str, dt: Dt, probe: bo
 /// pattern indicator (CP 0x3816: 0xF1 the name is a pattern, 0xF0 not;
 /// *LIBL and *USRLIBL name the job's library list or its user part) and
 /// a bitmap of what to return (CP 0x381D). The reply has the data format
-/// and result data asked for, one row per library: its name, the bitmap's
-/// first bit and the only one documented; other bits are not answered
-/// (docs/fidelity-gaps.md). IBM i Access Client Solutions' Data Transfer
+/// and result data asked for, one row per library with a column for each
+/// bit set: its name for the first bit, the only one documented, and
+/// empty text for the others (docs/fidelity-gaps.md). IBM i Access Client Solutions' Data Transfer
 /// asks for *USRLIBL.
 async fn library_info(srv: &mut crate::mapepire::Server<'_>, ds: &Ds, dt: Dt) -> Vec<u8> {
     let mut name = String::new();
     let mut pattern = false;
+    let mut bitmap = 0x8000_0000u32;
     for (cp, d) in ds.params(40) {
         match cp {
             0x3801 if d.len() >= 4 => {
@@ -641,20 +642,38 @@ async fn library_info(srv: &mut crate::mapepire::Server<'_>, ds: &Ds, dt: Dt) ->
                     .to_ascii_uppercase()
             }
             0x3816 => pattern = d.first() == Some(&0xF1),
+            0x381D if d.len() >= 4 => bitmap = u32::from_be_bytes([d[0], d[1], d[2], d[3]]),
             _ => {}
         }
     }
     let quoted = name.replace('\'', "''");
+    // A column for each bit asked for, in the bitmap's order (a client
+    // reads them by position): the name for the first bit, empty text for
+    // the others, whose meaning is not documented.
+    let mut columns = Vec::new();
+    for bit in 0..32 {
+        if bitmap & (0x8000_0000 >> bit) != 0 {
+            columns.push(if bit == 0 {
+                "CAST(SYSTEM_SCHEMA_NAME AS CHAR(10)) AS LIBRARY_NAME".to_string()
+            } else {
+                format!("CAST('' AS VARCHAR(50)) AS INFO{}", bit + 1)
+            });
+        }
+    }
+    if columns.is_empty() {
+        columns.push("CAST(SYSTEM_SCHEMA_NAME AS CHAR(10)) AS LIBRARY_NAME".into());
+    }
+    let columns = columns.join(", ");
     let sql = match name.as_str() {
-        "*LIBL" => "SELECT CAST(SYSTEM_SCHEMA_NAME AS CHAR(10)) AS LIBRARY_NAME
-                      FROM QSYS2.LIBRARY_LIST_INFO ORDER BY ORDINAL_POSITION"
-            .to_string(),
-        "*USRLIBL" => "SELECT CAST(SYSTEM_SCHEMA_NAME AS CHAR(10)) AS LIBRARY_NAME
-                         FROM QSYS2.LIBRARY_LIST_INFO WHERE TYPE = 'USER'
-                         ORDER BY ORDINAL_POSITION"
-            .to_string(),
+        "*LIBL" => {
+            format!("SELECT {columns} FROM QSYS2.LIBRARY_LIST_INFO ORDER BY ORDINAL_POSITION")
+        }
+        "*USRLIBL" => format!(
+            "SELECT {columns} FROM QSYS2.LIBRARY_LIST_INFO WHERE TYPE = 'USER'
+              ORDER BY ORDINAL_POSITION"
+        ),
         _ => format!(
-            "SELECT CAST(SYSTEM_SCHEMA_NAME AS CHAR(10)) AS LIBRARY_NAME
+            "SELECT {columns}
                FROM QSYS2.SYSSCHEMAS WHERE RTRIM(SYSTEM_SCHEMA_NAME) {} '{quoted}'
                ORDER BY SYSTEM_SCHEMA_NAME",
             if pattern { "LIKE" } else { "=" }

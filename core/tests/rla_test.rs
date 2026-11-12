@@ -14694,6 +14694,112 @@ dsply %char(stat('/no/such/dir': st));
     assert_eq!(r.messages, ["0 1", "-1"]);
 }
 
+/// A CONST parameter cannot be changed (issue #5; ILE RPG Reference,
+/// CONST): CRTBNDRPG fails with RNF5346, severity 30, for an assignment to
+/// it, and RNF7542, severity 30, when it is passed to a parameter the
+/// callee can change; a CONST parameter only read compiles (PUB400
+/// 2026-11-12, IBM i 7.5, these sources).
+#[tokio::test]
+async fn const_parameters_cannot_be_changed() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    cl_cmd(&mut job, format!("CRTSRCPF FILE({lib}/QSRC) RCDLEN(112)"))
+        .await
+        .unwrap();
+    let assign = "**FREE
+ctl-opt dftactgrp(*no);
+dcl-s r int(10);
+r = f(5);
+*inlr = *on;
+dcl-proc f;
+  dcl-pi *n int(10);
+    p int(10) const;
+  end-pi;
+  p = 7;
+  return p;
+end-proc;
+";
+    let forward = "**FREE
+ctl-opt dftactgrp(*no);
+dcl-s r int(10) inz(5);
+a(r);
+*inlr = *on;
+dcl-proc a;
+  dcl-pi *n;
+    p int(10) const;
+  end-pi;
+  b(p);
+end-proc;
+dcl-proc b;
+  dcl-pi *n;
+    q int(10);
+  end-pi;
+  q = 9;
+end-proc;
+";
+    let read = "**FREE
+ctl-opt dftactgrp(*no);
+dcl-s r int(10);
+r = f(5);
+*inlr = *on;
+dcl-proc f;
+  dcl-pi *n int(10);
+    p int(10) const;
+  end-pi;
+  return p + 1;
+end-proc;
+";
+    for (name, src) in [("CSTA", assign), ("CSTF", forward), ("CSTR", read)] {
+        source::put_member(
+            &client,
+            &source::Member {
+                library: lib.clone(),
+                file: "QSRC".into(),
+                name: name.into(),
+                srctype: "RPGLE".into(),
+                source: src.into(),
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    for (name, id) in [("CSTA", "*RNF5346 30"), ("CSTF", "*RNF7542 30")] {
+        job.calls.printed.clear();
+        let e = job
+            .run(&format!("CRTBNDRPG PGM({lib}/{name}) SRCFILE({lib}/QSRC)"))
+            .await
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default();
+        assert!(e.contains("RNS9308"), "{name}: {e}");
+        let listing = std::mem::take(&mut job.calls.printed).join("\n");
+        assert!(listing.contains(id), "{name}: {listing}");
+    }
+    cl_cmd(
+        &mut job,
+        format!("CRTBNDRPG PGM({lib}/CSTR) SRCFILE({lib}/QSRC)"),
+    )
+    .await
+    .unwrap();
+}
+
 /// QMHRCVPM by message key (Receive Program Message API): the key names
 /// one message of the job, received also when the call stack entry it
 /// was sent to has ended (iRPGUnit's getLatestEscMsg relies on it on IBM

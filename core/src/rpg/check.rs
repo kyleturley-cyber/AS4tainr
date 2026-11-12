@@ -14,6 +14,9 @@
 //!   result of a file operation (RNF7260), and the record format is then
 //!   not used (RNF7066, 00) (PUB400 2026-10-28, tools/golden/verify12.txt
 //!   n12_rpgp, n12_rpgx, n12_rpgj: `dcl-ds outr likerec(OUTR: *output)`);
+//! - RNF5346 (30): EVAL changes a CONST parameter, and RNF7542 (30): a
+//!   CONST parameter is passed to a parameter the callee can change
+//!   (PUB400 2026-11-12);
 //! - RNF7016 (20): DSPLY of a character field longer than 52 bytes
 //!   (PUB400 2026-10-30, tools/golden/verify26.txt s26_dsply60);
 //! - RNF7547 (30): a float field as an operand of MOVE or MOVEL (PUB400
@@ -120,6 +123,9 @@ impl Walker<'_> {
                 for a in args.iter().flatten() {
                     bad |= self.expr(line, a);
                 }
+                if let (Some(args), [callee]) = (args, parts.as_slice()) {
+                    self.const_arguments(line, callee, args);
+                }
             }
             Expr::Path { parts, idx, args } => {
                 for i in idx.iter().flatten() {
@@ -147,6 +153,46 @@ impl Walker<'_> {
             _ => {}
         }
         bad
+    }
+
+    /// Whether a value is a CONST parameter of the procedure being
+    /// checked.
+    fn const_param(&self, e: &Expr) -> bool {
+        let (Some(p), Expr::Name { parts, args: None }) = (self.proc, e) else {
+            return false;
+        };
+        let [name] = parts.as_slice() else {
+            return false;
+        };
+        p.params
+            .iter()
+            .any(|x| x.konst && x.name.eq_ignore_ascii_case(name))
+    }
+
+    /// A call's arguments: a CONST parameter passed to a parameter that is
+    /// neither CONST nor VALUE, which the callee could change, is RNF7542,
+    /// severity 30 (PUB400 2026-11-12, IBM i 7.5: `b(p)` with `p` CONST
+    /// and `b`'s parameter by reference).
+    fn const_arguments(&mut self, line: usize, callee: &str, args: &[Expr]) {
+        let up = callee.to_ascii_uppercase();
+        let params = match (self.prog.procs.get(&up), self.prog.protos.get(&up)) {
+            (Some(p), _) => &p.params,
+            (None, Some(p)) => &p.params,
+            (None, None) => return,
+        };
+        let changing = args
+            .iter()
+            .zip(params.iter())
+            .any(|(a, p)| !p.konst && !p.by_value && self.const_param(a));
+        if changing {
+            self.out.diags.push(Diag {
+                line,
+                id: "RNF7542".into(),
+                sev: 30,
+                text: "A CONST parameter is passed to a parameter that can change it.".into(),
+                at: None,
+            });
+        }
     }
 
     fn undefined(&mut self, line: usize, name: &str) {
@@ -241,6 +287,18 @@ impl Walker<'_> {
                     });
                 }
                 self.value(l, value);
+                // A CONST parameter cannot be changed: RNF5346, severity
+                // 30 (ILE RPG Reference, CONST; PUB400 2026-11-12, IBM i
+                // 7.5: `p = 7;` in the procedure).
+                if self.const_param(target) {
+                    self.out.diags.push(Diag {
+                        line: l,
+                        id: "RNF5346".into(),
+                        sev: 30,
+                        text: "A CONST parameter cannot be changed.".into(),
+                        at: None,
+                    });
+                }
                 if let (Some(t), Some(v)) = (self.class_of(target), self.class_of(value)) {
                     if t != v {
                         self.out.diags.push(Diag {

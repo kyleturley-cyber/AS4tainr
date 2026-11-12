@@ -20667,6 +20667,63 @@ ENDPGM
     );
 }
 
+/// MOVE with a float field does not compile (issue #8): CRTBNDRPG fails
+/// with RNF7547, severity 30, on the MOVE (PUB400 2026-11-12, IBM i 7.5,
+/// this source). Before, it compiled and the CALL panicked.
+#[tokio::test]
+async fn move_with_a_float_field_does_not_compile() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    cl_cmd(&mut job, format!("CRTSRCPF FILE({lib}/QSRC) RCDLEN(112)"))
+        .await
+        .unwrap();
+    let src = "     H DFTACTGRP(*NO)
+     DF                S              8F   INZ(1.5)
+     DC                S             10A
+     C                   MOVE      F             C
+     C                   EVAL      *INLR = *ON
+";
+    source::put_member(
+        &client,
+        &source::Member {
+            library: lib.clone(),
+            file: "QSRC".into(),
+            name: "MVFLT".into(),
+            srctype: "RPGLE".into(),
+            source: src.into(),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    job.calls.printed.clear();
+    let e = job
+        .run(&format!("CRTBNDRPG PGM({lib}/MVFLT) SRCFILE({lib}/QSRC)"))
+        .await
+        .err()
+        .map(|e| format!("{e:#}"))
+        .unwrap_or_default();
+    assert!(e.contains("RNS9308"), "{e}");
+    let listing = std::mem::take(&mut job.calls.printed).join("\n");
+    assert!(listing.contains("*RNF7547 30"), "{listing}");
+}
+
 /// What PUB400 showed for verify26 (2026-10-30, tools/golden/
 /// verify26.txt): DSPLY of a character field longer than 52 bytes does not
 /// compile (s26_dsply60, s26_dsply53: RNF7016 severity 20, RNS9308; 52

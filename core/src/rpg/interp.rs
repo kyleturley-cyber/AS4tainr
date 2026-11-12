@@ -4249,6 +4249,11 @@ impl<'a> Machine<'a> {
                     }
                     // An error inside a monitored body goes to the first
                     // ON-ERROR that lists its status (or *ALL / nothing).
+                    // A group none of whose ON-ERRORs takes it is left,
+                    // and the enclosing group gets the error (ILE RPG
+                    // Reference, MONITOR; PUB400 2026-11-12, IBM i 7.5: a
+                    // divide by zero in an inner group with only ON-ERROR
+                    // 00103 goes to the outer group's ON-ERROR 00102).
                     let mut handled = None;
                     let code = errors::status_code(&err);
                     let id = errors::message_id(&err);
@@ -4264,7 +4269,9 @@ impl<'a> Machine<'a> {
                                         })
                                 })
                                 .map(|h| h.1);
-                            break;
+                            if handled.is_some() {
+                                break;
+                            }
                         }
                         monitors.pop();
                     }

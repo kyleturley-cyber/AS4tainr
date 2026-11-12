@@ -3153,6 +3153,56 @@ ENDPGM";
         .is_err());
 }
 
+/// An error that the inner MONITOR group does not take goes to the
+/// enclosing group (issue #3; ILE RPG Reference, MONITOR), and the inner
+/// group still takes what it lists. Expected values: PUB400, IBM i 7.5,
+/// 2026-11-12, this program with DSPLY written to a stream file.
+#[tokio::test]
+async fn nested_monitor_passes_unhandled_errors_out() {
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = r#"**free
+ctl-opt dftactgrp(*no);
+dcl-s x packed(5:0) inz(0);
+monitor;
+  monitor;
+    x = 10 / x;
+  on-error 00103;
+    dsply ('MON INNER');
+  endmon;
+on-error 00102;
+  dsply ('MON OUTER');
+endmon;
+dsply ('MON AFTER');
+monitor;
+  monitor;
+    x = 10 / x;
+  on-error 00102;
+    dsply ('INNER TAKES IT');
+  endmon;
+on-error;
+  dsply ('OUTER SHOULD NOT');
+endmon;
+*inlr = *on;
+"#;
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        None,
+        "NESTMON".into(),
+        src.into(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.messages, ["MON OUTER", "MON AFTER", "INNER TAKES IT"]);
+}
+
 /// Run commands in a job whose library list is just `lib`.
 async fn job_run(
     client: &Client,

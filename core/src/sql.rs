@@ -14,8 +14,8 @@
 //!   `LIB.FILE`; unqualified names are found through the library list
 //! - `CURRENT DATE`, `CURRENT TIME`, `CURRENT TIMESTAMP`, the `CONCAT`
 //!   operator, `UCASE`/`LCASE`, `RRN(t)`, `SYSIBM.SYSDUMMY1`, and the
-//!   `WITH NC|UR|CS|RS|RR` and `OPTIMIZE FOR n ROWS` clauses (accepted and
-//!   ignored)
+//!   `WITH NC|UR|CS|RS|RR`, `OPTIMIZE FOR n ROWS` and `FOR READ ONLY` /
+//!   `FOR FETCH ONLY` clauses (accepted and ignored)
 //! - `INSERT INTO file VALUES (...)` without a column list fills the
 //!   file's fields in order
 //! - the relative record number column is hidden from results, as on
@@ -2887,6 +2887,21 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
                     }
                 }
             }
+            Some("FOR") => {
+                // The read-only clause: FOR READ ONLY or FOR FETCH ONLY
+                // (Db2 for i SQL Reference, select-statement): it only
+                // says the result is not updated.
+                let m = next_non_space(&toks, i + 1);
+                let o = m.and_then(|m| next_non_space(&toks, m + 1));
+                if let (Some(m), Some(o)) = (m, o) {
+                    if matches!(word(&toks[m]).as_deref(), Some("READ" | "FETCH"))
+                        && word(&toks[o]).as_deref() == Some("ONLY")
+                    {
+                        i = o + 1;
+                        continue;
+                    }
+                }
+            }
             Some("OPTIMIZE") => {
                 // OPTIMIZE FOR n ROW(S)
                 let f = next_non_space(&toks, i + 1);
@@ -4285,6 +4300,14 @@ mod tests {
             "select * from t"
         );
         assert_eq!(tr("select 'it''s' from t;").sql, "select 'it''s' from t");
+        // The read-only clause (Db2 for i SQL Reference, select-statement:
+        // FOR READ ONLY, or FOR FETCH ONLY), as IBM i Access Client
+        // Solutions' Data Transfer sends it.
+        assert_eq!(tr("select a from t for fetch only").sql, "select a from t");
+        assert_eq!(
+            tr("select a from t for read only with ur").sql,
+            "select a from t"
+        );
     }
 
     // CASE WHEN takes no EXISTS and no IN (fullselect); WHERE EXISTS is

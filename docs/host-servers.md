@@ -88,6 +88,13 @@ ROLLBACK statements end. Turning autocommit back on commits what is
 pending; a connection that ends rolls it back. SQL DDL statements run
 committed, outside the unit of work.
 
+### Libraries (catalog server)
+
+Retrieve library information (server 0xE006, function 0x1800) lists the
+libraries of `*LIBL`, `*USRLIBL` or a name or pattern, one row per
+library with its name. JDBC's `getSchemas` with `metadata source=0` uses
+it, and so does ACS Data Transfer's library browser.
+
 ### Database metadata
 
 At V7R5 the JDBC driver answers `DatabaseMetaData` by calling the
@@ -164,6 +171,9 @@ A member reads as the text Qshell reads (`qsyslib.rs`: each record's
 data and a newline) in CCSID 37; a source member written is put back
 a record for each line (a new member is made). Libraries, objects and
 members are not made, deleted or renamed through the file server.
+Lists come in blocks when the client asks for a maximum count: each entry
+carries a restart ID (its place in the list), and a request with a restart
+ID or restart name continues after that entry.
 The user handle requests (seed, create user handle) are answered for
 the connection's user, and lookups give an object handle with the
 object's owner, ASP and CCSID (JTOpen IFSObjAttrs1, IFSObjAttrs2).
@@ -206,6 +216,8 @@ docker-compose.yml). In ACS:
 - 5250 sessions: port 2323 (Compose maps it to the container's 23).
   Before a session starts, ACS signs on to the host servers and calls
   QSYCKUFU (Check User Function Usage) through the remote command server.
+- Integrated File System: the Toolbox reads the system value QTIMZON
+  (QWCRSVAL) to show file dates in the system's time zone.
 
 `AS4TAINR_QSECOFR_PASSWORD` sets QSECOFR's password only when the
 catalog is first made; with an existing database volume, change it with

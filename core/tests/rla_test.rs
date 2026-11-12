@@ -11539,6 +11539,48 @@ dsply err.msgid;
             .to_string(),
             vec!["2", "CPF2204"],
         ),
+        // QWCRSVAL (Retrieve System Values API): the number of values,
+        // their offsets, then name, type of data ('C' character, 'B'
+        // binary), status, length and data. QCCSID ships as 65535 and
+        // QUTCOFFSET as +0000 (the system value lists' shipped values).
+        (
+            "SVAL",
+            "**FREE
+dcl-pr qwcrsval extpgm('QWCRSVAL');
+  rcv char(256) options(*varsize);
+  len int(10) const;
+  n int(10) const;
+  names char(20) const;
+  err char(8);
+end-pr;
+dcl-ds rcv len(256);
+  count int(10) pos(1);
+  off1 int(10) pos(5);
+  off2 int(10) pos(9);
+end-ds;
+dcl-ds ent based(p);
+  name char(10);
+  type char(1);
+  status char(1);
+  dlen int(10);
+  data char(10);
+end-ds;
+dcl-s p pointer;
+dcl-s ccsid int(10) based(q);
+dcl-s q pointer;
+dcl-s err char(8) inz(*allx'00');
+qwcrsval(rcv : 256 : 2 : 'QCCSID    QUTCOFFSET' : err);
+dsply %char(count);
+p = %addr(rcv) + off1;
+q = %addr(data);
+dsply (%trim(name) + ' ' + type + ' ' + %char(dlen) + ' ' + %char(ccsid));
+p = %addr(rcv) + off2;
+dsply (%trim(name) + ' ' + type + ' ' + %subst(data : 1 : dlen));
+*inlr = *on;
+"
+            .to_string(),
+            vec!["2", "QCCSID B 4 65535", "QUTCOFFSET C +0000"],
+        ),
     ];
     for (name, source, want) in programs {
         let r = rpg::call(
@@ -28728,6 +28770,46 @@ async fn host_servers_sign_on_and_database_attributes() {
         .collect();
     assert_eq!(String::from_utf16_lossy(&got), "CUSTMAST.FILE");
     assert_eq!(u16b(&read(&mut s).await, 22), 18);
+    // A list in blocks (JTOpen IFSListAttrsReq: maximum get count at 34;
+    // a restart ID, CP 0x000E, or restart name, CP 0x0007, after the
+    // name; IFSListAttrsRep: the restart ID at 77; IFSFileEnumeration
+    // passes the last entry it got and takes what follows as the next
+    // block): one entry, then the one after it, the same either way, and
+    // never the first again.
+    let entry_name = |r: &[u8]| -> String {
+        let at = 20 + u16b(r, 16) as usize;
+        let n = u32_at(r, at) as usize - 6;
+        let got: Vec<u16> = r[at + 6..at + 6 + n]
+            .chunks(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&got)
+    };
+    let mut one = lst.clone();
+    one[14..16].copy_from_slice(&1u16.to_be_bytes());
+    let pattern = name(&format!("/QSYS.LIB/{lib}.LIB/*"));
+    s.write_all(&ds(&cp(0x0002, &pattern), 0xE002, 0x000A, &one))
+        .await
+        .unwrap();
+    let r = read(&mut s).await;
+    let first = entry_name(&r);
+    let restart = r[77..81].to_vec();
+    assert_ne!(restart, [0, 0, 0, 0], "a restart ID");
+    assert_eq!(u16b(&read(&mut s).await, 22), 18);
+    let mut p = cp(0x0002, &pattern);
+    p.extend(cp(0x000E, &restart));
+    s.write_all(&ds(&p, 0xE002, 0x000A, &one)).await.unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(u16b(&r, 18), 0x8005);
+    let second = entry_name(&r);
+    assert_ne!(second, first, "the next entry");
+    assert_eq!(u16b(&read(&mut s).await, 22), 18);
+    let mut p = cp(0x0002, &pattern);
+    p.extend(cp(0x0007, &name(&first)));
+    s.write_all(&ds(&p, 0xE002, 0x000A, &one)).await.unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(entry_name(&r), second, "restart by name");
+    assert_eq!(u16b(&read(&mut s).await, 22), 18);
     // The central server (JTOpen NLSGetTableRequest/Reply): CCSID 37's
     // characters in UTF-16, 0xC1 'A' (the code page 37 chart).
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -29106,4 +29188,34 @@ async fn host_servers_sign_on_and_database_attributes() {
         &find(&r, 0x3801)[2..],
         &as4tainr_core::hostsrv::ebcdic("SQL0204", 7)[..]
     );
+    // Retrieve library information (catalog server 0xE006, function
+    // 0x1800; JTOpen DBReturnObjectInformationRequestDS, JDUtilities
+    // getLibraries): the library name in CP 0x3801 (CCSID 37, length,
+    // name), the pattern indicator CP 0x3816 (0xF1 a pattern), the
+    // information bitmap CP 0x381D (0x80000000 the name); the reply's
+    // data format and result data give one row per library, error class
+    // 0 (getLibraries takes any other class as an error).
+    let roi = |name: &str, ind: u8| {
+        let mut d = 37u16.to_be_bytes().to_vec();
+        d.extend((name.len() as u16).to_be_bytes());
+        d.extend(as4tainr_core::hostsrv::ebcdic(name, name.len()));
+        let mut p = cp(0x3801, &d);
+        p.extend(cp(0x3816, &[ind]));
+        p.extend(cp(0x381D, &0x8000_0000u32.to_be_bytes()));
+        ds(&p, 0xE006, 0x1800, &tmpl(0x8C00_0000))
+    };
+    let r = exchange(&mut s, roi(&lib, 0xF1)).await;
+    assert_eq!(class_rc(&r), (0, 0));
+    let d = find(&r, 0x380E);
+    assert_eq!(u32_at(&d, 4), 1, "one library");
+    let lib_bytes = lib.as_bytes();
+    assert!(
+        d.windows(lib_bytes.len()).any(|w| w == lib_bytes)
+            || d.windows(lib_bytes.len())
+                .any(|w| w == &as4tainr_core::hostsrv::ebcdic(&lib, lib.len())[..]),
+        "the library's name"
+    );
+    let r = exchange(&mut s, roi(&format!("{lib}X%"), 0xF1)).await;
+    assert_eq!(class_rc(&r), (0, 0));
+    assert_eq!(u32_at(&find(&r, 0x380E), 4), 0, "no library matches");
 }

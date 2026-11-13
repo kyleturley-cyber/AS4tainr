@@ -14,7 +14,8 @@
 //!   result of a file operation (RNF7260), and the record format is then
 //!   not used (RNF7066, 00) (PUB400 2026-10-28, tools/golden/verify12.txt
 //!   n12_rpgp, n12_rpgx, n12_rpgj: `dcl-ds outr likerec(OUTR: *output)`);
-//! - RNF5346 (30): EVAL changes a CONST parameter, and RNF7542 (30): a
+//! - RNF5346 (30): EVAL or CLEAR changes a CONST parameter (the name, an
+//!   element, a subfield or %SUBST of it), and RNF7542 (30): a
 //!   CONST parameter is passed to a parameter the callee can change
 //!   (PUB400 2026-11-12);
 //! - RNF7016 (20): DSPLY of a character field longer than 52 bytes
@@ -169,6 +170,38 @@ impl Walker<'_> {
             .any(|x| x.konst && x.name.eq_ignore_ascii_case(name))
     }
 
+    /// Whether an assignment's target changes a CONST parameter of the
+    /// procedure being checked: the parameter, an element of it, a
+    /// subfield of it (LIKEDS), or %SUBST of one of those (PUB400
+    /// 2026-11-13, IBM i 7.5: RNF5346 for `%subst(p:1:1) = 'x'`,
+    /// `p.a = 'x'` and `p(1) = 3`).
+    fn changes_const(&self, e: &Expr) -> bool {
+        let Some(p) = self.proc else {
+            return false;
+        };
+        match e {
+            Expr::Name { parts, .. } | Expr::Path { parts, .. } => parts.first().is_some_and(|n| {
+                p.params
+                    .iter()
+                    .any(|x| x.konst && x.name.eq_ignore_ascii_case(n))
+            }),
+            Expr::Bif(b, args) if b.eq_ignore_ascii_case("SUBST") => {
+                args.first().is_some_and(|a| self.changes_const(a))
+            }
+            _ => false,
+        }
+    }
+
+    fn const_changed(&mut self, line: usize) {
+        self.out.diags.push(Diag {
+            line,
+            id: "RNF5346".into(),
+            sev: 30,
+            text: "A CONST parameter cannot be changed.".into(),
+            at: None,
+        });
+    }
+
     /// A call's arguments: a CONST parameter passed to a parameter that is
     /// neither CONST nor VALUE, which the callee could change, is RNF7542,
     /// severity 30 (PUB400 2026-11-12, IBM i 7.5: `b(p)` with `p` CONST
@@ -290,14 +323,8 @@ impl Walker<'_> {
                 // A CONST parameter cannot be changed: RNF5346, severity
                 // 30 (ILE RPG Reference, CONST; PUB400 2026-11-12, IBM i
                 // 7.5: `p = 7;` in the procedure).
-                if self.const_param(target) {
-                    self.out.diags.push(Diag {
-                        line: l,
-                        id: "RNF5346".into(),
-                        sev: 30,
-                        text: "A CONST parameter cannot be changed.".into(),
-                        at: None,
-                    });
+                if self.changes_const(target) {
+                    self.const_changed(l);
                 }
                 if let (Some(t), Some(v)) = (self.class_of(target), self.class_of(value)) {
                     if t != v {
@@ -368,6 +395,9 @@ impl Walker<'_> {
                     self.expr(l, r);
                 }
             }
+            // CLEAR of a CONST parameter: RNF5346 (PUB400 2026-11-13, IBM
+            // i 7.5: `clear p;`).
+            Stmt::Clear(target) if self.changes_const(target) => self.const_changed(l),
             Stmt::Comp { f1, f2, .. } => {
                 self.value(l, f1);
                 self.value(l, f2);

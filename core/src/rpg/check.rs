@@ -16,6 +16,8 @@
 //!   n12_rpgp, n12_rpgx, n12_rpgj: `dcl-ds outr likerec(OUTR: *output)`);
 //! - RNF7016 (20): DSPLY of a character field longer than 52 bytes
 //!   (PUB400 2026-10-30, tools/golden/verify26.txt s26_dsply60);
+//! - RNF7547 (30): a float field as an operand of MOVE or MOVEL (PUB400
+//!   2026-11-12);
 //! - RNF2121 (30) and RNF2109 (40): an externally described file whose
 //!   record format has the file's name, without RENAME (PUB400
 //!   2026-11-05, tools/golden/verify47.txt p47_crtr).
@@ -312,7 +314,30 @@ impl Walker<'_> {
                 self.value(l, f1);
                 self.value(l, f2);
             }
+            // A float field as factor 2 or result of MOVE or MOVEL is
+            // RNF7547, severity 30 (PUB400 2026-11-12, IBM i 7.5: a fixed
+            // form MOVE of an 8F field into a character field).
+            Stmt::Move { from, to, .. } if self.is_float(from) || self.is_float(to) => {
+                self.out.diags.push(Diag {
+                    line: l,
+                    id: "RNF7547".into(),
+                    sev: 30,
+                    text: "MOVE and MOVEL do not take a float field.".into(),
+                    at: None,
+                });
+            }
             _ => {}
+        }
+    }
+
+    /// Whether a value is a float field (or an element of a float array).
+    fn is_float(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Name { parts, .. } => matches!(
+                self.sym(&parts.join(".")),
+                Some(Sym::Var(v)) if matches!(v.dtype, DType::Float(_))
+            ),
+            _ => false,
         }
     }
 

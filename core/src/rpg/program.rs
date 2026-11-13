@@ -1803,6 +1803,9 @@ impl Binder<'_> {
         // Where the subfields that overlay a subfield end so far, by the
         // overlaid subfield: OVERLAY(name : *NEXT) goes there.
         let mut overlay_end: HashMap<String, usize> = HashMap::new();
+        // A group subfield's own OVERLAY target, by group: as the group
+        // grows, the next position within that target moves past it.
+        let mut group_parent: HashMap<String, String> = HashMap::new();
         if let Some(other) = &likeds {
             let found = match self.syms.get(other) {
                 Some(Sym::Ds(o)) => Some((other.clone(), o.clone())),
@@ -1944,6 +1947,16 @@ impl Binder<'_> {
                     });
             if is_group {
                 groups.insert(s.name.to_ascii_uppercase(), subs.len());
+                if let Some(k) = keyword(&s.keywords, "OVERLAY") {
+                    let parent = k
+                        .args
+                        .first()
+                        .map(|a| a.trim().to_ascii_uppercase())
+                        .unwrap_or_default();
+                    let e = overlay_end.entry(parent.clone()).or_insert(0);
+                    *e = (*e).max(off);
+                    group_parent.insert(s.name.to_ascii_uppercase(), parent);
+                }
                 subs.push((s.name.clone(), DType::Char(0), off, 0, s));
                 j += 1;
                 continue;
@@ -1968,6 +1981,14 @@ impl Binder<'_> {
                         if len as u32 > n {
                             subs[g].1 = DType::Char(len as u32);
                         }
+                    }
+                    // The group now reaches `end` within its own target
+                    // (PUB400 2026-11-13, IBM i 7.5: after a group of two
+                    // 2-byte subfields over a 10-byte field, a *NEXT
+                    // subfield of that field starts at position 5).
+                    if let Some(parent) = group_parent.get(&target) {
+                        let e = overlay_end.entry(parent.clone()).or_insert(0);
+                        *e = (*e).max(end);
                     }
                 }
             }

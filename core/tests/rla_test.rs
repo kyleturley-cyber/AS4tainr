@@ -23032,6 +23032,64 @@ async fn fixed_form_constants_and_initial_values() {
     );
 }
 
+/// OVERLAY(field : *NEXT) places a subfield past the earlier subfields
+/// that overlay the same field, within it, also after a group subfield
+/// that overlays it (issue #4; ILE RPG Reference, OVERLAY keyword).
+/// Expected values: PUB400, IBM i 7.5, 2026-11-12 and 2026-11-13 (the
+/// group), this program with DSPLY written to a stream file.
+#[tokio::test]
+async fn overlay_next_is_within_the_overlaid_field() {
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = r#"**free
+ctl-opt dftactgrp(*no);
+dcl-ds part;
+  PartNumber char(10);
+  Family char(3) overlay(PartNumber);
+  Sequence char(6) overlay(PartNumber : *next);
+  Language char(1) overlay(PartNumber : *next);
+end-ds;
+dcl-ds grpds;
+  pn char(10);
+  grp overlay(pn);
+    g1 char(2) overlay(grp);
+    g2 char(2) overlay(grp : *next);
+  gc char(3) overlay(pn : *next);
+end-ds;
+PartNumber = 'ABC123456E';
+dsply ('OVL FAMILY=' + Family + '|SEQUENCE=' + Sequence + '|LANGUAGE=' + Language + '|');
+dsply ('OVL SIZE=' + %char(%size(part)));
+pn = 'ABCDEFGHIJ';
+dsply ('GRP G1=' + g1 + '|G2=' + g2 + '|GRP=' + grp + '|GC=' + gc + '|');
+dsply ('GRP SIZE=' + %char(%size(grpds)));
+*inlr = *on;
+"#;
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        None,
+        "OVLNEXT".into(),
+        src.into(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "OVL FAMILY=ABC|SEQUENCE=123456|LANGUAGE=E|",
+            "OVL SIZE=10",
+            "GRP G1=AB|G2=CD|GRP=ABCD|GC=EFG|",
+            "GRP SIZE=10"
+        ]
+    );
+}
+
 /// An external procedure that is a service program's procedure (Db2 for
 /// i SQL Reference, CREATE PROCEDURE (external): EXTERNAL NAME
 /// 'lib/srvpgm(entry)'), PARAMETER STYLE GENERAL: parameters by

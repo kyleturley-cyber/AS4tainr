@@ -2388,6 +2388,24 @@ CREATE TABLE {lib}.OBJS AS (SELECT OBJNAME, OBJTYPE, CURRENT TIMESTAMP AS TS FRO
         .await,
         ["CHEAP|V|D|2", "CUSTMAST|P|D|4", "ITEMS|T|D|3"]
     );
+    // QSYS/QADBXFIL, the cross-reference by file, as IBM i Access Client
+    // Solutions' Data Transfer reads it (system naming, FOR FETCH ONLY):
+    // DBXATR PF physical, TB table, VW view; DBXTYP D data; DBXNFL the
+    // number of fields (the field texts and rows of DSPFFD QSYS/QADBXFIL
+    // and a query of it on PUB400, 2026-11-12, tools/golden/xref.txt).
+    assert_eq!(
+        rows(format!(
+            "SELECT DBXLIB, DBXFIL, DBXLB2, DBXLFI, DBXNFL, DBXATR, DBXTYP FROM QSYS/QADBXFIL
+              WHERE DBXLIB = '{lib}' AND DBXFIL IN ('CHEAP', 'CUSTMAST', 'ITEMS')
+              ORDER BY DBXLFI FOR FETCH ONLY"
+        ))
+        .await,
+        [
+            format!("{lib}|CHEAP|{lib}|CHEAP|2|VW|D"),
+            format!("{lib}|CUSTMAST|{lib}|CUSTMAST|4|PF|D"),
+            format!("{lib}|ITEMS|{lib}|ITEMS|3|TB|D"),
+        ]
+    );
     assert_eq!(
         rows(format!(
             "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, HAS_DEFAULT FROM QSYS2.SYSCOLUMNS
@@ -11589,6 +11607,48 @@ dsply err.msgid;
             .to_string(),
             vec!["2", "CPF2204"],
         ),
+        // QWCRSVAL (Retrieve System Values API): the number of values,
+        // their offsets, then name, type of data ('C' character, 'B'
+        // binary), status, length and data. QCCSID ships as 65535 and
+        // QUTCOFFSET as +0000 (the system value lists' shipped values).
+        (
+            "SVAL",
+            "**FREE
+dcl-pr qwcrsval extpgm('QWCRSVAL');
+  rcv char(256) options(*varsize);
+  len int(10) const;
+  n int(10) const;
+  names char(20) const;
+  err char(8);
+end-pr;
+dcl-ds rcv len(256);
+  count int(10) pos(1);
+  off1 int(10) pos(5);
+  off2 int(10) pos(9);
+end-ds;
+dcl-ds ent based(p);
+  name char(10);
+  type char(1);
+  status char(1);
+  dlen int(10);
+  data char(10);
+end-ds;
+dcl-s p pointer;
+dcl-s ccsid int(10) based(q);
+dcl-s q pointer;
+dcl-s err char(8) inz(*allx'00');
+qwcrsval(rcv : 256 : 2 : 'QCCSID    QUTCOFFSET' : err);
+dsply %char(count);
+p = %addr(rcv) + off1;
+q = %addr(data);
+dsply (%trim(name) + ' ' + type + ' ' + %char(dlen) + ' ' + %char(ccsid));
+p = %addr(rcv) + off2;
+dsply (%trim(name) + ' ' + type + ' ' + %subst(data : 1 : dlen));
+*inlr = *on;
+"
+            .to_string(),
+            vec!["2", "QCCSID B 4 65535", "QUTCOFFSET C +0000"],
+        ),
     ];
     for (name, source, want) in programs {
         let r = rpg::call(
@@ -12104,6 +12164,109 @@ async fn spooled_file_apis_and_printed_output_of_system() {
         "{:02X?}",
         &sp[sp.len().saturating_sub(want.len() + 8)..]
     );
+    // The same list through a program call by name with byte parameters,
+    // as the remote command server runs it (JTOpen SpooledFileOpenList,
+    // which IBM i Access Client Solutions' printer output uses: QGYOLSPL
+    // with a receiver of length 0 and number of records -1, filter
+    // OSPF0100 *ALL, format OSPL0300, then QGYGTLE and QGYCLST; the
+    // OSPL0300 layout of the Open List of Spooled Files API: the spooled
+    // file name at offset 26).
+    let all = |n: usize| {
+        let mut b = e("*ALL");
+        b.resize(n, 0x40);
+        b
+    };
+    let mut filter = 1i32.to_be_bytes().to_vec();
+    filter.extend(all(10));
+    filter.extend([0, 0]);
+    filter.extend(1i32.to_be_bytes());
+    filter.extend(all(10));
+    filter.extend(vec![0x40; 10]);
+    filter.extend(all(10));
+    filter.extend(all(10));
+    filter.extend(1i32.to_be_bytes());
+    filter.extend(all(10));
+    filter.extend([0, 0]);
+    let mut p = vec![
+        vec![],
+        0i32.to_be_bytes().to_vec(),
+        vec![0; 80],
+        (-1i32).to_be_bytes().to_vec(),
+        vec![0; 4],
+        filter,
+        vec![0x40; 26],
+        e("OSPL0300"),
+        vec![0; 8],
+    ];
+    as4tainr_core::spoolapi::host_call(&client, "QGYOLSPL", "QSECOFR", None, &mut p)
+        .await
+        .expect("an API")
+        .unwrap();
+    let total = i32::from_be_bytes(p[2][0..4].try_into().unwrap());
+    assert!(total >= 1, "the spooled files are listed");
+    let handle = p[2][8..12].to_vec();
+    let size = total as usize * 136;
+    let mut g = vec![
+        vec![0; size],
+        (size as i32).to_be_bytes().to_vec(),
+        handle.clone(),
+        vec![0; 80],
+        total.to_be_bytes().to_vec(),
+        1i32.to_be_bytes().to_vec(),
+        vec![0; 8],
+    ];
+    as4tainr_core::spoolapi::host_call(&client, "QGYGTLE", "QSECOFR", None, &mut g)
+        .await
+        .expect("an API")
+        .unwrap();
+    assert_eq!(i32::from_be_bytes(g[3][4..8].try_into().unwrap()), total);
+    assert!(
+        g[0].chunks(136).any(|r| r[26..36] == e("GLDSPL    ")[..]),
+        "GLDSPL is in the list"
+    );
+    let mut c = vec![handle, vec![0; 8]];
+    as4tainr_core::spoolapi::host_call(&client, "QGYCLST", "QSECOFR", None, &mut c)
+        .await
+        .expect("an API")
+        .unwrap();
+    // Format OSPL0200, which ACS's printer output asks for (JTOpen
+    // SpooledFileOpenList formatOutputData: the spooled file name at 0,
+    // the status as CHAR(10) at 82, the offset of the extension at 148,
+    // the date opened at 160): records of the length the list
+    // information gives.
+    p[7] = e("OSPL0200");
+    as4tainr_core::spoolapi::host_call(&client, "QGYOLSPL", "QSECOFR", None, &mut p)
+        .await
+        .expect("an API")
+        .unwrap();
+    let total = i32::from_be_bytes(p[2][0..4].try_into().unwrap());
+    let rec = i32::from_be_bytes(p[2][12..16].try_into().unwrap()) as usize;
+    let handle = p[2][8..12].to_vec();
+    let size = total as usize * rec;
+    let mut g = vec![
+        vec![0; size],
+        (size as i32).to_be_bytes().to_vec(),
+        handle.clone(),
+        vec![0; 80],
+        total.to_be_bytes().to_vec(),
+        1i32.to_be_bytes().to_vec(),
+        vec![0; 8],
+    ];
+    as4tainr_core::spoolapi::host_call(&client, "QGYGTLE", "QSECOFR", None, &mut g)
+        .await
+        .expect("an API")
+        .unwrap();
+    let r = g[0]
+        .chunks(rec)
+        .find(|r| r[0..10] == e("GLDSPL    ")[..])
+        .expect("GLDSPL in OSPL0200");
+    assert_eq!(r[82], e("*")[0], "a status such as *READY");
+    assert_eq!(i32::from_be_bytes(r[148..152].try_into().unwrap()), 152);
+    let mut c = vec![handle, vec![0; 8]];
+    as4tainr_core::spoolapi::host_call(&client, "QGYCLST", "QSECOFR", None, &mut c)
+        .await
+        .expect("an API")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -15039,6 +15202,98 @@ endmon;
     .unwrap();
     assert!(r.error.is_none(), "{:?}", r.error);
     assert_eq!(r.messages, ["excp RNX0100 100"]);
+}
+
+/// %SUBST and %SCAN take a start from 1 to the string's length (issue
+/// #6). Expected values: PUB400, IBM i 7.5, 2026-11-12, the same program
+/// with each line written to a stream file instead of DSPLY.
+#[tokio::test]
+async fn subst_and_scan_start_within_the_string() {
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = r#"**free
+ctl-opt dftactgrp(*no);
+dcl-s a char(10) inz('ABCDEFGHIJ');
+dcl-s v varchar(10) inz('');
+dcl-s c char(5);
+dcl-s n packed(3:0);
+dcl-s s0 packed(3:0) inz(0);
+dcl-s s1 packed(3:0) inz(1);
+dcl-s s2 packed(3:0) inz(2);
+dcl-s s10 packed(3:0) inz(10);
+dcl-s s11 packed(3:0) inz(11);
+dcl-s l0 packed(3:0) inz(0);
+monitor;
+  c = %subst(a:s11:l0);
+  dsply ('SUBST PAST 0 [' + c + ']');
+on-error;
+  dsply ('SUBST PAST 0 ERR ' + %char(%status));
+endmon;
+monitor;
+  c = %subst(v:s1:l0);
+  dsply ('SUBST EMPTY ERR? [' + c + ']');
+on-error;
+  dsply ('SUBST EMPTY ERR ' + %char(%status));
+endmon;
+monitor;
+  c = %subst(a:s10:l0);
+  dsply ('SUBST LAST 0 [' + c + ']');
+on-error;
+  dsply ('SUBST LAST 0 ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %scan('A':a:s11);
+  dsply ('SCAN PAST ' + %char(n));
+on-error;
+  dsply ('SCAN PAST ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %scan('A':a:s0);
+  dsply ('SCAN ZERO ' + %char(n));
+on-error;
+  dsply ('SCAN ZERO ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %scan('J':a:s10);
+  dsply ('SCAN AT LEN ' + %char(n));
+on-error;
+  dsply ('SCAN AT LEN ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %scan('A':v:s2);
+  dsply ('SCAN EMPTY ' + %char(n));
+on-error;
+  dsply ('SCAN EMPTY ERR ' + %char(%status));
+endmon;
+*inlr = *on;
+"#;
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        None,
+        "SUBSCAN".into(),
+        src.into(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "SUBST PAST 0 ERR 100",
+            "SUBST EMPTY ERR 100",
+            "SUBST LAST 0 [     ]",
+            "SCAN PAST ERR 100",
+            "SCAN ZERO ERR 100",
+            "SCAN AT LEN 10",
+            "SCAN EMPTY 0",
+        ]
+    );
 }
 
 /// OPTIONS(*TRIM) (ILE RPG Reference, OPTIONS keyword): a CONST or VALUE
@@ -28778,6 +29033,161 @@ async fn host_servers_sign_on_and_database_attributes() {
         .collect();
     assert_eq!(String::from_utf16_lossy(&got), "CUSTMAST.FILE");
     assert_eq!(u16b(&read(&mut s).await, 22), 18);
+    // A list in blocks (JTOpen IFSListAttrsReq: maximum get count at 34;
+    // a restart ID, CP 0x000E, or restart name, CP 0x0007, after the
+    // name; IFSListAttrsRep: the restart ID at 77; IFSFileEnumeration
+    // passes the last entry it got and takes what follows as the next
+    // block): one entry, then the one after it, the same either way, and
+    // never the first again.
+    let entry_name = |r: &[u8]| -> String {
+        let at = 20 + u16b(r, 16) as usize;
+        let n = u32_at(r, at) as usize - 6;
+        let got: Vec<u16> = r[at + 6..at + 6 + n]
+            .chunks(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&got)
+    };
+    let mut one = lst.clone();
+    one[14..16].copy_from_slice(&1u16.to_be_bytes());
+    let pattern = name(&format!("/QSYS.LIB/{lib}.LIB/*"));
+    s.write_all(&ds(&cp(0x0002, &pattern), 0xE002, 0x000A, &one))
+        .await
+        .unwrap();
+    let r = read(&mut s).await;
+    let first = entry_name(&r);
+    let restart = r[77..81].to_vec();
+    assert_ne!(restart, [0, 0, 0, 0], "a restart ID");
+    assert_eq!(u16b(&read(&mut s).await, 22), 18);
+    let mut p = cp(0x0002, &pattern);
+    p.extend(cp(0x000E, &restart));
+    s.write_all(&ds(&p, 0xE002, 0x000A, &one)).await.unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(u16b(&r, 18), 0x8005);
+    let second = entry_name(&r);
+    assert_ne!(second, first, "the next entry");
+    assert_eq!(u16b(&read(&mut s).await, 22), 18);
+    let mut p = cp(0x0002, &pattern);
+    p.extend(cp(0x0007, &name(&first)));
+    s.write_all(&ds(&p, 0xE002, 0x000A, &one)).await.unwrap();
+    let r = read(&mut s).await;
+    assert_eq!(entry_name(&r), second, "restart by name");
+    assert_eq!(u16b(&read(&mut s).await, 22), 18);
+    // The print server (as-netprt, 0xE003; JTOpen NPDataStream: a 12-byte
+    // template of action, flags, return code, error object; the reply ID
+    // the request's with bit 0x8000; NPConversation, PrintObjectImplRemote,
+    // PrintObjectTransformedInputStreamImplRemote): the server's CCSID
+    // (attribute 0x008A), a spooled file's pages (0x006F) by its ID
+    // (name 0x0068, number 0x0069, job name 0x003B, user 0x003E, number
+    // 0x003C), its text through open modified (0x001A), read (0x0003,
+    // NUMBYTES 0x007D; return code 0x0013 at the end) and close (0x0005).
+    {
+        use as4tainr_core::hostprt::{parse_values, values_cp, Value};
+        let job = as4tainr_core::jobs::start_interactive(
+            &client,
+            "PRTDEV",
+            &user,
+            None,
+            std::slice::from_ref(&lib),
+        )
+        .await
+        .unwrap();
+        as4tainr_core::spool::print_lines(
+            &client,
+            &job,
+            "QSYSPRT",
+            "NPTEST",
+            &["HELLO PRINT SERVER".into()],
+        )
+        .await
+        .unwrap();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let u2 = url.clone();
+        tokio::spawn(async move {
+            let (s, _) = l.accept().await.unwrap();
+            as4tainr_core::hostcmd::serve_as(&u2, s, 0xE003).await
+        });
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(&ds(&[], 0xE003, 0x7001, &client_seed))
+            .await
+            .unwrap();
+        let r = read(&mut s).await;
+        let server_seed = r[24..32].to_vec();
+        let mut p = cp(0x1105, &substitute("PW123", &server_seed, &client_seed));
+        p.extend(cp(0x1104, &uid37));
+        s.write_all(&ds(&p, 0xE003, 0x7002, &[3, 1])).await.unwrap();
+        assert_eq!(u32_at(&read(&mut s).await, 20), 0);
+        let tmpl = |action: u16| {
+            let mut t = action.to_be_bytes().to_vec();
+            t.extend([0u8; 10]);
+            t
+        };
+        let ids = |list: &[u16]| {
+            let mut d = (list.len() as u16).to_be_bytes().to_vec();
+            d.extend(2u16.to_be_bytes());
+            for i in list {
+                d.extend(i.to_be_bytes());
+            }
+            cp(0x0007, &d)
+        };
+        let value = |r: &[u8], id: u16| -> Vec<u8> {
+            let at = 32;
+            assert_eq!(u16::from_be_bytes([r[at + 4], r[at + 5]]), 0x0008);
+            parse_values(&r[at + 6..])[&id].clone()
+        };
+        s.write_all(&ds(&ids(&[0x008A]), 0xE003, 0x0008, &tmpl(0x000F)))
+            .await
+            .unwrap();
+        let r = read(&mut s).await;
+        assert_eq!(u16::from_be_bytes([r[18], r[19]]), 0x8008, "the reply ID");
+        assert_eq!(u16::from_be_bytes([r[26], r[27]]), 0, "return code");
+        assert_eq!(value(&r, 0x008A), 37i32.to_be_bytes());
+        let id = values_cp(
+            0x0001,
+            &[
+                (0x0068, Value::Str("QSYSPRT".into())),
+                (0x003B, Value::Str("PRTDEV".into())),
+                (0x003E, Value::Str(user.clone())),
+                (0x003C, Value::Str(format!("{:06}", job.number))),
+                (0x0069, Value::Int(1)),
+            ],
+        );
+        let mut p = id.clone();
+        p.extend(ids(&[0x006F]));
+        s.write_all(&ds(&p, 0xE003, 0x0001, &tmpl(0x000F)))
+            .await
+            .unwrap();
+        let r = read(&mut s).await;
+        assert_eq!(u16::from_be_bytes([r[26], r[27]]), 0);
+        assert_eq!(value(&r, 0x006F), 1i32.to_be_bytes(), "one page");
+        s.write_all(&ds(&id, 0xE003, 0x0001, &tmpl(0x001A)))
+            .await
+            .unwrap();
+        let r = read(&mut s).await;
+        assert_eq!(u16::from_be_bytes([r[26], r[27]]), 0);
+        assert_eq!(u16::from_be_bytes([r[36], r[37]]), 0x000C, "a handle");
+        let handle = cp(0x000C, &r[38..r.len()]);
+        let mut p = handle.clone();
+        p.extend(values_cp(0x0008, &[(0x007D, Value::Int(4096))]));
+        s.write_all(&ds(&p, 0xE003, 0x0001, &tmpl(0x0003)))
+            .await
+            .unwrap();
+        let r = read(&mut s).await;
+        assert_eq!(u16::from_be_bytes([r[36], r[37]]), 0x0009, "data");
+        let text = String::from_utf8_lossy(&r[38..]).to_string();
+        assert!(text.contains("HELLO PRINT SERVER\r\n"), "{text:?}");
+        s.write_all(&ds(&p, 0xE003, 0x0001, &tmpl(0x0003)))
+            .await
+            .unwrap();
+        let r = read(&mut s).await;
+        assert_eq!(u16::from_be_bytes([r[26], r[27]]), 0x0013, "end of file");
+        s.write_all(&ds(&handle, 0xE003, 0x0001, &tmpl(0x0005)))
+            .await
+            .unwrap();
+        let r = read(&mut s).await;
+        assert_eq!(u16::from_be_bytes([r[26], r[27]]), 0);
+    }
     // The central server (JTOpen NLSGetTableRequest/Reply): CCSID 37's
     // characters in UTF-16, 0xC1 'A' (the code page 37 chart).
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -29156,4 +29566,41 @@ async fn host_servers_sign_on_and_database_attributes() {
         &find(&r, 0x3801)[2..],
         &as4tainr_core::hostsrv::ebcdic("SQL0204", 7)[..]
     );
+    // Retrieve library information (catalog server 0xE006, function
+    // 0x1800; JTOpen DBReturnObjectInformationRequestDS, JDUtilities
+    // getLibraries): the library name in CP 0x3801 (CCSID 37, length,
+    // name), the pattern indicator CP 0x3816 (0xF1 a pattern), the
+    // information bitmap CP 0x381D (0x80000000 the name); the reply's
+    // data format and result data give one row per library, error class
+    // 0 (getLibraries takes any other class as an error).
+    let roi = |name: &str, ind: u8, bits: u32| {
+        let mut d = 37u16.to_be_bytes().to_vec();
+        d.extend((name.len() as u16).to_be_bytes());
+        d.extend(as4tainr_core::hostsrv::ebcdic(name, name.len()));
+        let mut p = cp(0x3801, &d);
+        p.extend(cp(0x3816, &[ind]));
+        p.extend(cp(0x381D, &bits.to_be_bytes()));
+        ds(&p, 0xE006, 0x1800, &tmpl(0x8C00_0000))
+    };
+    let r = exchange(&mut s, roi(&lib, 0xF1, 0x8000_0000)).await;
+    assert_eq!(class_rc(&r), (0, 0));
+    let d = find(&r, 0x380E);
+    assert_eq!(u32_at(&d, 4), 1, "one library");
+    let lib_bytes = lib.as_bytes();
+    assert!(
+        d.windows(lib_bytes.len()).any(|w| w == lib_bytes)
+            || d.windows(lib_bytes.len())
+                .any(|w| w == &as4tainr_core::hostsrv::ebcdic(&lib, lib.len())[..]),
+        "the library's name"
+    );
+    let r = exchange(&mut s, roi(&format!("{lib}X%"), 0xF1, 0x8000_0000)).await;
+    assert_eq!(class_rc(&r), (0, 0));
+    assert_eq!(u32_at(&find(&r, 0x380E), 4), 0, "no library matches");
+    // A field for each bit of the bitmap, in its order (the extended
+    // data format, JTOpen DBExtendedDataFormat: the number of fields at
+    // offset 4); IBM i Access Client Solutions asks for 0xE0000000 and
+    // reads three.
+    let r = exchange(&mut s, roi(&lib, 0xF1, 0xE000_0000)).await;
+    assert_eq!(class_rc(&r), (0, 0));
+    assert_eq!(u32_at(&find(&r, 0x380C), 4), 3, "three fields");
 }

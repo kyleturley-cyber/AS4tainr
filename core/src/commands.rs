@@ -11239,6 +11239,14 @@ impl Job<'_> {
         use crate::rpg::data::{a, e, load, store, DType, Fit, Value as RValue};
         let name = name.trim().to_ascii_uppercase();
         let lib = lib.trim().to_ascii_uppercase();
+        // The list APIs for spooled files (QGYOLSPL, QGYGTLE, QGYCLST).
+        let job = self.id.as_ref().map(|j| j.number);
+        if let Some(r) =
+            crate::spoolapi::host_call(self.client, &name, &self.user, job, &mut parms).await
+        {
+            r?;
+            return Ok((Outcome::Messages(Vec::new()), parms));
+        }
         if crate::sysapi::is_api(&name) {
             let mut types: Vec<DType> = parms.iter().map(|b| DType::Char(b.len() as u32)).collect();
             for (k, digits) in crate::dtaq::packed_params(&name) {

@@ -237,3 +237,19 @@ The harness sets `TERM=xterm-r6`, because ncurses uses the "repeat character" es
 ## Not yet
 
 These are tracked in [fidelity-gaps.md](fidelity-gaps.md): TLS (port 992), automatic sign-on and device names from NEW-ENVIRON ([RFC 4777](https://www.rfc-editor.org/rfc/rfc4777)), 27x132 screens, prompt help (F1) and list-parameter prompting, WRKOBJ options, disabling profiles after repeated failures, and job logs.
+
+## Tracing a client
+
+`AS4TAINR_TN5250_TRACE=1` writes every byte the server sends (`>`) and
+receives (`<`) to standard error in hexadecimal: the telnet negotiation
+and the 5250 records. Use it to see what an emulator that does not show
+a screen is doing.
+
+## Printed output
+
+A display command run with `OUTPUT(*PRINT)` at the command line does not
+show its report: the report becomes a spooled file of the session's job,
+named for the command's printer file (DSPJOB QPDSPJOB, DSPLIBL QPRTLIBL,
+DSPOBJD QPRTOBJD...; QSYSPRT for the others), with the command's name as
+its user data, and a message says so. WRKSPLF and ACS's printer output
+list it.

@@ -51,7 +51,8 @@ pub async fn serve(url: &str, sock: TcpStream) -> Result<()> {
 
 /// Serve one connection of the remote command server (0xE008), the data
 /// queue server (0xE007, hostdtaq.rs), the file server (0xE002,
-/// hostifs.rs) or the central server (0xE000, hostcentral.rs): the start of a connection is the same, the job the
+/// hostifs.rs), the central server (0xE000, hostcentral.rs) or the print
+/// server (0xE003, hostprt.rs): the start of a connection is the same, the job the
 /// requests run in too.
 pub async fn serve_as(url: &str, mut sock: TcpStream, server_id: u16) -> Result<()> {
     let client = crate::runtime::connect_db(url).await?;
@@ -62,6 +63,7 @@ pub async fn serve_as(url: &str, mut sock: TcpStream, server_id: u16) -> Result<
     let mut client_seed: Vec<u8> = Vec::new();
     let mut server: Option<crate::mapepire::Server> = None;
     let mut files = crate::hostifs::Files::default();
+    let mut prints = crate::hostprt::Session::default();
     while let Some(ds) = read_ds(&mut sock).await? {
         let corr = ds.correlation();
         let out = match ds.req_id() {
@@ -119,6 +121,7 @@ pub async fn serve_as(url: &str, mut sock: TcpStream, server_id: u16) -> Result<
                         0xE007 => "QZHQSSRV",
                         0xE002 => "QPWFSERVSO",
                         0xE000 => "QZSCSRVS",
+                        0xE003 => "QNPSERVS",
                         _ => "QZRCSRVS",
                     };
                     p.extend(job_name_param(job, "QUSER"));
@@ -127,6 +130,11 @@ pub async fn serve_as(url: &str, mut sock: TcpStream, server_id: u16) -> Result<
             }
             _ if server.is_none() => break,
             _ if server_id == 0xE000 => crate::hostcentral::request(&ds),
+            _ if server_id == 0xE003 => {
+                let srv = server.as_ref().expect("signed on");
+                let user = srv.job.user.clone();
+                crate::hostprt::request(&client, &user, &mut prints, &ds).await
+            }
             _ if server_id == 0xE002 => {
                 let srv = server.as_mut().expect("signed on");
                 let replies = crate::hostifs::request(srv, &mut files, &ds).await;

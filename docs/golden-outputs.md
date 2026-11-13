@@ -50,6 +50,7 @@ The lists:
 - `tools/golden/basics.txt`: display commands and their printed reports (DSPLIBL, DSPSYSVAL, DSPOBJD, DSPMSGD, DSPFD), CHKOBJ, CRTPF RCDLEN, DLTF.
 - `tools/golden/system-utility.txt`: the `system` utility itself (options, streams, exit statuses).
 - `tools/golden/messages.txt`: completion and escape message IDs and exit statuses of most commands as4tainr has, the command analyzer's diagnostics, shipped system values.
+- `tools/golden/xref.txt`: the database cross-reference file QSYS/QADBXFIL that IBM i Access Client Solutions' Data Transfer lists a library's files from (field layout, record selection, rows).
 - `tools/golden/files-and-programs.txt`: CPYF, DSPFFD, DSPFD, DSPOBJD, save files, CL and RPG programs from stream files, MONMSG of a failed CALL.
 
 Rounds so far (2026-10): basics, system utility, messages (130 commands), files and programs (43 commands; 40 match, the other 3 are a stream file PUB400 could not open and the CALL that depends on it).

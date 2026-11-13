@@ -63,6 +63,7 @@ pub async fn run(database_url: String, ip: String) -> Result<()> {
         ("as-dtaq", 8472),
         ("as-file", 8473),
         ("as-central", 8470),
+        ("as-netprt", 8474),
     ] {
         let addr = format!("{ip}:{port}");
         let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -88,6 +89,7 @@ pub async fn run(database_url: String, ip: String) -> Result<()> {
                         "as-dtaq" => crate::hostcmd::serve_as(&url, sock, 0xE007).await,
                         "as-file" => crate::hostcmd::serve_as(&url, sock, 0xE002).await,
                         "as-central" => crate::hostcmd::serve_as(&url, sock, 0xE000).await,
+                        "as-netprt" => crate::hostcmd::serve_as(&url, sock, 0xE003).await,
                         _ => crate::hostdb::serve(&url, sock).await,
                     };
                     if let Err(e) = r {

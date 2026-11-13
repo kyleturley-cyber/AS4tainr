@@ -1,6 +1,6 @@
 //! The system APIs done here, called from CL (`CALL PGM(QUSROBJD)`) and
 //! RPG (EXTPGM prototypes): which module does each, and the retrieve
-//! APIs QUSROBJD, QUSRMBRD and QUSRSPLA, and QSYCKUFU.
+//! APIs QUSROBJD, QUSRMBRD and QUSRSPLA, QWCRSVAL and QSYCKUFU.
 //!
 //! Written from IBM's documentation (Object APIs: "Retrieve Object
 //! Description (QUSROBJD)"; Database and File APIs: "Retrieve Member
@@ -51,6 +51,7 @@ pub fn is_api(name: &str) -> bool {
                 | "QWDRJOBD"
                 | "QWCRSSTS"
                 | "QSYCKUFU"
+                | "QWCRSVAL"
         )
 }
 
@@ -71,6 +72,7 @@ pub fn receiver_first(name: &str) -> bool {
             | "QSZRTVPR"
             | "QWDRJOBD"
             | "QWCRSSTS"
+            | "QWCRSVAL"
     )
 }
 
@@ -101,6 +103,7 @@ pub async fn call_api(
         "QSZRTVPR" => (product_information(args), 4),
         "QWDRJOBD" => (job_description(client, caller, args).await, 4),
         "QWCRSSTS" => (system_status(client, args).await, 4),
+        "QWCRSVAL" => (system_values(args), 4),
         "QSYCKUFU" => (check_function_usage(client, caller, args).await, 3),
         _ => bail!("{name} is not a system API done here."),
     };
@@ -188,6 +191,53 @@ fn network_attributes(args: &mut dyn ApiArgs) -> Result<()> {
         let data = value.map(|v| e(&v)).unwrap_or_default();
         let mut entry = field(&nm, 10);
         entry.extend_from_slice(&e("C "));
+        entry.extend_from_slice(&bin4(data.len() as i64));
+        entry.extend_from_slice(&data);
+        entries.push(entry);
+    }
+    let mut r = bin4(entries.len() as i64).to_vec();
+    let mut at = 4 + 4 * entries.len();
+    let mut offsets = Vec::new();
+    for en in &entries {
+        offsets.extend_from_slice(&bin4(at as i64));
+        at += en.len();
+    }
+    r.extend_from_slice(&offsets);
+    for en in entries {
+        r.extend_from_slice(&en);
+    }
+    r.truncate(len);
+    args.set_bytes(0, &r);
+    Ok(())
+}
+
+/// QWCRSVAL (Retrieve System Values API): receiver, its length, the
+/// number of values, their names (CHAR(10) each), error code. The
+/// receiver is laid out as QWCRNETA's: the number of values returned,
+/// an offset to each, then each value's entry: name CHAR(10), type of
+/// data CHAR(1) (C character, B binary), information status CHAR(1)
+/// (blank: returned), the data's length BINARY(4) and the data;
+/// numeric values are BINARY(4). A value as4tainr does not have gets an
+/// entry with no data (docs/fidelity-gaps.md). The IBM Toolbox for Java
+/// asks it for QTIMZON before it shows IFS dates.
+fn system_values(args: &mut dyn ApiArgs) -> Result<()> {
+    need(args, 5)?;
+    let len = args.num(1)?.max(0) as usize;
+    let n = args.num(2)?.clamp(0, 512);
+    let names = args.bytes(3);
+    let mut entries: Vec<Vec<u8>> = Vec::new();
+    for k in 0..n as usize {
+        let nm = a(names.get(k * 10..k * 10 + 10).unwrap_or(&[]))
+            .trim()
+            .to_ascii_uppercase();
+        let (kind, data) = match crate::clpgm::system_value_text(&nm) {
+            Some(Ok(t)) => ("C", e(&t)),
+            Some(Err(n)) => ("B", bin4(n).to_vec()),
+            None => (" ", Vec::new()),
+        };
+        let mut entry = field(&nm, 10);
+        entry.extend_from_slice(&e(kind));
+        entry.extend_from_slice(&e(" "));
         entry.extend_from_slice(&bin4(data.len() as i64));
         entry.extend_from_slice(&data);
         entries.push(entry);

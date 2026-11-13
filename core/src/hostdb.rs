@@ -17,9 +17,10 @@
 //! the server attributes, and SQL statements (server 0xE004): RPBs,
 //! prepare and describe, execute, execute immediate, open, describe and
 //! fetch, fetch, close, the last error's message, run on the
-//! connection's job by the statement engine of mapepire.rs. Statements
-//! with parameter markers, catalog requests (server 0xE006) and native
-//! database requests (0xE005) are not done yet (docs/fidelity-gaps.md).
+//! connection's job by the statement engine of mapepire.rs. Of the
+//! catalog requests (server 0xE006), retrieve library information
+//! (0x1800); the others and native database requests (0xE005) are not
+//! done yet (docs/fidelity-gaps.md).
 
 use crate::hostsrv::{ebcdic, job_name_param, param, read_ds, reply, seed, text37, Ds};
 use anyhow::Result;
@@ -193,6 +194,10 @@ pub async fn serve(url: &str, mut sock: TcpStream) -> Result<()> {
             id if ds.server_id() == 0xE004 => {
                 let srv = sql.as_mut().expect("signed on");
                 sql_request(srv, &ds, id, &mut stmts, &mut last_error, Dt::of(&attrs)).await
+            }
+            0x1800 if ds.server_id() == 0xE006 => {
+                let srv = sql.as_mut().expect("signed on");
+                library_info(srv, &ds, Dt::of(&attrs)).await
             }
             _ => db_reply(&ds, 0, 0, &[]),
         };
@@ -613,6 +618,81 @@ async fn run(srv: &mut crate::mapepire::Server<'_>, sql: &str, dt: Dt, probe: bo
         }
         crate::mapepire::Done::Count(n) => Ran::Count(n),
     })
+}
+
+/// Retrieve library information (catalog server 0xE006, function
+/// 0x1800; JTOpen DBReturnObjectInformationRequestDS and JDUtilities
+/// getLibraries): the library name (CP 0x3801: CCSID, length, name), a
+/// pattern indicator (CP 0x3816: 0xF1 the name is a pattern, 0xF0 not;
+/// *LIBL and *USRLIBL name the job's library list or its user part) and
+/// a bitmap of what to return (CP 0x381D). The reply has the data format
+/// and result data asked for, one row per library with a column for each
+/// bit set: its name for the first bit, the only one documented, and
+/// empty text for the others (docs/fidelity-gaps.md). IBM i Access Client Solutions' Data Transfer
+/// asks for *USRLIBL.
+async fn library_info(srv: &mut crate::mapepire::Server<'_>, ds: &Ds, dt: Dt) -> Vec<u8> {
+    let mut name = String::new();
+    let mut pattern = false;
+    let mut bitmap = 0x8000_0000u32;
+    for (cp, d) in ds.params(40) {
+        match cp {
+            0x3801 if d.len() >= 4 => {
+                name = decode(u16::from_be_bytes([d[0], d[1]]), &d[4..])
+                    .trim()
+                    .to_ascii_uppercase()
+            }
+            0x3816 => pattern = d.first() == Some(&0xF1),
+            0x381D if d.len() >= 4 => bitmap = u32::from_be_bytes([d[0], d[1], d[2], d[3]]),
+            _ => {}
+        }
+    }
+    let quoted = name.replace('\'', "''");
+    // A column for each bit asked for, in the bitmap's order (a client
+    // reads them by position): the name for the first bit, empty text for
+    // the others, whose meaning is not documented.
+    let mut columns = Vec::new();
+    for bit in 0..32 {
+        if bitmap & (0x8000_0000 >> bit) != 0 {
+            columns.push(if bit == 0 {
+                "CAST(SYSTEM_SCHEMA_NAME AS CHAR(10)) AS LIBRARY_NAME".to_string()
+            } else {
+                format!("CAST('' AS VARCHAR(50)) AS INFO{}", bit + 1)
+            });
+        }
+    }
+    if columns.is_empty() {
+        columns.push("CAST(SYSTEM_SCHEMA_NAME AS CHAR(10)) AS LIBRARY_NAME".into());
+    }
+    let columns = columns.join(", ");
+    let sql = match name.as_str() {
+        "*LIBL" => {
+            format!("SELECT {columns} FROM QSYS2.LIBRARY_LIST_INFO ORDER BY ORDINAL_POSITION")
+        }
+        "*USRLIBL" => format!(
+            "SELECT {columns} FROM QSYS2.LIBRARY_LIST_INFO WHERE TYPE = 'USER'
+              ORDER BY ORDINAL_POSITION"
+        ),
+        _ => format!(
+            "SELECT {columns}
+               FROM QSYS2.SYSSCHEMAS WHERE RTRIM(SYSTEM_SCHEMA_NAME) {} '{quoted}'
+               ORDER BY SYSTEM_SCHEMA_NAME",
+            if pattern { "LIKE" } else { "=" }
+        ),
+    };
+    let mut c = match run(srv, &sql, dt, false).await {
+        Ok(Ran::Rows(c)) => c,
+        Ok(_) => return db_reply(ds, 0, 0, &[]),
+        Err(e) => return fail(ds, e, &mut None),
+    };
+    let ors = ds.u32(20);
+    let mut p = Vec::new();
+    if ors & ORS_DATA_FORMAT != 0 {
+        p.extend(format(0x380C, &c.cols));
+    }
+    if ors & ORS_RESULT_DATA != 0 {
+        p.extend(result_data(&mut c).0);
+    }
+    db_reply(ds, 0, 0, &p)
 }
 
 /// An error as the reply reports it: error class 1 (SQL), the SQLCODE as

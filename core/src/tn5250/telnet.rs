@@ -150,6 +150,19 @@ pub fn record_data(rec: &[u8]) -> Result<&[u8]> {
     Ok(rec.get(start..).unwrap_or(&[]))
 }
 
+/// AS4TAINR_TN5250_TRACE=1: every byte sent (>) and received (<) on
+/// standard error in hexadecimal, to see what a 5250 client does.
+fn trace(dir: &str, bytes: &[u8]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("AS4TAINR_TN5250_TRACE").is_some()) {
+        return;
+    }
+    for chunk in bytes.chunks(32) {
+        let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02X}")).collect();
+        eprintln!("tn5250 {dir} {}", hex.join(" "));
+    }
+}
+
 pub struct Connection {
     stream: TcpStream,
     parser: Parser,
@@ -168,6 +181,7 @@ impl Connection {
     }
 
     async fn send(&mut self, bytes: &[u8]) -> Result<()> {
+        trace(">", bytes);
         self.stream.write_all(bytes).await?;
         Ok(())
     }
@@ -182,6 +196,7 @@ impl Connection {
             if n == 0 {
                 bail!("client disconnected");
             }
+            trace("<", &buf[..n]);
             let mut evs = Vec::new();
             self.parser.feed(&buf[..n], &mut evs);
             self.events.extend(evs);

@@ -10,12 +10,13 @@
 //! library list is the search path. Supported:
 //!
 //! - SELECT, WITH, VALUES, INSERT, UPDATE, DELETE; one statement at a time
-//! - system naming `LIB/FILE` (when LIB is a library) and SQL naming
+//! - system naming `LIB/FILE` (when LIB is a library; either name may be
+//!   delimited, `"QGPL"/"CUSTMAST"`) and SQL naming
 //!   `LIB.FILE`; unqualified names are found through the library list
 //! - `CURRENT DATE`, `CURRENT TIME`, `CURRENT TIMESTAMP`, the `CONCAT`
 //!   operator, `UCASE`/`LCASE`, `RRN(t)`, `SYSIBM.SYSDUMMY1`, and the
-//!   `WITH NC|UR|CS|RS|RR` and `OPTIMIZE FOR n ROWS` clauses (accepted and
-//!   ignored)
+//!   `WITH NC|UR|CS|RS|RR`, `OPTIMIZE FOR n ROWS` and `FOR READ ONLY` /
+//!   `FOR FETCH ONLY` clauses (accepted and ignored)
 //! - `INSERT INTO file VALUES (...)` without a column list fills the
 //!   file's fields in order
 //! - the relative record number column is hidden from results, as on
@@ -2064,12 +2065,20 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
         }
         let t = &toks[i];
         let w = word(t);
-        // System naming: LIB/FILE, written without blanks.
-        if let (Tok::Word(lib), Some(Tok::Punct(p)), Some(Tok::Word(file))) =
-            (t, toks.get(i + 1), toks.get(i + 2))
+        // System naming: LIB/FILE, written without blanks; either name
+        // may be a delimited identifier ("QGPL"/"CUSTMAST", as IBM i
+        // Access Client Solutions' Data Transfer writes them; Db2 for i
+        // SQL Reference, naming conventions).
+        let part = |t: Option<&Tok>| match t {
+            Some(Tok::Word(w)) => Some(w.to_ascii_uppercase()),
+            Some(Tok::Quoted(q)) => Some(q.clone()),
+            _ => None,
+        };
+        if let (Some(lib), Some(Tok::Punct(p)), Some(file)) =
+            (part(Some(t)), toks.get(i + 1), part(toks.get(i + 2)))
         {
-            if p == "/" && is_library(&lib.to_ascii_uppercase()) {
-                out.push(Tok::Word(format!("{}.{}", ident(lib), ident(file))));
+            if p == "/" && is_library(&lib) {
+                out.push(Tok::Word(format!("{}.{}", ident(&lib), ident(&file))));
                 i += 3;
                 continue;
             }
@@ -2884,6 +2893,21 @@ pub fn translate(sql: &str, is_library: &dyn Fn(&str) -> bool) -> Result<Transla
                         && next_non_space(&toks, j + 1).is_none()
                     {
                         break;
+                    }
+                }
+            }
+            Some("FOR") => {
+                // The read-only clause: FOR READ ONLY or FOR FETCH ONLY
+                // (Db2 for i SQL Reference, select-statement): it only
+                // says the result is not updated.
+                let m = next_non_space(&toks, i + 1);
+                let o = m.and_then(|m| next_non_space(&toks, m + 1));
+                if let (Some(m), Some(o)) = (m, o) {
+                    if matches!(word(&toks[m]).as_deref(), Some("READ" | "FETCH"))
+                        && word(&toks[o]).as_deref() == Some("ONLY")
+                    {
+                        i = o + 1;
+                        continue;
                     }
                 }
             }
@@ -4084,6 +4108,12 @@ mod tests {
             tr("SELECT * FROM QGPL.CUSTMAST").sql,
             "SELECT * FROM QGPL.CUSTMAST"
         );
+        // Delimited names in system naming (Db2 for i SQL Reference,
+        // naming conventions), as ACS Data Transfer writes a file.
+        assert_eq!(
+            tr("SELECT * FROM \"QGPL\"/\"CUSTMAST\" FOR FETCH ONLY").sql,
+            "SELECT * FROM \"qgpl\".\"custmast\""
+        );
         // Division stays division when the left side is not a library.
         assert_eq!(
             tr("select qty/2 from ordlin").sql,
@@ -4285,6 +4315,14 @@ mod tests {
             "select * from t"
         );
         assert_eq!(tr("select 'it''s' from t;").sql, "select 'it''s' from t");
+        // The read-only clause (Db2 for i SQL Reference, select-statement:
+        // FOR READ ONLY, or FOR FETCH ONLY), as IBM i Access Client
+        // Solutions' Data Transfer sends it.
+        assert_eq!(tr("select a from t for fetch only").sql, "select a from t");
+        assert_eq!(
+            tr("select a from t for read only with ur").sql,
+            "select a from t"
+        );
     }
 
     // CASE WHEN takes no EXISTS and no IN (fullselect); WHERE EXISTS is

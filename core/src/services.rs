@@ -23,7 +23,7 @@ use crate::sql::SQL_ROLE;
 // ORDER BY sorts as Db2 for i's *HEX sort sequence does ('*PUBLIC' before
 // names), whatever the database's default collation is.
 // 10-12: Db2 scalar functions CHAR, DIGITS, TIMESTAMP, VARCHAR_FORMAT (sqlfn.rs).
-const VERSION: &str = "as4tainr services 62";
+const VERSION: &str = "as4tainr services 63";
 
 /// The buffer length of a field in a record (what an RPG program reads),
 /// from its DDS data type, length and decimal positions.
@@ -198,6 +198,28 @@ SELECT
        CAST(' ' AS char(1)) COLLATE "C" AS control
 FROM pg_catalog.pg_views v
 WHERE v.schemaname IN ('qsys2', 'systools');
+
+-- QSYS/QADBXFIL: the database cross-reference by file (IBM i 7.5's
+-- logical file over QADBXREF, record format QDBXREF, every record,
+-- keyed by DBXFIL, DBXLIB: DSPFD and DSPFFD on PUB400, 2026-11-12,
+-- tools/golden/xref.txt). The fields as4tainr knows, with their types:
+-- DBXATR PF physical, LF logical, TB table, VW view; DBXTYP D data, S
+-- source; DBXNFL the number of fields. IBM i Access Client Solutions'
+-- Data Transfer lists a library's files from it.
+CREATE OR REPLACE VIEW qsys.qadbxfil AS
+SELECT CAST(t.system_table_name AS char(10)) COLLATE "C" AS dbxfil,
+       CAST(t.system_table_schema AS char(10)) COLLATE "C" AS dbxlib,
+       CAST(t.table_owner AS char(10)) COLLATE "C" AS dbxown,
+       CAST(coalesce(t.table_text, '') AS char(50)) COLLATE "C" AS dbxtxt,
+       CAST(CASE t.table_type WHEN 'T' THEN 'TB' WHEN 'V' THEN 'VW'
+                 WHEN 'L' THEN 'LF' ELSE 'PF' END AS char(2)) COLLATE "C" AS dbxatr,
+       CAST(t.file_type AS char(1)) COLLATE "C" AS dbxtyp,
+       CAST(coalesce(t.column_count, 0) AS numeric(5, 0)) AS dbxnfl,
+       CAST(coalesce(t.row_length, 0) AS numeric(11, 0)) AS dbxrdl,
+       CAST(t.table_name AS varchar(128)) COLLATE "C" AS dbxlfi,
+       CAST(t.table_schema AS varchar(128)) COLLATE "C" AS dbxlb2
+  FROM qsys2.systables t
+ WHERE t.system_table_name IS NOT NULL;
 
 -- SYSCOLUMNS: the columns of tables, physical and logical files and views.
 CREATE OR REPLACE VIEW qsys2.syscolumns AS
@@ -568,6 +590,8 @@ pub async fn init(client: &Client) -> Result<()> {
              {SPOOLED_FILE_DATA}
              GRANT USAGE ON SCHEMA systools TO {SQL_ROLE};
              GRANT EXECUTE ON FUNCTION systools.spooled_file_data(varchar, varchar, integer) TO {SQL_ROLE};
+             GRANT USAGE ON SCHEMA qsys TO {SQL_ROLE};
+             GRANT SELECT ON qsys.qadbxfil TO {SQL_ROLE};
              GRANT SELECT ON qsys2.sysschemas, qsys2.systables, qsys2.syscolumns,
                    qsys2.sysindexes, qsys2.syskeys, qsys2.sysviews TO {SQL_ROLE};
              GRANT EXECUTE ON FUNCTION qsys2.object_statistics(varchar, varchar, varchar) TO {SQL_ROLE};

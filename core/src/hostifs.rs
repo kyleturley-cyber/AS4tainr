@@ -263,7 +263,13 @@ fn date(us: i64) -> Vec<u8> {
 }
 
 /// An object's attributes reply (0x8005).
-fn attrs_reply(corr: u32, e: &crate::ifs::Entry, name: &str, chained: bool) -> Vec<u8> {
+fn attrs_reply(
+    corr: u32,
+    e: &crate::ifs::Entry,
+    name: &str,
+    chained: bool,
+    restart: u32,
+) -> Vec<u8> {
     let mut t = Vec::with_capacity(72);
     for _ in 0..3 {
         t.extend(date(e.changed_us));
@@ -279,7 +285,7 @@ fn attrs_reply(corr: u32, e: &crate::ifs::Entry, name: &str, chained: bool) -> V
     t.push(0); // 72 access history
     t.extend(1200u16.to_be_bytes()); // 73 name CCSID
     t.extend([0u8; 2]); // 75
-    t.extend([0u8; 4]); // 77 restart ID
+    t.extend(restart.to_be_bytes()); // 77 restart ID
     t.extend((e.size as u64).to_be_bytes()); // 81
     t.push(0); // 89 file system type
     t.push(0);
@@ -318,7 +324,7 @@ async fn list(client: &tokio_postgres::Client, files: &Files, ds: &Ds) -> Vec<Ve
             Ok(Some(mut e)) => {
                 e.size = f.data.len() as i64;
                 let name = f.path.rsplit('/').next().unwrap_or("").to_string();
-                vec![attrs_reply(corr, &e, &name, false)]
+                vec![attrs_reply(corr, &e, &name, false, 0)]
             }
             _ => vec![return_code(corr, FILE_NOT_FOUND)],
         };
@@ -335,7 +341,7 @@ async fn list(client: &tokio_postgres::Client, files: &Files, ds: &Ds) -> Vec<Ve
     };
     if !last.contains(['*', '?']) {
         return match stat(client, &path).await {
-            Ok(Some(e)) => vec![attrs_reply(corr, &e, &last, false)],
+            Ok(Some(e)) => vec![attrs_reply(corr, &e, &last, false, 0)],
             Ok(None) => {
                 let parent = stat(client, &dir).await.ok().flatten();
                 let code = if parent.is_some_and(|p| p.dir) {
@@ -359,15 +365,38 @@ async fn list(client: &tokio_postgres::Client, files: &Files, ds: &Ds) -> Vec<Ve
         0xFFFF | 0 => usize::MAX,
         n => n as usize,
     };
+    // The entries matching, each with its restart ID (its place in the
+    // list, from 1). A request with a restart ID (CP 0x000E) or restart
+    // name (CP 0x0007) continues after that entry (JTOpen IFSListAttrsReq;
+    // IFSFileEnumeration passes the last entry it got).
+    let matching: Vec<(u32, &String)> = names
+        .iter()
+        .filter(|(n, _)| matches(&last, n))
+        .enumerate()
+        .map(|(i, (n, _))| (i as u32 + 1, n))
+        .collect();
+    let after = if let Some(id) = cp_at(ds, 40, 0x000E).filter(|b| b.len() >= 4) {
+        u32::from_be_bytes([id[0], id[1], id[2], id[3]])
+    } else if let Some(rn) = cp_at(ds, 40, 0x0007) {
+        let rn = name_text(ccsid, &rn);
+        matching
+            .iter()
+            .find(|(_, n)| **n == rn)
+            .map(|(i, _)| *i)
+            // Gone since: nothing more rather than the list again.
+            .unwrap_or(u32::MAX)
+    } else {
+        0
+    };
     let mut out = Vec::new();
-    for (name, _) in names.iter().filter(|(n, _)| matches(&last, n)).take(max) {
+    for (id, name) in matching.into_iter().filter(|(i, _)| *i > after).take(max) {
         let full = if dir == "/" {
             format!("/{name}")
         } else {
             format!("{dir}/{name}")
         };
         if let Ok(Some(e)) = stat(client, &full).await {
-            out.push(attrs_reply(corr, &e, name, true));
+            out.push(attrs_reply(corr, &e, name, true, id));
         }
     }
     out.push(return_code(corr, NO_MORE_FILES));
@@ -955,7 +984,7 @@ mod tests {
             size: 5,
             changed_us: 1_700_000_000_123_456,
         };
-        let r = attrs_reply(1, &e, "a.txt", true);
+        let r = attrs_reply(1, &e, "a.txt", true, 0);
         assert_eq!(u16::from_be_bytes([r[20], r[21]]) & 1, 1, "chained");
         assert_eq!(
             u32::from_be_bytes([r[22], r[23], r[24], r[25]]),

@@ -1586,13 +1586,37 @@ impl<'a> Machine<'a> {
             "CHECK" | "CHECKR" => {
                 let set = arg(self, 0)?.chars()?;
                 let s = arg(self, 1)?.chars()?;
+                // The start (ILE RPG Reference, %CHECK, %CHECKR): where
+                // %CHECK begins and %CHECKR ends, a position in the string,
+                // 1 to its length, even when it is empty (PUB400, IBM i
+                // 7.5, 2026-11-13: start 0, start 11 of a 10-character
+                // field and start 1 of an empty varying field are status
+                // 00100; %CHECK('AB' : 'AAABBBCCCD' : 5) is 7,
+                // %CHECKR('CD' : 'AAABBBCCCD' : 5) is 5).
+                let start = match args.get(2) {
+                    Some(x) => {
+                        let n = self.eval(x)?.num()?.to_i128()?;
+                        if n < 1 || n as usize > s.len() {
+                            bail!(
+                                "RNQ0100: %{b} start {n} is outside the string (length {}).",
+                                s.len()
+                            );
+                        }
+                        Some(n as usize)
+                    }
+                    None => None,
+                };
                 let pos = if b == "CHECK" {
-                    s.iter()
+                    let from = start.unwrap_or(1) - 1;
+                    s[from..]
+                        .iter()
                         .position(|c| !set.contains(c))
-                        .map(|p| p + 1)
+                        .map(|p| p + from + 1)
                         .unwrap_or(0)
                 } else {
-                    s.iter()
+                    let to = start.unwrap_or(s.len());
+                    s[..to]
+                        .iter()
                         .rposition(|c| !set.contains(c))
                         .map(|p| p + 1)
                         .unwrap_or(0)

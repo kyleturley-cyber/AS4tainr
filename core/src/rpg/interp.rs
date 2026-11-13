@@ -3607,6 +3607,12 @@ impl<'a> Machine<'a> {
     /// as their zoned digits (sign in the zone of the last digit).
     fn move_image(&mut self, ex: &Expr) -> Result<Vec<u8>> {
         let t = self.type_of(ex);
+        // A float operand does not compile (RNF7547, check.rs); a program
+        // that skipped the checks (rpg::call, AS4TAINR_PGM_PATH) gets an
+        // error here rather than a zoned image of 0 digits.
+        if matches!(t, Some(DType::Float(_))) {
+            bail!("MOVE and MOVEL do not take a float field.");
+        }
         let v = self.eval(ex)?;
         Ok(match v {
             Value::Num(d) => {

@@ -21029,6 +21029,38 @@ async fn move_with_a_float_field_does_not_compile() {
     assert!(listing.contains("*RNF7547 30"), "{listing}");
 }
 
+/// MOVE with a float field run without the compiler's checks (rpg::call,
+/// as sources from AS4TAINR_PGM_PATH are run) ends with an error, not a
+/// panic. On IBM i it does not compile (RNF7547), so there is no run-time
+/// behavior to match; the text is as4tainr's.
+#[tokio::test]
+async fn move_with_a_float_field_is_an_error_when_run() {
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = "     H DFTACTGRP(*NO)
+     DF                S              8F   INZ(1.5)
+     DC                S             10A
+     C                   MOVE      F             C
+     C                   EVAL      *INLR = *ON
+";
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        None,
+        "MVFLTR".into(),
+        src.into(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let e = r.error.map(|e| format!("{e:#}")).unwrap_or_default();
+    assert!(e.contains("do not take a float field"), "{e}");
+}
+
 /// What PUB400 showed for verify26 (2026-10-30, tools/golden/
 /// verify26.txt): DSPLY of a character field longer than 52 bytes does not
 /// compile (s26_dsply60, s26_dsply53: RNF7016 severity 20, RNS9308; 52

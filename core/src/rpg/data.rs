@@ -181,7 +181,10 @@ impl DType {
             | DType::Binary(..)
             | DType::Int(_)
             | DType::Uns(_) => {
-                encode_num(self, &Dec::ZERO, &mut b).expect("zero fits");
+                // A type of 0 digits has no bytes to set.
+                if !b.is_empty() {
+                    encode_num(self, &Dec::ZERO, &mut b).expect("zero fits");
+                }
             }
             DType::Ind => b[0] = 0xF0,
             // Float: all zero bytes are 0.0.

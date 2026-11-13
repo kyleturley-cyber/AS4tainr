@@ -198,7 +198,7 @@ pub static COMMANDS: &[CommandDef] = &[
     CommandDef {
         name: "DSPLIBL",
         description: "Display Library List",
-        params: &[],
+        params: &[p("OUTPUT", Kind::Name, false, Some("*"), "Output").ch("*, *PRINT")],
     },
     CommandDef {
         name: "ADDLIBLE",

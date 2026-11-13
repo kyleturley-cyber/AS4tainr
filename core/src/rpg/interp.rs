@@ -5719,13 +5719,8 @@ impl Machine<'_> {
                     bail!("QGYOLSPL needs 8 parameters and an error code");
                 };
                 let format = text(self, fmt).trim().to_ascii_uppercase();
-                if format != "OSPL0300" {
-                    return self
-                        .api_error(
-                            rest.first(),
-                            anyhow!("CPF3C21: Format name {format} is not valid."),
-                        )
-                        .map(|_| true);
+                if let Err(e) = crate::spoolapi::ospl_records(&[], &format) {
+                    return self.api_error(rest.first(), e).map(|_| true);
                 }
                 let fb = self.bufs[filter.buf][filter.off..].to_vec();
                 // The filter's format (after the error code): OSPF0100 or
@@ -5754,7 +5749,7 @@ impl Machine<'_> {
                 let user = self.io.user.clone();
                 let client = self.io.client;
                 let files = self.block(crate::spoolapi::select(client, &f, &user, job))?;
-                let records: Vec<Vec<u8>> = files.iter().map(crate::spoolapi::ospl0300).collect();
+                let (records, rec_len) = crate::spoolapi::ospl_records(&files, &format)?;
                 let total = records.len();
                 let room = (num(self, len)?.to_i128()?.max(0) as usize).min(self.rcv_room(rcv));
                 let want = num(self, count)?.to_i128()?;
@@ -5773,7 +5768,7 @@ impl Machine<'_> {
                     total,
                     returned,
                     h,
-                    136,
+                    rec_len,
                     usize::from(returned > 0),
                     out.len(),
                 );

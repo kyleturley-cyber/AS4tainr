@@ -47,6 +47,7 @@ pub mod hostcmd;
 pub mod hostdb;
 pub mod hostdtaq;
 pub mod hostifs;
+pub mod hostprt;
 pub mod hostsrv;
 pub mod ibmcmds;
 pub mod ifs;

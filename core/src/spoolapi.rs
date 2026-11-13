@@ -362,6 +362,74 @@ pub fn ospl0300(s: &Splf) -> Vec<u8> {
     b
 }
 
+/// One spooled file in format OSPL0100 (176 bytes) or OSPL0200 (184),
+/// laid out as JTOpen SpooledFileOpenList reads them: spooled file name,
+/// job name, user and number, spooled file number, total pages, current
+/// page, copies left, output queue and library, user data, status
+/// (CHAR(10): *READY, *OPEN, *CLOSED, *SAVED, *WRITING, *HELD), form
+/// type, priority (CHAR(2)), internal job and spooled file identifiers
+/// (16 bytes each: as4tainr's job number and spooled file ID), device
+/// type, the offset of the extension (152: the job's system name,
+/// CHAR(8), the date and time opened, CYYMMDD and HHMMSS); OSPL0200 then
+/// printer assigned ('3': none) and printer name (blank).
+pub fn ospl0100(s: &Splf, ospl0200: bool) -> Vec<u8> {
+    let status = match s.status.as_str() {
+        "RDY" => "*READY",
+        "OPN" => "*OPEN",
+        "CLO" => "*CLOSED",
+        "SAV" => "*SAVED",
+        "WTR" => "*WRITING",
+        "HLD" => "*HELD",
+        other => other,
+    };
+    let mut b = Vec::with_capacity(184);
+    b.extend(field(&s.file, 10));
+    b.extend(field(&s.job_name, 10));
+    b.extend(field(&s.job_user, 10));
+    b.extend(field(&format!("{:06}", s.job_number), 6));
+    b.extend(s.number.to_be_bytes());
+    b.extend(s.pages.to_be_bytes());
+    b.extend(0i32.to_be_bytes()); // 44 current page
+    b.extend(1i32.to_be_bytes()); // 48 copies left
+    b.extend(field(&s.outq, 10));
+    b.extend(field(&s.outq_lib, 10));
+    b.extend(field(&s.user_data, 10));
+    b.extend(field(status, 10));
+    b.extend(field("*STD", 10));
+    b.extend(field("5", 2));
+    let mut job_id = s.job_number.to_be_bytes().to_vec();
+    job_id.resize(16, 0);
+    b.extend(job_id);
+    let mut splf_id = s.id.to_be_bytes().to_vec();
+    splf_id.resize(16, 0);
+    b.extend(splf_id);
+    b.extend(field("*SCS", 10)); // 136 device type
+    b.extend([0u8; 2]);
+    b.extend(152i32.to_be_bytes()); // 148 offset to the extension
+                                    // The extension: the job's system name, the date and time opened.
+    b.extend(field(&crate::report::system_name(), 8)); // 152
+    b.extend(field(&s.opened.0, 7)); // 160
+    b.extend(field(&s.opened.1, 6)); // 167
+    if ospl0200 {
+        b.extend(field("3", 1)); // 173 printer assigned
+        b.extend(field("", 10)); // 174 printer name
+    } else {
+        b.extend([0u8; 3]);
+    }
+    b
+}
+
+/// The records of format FORMAT (OSPL0100, OSPL0200 or OSPL0300) and
+/// their length, or the error for another format.
+pub fn ospl_records(files: &[Splf], format: &str) -> Result<(Vec<Vec<u8>>, usize)> {
+    Ok(match format {
+        "OSPL0100" => (files.iter().map(|s| ospl0100(s, false)).collect(), 176),
+        "OSPL0200" => (files.iter().map(|s| ospl0100(s, true)).collect(), 184),
+        "OSPL0300" => (files.iter().map(ospl0300).collect(), 136),
+        _ => bail!("CPF3C21: Format name {format} is not valid."),
+    })
+}
+
 /// Open spooled files (QSPOPNSP): handle → spooled file.
 static OPEN: std::sync::Mutex<Option<HashMap<i32, (i64, i32)>>> = std::sync::Mutex::new(None);
 static NEXT_SPLF_HANDLE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
@@ -525,9 +593,7 @@ pub async fn host_call(
                     );
                 }
                 let format = crate::rpg::data::a(&p[7]).trim().to_ascii_uppercase();
-                if format != "OSPL0300" {
-                    anyhow::bail!("CPF3C21: Format name {format} is not valid.");
-                }
+                ospl_records(&[], &format)?;
                 let ffmt = p
                     .get(9)
                     .map(|b| crate::rpg::data::a(b).trim().to_ascii_uppercase())
@@ -550,7 +616,7 @@ pub async fn host_call(
                     )
                 };
                 let files = select(client, &f, user, job).await?;
-                let records: Vec<Vec<u8>> = files.iter().map(ospl0300).collect();
+                let (records, rec_len) = ospl_records(&files, &format)?;
                 let total = records.len();
                 let room = (bin(&p[1]).max(0) as usize).min(p[0].len());
                 let want = bin(&p[3]);
@@ -569,7 +635,7 @@ pub async fn host_call(
                     total,
                     returned,
                     h,
-                    136,
+                    rec_len,
                     usize::from(returned > 0),
                     out.len(),
                 );

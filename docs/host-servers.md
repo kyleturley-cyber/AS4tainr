@@ -142,7 +142,7 @@ says its job is number/QUSER/QZRCSRVS, so `ProgramCall.getServerJob`
 needs no API call.
 
 Program calls reach the spooled file list APIs too (QGYOLSPL with
-format OSPL0300, QGYGTLE, QGYCLST), which JTOpen's SpooledFileOpenList
+formats OSPL0100, OSPL0200 and OSPL0300, QGYGTLE, QGYCLST), which JTOpen's SpooledFileOpenList
 and so ACS's printer output use.
 
 ## Data queues
@@ -182,6 +182,19 @@ ID or restart name continues after that entry.
 The user handle requests (seed, create user handle) are answered for
 the connection's user, and lookups give an object handle with the
 object's owner, ASP and CCSID (JTOpen IFSObjAttrs1, IFSObjAttrs2).
+
+## The print server
+
+The network print server (as-netprt, 8474) serves spooled files the way
+IBM i Access Client Solutions' printer output and the Toolbox's
+SpooledFile, PrintObjectInputStream and PrintObjectTransformedInputStream
+read them: the server's attributes (CCSID 37, its level and job), a
+spooled file's attributes (name, number, job, status, pages, output
+queue, user data, page size, lines and characters per inch...), its SCS
+data (open, read, seek, tell, close) and its text through open modified:
+ASCII lines ending in CR LF, a form feed after each page, whatever
+transform is asked for. Spooled files are not held, released, moved,
+deleted, sent or created through it.
 
 ## Passwords
 

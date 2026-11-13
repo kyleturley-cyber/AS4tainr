@@ -12179,6 +12179,44 @@ async fn spooled_file_apis_and_printed_output_of_system() {
         .await
         .expect("an API")
         .unwrap();
+    // Format OSPL0200, which ACS's printer output asks for (JTOpen
+    // SpooledFileOpenList formatOutputData: the spooled file name at 0,
+    // the status as CHAR(10) at 82, the offset of the extension at 148,
+    // the date opened at 160): records of the length the list
+    // information gives.
+    p[7] = e("OSPL0200");
+    as4tainr_core::spoolapi::host_call(&client, "QGYOLSPL", "QSECOFR", None, &mut p)
+        .await
+        .expect("an API")
+        .unwrap();
+    let total = i32::from_be_bytes(p[2][0..4].try_into().unwrap());
+    let rec = i32::from_be_bytes(p[2][12..16].try_into().unwrap()) as usize;
+    let handle = p[2][8..12].to_vec();
+    let size = total as usize * rec;
+    let mut g = vec![
+        vec![0; size],
+        (size as i32).to_be_bytes().to_vec(),
+        handle.clone(),
+        vec![0; 80],
+        total.to_be_bytes().to_vec(),
+        1i32.to_be_bytes().to_vec(),
+        vec![0; 8],
+    ];
+    as4tainr_core::spoolapi::host_call(&client, "QGYGTLE", "QSECOFR", None, &mut g)
+        .await
+        .expect("an API")
+        .unwrap();
+    let r = g[0]
+        .chunks(rec)
+        .find(|r| r[0..10] == e("GLDSPL    ")[..])
+        .expect("GLDSPL in OSPL0200");
+    assert_eq!(r[82], e("*")[0], "a status such as *READY");
+    assert_eq!(i32::from_be_bytes(r[148..152].try_into().unwrap()), 152);
+    let mut c = vec![handle, vec![0; 8]];
+    as4tainr_core::spoolapi::host_call(&client, "QGYCLST", "QSECOFR", None, &mut c)
+        .await
+        .expect("an API")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -28893,6 +28931,121 @@ async fn host_servers_sign_on_and_database_attributes() {
     let r = read(&mut s).await;
     assert_eq!(entry_name(&r), second, "restart by name");
     assert_eq!(u16b(&read(&mut s).await, 22), 18);
+    // The print server (as-netprt, 0xE003; JTOpen NPDataStream: a 12-byte
+    // template of action, flags, return code, error object; the reply ID
+    // the request's with bit 0x8000; NPConversation, PrintObjectImplRemote,
+    // PrintObjectTransformedInputStreamImplRemote): the server's CCSID
+    // (attribute 0x008A), a spooled file's pages (0x006F) by its ID
+    // (name 0x0068, number 0x0069, job name 0x003B, user 0x003E, number
+    // 0x003C), its text through open modified (0x001A), read (0x0003,
+    // NUMBYTES 0x007D; return code 0x0013 at the end) and close (0x0005).
+    {
+        use as4tainr_core::hostprt::{parse_values, values_cp, Value};
+        let job = as4tainr_core::jobs::start_interactive(
+            &client,
+            "PRTDEV",
+            &user,
+            None,
+            std::slice::from_ref(&lib),
+        )
+        .await
+        .unwrap();
+        as4tainr_core::spool::print_lines(
+            &client,
+            &job,
+            "QSYSPRT",
+            "NPTEST",
+            &["HELLO PRINT SERVER".into()],
+        )
+        .await
+        .unwrap();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let u2 = url.clone();
+        tokio::spawn(async move {
+            let (s, _) = l.accept().await.unwrap();
+            as4tainr_core::hostcmd::serve_as(&u2, s, 0xE003).await
+        });
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(&ds(&[], 0xE003, 0x7001, &client_seed))
+            .await
+            .unwrap();
+        let r = read(&mut s).await;
+        let server_seed = r[24..32].to_vec();
+        let mut p = cp(0x1105, &substitute("PW123", &server_seed, &client_seed));
+        p.extend(cp(0x1104, &uid37));
+        s.write_all(&ds(&p, 0xE003, 0x7002, &[3, 1])).await.unwrap();
+        assert_eq!(u32_at(&read(&mut s).await, 20), 0);
+        let tmpl = |action: u16| {
+            let mut t = action.to_be_bytes().to_vec();
+            t.extend([0u8; 10]);
+            t
+        };
+        let ids = |list: &[u16]| {
+            let mut d = (list.len() as u16).to_be_bytes().to_vec();
+            d.extend(2u16.to_be_bytes());
+            for i in list {
+                d.extend(i.to_be_bytes());
+            }
+            cp(0x0007, &d)
+        };
+        let value = |r: &[u8], id: u16| -> Vec<u8> {
+            let at = 32;
+            assert_eq!(u16::from_be_bytes([r[at + 4], r[at + 5]]), 0x0008);
+            parse_values(&r[at + 6..])[&id].clone()
+        };
+        s.write_all(&ds(&ids(&[0x008A]), 0xE003, 0x0008, &tmpl(0x000F)))
+            .await
+            .unwrap();
+        let r = read(&mut s).await;
+        assert_eq!(u16::from_be_bytes([r[18], r[19]]), 0x8008, "the reply ID");
+        assert_eq!(u16::from_be_bytes([r[26], r[27]]), 0, "return code");
+        assert_eq!(value(&r, 0x008A), 37i32.to_be_bytes());
+        let id = values_cp(
+            0x0001,
+            &[
+                (0x0068, Value::Str("QSYSPRT".into())),
+                (0x003B, Value::Str("PRTDEV".into())),
+                (0x003E, Value::Str(user.clone())),
+                (0x003C, Value::Str(format!("{:06}", job.number))),
+                (0x0069, Value::Int(1)),
+            ],
+        );
+        let mut p = id.clone();
+        p.extend(ids(&[0x006F]));
+        s.write_all(&ds(&p, 0xE003, 0x0001, &tmpl(0x000F)))
+            .await
+            .unwrap();
+        let r = read(&mut s).await;
+        assert_eq!(u16::from_be_bytes([r[26], r[27]]), 0);
+        assert_eq!(value(&r, 0x006F), 1i32.to_be_bytes(), "one page");
+        s.write_all(&ds(&id, 0xE003, 0x0001, &tmpl(0x001A)))
+            .await
+            .unwrap();
+        let r = read(&mut s).await;
+        assert_eq!(u16::from_be_bytes([r[26], r[27]]), 0);
+        assert_eq!(u16::from_be_bytes([r[36], r[37]]), 0x000C, "a handle");
+        let handle = cp(0x000C, &r[38..r.len()]);
+        let mut p = handle.clone();
+        p.extend(values_cp(0x0008, &[(0x007D, Value::Int(4096))]));
+        s.write_all(&ds(&p, 0xE003, 0x0001, &tmpl(0x0003)))
+            .await
+            .unwrap();
+        let r = read(&mut s).await;
+        assert_eq!(u16::from_be_bytes([r[36], r[37]]), 0x0009, "data");
+        let text = String::from_utf8_lossy(&r[38..]).to_string();
+        assert!(text.contains("HELLO PRINT SERVER\r\n"), "{text:?}");
+        s.write_all(&ds(&p, 0xE003, 0x0001, &tmpl(0x0003)))
+            .await
+            .unwrap();
+        let r = read(&mut s).await;
+        assert_eq!(u16::from_be_bytes([r[26], r[27]]), 0x0013, "end of file");
+        s.write_all(&ds(&handle, 0xE003, 0x0001, &tmpl(0x0005)))
+            .await
+            .unwrap();
+        let r = read(&mut s).await;
+        assert_eq!(u16::from_be_bytes([r[26], r[27]]), 0);
+    }
     // The central server (JTOpen NLSGetTableRequest/Reply): CCSID 37's
     // characters in UTF-16, 0xC1 'A' (the code page 37 chart).
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

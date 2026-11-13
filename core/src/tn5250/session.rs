@@ -973,6 +973,20 @@ async fn request(
                     .map(|m| (level, format!("  {}", crate::jobs::shown_text(m)))),
             );
         }
+        // A display command with OUTPUT(*PRINT): its report goes to its
+        // printer file as a spooled file of this job, as in a CL program
+        // (report.rs printer_file; verify9 d9_prt_rows), not on the screen.
+        Ok(Outcome::Display(d))
+            if !d.print.is_empty() && job.id.is_some() && printed_output(&line) =>
+        {
+            let name = command_name(&line);
+            let file = crate::report::printer_file(&name);
+            let id = job.id.clone().expect("a job");
+            crate::spool::print_lines(job.client, &id, file, &name, &d.print).await?;
+            done.message = format!("Output of {name} printed to spooled file {file}.");
+            rq.log.push((rq.level, format!("  {}", done.message)));
+            done.in_log = true;
+        }
         Ok(Outcome::Display(d)) => {
             show_list(term, job, &cfg.system_name, d).await?;
         }
@@ -2994,5 +3008,34 @@ mod tests {
         }
         assert_eq!(prompt_title_col("Create Data Area (CRTDTAARA)"), 27);
         assert_eq!(prompt_title_col("Create Printer File (CRTPRTF)"), 27);
+    }
+}
+
+/// The command's name, as typed first on the line.
+fn command_name(line: &str) -> String {
+    line.trim()
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase()
+}
+
+/// Was the command given OUTPUT(*PRINT)?
+fn printed_output(line: &str) -> bool {
+    crate::cl::parse(line).is_ok_and(|c| c.get("OUTPUT").eq_ignore_ascii_case("*PRINT"))
+}
+
+#[cfg(test)]
+mod printed_output_tests {
+    // OUTPUT(*PRINT) on a display command sends its report to a spooled
+    // file (CL reference: DSPJOB, DSPLIBL OUTPUT *PRINT); OUTPUT(*) or no
+    // OUTPUT shows it.
+    #[test]
+    fn output_print_is_seen() {
+        assert!(super::printed_output("DSPJOB OUTPUT(*PRINT)"));
+        assert!(super::printed_output("dsplibl output(*print)"));
+        assert!(!super::printed_output("DSPLIBL"));
+        assert!(!super::printed_output("DSPJOB OUTPUT(*)"));
+        assert_eq!(super::command_name("dspjob output(*print)"), "DSPJOB");
     }
 }

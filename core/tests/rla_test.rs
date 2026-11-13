@@ -15400,6 +15400,121 @@ endif;
     assert_eq!(r.messages, ["70 0 2", "1970-01-02"]);
 }
 
+/// %SUBST of a character field with literal arguments out of range does
+/// not compile (issue #7): CRTBNDRPG reports RNF0364, severity 20, for
+/// lines 7 and 8 (start 11 and start 12 of a 10-character field) and
+/// RNF0365, severity 20, for line 9 (start 9, length 5), and fails (PUB400
+/// 2026-11-12, IBM i 7.5, this source); start 0 is RNF0362, and a named
+/// constant start or a VARCHAR's declared length count too (2026-11-13).
+#[tokio::test]
+async fn subst_with_constants_out_of_range_does_not_compile() {
+    use as4tainr_core::commands::{Environment, Job};
+    use as4tainr_core::source;
+    let url = require_db!();
+    let (client, lib) = setup(&url).await;
+    let env = Environment {
+        database_url: url.clone(),
+    };
+    let mut job = Job {
+        client: &client,
+        env: &env,
+        user: "QSECOFR".into(),
+        curlib: Some(lib.clone()),
+        libl: vec![lib.clone(), "QGPL".into()],
+        display: None,
+        id: None,
+        calls: Default::default(),
+    };
+    cl_cmd(&mut job, format!("CRTSRCPF FILE({lib}/QSRC) RCDLEN(112)"))
+        .await
+        .unwrap();
+    let src = "**FREE
+// %SUBST with constant arguments out of range: what the compiler
+// says about each statement.
+ctl-opt dftactgrp(*no);
+dcl-s a char(10) inz('ABCDEFGHIJ');
+dcl-s c char(5);
+c = %subst(a:11);
+c = %subst(a:12:1);
+c = %subst(a:9:5);
+*inlr = *on;
+";
+    // A start of 0, a named constant start, and a start past a VARCHAR's
+    // declared length; a start within it, and a length of 0, compile
+    // (PUB400 2026-11-13, IBM i 7.5, this source).
+    let more = "**FREE
+// %SUBST with constant arguments out of range, for the review of
+// upstream PR #12: a start of 0, a named constant start, and a varchar
+// field with a start past its declared length.
+ctl-opt dftactgrp(*no);
+dcl-c START 11;
+dcl-s a char(10) inz('ABCDEFGHIJ');
+dcl-s v varchar(10) inz('ABC');
+dcl-s c char(5);
+c = %subst(a:0:1);
+c = %subst(a:START);
+c = %subst(v:11);
+c = %subst(v:10:1);
+c = %subst(a:2:0);
+*inlr = *on;
+";
+    for (name, src) in [("SUBK", src), ("SUBK2", more)] {
+        source::put_member(
+            &client,
+            &source::Member {
+                library: lib.clone(),
+                file: "QSRC".into(),
+                name: name.into(),
+                srctype: "RPGLE".into(),
+                source: src.into(),
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    // The (message, line) pairs of the listing's diagnostic lines, not
+    // the summary's counts.
+    let diags = |listing: &str| -> Vec<(String, String)> {
+        listing
+            .lines()
+            .filter(|l| l.starts_with("*RNF03"))
+            .filter_map(|l| {
+                let w: Vec<&str> = l.split_whitespace().collect();
+                let seq = w.get(3)?;
+                (seq.len() == 6 && seq.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| (w[0].to_string(), w[2].to_string()))
+            })
+            .collect()
+    };
+    for (name, want) in [
+        (
+            "SUBK",
+            vec![("*RNF0364", "7"), ("*RNF0364", "8"), ("*RNF0365", "9")],
+        ),
+        (
+            "SUBK2",
+            vec![("*RNF0362", "10"), ("*RNF0364", "11"), ("*RNF0364", "12")],
+        ),
+    ] {
+        job.calls.printed.clear();
+        let e = job
+            .run(&format!("CRTBNDRPG PGM({lib}/{name}) SRCFILE({lib}/QSRC)"))
+            .await
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default();
+        assert!(e.contains("RNS9308"), "{name}: {e}");
+        let listing = std::mem::take(&mut job.calls.printed).join("\n");
+        let want: Vec<(String, String)> = want
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        assert_eq!(diags(&listing), want, "{name}: {listing}");
+    }
+}
+
 /// mitime builds an MI time interval in the variable it is given (also a
 /// CONST-declared one, as iRPGUnit's MILIB prototype has it) and
 /// waittime waits that long (iRPGUnit's waitSeconds).

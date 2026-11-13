@@ -14,6 +14,9 @@
 //!   result of a file operation (RNF7260), and the record format is then
 //!   not used (RNF7066, 00) (PUB400 2026-10-28, tools/golden/verify12.txt
 //!   n12_rpgp, n12_rpgx, n12_rpgj: `dcl-ds outr likerec(OUTR: *output)`);
+//! - RNF0362, RNF0364 and RNF0365 (20): %SUBST of a character field
+//!   with a constant start of 0 or less, a start past its declared
+//!   length, or a length past its end (PUB400 2026-11-12, 2026-11-13);
 //! - RNF7016 (20): DSPLY of a character field longer than 52 bytes
 //!   (PUB400 2026-10-30, tools/golden/verify26.txt s26_dsply60);
 //! - RNF7547 (30): a float field as an operand of MOVE or MOVEL (PUB400
@@ -138,6 +141,9 @@ impl Walker<'_> {
                 for a in args {
                     bad |= self.expr(line, a);
                 }
+                if b.eq_ignore_ascii_case("SUBST") {
+                    self.subst_constants(line, args);
+                }
             }
             Expr::Unary(_, x) => bad |= self.expr(line, x),
             Expr::Bin(_, a, b) => {
@@ -147,6 +153,67 @@ impl Walker<'_> {
             _ => {}
         }
         bad
+    }
+
+    /// %SUBST of a character field with a constant start (and length): a
+    /// literal or a named constant. A start of 0 or less is RNF0362; a
+    /// start past the field's declared length is RNF0364; a length past
+    /// its end is RNF0365; all severity 20 (PUB400, IBM i 7.5: start 11
+    /// and 12 of a 10-character field, start 9 with length 5, 2026-11-12;
+    /// start 0, a named constant 11, start 11 of a VARCHAR(10),
+    /// 2026-11-13).
+    fn subst_constants(&mut self, line: usize, args: &[Expr]) {
+        let len = match args.first() {
+            Some(Expr::Name { parts, args: None }) => match self.sym(&parts.join(".")) {
+                Some(Sym::Var(v)) if v.dim == 0 => match v.dtype {
+                    DType::Char(n) | DType::Varchar(n) => i128::from(n),
+                    _ => return,
+                },
+                _ => return,
+            },
+            _ => return,
+        };
+        let constant = |e: Option<&Expr>| match e {
+            Some(Expr::Num(d)) => d.to_i128().ok(),
+            Some(Expr::Name { parts, args: None }) => match self.sym(&parts.join(".")) {
+                Some(Sym::Const(super::data::Value::Num(d))) => d.to_i128().ok(),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(start) = constant(args.get(1)) else {
+            return;
+        };
+        let diag = if start < 1 {
+            Some((
+                "RNF0362",
+                format!("The %SUBST start {start} is not a position in the string."),
+            ))
+        } else if start > len {
+            Some((
+                "RNF0364",
+                format!("The %SUBST start {start} is past the end of the string ({len})."),
+            ))
+        } else {
+            match constant(args.get(2)) {
+                Some(n) if n >= 0 && start - 1 + n > len => Some((
+                    "RNF0365",
+                    format!(
+                        "The %SUBST length {n} from start {start} goes past the end of the string ({len})."
+                    ),
+                )),
+                _ => None,
+            }
+        };
+        if let Some((id, text)) = diag {
+            self.out.diags.push(Diag {
+                line,
+                id: id.into(),
+                sev: 20,
+                text,
+                at: None,
+            });
+        }
     }
 
     fn undefined(&mut self, line: usize, name: &str) {

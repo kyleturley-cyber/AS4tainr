@@ -23032,6 +23032,48 @@ async fn fixed_form_constants_and_initial_values() {
     );
 }
 
+/// OVERLAY(field : *NEXT) places a subfield past the earlier subfields
+/// that overlay the same field, within it (issue #4; ILE RPG Reference,
+/// OVERLAY keyword). Expected values: PUB400, IBM i 7.5, 2026-11-12, this
+/// program with DSPLY written to a stream file.
+#[tokio::test]
+async fn overlay_next_is_within_the_overlaid_field() {
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = r#"**free
+ctl-opt dftactgrp(*no);
+dcl-ds part;
+  PartNumber char(10);
+  Family char(3) overlay(PartNumber);
+  Sequence char(6) overlay(PartNumber : *next);
+  Language char(1) overlay(PartNumber : *next);
+end-ds;
+PartNumber = 'ABC123456E';
+dsply ('OVL FAMILY=' + Family + '|SEQUENCE=' + Sequence + '|LANGUAGE=' + Language + '|');
+dsply ('OVL SIZE=' + %char(%size(part)));
+*inlr = *on;
+"#;
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        None,
+        "OVLNEXT".into(),
+        src.into(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        ["OVL FAMILY=ABC|SEQUENCE=123456|LANGUAGE=E|", "OVL SIZE=10"]
+    );
+}
+
 /// An external procedure that is a service program's procedure (Db2 for
 /// i SQL Reference, CREATE PROCEDURE (external): EXTERNAL NAME
 /// 'lib/srvpgm(entry)'), PARAMETER STYLE GENERAL: parameters by

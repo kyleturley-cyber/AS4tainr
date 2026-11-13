@@ -1800,6 +1800,9 @@ impl Binder<'_> {
         let mut shape: HashMap<String, (u32, usize, usize)> = HashMap::new();
         // Group subfields (no type or length) → their index in `subs`.
         let mut groups: HashMap<String, usize> = HashMap::new();
+        // Where the subfields that overlay a subfield end so far, by the
+        // overlaid subfield: OVERLAY(name : *NEXT) goes there.
+        let mut overlay_end: HashMap<String, usize> = HashMap::new();
         if let Some(other) = &likeds {
             let found = match self.syms.get(other) {
                 Some(Sym::Ds(o)) => Some((other.clone(), o.clone())),
@@ -1909,6 +1912,14 @@ impl Binder<'_> {
                         .ok_or_else(|| anyhow!("OVERLAY({target}): not a subfield before"))?
                 };
                 match k.args.get(1).map(|a| a.trim().to_ascii_uppercase()) {
+                    // The next position within the overlaid subfield, past
+                    // the subfields before this one that overlay it (ILE
+                    // RPG Reference, OVERLAY keyword; PUB400 2026-11-12,
+                    // IBM i 7.5: Family 1-3, Sequence 4-9 and Language 10
+                    // of a 10-byte PartNumber, a 10-byte structure).
+                    Some(p) if p == "*NEXT" && target != name => {
+                        overlay_end.get(&target).copied().unwrap_or(base)
+                    }
                     Some(p) if p == "*NEXT" => next,
                     Some(p) => base + p.parse::<usize>()? - 1,
                     None => base,
@@ -1979,6 +1990,15 @@ impl Binder<'_> {
                 }
             }
             let end = off + t.size() * sdim.max(1) as usize;
+            if let Some(k) = keyword(&s.keywords, "OVERLAY") {
+                let target = k
+                    .args
+                    .first()
+                    .map(|a| a.trim().to_ascii_uppercase())
+                    .unwrap_or_default();
+                let e = overlay_end.entry(target).or_insert(0);
+                *e = (*e).max(end);
+            }
             if keyword(&s.keywords, "OVERLAY").is_none() || end > next {
                 next = next.max(end);
             }

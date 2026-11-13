@@ -1404,7 +1404,12 @@ impl<'a> Machine<'a> {
             "SUBST" => {
                 let s = arg(self, 0)?.chars()?;
                 let start = arg(self, 1)?.num()?.to_i128()?;
-                if start < 1 || start as usize > s.len() + 1 {
+                // The start is a position in the string, 1 to its current
+                // length, even with a length of 0 (PUB400, IBM i 7.5,
+                // 2026-11-12: a 10-character field with start 11 and
+                // length 0, and an empty varying field with start 1, are
+                // status 00100).
+                if start < 1 || start as usize > s.len() {
                     bail!(
                         "RNQ0100: %SUBST start {start} is outside the string (length {}).",
                         s.len()
@@ -1503,10 +1508,22 @@ impl<'a> Machine<'a> {
                 let pat = arg(self, 0)?.chars()?;
                 let s = arg(self, 1)?.chars()?;
                 let start = match args.get(2) {
-                    Some(x) => self.eval(x)?.num()?.to_i128()? as usize,
+                    Some(x) => self.eval(x)?.num()?.to_i128()?,
                     None => 1,
                 };
-                let found = if pat.is_empty() || start == 0 || start > s.len() {
+                // The start is a position in the string, 1 to its length;
+                // in an empty string nothing is found (PUB400, IBM i 7.5,
+                // 2026-11-12: start 0, and start 11 of a 10-character
+                // field, are status 00100; an empty varying field gives 0
+                // with start 1 or 2).
+                if start < 1 || !s.is_empty() && start as usize > s.len() {
+                    bail!(
+                        "RNQ0100: %SCAN start {start} is outside the string (length {}).",
+                        s.len()
+                    );
+                }
+                let start = start as usize;
+                let found = if pat.is_empty() || start > s.len() {
                     0
                 } else {
                     s[start - 1..]

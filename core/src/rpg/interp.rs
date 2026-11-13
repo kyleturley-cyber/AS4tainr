@@ -1512,18 +1512,19 @@ impl<'a> Machine<'a> {
                     None => 1,
                 };
                 // The start is a position in the string, 1 to its length;
-                // in an empty string nothing is found (PUB400, IBM i 7.5,
-                // 2026-11-12: start 0, and start 11 of a 10-character
-                // field, are status 00100; an empty varying field gives 0
-                // with start 1 or 2).
-                if start < 1 || !s.is_empty() && start as usize > s.len() {
+                // in an empty string nothing is found, whatever the start
+                // (PUB400, IBM i 7.5: start 0, and start 11 of a
+                // 10-character field, are status 00100, 2026-11-12; an
+                // empty varying field gives 0 with start 1, 2, 99, 0 and
+                // -5, 2026-11-13).
+                if !s.is_empty() && (start < 1 || start as usize > s.len()) {
                     bail!(
                         "RNQ0100: %SCAN start {start} is outside the string (length {}).",
                         s.len()
                     );
                 }
                 let start = start as usize;
-                let found = if pat.is_empty() || start > s.len() {
+                let found = if pat.is_empty() || s.is_empty() {
                     0
                 } else {
                     s[start - 1..]

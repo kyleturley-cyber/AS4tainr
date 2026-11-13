@@ -15205,8 +15205,10 @@ endmon;
 }
 
 /// %SUBST and %SCAN take a start from 1 to the string's length (issue
-/// #6). Expected values: PUB400, IBM i 7.5, 2026-11-12, the same program
-/// with each line written to a stream file instead of DSPLY.
+/// #6); %SCAN of an empty string gives 0 whatever the start. Expected
+/// values: PUB400, IBM i 7.5, 2026-11-12 and 2026-11-13 (start 0 of an
+/// empty varying field), the same program with each line written to a
+/// stream file instead of DSPLY.
 #[tokio::test]
 async fn subst_and_scan_start_within_the_string() {
     use as4tainr_core::rpg;
@@ -15266,6 +15268,12 @@ monitor;
 on-error;
   dsply ('SCAN EMPTY ERR ' + %char(%status));
 endmon;
+monitor;
+  n = %scan('A':v:s0);
+  dsply ('SCAN EMPTY START0 ' + %char(n));
+on-error;
+  dsply ('SCAN EMPTY START0 ERR ' + %char(%status));
+endmon;
 *inlr = *on;
 "#;
     let r = rpg::call(
@@ -15292,6 +15300,7 @@ endmon;
             "SCAN ZERO ERR 100",
             "SCAN AT LEN 10",
             "SCAN EMPTY 0",
+            "SCAN EMPTY START0 0",
         ]
     );
 }

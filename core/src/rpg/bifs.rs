@@ -534,17 +534,25 @@ impl Machine<'_> {
             "SCANR" => {
                 let pat = arg(self, 0)?.chars()?;
                 let s = arg(self, 1)?.chars()?;
-                let start = if args.len() > 2 {
-                    int_arg(self, 2)? as usize
-                } else {
-                    1
-                };
+                let start = if args.len() > 2 { int_arg(self, 2)? } else { 1 };
+                // As %SCAN: a start from 1 to the string's length; in an
+                // empty string nothing is found (PUB400, IBM i 7.5,
+                // 2026-11-13: start 0 and start 11 of a 10-character field
+                // are status 00100; start 1 of an empty varying field
+                // gives 0).
+                if s.is_empty() && start >= 1 {
+                    return Ok(Some(num(0)));
+                }
+                if start < 1 || start as usize > s.len() {
+                    bail!("RNQ0100: %SCANR start or length is outside the string.");
+                }
+                let start = start as usize;
                 let len = if args.len() > 3 {
                     int_arg(self, 3)? as usize
                 } else {
-                    s.len() + 1 - start.max(1)
+                    s.len() + 1 - start
                 };
-                if start < 1 || start - 1 + len > s.len() {
+                if start - 1 + len > s.len() {
                     bail!("RNQ0100: %SCANR start or length is outside the string.");
                 }
                 let hay = &s[start - 1..start - 1 + len];

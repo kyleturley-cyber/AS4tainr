@@ -25293,6 +25293,184 @@ async fn work_with_move_rename_and_clear() {
         .is_some());
 }
 
+/// %CHECK and %CHECKR take their start (where %CHECK begins and %CHECKR
+/// ends), from 1 to the string's length, even for an empty string; %SCANR
+/// takes it from 1 to the length, and an empty string gives 0. Outside
+/// that, status 00100. Expected values: PUB400, IBM i 7.5, 2026-11-13,
+/// this program with DSPLY written to a stream file.
+#[tokio::test]
+async fn check_checkr_and_scanr_take_a_start_within_the_string() {
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = r#"**free
+ctl-opt dftactgrp(*no);
+dcl-s a char(10) inz('AAABBBCCCD');
+dcl-s v varchar(10) inz('');
+dcl-s n packed(3:0);
+dcl-s s0 packed(3:0) inz(0);
+dcl-s s1 packed(3:0) inz(1);
+dcl-s s2 packed(3:0) inz(2);
+dcl-s s5 packed(3:0) inz(5);
+dcl-s s9 packed(3:0) inz(9);
+dcl-s s10 packed(3:0) inz(10);
+dcl-s s11 packed(3:0) inz(11);
+monitor;
+  n = %check('A':a);
+  dsply ('CHECK NOSTART ' + %char(n));
+on-error;
+  dsply ('CHECK NOSTART ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %check('A':a:s2);
+  dsply ('CHECK START2 ' + %char(n));
+on-error;
+  dsply ('CHECK START2 ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %check('AB':a:s5);
+  dsply ('CHECK START5 ' + %char(n));
+on-error;
+  dsply ('CHECK START5 ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %check('A':a:s10);
+  dsply ('CHECK START10 ' + %char(n));
+on-error;
+  dsply ('CHECK START10 ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %check('A':a:s11);
+  dsply ('CHECK START11 ' + %char(n));
+on-error;
+  dsply ('CHECK START11 ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %check('A':a:s0);
+  dsply ('CHECK START0 ' + %char(n));
+on-error;
+  dsply ('CHECK START0 ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %check('A':v:s1);
+  dsply ('CHECK EMPTY1 ' + %char(n));
+on-error;
+  dsply ('CHECK EMPTY1 ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %checkr('CD':a);
+  dsply ('CHECKR NOSTART ' + %char(n));
+on-error;
+  dsply ('CHECKR NOSTART ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %checkr('D':a:s9);
+  dsply ('CHECKR START9 ' + %char(n));
+on-error;
+  dsply ('CHECKR START9 ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %checkr('CD':a:s5);
+  dsply ('CHECKR START5 ' + %char(n));
+on-error;
+  dsply ('CHECKR START5 ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %checkr('A':a:s11);
+  dsply ('CHECKR START11 ' + %char(n));
+on-error;
+  dsply ('CHECKR START11 ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %checkr('A':a:s0);
+  dsply ('CHECKR START0 ' + %char(n));
+on-error;
+  dsply ('CHECKR START0 ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %checkr('A':v:s1);
+  dsply ('CHECKR EMPTY1 ' + %char(n));
+on-error;
+  dsply ('CHECKR EMPTY1 ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %scanr('B':a);
+  dsply ('SCANR NOSTART ' + %char(n));
+on-error;
+  dsply ('SCANR NOSTART ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %scanr('B':a:s5);
+  dsply ('SCANR START5 ' + %char(n));
+on-error;
+  dsply ('SCANR START5 ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %scanr('D':a:s10);
+  dsply ('SCANR START10 ' + %char(n));
+on-error;
+  dsply ('SCANR START10 ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %scanr('A':a:s11);
+  dsply ('SCANR START11 ' + %char(n));
+on-error;
+  dsply ('SCANR START11 ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %scanr('A':a:s0);
+  dsply ('SCANR START0 ' + %char(n));
+on-error;
+  dsply ('SCANR START0 ERR ' + %char(%status));
+endmon;
+monitor;
+  n = %scanr('A':v:s1);
+  dsply ('SCANR EMPTY1 ' + %char(n));
+on-error;
+  dsply ('SCANR EMPTY1 ERR ' + %char(%status));
+endmon;
+*inlr = *on;
+"#;
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        None,
+        "CHKSTART".into(),
+        src.into(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "CHECK NOSTART 4",
+            "CHECK START2 4",
+            "CHECK START5 7",
+            "CHECK START10 10",
+            "CHECK START11 ERR 100",
+            "CHECK START0 ERR 100",
+            "CHECK EMPTY1 ERR 100",
+            "CHECKR NOSTART 6",
+            "CHECKR START9 9",
+            "CHECKR START5 5",
+            "CHECKR START11 ERR 100",
+            "CHECKR START0 ERR 100",
+            "CHECKR EMPTY1 ERR 100",
+            "SCANR NOSTART 6",
+            "SCANR START5 6",
+            "SCANR START10 10",
+            "SCANR START11 ERR 100",
+            "SCANR START0 ERR 100",
+            "SCANR EMPTY1 0",
+        ]
+    );
+}
+
 // CHGPF SRCFILE: the file made again from its changed DDS with its
 // records kept field by field by name: a longer field keeps its value, a
 // new field gets its default (blanks), a dropped field goes (CL

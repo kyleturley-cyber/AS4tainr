@@ -567,12 +567,19 @@ impl Machine<'_> {
                 } else {
                     1
                 };
+                // A start given is a position in the string, 1 to its
+                // length (PUB400, IBM i 7.5, 2026-11-14: start 8 and start
+                // 9 of a 7-character string are status 00100, as for
+                // %SUBST and %SCAN).
+                if start < 1 || args.len() > 3 && !s.is_empty() && start > s.len() {
+                    bail!("RNQ0100: %SCANRPL start or length is outside the string.");
+                }
                 let len = if args.len() > 4 {
                     int_arg(self, 4)? as usize
                 } else {
-                    s.len() + 1 - start.max(1)
+                    (s.len() + 1).saturating_sub(start)
                 };
-                if start < 1 || start - 1 + len > s.len() {
+                if start - 1 + len > s.len() {
                     bail!("RNQ0100: %SCANRPL start or length is outside the string.");
                 }
                 let mut out = s[..start - 1].to_vec();

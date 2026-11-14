@@ -15296,6 +15296,82 @@ endmon;
     );
 }
 
+/// %SCANRPL's start is a position in the string, 1 to its length. Expected
+/// values from PUB400 (IBM i 7.5, 2026-11-14): with 'abcabca', start 8 and
+/// start 9 are status 00100, as start 0 and a length past the end; start 3
+/// replaces from there on.
+#[tokio::test]
+async fn scanrpl_start_within_the_string() {
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = r#"**free
+ctl-opt dftactgrp(*no);
+dcl-s s varchar(10) inz('abcabca');
+dcl-s r varchar(30);
+dcl-s p0 int(10) inz(0);
+dcl-s p3 int(10) inz(3);
+dcl-s p8 int(10) inz(8);
+dcl-s p9 int(10) inz(9);
+dcl-s l9 int(10) inz(9);
+monitor;
+  r = %scanrpl('a':'XY':s:p3);
+  dsply ('SRPL START [' + r + ']');
+on-error;
+  dsply ('SRPL START ERR ' + %char(%status));
+endmon;
+monitor;
+  r = %scanrpl('a':'Z':s:p8);
+  dsply ('SRPL END [' + r + ']');
+on-error;
+  dsply ('SRPL END ERR ' + %char(%status));
+endmon;
+monitor;
+  r = %scanrpl('a':'Z':s:p9);
+  dsply ('SRPL PAST [' + r + ']');
+on-error;
+  dsply ('SRPL PAST ERR ' + %char(%status));
+endmon;
+monitor;
+  r = %scanrpl('a':'Z':s:p0);
+  dsply ('SRPL ZERO [' + r + ']');
+on-error;
+  dsply ('SRPL ZERO ERR ' + %char(%status));
+endmon;
+monitor;
+  r = %scanrpl('a':'Z':s:p3:l9);
+  dsply ('SRPL LONG [' + r + ']');
+on-error;
+  dsply ('SRPL LONG ERR ' + %char(%status));
+endmon;
+*inlr = *on;
+"#;
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        None,
+        "SCANRPLS".into(),
+        src.into(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "SRPL START [abcXYbcXY]",
+            "SRPL END ERR 100",
+            "SRPL PAST ERR 100",
+            "SRPL ZERO ERR 100",
+            "SRPL LONG ERR 100",
+        ]
+    );
+}
+
 /// OPTIONS(*TRIM) (ILE RPG Reference, OPTIONS keyword): a CONST or VALUE
 /// character argument is passed without its leading and trailing blanks,
 /// also a variable of the parameter's own type (iRPGUnit's parseNum

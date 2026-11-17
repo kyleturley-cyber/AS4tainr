@@ -102,7 +102,10 @@ pub async fn run(database_url: String, ip: String) -> Result<()> {
     if tasks.is_empty() {
         bail!("no host server could be started on {ip}");
     }
-    for t in tasks {
+    // Each server accepts connections until the process ends, so waiting
+    // for the first is all the loop that was here ever did
+    // (clippy::never_loop since Rust 1.100).
+    if let Some(t) = tasks.into_iter().next() {
         t.await?;
     }
     Ok(())

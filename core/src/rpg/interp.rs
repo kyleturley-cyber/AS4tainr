@@ -1484,10 +1484,11 @@ impl<'a> Machine<'a> {
                         }
                         // A named constant (ILE RPG Reference, %SIZE): a
                         // character constant's length; a numeric one's
-                        // size as packed decimal of its digits.
+                        // digits as written, its size as zoned (PUB400,
+                        // IBM i 7.5, 2026-11-14: 12345 is 5, 12.5 is 3, -5
+                        // is 1, .25 is 2, 100.00 is 5).
                         Some(Sym::Const(Value::Num(d))) => {
-                            let digits = (d.int_digits() + d.scale() as u32).max(1);
-                            digits as usize / 2 + 1
+                            (d.int_digits() + d.scale() as u32).max(1) as usize
                         }
                         Some(Sym::Const(c)) => c.chars()?.len(),
                         _ => bail!("%SIZE of {a0:?}"),

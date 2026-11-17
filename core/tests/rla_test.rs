@@ -18940,6 +18940,72 @@ async fn verify18_removed_messages_leave_the_job_log() {
     );
 }
 
+/// %SIZE of a numeric named constant is its digits as written (its size
+/// as zoned), not its size as packed. Expected values: PUB400, IBM i 7.5,
+/// 2026-11-14, this program with DSPLY written to a stream file.
+#[tokio::test]
+async fn size_of_a_numeric_named_constant_is_its_digits() {
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = r#"**free
+ctl-opt dftactgrp(*no);
+dcl-c K1 12345;
+dcl-c K2 12.5;
+dcl-c K3 1234567;
+dcl-c K4 -5;
+dcl-c K5 0;
+dcl-c K6 123456789012;
+dcl-c K7 .25;
+dcl-c K8 100.00;
+dcl-s n int(10);
+n = %size(K1);
+dsply ('SIZE 12345 ' + %char(n));
+n = %size(K2);
+dsply ('SIZE 12.5 ' + %char(n));
+n = %size(K3);
+dsply ('SIZE 1234567 ' + %char(n));
+n = %size(K4);
+dsply ('SIZE -5 ' + %char(n));
+n = %size(K5);
+dsply ('SIZE 0 ' + %char(n));
+n = %size(K6);
+dsply ('SIZE 123456789012 ' + %char(n));
+n = %size(K7);
+dsply ('SIZE .25 ' + %char(n));
+n = %size(K8);
+dsply ('SIZE 100.00 ' + %char(n));
+*inlr = *on;
+"#;
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        None,
+        "KSIZE".into(),
+        src.into(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "SIZE 12345 5",
+            "SIZE 12.5 3",
+            "SIZE 1234567 7",
+            "SIZE -5 1",
+            "SIZE 0 1",
+            "SIZE 123456789012 12",
+            "SIZE .25 2",
+            "SIZE 100.00 5",
+        ]
+    );
+}
+
 /// An RPG program's QMHSNDPM messages in a `system` job's printed job
 /// log, and DSPJOB's printed report (PUB400 2026-10-28,
 /// tools/golden/verify19.txt b19_joblog, b19_dfna, b19_stsa, b19_runa,

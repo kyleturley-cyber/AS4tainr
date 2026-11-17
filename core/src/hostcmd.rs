@@ -372,8 +372,10 @@ fn text_in(ccsid: u32, b: &[u8]) -> String {
     match ccsid {
         1200 | 13488 => {
             let units: Vec<u16> = b
-                .chunks_exact(2)
-                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_be_bytes(*c))
                 .collect();
             String::from_utf16_lossy(&units)
         }

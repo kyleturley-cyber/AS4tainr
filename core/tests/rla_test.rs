@@ -8201,6 +8201,47 @@ exec sql rollback;
     );
 }
 
+/// catalog::init does not hang behind an open transaction whose owner
+/// waits for a statement queued behind init's own DDL. A connection has
+/// read as4tainr.objects in a transaction, init runs on a second one (its
+/// ALTER TABLE ... ADD COLUMN IF NOT EXISTS waits for the transaction),
+/// and a third connection's SELECT on as4tainr.objects queues behind that
+/// ALTER. That SELECT must finish, and then init, once the transaction
+/// ends. Before, the three waited for each other: parallel test runs
+/// could hang this way.
+#[tokio::test(flavor = "multi_thread")]
+async fn catalog_init_does_not_hang_behind_an_open_transaction() {
+    let url = require_db!();
+    let _ = setup(&url).await;
+    let holder = runtime::connect_db(&url).await.unwrap();
+    holder
+        .batch_execute("BEGIN; SELECT count(*) FROM as4tainr.objects")
+        .await
+        .unwrap();
+    let u = url.clone();
+    let init = tokio::spawn(async move {
+        let c = runtime::connect_db(&u).await.unwrap();
+        catalog::init(&c).await
+    });
+    // Let init reach its ALTER, which waits for `holder`.
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    let reader = runtime::connect_db(&url).await.unwrap();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        reader.query_one("SELECT count(*) FROM as4tainr.objects", &[]),
+    )
+    .await;
+    assert!(
+        read.is_ok(),
+        "a SELECT queued behind catalog::init's ALTER never finished"
+    );
+    read.unwrap().unwrap();
+    holder.batch_execute("COMMIT").await.unwrap();
+    let done = tokio::time::timeout(std::time::Duration::from_secs(60), init).await;
+    assert!(done.is_ok(), "catalog::init never finished");
+    done.unwrap().unwrap().unwrap();
+}
+
 /// The decimal places of quotients, products and sums: the values IBM i
 /// 7.5 shows (PUB400, tools/golden/rpg-prec.txt, rows P01-P18).
 #[tokio::test]

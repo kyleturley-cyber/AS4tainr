@@ -386,114 +386,142 @@ pub async fn init(client: &Client) -> Result<()> {
     client
         .execute("SELECT pg_advisory_lock($1)", &[&INIT_LOCK_KEY])
         .await?;
-    let result = async {
-        client
-            .batch_execute(CATALOG_DDL)
-            .await
-            .context("creating catalog")?;
-        // INSERT through an alias over a source member (ddl.rs CREATE
-        // ALIAS).
-        client
-            .batch_execute(
-                &(crate::source::insert_function("as4tainr.source_alias_insert")
-                    + &crate::source::alias_change_function("as4tainr.source_alias_change")),
-            )
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::authority::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::temporal::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::ile::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::jobd::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::joblog::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::dtaara::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::dtaq::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::usrspc::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::cmd::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::prtf::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::msgf::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::sqlpl::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::menus::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::source::DDL)
-            .await
-            .context("creating catalog")?;
-        crate::ifs::init(client)
-            .await
-            .context("creating the integrated file system")?;
-        client
-            .batch_execute(crate::jobs::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::objlock::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::jobscde::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::spool::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::journal::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::pftrg::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::sysapi::DDL)
-            .await
-            .context("creating catalog")?;
-        client
-            .batch_execute(crate::save::DDL)
-            .await
-            .context("creating catalog")?;
-        // Where the transactions are now (SAVCHGOBJ with a REFDATE), once
-        // a minute at most.
-        client
+    // Every statement of the catalog's set-up waits at most 2 s for a lock.
+    // An `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` takes ACCESS EXCLUSIVE
+    // even when the column is there, so it waits for any open transaction
+    // that has read the table, and every later statement on the table
+    // queues behind it. When that transaction's owner waits for one of
+    // those statements on another connection, nothing moves, and
+    // PostgreSQL sees no deadlock: parallel tests hung this way. A lock
+    // timeout ends the wait and lets the queue drain; the set-up is
+    // idempotent, so it runs again.
+    client.batch_execute("SET lock_timeout = '2s'").await?;
+    let mut attempts = 0;
+    let result = loop {
+        let r = init_catalog(client).await;
+        match &r {
+            Err(e) if attempts < 60 && is_lock_timeout(e) => attempts += 1,
+            _ => break r,
+        }
+    };
+    client.batch_execute("RESET lock_timeout").await?;
+    client
+        .execute("SELECT pg_advisory_unlock($1)", &[&INIT_LOCK_KEY])
+        .await?;
+    result?;
+    // The system values CHGSYSVAL changed, for this process.
+    crate::clpgm::load_system_values(client).await
+}
+
+/// The catalog's set-up statements (`init`, under its advisory lock).
+async fn init_catalog(client: &Client) -> Result<()> {
+    client
+        .batch_execute(CATALOG_DDL)
+        .await
+        .context("creating catalog")?;
+    // INSERT through an alias over a source member (ddl.rs CREATE
+    // ALIAS).
+    client
+        .batch_execute(
+            &(crate::source::insert_function("as4tainr.source_alias_insert")
+                + &crate::source::alias_change_function("as4tainr.source_alias_change")),
+        )
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::authority::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::temporal::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::ile::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::jobd::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::joblog::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::dtaara::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::dtaq::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::usrspc::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::cmd::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::prtf::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::msgf::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::sqlpl::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::menus::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::source::DDL)
+        .await
+        .context("creating catalog")?;
+    crate::ifs::init(client)
+        .await
+        .context("creating the integrated file system")?;
+    client
+        .batch_execute(crate::jobs::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::objlock::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::jobscde::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::spool::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::journal::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::pftrg::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::sysapi::DDL)
+        .await
+        .context("creating catalog")?;
+    client
+        .batch_execute(crate::save::DDL)
+        .await
+        .context("creating catalog")?;
+    // Where the transactions are now (SAVCHGOBJ with a REFDATE), once
+    // a minute at most.
+    client
             .execute(
                 "INSERT INTO as4tainr.xid_clock (xid)
                  SELECT pg_snapshot_xmin(pg_current_snapshot())::text
@@ -501,53 +529,52 @@ pub async fn init(client: &Client) -> Result<()> {
                 &[],
             )
             .await?;
+    client.batch_execute(crate::ddl::SCHEMA_NAMES_DDL).await?;
+    client.batch_execute(crate::rpyl::DDL).await?;
+    for (lib, text) in SYSTEM_LIBRARIES {
+        create_library(client, lib, text).await?;
+        // Catalogs made by older versions gave every one the same text.
         client
-            .batch_execute(crate::ddl::SCHEMA_NAMES_DDL)
-            .await?;
-        client.batch_execute(crate::rpyl::DDL).await?;
-        for (lib, text) in SYSTEM_LIBRARIES {
-            create_library(client, lib, text).await?;
-            // Catalogs made by older versions gave every one the same text.
-            client
                 .execute(
                     "UPDATE as4tainr.objects SET text = $2
                      WHERE library = 'QSYS' AND name = $1 AND objtype = '*LIB' AND text = 'System library'",
                     &[lib, text],
                 )
                 .await?;
-        }
-        // Programs of QSYS that as4tainr provides itself: QCMD (the
-        // command processor; CALL QCMD shows Command Entry).
-        client
-            .execute(
-                "INSERT INTO as4tainr.objects (library, name, objtype, attribute, text)
+    }
+    // Programs of QSYS that as4tainr provides itself: QCMD (the
+    // command processor; CALL QCMD shows Command Entry).
+    client
+        .execute(
+            "INSERT INTO as4tainr.objects (library, name, objtype, attribute, text)
                  SELECT 'QSYS', 'QCMD', '*PGM', '', ''
                  WHERE NOT EXISTS (SELECT 1 FROM as4tainr.objects
                                     WHERE library = 'QSYS' AND name = 'QCMD' AND objtype = '*PGM')",
-                &[],
-            )
-            .await?;
-        crate::users::init(client).await?;
-        crate::outq::init(client).await?;
-        crate::envvar::init(client).await?;
-        crate::collate::init(client).await?;
-        crate::qtemp::cleanup(client).await?;
-        crate::qsysinc::init(client).await?;
-        crate::outfile::init(client).await?;
-        // SQL runs as a restricted role. A database user who may not
-        // create roles still gets a working system, without SQL.
-        if let Err(e) = crate::sql::init(client).await {
-            eprintln!("as4tainr: SQL is not available: {e:#}");
-        }
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
-    client
-        .execute("SELECT pg_advisory_unlock($1)", &[&INIT_LOCK_KEY])
+            &[],
+        )
         .await?;
-    result?;
-    // The system values CHGSYSVAL changed, for this process.
-    crate::clpgm::load_system_values(client).await
+    crate::users::init(client).await?;
+    crate::outq::init(client).await?;
+    crate::envvar::init(client).await?;
+    crate::collate::init(client).await?;
+    crate::qtemp::cleanup(client).await?;
+    crate::qsysinc::init(client).await?;
+    crate::outfile::init(client).await?;
+    // SQL runs as a restricted role. A database user who may not
+    // create roles still gets a working system, without SQL.
+    if let Err(e) = crate::sql::init(client).await {
+        eprintln!("as4tainr: SQL is not available: {e:#}");
+    }
+    Ok(())
+}
+
+/// Whether an error is PostgreSQL's lock timeout (SQLSTATE 55P03).
+fn is_lock_timeout(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<tokio_postgres::Error>()
+            .and_then(|p| p.code())
+            .is_some_and(|code| *code == tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE)
+    })
 }
 
 /// CRTLIB: like `create_library`, but fails with CPF2111 when the library exists.

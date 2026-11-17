@@ -1537,8 +1537,21 @@ impl<'a> Machine<'a> {
             "REPLACE" => {
                 let rep = arg(self, 0)?.chars()?;
                 let s = arg(self, 1)?.chars()?;
+                // The start is 1 to the string's length plus 1, which
+                // appends (PUB400, IBM i 7.5, 2026-11-14: start 0, and
+                // start 9 of a 7-character string, are status 00100;
+                // start 8 appends, with any length).
                 let start = match args.get(2) {
-                    Some(x) => self.eval(x)?.num()?.to_i128()? as usize,
+                    Some(x) => {
+                        let n = self.eval(x)?.num()?.to_i128()?;
+                        if n < 1 || n as usize > s.len() + 1 {
+                            bail!(
+                                "RNQ0100: %REPLACE start {n} is outside the string (length {}).",
+                                s.len()
+                            );
+                        }
+                        n as usize
+                    }
                     None => 1,
                 };
                 let len = match args.get(3) {

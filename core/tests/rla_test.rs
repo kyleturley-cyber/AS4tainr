@@ -8201,6 +8201,119 @@ exec sql rollback;
     );
 }
 
+/// %REPLACE takes a start from 1 to the string's length plus 1 (which
+/// appends); outside that, status 00100. Expected values: PUB400, IBM i
+/// 7.5, 2026-11-14, this program with DSPLY written to a stream file.
+#[tokio::test]
+async fn replace_takes_a_start_up_to_one_past_the_end() {
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = r#"**free
+ctl-opt dftactgrp(*no);
+dcl-s s varchar(10) inz('ABCDEFG');
+dcl-s x char(2) inz('XY');
+dcl-s r varchar(20);
+dcl-s p3 int(10) inz(3);
+dcl-s p8 int(10) inz(8);
+dcl-s p9 int(10) inz(9);
+dcl-s p0 int(10) inz(0);
+dcl-s l0 int(10) inz(0);
+dcl-s l2 int(10) inz(2);
+dcl-s l5 int(10) inz(5);
+monitor;
+  r = %replace(x:s:p3:l2);
+  dsply ('REPL START LEN [' + r + ']');
+on-error;
+  dsply ('REPL START LEN ERR ' + %char(%status));
+endmon;
+monitor;
+  r = %replace(x:s:p3);
+  dsply ('REPL START [' + r + ']');
+on-error;
+  dsply ('REPL START ERR ' + %char(%status));
+endmon;
+monitor;
+  r = %replace(x:s);
+  dsply ('REPL NOSTART [' + r + ']');
+on-error;
+  dsply ('REPL NOSTART ERR ' + %char(%status));
+endmon;
+monitor;
+  r = %replace(x:s:p3:l0);
+  dsply ('REPL INSERT [' + r + ']');
+on-error;
+  dsply ('REPL INSERT ERR ' + %char(%status));
+endmon;
+monitor;
+  r = %replace(x:s:p8:l0);
+  dsply ('REPL APPEND [' + r + ']');
+on-error;
+  dsply ('REPL APPEND ERR ' + %char(%status));
+endmon;
+monitor;
+  r = %replace(x:s:p3:l5);
+  dsply ('REPL LONGLEN [' + r + ']');
+on-error;
+  dsply ('REPL LONGLEN ERR ' + %char(%status));
+endmon;
+monitor;
+  r = %replace(x:s:p8:l2);
+  dsply ('REPL PASTLEN [' + r + ']');
+on-error;
+  dsply ('REPL PASTLEN ERR ' + %char(%status));
+endmon;
+monitor;
+  r = %replace(x:s:p9);
+  dsply ('REPL PAST [' + r + ']');
+on-error;
+  dsply ('REPL PAST ERR ' + %char(%status));
+endmon;
+monitor;
+  r = %replace(x:s:p0);
+  dsply ('REPL ZERO [' + r + ']');
+on-error;
+  dsply ('REPL ZERO ERR ' + %char(%status));
+endmon;
+monitor;
+  r = %replace(%trim('  Q '):s:p3:l2);
+  dsply ('REPL TRIM [' + r + ']');
+on-error;
+  dsply ('REPL TRIM ERR ' + %char(%status));
+endmon;
+*inlr = *on;
+"#;
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        None,
+        "REPLSTART".into(),
+        src.into(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "REPL START LEN [ABXYEFG]",
+            "REPL START [ABXYEFG]",
+            "REPL NOSTART [XYCDEFG]",
+            "REPL INSERT [ABXYCDEFG]",
+            "REPL APPEND [ABCDEFGXY]",
+            "REPL LONGLEN [ABXY]",
+            "REPL PASTLEN [ABCDEFGXY]",
+            "REPL PAST ERR 100",
+            "REPL ZERO ERR 100",
+            "REPL TRIM [ABQEFG]",
+        ]
+    );
+}
+
 /// The decimal places of quotients, products and sums: the values IBM i
 /// 7.5 shows (PUB400, tools/golden/rpg-prec.txt, rows P01-P18).
 #[tokio::test]

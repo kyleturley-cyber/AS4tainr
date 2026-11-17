@@ -11068,6 +11068,123 @@ INSERT INTO {lib}.EMP VALUES ('000010', 'B01');"
     assert!(e.to_string().starts_with("SQL0530"), "{e}");
 }
 
+/// Figurative constants into varying fields fill them to their maximum
+/// length (*BLANKS, *ZEROS, *ALL, *HIVAL, and INZ), while CLEAR leaves
+/// them empty; *HIVAL and *LOVAL compared with a numeric field are the
+/// highest and lowest values of its type. Expected values: PUB400, IBM i
+/// 7.5, 2026-11-14, this program with DSPLY written to a stream file.
+#[tokio::test]
+async fn figurative_constants_fill_varying_fields_and_compare_by_type() {
+    use as4tainr_core::rpg;
+    let url = require_db!();
+    let (_client, lib) = setup(&url).await;
+    let src = r#"**free
+ctl-opt dftactgrp(*no);
+dcl-s v varchar(5) inz('XY');
+dcl-s w varchar(5) inz(*blanks);
+dcl-s y varchar(5) inz(*zeros);
+dcl-s p packed(5:2) inz(123.45);
+dcl-s z zoned(3:0) inz(7);
+dcl-s i int(10) inz(5);
+dsply ('VAR INZ BLANKS [' + w + '] ' + %char(%len(w)));
+dsply ('VAR INZ ZEROS [' + y + '] ' + %char(%len(y)));
+v = *blanks;
+dsply ('VAR BLANKS [' + v + '] ' + %char(%len(v)));
+v = 'XY';
+v = *zeros;
+dsply ('VAR ZEROS [' + v + '] ' + %char(%len(v)));
+v = 'XY';
+v = *all'ab';
+dsply ('VAR ALL [' + v + '] ' + %char(%len(v)));
+v = 'XY';
+v = *hival;
+dsply ('VAR HIVAL LEN ' + %char(%len(v)));
+z = *hival;
+if z = *hival;
+  dsply ('ZONED EQ HIVAL YES');
+else;
+  dsply ('ZONED EQ HIVAL NO');
+endif;
+if z < *hival;
+  dsply ('ZONED LT HIVAL YES');
+else;
+  dsply ('ZONED LT HIVAL NO');
+endif;
+p = *loval;
+if p = *loval;
+  dsply ('PACKED EQ LOVAL YES');
+else;
+  dsply ('PACKED EQ LOVAL NO');
+endif;
+p = 999.99;
+if p = *hival;
+  dsply ('PACKED 999.99 EQ HIVAL YES');
+else;
+  dsply ('PACKED 999.99 EQ HIVAL NO');
+endif;
+p = 999.98;
+if p < *hival;
+  dsply ('PACKED 999.98 LT HIVAL YES');
+else;
+  dsply ('PACKED 999.98 LT HIVAL NO');
+endif;
+if i < *hival;
+  dsply ('INT LT HIVAL YES');
+else;
+  dsply ('INT LT HIVAL NO');
+endif;
+i = *hival;
+dsply ('INT HIVAL ' + %char(i));
+if i = *hival;
+  dsply ('INT EQ HIVAL YES');
+else;
+  dsply ('INT EQ HIVAL NO');
+endif;
+v = 'XY';
+clear v;
+dsply ('VAR CLEAR [' + v + '] ' + %char(%len(v)));
+v = 'XY';
+reset v;
+dsply ('VAR RESET [' + v + '] ' + %char(%len(v)));
+*inlr = *on;
+"#;
+    let r = rpg::call(
+        &url,
+        vec![lib.clone()],
+        "QSECOFR".into(),
+        None,
+        None,
+        None,
+        "FIGVAR".into(),
+        src.into(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.messages,
+        [
+            "VAR INZ BLANKS [     ] 5",
+            "VAR INZ ZEROS [00000] 5",
+            "VAR BLANKS [     ] 5",
+            "VAR ZEROS [00000] 5",
+            "VAR ALL [ababa] 5",
+            "VAR HIVAL LEN 5",
+            "ZONED EQ HIVAL YES",
+            "ZONED LT HIVAL NO",
+            "PACKED EQ LOVAL YES",
+            "PACKED 999.99 EQ HIVAL YES",
+            "PACKED 999.98 LT HIVAL YES",
+            "INT LT HIVAL YES",
+            "INT HIVAL 2147483647",
+            "INT EQ HIVAL YES",
+            "VAR CLEAR [] 0",
+            "VAR RESET [XY] 2",
+        ]
+    );
+}
+
 /// One value of `VALUES expr` through the SQL interface.
 async fn sql_value(client: &tokio_postgres::Client, url: &str, lib: &str, expr: &str) -> String {
     match as4tainr_core::sql::run_as(

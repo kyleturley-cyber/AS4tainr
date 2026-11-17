@@ -523,7 +523,11 @@ pub fn store(t: &DType, v: &Value, out: &mut [u8], fit: Fit, right: bool) -> Res
         }
         DType::Varchar(max) => {
             let src = match v {
-                Value::Fig(Fig::Blanks) | Value::Fig(Fig::Null) => vec![],
+                // A figurative constant fills a varying field to its
+                // maximum length, *BLANKS too (PUB400, IBM i 7.5,
+                // 2026-11-14: `v = *blanks` and INZ(*BLANKS) of a
+                // VARCHAR(5) give five blanks, length 5).
+                Value::Fig(Fig::Null) => vec![],
                 Value::Fig(f) => {
                     let mut tmp = vec![0u8; *max as usize];
                     fill_fig(&DType::Char(*max), f, &mut tmp)?;

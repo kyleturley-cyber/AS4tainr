@@ -1149,6 +1149,8 @@ impl<'a> Machine<'a> {
                         Value::Num(acc)
                     }
                     cmp => {
+                        let x = self.fig_for(x, r)?;
+                        let y = self.fig_for(y, l)?;
                         let o = data::compare(&x, &y)?;
                         Value::Ind(match cmp {
                             BinOp::Eq => o == Ordering::Equal,
@@ -1163,6 +1165,25 @@ impl<'a> Machine<'a> {
                 }
             }
         })
+    }
+
+    /// *HIVAL or *LOVAL compared with a numeric field: the highest or
+    /// lowest value of that field's type, as assigning it would store
+    /// (PUB400, IBM i 7.5, 2026-11-14: a 3-digit zoned field set to
+    /// *HIVAL equals *HIVAL; 999.99 of a 5,2 packed field equals *HIVAL;
+    /// an INT(10) set to *HIVAL is 2147483647). Anything else is unchanged.
+    fn fig_for(&self, v: Value, other: &Expr) -> Result<Value> {
+        if !matches!(v, Value::Fig(Fig::HiVal | Fig::LoVal)) {
+            return Ok(v);
+        }
+        match self.type_of(other) {
+            Some(t) if t.is_numeric() && !matches!(t, DType::Float(_)) => {
+                let mut b = t.initial();
+                data::store(&t, &v, &mut b, Fit::Strict { half_adjust: false }, false)?;
+                data::load(&t, &b)
+            }
+            _ => Ok(v),
+        }
     }
 
     /// The type of what an expression names, when it names a field.
@@ -3465,6 +3486,8 @@ impl<'a> Machine<'a> {
             Stmt::Comp { f1, f2, ind } => {
                 let x = self.eval(f1)?;
                 let y = self.eval(f2)?;
+                let x = self.fig_for(x, f2)?;
+                let y = self.fig_for(y, f1)?;
                 let o = data::compare(&x, &y)?;
                 self.set_result_inds(
                     ind,
@@ -3529,8 +3552,13 @@ impl<'a> Machine<'a> {
                         let t = self
                             .type_of(other)
                             .ok_or_else(|| anyhow!("CLEAR of {other:?}"))?;
+                        // CLEAR of a varying field leaves it empty
+                        // (PUB400, IBM i 7.5, 2026-11-14: length 0), where
+                        // *BLANKS fills it.
                         let v = if t.is_numeric() {
                             Value::Num(Dec::ZERO)
+                        } else if matches!(t, DType::Varchar(_) | DType::VarUcs2(_)) {
+                            Value::Char(Vec::new())
                         } else {
                             Value::Fig(Fig::Blanks)
                         };
